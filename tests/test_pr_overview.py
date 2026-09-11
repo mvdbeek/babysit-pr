@@ -18,6 +18,7 @@ def pr(key="one", updated="2026-09-11T12:00:00Z", ci="SUCCESS", **extra):
         "repository": {"nameWithOwner": "test/repo"},
         "author": {"login": "alice"},
         "updatedAt": updated,
+        "createdAt": "2025-01-02T09:00:00Z",
         "state": "OPEN",
         "isDraft": False,
         "reviewDecision": None,
@@ -52,6 +53,7 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
     first = result["prs"][0]
     assert first["roles"] == ["author", "assignee", "reviewer"]
     assert first["ci"] == "FAILURE"
+    assert first["opened_at"] == "2025-01-02T09:00:00Z"
     assert first["updated_at"] == "2026-09-11T13:00:00Z"
     assert result["prs"][1]["ci"] == "NONE"
     assert result["prs"][1]["author"] is None

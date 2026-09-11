@@ -8,7 +8,13 @@ The skill instructions and operating details are in [SKILL.md](SKILL.md) and [th
 
 The dashboard opens on the **Watcher** tab. Use **Pull requests** to switch to the
 PR overview; tabs support keyboard navigation, browser history, and direct links
-with `#watcher` or `#prs`. The PR table has a separate repository column.
+with `#watcher` or `#prs`. The PR table has separate repository, author, and draft/ready-for-review columns,
+plus opened and last-updated timestamps. Click any column heading to sort; click
+again to reverse it. Mobile layouts provide equivalent sort controls. Dates sort
+chronologically, other columns by their displayed text; missing metadata stays
+at the bottom. Last updated (newest first) is the default. Sort selection survives
+refreshes and filtering within the page. Ready for review means the PR is not a
+draft; it does not imply reviewer approval.
 
 The dashboard also discovers open GitHub PRs you authored, are assigned to, or are
 involved in reviewing (including team requests and completed reviews). It uses the

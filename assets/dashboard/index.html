@@ -134,15 +134,72 @@
         </div>
         <p id="pr-sync" class="pr-sync" role="status">Loading your open PRs…</p>
         <div id="pr-alert" class="alert" role="status" hidden></div>
+        <div class="pr-mobile-sort">
+          <label for="pr-sort">Sort by</label>
+          <select id="pr-sort">
+            <option value="repo">Repository</option>
+            <option value="title">Pull request</option>
+            <option value="author">Author</option>
+            <option value="readiness">Review status</option>
+            <option value="roles">Your role</option>
+            <option value="ci">CI</option>
+            <option value="opened_at">Opened</option>
+            <option value="updated_at" selected>Last updated</option>
+          </select>
+          <button id="pr-sort-direction" type="button">Descending</button>
+        </div>
         <div class="pr-table-wrap">
           <table class="pr-table">
             <thead>
               <tr>
-                <th scope="col">Repository</th>
-                <th scope="col">Pull request</th>
-                <th scope="col">Your role</th>
-                <th scope="col">CI</th>
-                <th scope="col">Last updated</th>
+                <th id="pr-heading-repo" scope="col" aria-label="Repository" aria-sort="none">
+                  <button id="pr-sort-repo" type="button" aria-label="Sort by Repository">
+                    Repository
+                  </button>
+                </th>
+                <th id="pr-heading-title" scope="col" aria-label="Pull request" aria-sort="none">
+                  <button id="pr-sort-title" type="button" aria-label="Sort by Pull request">
+                    Pull request
+                  </button>
+                </th>
+                <th id="pr-heading-author" scope="col" aria-label="Author" aria-sort="none">
+                  <button id="pr-sort-author" type="button" aria-label="Sort by Author">
+                    Author
+                  </button>
+                </th>
+                <th
+                  id="pr-heading-readiness"
+                  scope="col"
+                  aria-label="Review status"
+                  aria-sort="none"
+                >
+                  <button id="pr-sort-readiness" type="button" aria-label="Sort by Review status">
+                    Review status
+                  </button>
+                </th>
+                <th id="pr-heading-roles" scope="col" aria-label="Your role" aria-sort="none">
+                  <button id="pr-sort-roles" type="button" aria-label="Sort by Your role">
+                    Your role
+                  </button>
+                </th>
+                <th id="pr-heading-ci" scope="col" aria-label="CI" aria-sort="none">
+                  <button id="pr-sort-ci" type="button" aria-label="Sort by CI">CI</button>
+                </th>
+                <th id="pr-heading-opened_at" scope="col" aria-label="Opened" aria-sort="none">
+                  <button id="pr-sort-opened_at" type="button" aria-label="Sort by Opened">
+                    Opened
+                  </button>
+                </th>
+                <th
+                  id="pr-heading-updated_at"
+                  scope="col"
+                  aria-label="Last updated"
+                  aria-sort="descending"
+                >
+                  <button id="pr-sort-updated_at" type="button" aria-label="Sort by Last updated">
+                    Last updated
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="pr-list"></tbody>

@@ -17,7 +17,7 @@ query($query: String!, $cursor: String) {
     issueCount
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
-      id number title url updatedAt state isDraft reviewDecision
+      id number title url createdAt updatedAt state isDraft reviewDecision
       repository { nameWithOwner }
       author { login }
       statusCheckRollup { state }
@@ -74,6 +74,7 @@ def collect():
                     "repo": node["repository"]["nameWithOwner"],
                     "author": (node.get("author") or {}).get("login"),
                     "updated_at": node["updatedAt"],
+                    "opened_at": node["createdAt"],
                     "draft": node["isDraft"],
                     "review_decision": node.get("reviewDecision"),
                     "roles": roles,

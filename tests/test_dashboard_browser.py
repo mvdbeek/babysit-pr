@@ -73,6 +73,7 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
                 "ci": "FAILURE",
                 "draft": False,
                 "updated_at": "2026-09-11T10:00:00Z",
+                "opened_at": "2025-01-01T10:00:00Z",
             },
             {
                 "id": "pr-two",
@@ -85,6 +86,7 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
                 "ci": "SUCCESS",
                 "draft": True,
                 "updated_at": "2026-09-10T10:00:00Z",
+                "opened_at": "2026-08-01T10:00:00Z",
             },
         ],
     )
@@ -184,7 +186,9 @@ def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboar
     expect(rows.first.locator("td").nth(1)).to_contain_text("#8")
     expect(rows.first.locator("img")).to_have_count(0)
     assert page.evaluate("window.injected === undefined")
-    expect(rows.first.locator("time")).to_have_attribute("datetime", "2026-09-11T10:00:00Z")
+    expect(rows.first.locator(".pr-updated time")).to_have_attribute(
+        "datetime", "2026-09-11T10:00:00Z"
+    )
     expect(page.locator("#pr-sync")).to_contain_text("@fixture")
     expect(page.locator("#pr-sync")).to_contain_text("Synced")
     expect(page.get_by_role("link", name="CI Failed for test/alpha #8")).to_have_attribute(
@@ -270,3 +274,63 @@ def test_dashboard_tabs_default_to_watcher_and_support_navigation(
     prs.press("Home")
     expect(watcher).to_be_focused()
     expect(page.locator("#watcher-panel")).to_be_visible()
+
+
+@pytest.mark.parametrize(
+    "column,first",
+    [
+        ("Repository", "test/alpha"),
+        ("Pull request", "test/alpha"),
+        ("Author", "test/beta"),
+        ("Review status", "test/beta"),
+        ("Your role", "test/beta"),
+        ("CI", "test/alpha"),
+        ("Opened", "test/beta"),
+        ("Last updated", "test/beta"),
+    ],
+)
+def test_each_pr_column_sorts_both_directions(page: Page, dashboard_site, column, first) -> None:
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    rows = page.locator("#pr-list tr")
+    expect(rows).to_have_count(2)
+    button = page.get_by_role("button", name=f"Sort by {column}", exact=True)
+    button.click()
+    expect(rows.first.locator(".pr-repo")).to_have_text(first)
+    button.click()
+    expect(rows.first.locator(".pr-repo")).to_have_text(
+        "test/beta" if first == "test/alpha" else "test/alpha"
+    )
+    expect(page.get_by_role("columnheader", name=column, exact=True)).to_have_attribute(
+        "aria-sort",
+        "descending"
+        if column not in {"Opened", "Last updated"}
+        else "ascending"
+        if column == "Opened"
+        else "descending",
+    )
+
+
+def test_pr_metadata_and_mobile_sort_survive_refresh_and_filtering(
+    page: Page, dashboard_site
+) -> None:
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    expect(page.locator(".pr-author").first).to_have_text("fixture")
+    expect(page.locator(".pr-readiness").first).to_have_text("Ready for review")
+    expect(page.locator(".pr-readiness").last).to_have_text("Draft")
+    expect(page.locator(".pr-opened time").first).to_have_attribute(
+        "datetime", "2025-01-01T10:00:00Z"
+    )
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.get_by_label("Sort by", exact=True).select_option("author")
+    expect(page.locator(".pr-author").first).to_have_text("colleague")
+    page.get_by_role("button", name="Ascending", exact=True).click()
+    expect(page.locator(".pr-author").first).to_have_text("fixture")
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator(".pr-author").first).to_have_text("fixture")
+    page.get_by_label("Search pull requests").fill("colleague")
+    expect(page.locator("#pr-list tr")).to_have_count(1)
+    page.get_by_label("Search pull requests").fill("")
+    expect(page.locator(".pr-author").first).to_have_text("fixture")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")

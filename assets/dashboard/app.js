@@ -496,6 +496,71 @@ async function serviceLog() {
   }
 }
 
+const roleNames = { author: "Author", reviewer: "Reviewer", assignee: "Assignee" };
+const ciStates = {
+  SUCCESS: ["Passed", "green"],
+  FAILURE: ["Failed", "red"],
+  ERROR: ["Error", "red"],
+  PENDING: ["Pending", "amber"],
+  EXPECTED: ["Expected", "amber"],
+  NONE: ["No checks", ""],
+};
+
+const prColumns = {
+  repo: "Repository",
+  title: "Pull request",
+  author: "Author",
+  readiness: "Review status",
+  roles: "Your role",
+  ci: "CI",
+  opened_at: "Opened",
+  updated_at: "Last updated",
+};
+let prSort = "updated_at",
+  prAscending = false;
+function prSortValue(pr) {
+  if (prSort === "readiness") return pr.draft ? "Draft" : "Ready for review";
+  if (prSort === "roles")
+    return pr.roles
+      .map((role) => roleNames[role] || role)
+      .sort()
+      .join(", ");
+  if (prSort === "ci") return (ciStates[pr.ci] || ["Unknown"])[0];
+  if (prSort === "opened_at" || prSort === "updated_at") {
+    const value = Date.parse(pr[prSort]);
+    return Number.isFinite(value) ? value : null;
+  }
+  return pr[prSort] || null;
+}
+function comparePRs(a, b) {
+  const left = prSortValue(a),
+    right = prSortValue(b);
+  // Keep missing metadata at the bottom in either direction.
+  if (left === null || right === null) return left === right ? 0 : left === null ? 1 : -1;
+  const order =
+    typeof left === "number"
+      ? left - right
+      : left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+  return (prAscending ? order : -order) || a.id.localeCompare(b.id);
+}
+function sortPRs(column, toggle = false) {
+  prAscending =
+    column === prSort && toggle ? !prAscending : !["opened_at", "updated_at"].includes(column);
+  prSort = column;
+  renderPRs();
+}
+function prDate(value, label, cls) {
+  const cell = el("td", undefined, `pr-time ${cls}`);
+  const date = new Date(value || NaN);
+  const valid = Number.isFinite(date.getTime());
+  const stamp = el("time", valid ? date.toLocaleString() : "Unknown");
+  if (valid) stamp.setAttribute("datetime", value);
+  cell.append(
+    el("small", `${label} ${valid ? ago(date.getTime() / 1000) : "at an unknown time"}`),
+    stamp,
+  );
+  return cell;
+}
 function renderPRs() {
   if (!prData) return;
   const prs = prData.prs || [];
@@ -511,37 +576,38 @@ function renderPRs() {
         (ci === "PENDING" && pr.ci === "EXPECTED")) &&
       `${pr.repo} ${pr.title} ${pr.number} ${pr.author || ""}`.toLowerCase().includes(query),
   );
+  visible.sort(comparePRs);
+  for (const column of Object.keys(prColumns)) {
+    $(`pr-heading-${column}`).setAttribute(
+      "aria-sort",
+      column === prSort ? (prAscending ? "ascending" : "descending") : "none",
+    );
+  }
+  $("pr-sort").value = prSort;
+  $("pr-sort-direction").textContent = prAscending ? "Ascending" : "Descending";
   $("pr-count").textContent = `${visible.length} / ${prs.length}`;
   const sync = prData.synced_at ? new Date(prData.synced_at * 1000).toLocaleString() : null;
   $("pr-sync").textContent =
-    `${prData.login ? `@${prData.login} · ` : ""}Open PRs · most recently updated first · ${sync ? `Synced ${sync}` : "Not synced yet"}${prData.refreshing ? " · Syncing…" : " · GitHub refreshes every 2 minutes"}`;
+    `${prData.login ? `@${prData.login} · ` : ""}Open PRs · Sorted by ${prColumns[prSort]} (${prAscending ? "ascending" : "descending"}) · ${sync ? `Synced ${sync}` : "Not synced yet"}${prData.refreshing ? " · Syncing…" : " · GitHub refreshes every 2 minutes"}`;
   const issues = [prData.error, ...(prData.warnings || [])].filter(Boolean);
   $("pr-alert").hidden = !issues.length;
   $("pr-alert").textContent =
     issues.join(" ") +
     (prData.error && sync ? " Showing saved results; they may be out of date." : "");
   $("pr-list").replaceChildren();
-  const roleNames = { author: "Author", reviewer: "Reviewer", assignee: "Assignee" };
-  const ciStates = {
-    SUCCESS: ["Passed", "green"],
-    FAILURE: ["Failed", "red"],
-    ERROR: ["Error", "red"],
-    PENDING: ["Pending", "amber"],
-    EXPECTED: ["Expected", "amber"],
-    NONE: ["No checks", ""],
-  };
   for (const pr of visible) {
     const row = el("tr");
     const title = el("td");
     const titleLink = link(pr.title, pr.url);
     titleLink.className = "pr-title";
-    title.append(
-      titleLink,
-      el(
-        "span",
-        `#${pr.number}${pr.author ? ` · ${pr.author}` : ""}${pr.draft ? " · Draft" : ""}`,
-        "pr-meta",
-      ),
+    title.append(titleLink, el("span", `#${pr.number}`, "pr-meta"));
+    const author = el("td", undefined, "pr-author");
+    author.append(
+      pr.author ? link(pr.author, `https://github.com/${pr.author}`) : el("span", "Unknown"),
+    );
+    const readiness = el("td", undefined, "pr-readiness");
+    readiness.append(
+      el("span", pr.draft ? "Draft" : "Ready for review", `badge ${pr.draft ? "" : "blue"}`),
     );
     const roles = el("td");
     const tags = el("div", undefined, "pr-roles");
@@ -553,19 +619,12 @@ function renderPRs() {
     checksLink.className = `badge ${color}`;
     checksLink.setAttribute("aria-label", `CI ${label} for ${pr.repo} #${pr.number}`);
     checks.append(checksLink);
-    const updated = el("td", undefined, "pr-time");
-    const date = new Date(pr.updated_at);
-    const valid = Number.isFinite(date.getTime());
-    const stamp = el("time", valid ? date.toLocaleString() : "Unknown");
-    if (valid) stamp.setAttribute("datetime", pr.updated_at);
-    updated.append(
-      el("small", `Updated ${valid ? ago(date.getTime() / 1000) : "at an unknown time"}`),
-      stamp,
-    );
+    const opened = prDate(pr.opened_at, "Opened", "pr-opened");
+    const updated = prDate(pr.updated_at, "Updated", "pr-updated");
     const repo = el("td", undefined, "pr-repo");
     repo.append(link(pr.repo, `https://github.com/${pr.repo}`));
     title.className = "pr-description";
-    row.append(repo, title, roles, checks, updated);
+    row.append(repo, title, author, readiness, roles, checks, opened, updated);
     $("pr-list").append(row);
   }
   $("pr-empty").hidden = visible.length > 0;
@@ -643,6 +702,11 @@ for (const page of ["watcher", "prs"]) {
 }
 window.addEventListener("hashchange", pageFromURL);
 pageFromURL();
+for (const column of Object.keys(prColumns)) {
+  $(`pr-sort-${column}`).onclick = () => sortPRs(column, true);
+}
+$("pr-sort").onchange = () => sortPRs($("pr-sort").value);
+$("pr-sort-direction").onclick = () => sortPRs(prSort, true);
 $("pr-refresh").onclick = refreshPRs;
 $("show-attention").onclick = () => {
   $("filter").value = "attention";
