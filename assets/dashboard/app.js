@@ -561,19 +561,41 @@ function prDate(value, label, cls) {
   );
   return cell;
 }
+let prRepositoriesKey = null;
+function updatePRRepositories(prs) {
+  const select = $("pr-repo");
+  const selected = select.value || "all";
+  const repositories = [...new Set(prs.map((pr) => pr.repo))].sort((a, b) => a.localeCompare(b));
+  // Retain an active filter if its last PR closes between snapshots.
+  if (selected !== "all" && !repositories.includes(selected)) repositories.push(selected);
+  const key = JSON.stringify(repositories);
+  if (key === prRepositoriesKey) return;
+  prRepositoriesKey = key;
+  const options = [["all", "All repositories"], ...repositories.map((repo) => [repo, repo])].map(
+    ([value, text]) => {
+      const option = el("option", text);
+      option.value = value;
+      return option;
+    },
+  );
+  select.replaceChildren(...options);
+  select.value = selected;
+}
 function renderPRs() {
   if (!prData) return;
   const prs = prData.prs || [];
+  updatePRRepositories(prs);
   const query = $("pr-search").value.toLowerCase();
   const role = $("pr-role").value;
   const ci = $("pr-ci").value;
+  const repo = $("pr-repo").value;
+  const review = $("pr-review").value;
   const visible = prs.filter(
     (pr) =>
       (role === "all" || pr.roles.includes(role)) &&
-      (ci === "all" ||
-        pr.ci === ci ||
-        (ci === "FAILURE" && pr.ci === "ERROR") ||
-        (ci === "PENDING" && pr.ci === "EXPECTED")) &&
+      (ci === "all" || pr.ci === ci || (ci === "UNKNOWN" && !ciStates[pr.ci])) &&
+      (repo === "all" || pr.repo === repo) &&
+      (review === "all" || (review === "draft" ? pr.draft : !pr.draft)) &&
       `${pr.repo} ${pr.title} ${pr.number} ${pr.author || ""}`.toLowerCase().includes(query),
   );
   visible.sort(comparePRs);
@@ -722,6 +744,8 @@ $("refresh").onclick = refresh;
 $("pr-search").oninput = renderPRs;
 $("pr-role").onchange = renderPRs;
 $("pr-ci").onchange = renderPRs;
+$("pr-repo").onchange = renderPRs;
+$("pr-review").onchange = renderPRs;
 $("search").oninput = render;
 $("filter").onchange = render;
 $("service-details").ontoggle = () => {

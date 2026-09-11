@@ -334,3 +334,72 @@ def test_pr_metadata_and_mobile_sort_survive_refresh_and_filtering(
     page.get_by_label("Search pull requests").fill("")
     expect(page.locator(".pr-author").first).to_have_text("fixture")
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_pr_filters_combine_and_keep_repository_selection_on_refresh(
+    page: Page, dashboard_site
+) -> None:
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    repo = page.get_by_label("Filter pull requests by repository")
+    review = page.get_by_label("Filter pull requests by review status")
+    ci = page.get_by_label("Filter pull requests by CI")
+    rows = page.locator("#pr-list tr")
+    expect(repo.locator("option")).to_have_text(["All repositories", "test/alpha", "test/beta"])
+    repo.select_option("test/beta")
+    review.select_option("draft")
+    ci.select_option("SUCCESS")
+    expect(rows).to_have_count(1)
+    expect(rows).to_contain_text(["Assigned PR"])
+    review.select_option("ready")
+    expect(rows).to_have_count(0)
+    expect(page.locator("#pr-empty")).to_have_text("No matching pull requests.")
+    expect(repo.locator("option")).to_have_count(3)
+    repo.select_option("test/alpha")
+    ci.select_option("FAILURE")
+    expect(rows).to_have_count(1)
+    page.get_by_label("Filter pull requests by role").select_option("assignee")
+    expect(rows).to_have_count(0)
+    page.get_by_label("Filter pull requests by role").select_option("all")
+    expect(rows).to_have_count(1)
+    page.route("**/api/prs", lambda route: route.fulfill(json={"prs": [], "synced_at": 1234}))
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(rows).to_have_count(0)
+    expect(repo).to_have_value("test/alpha")
+    expect(review).to_have_value("ready")
+    expect(ci).to_have_value("FAILURE")
+    page.unroute("**/api/prs")
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(rows).to_have_count(1)
+    page.set_viewport_size({"width": 390, "height": 844})
+    expect(repo).to_be_visible()
+    expect(review).to_be_visible()
+    expect(ci).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_ci_filters_match_each_displayed_state(page: Page, dashboard_site) -> None:
+    url, _ = dashboard_site
+    states = ["SUCCESS", "FAILURE", "PENDING", "ERROR", "EXPECTED", "NONE", "UNKNOWN"]
+    prs = [
+        {
+            "id": state,
+            "repo": "test/repo",
+            "title": state,
+            "number": index,
+            "url": f"https://github.com/test/repo/pull/{index}",
+            "roles": ["author"],
+            "ci": state,
+            "draft": False,
+            "updated_at": "2026-09-11T10:00:00Z",
+        }
+        for index, state in enumerate(states, 1)
+    ]
+    page.route("**/api/prs", lambda route: route.fulfill(json={"prs": prs, "synced_at": 1234}))
+    page.goto(url + "/#prs")
+    for state in states:
+        page.get_by_label("Filter pull requests by CI").select_option(state)
+        expect(page.locator("#pr-list tr")).to_have_count(1)
+        expect(page.locator("#pr-list .pr-title")).to_have_text(state)
+    page.get_by_label("Filter pull requests by CI").select_option("all")
+    expect(page.locator("#pr-list tr")).to_have_count(7)

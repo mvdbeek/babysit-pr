@@ -116,21 +116,46 @@
               placeholder="Find a PR or repo…"
               aria-label="Search pull requests"
             />
+            <button id="pr-refresh" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="pr-filters">
+          <label for="pr-repo"
+            >Repository
+            <select id="pr-repo" aria-label="Filter pull requests by repository">
+              <option value="all">All repositories</option>
+            </select>
+          </label>
+          <label for="pr-ci"
+            >CI state
+            <select id="pr-ci" aria-label="Filter pull requests by CI">
+              <option value="all">All CI states</option>
+              <option value="SUCCESS">Passed</option>
+              <option value="FAILURE">Failed</option>
+              <option value="PENDING">Pending</option>
+              <option value="ERROR">Error</option>
+              <option value="EXPECTED">Expected</option>
+              <option value="NONE">No checks</option>
+              <option value="UNKNOWN">Unknown</option>
+            </select>
+          </label>
+          <label for="pr-review"
+            >Review status
+            <select id="pr-review" aria-label="Filter pull requests by review status">
+              <option value="all">All review statuses</option>
+              <option value="draft">Draft</option>
+              <option value="ready">Ready for review</option>
+            </select>
+          </label>
+          <label for="pr-role"
+            >Your role
             <select id="pr-role" aria-label="Filter pull requests by role">
               <option value="all">All roles</option>
               <option value="author">My PRs</option>
               <option value="reviewer">Reviewer</option>
               <option value="assignee">Assignee</option>
             </select>
-            <select id="pr-ci" aria-label="Filter pull requests by CI">
-              <option value="all">All CI states</option>
-              <option value="SUCCESS">Passed</option>
-              <option value="FAILURE">Failed</option>
-              <option value="PENDING">Pending</option>
-              <option value="NONE">No checks</option>
-            </select>
-            <button id="pr-refresh" type="button">Refresh</button>
-          </div>
+          </label>
         </div>
         <p id="pr-sync" class="pr-sync" role="status">Loading your open PRs…</p>
         <div id="pr-alert" class="alert" role="status" hidden></div>

@@ -21,7 +21,11 @@ involved in reviewing (including team requests and completed reviews). It uses t
 active `gh` account on github.com. No registration is needed. These PRs are a
 read-only overview and do not start agents or create repair watches.
 
-Search by repository, title, number, or author, and filter by role or CI state.
+Search by repository, title, number, or author. The labeled filter row combines
+repository, CI state, review status (Draft or Ready for review), and your role.
+Repository choices come from all discovered PRs; selections survive refreshes
+even if a repository no longer has matching PRs. CI states have individual options,
+including Error, Expected, No checks, and Unknown.
 Each row links to the PR and its checks. CI is GitHub's combined head-ref check
 status; “No checks” means GitHub returned no rollup, not a successful build.
 “Last updated” is GitHub's PR `updatedAt` (PR activity, not the last poll or CI
