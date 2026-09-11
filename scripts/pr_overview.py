@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 
-POLL_SECONDS = 120
+POLL_SECONDS = 300
 ROLES = {"author": "author", "assignee": "assignee", "reviewer": "review-involves"}
 QUERY = """
 query($query: String!, $cursor: String) {

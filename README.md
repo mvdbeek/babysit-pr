@@ -28,7 +28,7 @@ status; “No checks” means GitHub returned no rollup, not a successful build.
 completion time). The separate sync timestamp shows how fresh the data is.
 
 While the dashboard is open, one background worker refreshes GitHub at most every
-two minutes; browser refreshes and multiple tabs share the cache. Pagination fetches
+five minutes; browser refreshes and multiple tabs share the cache. Pagination fetches
 up to GitHub's search limit of 1,000 PRs per role, with an explicit notice if capped.
 Duplicates appear once with all matching roles. Failed requests keep the last
 complete snapshot with a visible error. Cached metadata lives in

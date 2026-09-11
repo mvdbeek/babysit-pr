@@ -588,7 +588,7 @@ function renderPRs() {
   $("pr-count").textContent = `${visible.length} / ${prs.length}`;
   const sync = prData.synced_at ? new Date(prData.synced_at * 1000).toLocaleString() : null;
   $("pr-sync").textContent =
-    `${prData.login ? `@${prData.login} · ` : ""}Open PRs · Sorted by ${prColumns[prSort]} (${prAscending ? "ascending" : "descending"}) · ${sync ? `Synced ${sync}` : "Not synced yet"}${prData.refreshing ? " · Syncing…" : " · GitHub refreshes every 2 minutes"}`;
+    `${prData.login ? `@${prData.login} · ` : ""}Open PRs · Sorted by ${prColumns[prSort]} (${prAscending ? "ascending" : "descending"}) · ${sync ? `Synced ${sync}` : "Not synced yet"}${prData.refreshing ? " · Syncing…" : " · GitHub refreshes every 5 minutes"}`;
   const issues = [prData.error, ...(prData.warnings || [])].filter(Boolean);
   $("pr-alert").hidden = !issues.length;
   $("pr-alert").textContent =
