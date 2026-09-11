@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Loopback dashboard with watch cancellation for the shared babysit-pr watcher."""
+
+import argparse
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import re
+import sqlite3
+import time
+from urllib.parse import parse_qs, urlsplit
+import webbrowser
+
+ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
+LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+
+
+def read_jobs(home):
+    path = home / "queue.sqlite"
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return []
+    # Never create a database or take ownership of monitoring just to display it.
+    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+        return [json.loads(row[0]) for row in db.execute("SELECT data FROM jobs")]
+    finally:
+        db.close()
+
+
+def present_job(job):
+    snapshot = job.get("snapshot") or {}
+    pr = snapshot.get("pr") or {}
+    ci = snapshot.get("ci") or {}
+    from pr_supervisor import feedback_token, approved_feedback
+    feedback = job.get("pending_reviews") or []
+    return {
+        "feedback": feedback, "feedback_token": feedback_token(feedback),
+        "feedback_approved": len(approved_feedback(job)),
+        "cleanup_ready": bool(job.get("cleanup_ready") or (job.get("status") == "closed" and (pr.get("closed") or pr.get("merged")))),
+        "pr_outcome": "merged" if pr.get("merged") else "closed" if pr.get("closed") else None,
+        "id": job["id"], "url": job.get("url"), "repo": job.get("repo"),
+        "branch": job.get("branch") or pr.get("head_branch"),
+        "kind": "branch" if job.get("branch") else "pr", "number": pr.get("number"),
+        "ci_repo": ci.get("repo") or job.get("ci_repo") or job.get("repo"),
+        "sha": pr.get("head_sha"), "status": job.get("status", "unknown"),
+        "summary": job.get("summary", ""), "attempts": job.get("attempts", 0),
+        "max_repairs": job.get("max_repairs", 0), "pending_reviews": len(job.get("pending_reviews") or []),
+        "checks": snapshot.get("checks"), "check_details": snapshot.get("check_details") or [],
+        "failed_jobs": snapshot.get("failed_jobs") or [],
+        "updated_at": job.get("updated_at"), "next_poll": job.get("next_poll"),
+        "last_poll": (job.get("watcher_state") or {}).get("last_snapshot_at"),
+        "started_at": job.get("started_at"), "cwd": job.get("cwd"),
+        "attempt": job.get("attempt"), "poll_errors": job.get("poll_errors", 0),
+        "pause_after_run": job.get("pause_after_run", False),
+        "stop_after_run": job.get("stop_after_run", False),
+    }
+
+
+def status(home):
+    now = time.time()
+    result = {"time": now, "home": str(home), "jobs": [], "error": None,
+              "daemon": {"health": "unknown", "heartbeat_age": None, "max_workers": None}}
+    try:
+        result["jobs"] = sorted((present_job(job) for job in read_jobs(home)),
+                                key=lambda job: job.get("updated_at") or 0, reverse=True)
+        heartbeat = read_json(home / "heartbeat.json") or {}
+        daemon = read_json(home / "daemon.json") or {}
+        age = max(0, now - heartbeat["time"]) if heartbeat.get("time") else None
+        result["daemon"] = {"health": "healthy" if age is not None and age < 15 else "stale" if age is not None else "offline",
+                            "heartbeat_age": age, "max_workers": daemon.get("max_workers")}
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        result["error"] = f"Cannot read watcher state: {exc}"
+    return result
+
+
+def cancel_watch(home, job_id):
+    from pr_supervisor import stop_watch
+    # Cancellation must not create a new queue when the configured home is wrong.
+    db = sqlite3.connect((home / "queue.sqlite").as_uri() + "?mode=rw", uri=True, timeout=2)
+    try:
+        return present_job(stop_watch(db, job_id))
+    finally:
+        db.close()
+
+
+def handle_feedback(home, job_id, token):
+    from pr_supervisor import approve_feedback
+    db = sqlite3.connect((home / "queue.sqlite").as_uri() + "?mode=rw", uri=True, timeout=2)
+    try:
+        return present_job(approve_feedback(db, job_id, token))
+    finally:
+        db.close()
+
+
+def tail_log(home, kind, job_id=None):
+    if kind == "supervisor":
+        path = home / "supervisor.log"
+    else:
+        if kind not in LOGS:
+            raise ValueError("Unknown log")
+        job = next((job for job in read_jobs(home) if job["id"] == job_id), None)
+        if job is None:
+            raise ValueError("Unknown watch")
+        attempt = job.get("attempt", "")
+        if not re.fullmatch(r"[0-9a-f-]{36}", attempt):
+            return {"text": "No repair has run for this watch yet.", "truncated": False}
+        path = home / "runs" / attempt / LOGS[kind]
+    # Only known watcher log files may be served, never arbitrary paths/symlinks.
+    if not path.resolve().is_relative_to(home.resolve()):
+        raise ValueError("Log is outside the watcher state directory")
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            start = max(0, size - 64 * 1024)
+            stream.seek(start)
+            data = stream.read(64 * 1024)
+        return {"text": data.decode("utf-8", errors="replace"), "truncated": start > 0}
+    except FileNotFoundError:
+        return {"text": "This log is not available yet.", "truncated": False}
+
+
+class DashboardServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, home, port, allowed_hosts=()):
+        self.home = home
+        self.allowed_hosts = set(allowed_hosts)
+        super().__init__(("127.0.0.1", port), Handler)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def send_body(self, code, body, content_type):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, code, value):
+        self.send_body(code, json.dumps(value).encode(), "application/json; charset=utf-8")
+
+    def do_POST(self):
+        self.close_connection = True
+        host = self.headers.get("Host")
+        allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"} | self.server.allowed_hosts
+        origin = self.headers.get("Origin")
+        action = self.headers.get("X-Babysit-Action")
+        # A custom header requires a browser preflight; no cross-origin requests
+        # are allowed. Check Origin too, including for trusted tailnet proxies.
+        if (host not in allowed or action not in {"cancel", "feedback"}
+                or self.headers.get("Sec-Fetch-Site") == "cross-site"
+                or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})):
+            self.send_json(403, {"error": "This action requires the configured dashboard"})
+            return
+        if self.path != f"/api/{action}":
+            self.send_json(404, {"error": "Not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 1024 or self.headers.get("Content-Type") != "application/json":
+                raise ValueError("Expected a small JSON action request")
+            self.connection.settimeout(5)
+            request = json.loads(self.rfile.read(length))
+            if not isinstance(request, dict) or not isinstance(request.get("id"), str) or not request["id"]:
+                raise ValueError("Supply a watch ID")
+            if action == "feedback":
+                job = handle_feedback(self.server.home, request["id"], request.get("token"))
+            else:
+                job = cancel_watch(self.server.home, request["id"])
+            self.send_json(200, {"job": job})
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (OSError, sqlite3.Error) as exc:
+            self.send_json(503, {"error": f"Cannot update watch: {exc}"})
+
+    def do_GET(self):
+        port = self.server.server_port
+        if self.headers.get("Host") not in {f"127.0.0.1:{port}", f"localhost:{port}"} | self.server.allowed_hosts:
+            self.send_json(403, {"error": "Use a configured dashboard URL"})
+            return
+        if (self.headers.get("Sec-Fetch-Site") == "cross-site"
+                and self.headers.get("Sec-Fetch-Mode") != "navigate"):
+            self.send_json(403, {"error": "Cross-site access is disabled"})
+            return
+        route = urlsplit(self.path)
+        try:
+            if route.path == "/api/status":
+                self.send_json(200, status(self.server.home))
+            elif route.path == "/api/log":
+                query = parse_qs(route.query)
+                self.send_json(200, tail_log(self.server.home, query.get("kind", ["agent"])[0], query.get("job", [None])[0]))
+            else:
+                files = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
+                         "/style.css": ("style.css", "text/css")}
+                if route.path not in files:
+                    self.send_json(404, {"error": "Not found"})
+                    return
+                filename, mime = files[route.path]
+                self.send_body(200, (ASSETS / filename).read_bytes(), mime + "; charset=utf-8")
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (OSError, sqlite3.Error) as exc:
+            self.send_json(503, {"error": f"Cannot read watcher data: {exc}"})
+
+
+def serve(home, port=8765, open_browser=False, allowed_hosts=()):
+    with DashboardServer(home, port, allowed_hosts) as server:
+        url = f"http://127.0.0.1:{server.server_port}"
+        print(f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.", flush=True)
+        if open_browser:
+            webbrowser.open(url)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path.home() / ".local/state/babysit-pr")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--open", action="store_true")
+    parser.add_argument("--allow-host", action="append", default=[], help="Exact Host header accepted through a trusted local proxy")
+    args = parser.parse_args()
+    serve(args.home.expanduser().resolve(), args.port, args.open, args.allow_host)

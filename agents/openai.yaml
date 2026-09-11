@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Babysitter"
+  short_description: "Watch CI with a shared service and bounded repairs"
+  default_prompt: "Use $babysit-pr to hand off this PR or branch CI to the shared watcher and resume this Codex session only when CI or review feedback needs work."
