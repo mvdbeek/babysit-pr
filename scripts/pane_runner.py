@@ -1,9 +1,9 @@
 """Bind a watch to its original terminal and launch bounded work visibly there."""
 
 import os
-from pathlib import Path
 import shlex
 import sys
+from pathlib import Path
 
 from herdr_handoff import herdr, result
 
@@ -31,10 +31,13 @@ def release_is_foreground(procs, pane):
     """Recognize this release command, invoked directly by the bound shell."""
     pid = os.getpid()
     foreground = procs.get("foreground_processes") or []
-    if (os.getppid() != procs.get("shell_pid") or not os.isatty(0)
-            or procs.get("foreground_process_group_id") != os.getpgrp()
-            or os.tcgetpgrp(0) != os.getpgrp()
-            or not any(p["pid"] == pid for p in foreground)):
+    if (
+        os.getppid() != procs.get("shell_pid")
+        or not os.isatty(0)
+        or procs.get("foreground_process_group_id") != os.getpgrp()
+        or os.tcgetpgrp(0) != os.getpgrp()
+        or not any(p["pid"] == pid for p in foreground)
+    ):
         return False
     # The synchronous process-info query may itself be present in its snapshot.
     # No other sibling pipeline command or agent is part of this exemption.
@@ -42,8 +45,11 @@ def release_is_foreground(procs, pane):
         if process["pid"] == pid:
             continue
         argv = process.get("argv") or []
-        if not (argv and Path(argv[0]).name == "herdr"
-                and argv[1:] == ["pane", "process-info", "--pane", pane]):
+        if not (
+            argv
+            and Path(argv[0]).name == "herdr"
+            and argv[1:] == ["pane", "process-info", "--pane", pane]
+        ):
             return False
     return True
 
@@ -56,7 +62,10 @@ def locate(binding, cwd, require_shell=False, runner_pid=None, allow_release=Fal
         raise RuntimeError("Original herdr terminal is missing; no background fallback")
     pane = matches[0]["pane_id"]
     info, procs = inspect(pane)
-    if info["terminal_id"] != binding["terminal_id"] or procs.get("shell_pid") != binding["shell_pid"]:
+    if (
+        info["terminal_id"] != binding["terminal_id"]
+        or procs.get("shell_pid") != binding["shell_pid"]
+    ):
         raise RuntimeError("Original herdr terminal or shell was replaced")
     foreground = procs.get("foreground_processes") or []
     if Path(info.get("foreground_cwd") or info.get("cwd", "")).resolve() != Path(cwd).resolve():
@@ -72,8 +81,9 @@ def locate(binding, cwd, require_shell=False, runner_pid=None, allow_release=Fal
 
 def launch(job, home, script):
     pane = locate(job["pane"], job["cwd"], require_shell=True)
-    command = shlex.join([sys.executable, str(script), "--home", str(home),
-                          "_repair", job["id"], job["attempt"]])
+    command = shlex.join(
+        [sys.executable, str(script), "--home", str(home), "_repair", job["id"], job["attempt"]]
+    )
     # Exactly one atomic text+Enter submission. Never retry ambiguous delivery.
     herdr("pane", "run", pane, command)  # successful CLI submission has no JSON body
 

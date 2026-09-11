@@ -4,12 +4,12 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 
 import pr_supervisor as supervisor
 
@@ -61,11 +61,12 @@ def latest_turn(rollout, session_id):
     return turn, complete
 
 
-def styled_chars(line):
+def styled_chars(line: str) -> list[tuple[str, bool]]:
     """Retain faint style so a user-typed placeholder is not mistaken for empty input."""
-    out, faint, position = [], False, 0
+    out: list[tuple[str, bool]] = []
+    faint, position = False, 0
     for match in SGR.finditer(line):
-        out.extend((c, faint) for c in line[position:match.start()])
+        out.extend((c, faint) for c in line[position : match.start()])
         codes = [int(c or 0) for c in match.group(1).split(";")]
         i = 0
         while i < len(codes):
@@ -103,16 +104,20 @@ def empty_composer(screen):
     if not text[start:].startswith(placeholder):
         return False
     end = start + len(placeholder)
-    return (all(dim for _, dim in chars[start:end])
-            and all(c.isspace() or "\u2800" <= c <= "\u28ff" for c in text[end:]))
+    return all(dim for _, dim in chars[start:end]) and all(
+        c.isspace() or "\u2800" <= c <= "\u28ff" for c in text[end:]
+    )
 
 
 def verify_identity(target, info, procs):
     if info["terminal_id"] != target["terminal_id"] or procs["shell_pid"] != target["shell_pid"]:
         raise RuntimeError("Pane terminal or shell changed; handoff cancelled")
     matches = [p for p in procs["foreground_processes"] if p["pid"] == target["agent_pid"]]
-    if (len(matches) != 1 or matches[0].get("argv") != target["agent_argv"]
-            or info.get("agent") != "codex"):
+    if (
+        len(matches) != 1
+        or matches[0].get("argv") != target["agent_argv"]
+        or info.get("agent") != "codex"
+    ):
         raise RuntimeError("Original Codex process changed; handoff cancelled")
     if Path(matches[0].get("cwd", "")).resolve() != Path(target["cwd"]).resolve():
         raise RuntimeError("Original Codex cwd changed")
@@ -136,7 +141,9 @@ def verify_screen(target, info, screen):
 def schedule(db, home, args):
     job = supervisor.get_job(db, args.id)
     if job.get("agent", "codex") != "codex":
-        raise ValueError("Automatic initial exit currently supports Codex; exit Claude manually before release")
+        raise ValueError(
+            "Automatic initial exit currently supports Codex; exit Claude manually before release"
+        )
     if os.environ.get("CODEX_THREAD_ID") != job["session_id"]:
         raise ValueError("Schedule the handoff from the registered Codex conversation")
     if job["status"] not in {"awaiting_release", "paused"}:
@@ -145,22 +152,35 @@ def schedule(db, home, args):
     if complete is not None:
         raise ValueError("Schedule from an active turn, before its final response")
     info, procs, _ = inspect(args.pane)
-    matches = [p for p in procs["foreground_processes"]
-               if Path(p.get("argv0", "")).name == "codex"
-               and Path(p.get("cwd", "")).resolve() == Path(job["cwd"]).resolve()]
+    matches = [
+        p
+        for p in procs["foreground_processes"]
+        if Path(p.get("argv0", "")).name == "codex"
+        and Path(p.get("cwd", "")).resolve() == Path(job["cwd"]).resolve()
+    ]
     if info.get("agent") != "codex" or len(matches) != 1:
         raise ValueError("Pane must contain exactly one Codex foreground process in this worktree")
     if matches[0]["pid"] == procs["shell_pid"]:
         raise ValueError("Codex is the pane root process; exiting could close the pane")
     if info.get("agent_status") == "blocked":
-        raise ValueError("Pane has a pending dialog/question; use manual handoff after resolving it")
+        raise ValueError(
+            "Pane has a pending dialog/question; use manual handoff after resolving it"
+        )
     token = uuid.uuid4().hex
     target = {
-        "job_id": job["id"], "session_id": job["session_id"], "rollout": job["rollout"],
-        "cwd": job["cwd"], "pane_id": args.pane, "terminal_id": info["terminal_id"],
-        "shell_pid": procs["shell_pid"], "agent_pid": matches[0]["pid"],
-        "agent_argv": matches[0]["argv"], "turn_id": turn, "token": token,
-        "marker": f"[babysit-handoff:{token[:16]}]", "timeout": args.timeout,
+        "job_id": job["id"],
+        "session_id": job["session_id"],
+        "rollout": job["rollout"],
+        "cwd": job["cwd"],
+        "pane_id": args.pane,
+        "terminal_id": info["terminal_id"],
+        "shell_pid": procs["shell_pid"],
+        "agent_pid": matches[0]["pid"],
+        "agent_argv": matches[0]["argv"],
+        "turn_id": turn,
+        "token": token,
+        "marker": f"[babysit-handoff:{token[:16]}]",
+        "timeout": args.timeout,
     }
     # Bootstrap before asking the original agent to exit. No repair can launch
     # while this job is in handoff; this also proves the service can start here.
@@ -170,8 +190,12 @@ def schedule(db, home, args):
         current = supervisor.get_job(db, job["id"])
         if current["epoch"] != job["epoch"] or current["status"] != job["status"]:
             raise ValueError("Watch ownership changed while scheduling")
-        current.update(status="handoff", epoch=current["epoch"] + 1,
-                       handoff_token=token, summary="Waiting for final response and verified TUI exit")
+        current.update(
+            status="handoff",
+            epoch=current["epoch"] + 1,
+            handoff_token=token,
+            summary="Waiting for final response and verified TUI exit",
+        )
         target["epoch"] = current["epoch"]
         supervisor.save_job(db, current)
     folder = home / "handoffs"
@@ -179,20 +203,31 @@ def schedule(db, home, args):
         folder.mkdir(exist_ok=True, mode=0o700)
         supervisor.watch.save_state(folder / f"{token}.json", target)
         with (folder / f"{token}.log").open("a") as log:
-            subprocess.Popen([sys.executable, str(SCRIPT), "--home", str(home), token],
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                             start_new_session=True)
+            subprocess.Popen(
+                [sys.executable, str(SCRIPT), "--home", str(home), token],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
     except Exception as exc:
         with db:
             db.execute("BEGIN IMMEDIATE")
             current = supervisor.get_job(db, job["id"])
             if current["status"] == "handoff" and current.get("handoff_token") == token:
-                current.update(status="awaiting_release", epoch=current["epoch"] + 1,
-                               summary=f"Could not start automatic handoff: {exc}")
+                current.update(
+                    status="awaiting_release",
+                    epoch=current["epoch"] + 1,
+                    summary=f"Could not start automatic handoff: {exc}",
+                )
                 supervisor.save_job(db, current)
         raise
-    return {"id": job["id"], "status": "handoff", "final_response_marker": target["marker"],
-            "audit_file": str(folder / f"{token}.audit.json")}
+    return {
+        "id": job["id"],
+        "status": "handoff",
+        "final_response_marker": target["marker"],
+        "audit_file": str(folder / f"{token}.audit.json"),
+    }
 
 
 def perform(target, home, db):
@@ -203,8 +238,11 @@ def perform(target, home, db):
 
     def still_owned():
         job = supervisor.get_job(db, target["job_id"])
-        if (job["status"] != "handoff" or job["epoch"] != target["epoch"]
-                or job.get("handoff_token") != target["token"]):
+        if (
+            job["status"] != "handoff"
+            or job["epoch"] != target["epoch"]
+            or job.get("handoff_token") != target["token"]
+        ):
             raise RuntimeError("Watch paused, stopped, or ownership changed; handoff cancelled")
         return job
 
@@ -228,19 +266,42 @@ def perform(target, home, db):
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for the final response; agent left open")
             time.sleep(1)
-        screen = herdr("agent", "read", target["pane_id"], "--source", "visible", "--lines", "100", "--format", "ansi")
+        screen = herdr(
+            "agent",
+            "read",
+            target["pane_id"],
+            "--source",
+            "visible",
+            "--lines",
+            "100",
+            "--format",
+            "ansi",
+        )
         verify_screen(target, info, screen)
         before = fingerprint(target["rollout"])
         info2, procs2, agent2 = inspect(target["pane_id"])
         verify_identity(target, info2, procs2)
-        screen2 = herdr("agent", "read", target["pane_id"], "--source", "visible", "--lines", "100", "--format", "ansi")
+        screen2 = herdr(
+            "agent",
+            "read",
+            target["pane_id"],
+            "--source",
+            "visible",
+            "--lines",
+            "100",
+            "--format",
+            "ansi",
+        )
         verify_screen(target, info2, screen2)
-        if (info2.get("agent_status") not in {"idle", "done"}
-                or agent.get("state_change_seq") is None
-                or agent2.get("state_change_seq") != agent.get("state_change_seq")
-                or target["marker"] not in SGR.sub("", screen2) or not empty_composer(screen2)
-                or fingerprint(target["rollout"]) != before
-                or latest_turn(target["rollout"], target["session_id"]) != (turn, complete)):
+        if (
+            info2.get("agent_status") not in {"idle", "done"}
+            or agent.get("state_change_seq") is None
+            or agent2.get("state_change_seq") != agent.get("state_change_seq")
+            or target["marker"] not in SGR.sub("", screen2)
+            or not empty_composer(screen2)
+            or fingerprint(target["rollout"]) != before
+            or latest_turn(target["rollout"], target["session_id"]) != (turn, complete)
+        ):
             raise RuntimeError("Session or input changed before exit; handoff cancelled")
         still_owned()
         save("exit_sent", screen_before=screen2)
@@ -251,7 +312,10 @@ def perform(target, home, db):
             still_owned()
             info = result("pane", "get", target["pane_id"])["pane"]
             procs = result("pane", "process-info", "--pane", target["pane_id"])["process_info"]
-            if info["terminal_id"] != target["terminal_id"] or procs["shell_pid"] != target["shell_pid"]:
+            if (
+                info["terminal_id"] != target["terminal_id"]
+                or procs["shell_pid"] != target["shell_pid"]
+            ):
                 raise RuntimeError("Shell or terminal changed after exit; watch was not released")
             foreground = procs["foreground_processes"]
             if foreground and all(p["pid"] == target["shell_pid"] for p in foreground):
@@ -265,8 +329,13 @@ def perform(target, home, db):
         with db:
             db.execute("BEGIN IMMEDIATE")
             job = still_owned()
-            job.update(status="watching", epoch=job["epoch"] + 1, next_poll=0,
-                       dispatch_ready=False, summary="Original TUI exited; watcher owns this session")
+            job.update(
+                status="watching",
+                epoch=job["epoch"] + 1,
+                next_poll=0,
+                dispatch_ready=False,
+                summary="Original TUI exited; watcher owns this session",
+            )
             supervisor.save_job(db, job)
         save("released")
         supervisor.emit({"id": target["job_id"], "status": "watching"})
@@ -276,8 +345,11 @@ def perform(target, home, db):
             db.execute("BEGIN IMMEDIATE")
             job = supervisor.get_job(db, target["job_id"])
             if job["status"] == "handoff" and job.get("handoff_token") == target["token"]:
-                job.update(status="awaiting_release", epoch=job["epoch"] + 1,
-                           summary=f"Automatic handoff stopped: {exc}")
+                job.update(
+                    status="awaiting_release",
+                    epoch=job["epoch"] + 1,
+                    summary=f"Automatic handoff stopped: {exc}",
+                )
                 supervisor.save_job(db, job)
         raise
 

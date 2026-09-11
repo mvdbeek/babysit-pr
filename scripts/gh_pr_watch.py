@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
 
 FAILED_RUN_CONCLUSIONS = {
@@ -61,11 +62,11 @@ def parse_args():
     )
     parser.add_argument("--pr", default="auto", help="auto, PR number, or PR URL")
     parser.add_argument("--repo", help="Optional OWNER/REPO override")
-    parser.add_argument("--ci-repo", help="Watch Actions in OWNER/REPO, or 'head' for the PR source repository")
-    parser.add_argument("--branch", help="Watch a branch without a PR; requires --repo OWNER/REPO")
     parser.add_argument(
-        "--poll-seconds", type=int, default=30, help="Watch poll interval"
+        "--ci-repo", help="Watch Actions in OWNER/REPO, or 'head' for the PR source repository"
     )
+    parser.add_argument("--branch", help="Watch a branch without a PR; requires --repo OWNER/REPO")
+    parser.add_argument("--poll-seconds", type=int, default=30, help="Watch poll interval")
     parser.add_argument(
         "--max-flaky-retries",
         type=int,
@@ -73,12 +74,8 @@ def parse_args():
         help="Max rerun cycles per head SHA before stop recommendation",
     )
     parser.add_argument("--state-file", help="Path to state JSON file")
-    parser.add_argument(
-        "--once", action="store_true", help="Emit one snapshot and exit"
-    )
-    parser.add_argument(
-        "--watch", action="store_true", help="Continuously emit JSONL snapshots"
-    )
+    parser.add_argument("--once", action="store_true", help="Emit one snapshot and exit")
+    parser.add_argument("--watch", action="store_true", help="Continuously emit JSONL snapshots")
     parser.add_argument(
         "--retry-failed-now",
         action="store_true",
@@ -125,11 +122,19 @@ def gh_text(args, repo=None, cwd=None):
     cmd.extend(args)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
-        if args[:2] == ["pr", "checks"] and proc.returncode == 1 and "no checks reported" in proc.stderr.lower():
+        if (
+            args[:2] == ["pr", "checks"]
+            and proc.returncode == 1
+            and "no checks reported" in proc.stderr.lower()
+        ):
             return "[]"
         # `pr checks` returns 1 for failure and 8 for pending checks even
         # when its JSON payload is valid. Those are observations, not errors.
-        checks_status = args[:2] == ["pr", "checks"] and proc.returncode in (1, 8) and proc.stdout.strip().startswith("[")
+        checks_status = (
+            args[:2] == ["pr", "checks"]
+            and proc.returncode in (1, 8)
+            and proc.stdout.strip().startswith("[")
+        )
         if proc.returncode and not checks_status:
             raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
     except FileNotFoundError as err:
@@ -148,9 +153,7 @@ def gh_json(args, repo=None, cwd=None):
     try:
         return json.loads(raw)
     except json.JSONDecodeError as err:
-        raise GhCommandError(
-            f"Failed to parse JSON from gh output for {' '.join(args)}"
-        ) from err
+        raise GhCommandError(f"Failed to parse JSON from gh output for {' '.join(args)}") from err
 
 
 def parse_pr_spec(pr_spec):
@@ -186,11 +189,7 @@ def resolve_pr(pr_spec, repo_override=None, cwd=None):
         raise GhCommandError("Unexpected PR payload from `gh pr view`")
 
     pr_url = str(data.get("url") or "")
-    repo = (
-        repo_override
-        or extract_repo_from_pr_url(pr_url)
-        or extract_repo_from_pr_view(data)
-    )
+    repo = repo_override or extract_repo_from_pr_url(pr_url) or extract_repo_from_pr_view(data)
     if not repo:
         raise GhCommandError("Unable to determine OWNER/REPO for the PR")
 
@@ -247,11 +246,22 @@ def resolve_subject(pr_spec, repo_override=None, branch=None, cwd=None):
     if not sha or data.get("name") != branch:
         raise GhCommandError("Cannot verify the requested remote branch and commit")
     # Keep the normalized subject fields used by worktree and event checks.
-    return {"kind": "branch", "number": None, "repo": repo, "head_repo": repo,
-            "url": f"https://github.com/{repo}/tree/{quote(branch, safe='')}",
-            "head_sha": sha, "head_branch": branch, "base_sha": "",
-            "state": "OPEN", "merged": False, "closed": False,
-            "mergeable": "", "merge_state_status": "", "review_decision": ""}
+    return {
+        "kind": "branch",
+        "number": None,
+        "repo": repo,
+        "head_repo": repo,
+        "url": f"https://github.com/{repo}/tree/{quote(branch, safe='')}",
+        "head_sha": sha,
+        "head_branch": branch,
+        "base_sha": "",
+        "state": "OPEN",
+        "merged": False,
+        "closed": False,
+        "mergeable": "",
+        "merge_state_status": "",
+        "review_decision": "",
+    }
 
 
 def extract_repo_from_pr_url(pr_url):
@@ -286,9 +296,7 @@ def load_state(path):
 def save_state(path, state):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
-    )
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
@@ -363,27 +371,43 @@ def get_workflow_runs_for_sha(repo, head_sha, branch=None):
     endpoint = f"repos/{repo}/actions/runs"
     runs = []
     for page in range(1, 11):
-        args = ["api", endpoint, "-X", "GET", "-f", f"head_sha={head_sha}",
-                "-f", "per_page=100", "-f", f"page={page}"]
+        args = [
+            "api",
+            endpoint,
+            "-X",
+            "GET",
+            "-f",
+            f"head_sha={head_sha}",
+            "-f",
+            "per_page=100",
+            "-f",
+            f"page={page}",
+        ]
         if branch is not None:
             args += ["-f", f"branch={branch}"]
         data = gh_json(args, repo=repo)
         if not isinstance(data, dict) or not isinstance(data.get("workflow_runs"), list):
             raise GhCommandError("Unexpected payload from actions runs API")
         if data.get("total_count", 0) > 1000:
-            raise GhCommandError("Too many workflow runs for this commit; cannot obtain a complete CI snapshot")
+            raise GhCommandError(
+                "Too many workflow runs for this commit; cannot obtain a complete CI snapshot"
+            )
         batch = data["workflow_runs"]
         runs.extend(batch)
         if len(batch) < 100:
             break
     if branch is not None:
-        runs = [run for run in runs if run.get("head_sha") == head_sha and run.get("head_branch") == branch]
+        runs = [
+            run
+            for run in runs
+            if run.get("head_sha") == head_sha and run.get("head_branch") == branch
+        ]
     return runs
 
 
 def latest_workflow_runs(runs):
     """A fresh dispatch supersedes an older run of the same workflow/event."""
-    latest = {}
+    latest: dict[tuple[str | int, str | None], dict[str, Any]] = {}
     for run in runs:
         key = (run.get("workflow_id") or run.get("path") or run["id"], run.get("event"))
         order = (int(run["id"]), int(run.get("run_attempt", 1)))
@@ -407,11 +431,18 @@ def checks_from_workflow_runs(runs):
             bucket = "skipping"
         else:
             bucket = "pending"  # unknown outcome is not evidence of success
-        checks.append({"name": run.get("name") or str(run["id"]), "bucket": bucket,
-                       "state": str(conclusion or run.get("status") or "").upper(),
-                       "link": run.get("html_url"), "workflow": run.get("name"),
-                       "event": run.get("event"), "startedAt": run.get("run_started_at"),
-                       "completedAt": run.get("updated_at") if run.get("status") == "completed" else None})
+        checks.append(
+            {
+                "name": run.get("name") or str(run["id"]),
+                "bucket": bucket,
+                "state": str(conclusion or run.get("status") or "").upper(),
+                "link": run.get("html_url"),
+                "workflow": run.get("name"),
+                "event": run.get("event"),
+                "startedAt": run.get("run_started_at"),
+                "completedAt": run.get("updated_at") if run.get("status") == "completed" else None,
+            }
+        )
     return checks
 
 
@@ -448,8 +479,21 @@ def get_jobs_for_run(repo, run_id):
     endpoint = f"repos/{repo}/actions/runs/{run_id}/jobs"
     jobs, page = [], 1
     while True:
-        data = gh_json(["api", endpoint, "-X", "GET", "-f", "per_page=100",
-                        "-f", f"page={page}", "-f", "filter=latest"], repo=repo)
+        data = gh_json(
+            [
+                "api",
+                endpoint,
+                "-X",
+                "GET",
+                "-f",
+                "per_page=100",
+                "-f",
+                f"page={page}",
+                "-f",
+                "filter=latest",
+            ],
+            repo=repo,
+        )
         if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
             raise GhCommandError("Unexpected payload from actions run jobs API")
         jobs.extend(data["jobs"])
@@ -470,10 +514,7 @@ def failed_jobs_from_workflow_runs(repo, runs, head_sha):
             continue
         run_status = str(run.get("status") or "")
         run_conclusion = str(run.get("conclusion") or "")
-        if (
-            run_status.lower() == "completed"
-            and run_conclusion not in FAILED_RUN_CONCLUSIONS
-        ):
+        if run_status.lower() == "completed" and run_conclusion not in FAILED_RUN_CONCLUSIONS:
             continue
         jobs = get_jobs_for_run(repo, run_id)
         for job in jobs:
@@ -514,9 +555,7 @@ def failed_jobs_from_workflow_runs(repo, runs, head_sha):
 def get_authenticated_login():
     data = gh_json(["api", "user"])
     if not isinstance(data, dict) or not data.get("login"):
-        raise GhCommandError(
-            "Unable to determine authenticated GitHub login from `gh api user`"
-        )
+        raise GhCommandError("Unable to determine authenticated GitHub login from `gh api user`")
     return str(data["login"])
 
 
@@ -607,9 +646,7 @@ def normalize_reviews(items):
                 "id": str(item.get("id") or ""),
                 "author": extract_login(item.get("user")),
                 "author_association": str(item.get("author_association") or ""),
-                "created_at": str(
-                    item.get("submitted_at") or item.get("created_at") or ""
-                ),
+                "created_at": str(item.get("submitted_at") or item.get("created_at") or ""),
                 "body": str(item.get("body") or ""),
                 "path": None,
                 "line": None,
@@ -652,9 +689,7 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
     endpoints = comment_endpoints(repo, pr_number)
 
     issue_payload = gh_api_list_paginated(endpoints["issue_comment"], repo=repo)
-    review_comment_payload = gh_api_list_paginated(
-        endpoints["review_comment"], repo=repo
-    )
+    review_comment_payload = gh_api_list_paginated(endpoints["review_comment"], repo=repo)
     review_payload = gh_api_list_paginated(endpoints["review"], repo=repo)
 
     issue_items = normalize_issue_comments(issue_payload)
@@ -664,9 +699,7 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
         if isinstance(item, dict) and item.get("id") not in (None, "")
     }
     pending_review_ids = {
-        review_id
-        for review_id, review_state in review_states.items()
-        if review_state == "PENDING"
+        review_id for review_id, review_state in review_states.items() if review_state == "PENDING"
     }
     pending_review_comment_ids = {
         str(item.get("id"))
@@ -675,9 +708,7 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
         and item.get("id") not in (None, "")
         and str(item.get("pull_request_review_id") or "") in pending_review_ids
     }
-    review_comment_items = normalize_review_comments(
-        review_comment_payload, review_states
-    )
+    review_comment_items = normalize_review_comments(review_comment_payload, review_states)
     review_items = normalize_reviews(review_payload)
     all_items = issue_items + review_comment_items + review_items
 
@@ -711,7 +742,11 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
         version = hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()
         previous = versions.get(version_key)
         versions[version_key] = version
-        seen = {"issue_comment": seen_issue, "review_comment": seen_review_comment, "review": seen_review}[kind]
+        seen = {
+            "issue_comment": seen_issue,
+            "review_comment": seen_review_comment,
+            "review": seen_review,
+        }[kind]
         if item_id in seen and (previous is None or previous == version):
             continue
 
@@ -812,11 +847,7 @@ def recommend_actions(
             actions.append("stop_exhausted_retries")
         else:
             actions.append("diagnose_ci_failure")
-            if (
-                checks_summary["all_terminal"]
-                and failed_runs
-                and retries_used < max_retries
-            ):
+            if checks_summary["all_terminal"] and failed_runs and retries_used < max_retries:
                 actions.append("retry_failed_checks")
 
     if not actions:
@@ -827,9 +858,7 @@ def recommend_actions(
 def collect_snapshot(args, state=None, persist=True):
     branch = getattr(args, "branch", None)
     pr = resolve_subject(args.pr, repo_override=args.repo, branch=branch)
-    state_path = (
-        Path(args.state_file) if args.state_file else default_state_file_for(pr)
-    )
+    state_path = Path(args.state_file) if args.state_file else default_state_file_for(pr)
     if state is None:
         state, fresh_state = load_state(state_path)
     else:
@@ -844,15 +873,25 @@ def collect_snapshot(args, state=None, persist=True):
         state.update(last_snapshot_at=int(time.time()), last_seen_head_sha=pr["head_sha"])
         if persist:
             save_state(state_path, state)
-        return {"pr": pr, "ci": {"repo": pr["repo"], "source": "pr"},
-                "checks": summarize_checks([]), "check_details": [], "failed_runs": [],
-                "failed_jobs": [], "new_review_items": [], "actions": ["stop_pr_closed"]}, state_path
+        return {
+            "pr": pr,
+            "ci": {"repo": pr["repo"], "source": "pr"},
+            "checks": summarize_checks([]),
+            "check_details": [],
+            "failed_runs": [],
+            "failed_jobs": [],
+            "new_review_items": [],
+            "actions": ["stop_pr_closed"],
+        }, state_path
 
     if branch:
         new_review_items = []
     else:
         new_review_items = fetch_new_review_items(
-            pr, state, fresh_state=fresh_state, authenticated_login=get_authenticated_login(),
+            pr,
+            state,
+            fresh_state=fresh_state,
+            authenticated_login=get_authenticated_login(),
         )
     # Surface review feedback before drilling into CI and mergeability details.
     # That keeps the babysitter responsive to new comments even when other
@@ -862,16 +901,16 @@ def collect_snapshot(args, state=None, persist=True):
     selected_ci_repo = pr["repo"] if branch else resolve_ci_repo(getattr(args, "ci_repo", None), pr)
     ci_repo = selected_ci_repo or pr["repo"]
     if selected_ci_repo:
-        workflow_runs = latest_workflow_runs(get_workflow_runs_for_sha(ci_repo, pr["head_sha"], pr["head_branch"]))
+        workflow_runs = latest_workflow_runs(
+            get_workflow_runs_for_sha(ci_repo, pr["head_sha"], pr["head_branch"])
+        )
         checks = checks_from_workflow_runs(workflow_runs)
     else:
         checks = get_pr_checks(str(pr["number"]), repo=pr["repo"])
         workflow_runs = get_workflow_runs_for_sha(ci_repo, pr["head_sha"])
     checks_summary = summarize_checks(checks)
     failed_runs = failed_runs_from_workflow_runs(workflow_runs, pr["head_sha"])
-    failed_jobs = failed_jobs_from_workflow_runs(
-        ci_repo, workflow_runs, pr["head_sha"]
-    )
+    failed_jobs = failed_jobs_from_workflow_runs(ci_repo, workflow_runs, pr["head_sha"])
 
     retries_used = current_retry_count(state, pr["head_sha"])
     actions = recommend_actions(
@@ -897,8 +936,12 @@ def collect_snapshot(args, state=None, persist=True):
 
     snapshot = {
         "pr": pr,
-        "ci": {"repo": ci_repo, "source": "actions" if selected_ci_repo else "pr",
-               "branch": pr["head_branch"], "head_sha": pr["head_sha"]},
+        "ci": {
+            "repo": ci_repo,
+            "source": "actions" if selected_ci_repo else "pr",
+            "branch": pr["head_branch"],
+            "head_sha": pr["head_sha"],
+        },
         "checks": checks_summary,
         "check_details": checks,
         "failed_runs": failed_runs,
@@ -1024,9 +1067,7 @@ def run_watch(args):
         )
         actions = set(snapshot.get("actions") or [])
         if "stop_pr_closed" in actions or "stop_exhausted_retries" in actions:
-            print_event(
-                "stop", {"actions": snapshot.get("actions"), "pr": snapshot.get("pr")}
-            )
+            print_event("stop", {"actions": snapshot.get("actions"), "pr": snapshot.get("pr")})
             return 0
 
         current_change_key = snapshot_change_key(snapshot)

@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-
 MODULE_PATH = Path(__file__).with_name("gh_pr_watch.py")
 MODULE_SPEC = importlib.util.spec_from_file_location("gh_pr_watch", MODULE_PATH)
 gh_pr_watch = importlib.util.module_from_spec(MODULE_SPEC)

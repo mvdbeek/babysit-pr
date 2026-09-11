@@ -2,8 +2,8 @@
 
 import json
 import os
-from pathlib import Path
 import uuid
+from pathlib import Path
 
 
 def config_home():
@@ -17,7 +17,11 @@ def _within(path, root):
 
 def session_info(session_id, cwd, transcript=None):
     session_id = str(uuid.UUID(session_id))
-    files = [Path(transcript)] if transcript else list((config_home() / "projects").glob(f"*/{session_id}.jsonl"))
+    files = (
+        [Path(transcript)]
+        if transcript
+        else list((config_home() / "projects").glob(f"*/{session_id}.jsonl"))
+    )
     if len(files) != 1:
         raise ValueError("Supply --rollout: could not identify one saved Claude transcript")
     seen = False
@@ -45,8 +49,12 @@ def session_info(session_id, cwd, transcript=None):
                 permission_mode = item["permissionMode"]
     if not seen or not model:
         raise ValueError("Cannot validate the Claude conversation and its model")
-    return {"session_id": session_id, "rollout": str(files[0].resolve()), "model": model,
-            "claude_permission_mode": "plan" if permission_mode == "plan" else "dontAsk"}
+    return {
+        "session_id": session_id,
+        "rollout": str(files[0].resolve()),
+        "model": model,
+        "claude_permission_mode": "plan" if permission_mode == "plan" else "dontAsk",
+    }
 
 
 def safehouse_command():
@@ -54,8 +62,17 @@ def safehouse_command():
 
 
 def command_for(job, schema):
-    cmd = [*job["claude_command"], "--print", "--resume", job["session_id"],
-           "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(schema)]
+    cmd = [
+        *job["claude_command"],
+        "--print",
+        "--resume",
+        job["session_id"],
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        json.dumps(schema),
+    ]
     mode = job.get("claude_permission_mode", "dontAsk")
     if mode == "safehouse":
         if job["claude_command"] != safehouse_command():
@@ -86,7 +103,10 @@ def display_event(event):
             content = block.get("content", "")
             yield content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
     if event.get("type") == "result":
-        yield json.dumps(event.get("structured_output") or event.get("result") or event.get("errors") or {}, ensure_ascii=False)
+        yield json.dumps(
+            event.get("structured_output") or event.get("result") or event.get("errors") or {},
+            ensure_ascii=False,
+        )
 
 
 def stream_output(stream, log, visible):
@@ -123,10 +143,20 @@ def read_result(path, session_id):
         raise RuntimeError("Claude returned no unambiguous result for the original session")
     result = results[0]
     if result.get("is_error") or result.get("subtype") != "success":
-        raise RuntimeError("Claude did not complete successfully: " + str(result.get("errors") or result.get("result") or result.get("subtype")))
+        raise RuntimeError(
+            "Claude did not complete successfully: "
+            + str(result.get("errors") or result.get("result") or result.get("subtype"))
+        )
     if result.get("permission_denials"):
-        return {"status": "blocked", "summary": "Claude encountered permission denials; review existing tool grants before resuming"}
+        return {
+            "status": "blocked",
+            "summary": "Claude encountered permission denials; review existing tool grants before resuming",
+        }
     structured = result.get("structured_output")
-    if not isinstance(structured, dict) or structured.get("status") not in {"waiting", "blocked"} or not isinstance(structured.get("summary"), str):
+    if (
+        not isinstance(structured, dict)
+        or structured.get("status") not in {"waiting", "blocked"}
+        or not isinstance(structured.get("summary"), str)
+    ):
         raise RuntimeError("Claude returned no valid structured continuation outcome")
     return structured

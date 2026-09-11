@@ -9,3 +9,11 @@ __pycache__/
 .env
 .env.*
 /runs/
+node_modules/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+/reports/
+/test-results/
+.tox/

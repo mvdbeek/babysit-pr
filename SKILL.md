@@ -112,6 +112,7 @@ An empty run list means waiting for CI, not success. Details and examples are in
    shared `--home`. The stored terminal identity survives pane moves. A missing,
    replaced, busy, or different-worktree pane blocks launches; never silently
    fall back to a background agent. Use `--headless` only if explicitly requested.
+
 4. **Manual exit is this user's default preference.** Return the watch ID and
    exact `release_argv` command, quoted as shell arguments. The user exits the original CLI
    with Ctrl-D and runs it in the remaining shell. Report `awaiting_release`;
@@ -124,7 +125,7 @@ An empty run list means waiting for CI, not success. Details and examples are in
    subsequent repairs and continuations still exit automatically.
    Identify this session's explicit pane ID using `herdr agent list` and
    `herdr pane process-info --pane
-   PANE`; never assume the currently focused pane is this agent. Match the
+PANE`; never assume the currently focused pane is this agent. Match the
    worktree and conversation; if ambiguous, use the manual fallback below.
 
    ```sh
@@ -192,7 +193,10 @@ broaden Safehouse grants as part of handoff.
    spawn a new supervisor, or keep the harness alive. Return structured JSON:
 
    ```json
-   {"status": "waiting", "summary": "Fixed the failing test, validated it locally, and pushed COMMIT."}
+   {
+     "status": "waiting",
+     "summary": "Fixed the failing test, validated it locally, and pushed COMMIT."
+   }
    ```
 
    Use `blocked` when input, credentials, infrastructure recovery, or clarification

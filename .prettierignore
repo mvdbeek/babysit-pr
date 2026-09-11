@@ -1,0 +1,10 @@
+.venv/
+node_modules/
+reports/
+uv.lock
+.git/
+.coverage*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/

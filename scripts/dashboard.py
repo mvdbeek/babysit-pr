@@ -3,13 +3,13 @@
 
 import argparse
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 import re
 import sqlite3
 import time
-from urllib.parse import parse_qs, urlsplit
 import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
@@ -40,26 +40,41 @@ def present_job(job):
     snapshot = job.get("snapshot") or {}
     pr = snapshot.get("pr") or {}
     ci = snapshot.get("ci") or {}
-    from pr_supervisor import feedback_token, approved_feedback
+    from pr_supervisor import approved_feedback, feedback_token
+
     feedback = job.get("pending_reviews") or []
     return {
-        "feedback": feedback, "feedback_token": feedback_token(feedback),
+        "feedback": feedback,
+        "feedback_token": feedback_token(feedback),
         "feedback_approved": len(approved_feedback(job)),
-        "cleanup_ready": bool(job.get("cleanup_ready") or (job.get("status") == "closed" and (pr.get("closed") or pr.get("merged")))),
+        "cleanup_ready": bool(
+            job.get("cleanup_ready")
+            or (job.get("status") == "closed" and (pr.get("closed") or pr.get("merged")))
+        ),
         "pr_outcome": "merged" if pr.get("merged") else "closed" if pr.get("closed") else None,
-        "id": job["id"], "url": job.get("url"), "repo": job.get("repo"),
+        "id": job["id"],
+        "url": job.get("url"),
+        "repo": job.get("repo"),
         "branch": job.get("branch") or pr.get("head_branch"),
-        "kind": "branch" if job.get("branch") else "pr", "number": pr.get("number"),
+        "kind": "branch" if job.get("branch") else "pr",
+        "number": pr.get("number"),
         "ci_repo": ci.get("repo") or job.get("ci_repo") or job.get("repo"),
-        "sha": pr.get("head_sha"), "status": job.get("status", "unknown"),
-        "summary": job.get("summary", ""), "attempts": job.get("attempts", 0),
-        "max_repairs": job.get("max_repairs", 0), "pending_reviews": len(job.get("pending_reviews") or []),
-        "checks": snapshot.get("checks"), "check_details": snapshot.get("check_details") or [],
+        "sha": pr.get("head_sha"),
+        "status": job.get("status", "unknown"),
+        "summary": job.get("summary", ""),
+        "attempts": job.get("attempts", 0),
+        "max_repairs": job.get("max_repairs", 0),
+        "pending_reviews": len(job.get("pending_reviews") or []),
+        "checks": snapshot.get("checks"),
+        "check_details": snapshot.get("check_details") or [],
         "failed_jobs": snapshot.get("failed_jobs") or [],
-        "updated_at": job.get("updated_at"), "next_poll": job.get("next_poll"),
+        "updated_at": job.get("updated_at"),
+        "next_poll": job.get("next_poll"),
         "last_poll": (job.get("watcher_state") or {}).get("last_snapshot_at"),
-        "started_at": job.get("started_at"), "cwd": job.get("cwd"),
-        "attempt": job.get("attempt"), "poll_errors": job.get("poll_errors", 0),
+        "started_at": job.get("started_at"),
+        "cwd": job.get("cwd"),
+        "attempt": job.get("attempt"),
+        "poll_errors": job.get("poll_errors", 0),
         "pause_after_run": job.get("pause_after_run", False),
         "stop_after_run": job.get("stop_after_run", False),
     }
@@ -67,16 +82,31 @@ def present_job(job):
 
 def status(home):
     now = time.time()
-    result = {"time": now, "home": str(home), "jobs": [], "error": None,
-              "daemon": {"health": "unknown", "heartbeat_age": None, "max_workers": None}}
+    result = {
+        "time": now,
+        "home": str(home),
+        "jobs": [],
+        "error": None,
+        "daemon": {"health": "unknown", "heartbeat_age": None, "max_workers": None},
+    }
     try:
-        result["jobs"] = sorted((present_job(job) for job in read_jobs(home)),
-                                key=lambda job: job.get("updated_at") or 0, reverse=True)
+        result["jobs"] = sorted(
+            (present_job(job) for job in read_jobs(home)),
+            key=lambda job: job.get("updated_at") or 0,
+            reverse=True,
+        )
         heartbeat = read_json(home / "heartbeat.json") or {}
         daemon = read_json(home / "daemon.json") or {}
         age = max(0, now - heartbeat["time"]) if heartbeat.get("time") else None
-        result["daemon"] = {"health": "healthy" if age is not None and age < 15 else "stale" if age is not None else "offline",
-                            "heartbeat_age": age, "max_workers": daemon.get("max_workers")}
+        result["daemon"] = {
+            "health": "healthy"
+            if age is not None and age < 15
+            else "stale"
+            if age is not None
+            else "offline",
+            "heartbeat_age": age,
+            "max_workers": daemon.get("max_workers"),
+        }
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
         result["error"] = f"Cannot read watcher state: {exc}"
     return result
@@ -84,6 +114,7 @@ def status(home):
 
 def cancel_watch(home, job_id):
     from pr_supervisor import stop_watch
+
     # Cancellation must not create a new queue when the configured home is wrong.
     db = sqlite3.connect((home / "queue.sqlite").as_uri() + "?mode=rw", uri=True, timeout=2)
     try:
@@ -94,6 +125,7 @@ def cancel_watch(home, job_id):
 
 def handle_feedback(home, job_id, token):
     from pr_supervisor import approve_feedback
+
     db = sqlite3.connect((home / "queue.sqlite").as_uri() + "?mode=rw", uri=True, timeout=2)
     try:
         return present_job(approve_feedback(db, job_id, token))
@@ -131,13 +163,17 @@ def tail_log(home, kind, job_id=None):
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, home, port, allowed_hosts=()):
+    def __init__(
+        self, home: Path, port: int, allowed_hosts: tuple[str, ...] | list[str] = ()
+    ) -> None:
         self.home = home
         self.allowed_hosts = set(allowed_hosts)
         super().__init__(("127.0.0.1", port), Handler)
 
 
 class Handler(BaseHTTPRequestHandler):
+    server: DashboardServer
+
     def log_message(self, *args):
         pass
 
@@ -147,7 +183,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        )
         self.end_headers()
         self.wfile.write(body)
 
@@ -157,14 +196,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.close_connection = True
         host = self.headers.get("Host")
-        allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"} | self.server.allowed_hosts
+        allowed = {
+            f"127.0.0.1:{self.server.server_port}",
+            f"localhost:{self.server.server_port}",
+        } | self.server.allowed_hosts
         origin = self.headers.get("Origin")
         action = self.headers.get("X-Babysit-Action")
         # A custom header requires a browser preflight; no cross-origin requests
         # are allowed. Check Origin too, including for trusted tailnet proxies.
-        if (host not in allowed or action not in {"cancel", "feedback"}
-                or self.headers.get("Sec-Fetch-Site") == "cross-site"
-                or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})):
+        if (
+            host not in allowed
+            or action not in {"cancel", "feedback"}
+            or self.headers.get("Sec-Fetch-Site") == "cross-site"
+            or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
+        ):
             self.send_json(403, {"error": "This action requires the configured dashboard"})
             return
         if self.path != f"/api/{action}":
@@ -176,7 +221,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a small JSON action request")
             self.connection.settimeout(5)
             request = json.loads(self.rfile.read(length))
-            if not isinstance(request, dict) or not isinstance(request.get("id"), str) or not request["id"]:
+            if (
+                not isinstance(request, dict)
+                or not isinstance(request.get("id"), str)
+                or not request["id"]
+            ):
                 raise ValueError("Supply a watch ID")
             if action == "feedback":
                 job = handle_feedback(self.server.home, request["id"], request.get("token"))
@@ -190,11 +239,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         port = self.server.server_port
-        if self.headers.get("Host") not in {f"127.0.0.1:{port}", f"localhost:{port}"} | self.server.allowed_hosts:
+        if (
+            self.headers.get("Host")
+            not in {f"127.0.0.1:{port}", f"localhost:{port}"} | self.server.allowed_hosts
+        ):
             self.send_json(403, {"error": "Use a configured dashboard URL"})
             return
-        if (self.headers.get("Sec-Fetch-Site") == "cross-site"
-                and self.headers.get("Sec-Fetch-Mode") != "navigate"):
+        if (
+            self.headers.get("Sec-Fetch-Site") == "cross-site"
+            and self.headers.get("Sec-Fetch-Mode") != "navigate"
+        ):
             self.send_json(403, {"error": "Cross-site access is disabled"})
             return
         route = urlsplit(self.path)
@@ -203,10 +257,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, status(self.server.home))
             elif route.path == "/api/log":
                 query = parse_qs(route.query)
-                self.send_json(200, tail_log(self.server.home, query.get("kind", ["agent"])[0], query.get("job", [None])[0]))
+                self.send_json(
+                    200,
+                    tail_log(
+                        self.server.home,
+                        query.get("kind", ["agent"])[0],
+                        query.get("job", [None])[0],
+                    ),
+                )
             else:
-                files = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
-                         "/style.css": ("style.css", "text/css")}
+                files = {
+                    "/": ("index.html", "text/html"),
+                    "/app.js": ("app.js", "text/javascript"),
+                    "/style.css": ("style.css", "text/css"),
+                }
                 if route.path not in files:
                     self.send_json(404, {"error": "Not found"})
                     return
@@ -221,7 +285,10 @@ class Handler(BaseHTTPRequestHandler):
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
     with DashboardServer(home, port, allowed_hosts) as server:
         url = f"http://127.0.0.1:{server.server_port}"
-        print(f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.", flush=True)
+        print(
+            f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",
+            flush=True,
+        )
         if open_browser:
             webbrowser.open(url)
         try:
@@ -235,6 +302,11 @@ if __name__ == "__main__":
     parser.add_argument("--home", type=Path, default=Path.home() / ".local/state/babysit-pr")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--open", action="store_true")
-    parser.add_argument("--allow-host", action="append", default=[], help="Exact Host header accepted through a trusted local proxy")
+    parser.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        help="Exact Host header accepted through a trusted local proxy",
+    )
     args = parser.parse_args()
     serve(args.home.expanduser().resolve(), args.port, args.open, args.allow_host)

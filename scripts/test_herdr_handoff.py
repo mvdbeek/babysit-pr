@@ -4,26 +4,27 @@ import argparse
 import copy
 import json
 
-import pytest
-
 import herdr_handoff as handoff
 import pr_supervisor as supervisor
-
+import pytest
 
 EMPTY = "› \x1b[2mAsk Codex to do anything\x1b[0m"
 
 
-@pytest.mark.parametrize("screen,expected", [
-    (EMPTY, True),
-    (EMPTY + "  ⠁⣀", True),
-    ("› Ask Codex to do anything", False),
-    ("› \x1b[38;2;2;2;2mAsk Codex to do anything", False),
-    ("› \x1b[48;2;30;30;30m\x1b[2mAsk Codex to do anything", True),
-    (EMPTY + " draft", False),
-    (EMPTY + "\n› please keep working", False),
-    ("› please keep working", False),
-    ("another UI", False),
-])
+@pytest.mark.parametrize(
+    "screen,expected",
+    [
+        (EMPTY, True),
+        (EMPTY + "  ⠁⣀", True),
+        ("› Ask Codex to do anything", False),
+        ("› \x1b[38;2;2;2;2mAsk Codex to do anything", False),
+        ("› \x1b[48;2;30;30;30m\x1b[2mAsk Codex to do anything", True),
+        (EMPTY + " draft", False),
+        (EMPTY + "\n› please keep working", False),
+        ("› please keep working", False),
+        ("another UI", False),
+    ],
+)
 def test_empty_composer(screen, expected):
     assert handoff.empty_composer(screen) is expected
 
@@ -33,20 +34,47 @@ def rig(tmp_path, monkeypatch):
     db = supervisor.open_db(tmp_path)
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_text("stable")
-    target = dict(job_id="watch", session_id="session", rollout=str(rollout),
-                  cwd=str(tmp_path), pane_id="w1:p1", terminal_id="terminal",
-                  shell_pid=100, agent_pid=200, agent_argv=["codex"],
-                  turn_id="turn", token="a" * 32, marker="[receipt]", timeout=2, epoch=2)
+    target = dict(
+        job_id="watch",
+        session_id="session",
+        rollout=str(rollout),
+        cwd=str(tmp_path),
+        pane_id="w1:p1",
+        terminal_id="terminal",
+        shell_pid=100,
+        agent_pid=200,
+        agent_argv=["codex"],
+        turn_id="turn",
+        token="a" * 32,
+        marker="[receipt]",
+        timeout=2,
+        epoch=2,
+    )
     with db:
-        supervisor.save_job(db, dict(id="watch", status="handoff", epoch=2,
-                                    handoff_token=target["token"]))
-    info = dict(terminal_id="terminal", agent="codex", agent_status="idle",
-                scroll=dict(offset_from_bottom=0))
-    procs = dict(shell_pid=100, foreground_processes=[dict(
-        pid=200, argv0="codex", argv=["codex"], cwd=str(tmp_path))])
-    state = dict(screen="[receipt]\n" + EMPTY, info=info, procs=procs,
-                 turn=("turn", "[receipt]"), sent=[], exited=False,
-                 confirm=True, clock=0, reads=0)
+        supervisor.save_job(
+            db, dict(id="watch", status="handoff", epoch=2, handoff_token=target["token"])
+        )
+    info = dict(
+        terminal_id="terminal",
+        agent="codex",
+        agent_status="idle",
+        scroll=dict(offset_from_bottom=0),
+    )
+    procs = dict(
+        shell_pid=100,
+        foreground_processes=[dict(pid=200, argv0="codex", argv=["codex"], cwd=str(tmp_path))],
+    )
+    state = dict(
+        screen="[receipt]\n" + EMPTY,
+        info=info,
+        procs=procs,
+        turn=("turn", "[receipt]"),
+        sent=[],
+        exited=False,
+        confirm=True,
+        clock=0,
+        reads=0,
+    )
 
     def inspect(_):
         return copy.deepcopy(state["info"]), copy.deepcopy(state["procs"]), {"state_change_seq": 5}
@@ -95,10 +123,15 @@ def test_success_exits_once_then_releases(rig):
     handoff.perform(target, home, db)
     assert len(state["sent"]) == 1
     assert supervisor.get_job(db, "watch")["status"] == "watching"
-    assert json.loads((home / "handoffs" / (target["token"] + ".audit.json")).read_text())["stage"] == "released"
+    assert (
+        json.loads((home / "handoffs" / (target["token"] + ".audit.json")).read_text())["stage"]
+        == "released"
+    )
 
 
-@pytest.mark.parametrize("reason", ["draft", "question", "new_turn", "process", "terminal", "queued", "race", "scroll"])
+@pytest.mark.parametrize(
+    "reason", ["draft", "question", "new_turn", "process", "terminal", "queued", "race", "scroll"]
+)
 def test_changes_cancel_without_keys(rig, reason):
     target, home, db, state = rig
     if reason == "draft":
@@ -145,8 +178,17 @@ def test_pause_cancels_wait_and_preserves_status(rig):
 def test_schedule_failure_leaves_watch_inactive(rig, monkeypatch, failure):
     target, home, db, state = rig
     with db:
-        supervisor.save_job(db, dict(id="watch", status="awaiting_release", epoch=1,
-                                    session_id="session", rollout=target["rollout"], cwd=target["cwd"]))
+        supervisor.save_job(
+            db,
+            dict(
+                id="watch",
+                status="awaiting_release",
+                epoch=1,
+                session_id="session",
+                rollout=target["rollout"],
+                cwd=target["cwd"],
+            ),
+        )
     state["turn"] = ("turn", None)
     monkeypatch.setenv("CODEX_THREAD_ID", "wrong" if failure == "wrong_session" else "session")
     monkeypatch.setattr(supervisor, "start_daemon", lambda *a: None)
@@ -158,20 +200,30 @@ def test_schedule_failure_leaves_watch_inactive(rig, monkeypatch, failure):
 
     monkeypatch.setattr(handoff.subprocess, "Popen", fail_spawn)
     with pytest.raises((ValueError, OSError)):
-        handoff.schedule(db, home, argparse.Namespace(id="watch", pane="w1:p1", timeout=2, max_workers=2))
+        handoff.schedule(
+            db, home, argparse.Namespace(id="watch", pane="w1:p1", timeout=2, max_workers=2)
+        )
     assert supervisor.get_job(db, "watch")["status"] == "awaiting_release"
     assert not state["sent"]
 
 
 def test_rollout_requires_exact_turn_and_session(tmp_path):
     path = tmp_path / "rollout.jsonl"
-    items = [dict(type="session_meta", payload=dict(id="session")),
-             dict(type="event_msg", payload=dict(type="task_started", turn_id="one")),
-             dict(type="event_msg", payload=dict(type="task_complete", turn_id="one", last_agent_message="done"))]
+    items = [
+        dict(type="session_meta", payload=dict(id="session")),
+        dict(type="event_msg", payload=dict(type="task_started", turn_id="one")),
+        dict(
+            type="event_msg",
+            payload=dict(type="task_complete", turn_id="one", last_agent_message="done"),
+        ),
+    ]
     path.write_text("\n".join(json.dumps(item) for item in items))
     assert handoff.latest_turn(path, "session") == ("one", "done")
     with pytest.raises(RuntimeError):
         handoff.latest_turn(path, "other")
     with path.open("a") as stream:
-        stream.write("\n" + json.dumps(dict(type="event_msg", payload=dict(type="task_started", turn_id="two"))))
+        stream.write(
+            "\n"
+            + json.dumps(dict(type="event_msg", payload=dict(type="task_started", turn_id="two")))
+        )
     assert handoff.latest_turn(path, "session") == ("two", None)

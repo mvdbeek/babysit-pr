@@ -1,0 +1,62 @@
+[project]
+name = "babysit-pr"
+version = "0.1.0"
+description = "Shared PR watcher and dashboard for bounded agent repairs"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["scripts", "tests"]
+pythonpath = ["scripts"]
+addopts = "-ra --strict-markers --strict-config"
+markers = ["browser: real Chromium tests against an isolated local dashboard"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.mypy]
+files = ["scripts"]
+exclude = ["scripts/test_.*\\.py$", "scripts/conftest.py"]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+[tool.coverage.run]
+branch = true
+source = ["scripts"]
+omit = ["*/test_*.py", "*/conftest.py"]
+patch = ["subprocess"]
+sigterm = true
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+skip_covered = true
+
+[tool.coverage.html]
+directory = "reports/coverage"
+
+[tool.coverage.xml]
+output = "reports/coverage.xml"
+
+[dependency-groups]
+dev = [
+    "mypy==2.3.1",
+    "playwright==1.62.0",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "pytest-playwright==0.9.0",
+    "pyyaml==6.0.3",
+    "ruff==0.16.7",
+    "tox==4.61.4",
+    "tox-uv==1.36.0",
+    "types-pyyaml==6.0.12.20260906",
+]

@@ -2,16 +2,25 @@
 
 import argparse
 
-import pytest
-
 import gh_pr_watch as watch
 import pr_supervisor as supervisor
+import pytest
 
 
 def run(run_id=1, **overrides):
-    return {"id": run_id, "workflow_id": 10, "head_sha": "abc", "head_branch": "feature/fix",
-            "name": "CI", "event": "push", "status": "completed", "conclusion": "failure",
-            "run_attempt": 1, "html_url": f"https://github.com/me/fork/actions/runs/{run_id}", **overrides}
+    return {
+        "id": run_id,
+        "workflow_id": 10,
+        "head_sha": "abc",
+        "head_branch": "feature/fix",
+        "name": "CI",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "failure",
+        "run_attempt": 1,
+        "html_url": f"https://github.com/me/fork/actions/runs/{run_id}",
+        **overrides,
+    }
 
 
 @pytest.fixture
@@ -22,10 +31,18 @@ def api(monkeypatch):
         state["calls"].append((args, repo))
         if args[:2] == ["pr", "view"]:
             assert repo == "upstream/project"
-            return {"number": 2, "url": "https://github.com/upstream/project/pull/2", "state": "OPEN",
-                    "headRefOid": state["sha"], "headRefName": "feature/fix", "baseRefOid": "base",
-                    "headRepository": {"name": "fork"}, "headRepositoryOwner": {"login": "me"},
-                    "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"}
+            return {
+                "number": 2,
+                "url": "https://github.com/upstream/project/pull/2",
+                "state": "OPEN",
+                "headRefOid": state["sha"],
+                "headRefName": "feature/fix",
+                "baseRefOid": "base",
+                "headRepository": {"name": "fork"},
+                "headRepositoryOwner": {"login": "me"},
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
         assert args[0] == "api", args
         endpoint = args[1]
         if endpoint == "repos/me/fork/branches/feature%2Ffix":
@@ -34,7 +51,11 @@ def api(monkeypatch):
             assert "branch=feature/fix" in args and f"head_sha={state['sha']}" in args
             return {"workflow_runs": state["runs"], "total_count": len(state["runs"])}
         if endpoint.startswith("repos/me/fork/actions/runs/") and endpoint.endswith("/jobs"):
-            return {"jobs": [{"id": 50, "name": "tests", "conclusion": "failure", "status": "completed"}]}
+            return {
+                "jobs": [
+                    {"id": 50, "name": "tests", "conclusion": "failure", "status": "completed"}
+                ]
+            }
         raise AssertionError(f"Unexpected GitHub request: {args} repo={repo}")
 
     monkeypatch.setattr(watch, "gh_json", fake)
@@ -42,8 +63,14 @@ def api(monkeypatch):
 
 
 def args(branch=None):
-    return argparse.Namespace(pr="auto" if branch else "2", repo="me/fork" if branch else "upstream/project",
-                              ci_repo=None if branch else "head", branch=branch, state_file=None, max_flaky_retries=3)
+    return argparse.Namespace(
+        pr="auto" if branch else "2",
+        repo="me/fork" if branch else "upstream/project",
+        ci_repo=None if branch else "head",
+        branch=branch,
+        state_file=None,
+        max_flaky_retries=3,
+    )
 
 
 def test_fork_ci_uses_upstream_reviews_and_fork_logs(api, monkeypatch):
@@ -71,9 +98,16 @@ def test_branch_without_pr_only_calls_branch_and_actions(api):
     packet, _ = watch.collect_snapshot(args("feature/fix"), state={}, persist=False)
     assert packet["pr"]["kind"] == "branch"
     assert packet["new_review_items"] == []
-    assert packet["ci"] == {"repo": "me/fork", "source": "actions", "branch": "feature/fix", "head_sha": "abc"}
+    assert packet["ci"] == {
+        "repo": "me/fork",
+        "source": "actions",
+        "branch": "feature/fix",
+        "head_sha": "abc",
+    }
     assert packet["failed_jobs"]
-    assert all(call[0][0] == "api" and call[0][1].startswith("repos/me/fork/") for call in api["calls"])
+    assert all(
+        call[0][0] == "api" and call[0][1].startswith("repos/me/fork/") for call in api["calls"]
+    )
 
 
 def test_fork_success_never_claims_pr_merge_readiness(api, monkeypatch):
@@ -86,8 +120,13 @@ def test_fork_success_never_claims_pr_merge_readiness(api, monkeypatch):
 
 
 def test_filters_other_branches_old_shas_and_superseded_dispatches(api):
-    api["runs"] = [run(), run(2, conclusion="success"), run(3, head_branch="other"),
-                   run(4, head_sha="old"), run(5, event="workflow_dispatch", conclusion="success")]
+    api["runs"] = [
+        run(),
+        run(2, conclusion="success"),
+        run(3, head_branch="other"),
+        run(4, head_sha="old"),
+        run(5, event="workflow_dispatch", conclusion="success"),
+    ]
     packet, _ = watch.collect_snapshot(args("feature/fix"), state={}, persist=False)
     assert packet["checks"]["passed_count"] == 2
     assert packet["failed_runs"] == packet["failed_jobs"] == []
@@ -95,8 +134,16 @@ def test_filters_other_branches_old_shas_and_superseded_dispatches(api):
     assert "ready_to_merge" not in packet["actions"]
 
 
-@pytest.mark.parametrize("runs", [[], [run(conclusion="skipped")], [run(conclusion="neutral")],
-                                  [run(status="queued", conclusion=None)], [run(conclusion="unknown")]])
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [],
+        [run(conclusion="skipped")],
+        [run(conclusion="neutral")],
+        [run(status="queued", conclusion=None)],
+        [run(conclusion="unknown")],
+    ],
+)
 def test_empty_skipped_and_unfinished_runs_never_report_green(api, runs):
     api["runs"] = runs
     packet, _ = watch.collect_snapshot(args("feature/fix"), state={}, persist=False)

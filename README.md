@@ -1,0 +1,49 @@
+# PR babysitter
+
+A shared watcher that waits for GitHub CI and PR activity without keeping coding agents alive. Bounded Codex and Claude repairs resume the original conversation in its original herdr pane. The local dashboard shows watches, CI, feedback awaiting approval, repair logs, and cleanup readiness.
+
+The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
+
+## Development
+
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, and zsh. Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.
+
+Run every local check through tox:
+
+```sh
+uv run --locked tox
+```
+
+Tox uses `tox-uv` to create isolated Python environments from `uv.lock`. It also
+runs `npm ci` from `package-lock.json` and installs the pinned Chromium build.
+No separate manual dependency installation is needed beyond uv, Node/npm, Git,
+and zsh. The first run requires downloads; subsequent runs reuse tool caches.
+
+The default environments are `lint`, `format`, `types`, `skill`, `frontend`,
+`unit`, `browser`, and `coverage`. The coverage report depends on both test
+environments. To run independent environments concurrently:
+
+```sh
+uv run --locked tox run-parallel
+```
+
+Tox runs Ruff lint/format checks, mypy across the Python runtime and development
+scripts, ESLint, Prettier, zsh syntax checking, the repository-local skill
+validator, the Node interaction test, and pytest including real Chromium tests.
+Mypy checks unannotated function bodies; this is gradual typing, not strict typing
+of every JSON payload. No automated CI workflow is configured.
+
+Apply formatting and safe lint fixes through the separate opt-in environment:
+
+```sh
+uv run --locked tox -e fix
+```
+
+For a targeted rerun, select a tox environment, for example
+`uv run --locked tox -e types` or `uv run --locked tox -e browser`.
+
+Browser tests use a real Chromium process and a real HTTP server backed by a temporary SQLite queue. They cover comment text rendering, explicit feedback approval, stale approval rejection, cancellation/history, cleanup indicators, and mobile layout. They never start the production watcher or a coding agent. Other integration tests use fake GitHub/agent executables and temporary worktrees, and exercise timeouts, process ownership, and restart recovery.
+
+Coverage includes Python branches and instrumented child Python processes. The `coverage` tox environment writes a terminal summary, HTML at `reports/coverage/index.html`, and XML at `reports/coverage.xml`. The combined Python line/branch coverage gate is 75%. Reports and browser failure artifacts are ignored by Git. JavaScript behavior is exercised by browser and Node tests; the coverage percentage measures Python only.
+
+The Safehouse launcher matches this user's installed configuration. Tests check its command construction, but do not require Safehouse or claim to test macOS sandbox enforcement on every machine.

@@ -1,11 +1,9 @@
-import copy
 import json
 import time
 
-import pytest
-
 import pr_supervisor as supervisor
-from test_pr_supervisor import harness, job, release_fixture, snapshot, start_service, wait_until
+import pytest
+from test_pr_supervisor import job, release_fixture, snapshot, start_service, wait_until
 
 
 def green_job():
@@ -31,16 +29,25 @@ def test_green_is_opt_in_and_consumed_once_even_after_new_commits():
     assert not supervisor.actionable(j)
 
 
-@pytest.mark.parametrize("condition", ["empty", "pending", "failed", "closed", "conflict", "review", "failed_job"])
+@pytest.mark.parametrize(
+    "condition", ["empty", "pending", "failed", "closed", "conflict", "review", "failed_job"]
+)
 def test_continuation_waits_for_success_without_other_work(condition):
     j = green_job()
-    if condition == "empty": j["snapshot"]["checks"]["passed_count"] = 0
-    if condition == "pending": j["snapshot"]["checks"].update(pending_count=1, all_terminal=False)
-    if condition == "failed": j["snapshot"]["checks"]["failed_count"] = 1
-    if condition == "closed": j["snapshot"]["pr"]["closed"] = True
-    if condition == "conflict": j["snapshot"]["pr"]["mergeable"] = "CONFLICTING"
-    if condition == "review": j["pending_reviews"] = [{"kind": "review", "id": "1"}]
-    if condition == "failed_job": j["snapshot"]["failed_jobs"] = [{"job_id": 1}]
+    if condition == "empty":
+        j["snapshot"]["checks"]["passed_count"] = 0
+    if condition == "pending":
+        j["snapshot"]["checks"].update(pending_count=1, all_terminal=False)
+    if condition == "failed":
+        j["snapshot"]["checks"]["failed_count"] = 1
+    if condition == "closed":
+        j["snapshot"]["pr"]["closed"] = True
+    if condition == "conflict":
+        j["snapshot"]["pr"]["mergeable"] = "CONFLICTING"
+    if condition == "review":
+        j["pending_reviews"] = [{"kind": "review", "id": "1"}]
+    if condition == "failed_job":
+        j["snapshot"]["failed_jobs"] = [{"job_id": 1}]
     assert not supervisor.green_ready(j)
     assert not any(key.startswith("green:") for key in supervisor.wake_keys(j))
 
@@ -58,7 +65,8 @@ def test_configure_preserves_paused_ownership(tmp_path):
     db = supervisor.open_db(tmp_path)
     j = green_job()
     j.update(status="paused", epoch=4)
-    with db: supervisor.save_job(db, j)
+    with db:
+        supervisor.save_job(db, j)
     configured = supervisor.configure_on_green(db, j["id"], "Finish the authorized task")
     assert configured["status"] == "paused"
     assert configured["epoch"] == 5
@@ -71,7 +79,9 @@ def test_green_resumes_once_and_survives_service_restart(harness):
     state = json.loads(h["state"].read_text())
     state["failed"] = False
     h["state"].write_text(json.dumps(state))
-    supervisor.configure_on_green(h["db"], h["job"]["id"], "Open the already authorized draft PR; avoid duplicates")
+    supervisor.configure_on_green(
+        h["db"], h["job"]["id"], "Open the already authorized draft PR; avoid duplicates"
+    )
     release_fixture(h)
     proc = start_service(h)
     try:

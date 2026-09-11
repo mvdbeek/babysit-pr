@@ -1,15 +1,84 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Babysitter</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
-<body>
-<header><div class="brand"><span class="mark" aria-hidden="true">b.</span><div><h1>Babysitter</h1><p>CI keeps moving. Agents work when needed.</p></div></div><div class="connection"><span id="health" class="badge">Connecting</span><small id="updated">Reading watcher state…</small></div></header>
-<main>
-<div id="alert" class="alert" role="status" hidden></div>
-<section class="metrics" aria-label="Overview"><div><span>Watching</span><strong id="watching">—</strong></div><div><span>Repairs running</span><strong id="running">—</strong></div><button id="show-attention" type="button" aria-label="Show watches needing attention"><span>Needs attention</span><strong id="attention">—</strong></button><div><span>Repairs used</span><strong id="repairs">—</strong></div><button id="show-ended" type="button" aria-label="Show ended watches"><span>Ended watches</span><strong id="ended">—</strong></button></section>
-<div class="toolbar"><h2>Your watches <span id="count" class="count">0</span></h2><div class="filters"><input id="search" type="search" placeholder="Find a repo or branch…" aria-label="Search watches"><select id="filter" aria-label="Filter watches"><option value="active">Active</option><option value="attention">Needs attention</option><option value="all">All watches</option><option value="ended">Ended</option></select><button id="refresh">Refresh</button></div></div>
-<div class="workspace"><section class="watch-list" aria-label="Watches"><div id="list"></div><div id="empty" class="empty" hidden><span class="empty-icon" aria-hidden="true">⌁</span><h3 id="empty-title">Nothing to watch yet</h3><p id="empty-text">Ask an agent to babysit a PR or your fork’s branch CI. Registered watches will appear here.</p></div></section>
-<aside id="detail" aria-label="Watch details"><div class="detail-placeholder"><span aria-hidden="true">↖</span><h3>A closer look</h3><p>Select a watch to see its checks, repair budget, and latest logs.</p></div></aside></div>
-<section class="service-log"><details id="service-details"><summary>Watcher service log</summary><pre id="service-log">Open to load the latest log.</pre></details></section>
-<footer><span>Local dashboard · refreshes every 5 seconds</span><span id="state-home"></span></footer>
-</main>
-</body></html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Babysitter</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="mark" aria-hidden="true">b.</span>
+        <div>
+          <h1>Babysitter</h1>
+          <p>CI keeps moving. Agents work when needed.</p>
+        </div>
+      </div>
+      <div class="connection">
+        <span id="health" class="badge">Connecting</span
+        ><small id="updated">Reading watcher state…</small>
+      </div>
+    </header>
+    <main>
+      <div id="alert" class="alert" role="status" hidden></div>
+      <section class="metrics" aria-label="Overview">
+        <div><span>Watching</span><strong id="watching">—</strong></div>
+        <div><span>Repairs running</span><strong id="running">—</strong></div>
+        <button id="show-attention" type="button" aria-label="Show watches needing attention">
+          <span>Needs attention</span><strong id="attention">—</strong>
+        </button>
+        <div><span>Repairs used</span><strong id="repairs">—</strong></div>
+        <button id="show-ended" type="button" aria-label="Show ended watches">
+          <span>Ended watches</span><strong id="ended">—</strong>
+        </button>
+      </section>
+      <div class="toolbar">
+        <h2>Your watches <span id="count" class="count">0</span></h2>
+        <div class="filters">
+          <input
+            id="search"
+            type="search"
+            placeholder="Find a repo or branch…"
+            aria-label="Search watches"
+          /><select id="filter" aria-label="Filter watches">
+            <option value="active">Active</option>
+            <option value="attention">Needs attention</option>
+            <option value="all">All watches</option>
+            <option value="ended">Ended</option></select
+          ><button id="refresh">Refresh</button>
+        </div>
+      </div>
+      <div class="workspace">
+        <section class="watch-list" aria-label="Watches">
+          <div id="list"></div>
+          <div id="empty" class="empty" hidden>
+            <span class="empty-icon" aria-hidden="true">⌁</span>
+            <h3 id="empty-title">Nothing to watch yet</h3>
+            <p id="empty-text">
+              Ask an agent to babysit a PR or your fork’s branch CI. Registered watches will appear
+              here.
+            </p>
+          </div>
+        </section>
+        <aside id="detail" aria-label="Watch details">
+          <div class="detail-placeholder">
+            <span aria-hidden="true">↖</span>
+            <h3>A closer look</h3>
+            <p>Select a watch to see its checks, repair budget, and latest logs.</p>
+          </div>
+        </aside>
+      </div>
+      <section class="service-log">
+        <details id="service-details">
+          <summary>Watcher service log</summary>
+          <pre id="service-log">Open to load the latest log.</pre>
+        </details>
+      </section>
+      <footer>
+        <span>Local dashboard · refreshes every 5 seconds</span><span id="state-home"></span>
+      </footer>
+    </main>
+  </body>
+</html>
