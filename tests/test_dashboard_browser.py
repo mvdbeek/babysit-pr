@@ -176,9 +176,12 @@ def test_mobile_cleanup_attention_and_offline_state(page: Page, dashboard_site) 
 def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboard_site) -> None:
     url, home = dashboard_site
     page.goto(url)
+    page.get_by_role("tab", name="Pull requests", exact=True).click()
     rows = page.locator("#pr-list tr")
     expect(rows).to_have_count(2)
-    expect(rows.first).to_contain_text("test/alpha #8")
+    expect(page.get_by_role("columnheader", name="Repository", exact=True)).to_be_visible()
+    expect(rows.first.locator("td").nth(0)).to_have_text("test/alpha")
+    expect(rows.first.locator("td").nth(1)).to_contain_text("#8")
     expect(rows.first.locator("img")).to_have_count(0)
     assert page.evaluate("window.injected === undefined")
     expect(rows.first.locator("time")).to_have_attribute("datetime", "2026-09-11T10:00:00Z")
@@ -219,6 +222,7 @@ def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site
         ),
     )
     page.goto(url)
+    page.get_by_role("tab", name="Pull requests", exact=True).click()
     expect(page.locator("#pr-alert")).to_contain_text("GitHub authentication failed")
     expect(page.locator("#pr-empty")).to_contain_text("PR data is unavailable")
     page.unroute("**/api/prs")
@@ -235,3 +239,34 @@ def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site
     page.get_by_role("button", name="Refresh", exact=True).click()
     expect(page.locator("#pr-empty")).to_have_text("No open pull requests for your roles.")
     expect(page.locator("#pr-alert")).to_be_hidden()
+
+
+def test_dashboard_tabs_default_to_watcher_and_support_navigation(
+    page: Page, dashboard_site
+) -> None:
+    url, _ = dashboard_site
+    page.goto(url)
+    watcher = page.get_by_role("tab", name="Watcher", exact=True)
+    prs = page.get_by_role("tab", name="Pull requests", exact=True)
+    expect(watcher).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#watcher-panel")).to_be_visible()
+    expect(page.locator("#prs-panel")).to_be_hidden()
+    expect(page.locator(".page-tabs [role=tab]").first).to_have_text("Watcher")
+    watcher.focus()
+    watcher.press("ArrowRight")
+    expect(prs).to_be_focused()
+    expect(prs).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#watcher-panel")).to_be_hidden()
+    expect(page.locator("#prs-panel")).to_be_visible()
+    expect(page).to_have_url(url + "/#prs")
+    page.get_by_label("Search pull requests").fill("alpha")
+    watcher.click()
+    page.go_back()
+    expect(prs).to_have_attribute("aria-selected", "true")
+    expect(page.get_by_label("Search pull requests")).to_have_value("alpha")
+    page.reload()
+    expect(page.locator("#prs-panel")).to_be_visible()
+    prs.focus()
+    prs.press("Home")
+    expect(watcher).to_be_focused()
+    expect(page.locator("#watcher-panel")).to_be_visible()

@@ -6,6 +6,10 @@ The skill instructions and operating details are in [SKILL.md](SKILL.md) and [th
 
 ## Your pull requests
 
+The dashboard opens on the **Watcher** tab. Use **Pull requests** to switch to the
+PR overview; tabs support keyboard navigation, browser history, and direct links
+with `#watcher` or `#prs`. The PR table has a separate repository column.
+
 The dashboard also discovers open GitHub PRs you authored, are assigned to, or are
 involved in reviewing (including team requests and completed reviews). It uses the
 active `gh` account on github.com. No registration is needed. These PRs are a

@@ -55,6 +55,7 @@ const context = vm.createContext({
   URL,
   console,
   fixture,
+  window: { location: { hash: "" }, addEventListener() {} },
   document: { getElementById: get, createElement: (tag) => new Node(tag), addEventListener() {} },
   setInterval() {},
   fetch: async (url, options) => {

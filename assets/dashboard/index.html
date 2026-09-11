@@ -22,19 +22,91 @@
       </div>
     </header>
     <main>
-      <div id="alert" class="alert" role="status" hidden></div>
-      <section class="metrics" aria-label="Overview">
-        <div><span>Watching</span><strong id="watching">—</strong></div>
-        <div><span>Repairs running</span><strong id="running">—</strong></div>
-        <button id="show-attention" type="button" aria-label="Show watches needing attention">
-          <span>Needs attention</span><strong id="attention">—</strong>
+      <div class="page-tabs" role="tablist" aria-label="Dashboard views">
+        <button
+          id="watcher-tab"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          aria-controls="watcher-panel"
+        >
+          Watcher
         </button>
-        <div><span>Repairs used</span><strong id="repairs">—</strong></div>
-        <button id="show-ended" type="button" aria-label="Show ended watches">
-          <span>Ended watches</span><strong id="ended">—</strong>
+        <button
+          id="prs-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="prs-panel"
+          tabindex="-1"
+        >
+          Pull requests
         </button>
+      </div>
+      <section id="watcher-panel" role="tabpanel" aria-labelledby="watcher-tab" tabindex="0">
+        <div id="alert" class="alert" role="status" hidden></div>
+        <section class="metrics" aria-label="Overview">
+          <div><span>Watching</span><strong id="watching">—</strong></div>
+          <div><span>Repairs running</span><strong id="running">—</strong></div>
+          <button id="show-attention" type="button" aria-label="Show watches needing attention">
+            <span>Needs attention</span><strong id="attention">—</strong>
+          </button>
+          <div><span>Repairs used</span><strong id="repairs">—</strong></div>
+          <button id="show-ended" type="button" aria-label="Show ended watches">
+            <span>Ended watches</span><strong id="ended">—</strong>
+          </button>
+        </section>
+        <div class="toolbar">
+          <h2>Your watches <span id="count" class="count">0</span></h2>
+          <div class="filters">
+            <input
+              id="search"
+              type="search"
+              placeholder="Find a repo or branch…"
+              aria-label="Search watches"
+            /><select id="filter" aria-label="Filter watches">
+              <option value="active">Active</option>
+              <option value="attention">Needs attention</option>
+              <option value="all">All watches</option>
+              <option value="ended">Ended</option></select
+            ><button id="refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="workspace">
+          <section class="watch-list" aria-label="Watches">
+            <div id="list"></div>
+            <div id="empty" class="empty" hidden>
+              <span class="empty-icon" aria-hidden="true">⌁</span>
+              <h3 id="empty-title">Nothing to watch yet</h3>
+              <p id="empty-text">
+                Ask an agent to babysit a PR or your fork’s branch CI. Registered watches will
+                appear here.
+              </p>
+            </div>
+          </section>
+          <aside id="detail" aria-label="Watch details">
+            <div class="detail-placeholder">
+              <span aria-hidden="true">↖</span>
+              <h3>A closer look</h3>
+              <p>Select a watch to see its checks, repair budget, and latest logs.</p>
+            </div>
+          </aside>
+        </div>
+        <section class="service-log">
+          <details id="service-details">
+            <summary>Watcher service log</summary>
+            <pre id="service-log">Open to load the latest log.</pre>
+          </details>
+        </section>
       </section>
-      <section class="pr-overview" aria-label="Your pull requests">
+      <section
+        id="prs-panel"
+        class="pr-overview"
+        role="tabpanel"
+        aria-labelledby="prs-tab"
+        tabindex="0"
+        hidden
+      >
         <div class="toolbar">
           <h2>Your pull requests <span id="pr-count" class="count">0</span></h2>
           <div class="filters">
@@ -57,6 +129,7 @@
               <option value="PENDING">Pending</option>
               <option value="NONE">No checks</option>
             </select>
+            <button id="pr-refresh" type="button">Refresh</button>
           </div>
         </div>
         <p id="pr-sync" class="pr-sync" role="status">Loading your open PRs…</p>
@@ -65,6 +138,7 @@
           <table class="pr-table">
             <thead>
               <tr>
+                <th scope="col">Repository</th>
                 <th scope="col">Pull request</th>
                 <th scope="col">Your role</th>
                 <th scope="col">CI</th>
@@ -75,48 +149,6 @@
           </table>
           <p id="pr-empty" class="pr-empty" hidden></p>
         </div>
-      </section>
-      <div class="toolbar">
-        <h2>Your watches <span id="count" class="count">0</span></h2>
-        <div class="filters">
-          <input
-            id="search"
-            type="search"
-            placeholder="Find a repo or branch…"
-            aria-label="Search watches"
-          /><select id="filter" aria-label="Filter watches">
-            <option value="active">Active</option>
-            <option value="attention">Needs attention</option>
-            <option value="all">All watches</option>
-            <option value="ended">Ended</option></select
-          ><button id="refresh">Refresh</button>
-        </div>
-      </div>
-      <div class="workspace">
-        <section class="watch-list" aria-label="Watches">
-          <div id="list"></div>
-          <div id="empty" class="empty" hidden>
-            <span class="empty-icon" aria-hidden="true">⌁</span>
-            <h3 id="empty-title">Nothing to watch yet</h3>
-            <p id="empty-text">
-              Ask an agent to babysit a PR or your fork’s branch CI. Registered watches will appear
-              here.
-            </p>
-          </div>
-        </section>
-        <aside id="detail" aria-label="Watch details">
-          <div class="detail-placeholder">
-            <span aria-hidden="true">↖</span>
-            <h3>A closer look</h3>
-            <p>Select a watch to see its checks, repair budget, and latest logs.</p>
-          </div>
-        </aside>
-      </div>
-      <section class="service-log">
-        <details id="service-details">
-          <summary>Watcher service log</summary>
-          <pre id="service-log">Open to load the latest log.</pre>
-        </details>
       </section>
       <footer>
         <span>Local dashboard · refreshes every 5 seconds</span><span id="state-home"></span>

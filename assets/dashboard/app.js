@@ -539,7 +539,7 @@ function renderPRs() {
       titleLink,
       el(
         "span",
-        `${pr.repo} #${pr.number}${pr.author ? ` · ${pr.author}` : ""}${pr.draft ? " · Draft" : ""}`,
+        `#${pr.number}${pr.author ? ` · ${pr.author}` : ""}${pr.draft ? " · Draft" : ""}`,
         "pr-meta",
       ),
     );
@@ -562,7 +562,10 @@ function renderPRs() {
       el("small", `Updated ${valid ? ago(date.getTime() / 1000) : "at an unknown time"}`),
       stamp,
     );
-    row.append(title, roles, checks, updated);
+    const repo = el("td", undefined, "pr-repo");
+    repo.append(link(pr.repo, `https://github.com/${pr.repo}`));
+    title.className = "pr-description";
+    row.append(repo, title, roles, checks, updated);
     $("pr-list").append(row);
   }
   $("pr-empty").hidden = visible.length > 0;
@@ -607,6 +610,40 @@ async function refresh() {
     busy = false;
   }
 }
+function showPage(name) {
+  for (const page of ["watcher", "prs"]) {
+    const active = page === name;
+    $(`${page}-panel`).hidden = !active;
+    $(`${page}-tab`).setAttribute("aria-selected", String(active));
+    $(`${page}-tab`).tabIndex = active ? 0 : -1;
+  }
+}
+function pageFromURL() {
+  showPage(window.location.hash === "#prs" ? "prs" : "watcher");
+}
+for (const page of ["watcher", "prs"]) {
+  $(`${page}-tab`).onclick = () => {
+    window.location.hash = page;
+    showPage(page);
+  };
+  $(`${page}-tab`).onkeydown = (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const next =
+      event.key === "Home"
+        ? "watcher"
+        : event.key === "End"
+          ? "prs"
+          : page === "watcher"
+            ? "prs"
+            : "watcher";
+    $(`${next}-tab`).click();
+    $(`${next}-tab`).focus();
+  };
+}
+window.addEventListener("hashchange", pageFromURL);
+pageFromURL();
+$("pr-refresh").onclick = refreshPRs;
 $("show-attention").onclick = () => {
   $("filter").value = "attention";
   $("search").value = "";
