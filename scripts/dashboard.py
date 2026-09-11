@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from pr_overview import Overview
+
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
 
@@ -164,9 +166,14 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(
-        self, home: Path, port: int, allowed_hosts: tuple[str, ...] | list[str] = ()
+        self,
+        home: Path,
+        port: int,
+        allowed_hosts: tuple[str, ...] | list[str] = (),
+        overview: Overview | None = None,
     ) -> None:
         self.home = home
+        self.overview = overview
         self.allowed_hosts = set(allowed_hosts)
         super().__init__(("127.0.0.1", port), Handler)
 
@@ -255,6 +262,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route.path == "/api/status":
                 self.send_json(200, status(self.server.home))
+            elif route.path == "/api/prs":
+                self.send_json(
+                    200,
+                    self.server.overview.snapshot()
+                    if self.server.overview
+                    else {
+                        "prs": [],
+                        "synced_at": None,
+                        "error": "PR overview is not enabled",
+                    },
+                )
             elif route.path == "/api/log":
                 query = parse_qs(route.query)
                 self.send_json(
@@ -283,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
-    with DashboardServer(home, port, allowed_hosts) as server:
+    with DashboardServer(home, port, allowed_hosts, overview=Overview(home)) as server:
         url = f"http://127.0.0.1:{server.server_port}"
         print(
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",

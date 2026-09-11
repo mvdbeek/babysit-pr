@@ -4,6 +4,28 @@ A shared watcher that waits for GitHub CI and PR activity without keeping coding
 
 The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
 
+## Your pull requests
+
+The dashboard also discovers open GitHub PRs you authored, are assigned to, or are
+involved in reviewing (including team requests and completed reviews). It uses the
+active `gh` account on github.com. No registration is needed. These PRs are a
+read-only overview and do not start agents or create repair watches.
+
+Search by repository, title, number, or author, and filter by role or CI state.
+Each row links to the PR and its checks. CI is GitHub's combined head-ref check
+status; “No checks” means GitHub returned no rollup, not a successful build.
+“Last updated” is GitHub's PR `updatedAt` (PR activity, not the last poll or CI
+completion time). The separate sync timestamp shows how fresh the data is.
+
+While the dashboard is open, one background worker refreshes GitHub at most every
+two minutes; browser refreshes and multiple tabs share the cache. Pagination fetches
+up to GitHub's search limit of 1,000 PRs per role, with an explicit notice if capped.
+Duplicates appear once with all matching roles. Failed requests keep the last
+complete snapshot with a visible error. Cached metadata lives in
+`pr-overview.json` in the watcher state directory, outside this repository.
+The HTTP API is `/api/prs` and uses the same local/tailnet access restrictions as
+the watch dashboard. This overview does not require the watcher daemon to be online.
+
 ## Development
 
 Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, and zsh. Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.

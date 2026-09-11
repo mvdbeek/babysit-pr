@@ -8,6 +8,8 @@ let data = null,
   logKind = "agent",
   busy = false,
   detailKey = null;
+let prData = null,
+  prBusy = false;
 const cancelling = new Set(),
   cancelErrors = new Map(),
   approving = new Set(),
@@ -493,7 +495,102 @@ async function serviceLog() {
     $("service-log").textContent = e.message;
   }
 }
+
+function renderPRs() {
+  if (!prData) return;
+  const prs = prData.prs || [];
+  const query = $("pr-search").value.toLowerCase();
+  const role = $("pr-role").value;
+  const ci = $("pr-ci").value;
+  const visible = prs.filter(
+    (pr) =>
+      (role === "all" || pr.roles.includes(role)) &&
+      (ci === "all" ||
+        pr.ci === ci ||
+        (ci === "FAILURE" && pr.ci === "ERROR") ||
+        (ci === "PENDING" && pr.ci === "EXPECTED")) &&
+      `${pr.repo} ${pr.title} ${pr.number} ${pr.author || ""}`.toLowerCase().includes(query),
+  );
+  $("pr-count").textContent = `${visible.length} / ${prs.length}`;
+  const sync = prData.synced_at ? new Date(prData.synced_at * 1000).toLocaleString() : null;
+  $("pr-sync").textContent =
+    `${prData.login ? `@${prData.login} · ` : ""}Open PRs · most recently updated first · ${sync ? `Synced ${sync}` : "Not synced yet"}${prData.refreshing ? " · Syncing…" : " · GitHub refreshes every 2 minutes"}`;
+  const issues = [prData.error, ...(prData.warnings || [])].filter(Boolean);
+  $("pr-alert").hidden = !issues.length;
+  $("pr-alert").textContent =
+    issues.join(" ") +
+    (prData.error && sync ? " Showing saved results; they may be out of date." : "");
+  $("pr-list").replaceChildren();
+  const roleNames = { author: "Author", reviewer: "Reviewer", assignee: "Assignee" };
+  const ciStates = {
+    SUCCESS: ["Passed", "green"],
+    FAILURE: ["Failed", "red"],
+    ERROR: ["Error", "red"],
+    PENDING: ["Pending", "amber"],
+    EXPECTED: ["Expected", "amber"],
+    NONE: ["No checks", ""],
+  };
+  for (const pr of visible) {
+    const row = el("tr");
+    const title = el("td");
+    const titleLink = link(pr.title, pr.url);
+    titleLink.className = "pr-title";
+    title.append(
+      titleLink,
+      el(
+        "span",
+        `${pr.repo} #${pr.number}${pr.author ? ` · ${pr.author}` : ""}${pr.draft ? " · Draft" : ""}`,
+        "pr-meta",
+      ),
+    );
+    const roles = el("td");
+    const tags = el("div", undefined, "pr-roles");
+    for (const value of pr.roles) tags.append(el("span", roleNames[value] || value, "badge"));
+    roles.append(tags);
+    const checks = el("td");
+    const [label, color] = ciStates[pr.ci] || ["Unknown", ""];
+    const checksLink = link(label, `${pr.url}/checks`);
+    checksLink.className = `badge ${color}`;
+    checksLink.setAttribute("aria-label", `CI ${label} for ${pr.repo} #${pr.number}`);
+    checks.append(checksLink);
+    const updated = el("td", undefined, "pr-time");
+    const date = new Date(pr.updated_at);
+    const valid = Number.isFinite(date.getTime());
+    const stamp = el("time", valid ? date.toLocaleString() : "Unknown");
+    if (valid) stamp.setAttribute("datetime", pr.updated_at);
+    updated.append(
+      el("small", `Updated ${valid ? ago(date.getTime() / 1000) : "at an unknown time"}`),
+      stamp,
+    );
+    row.append(title, roles, checks, updated);
+    $("pr-list").append(row);
+  }
+  $("pr-empty").hidden = visible.length > 0;
+  $("pr-empty").textContent = prs.length
+    ? "No matching pull requests."
+    : prData.synced_at
+      ? "No open pull requests for your roles."
+      : prData.error
+        ? "PR data is unavailable. Check GitHub authentication and the sync error above."
+        : "Loading your open pull requests…";
+}
+async function refreshPRs() {
+  if (prBusy) return;
+  prBusy = true;
+  try {
+    prData = await get("/api/prs");
+    renderPRs();
+  } catch (error) {
+    $("pr-alert").hidden = false;
+    $("pr-alert").textContent =
+      `Cannot refresh PR overview: ${error.message}. Saved results may be out of date.`;
+  } finally {
+    prBusy = false;
+  }
+}
+
 async function refresh() {
+  void refreshPRs();
   if (busy) return;
   busy = true;
   try {
@@ -521,6 +618,9 @@ $("show-ended").onclick = () => {
   render();
 };
 $("refresh").onclick = refresh;
+$("pr-search").oninput = renderPRs;
+$("pr-role").onchange = renderPRs;
+$("pr-ci").onchange = renderPRs;
 $("search").oninput = render;
 $("filter").onchange = render;
 $("service-details").ontoggle = () => {

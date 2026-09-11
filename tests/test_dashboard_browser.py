@@ -11,6 +11,7 @@ import dashboard
 import pr_supervisor as supervisor
 import pytest
 from playwright.sync_api import Page, expect
+from pr_overview import Overview
 
 pytestmark = pytest.mark.browser
 
@@ -55,7 +56,39 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
         supervisor.save_job(db, closed)
     db.close()
     (tmp_path / "heartbeat.json").write_text(json.dumps({"time": time.time()}))
-    with dashboard.DashboardServer(tmp_path, 0) as server:
+    overview = Overview(tmp_path)
+    overview.next_poll = float("inf")  # Browser fixtures never call real GitHub.
+    overview.value.update(
+        login="fixture",
+        synced_at=time.time(),
+        prs=[
+            {
+                "id": "pr-one",
+                "repo": "test/alpha",
+                "number": 8,
+                "title": '<img src=x onerror="window.injected=true"> Test PR',
+                "url": "https://github.com/test/alpha/pull/8",
+                "author": "fixture",
+                "roles": ["author", "reviewer"],
+                "ci": "FAILURE",
+                "draft": False,
+                "updated_at": "2026-09-11T10:00:00Z",
+            },
+            {
+                "id": "pr-two",
+                "repo": "test/beta",
+                "number": 9,
+                "title": "Assigned PR",
+                "url": "https://github.com/test/beta/pull/9",
+                "author": "colleague",
+                "roles": ["assignee"],
+                "ci": "SUCCESS",
+                "draft": True,
+                "updated_at": "2026-09-10T10:00:00Z",
+            },
+        ],
+    )
+    with dashboard.DashboardServer(tmp_path, 0, overview=overview) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -138,3 +171,67 @@ def test_mobile_cleanup_attention_and_offline_state(page: Page, dashboard_site) 
     (home / "heartbeat.json").unlink()
     page.get_by_role("button", name="Refresh", exact=True).click()
     expect(page.locator("#health")).to_have_text("Watcher offline")
+
+
+def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboard_site) -> None:
+    url, home = dashboard_site
+    page.goto(url)
+    rows = page.locator("#pr-list tr")
+    expect(rows).to_have_count(2)
+    expect(rows.first).to_contain_text("test/alpha #8")
+    expect(rows.first.locator("img")).to_have_count(0)
+    assert page.evaluate("window.injected === undefined")
+    expect(rows.first.locator("time")).to_have_attribute("datetime", "2026-09-11T10:00:00Z")
+    expect(page.locator("#pr-sync")).to_contain_text("@fixture")
+    expect(page.locator("#pr-sync")).to_contain_text("Synced")
+    expect(page.get_by_role("link", name="CI Failed for test/alpha #8")).to_have_attribute(
+        "href", "https://github.com/test/alpha/pull/8/checks"
+    )
+    page.get_by_label("Filter pull requests by role").select_option("reviewer")
+    expect(rows).to_have_count(1)
+    page.get_by_label("Filter pull requests by role").select_option("assignee")
+    expect(rows).to_contain_text(["Assigned PR"])
+    page.get_by_label("Filter pull requests by role").select_option("all")
+    page.get_by_label("Filter pull requests by CI").select_option("FAILURE")
+    expect(rows).to_have_count(1)
+    page.get_by_label("Filter pull requests by CI").select_option("all")
+    page.get_by_label("Search pull requests").fill("colleague")
+    expect(rows).to_contain_text(["Assigned PR"])
+    page.get_by_label("Search pull requests").fill("missing")
+    expect(page.locator("#pr-empty")).to_have_text("No matching pull requests.")
+    assert len(dashboard.read_jobs(home)) == 3  # Discovery creates no repair watches.
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.get_by_label("Search pull requests").fill("")
+    expect(rows).to_have_count(2)
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site) -> None:
+    url, _ = dashboard_site
+    page.route(
+        "**/api/prs",
+        lambda route: route.fulfill(
+            json={
+                "prs": [],
+                "synced_at": None,
+                "error": "GitHub authentication failed",
+            }
+        ),
+    )
+    page.goto(url)
+    expect(page.locator("#pr-alert")).to_contain_text("GitHub authentication failed")
+    expect(page.locator("#pr-empty")).to_contain_text("PR data is unavailable")
+    page.unroute("**/api/prs")
+    page.route(
+        "**/api/prs",
+        lambda route: route.fulfill(
+            json={
+                "prs": [],
+                "synced_at": 1234,
+                "error": None,
+            }
+        ),
+    )
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#pr-empty")).to_have_text("No open pull requests for your roles.")
+    expect(page.locator("#pr-alert")).to_be_hidden()
