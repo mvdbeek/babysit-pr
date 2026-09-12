@@ -1,0 +1,41 @@
+#upstream-panel {
+  min-width: 0;
+}
+#upstream-scope,
+#upstream-status {
+  color: var(--muted);
+  line-height: 1.6;
+}
+.upstream-card {
+  padding: 18px;
+  margin: 12px 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow-wrap: anywhere;
+}
+.upstream-card h3 {
+  font-size: 14px;
+  font-family: monospace;
+}
+.upstream-card p,
+.upstream-card li {
+  font-size: 13px;
+  line-height: 1.6;
+}
+.upstream-card ul {
+  padding-left: 20px;
+}
+.upstream-note {
+  color: var(--muted);
+}
+@media (max-width: 650px) {
+  .page-tabs:has(#upstream-tab:not([hidden])) {
+    flex-wrap: wrap;
+  }
+  #upstream-panel .filters {
+    flex-wrap: wrap;
+  }
+  #upstream-panel .toolbar {
+    align-items: flex-start;
+  }
+}

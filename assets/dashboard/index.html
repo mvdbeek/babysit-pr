@@ -6,6 +6,8 @@
     <title>Babysitter</title>
     <link rel="stylesheet" href="/style.css" />
     <script src="/app.js" defer></script>
+    <script src="/upstream-tests.js" defer></script>
+    <link rel="stylesheet" href="/upstream-tests.css" />
   </head>
   <body>
     <header>
@@ -52,7 +54,40 @@
         >
           Issues
         </button>
+        <button
+          id="upstream-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="upstream-panel"
+          tabindex="-1"
+          hidden
+        >
+          Upstream tests <span class="count">Experiment</span>
+        </button>
       </div>
+      <section
+        id="upstream-panel"
+        role="tabpanel"
+        aria-labelledby="upstream-tab"
+        tabindex="0"
+        hidden
+      >
+        <div class="toolbar">
+          <h2>Upstream test failures <span class="count">Experimental</span></h2>
+          <div class="filters">
+            <label for="upstream-group">Group by</label
+            ><select id="upstream-group">
+              <option value="test">Failing test</option>
+              <option value="branch">Branch / workflow</option></select
+            ><button id="upstream-refresh" type="button">Refresh</button>
+          </div>
+        </div>
+        <p id="upstream-status" role="status">Loading experiment…</p>
+        <p id="upstream-scope"></p>
+        <div id="upstream-notices" role="status"></div>
+        <div id="upstream-results"></div>
+      </section>
       <section id="watcher-panel" role="tabpanel" aria-labelledby="watcher-tab" tabindex="0">
         <div id="alert" class="alert" role="status" hidden></div>
         <section class="metrics" aria-label="Overview">

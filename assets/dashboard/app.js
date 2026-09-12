@@ -1426,7 +1426,7 @@ async function refresh() {
     busy = false;
   }
 }
-const pages = ["watcher", "prs", "issues"];
+const pages = ["watcher", "prs", "issues", "upstream"];
 function showPage(name) {
   for (const page of pages) {
     const active = page === name;
@@ -1436,6 +1436,7 @@ function showPage(name) {
   }
   if (name === "prs") prTable.render();
   if (name === "issues") issueTable.render();
+  if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
 }
 function overviewVisible() {
   return !$("prs-panel").hidden || !$("issues-panel").hidden;
@@ -1444,7 +1445,7 @@ function pageFromURL() {
   const name = window.location.hash.slice(1);
   showPage(pages.includes(name) ? name : "watcher");
 }
-for (const [index, page] of pages.entries()) {
+for (const page of pages) {
   $(`${page}-tab`).onclick = () => {
     window.location.hash = page;
     showPage(page);
@@ -1453,12 +1454,16 @@ for (const [index, page] of pages.entries()) {
   $(`${page}-tab`).onkeydown = (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
+    const available = pages.filter((name) => !$(`${name}-tab`).hidden);
+    const index = available.indexOf(page);
     const next =
       event.key === "Home"
-        ? pages[0]
+        ? available[0]
         : event.key === "End"
-          ? pages[pages.length - 1]
-          : pages[(index + (event.key === "ArrowRight" ? 1 : pages.length - 1)) % pages.length];
+          ? available[available.length - 1]
+          : available[
+              (index + (event.key === "ArrowRight" ? 1 : available.length - 1)) % available.length
+            ];
     $(`${next}-tab`).click();
     $(`${next}-tab`).focus();
   };
