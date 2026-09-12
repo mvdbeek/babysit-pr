@@ -704,8 +704,20 @@ button:disabled {
   gap: 5px;
   flex-wrap: wrap;
 }
+.pr-dates {
+  vertical-align: top;
+}
 .pr-time {
   white-space: nowrap;
+}
+.pr-opened {
+  margin-bottom: 8px;
+  color: var(--muted);
+}
+.pr-date-sorts {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
 }
 .pr-time small {
   display: block;
@@ -751,7 +763,7 @@ button:disabled {
     min-width: 0;
     grid-column: 1 / -1;
   }
-  .pr-table .pr-time {
+  .pr-table .pr-dates {
     grid-column: 1 / -1;
   }
   .pr-table-wrap {
@@ -796,14 +808,14 @@ button:disabled {
 .pr-table th button::after {
   content: " ↕";
 }
-.pr-table th[aria-sort="ascending"] button::after {
+.pr-table th button[data-sort="ascending"]::after {
   content: " ↑";
 }
-.pr-table th[aria-sort="descending"] button::after {
+.pr-table th button[data-sort="descending"]::after {
   content: " ↓";
 }
-.pr-table th[aria-sort="ascending"],
-.pr-table th[aria-sort="descending"] {
+.pr-table th button[data-sort="ascending"],
+.pr-table th button[data-sort="descending"] {
   color: var(--green);
 }
 .pr-author,

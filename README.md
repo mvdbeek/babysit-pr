@@ -40,7 +40,15 @@ status; “No checks” means GitHub returned no rollup, not a successful build.
 “Last updated” is GitHub's PR `updatedAt` (PR activity, not the last poll or CI
 completion time). The separate sync timestamp shows how fresh the data is.
 
-Both PR and issue rows show **Latest activity** beneath Last updated: the person
+Both PR and issue rows combine **Opened** and **Updated** in one compact
+**Dates / activity** column, with relative ages and exact local timestamps. Use its
+Opened or Updated header buttons to sort by either date (click again to reverse),
+or choose Opened or Last updated in the mobile sort menu. Last updated, newest
+first, remains the default. Missing dates show “Unknown” and sort last in either
+direction. Since-visit activity highlighting targets the Updated section, leaving
+the Opened timestamp unhighlighted.
+
+Rows show **Latest activity** beneath Updated: the person
 or bot, an action, its own timestamp (hover for the exact time), and a direct link
 when GitHub supplies one. The existing queries fetch the last five timeline items
 and the latest description edit; there are no additional HTTP requests or polls.

@@ -250,6 +250,117 @@ def test_latest_activity_display_refresh_and_fallback(page, dashboard_site, kind
     assert page.evaluate("window.injected") is None
 
 
+@pytest.mark.parametrize("kind,prefix,columns", [("prs", "pr", 8), ("issues", "issue", 9)])
+@pytest.mark.parametrize("width", [1280, 390])
+def test_compact_dates_share_a_column_and_keep_both_sorts(
+    page, dashboard_site, kind, prefix, columns, width
+):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    expect(rows).to_have_count(2)
+    table = rows.first.locator("xpath=ancestor::table")
+    page.screenshot(path=f"reports/{kind}-compact-dates-{width}.png", full_page=True)
+    expect(table.locator("thead th")).to_have_count(columns)
+    expect(rows.first.locator("td")).to_have_count(columns)
+    dates = rows.first.locator("td.pr-dates")
+    expect(dates.locator(".pr-opened > time")).to_have_attribute(
+        "datetime", "2025-01-01T10:00:00Z" if kind == "prs" else "2025-02-01T10:00:00Z"
+    )
+    expect(dates.locator(".pr-updated > time")).to_have_attribute(
+        "datetime", "2026-09-11T10:00:00Z" if kind == "prs" else "2026-09-11T09:00:00Z"
+    )
+    expect(dates.locator(".pr-opened")).to_contain_text("Opened")
+    expect(dates.locator(".pr-updated")).to_contain_text("Updated")
+    expect(dates.locator(".pr-activity")).to_contain_text("Unavailable")
+    expect(page.locator(f"#{prefix}-sync")).to_contain_text("Sorted by Last updated (descending)")
+    for field, label in [("opened_at", "Opened"), ("updated_at", "Last updated")]:
+        if width == 390:
+            page.locator(f"#{prefix}-sort").select_option(field)
+        else:
+            button = page.get_by_role("button", name=f"Sort by {label}", exact=True)
+            button.focus()
+            button.press("Enter")
+            expect(button).to_be_focused()
+            expect(button).to_have_attribute("aria-pressed", "true")
+            expect(
+                table.get_by_role("columnheader", name=f"Dates / activity, sorted by {label}")
+            ).to_have_attribute("aria-sort", "descending")
+        expect(rows.first.locator(".pr-repo")).to_have_text(
+            "test/beta" if field == "opened_at" else "test/alpha"
+        )
+        if width == 390:
+            page.locator(f"#{prefix}-sort-direction").click()
+        else:
+            button.press("Space")
+        expect(rows.first.locator(".pr-repo")).to_have_text(
+            "test/alpha" if field == "opened_at" else "test/beta"
+        )
+    dates.scroll_into_view_if_needed()
+    assert dates.evaluate("node => node.scrollWidth <= node.clientWidth")
+    if width == 390:
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+def test_compact_dates_keep_missing_dates_last_in_both_directions(
+    page, dashboard_site, kind, prefix
+):
+    url, _ = dashboard_site
+    snapshot = page.request.get(f"{url}/api/{kind}").json()
+    snapshot[kind][1].update(opened_at=None, updated_at="invalid")
+    page.route(f"**/api/{kind}", lambda route: route.fulfill(json=snapshot))
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    expect(rows).to_have_count(2)
+    for field in ["opened", "updated"]:
+        detail = rows.last.locator(f".pr-{field}")
+        expect(detail.locator(":scope > time")).to_have_text("Unknown")
+        expect(detail.locator(":scope > time[datetime]")).to_have_count(0)
+        expect(detail).to_contain_text("at an unknown time")
+    for label in ["Opened", "Last updated"]:
+        button = page.get_by_role("button", name=f"Sort by {label}", exact=True)
+        for _ in range(2):
+            button.click()
+            expect(rows.last.locator(".pr-repo")).to_have_text("test/beta")
+    page.locator(f"#{prefix}-refresh").click()
+    expect(rows.last.locator(".pr-repo")).to_have_text("test/beta")
+
+
+@pytest.mark.parametrize(
+    "kind,prefix,field",
+    [("prs", "pr", "updated_at"), ("prs", "pr", "head_sha"), ("issues", "issue", "updated_at")],
+)
+def test_compact_dates_highlight_updated_section_only(page, dashboard_site, kind, prefix, field):
+    url, _ = dashboard_site
+    snapshot = page.request.get(f"{url}/api/{kind}").json()
+    page.route(f"**/api/{kind}", lambda route: route.fulfill(json=snapshot))
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    expect(rows).to_have_count(2)
+    snapshot[kind][0][field] = "2026-09-12T12:00:00Z" if field == "updated_at" else "b" * 40
+    snapshot["synced_at"] += 1
+    page.locator(f"#{prefix}-refresh").click()
+    changed = page.locator(f"#{prefix}-list .pr-changed")
+    expect(changed).to_have_count(1)
+    expect(changed.locator(".pr-updated.pr-field-changed")).to_have_count(1)
+    expect(
+        changed.locator(".pr-dates.pr-field-changed, .pr-opened.pr-field-changed")
+    ).to_have_count(0)
+    expect(changed.locator(".pr-change-note")).to_have_text(
+        "New commits"
+        if field == "head_sha"
+        else f"{'PR' if kind == 'prs' else 'Issue'} activity changed"
+    )
+    # The local highlight must not color Opened through a shared parent.
+    assert changed.locator(".pr-updated").evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    ) != changed.locator(".pr-opened").evaluate("node => getComputedStyle(node).backgroundColor")
+    page.reload()
+    expect(page.locator(f"#{prefix}-list .pr-field-changed")).to_have_count(0)
+
+
 def open_watch(page: Page, url: str, repo: str) -> None:
     page.goto(url)
     page.get_by_role("button", name=f"{repo}, feature,", exact=False).click()
@@ -460,7 +571,7 @@ def test_each_pr_column_sorts_both_directions(page: Page, dashboard_site, column
     expect(rows.first.locator(".pr-repo")).to_have_text(
         "test/beta" if first == "test/alpha" else "test/alpha"
     )
-    expect(page.get_by_role("columnheader", name=column, exact=True)).to_have_attribute(
+    expect(button.locator("xpath=ancestor::th")).to_have_attribute(
         "aria-sort",
         "descending"
         if column not in {"Opened", "Last updated"}
@@ -1485,12 +1596,13 @@ def test_each_issue_column_sorts_both_directions(
     expect(rows.first.locator(".pr-repo")).to_have_text(first)
     button.click()
     expect(rows.first.locator(".pr-repo")).to_have_text(second)
-    heading = page.get_by_role("columnheader", name=column, exact=True)
+    heading = button.locator("xpath=ancestor::th")
     expect(heading).to_have_attribute(
         "aria-sort", "ascending" if column == "Opened" else "descending"
     )
-    expect(page.get_by_role("columnheader", name="Last updated", exact=True)).to_have_attribute(
-        "aria-sort", "descending" if column == "Last updated" else "none"
+    expect(page.locator("#issue-heading-dates")).to_have_attribute(
+        "aria-sort",
+        "descending" if column == "Last updated" else "ascending" if column == "Opened" else "none",
     )
     page.set_viewport_size({"width": 390, "height": 844})
     expect(page.get_by_label("Sort issues by", exact=True)).to_be_visible()
