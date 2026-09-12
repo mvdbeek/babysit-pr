@@ -10,6 +10,7 @@ from pathlib import Path
 import dashboard
 import pr_supervisor as supervisor
 import pytest
+from issue_overview import Overview as IssueOverview
 from playwright.sync_api import Page, expect
 from pr_overview import Overview
 
@@ -90,7 +91,58 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
             },
         ],
     )
-    with dashboard.DashboardServer(tmp_path, 0, overview=overview) as server:
+    issues = IssueOverview(tmp_path)
+    issues.next_poll = float("inf")
+    issues.value.update(
+        login="fixture",
+        synced_at=time.time(),
+        issues=[
+            {
+                "id": "issue-one",
+                "repo": "test/alpha",
+                "number": 30,
+                "title": '<img src=x onerror="window.injected=true"> Crash on start',
+                "url": "https://github.com/test/alpha/issues/30",
+                "author": "fixture",
+                "assignees": ["colleague"],
+                "labels": [{"name": "kind/bug", "color": "d73a4a"}],
+                "comments": 4,
+                "roles": ["author", "mentioned"],
+                "linked_prs": [
+                    {
+                        "id": "pr-one",
+                        "number": 8,
+                        "title": "Test PR",
+                        "url": "https://github.com/test/alpha/pull/8",
+                        "repo": "test/alpha",
+                        "state": "OPEN",
+                        "draft": False,
+                        "head_repo": "fork/alpha",
+                        "head_branch": "fix-30",
+                        "head_sha": "c" * 40,
+                    }
+                ],
+                "updated_at": "2026-09-11T09:00:00Z",
+                "opened_at": "2025-02-01T10:00:00Z",
+            },
+            {
+                "id": "issue-two",
+                "repo": "test/beta",
+                "number": 31,
+                "title": "Assigned issue",
+                "url": "https://github.com/test/beta/issues/31",
+                "author": "colleague",
+                "assignees": [],
+                "labels": [],
+                "comments": 0,
+                "roles": ["assignee"],
+                "linked_prs": [],
+                "updated_at": "2026-09-10T09:00:00Z",
+                "opened_at": "2026-08-02T10:00:00Z",
+            },
+        ],
+    )
+    with dashboard.DashboardServer(tmp_path, 0, overview=overview, issues=issues) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -274,6 +326,23 @@ def test_dashboard_tabs_default_to_watcher_and_support_navigation(
     prs.press("Home")
     expect(watcher).to_be_focused()
     expect(page.locator("#watcher-panel")).to_be_visible()
+    issues = page.get_by_role("tab", name="Issues", exact=True)
+    watcher.press("End")
+    expect(issues).to_be_focused()
+    expect(issues).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#issues-panel")).to_be_visible()
+    expect(page.locator("#prs-panel")).to_be_hidden()
+    expect(page).to_have_url(url + "/#issues")
+    issues.press("ArrowRight")
+    expect(watcher).to_be_focused()
+    watcher.press("ArrowLeft")
+    expect(issues).to_be_focused()
+    issues.press("ArrowLeft")
+    expect(prs).to_be_focused()
+    expect(page.locator("#prs-panel")).to_be_visible()
+    page.goto(url + "/#issues")
+    expect(page.locator("#issues-panel")).to_be_visible()
+    expect(page.locator("#issue-list tr")).to_have_count(2)
 
 
 @pytest.mark.parametrize(
@@ -1141,3 +1210,257 @@ def test_log_scroll_serializes_requests_and_closing_cancels_pending_read(
     page.get_by_text("Downloaded test log", exact=True).click()
     expect(page.locator(".ci-log-viewer pre")).to_contain_text("Full log page 1")
     expect(page.locator(".ci-log-viewer pre")).not_to_contain_text("Late output")
+
+
+def test_issue_overview_columns_filters_linked_prs_and_safe_titles(
+    page: Page, dashboard_site
+) -> None:
+    url, home = dashboard_site
+    page.goto(url + "/#issues")
+    rows = page.locator("#issue-list tr")
+    expect(rows).to_have_count(2)
+    expect(page.get_by_role("columnheader", name="Linked PRs", exact=True)).to_be_visible()
+    first = rows.first
+    expect(first.locator(".pr-repo")).to_have_text("test/alpha")
+    expect(first.locator(".pr-description")).to_contain_text("#30")
+    expect(first.locator(".pr-description")).to_contain_text('<img src=x onerror="window.injected')
+    expect(first.locator("img")).to_have_count(0)
+    assert page.evaluate("window.injected === undefined")
+    expect(first.locator(".pr-label")).to_have_text("kind/bug")
+    expect(first.locator(".pr-assignees")).to_have_text("colleague")
+    expect(first.locator(".pr-comments")).to_have_text("4")
+    expect(first.locator(".pr-roles .badge").first).to_have_text("Author")
+    expect(first.locator(".pr-updated time")).to_have_attribute("datetime", "2026-09-11T09:00:00Z")
+    linked = first.get_by_role("link", name="Pull request test/alpha #8", exact=True)
+    expect(linked).to_have_attribute("href", "https://github.com/test/alpha/pull/8")
+    expect(linked).to_have_text("#8")
+    # CI comes from the PR overview because #8 is already there; nothing is fetched per issue.
+    expect(
+        first.get_by_role("link", name="CI Failed for test/alpha #8", exact=True)
+    ).to_have_attribute("href", "https://github.com/test/alpha/pull/8/checks")
+    expect(rows.last.locator(".pr-linked")).to_have_text("None")
+    expect(rows.last.locator(".pr-assignees")).to_have_text("Unassigned")
+    expect(page.locator("#issue-sync")).to_contain_text("@fixture")
+    expect(page.locator("#issue-sync")).to_contain_text("Open issues")
+    expect(page.locator("#pr-sync")).to_contain_text("Open PRs")
+    page.get_by_label("Filter issues by role").select_option("assignee")
+    expect(rows).to_have_count(1)
+    expect(rows).to_contain_text(["Assigned issue"])
+    page.get_by_label("Filter issues by role").select_option("all")
+    label = page.get_by_label("Filter issues by label")
+    expect(label.locator("option")).to_have_text(["All labels", "kind/bug"])
+    label.select_option("kind/bug")
+    expect(rows).to_have_count(1)
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+    label.select_option("all")
+    page.get_by_label("Filter issues by linked pull requests").select_option("unlinked")
+    expect(rows).to_have_count(1)
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
+    page.get_by_label("Filter issues by linked pull requests").select_option("linked")
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+    page.get_by_label("Filter issues by linked pull requests").select_option("all")
+    page.get_by_label("Filter issues by repository").select_option("test/beta")
+    expect(rows).to_have_count(1)
+    page.get_by_label("Filter issues by repository").select_option("all")
+    page.get_by_label("Search issues").fill("colleague")
+    expect(rows).to_have_count(2)  # Assignee on one issue, author of the other.
+    page.get_by_label("Search issues").fill("kind/bug")
+    expect(rows).to_have_count(1)
+    page.get_by_label("Search issues").fill("missing")
+    expect(page.locator("#issue-empty")).to_have_text("No matching issues.")
+    page.get_by_label("Search issues").fill("")
+    assert len(dashboard.read_jobs(home)) == 3  # Discovery creates no repair watches.
+    expect(page.locator("#pr-list tr")).to_have_count(2)  # The PR tab is untouched.
+    page.screenshot(path="reports/issues-desktop.png")
+    page.set_viewport_size({"width": 390, "height": 844})
+    expect(rows).to_have_count(2)
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path="reports/issues-mobile.png")
+
+
+@pytest.mark.parametrize(
+    "column,first,second",
+    [
+        ("Repository", "test/alpha", "test/beta"),
+        ("Issue", "test/alpha", "test/beta"),
+        ("Author", "test/beta", "test/alpha"),
+        ("Assignees", "test/alpha", "test/alpha"),  # Unassigned stays at the bottom.
+        ("Your role", "test/beta", "test/alpha"),
+        ("Comments", "test/beta", "test/alpha"),
+        ("Linked PRs", "test/beta", "test/alpha"),
+        ("Opened", "test/beta", "test/alpha"),
+        ("Last updated", "test/beta", "test/alpha"),
+    ],
+)
+def test_each_issue_column_sorts_both_directions(
+    page: Page, dashboard_site, column, first, second
+) -> None:
+    url, _ = dashboard_site
+    page.goto(url + "/#issues")
+    rows = page.locator("#issue-list tr")
+    expect(rows).to_have_count(2)
+    button = page.get_by_role("button", name=f"Sort by {column}", exact=True)
+    button.click()
+    expect(rows.first.locator(".pr-repo")).to_have_text(first)
+    button.click()
+    expect(rows.first.locator(".pr-repo")).to_have_text(second)
+    heading = page.get_by_role("columnheader", name=column, exact=True)
+    expect(heading).to_have_attribute(
+        "aria-sort", "ascending" if column == "Opened" else "descending"
+    )
+    expect(page.get_by_role("columnheader", name="Last updated", exact=True)).to_have_attribute(
+        "aria-sort", "descending" if column == "Last updated" else "none"
+    )
+    page.set_viewport_size({"width": 390, "height": 844})
+    expect(page.get_by_label("Sort issues by", exact=True)).to_be_visible()
+    page.get_by_label("Sort issues by", exact=True).select_option("comments")
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_issue_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site) -> None:
+    url, _ = dashboard_site
+    page.route(
+        "**/api/issues",
+        lambda route: route.fulfill(
+            json={"issues": [], "synced_at": None, "error": "GitHub authentication failed"}
+        ),
+    )
+    page.goto(url + "/#issues")
+    expect(page.locator("#issue-alert")).to_contain_text("GitHub authentication failed")
+    expect(page.locator("#issue-empty")).to_contain_text("Issue data is unavailable")
+    expect(page.locator("#pr-alert")).to_be_hidden()
+    page.unroute("**/api/issues")
+    page.route(
+        "**/api/issues",
+        lambda route: route.fulfill(json={"issues": [], "synced_at": 1234, "error": None}),
+    )
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#issue-empty")).to_have_text("No open issues for your roles.")
+    expect(page.locator("#issue-alert")).to_be_hidden()
+
+
+def test_issue_visit_tracking_is_separate_from_prs(page: Page, dashboard_site) -> None:
+    url, _ = dashboard_site
+    snapshot = page.request.get(url + "/api/issues").json()
+    page.route("**/api/issues", lambda route: route.fulfill(json=snapshot))
+    page.goto(url + "/#issues")
+    expect(page.locator("#issue-list tr")).to_have_count(2)
+    expect(page.locator("#issue-changes")).to_contain_text("from this visit onward")
+    saved = page.evaluate("JSON.parse(localStorage.getItem('babysit-pr:seen-issues:v1:fixture'))")
+    assert saved["issues"]["issue-one"]["comments"] == 4
+    assert saved["issues"]["issue-one"]["linked_prs"] == ["test/alpha#8"]
+    assert "prs" not in saved
+    assert page.evaluate("localStorage.getItem('babysit-pr:seen-prs:v1:fixture')") is None
+    snapshot["synced_at"] += 1
+    snapshot["issues"][0].update(comments=5, linked_prs=[], labels=[])
+    new = copy.deepcopy(snapshot["issues"][1])
+    new.update(id="issue-new", title="A newly discovered issue", number=32)
+    snapshot["issues"].append(new)
+    page.reload()
+    expect(page.locator("#issue-changes")).to_contain_text("1 new · 1 updated")
+    changed = page.locator("#issue-list .pr-changed")
+    expect(changed.locator(".pr-change-note")).to_have_text("Labels · Comments · Linked PRs")
+    expect(changed.locator(".pr-field-changed")).to_have_count(3)
+    expect(page.locator("#issue-list .pr-new .pr-change-badge")).to_have_text("New")
+    expect(page.locator("#pr-list .pr-changed, #pr-list .pr-new")).to_have_count(0)
+    page.reload()
+    expect(page.locator("#issue-changes")).to_contain_text("No changes since your last visit")
+
+
+@pytest.fixture
+def issue_workspace_routes(page):
+    info = {
+        "matches": [],
+        "suggestions": ["/fixture/other-repo/issue-30"],
+        "clones": ["/fixture/alpha"],
+        "preferred_clone": "/fixture/alpha",
+        "destination": None,
+        "operation": None,
+    }
+    linked_match = {
+        "path": "/fixture/alpha-fix-30",
+        "workspace_id": "w7",
+        "name": "Fix 30 workspace",
+        "agent_status": "idle",
+        "url": "https://mac-mini.tailfb45be.ts.net/space/w7",
+        "linked_pr": 8,
+    }
+    snapshot = {
+        "prs": {"pr-one": {**copy.deepcopy(info), "suggestions": []}},
+        "issues": {
+            "issue-one": info,
+            "issue-two": {**copy.deepcopy(info), "matches": [linked_match], "suggestions": []},
+        },
+        "error": None,
+        "synced_at": 1234,
+    }
+    requests = []
+    page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+
+    def action(route):
+        body = route.request.post_data_json
+        requests.append(body)
+        if body["action"] in {"open", "focus"}:
+            route.fulfill(json={"result": linked_match})
+        else:
+            op = {"id": "op2", "status": "running", "message": "Fetching issue", "log": "wti"}
+            info["operation"] = op
+            route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-action", action)
+    return info, snapshot, requests
+
+
+def test_issue_workspace_create_and_linked_pr_match(page, dashboard_site, issue_workspace_routes):
+    url, _ = dashboard_site
+    info, _, requests = issue_workspace_routes
+    page.goto(url + "/#issues")
+    rows = page.locator("#issue-list tr")
+    expect(rows).to_have_count(2)
+    expect(rows.last.locator(".pr-actions")).to_contain_text("Via PR #8")
+    rows.first.get_by_role("button", name="Create workspace", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_contain_text("test/alpha #30")
+    expect(dialog).to_contain_text(
+        "Unverified branch-name suggestions: /fixture/other-repo/issue-30"
+    )
+    expect(dialog.get_by_label("Agent", exact=True)).to_have_value("codex")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    assert not requests
+    dialog.get_by_label("Task", exact=True).fill("Reproduce the crash and fix it")
+    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Fetching issue")
+    assert requests == [
+        {
+            "id": "issue-one",
+            "action": "create",
+            "agent": "claude",
+            "task": "Reproduce the crash and fix it",
+            "clone": "/fixture/alpha",
+            "retry": False,
+        }
+    ]
+    info["operation"].update(
+        status="complete",
+        message="Workspace ready",
+        result={"url": "https://mac-mini.tailfb45be.ts.net/space/w8"},
+    )
+    page.evaluate("refreshWorkspaces()")
+    expect(dialog.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://mac-mini.tailfb45be.ts.net/space/w8"
+    )
+    dialog.get_by_role("button", name="Close workspace actions").click()
+    page.evaluate("window.open = () => { window.opened = {location: {}}; return window.opened; }")
+    rows.last.get_by_role("button", name="Open workspace", exact=True).click()
+    expect(page.locator("#workspace-result a")).to_have_attribute(
+        "href", "https://mac-mini.tailfb45be.ts.net/space/w7"
+    )
+    assert requests[-1] == {
+        "id": "issue-two",
+        "action": "open",
+        "path": "/fixture/alpha-fix-30",
+        "workspace_id": "w7",
+    }
+    page.screenshot(path="reports/issue-workspace-desktop.png")

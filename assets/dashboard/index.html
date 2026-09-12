@@ -42,6 +42,16 @@
         >
           Pull requests
         </button>
+        <button
+          id="issues-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="issues-panel"
+          tabindex="-1"
+        >
+          Issues
+        </button>
       </div>
       <section id="watcher-panel" role="tabpanel" aria-labelledby="watcher-tab" tabindex="0">
         <div id="alert" class="alert" role="status" hidden></div>
@@ -232,6 +242,152 @@
             <tbody id="pr-list"></tbody>
           </table>
           <p id="pr-empty" class="pr-empty" hidden></p>
+        </div>
+      </section>
+      <section
+        id="issues-panel"
+        class="pr-overview"
+        role="tabpanel"
+        aria-labelledby="issues-tab"
+        tabindex="0"
+        hidden
+      >
+        <div class="toolbar">
+          <h2>Your issues <span id="issue-count" class="count">0</span></h2>
+          <div class="filters">
+            <input
+              id="issue-search"
+              type="search"
+              placeholder="Find an issue, label or repo…"
+              aria-label="Search issues"
+            />
+            <button id="issue-refresh" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="pr-filters">
+          <label for="issue-repo"
+            >Repository
+            <select id="issue-repo" aria-label="Filter issues by repository">
+              <option value="all">All repositories</option>
+            </select>
+          </label>
+          <label for="issue-role"
+            >Your role
+            <select id="issue-role" aria-label="Filter issues by role">
+              <option value="all">All roles</option>
+              <option value="author">My issues</option>
+              <option value="assignee">Assignee</option>
+              <option value="mentioned">Mentioned</option>
+              <option value="participant">Participant</option>
+            </select>
+          </label>
+          <label for="issue-label"
+            >Label
+            <select id="issue-label" aria-label="Filter issues by label">
+              <option value="all">All labels</option>
+            </select>
+          </label>
+          <label for="issue-linked"
+            >Linked pull requests
+            <select id="issue-linked" aria-label="Filter issues by linked pull requests">
+              <option value="all">With or without</option>
+              <option value="linked">Has a linked PR</option>
+              <option value="unlinked">No linked PR</option>
+            </select>
+          </label>
+        </div>
+        <p id="issue-sync" class="pr-sync" role="status">Loading your open issues…</p>
+        <p id="issue-changes" class="pr-sync" role="status" hidden></p>
+        <div id="issue-alert" class="alert" role="status" hidden></div>
+        <div class="pr-mobile-sort">
+          <label for="issue-sort">Sort issues by</label>
+          <select id="issue-sort">
+            <option value="repo">Repository</option>
+            <option value="title">Issue</option>
+            <option value="author">Author</option>
+            <option value="assignees">Assignees</option>
+            <option value="roles">Your role</option>
+            <option value="comments">Comments</option>
+            <option value="linked_prs">Linked PRs</option>
+            <option value="opened_at">Opened</option>
+            <option value="updated_at" selected>Last updated</option>
+          </select>
+          <button id="issue-sort-direction" type="button">Descending</button>
+        </div>
+        <div class="pr-table-wrap">
+          <table class="pr-table">
+            <thead>
+              <tr>
+                <th id="issue-heading-repo" scope="col" aria-label="Repository" aria-sort="none">
+                  <button id="issue-sort-repo" type="button" aria-label="Sort by Repository">
+                    Repository
+                  </button>
+                </th>
+                <th id="issue-heading-title" scope="col" aria-label="Issue" aria-sort="none">
+                  <button id="issue-sort-title" type="button" aria-label="Sort by Issue">
+                    Issue
+                  </button>
+                </th>
+                <th id="issue-heading-author" scope="col" aria-label="Author" aria-sort="none">
+                  <button id="issue-sort-author" type="button" aria-label="Sort by Author">
+                    Author
+                  </button>
+                </th>
+                <th
+                  id="issue-heading-assignees"
+                  scope="col"
+                  aria-label="Assignees"
+                  aria-sort="none"
+                >
+                  <button id="issue-sort-assignees" type="button" aria-label="Sort by Assignees">
+                    Assignees
+                  </button>
+                </th>
+                <th id="issue-heading-roles" scope="col" aria-label="Your role" aria-sort="none">
+                  <button id="issue-sort-roles" type="button" aria-label="Sort by Your role">
+                    Your role
+                  </button>
+                </th>
+                <th id="issue-heading-comments" scope="col" aria-label="Comments" aria-sort="none">
+                  <button id="issue-sort-comments" type="button" aria-label="Sort by Comments">
+                    Comments
+                  </button>
+                </th>
+                <th
+                  id="issue-heading-linked_prs"
+                  scope="col"
+                  aria-label="Linked PRs"
+                  aria-sort="none"
+                >
+                  <button id="issue-sort-linked_prs" type="button" aria-label="Sort by Linked PRs">
+                    Linked PRs
+                  </button>
+                </th>
+                <th id="issue-heading-opened_at" scope="col" aria-label="Opened" aria-sort="none">
+                  <button id="issue-sort-opened_at" type="button" aria-label="Sort by Opened">
+                    Opened
+                  </button>
+                </th>
+                <th
+                  id="issue-heading-updated_at"
+                  scope="col"
+                  aria-label="Last updated"
+                  aria-sort="descending"
+                >
+                  <button
+                    id="issue-sort-updated_at"
+                    type="button"
+                    aria-label="Sort by Last updated"
+                  >
+                    Last updated
+                  </button>
+                </th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="issue-list"></tbody>
+          </table>
+          <p id="issue-empty" class="pr-empty" hidden></p>
         </div>
       </section>
       <footer>

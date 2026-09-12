@@ -8,8 +8,6 @@ let data = null,
   logKind = "agent",
   busy = false,
   detailKey = null;
-let prData = null,
-  prBusy = false;
 const cancelling = new Set(),
   cancelErrors = new Map(),
   approving = new Set(),
@@ -496,7 +494,13 @@ async function serviceLog() {
   }
 }
 
-const roleNames = { author: "Author", reviewer: "Reviewer", assignee: "Assignee" };
+const roleNames = {
+  author: "Author",
+  reviewer: "Reviewer",
+  assignee: "Assignee",
+  mentioned: "Mentioned",
+  participant: "Participant",
+};
 const ciStates = {
   SUCCESS: ["Passed", "green"],
   FAILURE: ["Failed", "red"],
@@ -506,59 +510,7 @@ const ciStates = {
   NONE: ["No checks", ""],
 };
 
-const prColumns = {
-  repo: "Repository",
-  title: "Pull request",
-  author: "Author",
-  readiness: "Review status",
-  roles: "Your role",
-  ci: "CI",
-  opened_at: "Opened",
-  updated_at: "Last updated",
-};
-let prSort = "updated_at",
-  prAscending = false;
-function prReviewBadges(pr) {
-  const badges = pr.draft ? [["Draft", ""]] : [];
-  if (pr.review_decision === "APPROVED") badges.push(["Approved", "green pr-approved"]);
-  else if (!pr.draft) badges.push(["Ready for review", "blue"]);
-  return badges;
-}
-function prSortValue(pr) {
-  if (prSort === "readiness")
-    return prReviewBadges(pr)
-      .map(([label]) => label)
-      .join(" · ");
-  if (prSort === "roles")
-    return pr.roles
-      .map((role) => roleNames[role] || role)
-      .sort()
-      .join(", ");
-  if (prSort === "ci") return (ciStates[pr.ci] || ["Unknown"])[0];
-  if (prSort === "opened_at" || prSort === "updated_at") {
-    const value = Date.parse(pr[prSort]);
-    return Number.isFinite(value) ? value : null;
-  }
-  return pr[prSort] || null;
-}
-function comparePRs(a, b) {
-  const left = prSortValue(a),
-    right = prSortValue(b);
-  // Keep missing metadata at the bottom in either direction.
-  if (left === null || right === null) return left === right ? 0 : left === null ? 1 : -1;
-  const order =
-    typeof left === "number"
-      ? left - right
-      : left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
-  return (prAscending ? order : -order) || a.id.localeCompare(b.id);
-}
-function sortPRs(column, toggle = false) {
-  prAscending =
-    column === prSort && toggle ? !prAscending : !["opened_at", "updated_at"].includes(column);
-  prSort = column;
-  renderPRs();
-}
-function prDate(value, label, cls) {
+function dateCell(value, label, cls) {
   const cell = el("td", undefined, `pr-time ${cls}`);
   const date = new Date(value || NaN);
   const valid = Number.isFinite(date.getTime());
@@ -570,212 +522,393 @@ function prDate(value, label, cls) {
   );
   return cell;
 }
-let prRepositoriesKey = null;
-function updatePRRepositories(prs) {
-  const select = $("pr-repo");
-  const selected = select.value || "all";
-  const repositories = [...new Set(prs.map((pr) => pr.repo))].sort((a, b) => a.localeCompare(b));
-  // Retain an active filter if its last PR closes between snapshots.
-  if (selected !== "all" && !repositories.includes(selected)) repositories.push(selected);
-  const key = JSON.stringify(repositories);
-  if (key === prRepositoriesKey) return;
-  prRepositoriesKey = key;
-  const options = [["all", "All repositories"], ...repositories.map((repo) => [repo, repo])].map(
-    ([value, text]) => {
-      const option = el("option", text);
-      option.value = value;
-      return option;
-    },
-  );
-  select.replaceChildren(...options);
-  select.value = selected;
+function repoCell(repo) {
+  const cell = el("td", undefined, "pr-repo");
+  cell.append(link(repo, `https://github.com/${repo}`));
+  return cell;
 }
-const prVisits = new Map();
-const prChangeFields = {
-  repo: "Repository",
-  title: "Title",
-  author: "Author",
-  ci: "CI",
-  review_decision: "Review",
-  draft: "Draft status",
-  roles: "Your role",
-  head_sha: "New commits",
-};
-function prVisitSnapshot() {
-  return {
-    synced_at: prData.synced_at,
-    prs: Object.fromEntries(
-      prData.prs.map((pr) => [
-        pr.id,
-        Object.fromEntries(
-          [...Object.keys(prChangeFields), "updated_at"].map((field) => [
-            field,
-            field === "roles" ? [...(pr.roles || [])].sort() : (pr[field] ?? null),
-          ]),
-        ),
-      ]),
-    ),
+function authorCell(login) {
+  const cell = el("td", undefined, "pr-author");
+  cell.append(login ? link(login, `https://github.com/${login}`) : el("span", "Unknown"));
+  return cell;
+}
+function rolesCell(values) {
+  const cell = el("td");
+  const tags = el("div", undefined, "pr-roles");
+  for (const value of values || []) tags.append(el("span", roleNames[value] || value, "badge"));
+  cell.append(tags);
+  return cell;
+}
+function ciBadge(pr) {
+  const [label, color] = ciStates[pr.ci] || ["Unknown", ""];
+  const checksLink = link(label, `${pr.url}/checks`);
+  checksLink.className = `badge ${color}`;
+  checksLink.setAttribute("aria-label", `CI ${label} for ${pr.repo} #${pr.number}`);
+  checksLink.onclick = (event) => {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    openPRCI(pr);
   };
+  return checksLink;
 }
-function readPRVisit(key) {
-  const saved = JSON.parse(localStorage.getItem(key));
-  return saved &&
-    Number.isFinite(saved.synced_at) &&
-    saved.prs &&
-    typeof saved.prs === "object" &&
-    !Array.isArray(saved.prs)
-    ? saved
-    : null;
-}
-function currentPRVisit() {
-  if (document.hidden || $("prs-panel").hidden || !prData.login || !prData.synced_at) return null;
-  const key = `babysit-pr:seen-prs:v1:${prData.login}`;
-  if (!prVisits.has(key)) {
-    let baseline = null;
-    let storage = true;
-    try {
-      baseline = readPRVisit(key);
-    } catch (error) {
-      storage = error instanceof SyntaxError;
-    }
-    prVisits.set(key, {
-      key,
-      baseline: baseline || prVisitSnapshot(),
-      first: !baseline,
-      storage,
-      saved: null,
-    });
+function labelBadge(label) {
+  const node = el("span", label.name, "badge pr-label");
+  if (/^[0-9a-f]{6}$/i.test(label.color || "")) {
+    // CSSOM assignments are allowed by the style-src policy; inline attributes are not.
+    const [r, g, b] = [0, 2, 4].map((i) => parseInt(label.color.slice(i, i + 2), 16));
+    node.style.background = `#${label.color}`;
+    node.style.color = r * 0.299 + g * 0.587 + b * 0.114 > 150 ? "#1e2a24" : "#fff";
   }
-  return prVisits.get(key);
+  return node;
 }
-function rememberPRVisit(visit) {
-  if (!visit || !visit.storage || prData.error || prData.refreshing) return;
-  const snapshot = prVisitSnapshot();
-  if (snapshot.synced_at < visit.baseline.synced_at) return;
-  const serialized = JSON.stringify(snapshot);
-  if (serialized === visit.saved) return;
-  try {
-    let latest = null;
-    try {
-      latest = readPRVisit(visit.key);
-    } catch (error) {
-      if (!(error instanceof SyntaxError)) throw error;
-    }
-    // A slower tab must not overwrite a newer snapshot saved by another tab.
-    if (!latest || latest.synced_at <= snapshot.synced_at)
-      localStorage.setItem(visit.key, serialized);
-    visit.saved = serialized;
-  } catch {
-    visit.storage = false;
+function sortedNames(values) {
+  return [...(values || [])].sort();
+}
+function prReviewBadges(pr) {
+  const badges = pr.draft ? [["Draft", ""]] : [];
+  if (pr.review_decision === "APPROVED") badges.push(["Approved", "green pr-approved"]);
+  else if (!pr.draft) badges.push(["Ready for review", "blue"]);
+  return badges;
+}
+
+// One sortable, filterable overview table with "since your last visit" highlighting.
+// `spec` supplies the column list, per-item cells, filters, and wording; the factory
+// owns sorting state, repository/label option lists, visit tracking, and rendering.
+function itemTable(spec) {
+  const id = (suffix) => $(`${spec.prefix}-${suffix}`);
+  const table = {
+    data: null,
+    busy: false,
+    sort: spec.defaultSort,
+    ascending: false,
+    visits: new Map(),
+    optionKeys: new Map(),
+  };
+  function items() {
+    return table.data?.[spec.key] || [];
   }
-}
-function prChanges(pr, visit) {
-  if (!visit || prData.synced_at < visit.baseline.synced_at) return null;
-  const old = Object.hasOwn(visit.baseline.prs, pr.id) ? visit.baseline.prs[pr.id] : null;
-  if (!old || typeof old !== "object") return { isNew: true, fields: [] };
-  const fields = Object.keys(prChangeFields).filter((field) => {
-    const value = field === "roles" ? [...(pr.roles || [])].sort() : (pr[field] ?? null);
-    return JSON.stringify(old[field] ?? null) !== JSON.stringify(value);
-  });
-  if (!fields.length && old.updated_at === (pr.updated_at ?? null)) return null;
-  return { isNew: false, fields };
-}
-function renderPRs() {
-  if (!prData) return;
-  const prs = prData.prs || [];
-  const visit = currentPRVisit();
-  updatePRRepositories(prs);
-  const query = $("pr-search").value.toLowerCase();
-  const role = $("pr-role").value;
-  const ci = $("pr-ci").value;
-  const repo = $("pr-repo").value;
-  const review = $("pr-review").value;
-  const visible = prs.filter(
-    (pr) =>
-      (role === "all" || pr.roles.includes(role)) &&
-      (ci === "all" || pr.ci === ci || (ci === "UNKNOWN" && !ciStates[pr.ci])) &&
-      (repo === "all" || pr.repo === repo) &&
-      (review === "all" || (review === "draft" ? pr.draft : !pr.draft)) &&
-      `${pr.repo} ${pr.title} ${pr.number} ${pr.author || ""}`.toLowerCase().includes(query),
-  );
-  visible.sort(comparePRs);
-  for (const column of Object.keys(prColumns)) {
-    $(`pr-heading-${column}`).setAttribute(
-      "aria-sort",
-      column === prSort ? (prAscending ? "ascending" : "descending") : "none",
+  function sortValue(item) {
+    const column = table.sort;
+    if (spec.dates.includes(column)) {
+      const value = Date.parse(item[column]);
+      return Number.isFinite(value) ? value : null;
+    }
+    const value = spec.sortValue(item, column);
+    return value === undefined ? item[column] || null : value;
+  }
+  function compare(a, b) {
+    const left = sortValue(a),
+      right = sortValue(b);
+    // Keep missing metadata at the bottom in either direction.
+    if (left === null || right === null) return left === right ? 0 : left === null ? 1 : -1;
+    const order =
+      typeof left === "number"
+        ? left - right
+        : left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+    return (table.ascending ? order : -order) || a.id.localeCompare(b.id);
+  }
+  function sort(column, toggle = false) {
+    table.ascending =
+      column === table.sort && toggle ? !table.ascending : !spec.dates.includes(column);
+    table.sort = column;
+    render();
+  }
+  function updateOptions(name, values, allLabel) {
+    const select = id(name);
+    const selected = select.value || "all";
+    const options = [...new Set(values)].sort((a, b) => a.localeCompare(b));
+    // Retain an active filter if its last item disappears between snapshots.
+    if (selected !== "all" && !options.includes(selected)) options.push(selected);
+    const key = JSON.stringify(options);
+    if (key === table.optionKeys.get(name)) return;
+    table.optionKeys.set(name, key);
+    select.replaceChildren(
+      ...[["all", allLabel], ...options.map((value) => [value, value])].map(([value, text]) => {
+        const option = el("option", text);
+        option.value = value;
+        return option;
+      }),
     );
+    select.value = selected;
   }
-  $("pr-sort").value = prSort;
-  $("pr-sort-direction").textContent = prAscending ? "Ascending" : "Descending";
-  $("pr-count").textContent = `${visible.length} / ${prs.length}`;
-  const sync = prData.synced_at ? new Date(prData.synced_at * 1000).toLocaleString() : null;
-  $("pr-sync").textContent =
-    `${prData.login ? `@${prData.login} · ` : ""}Open PRs · Sorted by ${prColumns[prSort]} (${prAscending ? "ascending" : "descending"}) · ${sync ? `Synced ${sync}` : "Not synced yet"}${prData.refreshing ? " · Syncing…" : " · GitHub refreshes every 5 minutes"}`;
-  const issues = [prData.error, ...(prData.warnings || [])].filter(Boolean);
-  $("pr-alert").hidden = !issues.length;
-  $("pr-alert").textContent =
-    issues.join(" ") +
-    (prData.error && sync ? " Showing saved results; they may be out of date." : "");
-  $("pr-list").replaceChildren();
-  let newCount = 0,
-    changedCount = 0;
-  for (const pr of visible) {
-    const row = el("tr");
-    const title = el("td");
+  function changeValue(item, field) {
+    const value = spec.changeValue?.(item, field);
+    return value === undefined ? (item[field] ?? null) : value;
+  }
+  function visitSnapshot() {
+    return {
+      synced_at: table.data.synced_at,
+      [spec.key]: Object.fromEntries(
+        items().map((item) => [
+          item.id,
+          Object.fromEntries(
+            [...Object.keys(spec.changeFields), "updated_at"].map((field) => [
+              field,
+              changeValue(item, field),
+            ]),
+          ),
+        ]),
+      ),
+    };
+  }
+  function readVisit(key) {
+    const saved = JSON.parse(localStorage.getItem(key));
+    return saved &&
+      Number.isFinite(saved.synced_at) &&
+      saved[spec.key] &&
+      typeof saved[spec.key] === "object" &&
+      !Array.isArray(saved[spec.key])
+      ? saved
+      : null;
+  }
+  function currentVisit() {
+    if (document.hidden || $(spec.panel).hidden || !table.data.login || !table.data.synced_at)
+      return null;
+    const key = `babysit-pr:seen-${spec.key}:v1:${table.data.login}`;
+    if (!table.visits.has(key)) {
+      let baseline = null;
+      let storage = true;
+      try {
+        baseline = readVisit(key);
+      } catch (error) {
+        storage = error instanceof SyntaxError;
+      }
+      table.visits.set(key, {
+        key,
+        baseline: baseline || visitSnapshot(),
+        first: !baseline,
+        storage,
+        saved: null,
+      });
+    }
+    return table.visits.get(key);
+  }
+  function rememberVisit(visit) {
+    if (!visit || !visit.storage || table.data.error || table.data.refreshing) return;
+    const snapshot = visitSnapshot();
+    if (snapshot.synced_at < visit.baseline.synced_at) return;
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === visit.saved) return;
+    try {
+      let latest = null;
+      try {
+        latest = readVisit(visit.key);
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      // A slower tab must not overwrite a newer snapshot saved by another tab.
+      if (!latest || latest.synced_at <= snapshot.synced_at)
+        localStorage.setItem(visit.key, serialized);
+      visit.saved = serialized;
+    } catch {
+      visit.storage = false;
+    }
+  }
+  function changes(item, visit) {
+    if (!visit || table.data.synced_at < visit.baseline.synced_at) return null;
+    const seen = visit.baseline[spec.key];
+    const old = Object.hasOwn(seen, item.id) ? seen[item.id] : null;
+    if (!old || typeof old !== "object") return { isNew: true, fields: [] };
+    const fields = Object.keys(spec.changeFields).filter(
+      (field) => JSON.stringify(old[field] ?? null) !== JSON.stringify(changeValue(item, field)),
+    );
+    if (!fields.length && old.updated_at === (item.updated_at ?? null)) return null;
+    return { isNew: false, fields };
+  }
+  function render() {
+    if (!table.data) return;
+    const all = items();
+    const visit = currentVisit();
+    spec.updateFilters(all, updateOptions);
+    const query = id("search").value.toLowerCase();
+    const filters = Object.fromEntries(spec.filters.map((name) => [name, id(name).value]));
+    const visible = all.filter(
+      (item) => spec.visible(item, filters) && spec.searchText(item).toLowerCase().includes(query),
+    );
+    visible.sort(compare);
+    for (const column of Object.keys(spec.columns)) {
+      id(`heading-${column}`).setAttribute(
+        "aria-sort",
+        column === table.sort ? (table.ascending ? "ascending" : "descending") : "none",
+      );
+    }
+    id("sort").value = table.sort;
+    id("sort-direction").textContent = table.ascending ? "Ascending" : "Descending";
+    id("count").textContent = `${visible.length} / ${all.length}`;
+    const sync = table.data.synced_at
+      ? new Date(table.data.synced_at * 1000).toLocaleString()
+      : null;
+    id("sync").textContent =
+      `${table.data.login ? `@${table.data.login} · ` : ""}${spec.text.open} · Sorted by ${spec.columns[table.sort]} (${table.ascending ? "ascending" : "descending"}) · ${sync ? `Synced ${sync}` : "Not synced yet"}${table.data.refreshing ? " · Syncing…" : " · GitHub refreshes every 5 minutes"}`;
+    const problems = [table.data.error, ...(table.data.warnings || [])].filter(Boolean);
+    id("alert").hidden = !problems.length;
+    id("alert").textContent =
+      problems.join(" ") +
+      (table.data.error && sync ? " Showing saved results; they may be out of date." : "");
+    id("list").replaceChildren();
+    let newCount = 0,
+      changedCount = 0;
+    for (const item of visible) {
+      const row = el("tr");
+      const { cells, title, fields, updated } = spec.row(item);
+      const change = changes(item, visit);
+      if (change) {
+        row.className = change.isNew ? "pr-new" : "pr-changed";
+        if (change.isNew) newCount += 1;
+        else changedCount += 1;
+        title.append(
+          el(
+            "span",
+            change.isNew ? "New" : "Updated",
+            `badge ${change.isNew ? "blue" : "amber"} pr-change-badge`,
+          ),
+        );
+        title.append(
+          el(
+            "small",
+            change.isNew
+              ? "Since your last visit"
+              : change.fields.length
+                ? change.fields.map((field) => spec.changeFields[field]).join(" · ")
+                : spec.text.activity,
+            "pr-change-note",
+          ),
+        );
+        for (const field of change.fields) fields[field].classList.add("pr-field-changed");
+        if (!change.isNew && !change.fields.length) updated.classList.add("pr-field-changed");
+      }
+      row.append(...cells, workspaceCell(item));
+      id("list").append(row);
+    }
+    rememberVisit(visit);
+    id("changes").hidden = !visit;
+    id("changes").textContent = !visit
+      ? ""
+      : !visit.storage
+        ? "Changes are tracked for this visit only; browser storage is unavailable."
+        : table.data.synced_at < visit.baseline.synced_at
+          ? `Waiting for a current ${spec.text.short} snapshot to compare with your last visit.`
+          : newCount || changedCount
+            ? `Since your last visit: ${newCount} new · ${changedCount} updated in this view.`
+            : visit.first
+              ? "Changes will be highlighted from this visit onward, in this browser."
+              : "No changes since your last visit in this view.";
+    id("empty").hidden = visible.length > 0;
+    id("empty").textContent = all.length
+      ? spec.text.noMatch
+      : table.data.synced_at
+        ? spec.text.none
+        : table.data.error
+          ? spec.text.unavailable
+          : spec.text.loading;
+  }
+  async function refresh() {
+    if (table.busy) return;
+    table.busy = true;
+    try {
+      table.data = await get(spec.endpoint);
+      render();
+    } catch (error) {
+      id("alert").hidden = false;
+      id("alert").textContent =
+        `${spec.text.refreshError}: ${error.message}. Saved results may be out of date.`;
+    } finally {
+      table.busy = false;
+    }
+  }
+  for (const column of Object.keys(spec.columns)) {
+    id(`sort-${column}`).onclick = () => sort(column, true);
+  }
+  id("sort").onchange = () => sort(id("sort").value);
+  id("sort-direction").onclick = () => sort(table.sort, true);
+  id("refresh").onclick = refresh;
+  id("search").oninput = render;
+  for (const name of spec.filters) id(name).onchange = render;
+  return Object.assign(table, { items, render, refresh });
+}
+
+const prTable = itemTable({
+  prefix: "pr",
+  key: "prs",
+  endpoint: "/api/prs",
+  panel: "prs-panel",
+  columns: {
+    repo: "Repository",
+    title: "Pull request",
+    author: "Author",
+    readiness: "Review status",
+    roles: "Your role",
+    ci: "CI",
+    opened_at: "Opened",
+    updated_at: "Last updated",
+  },
+  dates: ["opened_at", "updated_at"],
+  defaultSort: "updated_at",
+  filters: ["role", "ci", "repo", "review"],
+  text: {
+    short: "PR",
+    open: "Open PRs",
+    activity: "PR activity changed",
+    noMatch: "No matching pull requests.",
+    none: "No open pull requests for your roles.",
+    unavailable: "PR data is unavailable. Check GitHub authentication and the sync error above.",
+    loading: "Loading your open pull requests…",
+    refreshError: "Cannot refresh PR overview",
+  },
+  changeFields: {
+    repo: "Repository",
+    title: "Title",
+    author: "Author",
+    ci: "CI",
+    review_decision: "Review",
+    draft: "Draft status",
+    roles: "Your role",
+    head_sha: "New commits",
+  },
+  changeValue: (pr, field) => (field === "roles" ? sortedNames(pr.roles) : undefined),
+  sortValue(pr, column) {
+    if (column === "readiness")
+      return prReviewBadges(pr)
+        .map(([label]) => label)
+        .join(" · ");
+    if (column === "roles")
+      return sortedNames(pr.roles.map((role) => roleNames[role] || role)).join(", ");
+    if (column === "ci") return (ciStates[pr.ci] || ["Unknown"])[0];
+    return undefined;
+  },
+  updateFilters(prs, update) {
+    update(
+      "repo",
+      prs.map((pr) => pr.repo),
+      "All repositories",
+    );
+  },
+  visible: (pr, f) =>
+    (f.role === "all" || pr.roles.includes(f.role)) &&
+    (f.ci === "all" || pr.ci === f.ci || (f.ci === "UNKNOWN" && !ciStates[pr.ci])) &&
+    (f.repo === "all" || pr.repo === f.repo) &&
+    (f.review === "all" || (f.review === "draft" ? pr.draft : !pr.draft)),
+  searchText: (pr) => `${pr.repo} ${pr.title} ${pr.number} ${pr.author || ""}`,
+  row(pr) {
+    const title = el("td", undefined, "pr-description");
     const titleLink = link(pr.title, pr.url);
     titleLink.className = "pr-title";
     title.append(titleLink, el("span", `#${pr.number}`, "pr-meta"));
-    const author = el("td", undefined, "pr-author");
-    author.append(
-      pr.author ? link(pr.author, `https://github.com/${pr.author}`) : el("span", "Unknown"),
-    );
+    const author = authorCell(pr.author);
     const readiness = el("td", undefined, "pr-readiness");
     for (const [label, color] of prReviewBadges(pr))
       readiness.append(el("span", label, `badge ${color}`));
-    const roles = el("td");
-    const tags = el("div", undefined, "pr-roles");
-    for (const value of pr.roles) tags.append(el("span", roleNames[value] || value, "badge"));
-    roles.append(tags);
+    const roles = rolesCell(pr.roles);
     const checks = el("td");
-    const [label, color] = ciStates[pr.ci] || ["Unknown", ""];
-    const checksLink = link(label, `${pr.url}/checks`);
-    checksLink.className = `badge ${color}`;
-    checksLink.setAttribute("aria-label", `CI ${label} for ${pr.repo} #${pr.number}`);
-    checksLink.onclick = (event) => {
-      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-      event.preventDefault();
-      openPRCI(pr);
-    };
-    checks.append(checksLink);
-    const opened = prDate(pr.opened_at, "Opened", "pr-opened");
-    const updated = prDate(pr.updated_at, "Updated", "pr-updated");
-    const repo = el("td", undefined, "pr-repo");
-    repo.append(link(pr.repo, `https://github.com/${pr.repo}`));
-    title.className = "pr-description";
-    const changes = prChanges(pr, visit);
-    if (changes) {
-      row.className = changes.isNew ? "pr-new" : "pr-changed";
-      if (changes.isNew) newCount += 1;
-      else changedCount += 1;
-      title.append(
-        el(
-          "span",
-          changes.isNew ? "New" : "Updated",
-          `badge ${changes.isNew ? "blue" : "amber"} pr-change-badge`,
-        ),
-      );
-      title.append(
-        el(
-          "small",
-          changes.isNew
-            ? "Since your last visit"
-            : changes.fields.length
-              ? changes.fields.map((field) => prChangeFields[field]).join(" · ")
-              : "PR activity changed",
-          "pr-change-note",
-        ),
-      );
-      const cells = {
+    checks.append(ciBadge(pr));
+    const opened = dateCell(pr.opened_at, "Opened", "pr-opened");
+    const updated = dateCell(pr.updated_at, "Updated", "pr-updated");
+    const repo = repoCell(pr.repo);
+    return {
+      cells: [repo, title, author, readiness, roles, checks, opened, updated],
+      title,
+      updated,
+      fields: {
         repo,
         title,
         author,
@@ -784,52 +917,149 @@ function renderPRs() {
         draft: readiness,
         roles,
         head_sha: updated,
-      };
-      for (const field of changes.fields) cells[field].classList.add("pr-field-changed");
-      if (!changes.isNew && !changes.fields.length) updated.classList.add("pr-field-changed");
-    }
-    row.append(repo, title, author, readiness, roles, checks, opened, updated, workspaceCell(pr));
-    $("pr-list").append(row);
-  }
-  rememberPRVisit(visit);
-  $("pr-changes").hidden = !visit;
-  $("pr-changes").textContent = !visit
-    ? ""
-    : !visit.storage
-      ? "Changes are tracked for this visit only; browser storage is unavailable."
-      : prData.synced_at < visit.baseline.synced_at
-        ? "Waiting for a current PR snapshot to compare with your last visit."
-        : newCount || changedCount
-          ? `Since your last visit: ${newCount} new · ${changedCount} updated in this view.`
-          : visit.first
-            ? "Changes will be highlighted from this visit onward, in this browser."
-            : "No changes since your last visit in this view.";
-  $("pr-empty").hidden = visible.length > 0;
-  $("pr-empty").textContent = prs.length
-    ? "No matching pull requests."
-    : prData.synced_at
-      ? "No open pull requests for your roles."
-      : prData.error
-        ? "PR data is unavailable. Check GitHub authentication and the sync error above."
-        : "Loading your open pull requests…";
-}
-async function refreshPRs() {
-  if (prBusy) return;
-  prBusy = true;
-  try {
-    prData = await get("/api/prs");
-    renderPRs();
-  } catch (error) {
-    $("pr-alert").hidden = false;
-    $("pr-alert").textContent =
-      `Cannot refresh PR overview: ${error.message}. Saved results may be out of date.`;
-  } finally {
-    prBusy = false;
-  }
+      },
+    };
+  },
+});
+
+function linkedPRBadge(issue, pr) {
+  const wrap = el("span", undefined, "pr-linked-pr");
+  const label = pr.repo === issue.repo ? `#${pr.number}` : `${pr.repo}#${pr.number}`;
+  const anchor = link(label, pr.url);
+  anchor.className = `badge ${pr.draft ? "" : pr.state === "MERGED" ? "green" : "blue"}`;
+  anchor.setAttribute("aria-label", `Pull request ${pr.repo} #${pr.number}`);
+  if (pr.title) anchor.title = pr.title;
+  wrap.append(anchor);
+  if (pr.draft) wrap.append(el("small", "Draft"));
+  // CI is only known for PRs already in the PR overview; nothing is fetched here.
+  const known = prTable.items().find((p) => p.repo === pr.repo && p.number === pr.number);
+  if (known) wrap.append(ciBadge(known));
+  return wrap;
 }
 
+const issueTable = itemTable({
+  prefix: "issue",
+  key: "issues",
+  endpoint: "/api/issues",
+  panel: "issues-panel",
+  columns: {
+    repo: "Repository",
+    title: "Issue",
+    author: "Author",
+    assignees: "Assignees",
+    roles: "Your role",
+    comments: "Comments",
+    linked_prs: "Linked PRs",
+    opened_at: "Opened",
+    updated_at: "Last updated",
+  },
+  dates: ["opened_at", "updated_at"],
+  defaultSort: "updated_at",
+  filters: ["role", "repo", "label", "linked"],
+  text: {
+    short: "issue",
+    open: "Open issues",
+    activity: "Issue activity changed",
+    noMatch: "No matching issues.",
+    none: "No open issues for your roles.",
+    unavailable: "Issue data is unavailable. Check GitHub authentication and the sync error above.",
+    loading: "Loading your open issues…",
+    refreshError: "Cannot refresh issue overview",
+  },
+  changeFields: {
+    repo: "Repository",
+    title: "Title",
+    author: "Author",
+    assignees: "Assignees",
+    labels: "Labels",
+    roles: "Your role",
+    comments: "Comments",
+    linked_prs: "Linked PRs",
+  },
+  changeValue(issue, field) {
+    if (field === "roles" || field === "assignees") return sortedNames(issue[field]);
+    if (field === "labels") return sortedNames((issue.labels || []).map((label) => label.name));
+    if (field === "linked_prs")
+      return sortedNames((issue.linked_prs || []).map((pr) => `${pr.repo}#${pr.number}`));
+    return undefined;
+  },
+  sortValue(issue, column) {
+    if (column === "roles")
+      return sortedNames(issue.roles.map((role) => roleNames[role] || role)).join(", ");
+    if (column === "assignees")
+      return issue.assignees?.length ? sortedNames(issue.assignees).join(", ") : null;
+    if (column === "comments") return Number(issue.comments) || 0;
+    if (column === "linked_prs") return (issue.linked_prs || []).length;
+    return undefined;
+  },
+  updateFilters(issues, update) {
+    update(
+      "repo",
+      issues.map((issue) => issue.repo),
+      "All repositories",
+    );
+    update(
+      "label",
+      issues.flatMap((issue) => (issue.labels || []).map((label) => label.name)),
+      "All labels",
+    );
+  },
+  visible: (issue, f) =>
+    (f.role === "all" || issue.roles.includes(f.role)) &&
+    (f.repo === "all" || issue.repo === f.repo) &&
+    (f.label === "all" || (issue.labels || []).some((label) => label.name === f.label)) &&
+    (f.linked === "all" || (f.linked === "linked") === Boolean(issue.linked_prs?.length)),
+  searchText: (issue) =>
+    `${issue.repo} ${issue.title} ${issue.number} ${issue.author || ""} ${(issue.assignees || []).join(" ")} ${(issue.labels || []).map((label) => label.name).join(" ")}`,
+  row(issue) {
+    const title = el("td", undefined, "pr-description");
+    const titleLink = link(issue.title, issue.url);
+    titleLink.className = "pr-title";
+    title.append(titleLink, el("span", `#${issue.number}`, "pr-meta"));
+    if (issue.labels?.length) {
+      const labels = el("div", undefined, "pr-badges pr-labels");
+      for (const label of issue.labels) labels.append(labelBadge(label));
+      title.append(labels);
+    }
+    const author = authorCell(issue.author);
+    const assignees = el("td", undefined, "pr-assignees");
+    if (issue.assignees?.length) {
+      const list = el("div", undefined, "pr-badges");
+      for (const login of issue.assignees) list.append(link(login, `https://github.com/${login}`));
+      assignees.append(list);
+    } else assignees.append(el("span", "Unassigned", "pr-meta"));
+    const roles = rolesCell(issue.roles);
+    const comments = el("td", String(Number(issue.comments) || 0), "pr-comments");
+    const linked = el("td", undefined, "pr-linked");
+    if (issue.linked_prs?.length) {
+      const list = el("div", undefined, "pr-badges");
+      for (const pr of issue.linked_prs) list.append(linkedPRBadge(issue, pr));
+      linked.append(list);
+    } else linked.append(el("span", "None", "pr-meta"));
+    const opened = dateCell(issue.opened_at, "Opened", "pr-opened");
+    const updated = dateCell(issue.updated_at, "Updated", "pr-updated");
+    const repo = repoCell(issue.repo);
+    return {
+      cells: [repo, title, author, assignees, roles, comments, linked, opened, updated],
+      title,
+      updated,
+      fields: {
+        repo,
+        title,
+        author,
+        assignees,
+        labels: title,
+        roles,
+        comments,
+        linked_prs: linked,
+      },
+    };
+  },
+});
+
 async function refresh() {
-  void refreshPRs();
+  // Issues render linked-PR CI from the PR overview, so refresh PRs first.
+  void prTable.refresh().then(() => issueTable.refresh());
   if (busy) return;
   busy = true;
   try {
@@ -846,19 +1076,25 @@ async function refresh() {
     busy = false;
   }
 }
+const pages = ["watcher", "prs", "issues"];
 function showPage(name) {
-  for (const page of ["watcher", "prs"]) {
+  for (const page of pages) {
     const active = page === name;
     $(`${page}-panel`).hidden = !active;
     $(`${page}-tab`).setAttribute("aria-selected", String(active));
     $(`${page}-tab`).tabIndex = active ? 0 : -1;
   }
-  if (name === "prs") renderPRs();
+  if (name === "prs") prTable.render();
+  if (name === "issues") issueTable.render();
+}
+function overviewVisible() {
+  return !$("prs-panel").hidden || !$("issues-panel").hidden;
 }
 function pageFromURL() {
-  showPage(window.location.hash === "#prs" ? "prs" : "watcher");
+  const name = window.location.hash.slice(1);
+  showPage(pages.includes(name) ? name : "watcher");
 }
-for (const page of ["watcher", "prs"]) {
+for (const [index, page] of pages.entries()) {
   $(`${page}-tab`).onclick = () => {
     window.location.hash = page;
     showPage(page);
@@ -869,24 +1105,16 @@ for (const page of ["watcher", "prs"]) {
     event.preventDefault();
     const next =
       event.key === "Home"
-        ? "watcher"
+        ? pages[0]
         : event.key === "End"
-          ? "prs"
-          : page === "watcher"
-            ? "prs"
-            : "watcher";
+          ? pages[pages.length - 1]
+          : pages[(index + (event.key === "ArrowRight" ? 1 : pages.length - 1)) % pages.length];
     $(`${next}-tab`).click();
     $(`${next}-tab`).focus();
   };
 }
 window.addEventListener("hashchange", pageFromURL);
 pageFromURL();
-for (const column of Object.keys(prColumns)) {
-  $(`pr-sort-${column}`).onclick = () => sortPRs(column, true);
-}
-$("pr-sort").onchange = () => sortPRs($("pr-sort").value);
-$("pr-sort-direction").onclick = () => sortPRs(prSort, true);
-$("pr-refresh").onclick = refreshPRs;
 $("show-attention").onclick = () => {
   $("filter").value = "attention";
   $("search").value = "";
@@ -898,11 +1126,6 @@ $("show-ended").onclick = () => {
   render();
 };
 $("refresh").onclick = refresh;
-$("pr-search").oninput = renderPRs;
-$("pr-role").onchange = renderPRs;
-$("pr-ci").onchange = renderPRs;
-$("pr-repo").onchange = renderPRs;
-$("pr-review").onchange = renderPRs;
 $("search").oninput = render;
 $("filter").onchange = render;
 $("service-details").ontoggle = () => {
@@ -919,14 +1142,23 @@ setInterval(() => {
 }, 5000);
 refresh();
 
-let workspaceData = { prs: {} },
+let workspaceData = { prs: {}, issues: {} },
   workspaceBusy = false;
+// GraphQL ids are globally unique, so one id names one PR or issue across both maps.
+function workspaceInfo(item) {
+  return workspaceData.prs?.[item.id] ?? workspaceData.issues?.[item.id];
+}
+function setWorkspaceOperation(item, operation) {
+  const info = workspaceInfo(item);
+  if (info) info.operation = operation;
+}
 async function refreshWorkspaces() {
-  if (workspaceBusy || document.hidden || $("prs-panel").hidden) return;
+  if (workspaceBusy || document.hidden || !overviewVisible()) return;
   workspaceBusy = true;
   try {
     workspaceData = await get("/api/workspaces");
-    renderPRs();
+    prTable.render();
+    issueTable.render();
     updateWorkspaceOperation();
   } catch (error) {
     workspaceData.error = error.message;
@@ -934,16 +1166,19 @@ async function refreshWorkspaces() {
     workspaceBusy = false;
   }
 }
-let workspaceDialogPR = null;
+let workspaceDialogItem = null;
 function workspaceButton(label, callback) {
   const button = el("button", label);
   button.type = "button";
   button.onclick = callback;
   return button;
 }
-function workspaceCell(pr) {
+function workspaceStatus(target) {
+  return `${target.agent_status}${target.linked_pr ? ` · via PR #${target.linked_pr}` : ""} · ${target.path}`;
+}
+function workspaceCell(item) {
   const cell = el("td", undefined, "pr-actions");
-  const info = workspaceData.prs[pr.id];
+  const info = workspaceInfo(item);
   const matches = info?.matches || [];
   const label = matches.some((m) => m.workspace_id)
     ? "Open workspace"
@@ -954,8 +1189,8 @@ function workspaceCell(pr) {
         : "Clone and create";
   const button = workspaceButton(info ? label : "Workspace actions", () => {
     if (matches.length === 1 && matches[0].workspace_id) {
-      void chooseWorkspace(pr, matches[0], "open");
-    } else void workspaceDialog(pr);
+      void chooseWorkspace(item, matches[0], "open");
+    } else void workspaceDialog(item);
   });
   cell.append(button);
   if (matches.length === 1) {
@@ -963,19 +1198,20 @@ function workspaceCell(pr) {
     menu.append(el("summary", "More actions"));
     if (matches[0].workspace_id)
       menu.append(
-        workspaceButton("Focus in herdr", () => chooseWorkspace(pr, matches[0], "focus")),
+        workspaceButton("Focus in herdr", () => chooseWorkspace(item, matches[0], "focus")),
       );
-    menu.append(workspaceButton("Copy command", () => chooseWorkspace(pr, matches[0], "copy")));
+    menu.append(workspaceButton("Copy command", () => chooseWorkspace(item, matches[0], "copy")));
     cell.append(menu);
+    if (matches[0].linked_pr) cell.append(el("small", `Via PR #${matches[0].linked_pr}`));
   }
   if (info?.operation) cell.append(el("small", info.operation.message));
   return cell;
 }
-async function workspaceRequest(pr, action, params = {}) {
+async function workspaceRequest(item, action, params = {}) {
   const response = await fetch("/api/workspace-action", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-action" },
-    body: JSON.stringify({ id: pr.id, action, ...params }),
+    body: JSON.stringify({ id: item.id, action, ...params }),
   });
   const value = await response.json();
   if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
@@ -984,37 +1220,37 @@ async function workspaceRequest(pr, action, params = {}) {
 function workspaceError(error) {
   $("workspace-error").textContent = error.message;
 }
-async function chooseWorkspace(pr, target, action) {
+async function chooseWorkspace(item, target, action) {
   const opened = action === "open" ? window.open("about:blank", "_blank") : null;
   if (opened) opened.opener = null;
   $("workspace-error").textContent = "";
   const params = { path: target.path };
   if (target.workspace_id) params.workspace_id = target.workspace_id;
   try {
-    const value = await workspaceRequest(pr, action, params);
+    const value = await workspaceRequest(item, action, params);
     if (action === "copy") {
       await navigator.clipboard.writeText(value.command);
       $("workspace-error").textContent = "Command copied";
     } else if (value.result && action === "open") {
       if (opened) opened.location.href = value.result.url;
       else {
-        await workspaceDialog(pr);
+        await workspaceDialog(item);
         $("workspace-error").textContent = "Use Open in Collie to continue.";
       }
       $("workspace-result").replaceChildren(link("Open in Collie", value.result.url));
     } else if (value.operation) {
-      workspaceData.prs[pr.id].operation = value.operation;
+      setWorkspaceOperation(item, value.operation);
       updateWorkspaceOperation();
     }
   } catch (error) {
     if (opened) opened.close();
-    if (!$("workspace-dialog").open) await workspaceDialog(pr);
+    if (!$("workspace-dialog").open) await workspaceDialog(item);
     workspaceError(error);
   }
 }
-async function workspaceDialog(pr) {
-  workspaceDialogPR = pr.id;
-  $("workspace-title").textContent = `${pr.repo} #${pr.number}`;
+async function workspaceDialog(item) {
+  workspaceDialogItem = item;
+  $("workspace-title").textContent = `${item.repo} #${item.number}`;
   $("workspace-error").textContent = "";
   $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
   $("workspace-result").replaceChildren();
@@ -1024,8 +1260,8 @@ async function workspaceDialog(pr) {
   try {
     // Discovery is shared and cached; every action revalidates the selected target.
     workspaceData = await get("/api/workspaces");
-    if (workspaceDialogPR !== pr.id) return;
-    const info = workspaceData.prs[pr.id];
+    if (workspaceDialogItem !== item) return;
+    const info = workspaceInfo(item);
     if (workspaceData.error) throw Error(workspaceData.error);
     if (workspaceData.synced_at === null)
       throw Error("Local discovery is still running. Try again in a moment.");
@@ -1036,22 +1272,19 @@ async function workspaceDialog(pr) {
       body.append(el("p", "Choose a checkout. Opening a workspace preserves its current agent."));
       for (const target of info.matches) {
         const row = el("section", undefined, "workspace-choice");
-        row.append(
-          el("strong", target.name),
-          el("small", `${target.agent_status} · ${target.path}`),
-        );
+        row.append(el("strong", target.name), el("small", workspaceStatus(target)));
         row.append(
           workspaceButton(target.workspace_id ? "Open workspace" : "Reopen workspace", () =>
-            chooseWorkspace(pr, target, target.workspace_id ? "open" : "reopen"),
+            chooseWorkspace(item, target, target.workspace_id ? "open" : "reopen"),
           ),
         );
         const menu = el("details");
         menu.append(el("summary", "More actions"));
         if (target.workspace_id)
           menu.append(
-            workspaceButton("Focus in herdr", () => chooseWorkspace(pr, target, "focus")),
+            workspaceButton("Focus in herdr", () => chooseWorkspace(item, target, "focus")),
           );
-        menu.append(workspaceButton("Copy command", () => chooseWorkspace(pr, target, "copy")));
+        menu.append(workspaceButton("Copy command", () => chooseWorkspace(item, target, "copy")));
         row.append(menu);
         body.append(row);
       }
@@ -1095,7 +1328,7 @@ async function workspaceDialog(pr) {
           el(
             "p",
             info.destination
-              ? `Clone ${pr.repo} into ${info.destination}`
+              ? `Clone ${item.repo} into ${info.destination}`
               : "Both clone destinations already exist. Move conflicting content before trying again.",
           ),
         );
@@ -1116,16 +1349,16 @@ async function workspaceDialog(pr) {
         $("workspace-error").textContent = "";
         try {
           const value = await workspaceRequest(
-            pr,
+            item,
             info.clones.length ? "create" : "clone-and-create",
             {
               agent: agent.value,
               task: task.value,
               ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
-              retry: workspaceData.prs[pr.id]?.operation?.status === "failed",
+              retry: workspaceInfo(item)?.operation?.status === "failed",
             },
           );
-          workspaceData.prs[pr.id].operation = value.operation;
+          setWorkspaceOperation(item, value.operation);
           updateWorkspaceOperation();
         } catch (error) {
           workspaceError(error);
@@ -1143,8 +1376,8 @@ async function workspaceDialog(pr) {
   }
 }
 function updateWorkspaceOperation() {
-  if (!workspaceDialogPR || !$("workspace-dialog").open) return;
-  const op = workspaceData.prs[workspaceDialogPR]?.operation;
+  if (!workspaceDialogItem || !$("workspace-dialog").open) return;
+  const op = workspaceInfo(workspaceDialogItem)?.operation;
   if (!op) return;
   $("workspace-progress").textContent = `${op.status}: ${op.message}`;
   $("workspace-log").textContent = op.log || "";
@@ -1169,7 +1402,7 @@ function stopCILoads() {
 async function loadCI(url, generation, render, fail, attempt = 0) {
   if (generation !== ciGeneration || !$("ci-dialog").open) return;
   try {
-    if (!document.hidden && !$("prs-panel").hidden) {
+    if (!document.hidden && overviewVisible()) {
       const result = await get(url);
       if (generation !== ciGeneration || !$("ci-dialog").open) return;
       render(result);
@@ -1391,7 +1624,7 @@ function ciLogStream(url, detail) {
       detail.open &&
       $("ci-dialog").open &&
       !document.hidden &&
-      !$("prs-panel").hidden &&
+      overviewVisible() &&
       output.getClientRects().length
     );
   }

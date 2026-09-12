@@ -690,7 +690,8 @@ button:disabled {
   display: block;
   color: var(--muted);
 }
-.pr-roles {
+.pr-roles,
+.pr-badges {
   display: flex;
   gap: 5px;
   flex-wrap: wrap;
@@ -783,8 +784,27 @@ button:disabled {
 .pr-table th[aria-sort="descending"] {
   color: var(--green);
 }
-.pr-author {
+.pr-author,
+.pr-assignees,
+.pr-linked {
   overflow-wrap: anywhere;
+}
+.pr-labels {
+  margin-top: 6px;
+}
+.pr-label {
+  border: 1px solid #0002;
+}
+.pr-linked-pr {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.pr-linked-pr small {
+  color: var(--muted);
+}
+.pr-comments {
+  text-align: center;
 }
 .pr-mobile-sort {
   display: none;
@@ -800,6 +820,21 @@ button:disabled {
   .pr-author::before {
     content: "Author: ";
     color: var(--muted);
+  }
+  .pr-assignees::before {
+    content: "Assignees: ";
+    color: var(--muted);
+  }
+  .pr-comments::before {
+    content: "Comments: ";
+    color: var(--muted);
+  }
+  .pr-linked::before {
+    content: "Linked PRs: ";
+    color: var(--muted);
+  }
+  .pr-comments {
+    text-align: left;
   }
 }
 
