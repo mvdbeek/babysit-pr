@@ -35,6 +35,203 @@ function el(tag, text, cls) {
   if (cls) node.className = cls;
   return node;
 }
+// Keep native values and change events as the contract with filtering and forms.
+const searchableSelects = new WeakMap();
+let selectSequence = 0;
+let dismissSelect = null;
+function syncSelect(select) {
+  searchableSelects.get(select)?.sync();
+}
+function searchableSelect(select) {
+  if (searchableSelects.has(select)) return;
+  const key = `select-${++selectSequence}`;
+  const labels = [...select.labels];
+  const name =
+    select.getAttribute("aria-label") || labels.map((l) => l.textContent.trim()).join(" ");
+  const wrapper = el("span", undefined, "searchable-select");
+  const field = el("span", undefined, "select-field");
+  const input = el("input");
+  input.id = `${key}-input`;
+  input.type = "text";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.setAttribute("role", "combobox");
+  input.setAttribute("aria-label", name);
+  input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-expanded", "false");
+  input.setAttribute("aria-controls", `${key}-options`);
+  const clear = el("button", "×", "select-clear");
+  clear.type = "button";
+  clear.setAttribute("aria-label", `Clear search for ${name}`);
+  const toggle = el("button", "▾", "select-toggle");
+  toggle.type = "button";
+  toggle.tabIndex = -1;
+  toggle.setAttribute("aria-label", `Show options for ${name}`);
+  const value = el("span", undefined, "select-value");
+  const popup = el("span", undefined, "select-popup");
+  popup.hidden = true;
+  const list = el("span", undefined, "select-options");
+  list.id = `${key}-options`;
+  list.setAttribute("role", "listbox");
+  list.setAttribute("aria-label", name);
+  const status = el("span", undefined, "select-status");
+  status.setAttribute("role", "status");
+  popup.append(list, status);
+  select.before(wrapper);
+  // Unnest the original label so it labels only the editable input, not its buttons.
+  if (select.parentElement.tagName === "LABEL") {
+    const label = select.parentElement;
+    label.after(wrapper);
+    wrapper.append(label);
+  }
+  for (const label of labels) label.htmlFor = input.id;
+  select.hidden = true;
+  select.removeAttribute("aria-label");
+  select.tabIndex = -1;
+  field.append(input, clear, toggle);
+  wrapper.append(select, field, value, popup);
+  let opened = false,
+    query = "",
+    active = null,
+    matches = [];
+  function draw() {
+    const selectedOption = select.selectedOptions[0];
+    const text = selectedOption?.label || "";
+    input.placeholder = opened ? "Type to narrow…" : "Choose an option";
+    input.value = opened ? query : text;
+    input.title = text;
+    input.disabled = select.disabled;
+    toggle.disabled = select.disabled;
+    input.setAttribute("aria-required", String(select.required));
+    value.textContent = text;
+    value.hidden = text.length < 32;
+    clear.hidden = !opened || !query;
+    popup.hidden = !opened;
+    input.setAttribute("aria-expanded", String(opened));
+    input.removeAttribute("aria-activedescendant");
+    if (!opened) return;
+    matches = [...select.options].filter(
+      (option) =>
+        !option.disabled && option.label.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
+    );
+    if (!matches.some((option) => option.value === active)) active = matches[0]?.value ?? null;
+    list.replaceChildren(
+      ...matches.map((option, index) => {
+        const row = el("span", option.label, "select-option");
+        row.id = `${key}-option-${index}`;
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", String(option.value === select.value));
+        if (option.value === active) {
+          row.classList.add("active");
+          input.setAttribute("aria-activedescendant", row.id);
+        }
+        row.onmousedown = (event) => event.preventDefault();
+        row.onclick = () => choose(option);
+        return row;
+      }),
+    );
+    status.textContent = matches.length
+      ? `${matches.length} option${matches.length === 1 ? "" : "s"}`
+      : "No matches";
+  }
+  function close() {
+    if (opened) dismissSelect = null;
+    opened = false;
+    query = "";
+    active = null;
+    draw();
+  }
+  function open() {
+    if (opened || select.disabled) return;
+    dismissSelect?.();
+    dismissSelect = (target) => {
+      if (!wrapper.contains(target)) close();
+    };
+    opened = true;
+    active = select.value;
+    draw();
+  }
+  function choose(option) {
+    const changed = select.value !== option.value;
+    select.value = option.value;
+    input.setCustomValidity("");
+    input.focus();
+    close();
+    if (changed) {
+      select.dispatchEvent(new Event("input", { bubbles: true }));
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  }
+  input.onfocus = open;
+  input.onclick = open;
+  input.oncompositionstart = open;
+  input.oninput = () => {
+    const typed = input.value;
+    open();
+    query = typed;
+    active = null;
+    draw();
+  };
+  input.onkeydown = (event) => {
+    if (event.isComposing) return;
+    if (
+      !opened &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      (event.key.length === 1 || ["Backspace", "Delete"].includes(event.key))
+    )
+      open();
+    if (event.key === "Escape" && opened) {
+      event.preventDefault();
+      event.stopPropagation(); // Close the choices before a containing dialog.
+      close();
+    } else if (event.key === "Enter" && opened) {
+      event.preventDefault();
+      const option = matches.find((option) => option.value === active);
+      if (option) choose(option);
+    } else if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+      event.preventDefault();
+      const wasOpen = opened;
+      open();
+      if (wasOpen) {
+        const index = matches.findIndex((option) => option.value === active);
+        active =
+          matches[
+            Math.max(0, Math.min(matches.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)))
+          ]?.value ?? null;
+        draw();
+      }
+      list.querySelector(".active")?.scrollIntoView({ block: "nearest" });
+    } else if (event.key === "Tab") close();
+  };
+  clear.onmousedown = toggle.onmousedown = (event) => event.preventDefault();
+  clear.onclick = () => {
+    input.focus();
+    query = "";
+    active = select.value;
+    draw();
+  };
+  toggle.onclick = () => {
+    const wasOpen = opened;
+    input.focus();
+    if (wasOpen) close();
+    else open();
+  };
+  wrapper.addEventListener("focusout", (event) => {
+    if (!wrapper.contains(event.relatedTarget)) close();
+  });
+  select.addEventListener("change", close);
+  select.addEventListener("invalid", (event) => {
+    event.preventDefault();
+    input.setCustomValidity("Choose an option from the list.");
+    input.focus();
+    input.reportValidity();
+  });
+  searchableSelects.set(select, { sync: draw });
+  draw();
+}
+
 function badge(status) {
   const color =
     {
@@ -114,6 +311,7 @@ function visibleJobs() {
 }
 function render() {
   if (!data) return;
+  syncSelect($("filter"));
   const jobs = data.jobs;
   $("watching").textContent = jobs.filter((j) => j.status === "watching").length;
   const running = jobs.filter((j) => j.status === "running").length;
@@ -669,6 +867,7 @@ function itemTable(spec) {
       }),
     );
     select.value = selected;
+    syncSelect(select);
   }
   function changeValue(item, field) {
     const value = spec.changeValue?.(item, field);
@@ -772,6 +971,7 @@ function itemTable(spec) {
       );
     }
     id("sort").value = table.sort;
+    syncSelect(id("sort"));
     id("sort-direction").textContent = table.ascending ? "Ascending" : "Descending";
     id("count").textContent = `${visible.length} / ${all.length}`;
     const sync = table.data.synced_at
@@ -1434,6 +1634,7 @@ async function workspaceDialog(item) {
       };
       task.oninput = () => task.setCustomValidity("");
       body.append(form);
+      if (info.clones.length) searchableSelect(clone);
       if (info.suggestions.length)
         body.append(el("p", `Unverified branch-name suggestions: ${info.suggestions.join(", ")}`));
     }
@@ -1795,3 +1996,6 @@ function ciLogStream(url, detail) {
   schedule();
   return viewer;
 }
+
+document.addEventListener("pointerdown", (event) => dismissSelect?.(event.target));
+for (const select of document.querySelectorAll("select")) searchableSelect(select);

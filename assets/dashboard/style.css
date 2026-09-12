@@ -1016,3 +1016,114 @@ button:disabled {
   min-height: 80px;
   overflow-anchor: none;
 }
+
+.searchable-select {
+  position: relative;
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: top;
+}
+.searchable-select > label {
+  display: block;
+  margin-bottom: 6px;
+}
+.select-field {
+  display: flex;
+  position: relative;
+}
+.select-field input {
+  width: 100%;
+  min-width: 0;
+  padding-right: 32px;
+  font: inherit;
+}
+.select-field:has(.select-clear:not([hidden])) input {
+  padding-right: 64px;
+}
+.select-field button {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  padding: 0;
+  width: 30px;
+  border: 0;
+  background: transparent;
+}
+.select-toggle {
+  right: 1px;
+}
+.select-clear {
+  right: 31px;
+}
+.select-popup {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 4px;
+  border: 1px solid #b8c8b0;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 6px 18px #243a2026;
+  color: var(--ink);
+  font-size: 14px;
+}
+.select-options {
+  display: block;
+  max-height: min(260px, 35vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.select-option {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.select-option.active,
+.select-option:hover {
+  background: #eff4ec;
+  outline: 1px solid #b8c8b0;
+  outline-offset: -1px;
+}
+.select-option[aria-selected="true"] {
+  font-weight: 700;
+}
+.select-status,
+.select-value {
+  display: block;
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.searchable-select [hidden] {
+  display: none;
+}
+.pr-filters > .searchable-select,
+#workspace-dialog .searchable-select {
+  width: 100%;
+}
+.filters > .searchable-select,
+.pr-mobile-sort > .searchable-select {
+  width: 190px;
+}
+
+.pr-filters > .searchable-select:last-child .select-popup {
+  left: auto;
+  right: 0;
+}
+.pr-filters .select-popup {
+  width: max(100%, min(320px, calc(100vw - 40px)));
+}
+@media (max-width: 540px) {
+  .pr-filters > .searchable-select:nth-child(even) .select-popup {
+    left: auto;
+    right: 0;
+  }
+}

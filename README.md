@@ -35,6 +35,17 @@ requests, and keeps the Draft badge visible for approved drafts.
 Repository choices come from all discovered PRs; selections survive refreshes
 even if a repository no longer has matching PRs. CI states have individual options,
 including Error, Expected, No checks, and Unknown.
+Dashboard filter pickers, mobile sort pickers, and workspace clone pickers are
+searchable: focus a picker and type to narrow its options by label (case-insensitive).
+Use arrow keys and Enter to select, or click an option. Escape, Tab, and clicking
+outside dismiss the list without changing the selection; reopening starts a fresh
+search. The × button clears the option search; choose an **All** option to reset a
+filter. No matches leaves the current selection intact. Refreshes preserve both
+active filters and an unfinished option search, including filters in hidden tabs.
+Long choices wrap in the list and show their full selected label beneath the input.
+The two-choice Agent and repair-log source pickers retain native selects; sort
+direction remains a button. These short controls do not need a search field.
+
 Each row links to the PR and its checks. CI is GitHub's combined head-ref check
 status; “No checks” means GitHub returned no rollup, not a successful build.
 “Last updated” is GitHub's PR `updatedAt` (PR activity, not the last poll or CI

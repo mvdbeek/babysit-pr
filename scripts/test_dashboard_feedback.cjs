@@ -56,7 +56,12 @@ const context = vm.createContext({
   console,
   fixture,
   window: { location: { hash: "" }, addEventListener() {} },
-  document: { getElementById: get, createElement: (tag) => new Node(tag), addEventListener() {} },
+  document: {
+    querySelectorAll: () => [],
+    getElementById: get,
+    createElement: (tag) => new Node(tag),
+    addEventListener() {},
+  },
   setInterval() {},
   fetch: async (url, options) => {
     requests.push({ url, options });
