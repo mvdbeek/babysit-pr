@@ -162,6 +162,200 @@ def read_job(home: Path, key: str) -> dict:
 
 @pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
 @pytest.mark.parametrize("width", [1280, 390])
+def test_item_pins_keyboard_mobile_and_reload(page, dashboard_site, kind, prefix, width):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    expect(rows).to_have_count(2)
+    mutations = []
+    page.on(
+        "request", lambda request: mutations.append(request) if request.method != "GET" else None
+    )
+    seen_key = f"babysit-pr:seen-{kind}:v1:fixture"
+    baseline = page.evaluate("key => localStorage.getItem(key)", seen_key)
+    pin = rows.nth(1).get_by_role(
+        "button",
+        name=f"Pin {prefix.upper() if prefix == 'pr' else prefix} test/beta #",
+        exact=False,
+    )
+    expect(pin).to_have_attribute("aria-pressed", "false")
+    pin.scroll_into_view_if_needed()
+    bounds = pin.bounding_box()
+    assert bounds and bounds["width"] >= 44 and bounds["height"] >= 44
+    pin.focus()
+    pin.press("Enter")
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
+    unpin = rows.first.locator(".item-pin")
+    expect(unpin).to_have_text("Unpin")
+    expect(unpin).to_have_attribute("aria-pressed", "true")
+    expect(unpin).to_be_focused()
+    expect(page.locator(f"#{prefix}-count")).to_have_text("2 / 2")
+    expect(rows.locator(".pr-change-badge")).to_have_count(0)
+    assert page.evaluate("key => localStorage.getItem(key)", seen_key) == baseline
+    assert not mutations
+    page.screenshot(path=f"reports/{kind}-pins-{width}.png", full_page=True)
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.reload()
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
+    expect(rows.first.locator(".item-pin")).to_have_attribute("aria-pressed", "true")
+    rows.first.locator(".item-pin").press("Space")
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+    expect(rows.nth(1).locator(".item-pin")).to_be_focused()
+    page.reload()
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+    assert (
+        page.evaluate(
+            "key => JSON.parse(localStorage.getItem(key))", f"babysit-pr:pins-{kind}:v1:fixture"
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+def test_item_pins_sort_filter_and_pagination(page, dashboard_site, kind, prefix):
+    url, _ = dashboard_site
+    snapshot = page.request.get(f"{url}/api/{kind}").json()
+    template = snapshot[kind][0]
+    snapshot[kind] = [
+        dict(
+            template,
+            id=f"node-{index}",
+            title=f"Item {index:03d}",
+            number=index,
+            repo="test/even" if index % 2 == 0 else "test/odd",
+        )
+        for index in range(1, 121)
+    ]
+    page.route(f"**/api/{kind}", lambda route: route.fulfill(json=snapshot))
+    # Keep pagination deterministic; the explicit Show more control is tested here.
+    page.add_init_script("window.IntersectionObserver = undefined;")
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    page.locator(f"#{prefix}-sort-title").click()
+    expect(rows.first.locator(".pr-title")).to_have_text("Item 001")
+    page.locator(f"#{prefix}-search").fill("Item 120")
+    rows.first.locator(".item-pin").click()
+    page.locator(f"#{prefix}-search").fill("")
+    expect(rows).to_have_count(50)
+    expect(rows.first.locator(".pr-title")).to_have_text("Item 120")
+    rows.filter(has=page.get_by_text("Item 002", exact=True)).locator(".item-pin").click()
+    expect(rows.locator(".pr-title")).to_have_text(
+        ["Item 002", "Item 120"] + [f"Item {i:03d}" for i in range(1, 50) if i != 2]
+    )
+    page.locator(f"#{prefix}-sort-title").click()
+    expect(rows.locator(".pr-title")).to_have_text(
+        ["Item 120", "Item 002"] + [f"Item {i:03d}" for i in range(119, 71, -1)]
+    )
+    page.locator(f"#{prefix}-repo").select_option("test/odd")
+    expect(rows.first.locator(".pr-title")).to_have_text("Item 119")
+    expect(rows.locator('.item-pin[aria-pressed="true"]')).to_have_count(0)
+    expect(page.locator(f"#{prefix}-count")).to_have_text("60 / 120")
+    page.locator(f"#{prefix}-repo").select_option("all")
+    page.locator(f"#{prefix}-search").fill("Item 11")
+    expect(rows).to_have_count(10)
+    expect(rows.locator('.item-pin[aria-pressed="true"]')).to_have_count(0)
+    page.locator(f"#{prefix}-search").fill("")
+    page.locator(f"#{prefix}-more-button").click()
+    expect(rows).to_have_count(100)
+    rows.first.locator(".item-pin").click()
+    expect(rows).to_have_count(100)
+    expect(rows.first.locator(".pr-title")).to_have_text("Item 002")
+    page.locator(f"#{prefix}-refresh").click()
+    expect(rows).to_have_count(100)
+    expect(page.locator(f"#{prefix}-more-button")).to_have_text("Show 20 more · 100 of 120 shown")
+    # Unpinning an item whose ordinary position is outside the window moves focus
+    # to Show more, and loading that page reveals its normal placement.
+    rows.first.locator(".item-pin").click()
+    expect(page.locator(f"#{prefix}-more-button")).to_be_focused()
+    expect(rows.first.locator(".pr-title")).to_have_text("Item 120")
+    page.locator(f"#{prefix}-more-button").press("Enter")
+    expect(rows).to_have_count(120)
+    expect(rows.nth(118).locator(".pr-title")).to_have_text("Item 002")
+
+
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+def test_item_pins_accounts_kinds_and_absent_items(page, dashboard_site, kind, prefix):
+    url, _ = dashboard_site
+    snapshot = page.request.get(f"{url}/api/{kind}").json()
+    missing = snapshot[kind][1]
+    page.route(f"**/api/{kind}", lambda route: route.fulfill(json=snapshot))
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    rows.nth(1).locator(".item-pin").click()
+    key = f"babysit-pr:pins-{kind}:v1:fixture"
+    assert page.evaluate("key => JSON.parse(localStorage.getItem(key))", key) == [missing["id"]]
+    other_kind = "issues" if kind == "prs" else "prs"
+    assert (
+        page.evaluate(
+            "key => localStorage.getItem(key)", f"babysit-pr:pins-{other_kind}:v1:fixture"
+        )
+        is None
+    )
+    snapshot["login"] = "second-account"
+    page.locator(f"#{prefix}-refresh").click()
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+    expect(rows.locator('.item-pin[aria-pressed="true"]')).to_have_count(0)
+    rows.first.locator(".item-pin").click()
+    assert page.evaluate("key => JSON.parse(localStorage.getItem(key))", key) == [missing["id"]]
+    snapshot["login"] = "fixture"
+    snapshot[kind].remove(missing)
+    page.locator(f"#{prefix}-refresh").click()
+    expect(rows).to_have_count(1)
+    rows.first.locator(".item-pin").click()
+    assert set(page.evaluate("key => JSON.parse(localStorage.getItem(key))", key)) == {
+        missing["id"],
+        snapshot[kind][0]["id"],
+    }
+    rows.first.locator(".item-pin").click()
+    snapshot[kind].append(missing)
+    page.locator(f"#{prefix}-refresh").click()
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
+    assert page.evaluate(
+        "key => JSON.parse(localStorage.getItem(key))", f"babysit-pr:pins-{kind}:v1:second-account"
+    ) == [snapshot[kind][0]["id"]]
+
+
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+@pytest.mark.parametrize("mode", ["blocked", "quota", "corrupt", "invalid", "stale"])
+def test_item_pins_storage_fallback(page, dashboard_site, kind, prefix, mode):
+    url, _ = dashboard_site
+    key = f"babysit-pr:pins-{kind}:v1:fixture"
+    if mode == "blocked":
+        page.add_init_script(
+            "Storage.prototype.getItem = () => { throw new DOMException('blocked', 'SecurityError'); };"
+        )
+    elif mode == "quota":
+        page.add_init_script(
+            "Storage.prototype.setItem = () => { throw new DOMException('full', 'QuotaExceededError'); };"
+        )
+    else:
+        value = {
+            "corrupt": "{broken",
+            "invalid": '{"wrong":true}',
+            "stale": '[null,5,"deleted-node"]',
+        }[mode]
+        page.add_init_script(f"localStorage.setItem({json.dumps(key)}, {json.dumps(value)});")
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    expect(rows).to_have_count(2)
+    rows.nth(1).locator(".item-pin").click()
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
+    page.locator(f"#{prefix}-refresh").click()
+    expect(rows.first.locator(".item-pin")).to_have_attribute("aria-pressed", "true")
+    if mode in {"blocked", "quota"}:
+        expect(page.locator(f"#{prefix}-pins-status")).to_contain_text("this tab only")
+    else:
+        saved = page.evaluate("key => JSON.parse(localStorage.getItem(key))", key)
+        assert f"{prefix}-two" in saved
+        assert all(isinstance(node, str) for node in saved)
+        expect(page.locator(f"#{prefix}-pins-status")).to_be_hidden()
+    rows.first.locator(".item-pin").click()
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+
+
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+@pytest.mark.parametrize("width", [1280, 390])
 def test_latest_activity_display_refresh_and_fallback(page, dashboard_site, kind, prefix, width):
     url, _ = dashboard_site
     page.set_viewport_size({"width": width, "height": 900})

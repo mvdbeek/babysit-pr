@@ -620,11 +620,70 @@ function itemTable(spec) {
     sort: spec.defaultSort,
     ascending: false,
     visits: new Map(),
+    pins: new Map(),
     optionKeys: new Map(),
     limit: PAGE_SIZE,
   };
   function items() {
     return table.data?.[spec.key] || [];
+  }
+  const pinStatus = id("pins-status");
+  function currentPins() {
+    if (!table.data.login) return null;
+    const key = `babysit-pr:pins-${spec.key}:v1:${table.data.login}`;
+    if (!table.pins.has(key)) table.pins.set(key, { key, ids: new Set(), storage: true });
+    const pins = table.pins.get(key);
+    if (pins.storage) {
+      try {
+        const saved = JSON.parse(localStorage.getItem(key));
+        pins.ids = new Set(
+          Array.isArray(saved) ? saved.filter((value) => typeof value === "string" && value) : [],
+        );
+      } catch (error) {
+        if (error instanceof SyntaxError) pins.ids = new Set();
+        else pins.storage = false;
+      }
+    }
+    return pins;
+  }
+  function pinButton(item, pins) {
+    const pinned = Boolean(pins?.ids.has(item.id));
+    const button = el("button", pinned ? "Unpin" : "Pin", "item-pin");
+    button.type = "button";
+    button.dataset.itemId = item.id;
+    button.disabled = !pins;
+    button.setAttribute("aria-pressed", String(pinned));
+    button.setAttribute(
+      "aria-label",
+      `${pinned ? "Unpin" : "Pin"} ${spec.text.short} ${item.repo} #${item.number}`,
+    );
+    button.title = !pins
+      ? "Pins are available once your GitHub account is known"
+      : pinned
+        ? "Unpin and restore normal sort position"
+        : "Pin to the top of matching results";
+    button.onclick = () => {
+      // Read again so another tab's pins are preserved when changing this item.
+      const latest = currentPins();
+      if (!latest) return;
+      if (pinned) latest.ids.delete(item.id);
+      else latest.ids.add(item.id);
+      if (latest.storage) {
+        try {
+          localStorage.setItem(latest.key, JSON.stringify([...latest.ids]));
+        } catch {
+          latest.storage = false;
+        }
+      }
+      render();
+      // Rendering replaces rows. Keep keyboard focus on the moved control, or
+      // on pagination if unpinning moved the item outside the rendered window.
+      const moved = [...id("list").querySelectorAll(".item-pin")].find(
+        (node) => node.dataset.itemId === item.id,
+      );
+      (moved || id("more-button")).focus();
+    };
+    return button;
   }
   function sortValue(item) {
     const column = table.sort;
@@ -758,13 +817,22 @@ function itemTable(spec) {
     if (!table.data) return;
     const all = items();
     const visit = currentVisit();
+    const pins = currentPins();
     spec.updateFilters(all, updateOptions);
     const query = id("search").value.toLowerCase();
     const filters = Object.fromEntries(spec.filters.map((name) => [name, id(name).value]));
     const visible = all.filter(
       (item) => spec.visible(item, filters) && spec.searchText(item).toLowerCase().includes(query),
     );
-    visible.sort(compare);
+    visible.sort(
+      (a, b) =>
+        Number(pins?.ids.has(b.id) || false) - Number(pins?.ids.has(a.id) || false) ||
+        compare(a, b),
+    );
+    pinStatus.hidden = !pins || pins.storage;
+    pinStatus.textContent = pinStatus.hidden
+      ? ""
+      : "Pins are kept in this tab only; browser storage is unavailable.";
     for (const column of Object.keys(spec.columns)) {
       id(`heading-${column}`).setAttribute(
         "aria-sort",
@@ -797,6 +865,10 @@ function itemTable(spec) {
       if (index >= table.limit) continue;
       const row = el("tr");
       const { cells, title, fields, updated } = spec.row(item);
+      const meta = title.querySelector(".pr-meta");
+      const pinMeta = el("div", undefined, "item-pin-meta");
+      meta.replaceWith(pinMeta);
+      pinMeta.append(meta, pinButton(item, pins));
       if (change) {
         row.className = change.isNew ? "pr-new" : "pr-changed";
         title.append(

@@ -22,6 +22,21 @@ restarts at the first 50; background refreshes keep the rows already shown. The 
 count and the since-your-last-visit counts cover the whole filtered list, not only the
 rendered rows.
 
+Use **Pin** beside a PR or issue number to keep it at the top of its overview;
+**Unpin** restores its normal position. Pinned items still obey search and filters,
+and the selected sort direction applies within both pinned and unpinned groups.
+Pins apply before the 50-row window, so a matching pin from a later page appears
+at the top. Pinning keeps the current window size and does not count as GitHub
+activity, register a repair watch, or create a workspace.
+
+Pins are saved in this browser and dashboard origin, separately for each GitHub
+account and item kind, under `babysit-pr:pins-prs:v1:<login>` and
+`babysit-pr:pins-issues:v1:<login>`, using GitHub node IDs. Closed, deleted, or
+otherwise absent items stay out of the overview; their pins remain saved in case
+they reappear. If browser storage is unavailable, pins work for the current tab
+and a notice explains that they cannot persist. Pin controls support Enter and
+Space, retain keyboard focus when rows move, and have touch-sized targets on mobile.
+
 The dashboard also discovers open GitHub PRs you authored, are assigned to, or are
 involved in reviewing (including team requests and completed reviews). It uses the
 active `gh` account on github.com. No registration is needed. These PRs are a
