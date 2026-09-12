@@ -1667,6 +1667,46 @@ async function workspaceDialog(item) {
         option.value = value;
         agent.append(option);
       }
+      const model = el("select");
+      model.id = "workspace-model";
+      const effort = el("select");
+      effort.id = "workspace-effort";
+      const settingsNote = el("small", "Default keeps the agent’s configured setting.");
+      function options(select, values) {
+        select.replaceChildren();
+        for (const value of ["", ...values]) {
+          const option = el("option", value || "Default");
+          option.value = value;
+          select.append(option);
+        }
+      }
+      function updateEfforts() {
+        const choices = workspaceData.agent_choices?.[agent.value];
+        const selected = choices?.models.find((choice) => choice.id === model.value);
+        const previous = effort.value;
+        options(effort, selected ? selected.efforts : (choices?.efforts ?? []));
+        if ([...effort.options].some((option) => option.value === previous))
+          effort.value = previous;
+        syncSelect(effort);
+        settingsNote.textContent =
+          !model.value && effort.value
+            ? "Effort support depends on the agent’s configured model."
+            : "Default keeps the agent’s configured setting.";
+      }
+      function updateModels() {
+        const choices = workspaceData.agent_choices?.[agent.value];
+        options(model, choices?.models.map((choice) => choice.id) ?? []);
+        effort.value = "";
+        updateEfforts();
+        syncSelect(model);
+        if (agent.value === "codex" && !choices?.models.length)
+          settingsNote.textContent =
+            "Default keeps your settings. Codex model choices need its local model cache.";
+      }
+      agent.onchange = updateModels;
+      model.onchange = updateEfforts;
+      effort.onchange = updateEfforts;
+      updateModels();
       const task = el("textarea");
       task.id = "workspace-task";
       task.required = true;
@@ -1688,6 +1728,9 @@ async function workspaceDialog(item) {
           ),
         );
       field("Agent", agent);
+      field("Model (optional)", model);
+      field("Reasoning effort (optional)", effort);
+      form.append(settingsNote);
       field("Task", task);
       const submit = el("button", info.clones.length ? "Create workspace" : "Clone and create");
       submit.type = "submit";
@@ -1708,6 +1751,8 @@ async function workspaceDialog(item) {
             info.clones.length ? "create" : "clone-and-create",
             {
               agent: agent.value,
+              ...(model.value ? { model: model.value } : {}),
+              ...(effort.value ? { effort: effort.value } : {}),
               task: task.value,
               ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
               retry: workspaceInfo(item)?.operation?.status === "failed",
@@ -1723,6 +1768,8 @@ async function workspaceDialog(item) {
       task.oninput = () => task.setCustomValidity("");
       body.append(form);
       if (info.clones.length) searchableSelect(clone);
+      searchableSelect(model);
+      searchableSelect(effort);
       if (info.suggestions.length)
         body.append(el("p", `Unverified branch-name suggestions: ${info.suggestions.join(", ")}`));
     }

@@ -23,6 +23,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+import workspace_agents
 from issue_overview import branch_number
 
 COLLIE_URL = "https://collie.tailfb45be.ts.net"
@@ -508,6 +509,7 @@ class Workspaces:
             described[key][target["id"]] = self.describe(target, inventory, state)
         return {
             **described,
+            "agent_choices": workspace_agents.catalog(),
             "error": inventory["error"],
             "refreshing": self.refreshing,
             "synced_at": inventory["synced_at"],
@@ -532,6 +534,8 @@ class Workspaces:
             "clone",
             "destination",
             "agent",
+            "model",
+            "effort",
             "task",
             "retry",
         }
@@ -623,6 +627,11 @@ class Workspaces:
                     raise ValueError("A verified checkout already exists; open or reopen it")
                 if request.get("agent", "codex") not in {"codex", "claude"}:
                     raise ValueError("Select Codex or Claude")
+                workspace_agents.validate(
+                    request.get("agent", "codex"),
+                    request.get("model", ""),
+                    request.get("effort", ""),
+                )
                 if (
                     not request.get("task", "").strip()
                     or len(request["task"]) > 32000
@@ -651,6 +660,8 @@ class Workspaces:
                 "clone": clone,
                 "path": target["path"] if action == "reopen" else None,
                 "agent": None if action == "reopen" else request.get("agent", "codex"),
+                "model": None if action == "reopen" else request.get("model") or None,
+                "effort": None if action == "reopen" else request.get("effort") or None,
                 "message": "Queued",
                 "log": "",
                 "created_at": time.time(),
@@ -779,6 +790,10 @@ class Workspaces:
                         branch=name,
                         message=f"Fetching {subject.lower()} and starting the selected agent",
                     )
+                    overrides = []
+                    for key in ("model", "effort"):
+                        if op.get(key):
+                            overrides.extend([f"--{key}", op[key]])
                     prompts = self.home / "workspace-prompts"
                     prompts.mkdir(mode=0o700, exist_ok=True)
                     prompt = prompts / op["id"]
@@ -787,6 +802,7 @@ class Workspaces:
                         stream.write(f"{task}\n\n{subject}: {canonical(pr)}\n")
                     args = [
                         f"--{op['agent']}",
+                        *overrides,
                         "--no-focus",
                         "--name",
                         name,
@@ -798,12 +814,18 @@ class Workspaces:
                         str(prompt),
                         canonical(pr),
                     ]
+                    command = f'export WT_MULTIPLEXER=herdr; {helper} "$@"'
+                    if overrides:
+                        # Source our helper only in this child login shell. Keep the user's
+                        # agent wrappers, without requiring an installed helper update.
+                        command = 'source "$1" || exit; shift; ' + command
+                        args.insert(0, str(Path(__file__).resolve().with_name("worktree.zsh")))
                     launching = True
                     self.run_logged(
                         op,
                         "zsh",
                         "-lic",
-                        f'export WT_MULTIPLEXER=herdr; {helper} "$@"',
+                        command,
                         "pr-workspaces",
                         *args,
                         timeout=600,

@@ -64,6 +64,18 @@ _wt_read_prompt_file() {
   print -r -- "$(<"$f")"
 }
 
+# Validate syntax before Git operations. Model availability belongs to the CLI/provider.
+_wt_validate_agent_options() {
+  if [[ -n "$WT_AGENT_MODEL" ]] && { [[ ${#WT_AGENT_MODEL} -gt 160 ]] || [[ ! "$WT_AGENT_MODEL" =~ '^[A-Za-z0-9][A-Za-z0-9._:/-]*$' ]]; }; then
+    print -u2 "wt: invalid model id"; return 1
+  fi
+  case "$WT_AGENT_EFFORT" in
+    ""|low|medium|high|xhigh|max) ;;
+    none|minimal|ultra) [[ "$1" == codex ]] || { print -u2 "wt: unsupported Claude effort"; return 1; } ;;
+    *) print -u2 "wt: invalid reasoning effort"; return 1 ;;
+  esac
+}
+
 # Build the shell command that starts the agent, optionally with an initial prompt
 # (claude and codex both accept one as a positional argument).
 #
@@ -82,9 +94,21 @@ _wt_read_prompt_file() {
 # The staged file is left behind deliberately -- the agent reads it after we return.
 # It lives in $TMPDIR, which the OS reaps.
 _wt_agent_cmd() {
-  local agent="$1" prompt="$2"
+  local agent="$1" prompt="$2" cmd="$1" arg
+  local -a args
+  args=()
+  [[ -n "$WT_AGENT_MODEL" ]] && args+=(--model "$WT_AGENT_MODEL")
+  if [[ -n "$WT_AGENT_EFFORT" ]]; then
+    case "$agent" in
+      codex) args+=(-c "model_reasoning_effort=\"$WT_AGENT_EFFORT\"") ;;
+      claude) args+=(--effort "$WT_AGENT_EFFORT") ;;
+    esac
+  fi
+  for arg in "${args[@]}"; do
+    cmd+=" ${(qqqq)arg}"
+  done
   if [[ -z "$prompt" ]]; then
-    printf '%s' "$agent"
+    printf '%s' "$cmd"
     return
   fi
   local pfile
@@ -93,7 +117,7 @@ _wt_agent_cmd() {
     return 1
   fi
   print -r -- "$prompt" > "$pfile" || return 1
-  printf '%s "$(cat %s)"' "$agent" "${(qqqq)pfile}"
+  printf '%s "$(cat %s)"' "$cmd" "${(qqqq)pfile}"
 }
 
 # open (or attach to) a session for a worktree:
@@ -257,6 +281,8 @@ herdr, cmux inside cmux, else tmux.
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --model <id>  override the model for a new session only
+  --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
@@ -287,6 +313,8 @@ the branch is generated from the issue number and title (issue-<number>-<slug>).
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --model <id>  override the model for a new session only
+  --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
@@ -310,6 +338,8 @@ handled by fetching the PR branch from the contributor repository.
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --model <id>  override the model for a new session only
+  --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
@@ -326,10 +356,15 @@ EOF
 #        numeric arg is treated as a PR number
 wt() {
   local repo=galaxy agent=claude prompt=
+  local WT_AGENT_MODEL= WT_AGENT_EFFORT=
   while [[ "$1" == -* ]]; do
     case "$1" in
       --codex) agent=codex; shift ;;
       --claude) agent=claude; shift ;;
+      --model|--effort)
+        [[ $# -ge 2 && -n "$2" ]] || { print -u2 "wt: $1 needs a value"; return 1; }
+        if [[ "$1" == --model ]]; then WT_AGENT_MODEL="$2"; else WT_AGENT_EFFORT="$2"; fi
+        shift 2 ;;
       -r) repo="$2"; shift 2 ;;
       -p|--prompt) prompt="$2"; shift 2 ;;
       -F|--prompt-file) prompt="$(_wt_read_prompt_file "$2")" || return 1; shift 2 ;;
@@ -337,7 +372,10 @@ wt() {
       *) print -u2 "wt: unknown option: $1"; _wt_help >&2; return 1 ;;
     esac
   done
+  _wt_validate_agent_options "$agent" || return 1
   local -a fwd
+  [[ -n "$WT_AGENT_MODEL" ]] && fwd+=(--model "$WT_AGENT_MODEL")
+  [[ -n "$WT_AGENT_EFFORT" ]] && fwd+=(--effort "$WT_AGENT_EFFORT")
   [[ "$agent" == "codex" ]] && fwd+=(--codex)
   [[ -n "$prompt" ]] && fwd+=(-p "$prompt")
   if [[ "$1" == "issue" || "$1" == "i" ]]; then
@@ -367,15 +405,17 @@ wt() {
 #        wt [--codex|--claude] issue <issue-number|issue-url> [branch-name] also works
 wti() {
   local repo=galaxy repo_override= slug= agent=claude prompt= name= repo_path= worktree_root=
-  local WT_NO_FOCUS=0 WT_REPO_PATH=
+  local WT_NO_FOCUS=0 WT_REPO_PATH= WT_AGENT_MODEL= WT_AGENT_EFFORT=
   while [[ "$1" == -* ]]; do
     case "$1" in
       --codex) agent=codex; shift ;;
       --claude) agent=claude; shift ;;
       --no-focus) WT_NO_FOCUS=1; shift ;;
-      --name|--repo-path|--worktree-root|-r|-p|--prompt|-F|--prompt-file)
+      --model|--effort|--name|--repo-path|--worktree-root|-r|-p|--prompt|-F|--prompt-file)
         [[ $# -ge 2 && -n "$2" ]] || { print -u2 "wti: $1 needs a value"; return 1; }
         case "$1" in
+          --model) WT_AGENT_MODEL="$2" ;;
+          --effort) WT_AGENT_EFFORT="$2" ;;
           --name) name="$2" ;;
           --repo-path) repo_path="$2" ;;
           --worktree-root) worktree_root="$2" ;;
@@ -388,6 +428,7 @@ wti() {
       *) print -u2 "wti: unknown option: $1"; _wti_help >&2; return 1 ;;
     esac
   done
+  _wt_validate_agent_options "$agent" || return 1
   local issue="$1"
   # A positional branch name may reuse an existing checkout; --name reserves a new one.
   local requested="${2:-$name}"
@@ -462,15 +503,17 @@ wtissue() { wti "$@"; }
 # usage: wtpr [--codex|--claude] [-r repo] <pr-number|pr-url>  (requires gh; handles PRs from forks)
 wtpr() {
   local repo=galaxy repo_override= slug= agent=claude prompt= name= repo_path= worktree_root=
-  local WT_NO_FOCUS=0 WT_REPO_PATH=
+  local WT_NO_FOCUS=0 WT_REPO_PATH= WT_AGENT_MODEL= WT_AGENT_EFFORT=
   while [[ "$1" == -* ]]; do
     case "$1" in
       --codex) agent=codex; shift ;;
       --claude) agent=claude; shift ;;
       --no-focus) WT_NO_FOCUS=1; shift ;;
-      --name|--repo-path|--worktree-root|-r|-p|--prompt|-F|--prompt-file)
+      --model|--effort|--name|--repo-path|--worktree-root|-r|-p|--prompt|-F|--prompt-file)
         [[ $# -ge 2 && -n "$2" ]] || { print -u2 "wtpr: $1 needs a value"; return 1; }
         case "$1" in
+          --model) WT_AGENT_MODEL="$2" ;;
+          --effort) WT_AGENT_EFFORT="$2" ;;
           --name) name="$2" ;;
           --repo-path) repo_path="$2" ;;
           --worktree-root) worktree_root="$2" ;;
@@ -483,6 +526,7 @@ wtpr() {
       *) print -u2 "wtpr: unknown option: $1"; _wtpr_help >&2; return 1 ;;
     esac
   done
+  _wt_validate_agent_options "$agent" || return 1
   local pr="$1"
   if [[ "$pr" == https://github.com/*/pull/* ]]; then
     local rest="${pr#https://github.com/}"

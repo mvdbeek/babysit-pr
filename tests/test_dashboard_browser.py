@@ -2167,3 +2167,106 @@ def test_searchable_workspace_clone_validation_and_escape(page, dashboard_site, 
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
     expect(page.locator("#workspace-progress")).to_contain_text("Fetching PR")
     assert requests[-1]["clone"] == info["clones"][1]
+
+
+@pytest.mark.parametrize("kind", ["pr", "issue"])
+@pytest.mark.parametrize("clone", [False, True])
+@pytest.mark.parametrize("settings", ["default", "codex", "claude"])
+def test_workspace_optional_model_effort(page, dashboard_site, request, kind, clone, settings):
+    routes = request.getfixturevalue(
+        "workspace_routes" if kind == "pr" else "issue_workspace_routes"
+    )
+    info, snapshot, requests = routes
+    info["matches"] = []
+    if clone:
+        info["clones"] = []
+        info["destination"] = "/fixture/new"
+    snapshot["agent_choices"] = {
+        "codex": {
+            "models": [{"id": "fixture-codex", "efforts": ["low", "ultra"]}],
+            "efforts": ["low", "ultra"],
+        },
+        "claude": {
+            "models": [{"id": "opus", "efforts": ["low", "high"]}, {"id": "haiku", "efforts": []}],
+            "efforts": ["low", "high"],
+        },
+    }
+    url, _ = dashboard_site
+    page.goto(url + ("/#prs" if kind == "pr" else "/#issues"))
+    page.locator("#pr-list tr" if kind == "pr" else "#issue-list tr").first.locator(
+        ".pr-actions button"
+    ).first.click()
+    dialog = page.get_by_role("dialog")
+    model = dialog.get_by_role("combobox", name="Model (optional)", exact=True)
+    native_model = dialog.locator("#workspace-model")
+    effort = dialog.get_by_role("combobox", name="Reasoning effort (optional)", exact=True)
+    native_effort = dialog.locator("#workspace-effort")
+    expect(model).to_have_value("Default")
+    expect(effort).to_have_value("Default")
+    expect(native_model.locator("option").first).to_have_text("Default")
+    expect(native_effort.locator("option").first).to_have_text("Default")
+    choose_option(model, "fixture-codex")
+    choose_option(effort, "ultra")
+    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    expect(model).to_have_value("Default")
+    expect(effort).to_have_value("Default")
+    expect(native_model.locator("option[value=fixture-codex]")).to_have_count(0)
+    expect(native_effort.locator("option[value=ultra]")).to_have_count(0)
+    choose_option(model, "opus")
+    choose_option(effort, "high")
+    choose_option(model, "haiku")
+    expect(effort).to_have_value("Default")
+    expect(native_effort.locator("option")).to_have_count(1)
+    dialog.get_by_label("Agent", exact=True).select_option("codex")
+    if settings != "default":
+        dialog.get_by_label("Agent", exact=True).select_option(settings)
+        choose_option(model, "fixture-codex" if settings == "codex" else "opus")
+        choose_option(effort, "ultra" if settings == "codex" else "high")
+    dialog.get_by_label("Task", exact=True).fill("Fix this")
+    if kind == "pr" and not clone and settings == "codex":
+        page.screenshot(path="reports/workspace-model-effort-desktop.png")
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.screenshot(path="reports/workspace-model-effort-mobile.png")
+        assert dialog.evaluate("el => el.scrollWidth <= el.clientWidth")
+    dialog.get_by_role(
+        "button", name="Clone and create" if clone else "Create workspace", exact=True
+    ).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    body = requests[-1]
+    assert body["action"] == ("clone-and-create" if clone else "create")
+    if settings == "default":
+        assert "model" not in body and "effort" not in body
+    else:
+        assert body["agent"] == settings
+        assert body["model"] == ("fixture-codex" if settings == "codex" else "opus")
+        assert body["effort"] == ("ultra" if settings == "codex" else "high")
+
+
+@pytest.mark.parametrize("kind", ["pr", "issue"])
+def test_existing_workspace_has_no_model_controls(page, dashboard_site, request, kind):
+    info, _, requests = request.getfixturevalue(
+        "workspace_routes" if kind == "pr" else "issue_workspace_routes"
+    )
+    info["matches"] = [
+        {
+            "path": "/fixture/checkout",
+            "workspace_id": None,
+            "name": "Saved session",
+            "agent_status": "No workspace",
+        }
+    ]
+    url, _ = dashboard_site
+    page.goto(url + ("/#prs" if kind == "pr" else "/#issues"))
+    page.locator("#pr-list tr" if kind == "pr" else "#issue-list tr").first.get_by_role(
+        "button", name="Reopen workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog.get_by_label("Model (optional)")).to_have_count(0)
+    expect(dialog.get_by_label("Reasoning effort (optional)")).to_have_count(0)
+    dialog.get_by_role("button", name="Reopen workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1] == {
+        "id": "pr-one" if kind == "pr" else "issue-one",
+        "action": "reopen",
+        "path": "/fixture/checkout",
+    }
