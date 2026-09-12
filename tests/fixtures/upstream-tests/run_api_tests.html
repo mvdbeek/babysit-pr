@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+  <body>
+    <div
+      id="data-container"
+      data-jsonblob='{ "tests": {
+"lib/galaxy_test/api/test_example.py::TestApi::test_case[a]": [{"result":"Failed", "testId":"lib/galaxy_test/api/test_example.py::TestApi::test_case[a]", "log":"AssertionError"}],
+"lib/galaxy_test/api/test_example.py::TestApi::test_case[b]": [{"result":"Error"}],
+"lib/galaxy_test/api/test_example.py::TestApi::test_retry": [{"result":"Rerun"}, {"result":"Passed"}],
+"lib/galaxy_test/api/test_example.py::TestApi::test_retry_failed": [{"result":"Rerun"}, {"result":"Failed"}],
+"lib/galaxy_test/api/test_example.py::TestApi::test_skip": [{"result":"Skipped"}],
+"lib/galaxy_test/api/test_example.py": [{"result":"Error"}]
+} }'
+    ></div>
+    <script>
+      throw new Error("Report scripts must never execute");
+    </script>
+  </body>
+</html>

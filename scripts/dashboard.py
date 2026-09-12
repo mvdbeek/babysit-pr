@@ -180,10 +180,12 @@ class DashboardServer(ThreadingHTTPServer):
         ci=None,
         ci_logs=None,
         issues: IssueOverview | None = None,
+        upstream_tests=None,
     ) -> None:
         self.home = home
         self.overview = overview
         self.issues = issues
+        self.upstream_tests = upstream_tests
         self.workspaces = workspaces
         self.ci = ci
         self.ci_logs = ci_logs
@@ -283,6 +285,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route.path == "/api/status":
                 self.send_json(200, status(self.server.home))
+            elif route.path == "/api/upstream-tests":
+                # Experimental failures must stay outside the main dashboard boundary.
+                try:
+                    value = (
+                        self.server.upstream_tests.snapshot()
+                        if self.server.upstream_tests
+                        else {"enabled": False}
+                    )
+                    self.send_json(200, value)
+                except Exception:
+                    self.send_json(
+                        200, {"enabled": True, "error": "Upstream test experiment unavailable"}
+                    )
             elif route.path == "/api/prs":
                 self.send_json(
                     200,
@@ -356,6 +371,8 @@ class Handler(BaseHTTPRequestHandler):
                 files = {
                     "/": ("index.html", "text/html"),
                     "/app.js": ("app.js", "text/javascript"),
+                    "/upstream-tests.js": ("upstream-tests.js", "text/javascript"),
+                    "/upstream-tests.css": ("upstream-tests.css", "text/css"),
                     "/style.css": ("style.css", "text/css"),
                 }
                 if route.path not in files:
@@ -370,6 +387,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
+    from upstream_tests import UpstreamTests
+
+    upstream_tests = UpstreamTests(home)
     overview = Overview(home)
     issues = IssueOverview(home)
     workspaces = Workspaces(home, overview, lambda: read_jobs(home), issues=issues)
@@ -384,6 +404,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         ci=ci,
         ci_logs=ci_logs,
         issues=issues,
+        upstream_tests=upstream_tests,
     ) as server:
         ci_logs.start()
         url = f"http://127.0.0.1:{server.server_port}"

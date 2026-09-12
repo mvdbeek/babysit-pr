@@ -322,3 +322,5 @@ or in-progress syncs do not overwrite the last saved snapshot, and an older tab
 cannot replace a newer snapshot. If browser storage is unavailable, comparisons
 still work during the current visit. This uses the existing overview data and
 adds no server storage or GitHub requests. Closed PRs leave the open-PR overview.
+
+An opt-in [upstream test overview experiment](references/upstream-tests.md) adds a separate dashboard tab for confirmed failing tests on Galaxy dev and currently supported release branches, with grouping by test or branch/workflow. Enable it with `{"enabled": true}` in `experiments/upstream-tests/config.json` under the dashboard state directory, then restart the dashboard; delete that configuration or set `enabled` to `false` to disable it. It has isolated collection, cache, and errors. The first adapter reads pytest-html 4 reports from Galaxy-style test artifacts; missing, expired, unsupported, or oversized reports are labeled incomplete, not counted as failing tests. Collection uses bounded recent runs and does not imply complete branch coverage.

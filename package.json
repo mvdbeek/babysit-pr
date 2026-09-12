@@ -6,7 +6,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "lint": "eslint assets/dashboard/app.js scripts/test_dashboard_feedback.cjs",
+    "lint": "eslint assets/dashboard/*.js scripts/test_dashboard_feedback.cjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "node scripts/test_dashboard_feedback.cjs"
