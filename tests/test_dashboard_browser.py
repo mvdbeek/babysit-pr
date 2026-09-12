@@ -656,6 +656,47 @@ def test_workspace_create_required_task_agent_progress_and_errors(
     )
 
 
+def test_workspace_dialog_closes_on_backdrop_click_and_polls_running_operation(
+    page, dashboard_site, workspace_routes
+):
+    url, _ = dashboard_site
+    info, snapshot, _ = workspace_routes
+    info["matches"] = []
+    polls = []
+    page.route(
+        "**/api/workspaces",
+        lambda route: (polls.append(time.monotonic()), route.fulfill(json=snapshot)),
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_be_visible()
+    # Clicking inside the dialog box keeps it open; clicking the backdrop closes it.
+    dialog.get_by_role("heading").click()
+    expect(dialog).to_be_visible()
+    page.mouse.click(2, 2)
+    expect(dialog).not_to_be_visible()
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog.get_by_label("Task", exact=True).fill("Fix it")
+    started = time.monotonic()
+    before = len(polls)
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running: Fetching PR")
+    # A running operation polls faster than the 15-second refresh, and stops when done.
+    while len(polls) < before + 2:
+        assert time.monotonic() - started < 8, "expected fast polling while running"
+        page.wait_for_timeout(200)
+    info["operation"].update(status="complete", message="Workspace ready")
+    expect(page.locator("#workspace-progress")).to_contain_text("complete: Workspace ready")
+    settled = len(polls)
+    page.wait_for_timeout(3000)
+    assert len(polls) == settled  # No fast polling once the operation has finished.
+
+
 def test_clone_destination_mobile_and_protected_action_error(
     page, dashboard_site, workspace_routes
 ):

@@ -100,6 +100,10 @@ provenance. Branch names alone appear only as suggestions. Every action rechecks
 Git repository, branch and current workspace identity. Dirty files and unpushed
 commits do not prevent opening. Discovery searches main clones directly under
 `~/src` and the repository roots recorded by herdr.
+Each clone is resolved with three Git calls (config, `rev-parse`, `worktree list`)
+rather than five per worktree, and clones are resolved concurrently, so a scan of a
+few hundred worktrees takes seconds rather than a minute. Detached and prunable
+worktrees are skipped.
 
 `scripts/pr_workspaces.py` owns this integration. `GET /api/workspaces` discovers
 resources; `POST /api/workspace-action` accepts a known PR `id`, an `action`
@@ -112,8 +116,11 @@ No browser writes to Collie's API are involved.
 Associations, remembered clones, operation status and bounded logs live in
 `pr-workspaces.sqlite` under the configured watcher state directory, separate from
 `queue.sqlite`. Creation is asynchronous, deduplicated per PR, and serialized per
-clone with file locks inherited by helper processes. The dialog shows progress,
-logs and errors. Failed operations can be retried explicitly; interrupted or
+clone with file locks inherited by helper processes. Verification after launch
+rechecks only the new checkout and herdr, not the whole inventory. The dialog shows
+progress, logs and errors, polling every two seconds while an operation is queued or
+running; it closes with Escape, the Close button, or a click on the backdrop, like
+the CI details dialog. Failed operations can be retried explicitly; interrupted or
 uncertain launches are inspected and never automatically resubmitted. A verified
 existing checkout can be reopened without another agent. Previous operations stay
 in the database's `operation_history` table.

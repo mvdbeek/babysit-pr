@@ -3,6 +3,7 @@
 import http.client
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -172,6 +173,31 @@ def space(state, path, clone, wid="w99", name="Renamed pane"):
         }
     )
     state.write_text(json.dumps(data))
+
+
+def test_scan_resolves_worktrees_per_clone_and_skips_detached_and_prunable(local):
+    manager, pr, git, state, _ = local
+    clone = manager.src / "repo"
+    tracked = make_checkout(local, name="tracked")
+    git("config", "branch.feature.remote", "origin")
+    git("config", "branch.feature.merge", "refs/heads/feature")
+    git("worktree", "add", "--detach", str(manager.src / "worktrees" / "detached"))
+    git("branch", "gone")
+    gone = make_checkout(local, branch="gone", name="gone")
+    shutil.rmtree(gone)
+    inventory = manager.scan()
+    by_path = {item["path"]: item for item in inventory["checkouts"]}
+    assert set(by_path) == {str(clone.resolve()), str(tracked.resolve())}
+    item = by_path[str(tracked.resolve())]
+    assert item["branch"] == "feature"
+    assert item["sha"] == git("rev-parse", "feature")
+    assert item["common"] == str((clone / ".git").resolve())
+    assert item["remotes"] == ["base/repo"]
+    assert item["upstream"] == ["base/repo", "feature"]
+    assert by_path[str(clone.resolve())]["branch"] == "main"
+    assert [c["path"] for c in inventory["clones"]] == [str(clone.resolve())]
+    # Single-path verification and the batched scan agree on provenance.
+    assert pw.checkout(tracked) == item
 
 
 def test_fork_branch_is_only_a_suggestion_without_provenance(local):

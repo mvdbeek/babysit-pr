@@ -5,6 +5,7 @@ matched to checkouts by verified head provenance; issues by a ``wti``-style
 ``issue-<number>`` branch in the issue's repository or by a linked PR's verified head.
 """
 
+import concurrent.futures
 import contextlib
 import copy
 import fcntl
@@ -62,6 +63,44 @@ def git(path, *args):
     return run("git", "-C", path, *args, timeout=15)
 
 
+CONFIG_KEYS = r"^(remote\..*\.url|branch\..*\.(remote|merge))$"
+
+
+def repo_config(path):
+    """Remote URLs and branch upstreams of one repository; empty when none are set."""
+    try:
+        return dict(
+            line.split(" ", 1)
+            for line in git(path, "config", "--get-regexp", CONFIG_KEYS).splitlines()
+            if " " in line
+        )
+    except ValueError:
+        return {}
+
+
+def remote_slugs(config):
+    return {
+        key[7:-4]: slug
+        for key, value in config.items()
+        if key.startswith("remote.") and key.endswith(".url") and (slug := remote_slug(value))
+    }
+
+
+def provenance(path, common, branch, sha, config, remotes):
+    remote = config.get(f"branch.{branch}.remote")
+    ref = config.get(f"branch.{branch}.merge")
+    return {
+        "path": str(path),
+        "common": str(common),
+        "branch": branch,
+        "sha": sha,
+        "remotes": list(remotes.values()),
+        "upstream": [remotes.get(remote), ref.removeprefix("refs/heads/")]
+        if remote and ref
+        else None,
+    }
+
+
 def checkout(path):
     """Resolve provenance from Git, never from a workspace label or directory name."""
     path = Path(path).resolve()
@@ -74,39 +113,52 @@ def checkout(path):
         ).resolve()
         branch = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
         sha = git(path, "rev-parse", "HEAD")
-        try:
-            config = dict(
-                line.split(" ", 1)
-                for line in git(
-                    path,
-                    "config",
-                    "--get-regexp",
-                    r"^(remote\..*\.url|branch\..*\.(remote|merge))$",
-                ).splitlines()
-                if " " in line
-            )
-        except ValueError:
-            config = {}
-        remotes = {
-            key[7:-4]: slug
-            for key, value in config.items()
-            if key.startswith("remote.") and key.endswith(".url") and (slug := remote_slug(value))
-        }
-        remote = config.get(f"branch.{branch}.remote")
-        ref = config.get(f"branch.{branch}.merge")
-        upstream = (
-            [remotes.get(remote), ref.removeprefix("refs/heads/")] if remote and ref else None
-        )
-        return {
-            "path": str(path),
-            "common": str(common),
-            "branch": branch,
-            "sha": sha,
-            "remotes": list(remotes.values()),
-            "upstream": upstream,
-        }
+        config = repo_config(path)
+        return provenance(path, common, branch, sha, config, remote_slugs(config))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+def clone_worktrees(root, wanted):
+    """The clone at ``root`` and its attached worktrees, or None when not a wanted clone.
+
+    Three Git calls per clone replace five per worktree: the shared config supplies
+    remotes and branch upstreams, ``worktree list`` supplies every path, head and
+    branch. Bare, detached and prunable entries are skipped, as ``checkout`` skips them.
+    """
+    config = repo_config(root)
+    remotes = remote_slugs(config)
+    if not wanted.intersection(remotes.values()):
+        return None
+    try:
+        toplevel, common = git(
+            root, "rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir"
+        ).splitlines()
+        records = git(root, "worktree", "list", "--porcelain", "-z").split("\0\0")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if Path(toplevel).resolve() != root:
+        return None
+    common = Path(common).resolve()
+    items = []
+    for record in records:
+        fields = dict(
+            line.split(" ", 1) if " " in line else (line, "") for line in record.split("\0") if line
+        )
+        if (
+            "worktree" not in fields
+            or "bare" in fields
+            or "prunable" in fields
+            or not fields.get("branch", "").startswith("refs/heads/")
+        ):
+            continue
+        path = Path(fields["worktree"]).resolve()
+        if not path.is_dir():
+            continue
+        branch = fields["branch"].removeprefix("refs/heads/")
+        items.append(provenance(path, common, branch, fields.get("HEAD", ""), config, remotes))
+    main = next((item for item in items if item["path"] == str(root)), None)
+    return (main, items) if main else None
 
 
 def is_issue(target):
@@ -250,30 +302,16 @@ class Workspaces:
             wanted: set[str] = set()
             for target in self.targets():
                 wanted.update(repositories(target))
-            for root in sorted(roots):
-                try:
-                    urls = git(root, "config", "--get-regexp", r"^remote\..*\.url$")
-                except ValueError:
+            # Git spawns dominate; several clones resolve concurrently, merged in path order.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                found = pool.map(lambda root: clone_worktrees(root, wanted), sorted(roots))
+            for result in found:
+                if not result:
                     continue
-                if not wanted.intersection(
-                    remote_slug(line.split(" ", 1)[1]) for line in urls.splitlines() if " " in line
-                ):
-                    continue
-                main = checkout(root)
-                if not main:
-                    continue
+                main, worktrees = result
                 clones.append(main)
-                try:
-                    records = git(root, "worktree", "list", "--porcelain", "-z").split("\0\0")
-                    for record in records:
-                        first = record.split("\0")[0]
-                        if first.startswith("worktree "):
-                            path = first[9:]
-                            item = main if path == main["path"] else checkout(path)
-                            if item:
-                                items[item["path"]] = item
-                except ValueError:
-                    continue
+                for item in worktrees:
+                    items[item["path"]] = item
             self.inventory = {
                 "checkouts": list(items.values()),
                 "clones": clones,
@@ -631,10 +669,12 @@ class Workspaces:
                 db.execute(
                     "INSERT OR REPLACE INTO operations VALUES (?,?)", (pr["id"], json.dumps(op))
                 )
-            worker = threading.Thread(
-                target=self.perform, args=(pr, op, request.get("task", "")), daemon=True
-            )
-            self.workers[pr["id"]] = worker
+                worker = threading.Thread(
+                    target=self.perform, args=(pr, op, request.get("task", "")), daemon=True
+                )
+                # Registered before the reservation commits, so no snapshot sees a queued
+                # operation without an owner and marks it uncertain.
+                self.workers[pr["id"]] = worker
             worker.start()
             return {"operation": copy.deepcopy(op)}
 
@@ -781,7 +821,16 @@ class Workspaces:
                         raise ValueError("Resulting checkout has unexpected PR head provenance")
                     self.association(pr, item)
                 for _ in range(30):
-                    matches, _ = self.matches(pr, self.scan())
+                    # Verify the one checkout this operation owns; a full inventory scan
+                    # of every local clone is not needed to confirm it.
+                    fresh = checkout(op["path"])
+                    matches, _ = self.matches(
+                        pr,
+                        {
+                            "checkouts": [fresh] if fresh else [],
+                            "workspaces": herdr("workspace", "list")["workspaces"],
+                        },
+                    )
                     target = next(
                         (m for m in matches if m["path"] == op["path"] and m["workspace_id"]), None
                     )

@@ -58,6 +58,20 @@ function ago(value) {
         ? `${Math.floor(age / 60)}m ago`
         : `${Math.floor(age / 3600)}h ago`;
 }
+function closeOnBackdropClick(dialog) {
+  // A click on the backdrop targets the dialog element itself but lands outside its box.
+  dialog.onclick = (event) => {
+    if (event.target !== dialog) return;
+    const bounds = dialog.getBoundingClientRect();
+    if (
+      event.clientX < bounds.left ||
+      event.clientX > bounds.right ||
+      event.clientY < bounds.top ||
+      event.clientY > bounds.bottom
+    )
+      dialog.close();
+  };
+}
 function link(label, url) {
   const node = el("a", label);
   try {
@@ -1416,8 +1430,26 @@ function updateWorkspaceOperation() {
   if (op.result?.url) $("workspace-result").replaceChildren(link("Open in Collie", op.result.url));
   const submit = $("workspace-content").querySelector("button[type=submit]");
   if (submit) submit.disabled = op.status !== "failed";
+  syncWorkspacePolling();
+}
+let workspacePoll = null;
+function syncWorkspacePolling() {
+  // Poll every two seconds while the open dialog shows a queued or running operation;
+  // otherwise the shared 15-second workspace refresh is enough.
+  clearTimeout(workspacePoll);
+  const op =
+    workspaceDialogItem && $("workspace-dialog").open
+      ? workspaceInfo(workspaceDialogItem)?.operation
+      : null;
+  if (!op || !["queued", "running"].includes(op.status)) return;
+  workspacePoll = setTimeout(async () => {
+    await refreshWorkspaces();
+    syncWorkspacePolling();
+  }, 2000);
 }
 $("workspace-close").onclick = () => $("workspace-dialog").close();
+$("workspace-dialog").onclose = syncWorkspacePolling;
+closeOnBackdropClick($("workspace-dialog"));
 setInterval(refreshWorkspaces, 15000);
 void refreshWorkspaces();
 
@@ -1570,18 +1602,7 @@ function openPRCI(pr) {
   );
 }
 $("ci-close").onclick = () => $("ci-dialog").close();
-$("ci-dialog").onclick = (event) => {
-  const dialog = $("ci-dialog");
-  if (event.target !== dialog) return;
-  const bounds = dialog.getBoundingClientRect();
-  if (
-    event.clientX < bounds.left ||
-    event.clientX > bounds.right ||
-    event.clientY < bounds.top ||
-    event.clientY > bounds.bottom
-  )
-    dialog.close();
-};
+closeOnBackdropClick($("ci-dialog"));
 $("ci-dialog").onclose = stopCILoads;
 
 function ciDownloadedLog(pr, check) {
