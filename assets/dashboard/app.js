@@ -524,8 +524,8 @@ const ciStates = {
   NONE: ["No checks", ""],
 };
 
-function dateCell(value, label, cls) {
-  const cell = el("td", undefined, `pr-time ${cls}`);
+function dateDetail(value, label, cls) {
+  const cell = el("div", undefined, `pr-time ${cls}`);
   const date = new Date(value || NaN);
   const valid = Number.isFinite(date.getTime());
   const stamp = el("time", valid ? date.toLocaleString() : "Unknown");
@@ -536,8 +536,10 @@ function dateCell(value, label, cls) {
   );
   return cell;
 }
-function updatedCell(item) {
-  const cell = dateCell(item.updated_at, "Updated", "pr-updated");
+function datesCell(item) {
+  const cell = el("td", undefined, "pr-dates");
+  const opened = dateDetail(item.opened_at, "Opened", "pr-opened");
+  const updated = dateDetail(item.updated_at, "Updated", "pr-updated");
   const activity = item.latest_activity;
   const detail = el("div", undefined, "pr-activity");
   detail.title =
@@ -554,8 +556,9 @@ function updatedCell(item) {
       detail.append(stamp);
     }
   } else detail.append(el("span", "Unavailable", "pr-meta"));
-  cell.append(detail);
-  return cell;
+  updated.append(detail);
+  cell.append(opened, updated);
+  return { cell, updated };
 }
 function repoCell(repo) {
   const cell = el("td", undefined, "pr-repo");
@@ -765,12 +768,22 @@ function itemTable(spec) {
       (item) => spec.visible(item, filters) && spec.searchText(item).toLowerCase().includes(query),
     );
     visible.sort(compare);
+    const direction = table.ascending ? "ascending" : "descending";
     for (const column of Object.keys(spec.columns)) {
-      id(`heading-${column}`).setAttribute(
-        "aria-sort",
-        column === table.sort ? (table.ascending ? "ascending" : "descending") : "none",
-      );
+      const active = column === table.sort;
+      const button = id(`sort-${column}`);
+      button.setAttribute("data-sort", active ? direction : "none");
+      button.setAttribute("aria-pressed", String(active));
+      if (!spec.dates.includes(column))
+        id(`heading-${column}`).setAttribute("aria-sort", active ? direction : "none");
     }
+    // Both chronological sort choices share one physical column.
+    const dateSort = spec.dates.includes(table.sort);
+    id("heading-dates").setAttribute("aria-sort", dateSort ? direction : "none");
+    id("heading-dates").setAttribute(
+      "aria-label",
+      `Dates / activity${dateSort ? `, sorted by ${spec.columns[table.sort]}` : ""}`,
+    );
     id("sort").value = table.sort;
     id("sort-direction").textContent = table.ascending ? "Ascending" : "Descending";
     id("count").textContent = `${visible.length} / ${all.length}`;
@@ -968,11 +981,10 @@ const prTable = itemTable({
     const roles = rolesCell(pr.roles);
     const checks = el("td");
     checks.append(ciBadge(pr));
-    const opened = dateCell(pr.opened_at, "Opened", "pr-opened");
-    const updated = updatedCell(pr);
+    const { cell: dates, updated } = datesCell(pr);
     const repo = repoCell(pr.repo);
     return {
-      cells: [repo, title, author, readiness, roles, checks, opened, updated],
+      cells: [repo, title, author, readiness, roles, checks, dates],
       title,
       updated,
       fields: {
@@ -1103,11 +1115,10 @@ const issueTable = itemTable({
       for (const pr of issue.linked_prs) list.append(linkedPRBadge(issue, pr));
       linked.append(list);
     } else linked.append(el("span", "None", "pr-meta"));
-    const opened = dateCell(issue.opened_at, "Opened", "pr-opened");
-    const updated = updatedCell(issue);
+    const { cell: dates, updated } = datesCell(issue);
     const repo = repoCell(issue.repo);
     return {
-      cells: [repo, title, author, assignees, roles, comments, linked, opened, updated],
+      cells: [repo, title, author, assignees, roles, comments, linked, dates],
       title,
       updated,
       fields: {
