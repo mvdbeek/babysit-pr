@@ -234,12 +234,17 @@ def test_item_pins_keyboard_mobile_and_reload(page, dashboard_site, kind, prefix
     expect(pin).to_have_attribute("aria-pressed", "false")
     pin.scroll_into_view_if_needed()
     bounds = pin.bounding_box()
-    assert bounds and bounds["width"] >= 44 and bounds["height"] >= 44
+    target_size = 44 if width <= 540 else 28
+    assert bounds and bounds["width"] == target_size and bounds["height"] == target_size
+    expect(rows.nth(1).locator("td").first.locator(".item-pin")).to_have_count(1)
+    expect(pin).to_have_text("")
+    icon_bounds = pin.locator("svg").bounding_box()
+    assert icon_bounds and icon_bounds["width"] == 16 and icon_bounds["height"] == 16
     pin.focus()
     pin.press("Enter")
     expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
     unpin = rows.first.locator(".item-pin")
-    expect(unpin).to_have_text("Unpin")
+    assert unpin.get_attribute("aria-label").startswith("Unpin ")
     expect(unpin).to_have_attribute("aria-pressed", "true")
     expect(unpin).to_be_focused()
     expect(page.locator(f"#{prefix}-count")).to_have_text("2 / 2")
@@ -458,7 +463,7 @@ def test_latest_activity_display_refresh_and_fallback(page, dashboard_site, kind
     assert page.evaluate("window.injected") is None
 
 
-@pytest.mark.parametrize("kind,prefix,columns", [("prs", "pr", 8), ("issues", "issue", 9)])
+@pytest.mark.parametrize("kind,prefix,columns", [("prs", "pr", 9), ("issues", "issue", 10)])
 @pytest.mark.parametrize("width", [1280, 390])
 def test_compact_dates_share_a_column_and_keep_both_sorts(
     page, dashboard_site, kind, prefix, columns, width
@@ -645,8 +650,8 @@ def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboar
     rows = page.locator("#pr-list tr")
     expect(rows).to_have_count(2)
     expect(page.get_by_role("columnheader", name="Repository", exact=True)).to_be_visible()
-    expect(rows.first.locator("td").nth(0)).to_have_text("test/alpha")
-    expect(rows.first.locator("td").nth(1)).to_contain_text("#8")
+    expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+    expect(rows.first.locator(".pr-description")).to_contain_text("#8")
     expect(rows.first.locator("img")).to_have_count(0)
     assert page.evaluate("window.injected === undefined")
     expect(rows.first.locator(".pr-updated time")).to_have_attribute(

@@ -698,24 +698,38 @@ button:disabled {
   display: block;
   color: var(--muted);
 }
-.item-pin-meta {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
+.pr-table .item-pin-cell {
+  width: 28px;
+  padding: 12px 4px;
+  vertical-align: top;
 }
 .item-pin {
-  min-width: 44px;
-  min-height: 44px;
-  padding: 6px 10px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: var(--paper);
-  color: var(--green);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
 }
+.item-pin svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+}
+.item-pin:hover,
 .item-pin[aria-pressed="true"] {
-  border-color: var(--green);
+  color: var(--green);
   background: #e8f3ec;
+}
+.item-pin[aria-pressed="true"] svg {
+  fill: currentColor;
 }
 .pr-roles,
 .pr-badges {
@@ -766,15 +780,27 @@ button:disabled {
     display: none;
   }
   .pr-table tr {
+    position: relative;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    padding: 14px;
+    padding: 14px 14px 14px 48px;
     border-bottom: 1px solid var(--line);
   }
   .pr-table td {
     display: block;
     padding: 6px;
     border: 0;
+  }
+  .pr-table .item-pin-cell {
+    position: absolute;
+    top: 8px;
+    left: 2px;
+    width: 44px;
+    padding: 0;
+  }
+  .item-pin {
+    width: 44px;
+    height: 44px;
   }
   .pr-table .pr-description,
   .pr-table .pr-repo {

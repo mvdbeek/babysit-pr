@@ -849,7 +849,15 @@ function itemTable(spec) {
   }
   function pinButton(item, pins) {
     const pinned = Boolean(pins?.ids.has(item.id));
-    const button = el("button", pinned ? "Unpin" : "Pin", "item-pin");
+    const button = el("button", undefined, "item-pin");
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("aria-hidden", "true");
+    icon.setAttribute("focusable", "false");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", "M16 3H8l1 7-4 4v2h6v6h2v-6h6v-2l-4-4 1-7Z");
+    icon.append(path);
+    button.append(icon);
     button.type = "button";
     button.dataset.itemId = item.id;
     button.disabled = !pins;
@@ -1078,10 +1086,8 @@ function itemTable(spec) {
       if (index >= table.limit) continue;
       const row = el("tr");
       const { cells, title, fields, updated } = spec.row(item);
-      const meta = title.querySelector(".pr-meta");
-      const pinMeta = el("div", undefined, "item-pin-meta");
-      meta.replaceWith(pinMeta);
-      pinMeta.append(meta, pinButton(item, pins));
+      const pinCell = el("td", undefined, "item-pin-cell");
+      pinCell.append(pinButton(item, pins));
       if (change) {
         row.className = change.isNew ? "pr-new" : "pr-changed";
         title.append(
@@ -1105,7 +1111,7 @@ function itemTable(spec) {
         for (const field of change.fields) fields[field].classList.add("pr-field-changed");
         if (!change.isNew && !change.fields.length) updated.classList.add("pr-field-changed");
       }
-      row.append(...cells, workspaceCell(item));
+      row.append(pinCell, ...cells, workspaceCell(item));
       rows.push(row);
     }
     id("list").replaceChildren(...rows);
