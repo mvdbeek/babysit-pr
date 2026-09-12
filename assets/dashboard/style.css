@@ -698,6 +698,25 @@ button:disabled {
   display: block;
   color: var(--muted);
 }
+.item-pin-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.item-pin {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--paper);
+  color: var(--green);
+}
+.item-pin[aria-pressed="true"] {
+  border-color: var(--green);
+  background: #e8f3ec;
+}
 .pr-roles,
 .pr-badges {
   display: flex;
