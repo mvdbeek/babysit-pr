@@ -7,8 +7,8 @@ The skill instructions and operating details are in [SKILL.md](SKILL.md) and [th
 ## Your pull requests
 
 The dashboard opens on the **Watcher** tab. Use **Pull requests** to switch to the
-PR overview; tabs support keyboard navigation, browser history, and direct links
-with `#watcher` or `#prs`. The PR table has separate repository, author, and draft/ready-for-review columns,
+PR overview and **Issues** for the issue overview; tabs support keyboard navigation,
+browser history, and direct links with `#watcher`, `#prs` or `#issues`. The PR table has separate repository, author, and draft/ready-for-review columns,
 plus opened and last-updated timestamps. Click a metadata column heading to sort; click
 again to reverse it. Mobile layouts provide equivalent sort controls. Dates sort
 chronologically, other columns by their displayed text; missing metadata stays
@@ -42,6 +42,33 @@ complete snapshot with a visible error. Cached metadata lives in
 `pr-overview.json` in the watcher state directory, outside this repository.
 The HTTP API is `/api/prs` and uses the same local/tailnet access restrictions as
 the watch dashboard. This overview does not require the watcher daemon to be online.
+
+## Your issues
+
+The **Issues** tab lists open GitHub issues that involve the active `gh` account in
+any capacity: created (**Author**), **Assignee**, **Mentioned**, or **Participant**
+(you commented). It mirrors the PR tab: the same sortable columns, labeled filters,
+search, mobile sort controls, and “since your last visit” highlighting, stored
+separately under `babysit-pr:seen-issues:v1:<login>`. Columns are repository,
+issue title with its labels, author, assignees, your roles, comment count, linked
+pull requests, opened and last-updated times, and **Actions**. Filters combine
+repository, role, label (a select populated from the discovered labels) and
+whether the issue has a linked PR. Search covers repository, title, number,
+author, assignees and label names.
+
+**Linked PRs** are the open pull requests GitHub reports as closing the issue
+(`closedByPullRequestsReferences`), with a Draft marker where relevant. When a linked
+PR is already in your PR overview, its CI badge appears next to the link and opens
+the same CI details dialog; otherwise no CI is shown and nothing extra is fetched.
+Issues have no CI columns of their own.
+
+Discovery runs four searches (`author`, `assignee`, `mentions`, `commenter`) and
+merges duplicates with all matching roles, with the same 1,000-result cap notice as
+PRs. It shares the five-minute refresh cadence and the GitHub request machinery with
+the PR overview (`scripts/pr_overview.py`; the issue definition is
+`scripts/issue_overview.py`). Cached metadata lives in `issue-overview.json` next to
+`pr-overview.json`. The HTTP API is `GET /api/issues`, with the same access restrictions
+as `/api/prs`.
 
 ## PR workspace actions
 
@@ -91,14 +118,46 @@ interactive-shell Safehouse wrappers. Task text plus the canonical PR URL is sto
 in a private file under `workspace-prompts/` outside the checkout and passed with
 `--prompt-file`. No PR comments or CI watches are added.
 
-The chezmoi-managed `~/.config/zsh/worktree.zsh` helper now accepts `wtpr --name`,
-`--no-focus`, `--repo-path`, and `--worktree-root`. Existing terminal defaults remain
-unchanged. `scripts/worktree.zsh` is the matching helper snapshot used by isolated
-integration tests; keep it synchronized with
+The chezmoi-managed `~/.config/zsh/worktree.zsh` helper accepts `wtpr --name`,
+`--no-focus`, `--repo-path`, and `--worktree-root`, and `wti` accepts the same four
+options. Existing terminal defaults remain unchanged. `scripts/worktree.zsh` is the
+matching helper snapshot used by isolated integration tests; keep it synchronized with
 `~/.local/share/chezmoi/dot_config/zsh/worktree.zsh` when changing the helper.
 After updating that source, apply the individual helper with chezmoi and restart
 the dashboard process. Live rollout checks should use read-only `curl` requests to
-`/`, `/api/prs`, and `/api/workspaces`; they must not create a workspace or launch an agent.
+`/`, `/api/prs`, `/api/issues`, and `/api/workspaces`; they must not create a
+workspace or launch an agent.
+
+## Issue workspace actions
+
+The **Actions** column on the Issues tab offers the same open, reopen, focus, copy,
+create and clone-and-create actions as the PR tab, through the same dialog and the
+same `POST /api/workspace-action` endpoint. Requests carry the issue's GraphQL `id`;
+GraphQL node ids are globally unique, so the server dispatches on the id and needs no
+separate kind parameter. `GET /api/workspaces` returns an `issues` map beside `prs`,
+keyed by id, with the same `matches`, `suggestions`, `clones`, `preferred_clone`,
+`destination` and `operation` fields. One local inventory scan serves both tabs and
+refreshes every 15 seconds while either tab is visible.
+
+An issue's workspaces are checkouts that match one of these rules:
+
+- a saved association or a watcher job bound to the canonical issue URL, as for PRs;
+- a checkout whose branch is `issue-<number>` or `issue-<number>-…` (what `wti`
+  creates) in a clone of the issue's repository; the same branch name in another
+  repository is listed only as an unverified suggestion;
+- a checkout carrying the verified head of one of the issue's **linked PRs** (the
+  existing PR rule: upstream or branch plus the PR head commit). These count as the
+  issue's workspace and are labelled **via PR #n** in the Actions cell and chooser.
+
+**Create workspace** for an issue requires a task and an agent, exactly like PRs,
+and needs no head metadata. The adapter invokes `wti` through `zsh -lic` with
+`--codex|--claude --no-focus --name <name> --repo-path <clone> --worktree-root
+<root> --prompt-file <file> <issue-url>`. The worktree and branch name is `wti`'s
+own default, `issue-<number>-<title-slug>` (or `issue-<number>` when the title yields
+no slug), with a numeric suffix for collisions; the branch starts from the clone's
+`origin/HEAD`, so no upstream check applies. The prompt file contains the task and
+`Issue: <canonical URL>`. Associations, operations and logs share
+`pr-workspaces.sqlite`; the `pr` column keeps its name and stores both kinds of id.
 
 ## Development
 
