@@ -963,6 +963,37 @@ def test_pr_overview_pages_fifty_rows_and_loads_more_on_scroll(page: Page, dashb
     expect(page.locator("#issue-more")).to_be_hidden()
 
 
+@pytest.mark.parametrize(
+    "draft,outcome,branch,label",
+    [
+        (True, None, None, "Draft"),
+        (False, None, None, "Ready for review"),
+        (None, None, None, "PR status pending"),
+        (True, "merged", None, "Merged"),
+        (False, "closed", None, "Closed"),
+        (True, None, "dev", None),
+    ],
+)
+def test_watcher_pr_review_state(page, dashboard_site, draft, outcome, branch, label):
+    url, home = dashboard_site
+    db = supervisor.open_db(home)
+    with db:
+        job = supervisor.get_job(db, "feedback")
+        job["branch"] = branch
+        job["snapshot"]["pr"].update(
+            draft=draft, merged=outcome == "merged", closed=outcome == "closed"
+        )
+        supervisor.save_job(db, job)
+    db.close()
+    page.goto(url)
+    row = page.locator("#list .watch").filter(has_text="test/repo")
+    row.click()
+    for target in (row.locator(".watch-top"), page.locator("#detail .detail-top")):
+        expect(target.locator(".badge")).to_have_count(2 if label else 1)
+        if label:
+            expect(target.get_by_text(label, exact=True)).to_be_visible()
+
+
 @pytest.fixture
 def workspace_routes(page):
     target = {

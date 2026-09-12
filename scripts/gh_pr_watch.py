@@ -169,7 +169,7 @@ def parse_pr_spec(pr_spec):
 
 def pr_view_fields():
     return (
-        "number,url,state,mergedAt,closedAt,headRefName,headRefOid,"
+        "number,url,state,isDraft,mergedAt,closedAt,headRefName,headRefOid,"
         "headRepository,headRepositoryOwner,baseRefOid,mergeable,mergeStateStatus,reviewDecision"
     )
 
@@ -206,6 +206,7 @@ def resolve_pr(pr_spec, repo_override=None, cwd=None):
         "head_branch": str(data.get("headRefName") or ""),
         "base_sha": str(data.get("baseRefOid") or ""),
         "state": state,
+        "draft": data.get("isDraft"),
         "merged": merged,
         "closed": closed,
         "mergeable": str(data.get("mergeable") or ""),

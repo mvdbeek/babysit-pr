@@ -27,6 +27,19 @@ def sample_pr():
     }
 
 
+@pytest.mark.parametrize("draft", [True, False, None])
+def test_resolve_pr_includes_draft_in_existing_query(monkeypatch, draft):
+    calls = []
+
+    def query(args, **kwargs):
+        calls.append(args)
+        return {"number": 123, "url": "https://github.com/openai/codex/pull/123", "isDraft": draft}
+
+    monkeypatch.setattr(gh_pr_watch, "gh_json", query)
+    assert gh_pr_watch.resolve_pr("123")["draft"] is draft
+    assert len(calls) == 1 and "isDraft" in calls[0][-1].split(",")
+
+
 def sample_checks(**overrides):
     checks = {
         "pending_count": 0,

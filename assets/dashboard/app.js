@@ -362,7 +362,7 @@ function render() {
         `${job.repo}${job.kind === "pr" && job.number ? ` #${job.number}` : ""}`,
         "watch-title",
       ),
-      badge(job.status),
+      watchBadges(job),
     );
     const bottom = el("div", undefined, "watch-bottom");
     bottom.append(ciSummary(job), el("span", ago(job.last_poll)));
@@ -404,6 +404,24 @@ function fact(label, value, wide = false) {
   node.append(el("small", label), el("span", value || "—"));
   return node;
 }
+function watchBadges(job) {
+  const badges = el("div", undefined, "pr-badges");
+  if (job.kind === "pr") {
+    const label =
+      job.pr_outcome === "merged"
+        ? "Merged"
+        : job.pr_outcome === "closed"
+          ? "Closed"
+          : job.draft === true
+            ? "Draft"
+            : job.draft === false
+              ? "Ready for review"
+              : "PR status pending";
+    badges.append(el("span", label, "badge " + (label === "Ready for review" ? "blue" : "")));
+  }
+  badges.append(badge(job.status));
+  return badges;
+}
 function renderDetail() {
   const job = data.jobs.find((j) => j.id === selected);
   if (!job) {
@@ -439,7 +457,7 @@ function renderDetail() {
   const top = el("div", undefined, "detail-top");
   top.append(
     el("span", job.kind === "branch" ? "BRANCH CI" : "PULL REQUEST", "eyebrow"),
-    badge(job.status),
+    watchBadges(job),
   );
   const title = el("h2");
   title.append(link(job.branch || job.repo, job.url));

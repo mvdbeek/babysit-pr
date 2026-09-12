@@ -124,6 +124,11 @@ as `/api/prs`.
 
 ## Watcher workspace actions
 
+PR watches show **Draft** or **Ready for review** beside their monitoring status,
+in both the watch list and details. The value follows the regular watcher poll;
+older snapshots show **PR status pending** until refreshed. Completed PRs show
+**Merged** or **Closed** instead. Branch watches have no PR review status.
+
 Select a watch to **Open workspace** from its details, including branch watches
 and completed PR watches. This uses the watch's recorded checkout, independently
 of the open PR overview. **More actions** offers native focus and command copying;

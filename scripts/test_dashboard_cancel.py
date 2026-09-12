@@ -9,6 +9,13 @@ import pr_supervisor as supervisor
 import pytest
 
 
+@pytest.mark.parametrize("draft", [True, False, None])
+def test_present_job_draft_state(draft):
+    job = {"id": "pr", "snapshot": {"pr": {"draft": draft}}}
+    assert dashboard.present_job(job)["draft"] is draft
+    assert dashboard.present_job({**job, "branch": "dev"})["draft"] is None
+
+
 @pytest.fixture
 def server(tmp_path):
     db = supervisor.open_db(tmp_path)
