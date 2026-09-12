@@ -74,10 +74,15 @@ def rig(tmp_path, monkeypatch):
         confirm=True,
         clock=0,
         reads=0,
+        state_change_seq=5,
     )
 
     def inspect(_):
-        return copy.deepcopy(state["info"]), copy.deepcopy(state["procs"]), {"state_change_seq": 5}
+        return (
+            copy.deepcopy(state["info"]),
+            copy.deepcopy(state["procs"]),
+            {"state_change_seq": state["state_change_seq"]},
+        )
 
     def herdr(*args):
         if args[:2] == ("agent", "read"):
@@ -106,6 +111,8 @@ def rig(tmp_path, monkeypatch):
         if state.get("pause"):
             with db:
                 supervisor.save_job(db, dict(id="watch", status="paused", epoch=3))
+        if state.get("on_sleep"):
+            state["on_sleep"]()
 
     monkeypatch.setattr(handoff, "inspect", inspect)
     monkeypatch.setattr(handoff, "herdr", herdr)
@@ -126,6 +133,88 @@ def test_success_exits_once_then_releases(rig):
     assert (
         json.loads((home / "handoffs" / (target["token"] + ".audit.json")).read_text())["stage"]
         == "released"
+    )
+
+
+@pytest.mark.parametrize("screen", [EMPTY, "[receipt]", "[receipt]\n› "])
+def test_waits_for_final_display_then_exits_once(rig, screen):
+    target, home, db, state = rig
+    state["screen"] = screen
+    state["on_sleep"] = lambda: state.update(screen="[receipt]\n" + EMPTY)
+    handoff.perform(target, home, db)
+    assert len(state["sent"]) == 1
+    assert state["clock"] == handoff.SCREEN_SETTLE_INTERVAL
+    assert supervisor.get_job(db, "watch")["status"] == "watching"
+    audit = json.loads((home / "handoffs" / (target["token"] + ".audit.json")).read_text())
+    assert audit["first_failed_screen"] == screen
+    assert audit["last_screen"] == "[receipt]\n" + EMPTY
+
+
+def test_display_wait_is_bounded_and_saves_failed_screen(rig):
+    target, home, db, state = rig
+    target["timeout"] = 600
+    state["screen"] = EMPTY
+    with pytest.raises(RuntimeError, match="Timed out waiting for final display"):
+        handoff.perform(target, home, db)
+    assert state["clock"] == handoff.SCREEN_SETTLE_TIMEOUT
+    assert not state["sent"]
+    assert supervisor.get_job(db, "watch")["status"] == "awaiting_release"
+    audit = json.loads((home / "handoffs" / (target["token"] + ".audit.json")).read_text())
+    assert audit["stage"] == "error"
+    assert audit["last_failed_screen"] == EMPTY
+    assert "Final receipt" in audit["screen_error"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "draft",
+        "working",
+        "new_turn",
+        "question",
+        "process",
+        "sequence",
+        "rollout",
+        "pause",
+        "queued",
+        "scroll",
+    ],
+)
+def test_changes_during_display_wait_cancel(rig, change):
+    target, home, db, state = rig
+    state["screen"] = EMPTY
+
+    def changed():
+        state["screen"] = "[receipt]\n" + EMPTY
+        if change == "draft":
+            state["screen"] = "[receipt]\n› my draft"
+        elif change == "working":
+            state["info"]["agent_status"] = "working"
+        elif change == "new_turn":
+            state["turn"] = ("new", None)
+        elif change == "question":
+            state["info"]["agent_status"] = "blocked"
+        elif change == "process":
+            state["procs"]["foreground_processes"][0]["pid"] = 201
+        elif change == "sequence":
+            state["state_change_seq"] += 1
+        elif change == "rollout":
+            (home / "rollout.jsonl").write_text("new activity")
+        elif change == "pause":
+            with db:
+                supervisor.save_job(db, dict(id="watch", status="paused", epoch=3))
+        elif change == "queued":
+            state["screen"] += "\nQueued follow-up inputs"
+        elif change == "scroll":
+            state["info"]["scroll"]["offset_from_bottom"] = 5
+
+    state["on_sleep"] = changed
+    with pytest.raises(RuntimeError):
+        handoff.perform(target, home, db)
+    assert not state["sent"]
+    assert state["clock"] == handoff.SCREEN_SETTLE_INTERVAL
+    assert supervisor.get_job(db, "watch")["status"] == (
+        "paused" if change == "pause" else "awaiting_release"
     )
 
 
@@ -153,6 +242,7 @@ def test_changes_cancel_without_keys(rig, reason):
     with pytest.raises(RuntimeError):
         handoff.perform(target, home, db)
     assert not state["sent"]
+    assert state["clock"] == 0
     assert supervisor.get_job(db, "watch")["status"] == "awaiting_release"
 
 

@@ -21,6 +21,11 @@ Automatic handoff supports the Codex TUI's faint “Ask Codex to do anything”
 placeholder. Draft input, queued questions, dialogs, scrollback, a new turn, or an
 unknown layout cancels the handoff. Checks immediately before sending reduce the
 window for input races; herdr does not offer an atomic conditional key send.
+After turn completion, a missing final marker or blank/missing input area gets
+up to five seconds to render, bounded by the handoff timeout. Each retry rechecks
+ownership, process identity, and unchanged idle session state. Draft input and
+other cancellation conditions still stop immediately. The audit retains the
+first and last failed ANSI screens and the latest screen for diagnosis.
 Avoid typing into the pane during the brief handoff. Automatic initial exit is Codex-only; Claude uses manual Ctrl-D and release.
 
 Otherwise, exit the original CLI with Ctrl-D and run the returned `release_argv`

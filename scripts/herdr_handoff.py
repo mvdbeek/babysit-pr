@@ -15,6 +15,12 @@ import pr_supervisor as supervisor
 
 SCRIPT = Path(__file__).resolve()
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
+SCREEN_SETTLE_TIMEOUT = 5.0
+SCREEN_SETTLE_INTERVAL = 0.25
+
+
+class ScreenNotReady(RuntimeError):
+    """The final receipt or empty input has not finished rendering."""
 
 
 def herdr(*args):
@@ -132,10 +138,19 @@ def verify_screen(target, info, screen):
     plain = SGR.sub("", screen)
     if info.get("scroll", {}).get("offset_from_bottom", 0) != 0:
         raise RuntimeError("Terminal is scrolled; leave it under user control")
-    if target["marker"] not in plain or not empty_composer(screen):
-        raise RuntimeError("Final receipt or empty composer is unverified; no exit key sent")
     if "Queued follow-up inputs" in plain or "esc to interrupt" in plain:
         raise RuntimeError("Queued input or background work is visible; agent left open")
+    if not empty_composer(screen):
+        prompts = [
+            line.lstrip()[1:].strip()
+            for line in plain.splitlines()
+            if line.lstrip().startswith("›")
+        ]
+        if prompts and prompts[-1]:
+            raise RuntimeError("Composer contains input or an unknown layout; no exit key sent")
+        raise ScreenNotReady("Empty composer is not yet visible; no exit key sent")
+    if target["marker"] not in plain:
+        raise ScreenNotReady("Final receipt is not yet visible; no exit key sent")
 
 
 def schedule(db, home, args):
@@ -232,9 +247,32 @@ def schedule(db, home, args):
 
 def perform(target, home, db):
     audit = home / "handoffs" / f"{target['token']}.audit.json"
+    diagnostics: dict[str, str] = {}
 
     def save(stage, **details):
-        supervisor.watch.save_state(audit, {**target, "stage": stage, **details})
+        supervisor.watch.save_state(audit, {**target, **diagnostics, "stage": stage, **details})
+
+    def check_screen(info):
+        screen = herdr(
+            "agent",
+            "read",
+            target["pane_id"],
+            "--source",
+            "visible",
+            "--lines",
+            "100",
+            "--format",
+            "ansi",
+        )
+        diagnostics["last_screen"] = screen
+        try:
+            verify_screen(target, info, screen)
+        except RuntimeError as exc:
+            diagnostics.setdefault("first_failed_screen", screen)
+            diagnostics["last_failed_screen"] = screen
+            diagnostics["screen_error"] = str(exc)
+            raise
+        return screen
 
     def still_owned():
         job = supervisor.get_job(db, target["job_id"])
@@ -249,6 +287,8 @@ def perform(target, home, db):
     try:
         save("waiting")
         deadline = time.monotonic() + target["timeout"]
+        settle_deadline = None
+        settle_identity = None
         while True:
             still_owned()
             info, procs, agent = inspect(target["pane_id"])
@@ -258,41 +298,43 @@ def perform(target, home, db):
                 raise RuntimeError("A new turn started; handoff cancelled")
             if info.get("agent_status") == "blocked":
                 raise RuntimeError("Dialog or question is pending; handoff cancelled")
+            if settle_deadline is not None and (
+                info.get("agent_status") not in {"idle", "done"}
+                or (agent.get("state_change_seq"), fingerprint(target["rollout"]))
+                != settle_identity
+                or complete is None
+            ):
+                raise RuntimeError(
+                    "Session or input changed while waiting for display; handoff cancelled"
+                )
             if complete is not None:
                 if target["marker"] not in complete:
                     raise RuntimeError("Final response does not confirm this handoff")
                 if info.get("agent_status") in {"idle", "done"}:
+                    if settle_deadline is None:
+                        settle_deadline = min(deadline, time.monotonic() + SCREEN_SETTLE_TIMEOUT)
+                        settle_identity = (
+                            agent.get("state_change_seq"),
+                            fingerprint(target["rollout"]),
+                        )
+                    try:
+                        check_screen(info)
+                    except ScreenNotReady as exc:
+                        save("waiting_for_screen")
+                        if time.monotonic() >= settle_deadline:
+                            raise RuntimeError(
+                                f"Timed out waiting for final display: {exc}"
+                            ) from exc
+                        time.sleep(SCREEN_SETTLE_INTERVAL)
+                        continue
                     break
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for the final response; agent left open")
             time.sleep(1)
-        screen = herdr(
-            "agent",
-            "read",
-            target["pane_id"],
-            "--source",
-            "visible",
-            "--lines",
-            "100",
-            "--format",
-            "ansi",
-        )
-        verify_screen(target, info, screen)
         before = fingerprint(target["rollout"])
         info2, procs2, agent2 = inspect(target["pane_id"])
         verify_identity(target, info2, procs2)
-        screen2 = herdr(
-            "agent",
-            "read",
-            target["pane_id"],
-            "--source",
-            "visible",
-            "--lines",
-            "100",
-            "--format",
-            "ansi",
-        )
-        verify_screen(target, info2, screen2)
+        screen2 = check_screen(info2)
         if (
             info2.get("agent_status") not in {"idle", "done"}
             or agent.get("state_change_seq") is None
