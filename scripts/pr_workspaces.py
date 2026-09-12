@@ -295,33 +295,43 @@ class Workspaces:
                 self.refreshing = False
 
     def association(self, pr, item):
+        data = {**item, "head_repo": pr.get("head_repo"), "head_branch": pr.get("head_branch")}
         with self.db() as db:
             db.execute(
                 "INSERT OR REPLACE INTO associations VALUES (?,?,?)",
-                (
-                    pr["id"],
-                    item["path"],
-                    json.dumps(
-                        {
-                            **item,
-                            "head_repo": pr.get("head_repo"),
-                            "head_branch": pr.get("head_branch"),
-                        }
-                    ),
-                ),
+                (pr["id"], item["path"], json.dumps(data)),
             )
+        return data
 
-    def matches(self, pr, inventory):
+    def state(self):
+        """One read of the durable tables and watcher queue, shared across a whole snapshot."""
+        associations: dict[str, dict] = {}
         with self.db() as db:
-            saved = {
-                row[0]: json.loads(row[1])
-                for row in db.execute("SELECT path,data FROM associations WHERE pr=?", (pr["id"],))
+            for key, path, data in db.execute("SELECT pr,path,data FROM associations"):
+                associations.setdefault(key, {})[path] = json.loads(data)
+            clones = dict(db.execute("SELECT repo,path FROM clones"))
+            operations = {
+                key: json.loads(data) for key, data in db.execute("SELECT pr,data FROM operations")
             }
-        watches = self.jobs()
+        return {
+            "associations": associations,
+            "clones": clones,
+            "operations": operations,
+            "watches": self.jobs(),
+        }
+
+    def matches(self, pr, inventory, state=None):
+        if state is None:
+            state = self.state()
+        saved = state["associations"].get(pr["id"], {})
+        watches = state["watches"]
         matches, suggestions = [], []
+        issue = is_issue(pr)
+        repos = repositories(pr)  # Hoisted: snapshots compare every target with every checkout.
+        linked_prs = (pr.get("linked_prs") or []) if issue else []
         for item in inventory["checkouts"]:
-            same = same_repository(pr, item)
-            if not same and not is_issue(pr):
+            same = bool(repos & set(item["remotes"]))
+            if not same and not issue:
                 continue
             prior = saved.get(item["path"], {})
             associated = same and (
@@ -338,9 +348,9 @@ class Workspaces:
                 for w in watches
             )
             linked = None
-            if is_issue(pr):
+            if issue:
                 verified = same and verified_issue(pr, item)
-                if not verified:
+                if not verified and linked_prs and same:
                     linked = linked_checkout(pr, item)
                     verified = linked is not None
                 # A branch name alone is only a hint when the repository does not agree.
@@ -396,8 +406,10 @@ class Workspaces:
                 "INSERT OR REPLACE INTO operation_history VALUES (?,?)", (op["id"], json.dumps(op))
             )
 
-    def describe(self, pr, inventory):
-        op = self.operation(pr["id"])
+    def describe(self, pr, inventory, state=None):
+        if state is None:
+            state = self.state()
+        op = state["operations"].get(pr["id"])
         # Recover the durable resource reservation even if the server exited before
         # recording its association. Name alone is never sufficient provenance.
         if op and op.get("path") and op.get("branch") and op.get("common"):
@@ -408,14 +420,12 @@ class Workspaces:
                 and item["branch"] == op["branch"]
                 and (is_issue(pr) or item["upstream"] == self.expected_upstream(pr))
             ):
-                self.association(pr, item)
-        matches, suggestions = self.matches(pr, inventory)
+                state["associations"].setdefault(pr["id"], {})[item["path"]] = self.association(
+                    pr, item
+                )
+        matches, suggestions = self.matches(pr, inventory, state)
         clones = [c["path"] for c in inventory["clones"] if pr["repo"].lower() in c["remotes"]]
-        with self.db() as db:
-            choice = db.execute(
-                "SELECT path FROM clones WHERE repo=?", (pr["repo"].lower(),)
-            ).fetchone()
-        op = self.operation(pr["id"])
+        choice = state["clones"].get(pr["repo"].lower())
         if (
             op
             and op["status"] in {"queued", "running", "uncertain"}
@@ -438,7 +448,7 @@ class Workspaces:
             "matches": matches,
             "suggestions": suggestions,
             "clones": clones,
-            "preferred_clone": choice[0] if choice and choice[0] in clones else None,
+            "preferred_clone": choice if choice in clones else None,
             "destination": self.destination(pr),
             "operation": op,
         }
@@ -454,9 +464,10 @@ class Workspaces:
                 threading.Thread(target=self.refresh, daemon=True).start()
             inventory = copy.deepcopy(self.inventory)
         described: dict[str, dict] = {"prs": {}, "issues": {}}
+        state = self.state()
         for target in self.targets():
             key = "issues" if is_issue(target) else "prs"
-            described[key][target["id"]] = self.describe(target, inventory)
+            described[key][target["id"]] = self.describe(target, inventory, state)
         return {
             **described,
             "error": inventory["error"],

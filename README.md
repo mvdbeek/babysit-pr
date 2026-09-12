@@ -56,8 +56,9 @@ repository, role, label (a select populated from the discovered labels) and
 whether the issue has a linked PR. Search covers repository, title, number,
 author, assignees and label names.
 
-**Linked PRs** are the open pull requests GitHub reports as closing the issue
-(`closedByPullRequestsReferences`), with a Draft marker where relevant. When a linked
+**Linked PRs** are the pull requests GitHub reports as closing the issue
+(`closedByPullRequestsReferences` without closed, unmerged PRs; merged PRs still
+appear, in green), with a Draft marker where relevant. When a linked
 PR is already in your PR overview, its CI badge appears next to the link and opens
 the same CI details dialog; otherwise no CI is shown and nothing extra is fetched.
 Issues have no CI columns of their own.
