@@ -160,6 +160,45 @@ def read_job(home: Path, key: str) -> dict:
         db.close()
 
 
+@pytest.mark.parametrize("width", [1440, 768, 390, 320])
+def test_header_branding_and_status_fit_at_all_widths(page: Page, dashboard_site, width):
+    url, home = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url)
+    expect(page.locator("#updated")).to_contain_text("Refreshed")
+    (home / "heartbeat.json").unlink()
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#health")).to_have_text("Watcher offline")
+    page.screenshot(path=f"reports/header-{width}.png")
+
+    for selector in [".mark", "header h1", "#health", "#updated"]:
+        element = page.locator(selector)
+        expect(element).to_be_visible()
+        assert element.evaluate("node => node.scrollWidth <= node.clientWidth")
+        assert element.evaluate(
+            """node => {
+                const rect = node.getBoundingClientRect();
+                const header = node.closest('header').getBoundingClientRect();
+                return rect.left >= header.left && rect.right <= header.right
+                    && rect.top >= header.top && rect.bottom <= header.bottom;
+            }"""
+        )
+    assert page.locator(".brand").evaluate(
+        "node => node.getBoundingClientRect().right <= "
+        "document.querySelector('.connection').getBoundingClientRect().left"
+    )
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    tagline = page.locator("header p")
+    if width > 900:
+        expect(tagline).to_be_visible()
+        assert tagline.evaluate(
+            "node => node.getBoundingClientRect().left >= "
+            "document.querySelector('header h1').getBoundingClientRect().right"
+        )
+    elif width <= 540:
+        expect(tagline).to_be_hidden()
+
+
 @pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
 @pytest.mark.parametrize("width", [1280, 390])
 def test_latest_activity_display_refresh_and_fallback(page, dashboard_site, kind, prefix, width):

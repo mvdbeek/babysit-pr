@@ -50,35 +50,42 @@ summary:focus-visible {
   outline-offset: 3px;
 }
 header {
-  padding: 32px 5%;
+  padding: 12px 5%;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
   background: #fcfdf9;
   border-bottom: 1px solid var(--line);
 }
 .brand {
   display: flex;
-  gap: 16px;
+  gap: 10px;
   align-items: center;
+}
+.brand-copy {
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
 .mark {
   display: grid;
   place-items: center;
   background: var(--ink);
   color: #e5f0a3;
-  width: 49px;
-  height: 49px;
-  border-radius: 14px;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 10px;
   font:
-    bold 33px Georgia,
+    bold 25px Georgia,
     serif;
-  padding-bottom: 6px;
+  padding-bottom: 4px;
 }
 h1 {
-  font-size: 25px;
+  font-size: 20px;
   letter-spacing: -1px;
-  margin: 0 0 5px;
+  margin: 0;
 }
 p {
   line-height: 1.55;
@@ -90,9 +97,9 @@ header p {
 }
 .connection {
   display: flex;
-  align-items: flex-end;
-  flex-direction: column;
-  gap: 8px;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
 }
 small {
   color: var(--muted);
@@ -496,21 +503,22 @@ footer {
   .metrics > * {
     padding: 0 18px;
   }
-  .connection small {
-    display: none;
+  .brand-copy {
+    display: block;
+  }
+  .connection {
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 3px;
   }
 }
 @media (max-width: 540px) {
   header {
-    padding: 22px 5%;
-    gap: 10px;
+    padding: 8px 5%;
+    gap: 8px;
   }
   header p {
     display: none;
-  }
-  .mark {
-    width: 40px;
-    height: 40px;
   }
   main {
     padding-top: 22px;
