@@ -143,15 +143,51 @@ interactive-shell Safehouse wrappers. Task text plus the canonical PR URL is sto
 in a private file under `workspace-prompts/` outside the checkout and passed with
 `--prompt-file`. No PR comments or CI watches are added.
 
-The chezmoi-managed `~/.config/zsh/worktree.zsh` helper accepts `wtpr --name`,
-`--no-focus`, `--repo-path`, and `--worktree-root`, and `wti` accepts the same four
-options. Existing terminal defaults remain unchanged. `scripts/worktree.zsh` is the
-matching helper snapshot used by isolated integration tests; keep it synchronized with
-`~/.local/share/chezmoi/dot_config/zsh/worktree.zsh` when changing the helper.
-After updating that source, apply the individual helper with chezmoi and restart
-the dashboard process. Live rollout checks should use read-only `curl` requests to
-`/`, `/api/prs`, `/api/issues`, and `/api/workspaces`; they must not create a
-workspace or launch an agent.
+**Model (optional)** and **Reasoning effort (optional)** each start at **Default**.
+Blank fields are omitted from the launch command; the dashboard never writes agent
+configuration or adds model instructions to the task. Model and effort choices reset
+when switching agents, and effort choices follow the selected model. Requests can
+also set either field independently. With the default model, effort compatibility
+is resolved by the agent, since shell wrappers, provider settings and organization
+policies can determine the effective model. The operation records the requested
+`model` and `effort` (null for Default), not a claim about the provider's effective
+configuration. Agent startup/provenance verification and duplicate-launch protection
+remain in place. Open/reopen actions do not apply these settings to existing sessions.
+
+Codex choices come from picker-visible entries and supported reasoning levels in
+`$CODEX_HOME/models_cache.json` (normally `~/.codex/models_cache.json`). This is a
+read-only, local cache: the dashboard never starts Codex to discover models. A
+missing or incompatible cache leaves Default available; use Codex normally to
+populate its cache. Cache entries may become stale, and account/provider access is
+still enforced by Codex. No default model is inferred from cache ordering. Claude
+choices use the documented `fable`, `opus`, `sonnet`, and `haiku` aliases; Haiku has
+no explicit effort choices. Aliases and supported levels require a current Claude
+Code CLI and may be restricted or remapped by local/provider configuration.
+
+When either override is selected, the adapter sources the repository's
+`scripts/worktree.zsh` by an absolute path passed as a separate shell argument in
+the child `zsh -lic`, then invokes `wtpr` or `wti`. This preserves login-shell agent
+wrappers and requires **no installed-helper update or personal dotfile edits**.
+Keep `worktree.zsh` alongside `pr_workspaces.py` when distributing the scripts.
+All-default launches continue using the installed helper with its existing
+`--name`, `--no-focus`, `--repo-path`, `--worktree-root`, and `--prompt-file` support.
+The shipped helper also accepts `wt --model/--effort` for terminal use, and applies
+these flags only when starting a new session. Codex receives `--model` and
+`-c 'model_reasoning_effort="…"'`; Claude receives `--model` and `--effort`.
+CLI configuration precedence and organization policies still apply, including
+Codex managed new-thread defaults that can change when either override is supplied.
+
+References (verified against installed CLI help and official documentation):
+
+- [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+  describes model/effort overrides and managed defaults.
+- [Codex model discovery](https://learn.chatgpt.com/docs/app-server#list-models-modellist)
+  documents model-specific effort metadata; the local cache is a private CLI format,
+  parsed defensively here to avoid starting an app server during dashboard reads.
+- [Claude model configuration](https://code.claude.com/docs/en/model-config) documents
+  aliases, model-specific efforts, and fallback/organization restrictions.
+- [Claude CLI reference](https://code.claude.com/docs/en/cli-usage) documents session
+  `--model` and `--effort` flags.
 
 ## Issue workspace actions
 

@@ -52,6 +52,28 @@ def local(tmp_path, monkeypatch):
         "WORKSPACE_HELPER", str(Path(__file__).resolve().parents[1] / "scripts/worktree.zsh")
     )
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    cache = tmp_path / "codex/models_cache.json"
+    cache.parent.mkdir()
+    cache.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "fixture-codex",
+                        "visibility": "list",
+                        "supported_reasoning_levels": [
+                            {"effort": "low"},
+                            {"effort": "high"},
+                            {"effort": "ultra"},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
     monkeypatch.setenv("FAKE_ZSH_LOG", str(tmp_path / "zsh-calls.json"))
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
 
@@ -105,7 +127,7 @@ p.write_text(json.dumps(data)); print(json.dumps({'result':result}))
             """import json,os,sys
 from pathlib import Path
 p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
-data['agents'].append({'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[1]})
+data['agents'].append({'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]})
 p.write_text(json.dumps(data))
 """,
         )
@@ -113,9 +135,12 @@ p.write_text(json.dumps(data))
         "zsh",
         """import json,os,sys
 assert sys.argv[1]=='-lic'
-helper={'export WT_MULTIPLEXER=herdr; wtpr "$@"':'wtpr','export WT_MULTIPLEXER=herdr; wti "$@"':'wti'}[sys.argv[2]]
-with open(os.environ['FAKE_ZSH_LOG'],'a') as f: f.write(json.dumps([helper,*sys.argv[4:]])+'\\n')
-os.execv('/bin/zsh',['zsh','-fc','source "$WORKSPACE_HELPER"; export WT_MULTIPLEXER=herdr; '+helper+' "$@"','fixture',*sys.argv[4:]])
+command=sys.argv[2]
+bundled=command.startswith('source "$1" || exit; shift; ')
+helper='wti' if command.endswith('wti "$@"') else 'wtpr'
+args=sys.argv[5:] if bundled else sys.argv[4:]
+with open(os.environ['FAKE_ZSH_LOG'],'a') as f: f.write(json.dumps([helper,*args])+'\\n')
+os.execv('/bin/zsh',['zsh','-fc','source "$WORKSPACE_HELPER"; '+command,'fixture',*sys.argv[4:]])
 """,
     )
     overview = Overview(tmp_path / "state")
@@ -652,3 +677,226 @@ def test_http_serves_issues_and_dispatches_workspace_actions_by_id(local):
         finally:
             server.shutdown()
             thread.join()
+
+
+@pytest.mark.parametrize("key", ["PR_one", "I_one"])
+@pytest.mark.parametrize("action", ["create", "clone-and-create"])
+@pytest.mark.parametrize(
+    "agent,model,effort",
+    [
+        ("codex", "fixture-codex", "ultra"),
+        ("claude", "opus", "high"),
+        ("codex", "fixture-codex", ""),
+        ("claude", "", "low"),
+        ("codex", "", "high"),
+        ("claude", "sonnet", ""),
+        ("codex", "", ""),
+        ("claude", "", ""),
+    ],
+)
+def test_workspace_model_effort_argv_defaults_and_idempotency(
+    local, key, action, agent, model, effort
+):
+    manager, _, git, state, _ = local
+    request = {
+        "id": key,
+        "action": action,
+        "agent": agent,
+        "task": "Fix 'quotes' $(false)",
+        "model": model,
+        "effort": effort,
+    }
+    if action == "clone-and-create":
+        git("remote", "set-url", "origin", "https://github.com/unrelated/repo.git")
+        request["destination"] = manager.destination(manager.target(key))
+    manager.action(request)
+    op = finish(manager, key)
+    assert op["status"] == "complete", op["log"]
+    assert op["model"] == (model or None) and op["effort"] == (effort or None)
+    args = []
+    if model:
+        args += ["--model", model]
+    if effort:
+        args += (
+            ["-c", f'model_reasoning_effort="{effort}"']
+            if agent == "codex"
+            else ["--effort", effort]
+        )
+    subject = "Issue" if key == "I_one" else "Pull request"
+    expected_task = request["task"] + f"\n\n{subject}: " + pw.canonical(manager.target(key))
+    assert json.loads(state.read_text())["agents"][0]["argv"] == [*args, expected_task]
+    # Changed settings on a duplicate cannot launch or reconfigure an existing agent.
+    assert (
+        manager.action({**request, "model": "different", "effort": "high"})["operation"]["id"]
+        == op["id"]
+    )
+    assert len(json.loads(state.read_text())["agents"]) == 1
+    restarted = pw.Workspaces(
+        manager.home, manager.overview, lambda: [], manager.src, issues=manager.issues
+    )
+    assert restarted.operation(key)["model"] == op["model"]
+    assert restarted.operation(key)["effort"] == op["effort"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"model": "$(touch INJECTED)"},
+        {"model": "--help"},
+        {"model": "opus"},
+        {"model": "fixture-codex", "effort": "max"},
+        {"effort": "high;touch INJECTED"},
+        {"model": []},
+        {"effort": None},
+        {"agent": "claude", "effort": "ultra"},
+        {"agent": "claude", "model": "haiku", "effort": "high"},
+    ],
+)
+def test_model_effort_validation_has_no_side_effects(local, extra):
+    manager, _, _, state, _ = local
+    with pytest.raises(ValueError):
+        manager.action({"id": "PR_one", "action": "create", "task": "Fix", **extra})
+    assert manager.operation("PR_one") is None
+    assert not json.loads(state.read_text())["agents"]
+    assert not list(manager.src.glob("worktrees/**/*"))
+
+
+@pytest.mark.parametrize("key", ["PR_one", "I_one"])
+def test_overrides_use_bundled_helper_without_installing(local, monkeypatch, tmp_path, key):
+    manager, _, _, state, _ = local
+    old = tmp_path / "old.zsh"
+    old.write_text('wtpr() { touch "$HOME/INJECTED"; }; wti() { wtpr; }\n')
+    monkeypatch.setenv("WORKSPACE_HELPER", str(old))
+    manager.action({"id": key, "action": "create", "task": "Fix", "model": "fixture-codex"})
+    op = finish(manager, key)
+    assert op["status"] == "complete", op["log"]
+    assert not (tmp_path / "INJECTED").exists()
+    assert json.loads(state.read_text())["agents"][0]["argv"][:2] == ["--model", "fixture-codex"]
+    assert old.read_text() == 'wtpr() { touch "$HOME/INJECTED"; }; wti() { wtpr; }\n'
+
+
+@pytest.mark.parametrize("helper", ["wt", "wtpr", "wti"])
+@pytest.mark.parametrize(
+    "option,value", [("--model", "$(touch INJECTED)"), ("--effort", 'high";touch INJECTED')]
+)
+def test_helper_rejects_injection_before_git(local, helper, option, value, tmp_path):
+    result = subprocess.run(
+        [
+            "/bin/zsh",
+            "-fc",
+            'source "$WORKSPACE_HELPER"; "$@"',
+            "fixture",
+            helper,
+            option,
+            value,
+            "7",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "invalid" in result.stderr
+    assert not (tmp_path / "INJECTED").exists()
+
+
+def test_codex_catalog_missing_malformed_and_hidden(local):
+    from workspace_agents import catalog
+
+    cache = Path(os.environ["CODEX_HOME"]) / "models_cache.json"
+    cache.unlink()
+    assert catalog()["codex"] == {"models": [], "efforts": []}
+    for value in ("{", "null", '{"models": null}'):
+        cache.write_text(value)
+        assert catalog()["codex"]["models"] == []
+    cache.write_text(
+        json.dumps(
+            {
+                "models": [
+                    None,
+                    {"slug": "hidden", "visibility": "hide", "supported_reasoning_levels": []},
+                    {
+                        "slug": "$(touch INJECTED)",
+                        "visibility": "list",
+                        "supported_reasoning_levels": [],
+                    },
+                    {
+                        "slug": "visible",
+                        "visibility": "list",
+                        "supported_reasoning_levels": [{"effort": "high"}, {"effort": "invented"}],
+                    },
+                ]
+            }
+        )
+    )
+    assert catalog()["codex"] == {
+        "models": [{"id": "visible", "efforts": ["high"]}],
+        "efforts": ["high"],
+    }
+
+
+def test_bundled_helper_path_is_argv_and_preserves_shell_agent_wrapper(
+    local, monkeypatch, tmp_path
+):
+    manager, _, _, state, _ = local
+    # A relocated installation path is data, including shell metacharacters.
+    scripts = tmp_path / "scripts ' $(touch INJECTED)"
+    scripts.mkdir()
+    shutil.copyfile(Path(pw.__file__).with_name("worktree.zsh"), scripts / "worktree.zsh")
+    monkeypatch.setattr(pw, "__file__", str(scripts / "pr_workspaces.py"))
+    # The terminal shell can still resolve the user's alias before the executable.
+    startup = tmp_path / "terminal-startup.zsh"
+    startup.write_text('alias codex="codex --profile fixture-profile"\n')
+    herdr = Path(os.environ["PATH"].split(":")[0]) / "herdr"
+    herdr.write_text(
+        herdr.read_text().replace(
+            "['/bin/zsh','-fc',a[3]]",
+            "['/bin/zsh','-fc','source '+os.environ['FAKE_STARTUP']+'; eval '+__import__('shlex').quote(a[3])]",
+        )
+    )
+    monkeypatch.setenv("FAKE_STARTUP", str(startup))
+    manager.action(
+        {
+            "id": "PR_one",
+            "action": "create",
+            "task": "Fix",
+            "model": "fixture-codex",
+            "effort": "high",
+        }
+    )
+    op = finish(manager, "PR_one")
+    assert op["status"] == "complete", op["log"]
+    assert json.loads(state.read_text())["agents"][0]["argv"][:-1] == [
+        "--profile",
+        "fixture-profile",
+        "--model",
+        "fixture-codex",
+        "-c",
+        'model_reasoning_effort="high"',
+    ]
+    assert not (tmp_path / "INJECTED").exists()
+
+
+@pytest.mark.parametrize("key", ["PR_one", "I_one"])
+def test_reopen_ignores_creation_overrides(local, key):
+    manager, _, git, state, _ = local
+    if key == "I_one":
+        git("branch", "issue-12")
+        path = make_checkout(local, branch="issue-12", name="issue")
+    else:
+        git("remote", "add", "fork", "https://github.com/fork/repo.git")
+        path = make_checkout(local)
+    manager.action(
+        {
+            "id": key,
+            "action": "reopen",
+            "path": str(path),
+            "agent": "claude",
+            "model": "opus",
+            "effort": "high",
+        }
+    )
+    op = finish(manager, key)
+    assert op["status"] == "complete", op["log"]
+    assert op["model"] is None and op["effort"] is None and op["agent"] is None
+    assert not json.loads(state.read_text())["agents"]
