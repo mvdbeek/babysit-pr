@@ -1,4 +1,8 @@
-"""Read-only GitHub PR discovery, cached independently of repair watches."""
+"""Read-only GitHub PR discovery, cached independently of repair watches.
+
+The search, merge, pagination and cache machinery is parametrised by a `Kind` so the
+issue overview (`issue_overview.py`) shares it without copying it.
+"""
 
 import copy
 import json
@@ -6,31 +10,79 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 POLL_SECONDS = 300
 ROLES = {"author": "author", "assignee": "assignee", "reviewer": "review-involves"}
-QUERY = """
-query($query: String!, $cursor: String) {
-  viewer { login }
-  search(query: $query, type: ISSUE, first: 50, after: $cursor) {
-    issueCount
-    pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest {
+PR_FRAGMENT = """... on PullRequest {
       id number title url createdAt updatedAt state isDraft reviewDecision
       repository { nameWithOwner }
       headRepository { nameWithOwner }
       headRefName headRefOid
       author { login }
       statusCheckRollup { state }
-    } }
+    }"""
+QUERY = """
+query($query: String!, $cursor: String) {
+  viewer { login }
+  search(query: $query, type: ISSUE, first: 50, after: $cursor) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { %s }
   }
 }
 """
 
 
-def github_page(query, cursor=None):
-    payload = {"query": QUERY, "variables": {"query": query, "cursor": cursor}}
+def pr_record(node, roles):
+    rollup = node.get("statusCheckRollup")
+    return {
+        "id": node["id"],
+        "number": node["number"],
+        "title": node["title"],
+        "url": node["url"],
+        "repo": node["repository"]["nameWithOwner"],
+        "author": (node.get("author") or {}).get("login"),
+        "head_repo": (node.get("headRepository") or {}).get("nameWithOwner"),
+        "head_branch": node.get("headRefName"),
+        "head_sha": node.get("headRefOid"),
+        "updated_at": node["updatedAt"],
+        "opened_at": node["createdAt"],
+        "draft": node["isDraft"],
+        "review_decision": node.get("reviewDecision"),
+        "roles": roles,
+        "ci": rollup.get("state", "UNKNOWN") if rollup else "NONE",
+    }
+
+
+@dataclass(frozen=True)
+class Kind:
+    """One searchable GitHub item type: how to find it, map it, and where to cache it."""
+
+    key: str  # Snapshot/API key holding the list, e.g. "prs".
+    label: str  # Human label used in warnings and errors, e.g. "PR".
+    search: str  # Search prefix, e.g. "is:pr is:open".
+    roles: dict[str, str]  # Displayed role -> search qualifier.
+    fragment: str  # GraphQL inline fragment for one search node.
+    cache: str  # Cache file name under the watcher state directory.
+    record: Callable[[dict, list[str]], dict] = field(repr=False)
+
+
+PRS = Kind(
+    key="prs",
+    label="PR",
+    search="is:pr is:open",
+    roles=ROLES,
+    fragment=PR_FRAGMENT,
+    cache="pr-overview.json",
+    record=pr_record,
+)
+
+
+def github_page(query, cursor=None, fragment=PR_FRAGMENT):
+    payload = {"query": QUERY % fragment, "variables": {"query": query, "cursor": cursor}}
     result = subprocess.run(
         ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"],
         input=json.dumps(payload),
@@ -42,18 +94,20 @@ def github_page(query, cursor=None):
         raise ValueError(f"GitHub request failed: {result.stderr.strip()[:500]}")
     response = json.loads(result.stdout)
     if response.get("errors"):
-        raise ValueError("GitHub returned incomplete PR data; retrying on the next refresh")
+        raise ValueError("GitHub returned incomplete data; retrying on the next refresh")
     return response["data"]
 
 
-def collect():
-    prs: dict[str, dict] = {}
+def collect(kind: Kind = PRS):
+    items: dict[str, dict] = {}
     warnings = []
     login = None
-    for role, qualifier in ROLES.items():
+    for role, qualifier in kind.roles.items():
         cursor = None
         for _ in range(20):  # GitHub search exposes at most 1,000 results per query.
-            data = github_page(f"is:pr is:open {qualifier}:@me sort:updated-desc", cursor)
+            data = github_page(
+                f"{kind.search} {qualifier}:@me sort:updated-desc", cursor, kind.fragment
+            )
             if login is not None and login != data["viewer"]["login"]:
                 raise ValueError("GitHub account changed during refresh; retrying")
             login = data["viewer"]["login"]
@@ -62,42 +116,27 @@ def collect():
                 if not node or node.get("state") != "OPEN":
                     continue
                 key = node["id"]
-                roles = prs[key]["roles"] if key in prs else []
+                roles = items[key]["roles"] if key in items else []
                 if role not in roles:
                     roles.append(role)
-                if key in prs and prs[key]["updated_at"] > node["updatedAt"]:
+                if key in items and items[key]["updated_at"] > node["updatedAt"]:
                     continue
-                rollup = node.get("statusCheckRollup")
-                prs[key] = {
-                    "id": key,
-                    "number": node["number"],
-                    "title": node["title"],
-                    "url": node["url"],
-                    "repo": node["repository"]["nameWithOwner"],
-                    "author": (node.get("author") or {}).get("login"),
-                    "head_repo": (node.get("headRepository") or {}).get("nameWithOwner"),
-                    "head_branch": node.get("headRefName"),
-                    "head_sha": node.get("headRefOid"),
-                    "updated_at": node["updatedAt"],
-                    "opened_at": node["createdAt"],
-                    "draft": node["isDraft"],
-                    "review_decision": node.get("reviewDecision"),
-                    "roles": roles,
-                    "ci": rollup.get("state", "UNKNOWN") if rollup else "NONE",
-                }
+                items[key] = kind.record(node, roles)
             page = search["pageInfo"]
             if not page["hasNextPage"]:
                 if search["issueCount"] > 1000:
-                    warnings.append(f"Only the most recently updated 1,000 {role} PRs are shown.")
+                    warnings.append(
+                        f"Only the most recently updated 1,000 {role} {kind.label}s are shown."
+                    )
                 break
             if not page["endCursor"] or page["endCursor"] == cursor:
-                raise ValueError("GitHub PR pagination did not advance")
+                raise ValueError(f"GitHub {kind.label} pagination did not advance")
             cursor = page["endCursor"]
         else:
-            warnings.append(f"Only the most recently updated 1,000 {role} PRs are shown.")
+            warnings.append(f"Only the most recently updated 1,000 {role} {kind.label}s are shown.")
     return {
         "login": login,
-        "prs": sorted(prs.values(), key=lambda pr: pr["updated_at"], reverse=True),
+        kind.key: sorted(items.values(), key=lambda item: item["updated_at"], reverse=True),
         "warnings": warnings,
     }
 
@@ -105,24 +144,30 @@ def collect():
 class Overview:
     """Serve the last complete snapshot immediately; allow only one refresh at a time."""
 
+    kind: Kind = PRS
+
     def __init__(self, home: Path):
-        self.path = home / "pr-overview.json"
+        self.path = home / self.kind.cache
         self.lock = threading.Lock()
         self.worker: threading.Thread | None = None
         self.next_poll = 0.0
         self.value: dict = {
             "login": None,
-            "prs": [],
+            self.kind.key: [],
             "warnings": [],
             "synced_at": None,
             "error": None,
         }
         try:
             saved = json.loads(self.path.read_text())
-            if isinstance(saved, dict) and isinstance(saved.get("prs"), list):
+            if isinstance(saved, dict) and isinstance(saved.get(self.kind.key), list):
                 self.value.update(saved)
         except (OSError, ValueError):
             pass
+
+    def fetch(self):
+        # The module-level collector is looked up at call time so tests can replace it.
+        return collect()
 
     def snapshot(self):
         with self.lock:
@@ -136,7 +181,7 @@ class Overview:
 
     def refresh(self):
         try:
-            value = {**collect(), "synced_at": time.time(), "error": None}
+            value = {**self.fetch(), "synced_at": time.time(), "error": None}
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temp = self.path.with_suffix(".tmp")
             # This cache can contain private repository metadata, just like the watch queue.
@@ -146,7 +191,10 @@ class Overview:
             temp.replace(self.path)
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
             with self.lock:
-                self.value = {**self.value, "error": f"Cannot sync GitHub PRs: {exc}"}
+                self.value = {
+                    **self.value,
+                    "error": f"Cannot sync GitHub {self.kind.label}s: {exc}",
+                }
         else:
             with self.lock:
                 self.value = value
