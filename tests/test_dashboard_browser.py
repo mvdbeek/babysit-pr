@@ -1005,6 +1005,58 @@ def workspace_routes(page):
     return info, snapshot, requests
 
 
+@pytest.mark.parametrize(
+    "job_id,branch", [("feedback", None), ("running", "dev"), ("closed", None)]
+)
+def test_watcher_workspace_open(page, dashboard_site, workspace_routes, job_id, branch):
+    url, home = dashboard_site
+    info, snapshot, requests = workspace_routes
+    snapshot["watches"] = {f"watch:{job_id}": info}
+    if branch:
+        db = supervisor.open_db(home)
+        with db:
+            job = supervisor.get_job(db, job_id)
+            job["branch"] = branch
+            supervisor.save_job(db, job)
+        db.close()
+    page.goto(url)
+    page.evaluate("window.open = () => { window.opened = {location: {}}; return window.opened; }")
+    if job_id == "closed":
+        choose_option(page.get_by_role("combobox", name="Filter watches", exact=True), "all")
+    repo = {"feedback": "test/repo", "running": "test/running", "closed": "test/merged"}[job_id]
+    page.locator("#list .watch").filter(has_text=repo).click()
+    detail = page.locator("#detail")
+    detail.get_by_role("button", name="Open workspace", exact=True).click()
+    expect(page.locator("#workspace-result a")).to_have_attribute("href", info["matches"][0]["url"])
+    assert requests == [
+        {
+            "id": f"watch:{job_id}",
+            "action": "open",
+            "path": "/fixture/checkout",
+            "workspace_id": "w1",
+        }
+    ]
+    assert page.evaluate("window.opened.location.href").endswith("/space/w1")
+    detail.get_by_text("More actions", exact=True).click()
+    expect(detail.get_by_role("button", name="Copy command", exact=True)).to_be_visible()
+
+
+def test_watcher_workspace_unavailable_does_not_offer_creation(
+    page, dashboard_site, workspace_routes
+):
+    url, _ = dashboard_site
+    info, snapshot, requests = workspace_routes
+    info["matches"] = []
+    snapshot["watches"] = {"watch:feedback": info}
+    page.goto(url)
+    page.locator("#list .watch").filter(has_text="test/repo").click()
+    expect(
+        page.locator("#detail").get_by_role("button", name="Workspace unavailable")
+    ).to_be_disabled()
+    expect(page.locator("#detail").get_by_role("button", name="Create workspace")).to_have_count(0)
+    assert requests == []
+
+
 def test_workspace_single_open_and_explicit_native_menu(page, dashboard_site, workspace_routes):
     url, _ = dashboard_site
     _, _, requests = workspace_routes

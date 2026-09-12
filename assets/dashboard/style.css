@@ -943,10 +943,13 @@ button:disabled {
 .pr-actions {
   min-width: 145px;
 }
-.pr-actions small {
+.workspace-actions small {
   display: block;
   max-width: 220px;
   overflow-wrap: anywhere;
+}
+.detail-head > .workspace-actions {
+  margin-top: 16px;
 }
 #workspace-dialog {
   width: min(640px, 92vw);

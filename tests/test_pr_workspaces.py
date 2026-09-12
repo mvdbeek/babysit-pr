@@ -270,6 +270,51 @@ def test_watch_binding_dirty_unpushed_renamed_and_ambiguous_workspaces(local):
     assert not restarted.matches(pr, restarted.scan())[0]
 
 
+@pytest.mark.parametrize("branch,status", [("feature", "watching"), (None, "closed")])
+def test_watch_workspace_uses_recorded_checkout_without_overview(local, branch, status):
+    manager, pr, git, state, jobs = local
+    path = make_checkout(local)
+    jobs.append(
+        {
+            "id": "watch-one",
+            "repo": pr["repo"],
+            "cwd": str(path),
+            "branch": branch,
+            "status": status,
+        }
+    )
+    manager.overview.value["prs"] = []
+    space(state, path, manager.src / "repo")
+    manager.scan()
+    matches = manager.snapshot()["watches"]["watch:watch-one"]["matches"]
+    assert len(matches) == 1 and matches[0]["workspace_id"] == "w99"
+    request = {"id": "watch:watch-one", "action": "open", "path": str(path), "workspace_id": "w99"}
+    assert manager.action(request)["result"]["url"].endswith("/space/w99")
+    assert not json.loads(state.read_text())["agents"]
+    with pytest.raises(ValueError, match="verified checkout"):
+        manager.action({**request, "path": str(manager.src / "repo")})
+    with pytest.raises(ValueError, match="only open or reopen"):
+        manager.action({"id": "watch:watch-one", "action": "create"})
+    git("remote", "set-url", "origin", "https://github.com/unrelated/repo.git")
+    assert not manager.matches(manager.target("watch:watch-one"), manager.scan())[0]
+    with pytest.raises(ValueError, match="verified checkout"):
+        manager.action(request)
+
+
+def test_watch_reopens_checkout_outside_inventory_without_starting_agent(local):
+    manager, pr, git, state, jobs = local
+    path = state.parent / "outside-src"
+    git("worktree", "add", str(path), "feature")
+    jobs.append({"id": "branch-watch", "repo": pr["repo"], "cwd": str(path), "branch": "feature"})
+    manager.src = state.parent / "empty-inventory"
+    manager.overview.value["prs"] = []
+    manager.action({"id": "watch:branch-watch", "action": "reopen", "path": str(path)})
+    result = finish(manager, "watch:branch-watch")
+    assert result["status"] == "complete", result
+    assert not json.loads(state.read_text())["agents"]
+    assert result["result"]["url"].endswith("/space/w1")
+
+
 def test_reopen_preserves_checkout_without_agent(local):
     manager, pr, git, state, jobs = local
     path = make_checkout(local)

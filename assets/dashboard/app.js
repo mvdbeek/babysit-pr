@@ -428,6 +428,7 @@ function renderDetail() {
     cancelErrors.get(job.id),
     approving.has(job.id),
     feedbackErrors.get(job.id),
+    workspaceInfo({ id: `watch:${job.id}` }),
   ]);
   if (key === detailKey) {
     if (tab === "logs") loadLog(job);
@@ -443,6 +444,7 @@ function renderDetail() {
   const title = el("h2");
   title.append(link(job.branch || job.repo, job.url));
   head.append(top, title, el("p", job.summary));
+  head.append(workspaceControls({ ...job, id: `watch:${job.id}`, kind: "watch" }));
   if (job.stop_after_run || job.pause_after_run)
     head.append(
       el(
@@ -1503,23 +1505,28 @@ setInterval(() => {
 }, 5000);
 refresh();
 
-let workspaceData = { prs: {}, issues: {} },
+let workspaceData = { prs: {}, issues: {}, watches: {} },
   workspaceBusy = false;
-// GraphQL ids are globally unique, so one id names one PR or issue across both maps.
+// Overview ids are globally unique; watch ids carry a separate prefix.
 function workspaceInfo(item) {
-  return workspaceData.prs?.[item.id] ?? workspaceData.issues?.[item.id];
+  return (
+    workspaceData.prs?.[item.id] ??
+    workspaceData.issues?.[item.id] ??
+    workspaceData.watches?.[item.id]
+  );
 }
 function setWorkspaceOperation(item, operation) {
   const info = workspaceInfo(item);
   if (info) info.operation = operation;
 }
 async function refreshWorkspaces() {
-  if (workspaceBusy || document.hidden || !overviewVisible()) return;
+  if (workspaceBusy || document.hidden || (!overviewVisible() && $("watcher-panel").hidden)) return;
   workspaceBusy = true;
   try {
     workspaceData = await get("/api/workspaces");
     prTable.render();
     issueTable.render();
+    renderDetail();
     updateWorkspaceOperation();
   } catch (error) {
     workspaceData.error = error.message;
@@ -1539,21 +1546,30 @@ function workspaceStatus(target) {
 }
 function workspaceCell(item) {
   const cell = el("td", undefined, "pr-actions");
+  cell.append(workspaceControls(item));
+  return cell;
+}
+function workspaceControls(item) {
+  const cell = el("div", undefined, "workspace-actions");
   const info = workspaceInfo(item);
   const matches = info?.matches || [];
   const label = matches.some((m) => m.workspace_id)
     ? "Open workspace"
     : matches.length
       ? "Reopen workspace"
-      : info?.clones.length
-        ? "Create workspace"
-        : "Clone and create";
+      : item.kind === "watch"
+        ? "Workspace unavailable"
+        : info?.clones.length
+          ? "Create workspace"
+          : "Clone and create";
   const button = workspaceButton(info ? label : "Workspace actions", () => {
     if (matches.length === 1 && matches[0].workspace_id) {
       void chooseWorkspace(item, matches[0], "open");
     } else void workspaceDialog(item);
   });
   cell.append(button);
+  button.disabled = item.kind === "watch" && !!info && !matches.length;
+  if (button.disabled) button.title = "The watch’s registered checkout is no longer available.";
   if (matches.length === 1) {
     const menu = el("details");
     menu.append(el("summary", "More actions"));
@@ -1611,7 +1627,10 @@ async function chooseWorkspace(item, target, action) {
 }
 async function workspaceDialog(item) {
   workspaceDialogItem = item;
-  $("workspace-title").textContent = `${item.repo} #${item.number}`;
+  $("workspace-title").textContent =
+    item.kind === "watch"
+      ? `${item.repo} · ${item.branch || "Watched PR"}`
+      : `${item.repo} #${item.number}`;
   $("workspace-error").textContent = "";
   $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
   $("workspace-result").replaceChildren();
@@ -1649,6 +1668,8 @@ async function workspaceDialog(item) {
         row.append(menu);
         body.append(row);
       }
+    } else if (item.kind === "watch") {
+      body.append(el("p", "The watch’s registered checkout is no longer available."));
     } else {
       const form = el("form");
       const clone = el("select");

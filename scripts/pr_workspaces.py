@@ -273,21 +273,27 @@ class Workspaces:
             db.close()
 
     def targets(self):
-        """Every PR and issue currently known to the overviews, tagged with its kind."""
+        """Overview items and registered watches, with separate watch identifiers."""
         found: list[dict] = []
         for kind, overview in (("pr", self.overview), ("issue", self.issues)):
             if overview is not None:
                 found.extend(
                     {**item, "kind": kind} for item in overview.snapshot()[overview.kind.key]
                 )
+        found.extend(
+            {**job, "id": f"watch:{job['id']}", "kind": "watch", "head_repo": job.get("ci_repo")}
+            for job in self.jobs()
+            if job.get("id") and job.get("repo") and job.get("cwd")
+        )
         return found
 
     def target(self, key):
-        # GraphQL node ids are globally unique, so one id names one PR or issue.
+        # Overview node ids are global; watch ids use their own prefix.
         target = next((t for t in self.targets() if t["id"] == key), None)
         if target is None:
-            raise ValueError("Unknown PR or issue; refresh the overview")
-        canonical(target)
+            raise ValueError("Unknown PR or issue or watch; refresh the dashboard")
+        if target.get("kind") != "watch":
+            canonical(target)
         return target
 
     def scan(self):
@@ -313,6 +319,13 @@ class Workspaces:
                 clones.append(main)
                 for item in worktrees:
                     items[item["path"]] = item
+            # Headless watches may use checkouts outside the normal clone inventory.
+            for path in {
+                str(Path(j["cwd"]).resolve()) for j in self.jobs() if j.get("cwd")
+            } - items.keys():
+                item = checkout(path)
+                if item:
+                    items[path] = item
             self.inventory = {
                 "checkouts": list(items.values()),
                 "clones": clones,
@@ -366,9 +379,12 @@ class Workspaces:
         watches = state["watches"]
         matches, suggestions = [], []
         issue = is_issue(pr)
+        watch = pr.get("kind") == "watch"
         repos = repositories(pr)  # Hoisted: snapshots compare every target with every checkout.
         linked_prs = (pr.get("linked_prs") or []) if issue else []
         for item in inventory["checkouts"]:
+            if watch and str(Path(pr["cwd"]).resolve()) != item["path"]:
+                continue
             same = bool(repos & set(item["remotes"]))
             if not same and not issue:
                 continue
@@ -379,15 +395,22 @@ class Workspaces:
                 and prior.get("head_repo") == pr.get("head_repo")
                 and prior.get("head_branch") == pr.get("head_branch")
             )
-            bound = same and any(
-                w.get("url", "").rstrip("/") == canonical(pr)
-                and str(Path(w.get("cwd") or "/missing").resolve()) == item["path"]
-                and (w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"))
-                == item["branch"]
-                for w in watches
+            bound = (
+                same
+                and not watch
+                and any(
+                    w.get("url", "").rstrip("/") == canonical(pr)
+                    and str(Path(w.get("cwd") or "/missing").resolve()) == item["path"]
+                    and (w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"))
+                    == item["branch"]
+                    for w in watches
+                )
             )
             linked = None
-            if issue:
+            if watch:
+                verified = same
+                suggested = False
+            elif issue:
                 verified = same and verified_issue(pr, item)
                 if not verified and linked_prs and same:
                     linked = linked_checkout(pr, item)
@@ -488,7 +511,7 @@ class Workspaces:
             "suggestions": suggestions,
             "clones": clones,
             "preferred_clone": choice if choice in clones else None,
-            "destination": self.destination(pr),
+            "destination": None if pr.get("kind") == "watch" else self.destination(pr),
             "operation": op,
         }
 
@@ -502,10 +525,16 @@ class Workspaces:
                 self.refreshing = True
                 threading.Thread(target=self.refresh, daemon=True).start()
             inventory = copy.deepcopy(self.inventory)
-        described: dict[str, dict] = {"prs": {}, "issues": {}}
+        described: dict[str, dict] = {"prs": {}, "issues": {}, "watches": {}}
         state = self.state()
         for target in self.targets():
-            key = "issues" if is_issue(target) else "prs"
+            key = (
+                "watches"
+                if target.get("kind") == "watch"
+                else "issues"
+                if is_issue(target)
+                else "prs"
+            )
             described[key][target["id"]] = self.describe(target, inventory, state)
         return {
             **described,
@@ -560,6 +589,8 @@ class Workspaces:
             raise ValueError("Expected a retry flag")
         pr = self.target(request["id"])
         action = request["action"]
+        if pr.get("kind") == "watch" and action in {"create", "clone-and-create"}:
+            raise ValueError("Watch actions can only open or reopen the registered checkout")
         with self.lock:
             if action in {"create", "clone-and-create", "reopen"}:
                 existing = self.operation(pr["id"])
@@ -754,7 +785,11 @@ class Workspaces:
                         pass_fds=(lock.fileno(),),
                     )
                 main = checkout(clone)
-                if not main or pr["repo"].lower() not in main["remotes"]:
+                if not main or not (
+                    same_repository(pr, main)
+                    if pr.get("kind") == "watch"
+                    else pr["repo"].lower() in main["remotes"]
+                ):
                     raise ValueError("Local clone no longer belongs to the base repository")
                 with self.db() as db:
                     db.execute(

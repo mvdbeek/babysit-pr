@@ -122,6 +122,14 @@ the PR overview (`scripts/pr_overview.py`; the issue definition is
 `pr-overview.json`. The HTTP API is `GET /api/issues`, with the same access restrictions
 as `/api/prs`.
 
+## Watcher workspace actions
+
+Select a watch to **Open workspace** from its details, including branch watches
+and completed PR watches. This uses the watch's recorded checkout, independently
+of the open PR overview. **More actions** offers native focus and command copying;
+**Reopen workspace** restores a closed workspace without starting an agent.
+Missing or unrelated checkouts show **Workspace unavailable**.
+
 ## PR workspace actions
 
 The **Actions** column opens a verified workspace in
