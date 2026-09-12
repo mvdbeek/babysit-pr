@@ -536,6 +536,27 @@ function dateCell(value, label, cls) {
   );
   return cell;
 }
+function updatedCell(item) {
+  const cell = dateCell(item.updated_at, "Updated", "pr-updated");
+  const activity = item.latest_activity;
+  const detail = el("div", undefined, "pr-activity");
+  detail.title =
+    "Latest available activity from recent GitHub events and description edits; may not explain the last-updated time.";
+  detail.append(el("small", "Latest activity", "pr-meta"));
+  if (activity) {
+    const text = `${activity.actor || "Unknown actor"} ${activity.action}`;
+    detail.append(activity.url ? link(text, activity.url) : el("span", text));
+    const date = new Date(activity.at || NaN);
+    if (Number.isFinite(date.getTime())) {
+      const stamp = el("time", ago(date.getTime() / 1000));
+      stamp.dateTime = activity.at;
+      stamp.title = date.toLocaleString();
+      detail.append(stamp);
+    }
+  } else detail.append(el("span", "Unavailable", "pr-meta"));
+  cell.append(detail);
+  return cell;
+}
 function repoCell(repo) {
   const cell = el("td", undefined, "pr-repo");
   cell.append(link(repo, `https://github.com/${repo}`));
@@ -948,7 +969,7 @@ const prTable = itemTable({
     const checks = el("td");
     checks.append(ciBadge(pr));
     const opened = dateCell(pr.opened_at, "Opened", "pr-opened");
-    const updated = dateCell(pr.updated_at, "Updated", "pr-updated");
+    const updated = updatedCell(pr);
     const repo = repoCell(pr.repo);
     return {
       cells: [repo, title, author, readiness, roles, checks, opened, updated],
@@ -1083,7 +1104,7 @@ const issueTable = itemTable({
       linked.append(list);
     } else linked.append(el("span", "None", "pr-meta"));
     const opened = dateCell(issue.opened_at, "Opened", "pr-opened");
-    const updated = dateCell(issue.updated_at, "Updated", "pr-updated");
+    const updated = updatedCell(issue);
     const repo = repoCell(issue.repo);
     return {
       cells: [repo, title, author, assignees, roles, comments, linked, opened, updated],

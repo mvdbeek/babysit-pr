@@ -703,6 +703,16 @@ button:disabled {
   display: block;
   margin-top: 5px;
 }
+.pr-activity {
+  margin-top: 8px;
+  max-width: 240px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.pr-activity time {
+  display: block;
+  color: var(--muted);
+}
 .pr-empty {
   padding: 20px;
   text-align: center;

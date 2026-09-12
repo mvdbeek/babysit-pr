@@ -3,6 +3,7 @@
 import re
 
 import pr_overview
+from latest_activity import activity_fragment, latest_activity
 
 ROLES = {
     "author": "author",
@@ -11,7 +12,8 @@ ROLES = {
     "participant": "commenter",
 }
 # Linked PRs carry head provenance so a checkout of the fix can be verified like a PR checkout.
-ISSUE_FRAGMENT = """... on Issue {
+ISSUE_FRAGMENT = (
+    """... on Issue {
       id number title url createdAt updatedAt state
       repository { nameWithOwner }
       author { login }
@@ -26,7 +28,10 @@ ISSUE_FRAGMENT = """... on Issue {
           headRefName headRefOid
         }
       }
-    }"""
+    """
+    + activity_fragment()
+    + "}"
+)
 BRANCH = re.compile(r"issue-(\d+)(?:-|$)")
 
 
@@ -62,6 +67,7 @@ def issue_record(node, roles):
         ],
         "comments": (node.get("comments") or {}).get("totalCount", 0),
         "updated_at": node["updatedAt"],
+        "latest_activity": latest_activity(node),
         "opened_at": node["createdAt"],
         "roles": roles,
         "linked_prs": [linked_pr(p) for p in linked if p],

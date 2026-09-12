@@ -160,6 +160,57 @@ def read_job(home: Path, key: str) -> dict:
         db.close()
 
 
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+@pytest.mark.parametrize("width", [1280, 390])
+def test_latest_activity_display_refresh_and_fallback(page, dashboard_site, kind, prefix, width):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    snapshot = page.request.get(f"{url}/api/{kind}").json()
+    first = snapshot[kind][0]
+    activity_url = first["url"] + "#issuecomment-123"
+    first["latest_activity"] = {
+        "actor": "dependabot[bot]",
+        "action": "commented",
+        "at": "2026-09-11T08:00:00Z",
+        "url": activity_url,
+    }
+    page.route(f"**/api/{kind}", lambda route: route.fulfill(json=snapshot))
+    page.goto(f"{url}/#{kind}")
+    rows = page.locator(f"#{prefix}-list tr")
+    detail = rows.first.locator(".pr-activity")
+    expect(detail).to_contain_text("Latest activity")
+    expect(detail.get_by_role("link", name="dependabot[bot] commented")).to_have_attribute(
+        "href", activity_url
+    )
+    expect(detail.locator("time")).to_have_attribute("datetime", "2026-09-11T08:00:00Z")
+    assert detail.locator("time").get_attribute("title")
+    expect(rows.first.locator(".pr-updated > time")).to_have_attribute(
+        "datetime", first["updated_at"]
+    )
+    expect(rows.nth(1).locator(".pr-activity")).to_contain_text("Unavailable")
+    detail.scroll_into_view_if_needed()
+    expect(detail).to_be_visible()
+    assert detail.evaluate("node => node.scrollWidth <= node.clientWidth")
+    if width == 390:
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/{kind}-activity-{width}.png", full_page=True)
+
+    first["latest_activity"].update(actor=None, action="added a label", url=None)
+    page.locator(f"#{prefix}-refresh").click()
+    expect(detail).to_contain_text("Unknown actor added a label")
+    expect(detail.locator("a")).to_have_count(0)
+
+    first["latest_activity"].update(
+        actor='<img src=x onerror="window.injected=true">',
+        action="commented",
+        url="javascript:window.injected=true",
+    )
+    page.locator(f"#{prefix}-refresh").click()
+    expect(detail).to_contain_text('<img src=x onerror="window.injected=true"> commented')
+    expect(detail.locator("a, img")).to_have_count(0)
+    assert page.evaluate("window.injected") is None
+
+
 def open_watch(page: Page, url: str, repo: str) -> None:
     page.goto(url)
     page.get_by_role("button", name=f"{repo}, feature,", exact=False).click()

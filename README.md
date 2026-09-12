@@ -40,6 +40,17 @@ status; “No checks” means GitHub returned no rollup, not a successful build.
 “Last updated” is GitHub's PR `updatedAt` (PR activity, not the last poll or CI
 completion time). The separate sync timestamp shows how fresh the data is.
 
+Both PR and issue rows show **Latest activity** beneath Last updated: the person
+or bot, an action, its own timestamp (hover for the exact time), and a direct link
+when GitHub supplies one. The existing queries fetch the last five timeline items
+and the latest description edit; there are no additional HTTP requests or polls.
+Comments, reviews, labels, assignees, common state/branch changes, and PR commits
+are supported. Commit attribution uses the committer and commit time, not the
+pusher or push time. This is best-effort activity, not a definitive explanation of
+`updatedAt`: edits to older comments outside the window and other event types may
+be missing. An unsupported or inaccessible final event shows “Unavailable”; a
+missing actor shows “Unknown actor”. Old caches work and gain activity on refresh.
+
 While the dashboard is open, one background worker refreshes GitHub at most every
 five minutes; browser refreshes and multiple tabs share the cache. Pagination fetches
 up to GitHub's search limit of 1,000 PRs per role, with an explicit notice if capped.

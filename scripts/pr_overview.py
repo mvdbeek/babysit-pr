@@ -14,16 +14,22 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from latest_activity import activity_fragment, latest_activity
+
 POLL_SECONDS = 300
 ROLES = {"author": "author", "assignee": "assignee", "reviewer": "review-involves"}
-PR_FRAGMENT = """... on PullRequest {
+PR_FRAGMENT = (
+    """... on PullRequest {
       id number title url createdAt updatedAt state isDraft reviewDecision
       repository { nameWithOwner }
       headRepository { nameWithOwner }
       headRefName headRefOid
       author { login }
       statusCheckRollup { state }
-    }"""
+    """
+    + activity_fragment(pull_request=True)
+    + "}"
+)
 QUERY = """
 query($query: String!, $cursor: String) {
   viewer { login }
@@ -49,6 +55,7 @@ def pr_record(node, roles):
         "head_branch": node.get("headRefName"),
         "head_sha": node.get("headRefOid"),
         "updated_at": node["updatedAt"],
+        "latest_activity": latest_activity(node),
         "opened_at": node["createdAt"],
         "draft": node["isDraft"],
         "review_decision": node.get("reviewDecision"),
