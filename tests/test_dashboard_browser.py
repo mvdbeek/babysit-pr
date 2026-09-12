@@ -11,7 +11,7 @@ import dashboard
 import pr_supervisor as supervisor
 import pytest
 from issue_overview import Overview as IssueOverview
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 from pr_overview import Overview
 
 pytestmark = pytest.mark.browser
@@ -152,6 +152,19 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
             thread.join(timeout=5)
 
 
+def choose_option(control: Locator, value: str) -> None:
+    """Choose through the visible picker, including its real narrowing behavior."""
+    if control.evaluate("node => node.tagName") == "SELECT":
+        control.select_option(value)
+        return
+    wrapper = control.locator("xpath=../..")
+    label = wrapper.locator("select option").evaluate_all(
+        "(options, value) => options.find(option => option.value === value).label", value
+    )
+    control.fill(label)
+    wrapper.get_by_role("option", name=label, exact=True).click()
+
+
 def read_job(home: Path, key: str) -> dict:
     db = supervisor.open_db(home)
     try:
@@ -286,11 +299,12 @@ def test_item_pins_sort_filter_and_pagination(page, dashboard_site, kind, prefix
     expect(rows.locator(".pr-title")).to_have_text(
         ["Item 120", "Item 002"] + [f"Item {i:03d}" for i in range(119, 71, -1)]
     )
-    page.locator(f"#{prefix}-repo").select_option("test/odd")
+    repo_picker = page.locator(f"#{prefix}-repo").locator("..").get_by_role("combobox")
+    choose_option(repo_picker, "test/odd")
     expect(rows.first.locator(".pr-title")).to_have_text("Item 119")
     expect(rows.locator('.item-pin[aria-pressed="true"]')).to_have_count(0)
     expect(page.locator(f"#{prefix}-count")).to_have_text("60 / 120")
-    page.locator(f"#{prefix}-repo").select_option("all")
+    choose_option(repo_picker, "all")
     page.locator(f"#{prefix}-search").fill("Item 11")
     expect(rows).to_have_count(10)
     expect(rows.locator('.item-pin[aria-pressed="true"]')).to_have_count(0)
@@ -471,7 +485,9 @@ def test_compact_dates_share_a_column_and_keep_both_sorts(
     expect(page.locator(f"#{prefix}-sync")).to_contain_text("Sorted by Last updated (descending)")
     for field, label in [("opened_at", "Opened"), ("updated_at", "Last updated")]:
         if width == 390:
-            page.locator(f"#{prefix}-sort").select_option(field)
+            choose_option(
+                page.locator(f"#{prefix}-sort").locator("..").get_by_role("combobox"), field
+            )
         else:
             button = page.get_by_role("button", name=f"Sort by {label}", exact=True)
             button.focus()
@@ -600,7 +616,7 @@ def test_cancel_keeps_history_and_running_repairs_finish_first(page: Page, dashb
     page.locator("#show-ended").click()
     expect(page.locator("#list")).to_contain_text("test/repo")
     assert read_job(home, "feedback")["status"] == "stopped"
-    page.get_by_label("Filter watches").select_option("active")
+    choose_option(page.get_by_role("combobox", name="Filter watches", exact=True), "active")
     page.get_by_role("button", name="test/running, feature,", exact=False).click()
     page.get_by_role("button", name="Cancel watch", exact=True).click()
     expect(page.get_by_role("button", name="Cancellation pending", exact=True)).to_be_disabled()
@@ -641,14 +657,24 @@ def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboar
     expect(page.get_by_role("link", name="CI Failed for test/alpha #8")).to_have_attribute(
         "href", "https://github.com/test/alpha/pull/8/checks"
     )
-    page.get_by_label("Filter pull requests by role").select_option("reviewer")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by role", exact=True), "reviewer"
+    )
     expect(rows).to_have_count(1)
-    page.get_by_label("Filter pull requests by role").select_option("assignee")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by role", exact=True), "assignee"
+    )
     expect(rows).to_contain_text(["Assigned PR"])
-    page.get_by_label("Filter pull requests by role").select_option("all")
-    page.get_by_label("Filter pull requests by CI").select_option("FAILURE")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by role", exact=True), "all"
+    )
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by CI", exact=True), "FAILURE"
+    )
     expect(rows).to_have_count(1)
-    page.get_by_label("Filter pull requests by CI").select_option("all")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by CI", exact=True), "all"
+    )
     page.get_by_label("Search pull requests").fill("colleague")
     expect(rows).to_contain_text(["Assigned PR"])
     page.get_by_label("Search pull requests").fill("missing")
@@ -787,7 +813,7 @@ def test_pr_metadata_and_mobile_sort_survive_refresh_and_filtering(
         "datetime", "2025-01-01T10:00:00Z"
     )
     page.set_viewport_size({"width": 390, "height": 844})
-    page.get_by_label("Sort by", exact=True).select_option("author")
+    choose_option(page.get_by_role("combobox", name="Sort by", exact=True), "author")
     expect(page.locator(".pr-author").first).to_have_text("colleague")
     page.get_by_role("button", name="Ascending", exact=True).click()
     expect(page.locator(".pr-author").first).to_have_text("fixture")
@@ -805,33 +831,39 @@ def test_pr_filters_combine_and_keep_repository_selection_on_refresh(
 ) -> None:
     url, _ = dashboard_site
     page.goto(url + "/#prs")
-    repo = page.get_by_label("Filter pull requests by repository")
-    review = page.get_by_label("Filter pull requests by review status")
-    ci = page.get_by_label("Filter pull requests by CI")
+    repo = page.get_by_role("combobox", name="Filter pull requests by repository", exact=True)
+    review = page.get_by_role("combobox", name="Filter pull requests by review status", exact=True)
+    ci = page.get_by_role("combobox", name="Filter pull requests by CI", exact=True)
     rows = page.locator("#pr-list tr")
-    expect(repo.locator("option")).to_have_text(["All repositories", "test/alpha", "test/beta"])
-    repo.select_option("test/beta")
-    review.select_option("draft")
-    ci.select_option("SUCCESS")
+    expect(page.locator("#pr-repo option")).to_have_text(
+        ["All repositories", "test/alpha", "test/beta"]
+    )
+    choose_option(repo, "test/beta")
+    choose_option(review, "draft")
+    choose_option(ci, "SUCCESS")
     expect(rows).to_have_count(1)
     expect(rows).to_contain_text(["Assigned PR"])
-    review.select_option("ready")
+    choose_option(review, "ready")
     expect(rows).to_have_count(0)
     expect(page.locator("#pr-empty")).to_have_text("No matching pull requests.")
-    expect(repo.locator("option")).to_have_count(3)
-    repo.select_option("test/alpha")
-    ci.select_option("FAILURE")
+    expect(page.locator("#pr-repo option")).to_have_count(3)
+    choose_option(repo, "test/alpha")
+    choose_option(ci, "FAILURE")
     expect(rows).to_have_count(1)
-    page.get_by_label("Filter pull requests by role").select_option("assignee")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by role", exact=True), "assignee"
+    )
     expect(rows).to_have_count(0)
-    page.get_by_label("Filter pull requests by role").select_option("all")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by role", exact=True), "all"
+    )
     expect(rows).to_have_count(1)
     page.route("**/api/prs", lambda route: route.fulfill(json={"prs": [], "synced_at": 1234}))
     page.get_by_role("button", name="Refresh", exact=True).click()
     expect(rows).to_have_count(0)
     expect(repo).to_have_value("test/alpha")
-    expect(review).to_have_value("ready")
-    expect(ci).to_have_value("FAILURE")
+    expect(review).to_have_value("Ready for review")
+    expect(ci).to_have_value("Failed")
     page.unroute("**/api/prs")
     page.get_by_role("button", name="Refresh", exact=True).click()
     expect(rows).to_have_count(1)
@@ -862,10 +894,14 @@ def test_ci_filters_match_each_displayed_state(page: Page, dashboard_site) -> No
     page.route("**/api/prs", lambda route: route.fulfill(json={"prs": prs, "synced_at": 1234}))
     page.goto(url + "/#prs")
     for state in states:
-        page.get_by_label("Filter pull requests by CI").select_option(state)
+        choose_option(
+            page.get_by_role("combobox", name="Filter pull requests by CI", exact=True), state
+        )
         expect(page.locator("#pr-list tr")).to_have_count(1)
         expect(page.locator("#pr-list .pr-title")).to_have_text(state)
-    page.get_by_label("Filter pull requests by CI").select_option("all")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by CI", exact=True), "all"
+    )
     expect(page.locator("#pr-list tr")).to_have_count(7)
 
 
@@ -901,7 +937,10 @@ def test_pr_overview_pages_fifty_rows_and_loads_more_on_scroll(page: Page, dashb
     expect(rows).to_have_count(120)
     expect(page.locator("#pr-more")).to_be_hidden()
     # A filter restarts at the top of the first page; the button also appends a page.
-    page.get_by_label("Filter pull requests by repository").select_option("test/even")
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by repository", exact=True),
+        "test/even",
+    )
     expect(rows).to_have_count(50)
     assert page.evaluate("document.querySelector('#prs-panel .pr-table-wrap').scrollTop") == 0
     expect(more).to_have_text("Show 10 more · 50 of 60 shown")
@@ -1024,9 +1063,9 @@ def test_workspace_create_required_task_agent_progress_and_errors(
     expect(dialog.get_by_label("Agent", exact=True)).to_have_value("codex")
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
     assert not requests
-    dialog.get_by_label("Local clone").select_option("/fixture/two")
+    choose_option(dialog.get_by_role("combobox", name="Local clone", exact=True), "/fixture/two")
     dialog.get_by_label("Task", exact=True).fill("Fix 'quotes'\nsecond line")
-    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    choose_option(dialog.get_by_label("Agent", exact=True), "claude")
     page.screenshot(path="reports/workspace-desktop.png")
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
     expect(page.locator("#workspace-progress")).to_contain_text("Fetching PR")
@@ -1729,25 +1768,40 @@ def test_issue_overview_columns_filters_linked_prs_and_safe_titles(
     expect(page.locator("#issue-sync")).to_contain_text("@fixture")
     expect(page.locator("#issue-sync")).to_contain_text("Open issues")
     expect(page.locator("#pr-sync")).to_contain_text("Open PRs")
-    page.get_by_label("Filter issues by role").select_option("assignee")
+    choose_option(
+        page.get_by_role("combobox", name="Filter issues by role", exact=True), "assignee"
+    )
     expect(rows).to_have_count(1)
     expect(rows).to_contain_text(["Assigned issue"])
-    page.get_by_label("Filter issues by role").select_option("all")
-    label = page.get_by_label("Filter issues by label")
-    expect(label.locator("option")).to_have_text(["All labels", "kind/bug"])
-    label.select_option("kind/bug")
+    choose_option(page.get_by_role("combobox", name="Filter issues by role", exact=True), "all")
+    label = page.get_by_role("combobox", name="Filter issues by label", exact=True)
+    expect(page.locator("#issue-label option")).to_have_text(["All labels", "kind/bug"])
+    choose_option(label, "kind/bug")
     expect(rows).to_have_count(1)
     expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
-    label.select_option("all")
-    page.get_by_label("Filter issues by linked pull requests").select_option("unlinked")
+    choose_option(label, "all")
+    choose_option(
+        page.get_by_role("combobox", name="Filter issues by linked pull requests", exact=True),
+        "unlinked",
+    )
     expect(rows).to_have_count(1)
     expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
-    page.get_by_label("Filter issues by linked pull requests").select_option("linked")
+    choose_option(
+        page.get_by_role("combobox", name="Filter issues by linked pull requests", exact=True),
+        "linked",
+    )
     expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
-    page.get_by_label("Filter issues by linked pull requests").select_option("all")
-    page.get_by_label("Filter issues by repository").select_option("test/beta")
+    choose_option(
+        page.get_by_role("combobox", name="Filter issues by linked pull requests", exact=True),
+        "all",
+    )
+    choose_option(
+        page.get_by_role("combobox", name="Filter issues by repository", exact=True), "test/beta"
+    )
     expect(rows).to_have_count(1)
-    page.get_by_label("Filter issues by repository").select_option("all")
+    choose_option(
+        page.get_by_role("combobox", name="Filter issues by repository", exact=True), "all"
+    )
     page.get_by_label("Search issues").fill("colleague")
     expect(rows).to_have_count(2)  # Assignee on one issue, author of the other.
     page.get_by_label("Search issues").fill("kind/bug")
@@ -1799,8 +1853,12 @@ def test_each_issue_column_sorts_both_directions(
         "descending" if column == "Last updated" else "ascending" if column == "Opened" else "none",
     )
     page.set_viewport_size({"width": 390, "height": 844})
-    expect(page.get_by_label("Sort issues by", exact=True)).to_be_visible()
-    page.get_by_label("Sort issues by", exact=True).select_option("comments")
+    expect(page.get_by_role("combobox", name="Sort issues by", exact=True)).to_be_visible()
+    choose_option(page.get_by_role("combobox", name="Sort issues by", exact=True), "comments")
+    if column == "Comments":
+        # Re-selecting the current value preserves its direction, like a native picker.
+        expect(rows.first.locator(".pr-repo")).to_have_text("test/alpha")
+        page.get_by_role("button", name="Descending", exact=True).click()
     expect(rows.first.locator(".pr-repo")).to_have_text("test/beta")
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
@@ -1916,7 +1974,7 @@ def test_issue_workspace_create_and_linked_pr_match(page, dashboard_site, issue_
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
     assert not requests
     dialog.get_by_label("Task", exact=True).fill("Reproduce the crash and fix it")
-    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    choose_option(dialog.get_by_label("Agent", exact=True), "claude")
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
     expect(page.locator("#workspace-progress")).to_contain_text("Fetching issue")
     assert requests == [
@@ -1951,3 +2009,161 @@ def test_issue_workspace_create_and_linked_pr_match(page, dashboard_site, issue_
         "workspace_id": "w7",
     }
     page.screenshot(path="reports/issue-workspace-desktop.png")
+
+
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+def test_searchable_picker_keyboard_clear_and_dismissal(page, dashboard_site, kind, prefix):
+    url, _ = dashboard_site
+    page.goto(f"{url}/#{kind}")
+    native = page.locator(f"#{prefix}-repo")
+    picker = page.get_by_role(
+        "combobox", name=f"Filter {'pull requests' if kind == 'prs' else 'issues'} by repository"
+    )
+    options = page.get_by_role("listbox").get_by_role("option")
+    expect(native.locator("option")).to_have_count(3)
+    native.evaluate(
+        "node => { window.selectionChanges = 0; node.addEventListener('change', () => window.selectionChanges++); }"
+    )
+    picker.click()
+    expect(options).to_have_text(["All repositories", "test/alpha", "test/beta"])
+    picker.fill("TEST/")
+    expect(options).to_have_text(["test/alpha", "test/beta"])
+    picker.press("ArrowDown")
+    picker.press("ArrowUp")
+    picker.press("ArrowDown")
+    active = picker.get_attribute("aria-activedescendant")
+    expect(page.locator(f"#{active}")).to_have_text("test/beta")
+    picker.press("Enter")
+    expect(native).to_have_value("test/beta")
+    expect(picker).to_have_value("test/beta")
+    expect(picker).to_be_focused()
+    expect(picker).to_have_attribute("aria-expanded", "false")
+    assert page.evaluate("window.selectionChanges") == 1
+    expect(page.locator(f"#{prefix}-list tr")).to_have_count(1)
+
+    # Typing while focus stays on the committed value must reopen the list too.
+    picker.press_sequentially("missing repository")
+    expect(options).to_have_count(0)
+    expect(page.locator(".select-status:visible")).to_have_text("No matches")
+    assert picker.get_attribute("aria-activedescendant") is None
+    picker.press("Enter")
+    expect(native).to_have_value("test/beta")
+    page.get_by_role("button", name="Clear search for", exact=False).click()
+    expect(picker).to_have_value("")
+    expect(options).to_have_count(3)
+    expect(native).to_have_value("test/beta")
+    picker.fill("alpha")
+    picker.press("Escape")
+    expect(picker).to_have_value("test/beta")
+    expect(picker).to_be_focused()
+    picker.press("ArrowDown")
+    expect(options).to_have_count(3)
+    picker.fill("alpha")
+    page.locator(f"#{prefix}-sync").click()  # Non-focusable outside target.
+    expect(picker).to_have_attribute("aria-expanded", "false")
+    expect(picker).to_have_value("test/beta")
+    picker.click()
+    picker.fill("alpha")
+    picker.press("Tab")
+    expect(picker).to_have_attribute("aria-expanded", "false")
+    assert page.evaluate("window.selectionChanges") == 1
+    choose_option(picker, "all")
+    expect(page.locator(f"#{prefix}-list tr")).to_have_count(2)
+    assert page.evaluate("window.selectionChanges") == 2
+
+
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+def test_searchable_picker_refresh_preserves_query_selection_and_hidden_filters(
+    page, dashboard_site, kind, prefix
+):
+    url, _ = dashboard_site
+    snapshot = page.request.get(f"{url}/api/{kind}").json()
+    page.route(f"**/api/{kind}", lambda route: route.fulfill(json=snapshot))
+    page.goto(f"{url}/#{kind}")
+    picker = page.locator(f"#{prefix}-repo").locator("..").get_by_role("combobox")
+    choose_option(picker, "test/beta")
+    picker.fill("alp")
+    expect(page.get_by_role("option")).to_have_text(["test/alpha"])
+    picker.press("ArrowLeft")
+    caret = picker.evaluate("node => node.selectionStart")
+    snapshot[kind][1]["repo"] = "test/alpine"
+    page.evaluate(f"{prefix}Table.refresh()")
+    expect(page.get_by_role("option")).to_have_text(["test/alpha", "test/alpine"])
+    expect(picker).to_have_value("alp")
+    expect(picker).to_be_focused()
+    assert picker.evaluate("node => node.selectionStart") == caret
+    expect(page.locator(f"#{prefix}-repo")).to_have_value("test/beta")
+    expect(page.locator(f"#{prefix}-list tr")).to_have_count(0)
+    picker.press("Escape")
+    page.get_by_role("tab", name="Watcher", exact=True).click()
+    snapshot[kind] = []
+    page.evaluate(f"{prefix}Table.refresh()")
+    page.get_by_role("tab", name="Pull requests" if kind == "prs" else "Issues", exact=True).click()
+    expect(picker).to_have_value("test/beta")
+    picker.click()
+    expect(page.get_by_role("option")).to_have_text(["All repositories", "test/beta"])
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_searchable_long_plain_text_choices_and_layout(page, dashboard_site, width):
+    url, _ = dashboard_site
+    snapshot = page.request.get(f"{url}/api/issues").json()
+    label = "team/" + "very-long-label-" * 8 + '<img src=x onerror="window.injected=true">'
+    snapshot["issues"][0]["labels"] = [{"name": label, "color": "ffffff"}]
+    page.route("**/api/issues", lambda route: route.fulfill(json=snapshot))
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{url}/#issues")
+    picker = page.get_by_role("combobox", name="Filter issues by label", exact=True)
+    picker.fill("TEAM/")
+    option = page.get_by_role("option")
+    expect(option).to_have_text(label)
+    assert option.evaluate("node => node.scrollWidth <= node.clientWidth")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/searchable-options-{width}.png", full_page=True)
+    option.click()
+    selected = picker.locator("xpath=../..").locator(".select-value")
+    expect(selected).to_have_text(label)
+    expect(selected).to_be_visible()
+    assert selected.evaluate("node => node.scrollWidth <= node.clientWidth")
+    expect(page.locator(".searchable-select img")).to_have_count(0)
+    assert page.evaluate("window.injected") is None
+    page.screenshot(path=f"reports/searchable-selected-{width}.png", full_page=True)
+    if width == 390:
+        sort = page.get_by_role("combobox", name="Sort issues by", exact=True)
+        sort.fill("Last")
+        expect(page.get_by_role("option")).to_have_text(["Last updated"])
+        popup = page.locator(".select-popup:visible")
+        bounds = popup.bounding_box()
+        assert bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        page.screenshot(path="reports/searchable-sort-mobile.png", full_page=True)
+
+
+def test_searchable_workspace_clone_validation_and_escape(page, dashboard_site, workspace_routes):
+    url, _ = dashboard_site
+    info, _, requests = workspace_routes
+    info["matches"] = []
+    info["clones"] = ["/fixture/one", "/fixture/" + "long-clone-name/" * 8 + "two"]
+    page.set_viewport_size({"width": 390, "height": 900})
+    page.goto(f"{url}/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    clone = dialog.get_by_role("combobox", name="Local clone", exact=True)
+    dialog.get_by_label("Task", exact=True).fill("Fix the issue")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(clone).to_be_focused()
+    assert not requests
+    clone.fill("two")
+    expect(dialog.get_by_role("listbox").get_by_role("option")).to_have_text([info["clones"][1]])
+    page.screenshot(path="reports/searchable-clone-mobile.png", full_page=True)
+    clone.press("Escape")
+    expect(dialog).to_be_visible()
+    expect(clone).to_have_attribute("aria-expanded", "false")
+    clone.fill("two")
+    clone.press("Enter")
+    expect(page.locator("#workspace-clone")).to_have_value(info["clones"][1])
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Fetching PR")
+    assert requests[-1]["clone"] == info["clones"][1]
