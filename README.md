@@ -16,6 +16,12 @@ at the bottom. Last updated (newest first) is the default. Sort selection surviv
 refreshes and filtering within the page. Ready for review means the PR is not a
 draft; it does not imply reviewer approval.
 
+Both tables render 50 rows at a time. Scrolling to the end of the table, or clicking
+**Show 50 more**, appends the next 50 rows. Changing the search, a filter, or the sort
+restarts at the first 50; background refreshes keep the rows already shown. The match
+count and the since-your-last-visit counts cover the whole filtered list, not only the
+rendered rows.
+
 The dashboard also discovers open GitHub PRs you authored, are assigned to, or are
 involved in reviewing (including team requests and completed reviews). It uses the
 active `gh` account on github.com. No registration is needed. These PRs are a

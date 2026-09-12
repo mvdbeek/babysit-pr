@@ -708,6 +708,10 @@ button:disabled {
   text-align: center;
   color: var(--muted);
 }
+.pr-more {
+  padding: 14px;
+  text-align: center;
+}
 @media (max-width: 540px) {
   .pr-table thead {
     display: none;

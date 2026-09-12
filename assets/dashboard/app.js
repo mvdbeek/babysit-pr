@@ -574,6 +574,9 @@ function prReviewBadges(pr) {
 // One sortable, filterable overview table with "since your last visit" highlighting.
 // `spec` supplies the column list, per-item cells, filters, and wording; the factory
 // owns sorting state, repository/label option lists, visit tracking, and rendering.
+// Rows rendered per page; more append as the sentinel below the table scrolls into view.
+const PAGE_SIZE = 50;
+
 function itemTable(spec) {
   const id = (suffix) => $(`${spec.prefix}-${suffix}`);
   const table = {
@@ -583,6 +586,7 @@ function itemTable(spec) {
     ascending: false,
     visits: new Map(),
     optionKeys: new Map(),
+    limit: PAGE_SIZE,
   };
   function items() {
     return table.data?.[spec.key] || [];
@@ -611,7 +615,7 @@ function itemTable(spec) {
     table.ascending =
       column === table.sort && toggle ? !table.ascending : !spec.dates.includes(column);
     table.sort = column;
-    render();
+    restart();
   }
   function updateOptions(name, values, allLabel) {
     const select = id(name);
@@ -745,17 +749,21 @@ function itemTable(spec) {
     id("alert").textContent =
       problems.join(" ") +
       (table.data.error && sync ? " Showing saved results; they may be out of date." : "");
-    id("list").replaceChildren();
     let newCount = 0,
       changedCount = 0;
-    for (const item of visible) {
-      const row = el("tr");
-      const { cells, title, fields, updated } = spec.row(item);
+    const rows = [];
+    for (const [index, item] of visible.entries()) {
       const change = changes(item, visit);
       if (change) {
-        row.className = change.isNew ? "pr-new" : "pr-changed";
         if (change.isNew) newCount += 1;
         else changedCount += 1;
+      }
+      // Change counts cover the whole filtered list; only the current window gets rows.
+      if (index >= table.limit) continue;
+      const row = el("tr");
+      const { cells, title, fields, updated } = spec.row(item);
+      if (change) {
+        row.className = change.isNew ? "pr-new" : "pr-changed";
         title.append(
           el(
             "span",
@@ -778,8 +786,13 @@ function itemTable(spec) {
         if (!change.isNew && !change.fields.length) updated.classList.add("pr-field-changed");
       }
       row.append(...cells, workspaceCell(item));
-      id("list").append(row);
+      rows.push(row);
     }
+    id("list").replaceChildren(...rows);
+    const remaining = visible.length - rows.length;
+    id("more").hidden = remaining <= 0;
+    id("more-button").textContent =
+      `Show ${Math.min(PAGE_SIZE, remaining)} more · ${rows.length} of ${visible.length} shown`;
     rememberVisit(visit);
     id("changes").hidden = !visit;
     id("changes").textContent = !visit
@@ -816,14 +829,33 @@ function itemTable(spec) {
       table.busy = false;
     }
   }
+  function showMore() {
+    if (id("more").hidden) return;
+    table.limit += PAGE_SIZE;
+    render();
+  }
+  function restart() {
+    // A new search, filter or sort starts at the top of the first page; refreshes keep
+    // the window and scroll position.
+    table.limit = PAGE_SIZE;
+    id("list").closest(".pr-table-wrap").scrollTop = 0;
+    render();
+  }
   for (const column of Object.keys(spec.columns)) {
     id(`sort-${column}`).onclick = () => sort(column, true);
   }
   id("sort").onchange = () => sort(id("sort").value);
   id("sort-direction").onclick = () => sort(table.sort, true);
   id("refresh").onclick = refresh;
-  id("search").oninput = render;
-  for (const name of spec.filters) id(name).onchange = render;
+  id("search").oninput = restart;
+  for (const name of spec.filters) id(name).onchange = restart;
+  id("more-button").onclick = showMore;
+  // A hidden sentinel never intersects, so this only fires with more rows to show.
+  if (typeof IntersectionObserver === "function") {
+    new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) showMore();
+    }).observe(id("more"));
+  }
   return Object.assign(table, { items, render, refresh });
 }
 

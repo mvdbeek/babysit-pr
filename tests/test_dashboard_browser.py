@@ -474,6 +474,56 @@ def test_ci_filters_match_each_displayed_state(page: Page, dashboard_site) -> No
     expect(page.locator("#pr-list tr")).to_have_count(7)
 
 
+def test_pr_overview_pages_fifty_rows_and_loads_more_on_scroll(page: Page, dashboard_site) -> None:
+    url, _home = dashboard_site
+    prs = [
+        {
+            "id": f"pr-{index}",
+            "repo": "test/odd" if index % 2 else "test/even",
+            "title": f"Change {index}",
+            "number": index,
+            "url": f"https://github.com/test/repo/pull/{index}",
+            "roles": ["author"],
+            "ci": "SUCCESS",
+            "draft": False,
+            "updated_at": f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+        }
+        for index in range(1, 121)
+    ]
+    page.route("**/api/prs", lambda route: route.fulfill(json={"prs": prs, "synced_at": 1234}))
+    page.goto(url + "/#prs")
+    rows = page.locator("#pr-list tr")
+    more = page.locator("#pr-more-button")
+    expect(rows).to_have_count(50)
+    expect(page.locator("#pr-count")).to_have_text("120 / 120")  # Counts cover the whole list.
+    expect(rows.first.locator(".pr-title")).to_have_text("Change 120")
+    expect(more).to_have_text("Show 50 more · 50 of 120 shown")
+    # Scrolling the sentinel into view appends the next page.
+    more.scroll_into_view_if_needed()
+    expect(rows).to_have_count(100)
+    expect(more).to_have_text("Show 20 more · 100 of 120 shown")
+    more.scroll_into_view_if_needed()
+    expect(rows).to_have_count(120)
+    expect(page.locator("#pr-more")).to_be_hidden()
+    # A filter restarts at the top of the first page; the button also appends a page.
+    page.get_by_label("Filter pull requests by repository").select_option("test/even")
+    expect(rows).to_have_count(50)
+    assert page.evaluate("document.querySelector('#prs-panel .pr-table-wrap').scrollTop") == 0
+    expect(more).to_have_text("Show 10 more · 50 of 60 shown")
+    more.dispatch_event("click")
+    expect(rows).to_have_count(60)
+    expect(page.locator("#pr-more")).to_be_hidden()
+    # The timed refresh keeps the window; a search restarts it.
+    page.locator("#pr-refresh").click()
+    expect(rows).to_have_count(60)
+    page.get_by_label("Search pull requests").fill("Change 1")
+    expect(rows).to_have_count(16)  # Even numbers containing a 1: 10-18 and 100-120.
+    expect(page.locator("#pr-more")).to_be_hidden()
+    page.get_by_role("tab", name="Issues", exact=True).click()
+    expect(page.locator("#issue-list tr")).to_have_count(2)
+    expect(page.locator("#issue-more")).to_be_hidden()
+
+
 @pytest.fixture
 def workspace_routes(page):
     target = {
