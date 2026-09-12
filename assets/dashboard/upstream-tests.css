@@ -2,9 +2,18 @@
   min-width: 0;
 }
 #upstream-scope,
+#upstream-history,
 #upstream-status {
   color: var(--muted);
   line-height: 1.6;
+}
+#upstream-notices {
+  overflow-wrap: anywhere;
+}
+.upstream-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .upstream-card {
   padding: 18px;

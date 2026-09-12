@@ -36,9 +36,11 @@ def test_upstream_grouping_routes_keyboard_and_responsive_screenshots(page, upst
     page.goto(url + "/#upstream")
     expect(page.get_by_role("tab", name="Upstream tests")).to_be_visible()
     expect(page.locator("#upstream-panel")).to_be_visible()
-    expect(page.locator(".upstream-card")).to_have_count(3)
+    expect(page.locator(".upstream-card")).to_have_count(4)
     expect(page.locator(".upstream-card").first).to_contain_text("2 branches")
     expect(page.locator("#upstream-scope")).to_contain_text("dev, release_26.1")
+    expect(page.locator(".upstream-card").first).to_contain_text("Likely flaky")
+    page.locator(".upstream-card").first.get_by_text("Pass / fail evidence", exact=True).click()
     expect(page.locator(".upstream-card").first.get_by_role("link").first).to_have_attribute(
         "href", "https://github.com/galaxyproject/galaxy/actions/runs/10"
     )
@@ -82,7 +84,7 @@ def test_loading_stale_empty_incomplete_errors_and_untrusted_text(page, upstream
     plugin.value["incomplete"] = False
     page.locator("#upstream-refresh").click()
     expect(page.locator("#upstream-results")).to_contain_text(
-        "No confirmed failing tests in the selected runs"
+        "No failing or likely flaky tests in the selected runs"
     )
     plugin.value["groups"] = [
         {
@@ -110,6 +112,23 @@ def test_loading_stale_empty_incomplete_errors_and_untrusted_text(page, upstream
     assert page.request.get(url + "/api/status").ok
     assert page.request.get(url + "/api/prs").ok
     assert page.request.get(url + "/api/issues").ok
+
+
+def test_classification_filter_and_retry_evidence(page, upstream_site):
+    url, _ = upstream_site
+    page.goto(url + "/#upstream")
+    choose_option(page.get_by_role("combobox", name="Show", exact=True), "likely_flaky")
+    expect(page.locator(".upstream-card")).to_have_count(1)
+    card = page.locator(".upstream-card")
+    expect(card).to_contain_text("Passed after a test retry")
+    expect(card).to_contain_text("0 failed / 1 passed")
+    card.get_by_text("Pass / fail evidence", exact=True).click()
+    expect(card).to_contain_text("Passed after retry")
+    expect(card).to_contain_text("Commit aaaaaaaaaaaa")
+    choose_option(page.get_by_role("combobox", name="Show", exact=True), "likely_broken")
+    expect(page.locator("#upstream-results")).to_contain_text("No findings match this filter")
+    choose_option(page.get_by_role("combobox", name="Show", exact=True), "insufficient")
+    expect(page.locator(".upstream-card")).to_have_count(3)
 
 
 def test_disabled_and_broken_plugin_do_not_affect_other_views(page, tmp_path):

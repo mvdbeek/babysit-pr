@@ -22,6 +22,9 @@ MAX_ARCHIVE = 8 * 1024 * 1024
 MAX_REPORT = 32 * 1024 * 1024
 MAX_STATE = 8 * 1024 * 1024
 MAX_CASES = 2000
+MAX_OUTCOMES = 20000
+HISTORY_RUNS = 5
+CACHE_VERSION = 2
 INTERVAL = 900
 WINDOW = 14
 
@@ -100,7 +103,7 @@ class ReportHTML(HTMLParser):
             self.blob = values.get("data-jsonblob")
 
 
-def report_failures(data):
+def report_outcomes(data):
     """Read pytest-html 4 embedded JSON, never render report HTML or execute scripts."""
     parser = ReportHTML()
     parser.feed(data.decode("utf-8"))
@@ -109,7 +112,7 @@ def report_failures(data):
     tests = json.loads(parser.blob).get("tests")
     if not isinstance(tests, dict):
         raise ValueError("Invalid pytest-html tests")
-    failures = []
+    outcomes = []
     for nodeid, results in tests.items():
         if not isinstance(nodeid, str) or "::" not in nodeid or len(nodeid) > 2048:
             continue  # Collection errors are not individual test failures.
@@ -119,20 +122,37 @@ def report_failures(data):
         # setup/teardown errors even if a separate call-phase result passed.
         final = [r for r in results if r.get("result") != "Rerun"]
         failed = [r for r in final if r.get("result") in {"Failed", "Error"}]
-        if failed:
-            failures.append({"test": nodeid, "summary": failed[-1]["result"]})
-        if len(failures) > MAX_CASES:
-            raise ValueError("Report failure count exceeds limit")
-    return failures
+        passed = any(r.get("result") == "Passed" for r in final)
+        if failed or passed:
+            outcomes.append(
+                {
+                    "test": nodeid,
+                    "summary": failed[-1]["result"] if failed else "Passed",
+                    "retried": any(r.get("result") == "Rerun" for r in results),
+                }
+            )
+        if len(outcomes) > MAX_OUTCOMES:
+            raise ValueError("Report outcome count exceeds limit")
+    return outcomes
 
 
-def archive_failures(data):
-    failures = {}
+def report_failures(data):
+    return [
+        {"test": r["test"], "summary": r["summary"]}
+        for r in report_outcomes(data)
+        if r["summary"] in {"Failed", "Error"}
+    ]
+
+
+def archive_outcomes(data):
+    outcomes = []
     reports = 0
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         members = archive.infolist()
         if len(members) > 100 or sum(m.file_size for m in members) > 64 * 1024 * 1024:
             raise ValueError("Archive expanded size/member limit exceeded")
+        if len({m.filename for m in members}) != len(members):
+            raise ValueError("Duplicate archive member path")
         for member in members:
             path = PurePosixPath(member.filename)
             if path.is_absolute() or ".." in path.parts or "\\" in member.filename:
@@ -142,10 +162,23 @@ def archive_failures(data):
             if not re.fullmatch(r"run_[A-Za-z0-9_]+_tests\.html", path.name):
                 continue
             reports += 1
-            for failure in report_failures(archive.read(member)):
-                failures[failure["test"]] = failure
+            for result in report_outcomes(archive.read(member)):
+                outcomes.append({**result, "report": member.filename})
+                if len(outcomes) > MAX_OUTCOMES:
+                    raise ValueError("Artifact outcome count exceeds limit")
     if not reports:
         raise ValueError("No supported pytest-html report in artifact")
+    return outcomes
+
+
+def archive_failures(data):
+    failures = {
+        r["test"]: {"test": r["test"], "summary": r["summary"]}
+        for r in archive_outcomes(data)
+        if r["summary"] in {"Failed", "Error"}
+    }
+    if len(failures) > MAX_CASES:
+        raise ValueError("Report failure count exceeds limit")
     return list(failures.values())
 
 
@@ -176,6 +209,214 @@ def supported_branches(api, repo, now):
     return ["dev", *sorted(branches)]
 
 
+def run_row(run, branch, repo):
+    return {
+        "branch": branch,
+        "workflow": run.get("name", str(run["workflow_id"])),
+        "workflow_id": run["workflow_id"],
+        "run_id": run["id"],
+        "attempt": run.get("run_attempt", 1),
+        "url": f"https://github.com/{repo}/actions/runs/{run['id']}",
+        "updated_at": run["updated_at"],
+        "sha": run.get("head_sha", ""),
+        "state": run.get("conclusion") or run["status"],
+        "failures": [],
+        "outcomes": [],
+        "jobs": [],
+        "notes": [],
+        "sampled": False,
+    }
+
+
+def observe_run(run, row, repo, api, cache, used_cache, now):
+    """Only explicit individual report outcomes count, including in green runs."""
+    fingerprint = [run.get(k) for k in ("id", "run_attempt", "status", "conclusion", "updated_at")]
+    run_key = f"run:{run['id']}"
+    cached = cache.get(run_key, {})
+    if (
+        isinstance(cached, dict)
+        and cached.get("version") == CACHE_VERSION
+        and cached.get("fingerprint") == fingerprint
+        and 0 <= now.timestamp() - cached.get("observed_at", 0) < 4 * INTERVAL
+    ):
+        row.update(copy.deepcopy(cached["row"]))
+        used_cache[run_key] = cached
+        return
+    root = f"repos/{repo}/actions/runs/{run['id']}"
+    reusable = True
+    pending_cache = {}
+    try:
+        artifacts = api.get(f"{root}/artifacts?per_page=100")
+        if artifacts.get("total_count", 0) > 100:
+            row["notes"].append("Artifact list truncated")
+        candidates = [
+            a for a in artifacts["artifacts"] if "test results" in a.get("name", "").lower()
+        ]
+        for artifact in candidates[:12]:
+            try:
+                if artifact.get("expired"):
+                    raise ValueError("Report artifact expired")
+                if artifact.get("size_in_bytes", 0) > MAX_ARCHIVE:
+                    raise ValueError("Report artifact exceeds download limit")
+                if row["attempt"] > 1 and timestamp(artifact["created_at"]) < timestamp(
+                    run["run_started_at"]
+                ):
+                    raise ValueError("Earlier-attempt report ignored")
+                key = str(artifact["id"])
+                saved = cache.get(key, {})
+                outcomes = (
+                    saved.get("outcomes")
+                    if isinstance(saved, dict) and saved.get("version") == CACHE_VERSION
+                    else None
+                )
+                if outcomes is None:
+                    outcomes = archive_outcomes(
+                        api.get(
+                            f"repos/{repo}/actions/artifacts/{artifact['id']}/zip", archive=True
+                        )
+                    )
+                pending_cache[key] = {"version": CACHE_VERSION, "outcomes": outcomes}
+                if len(row["outcomes"]) + len(outcomes) > MAX_OUTCOMES:
+                    raise ValueError("Run outcome count exceeds limit")
+                row["outcomes"].extend(
+                    {**result, "artifact": artifact["name"]} for result in outcomes
+                )
+            except Exception as exc:
+                reusable = False
+                row["notes"].append(f"{artifact['name']}: {exc}")
+        if len(candidates) > 12:
+            row["notes"].append("Artifact count limit reached")
+        if candidates:
+            jobs = api.get(f"{root}/attempts/{row['attempt']}/jobs?per_page=100")
+            row["jobs"] = [
+                {
+                    "name": j["name"],
+                    "url": f"{row['url']}/job/{j['id']}",
+                    "state": j.get("conclusion") or j["status"],
+                }
+                for j in jobs["jobs"]
+            ]
+            if jobs.get("total_count", 0) > 100:
+                row["notes"].append("Job list truncated")
+        current = api.get(root)
+        if any(
+            current.get(k) != run.get(k)
+            for k in ("run_attempt", "status", "conclusion", "updated_at")
+        ):
+            raise ValueError("Run changed during collection; awaiting next refresh")
+        row["sampled"] = bool(row["outcomes"])
+        row["failures"] = [r for r in row["outcomes"] if r["summary"] in {"Failed", "Error"}]
+        if len(row["failures"]) > MAX_CASES:
+            raise ValueError("Run failure count exceeds limit")
+        if not row["sampled"]:
+            row["notes"].append(
+                "No confirmed individual test outcomes; infrastructure/build failure or unavailable/unsupported reports"
+            )
+        # Revalidate before caching: a changed attempt must not contribute history.
+        if reusable:
+            used_cache[run_key] = {
+                "version": CACHE_VERSION,
+                "fingerprint": fingerprint,
+                "observed_at": now.timestamp(),
+                "row": copy.deepcopy(row),
+            }
+        else:
+            used_cache.update(pending_cache)
+    except Exception as exc:
+        row["outcomes"], row["failures"], row["sampled"] = [], [], False
+        row["notes"].append(f"Run evidence could not be verified: {exc}")
+
+
+def test_groups(rows, samples):
+    """Compare exact test/matrix/report identities; a green workflow is not a test pass."""
+    current = {(r["branch"], r["workflow_id"]): r["run_id"] for r in rows}
+    contexts: dict[tuple, list[dict]] = {}
+    for row in samples:
+        # Duplicate reports must not inflate the number of observations.
+        seen = set()
+        for result in row["outcomes"]:
+            key = (
+                result["test"],
+                row["branch"],
+                row["workflow_id"],
+                result["artifact"],
+                result["report"],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            contexts.setdefault(key, []).append(
+                {
+                    **{
+                        k: row[k]
+                        for k in (
+                            "branch",
+                            "workflow",
+                            "workflow_id",
+                            "run_id",
+                            "attempt",
+                            "url",
+                            "sha",
+                            "updated_at",
+                            "jobs",
+                        )
+                    },
+                    **result,
+                    "current": current.get((row["branch"], row["workflow_id"])) == row["run_id"],
+                }
+            )
+    groups: dict[str, dict] = {}
+    for key, observations in contexts.items():
+        observations.sort(key=lambda o: o["run_id"], reverse=True)
+        failures = [o for o in observations if o["summary"] in {"Failed", "Error"}]
+        passes = [o for o in observations if o["summary"] == "Passed"]
+        retries = [o for o in passes if o["retried"]]
+        failed_shas = {o["sha"] for o in failures if o["sha"]}
+        mixed_sha = bool(failed_shas & {o["sha"] for o in passes if o["sha"]})
+        currently_failing = any(o["current"] for o in failures)
+        if retries or mixed_sha:
+            classification = "likely_flaky"
+            reason = (
+                "Passed after a test retry."
+                if retries
+                else "Passed and failed on the same commit in the same test context."
+            )
+        elif currently_failing and len(failures) >= 2 and not passes:
+            classification = "likely_broken"
+            reason = "Fails in the latest run and at least two sampled runs, with no observed pass in this context."
+        elif currently_failing and passes:
+            classification = "mixed"
+            reason = "Passes and failures are on different commits; a fix or regression could explain the change."
+        elif currently_failing:
+            classification = "insufficient"
+            reason = "Current failure, but too little comparable history to distinguish a breakage from a flake."
+        else:
+            continue  # Superseded failures alone are not current failures or flake evidence.
+        group = groups.setdefault(key[0], {"test": key[0], "occurrences": [], "assessments": []})
+        group["occurrences"].extend(observations)
+        group["assessments"].append(
+            {
+                "branch": key[1],
+                "workflow": observations[0]["workflow"],
+                "workflow_id": key[2],
+                "artifact": key[3],
+                "report": key[4],
+                "classification": classification,
+                "reason": reason,
+                "failures": len(failures),
+                "passes": len(passes),
+                "retry_passes": len(retries),
+                "currently_failing": currently_failing,
+                "sampled_runs": len(observations),
+            }
+        )
+    priority = {"likely_flaky": 0, "likely_broken": 1, "mixed": 2, "insufficient": 3}
+    return sorted(
+        groups.values(),
+        key=lambda g: (min(priority[a["classification"]] for a in g["assessments"]), g["test"]),
+    )
+
+
 def collect(config, api, now, artifact_cache):
     repo = config.get("repo", "galaxyproject/galaxy")
     if (
@@ -195,9 +436,7 @@ def collect(config, api, now, artifact_cache):
     ):
         raise ValueError("Configure between 1 and 8 branch names")
     branches = list(dict.fromkeys(branches))
-    rows = []
-    warnings = []
-    used_cache: dict = {}
+    rows, warnings, histories = [], [], []
     since = (now - timedelta(days=WINDOW)).isoformat()
     for branch in branches:
         try:
@@ -207,129 +446,81 @@ def collect(config, api, now, artifact_cache):
             runs = response["workflow_runs"]
             if response.get("total_count", len(runs)) > len(runs):
                 warnings.append(
-                    f"{branch}: only the newest 100 runs inspected; workflows may be missing"
+                    f"{branch}: only the newest 100 runs inspected; workflows or older history may be missing"
                 )
-            latest: dict = {}
-            for run in runs:
+            by_workflow: dict[int, list[dict]] = {}
+            seen_runs = set()
+            for run in sorted(runs, key=lambda r: r["id"], reverse=True):
                 if (
                     run.get("head_branch") != branch
                     or run.get("event") not in {"push", "schedule", "workflow_dispatch"}
                     or timestamp(run["created_at"]) < now - timedelta(days=WINDOW)
                 ):
                     continue
-                key = run["workflow_id"]
-                if key not in latest or run["id"] > latest[key]["id"]:
-                    latest[key] = run
-            if not latest:
-                warnings.append(f"{branch}: no eligible runs in the observation window")
-            for run in sorted(latest.values(), key=lambda r: r["id"], reverse=True)[:30]:
-                row = {
-                    "branch": branch,
-                    "workflow": run.get("name", str(run["workflow_id"])),
-                    "run_id": run["id"],
-                    "attempt": run.get("run_attempt", 1),
-                    "url": f"https://github.com/{repo}/actions/runs/{run['id']}",
-                    "updated_at": run["updated_at"],
-                    "sha": run.get("head_sha", ""),
-                    "state": run.get("conclusion") or run["status"],
-                    "failures": [],
-                    "jobs": [],
-                    "notes": [],
-                }
-                rows.append(row)
-                if run["status"] != "completed" or run.get("conclusion") in {
-                    "success",
-                    "skipped",
-                    "neutral",
-                }:
+                if run["id"] in seen_runs:
                     continue
-                try:
-                    root = f"repos/{repo}/actions/runs/{run['id']}"
-                    jobs = api.get(f"{root}/attempts/{row['attempt']}/jobs?per_page=100")
-                    row["jobs"] = [
-                        {
-                            "name": j["name"],
-                            "url": f"{row['url']}/job/{j['id']}",
-                            "state": j.get("conclusion") or j["status"],
-                        }
-                        for j in jobs["jobs"]
-                    ]
-                    if jobs.get("total_count", 0) > 100:
-                        row["notes"].append("Job list truncated")
-                    artifacts = api.get(f"{root}/artifacts?per_page=100")
-                    if artifacts.get("total_count", 0) > 100:
-                        row["notes"].append("Artifact list truncated")
-                    candidates = [
-                        a
-                        for a in artifacts["artifacts"]
-                        if "test results" in a.get("name", "").lower()
-                    ]
-                    for artifact in candidates[:12]:
-                        try:
-                            if artifact.get("expired"):
-                                raise ValueError("Report artifact expired")
-                            if artifact.get("size_in_bytes", 0) > MAX_ARCHIVE:
-                                raise ValueError("Report artifact exceeds download limit")
-                            if row["attempt"] > 1 and timestamp(artifact["created_at"]) < timestamp(
-                                run["run_started_at"]
-                            ):
-                                raise ValueError("Earlier-attempt report ignored")
-                            key = str(artifact["id"])
-                            failures = artifact_cache.get(key)
-                            if failures is None:
-                                failures = archive_failures(
-                                    api.get(
-                                        f"repos/{repo}/actions/artifacts/{artifact['id']}/zip",
-                                        archive=True,
-                                    )
-                                )
-                            if len(used_cache) < 200:
-                                used_cache[key] = failures
-                            for failure in failures:
-                                if len(row["failures"]) >= MAX_CASES:
-                                    raise ValueError("Run failure count exceeds limit")
-                                row["failures"].append({**failure, "artifact": artifact["name"]})
-                        except Exception as exc:
-                            row["notes"].append(f"{artifact['name']}: {exc}")
-                    if len(candidates) > 12:
-                        row["notes"].append("Artifact count limit reached")
-                    # A rerun or replacement during collection invalidates this sample.
-                    current = api.get(root)
-                    if any(
-                        current.get(k) != run.get(k)
-                        for k in ("run_attempt", "status", "conclusion", "updated_at")
-                    ):
-                        row["failures"] = []
-                        row["notes"].append("Run changed during collection; awaiting next refresh")
-                    if not row["failures"]:
-                        row["notes"].append(
-                            "No confirmed individual test failures; infrastructure/build failure or unavailable/unsupported reports"
-                        )
-                except Exception as exc:
-                    row["failures"] = []
-                    row["notes"].append(f"Run evidence could not be verified: {exc}")
-            if len(latest) > 30:
+                seen_runs.add(run["id"])
+                history = by_workflow.setdefault(run["workflow_id"], [])
+                if len(history) < HISTORY_RUNS:
+                    history.append(run)
+            if not by_workflow:
+                warnings.append(f"{branch}: no eligible runs in the observation window")
+            for history in list(by_workflow.values())[:30]:
+                latest = run_row(history[0], branch, repo)
+                rows.append(latest)
+                # Inspect failures and test workflows, including green runs with retry evidence.
+                if any(r.get("conclusion") == "failure" for r in history) or re.search(
+                    r"test|integration|selenium", latest["workflow"], re.I
+                ):
+                    histories.append(
+                        [
+                            (run, latest if i == 0 else run_row(run, branch, repo))
+                            for i, run in enumerate(history)
+                        ]
+                    )
+            if len(by_workflow) > 30:
                 warnings.append(f"{branch}: workflow limit reached")
         except Exception as exc:
             warnings.append(f"{branch}: {exc}")
-    groups: dict = {}
-    for row in rows:
-        for failure in row["failures"]:
-            nodeid = failure["test"]
-            group = groups.setdefault(nodeid, {"test": nodeid, "occurrences": []})
-            group["occurrences"].append(
-                {
-                    "branch": row["branch"],
-                    "workflow": row["workflow"],
-                    "url": row["url"],
-                    "run_id": row["run_id"],
-                    "attempt": row["attempt"],
-                    "updated_at": row["updated_at"],
-                    "artifact": failure["artifact"],
-                    "summary": failure["summary"],
-                    "jobs": row["jobs"],
-                }
-            )
+    used_cache: dict = {}
+    samples = []
+    # Current failures across all branches first; then expand one history level at a time.
+    histories.sort(key=lambda h: h[0][1]["state"] != "failure")
+    for depth in range(HISTORY_RUNS):
+        for run_history in histories:
+            if depth >= len(run_history):
+                continue
+            run, row = run_history[depth]
+            if run["status"] != "completed" or run.get("conclusion") in {
+                "skipped",
+                "neutral",
+                "cancelled",
+            }:
+                continue
+            observe_run(run, row, repo, api, artifact_cache, used_cache, now)
+            samples.append(row)
+    groups = test_groups(rows, samples)
+    # Passing tests are only returned when they support a displayed assessment.
+    public_rows = [{k: v for k, v in r.items() if k != "outcomes"} for r in rows]
+    history_gaps = [
+        {
+            "branch": r["branch"],
+            "workflow": r["workflow"],
+            "run_id": r["run_id"],
+            "url": r["url"],
+            "notes": r["notes"],
+        }
+        for r in samples
+        if r["notes"]
+    ]
+    # Limit persisted evidence without failing an otherwise useful observation.
+    retained: dict = {}
+    size = 0
+    for key, value in used_cache.items():
+        entry_size = len(json.dumps(value).encode())
+        if len(retained) < 200 and size + entry_size <= MAX_STATE // 2:
+            retained[key] = value
+            size += entry_size
     return {
         "repo": repo,
         "branches": branches,
@@ -338,12 +529,18 @@ def collect(config, api, now, artifact_cache):
         else "Explicit branch configuration",
         "policy_url": POLICY if automatic else None,
         "window_days": WINDOW,
-        "runs": rows,
-        "groups": sorted(groups.values(), key=lambda g: g["test"]),
+        "runs": public_rows,
+        "groups": groups,
         "warnings": warnings,
-        "incomplete": bool(warnings or any(r["notes"] for r in rows)),
+        "history": {
+            "runs_per_workflow": HISTORY_RUNS,
+            "sampled_runs": sum(r["sampled"] for r in samples),
+            "selected_runs": len(samples),
+            "gaps": history_gaps,
+        },
+        "incomplete": bool(warnings or history_gaps),
         "budget": {"requests": api.calls, "downloads": api.downloads, "bytes": api.bytes},
-    }, used_cache
+    }, retained
 
 
 class UpstreamTests:
@@ -371,9 +568,10 @@ class UpstreamTests:
             cache_path = self.directory / "cache.json"
             if self.enabled and cache_path.exists() and cache_path.stat().st_size <= MAX_STATE:
                 cache = json.loads(cache_path.read_text())
-                if cache.get("config") == self.config:
+                if cache.get("version") == CACHE_VERSION and cache.get("config") == self.config:
                     self.value = cache["value"]
                     self.artifacts = cache.get("artifacts", {})
+                    self.next_poll = self.value.get("synced_at", 0) + INTERVAL
         except Exception as exc:
             self.error = f"Experiment configuration/cache unavailable: {exc}"
 
@@ -400,7 +598,14 @@ class UpstreamTests:
                 self.config, Budget(self.fetch), datetime.now(UTC), self.artifacts
             )
             value["synced_at"] = time.time()
-            payload = json.dumps({"config": self.config, "value": value, "artifacts": artifacts})
+            payload = json.dumps(
+                {
+                    "version": CACHE_VERSION,
+                    "config": self.config,
+                    "value": value,
+                    "artifacts": artifacts,
+                }
+            )
             if len(payload.encode()) > MAX_STATE:
                 raise ValueError("Experiment cache size limit exceeded")
             self.directory.mkdir(parents=True, exist_ok=True)

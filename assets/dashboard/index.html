@@ -74,17 +74,31 @@
         hidden
       >
         <div class="toolbar">
-          <h2>Upstream test failures <span class="count">Experimental</span></h2>
+          <h2>Upstream test health <span class="count">Experimental</span></h2>
           <div class="filters">
-            <label for="upstream-group">Group by</label
-            ><select id="upstream-group">
-              <option value="test">Failing test</option>
-              <option value="branch">Branch / workflow</option></select
-            ><button id="upstream-refresh" type="button">Refresh</button>
+            <div class="upstream-picker">
+              <label for="upstream-group">Group by</label
+              ><select id="upstream-group">
+                <option value="test">Test</option>
+                <option value="branch">Branch / workflow</option>
+              </select>
+            </div>
+            <div class="upstream-picker">
+              <label for="upstream-classification">Show</label
+              ><select id="upstream-classification">
+                <option value="all">All findings</option>
+                <option value="likely_flaky">Likely flaky</option>
+                <option value="likely_broken">Likely broken</option>
+                <option value="mixed">Mixed results</option>
+                <option value="insufficient">Insufficient history</option>
+              </select>
+            </div>
+            <button id="upstream-refresh" type="button">Refresh</button>
           </div>
         </div>
         <p id="upstream-status" role="status">Loading experiment…</p>
         <p id="upstream-scope"></p>
+        <div id="upstream-history"></div>
         <div id="upstream-notices" role="status"></div>
         <div id="upstream-results"></div>
       </section>

@@ -4,6 +4,12 @@
   let snapshot = null;
   let busy = false;
   let limit = 50;
+  const classifications = {
+    likely_flaky: "Likely flaky",
+    likely_broken: "Likely broken",
+    mixed: "Mixed results",
+    insufficient: "Insufficient history",
+  };
   function node(tag, text, className) {
     const element = document.createElement(tag);
     if (text !== undefined) element.textContent = text;
@@ -33,7 +39,7 @@
     item.append(
       node(
         "p",
-        `${value.summary || ""} · ${value.artifact || ""} · Updated ${date(value.updated_at)}`,
+        `${value.summary || ""}${value.retried ? " after retry" : ""} · ${value.current ? "Latest run" : "Historical observation"} · ${value.artifact || ""} · ${value.report || ""} · Commit ${(value.sha || "").slice(0, 12) || "unavailable"} · Updated ${date(value.updated_at)}`,
       ),
     );
     const jobs = node("details");
@@ -56,6 +62,7 @@
     byId("results").replaceChildren();
     byId("notices").replaceChildren();
     byId("scope").textContent = "";
+    byId("history").textContent = "";
     if (!data.enabled) {
       status.textContent =
         data.error ||
@@ -65,21 +72,54 @@
     status.textContent = `${data.loading ? "Loading / refreshing… " : ""}${data.stale ? "Stale saved results — " : ""}${data.synced_at ? `Observed ${date(data.synced_at * 1000)}. ` : "No observation yet. "}${data.incomplete ? "Incomplete coverage. " : ""}Refresh checks the cache; GitHub collection runs at most every 15 minutes.`;
     if (data.repo) {
       byId("scope").textContent =
-        `${data.repo} · Tracking: ${(data.branches || []).join(", ")}. ${data.selection}. Newest run per workflow and branch from the past ${data.window_days} days (push, schedule, manual); pending and passing replacements clear older failures. This is an observation, not branch-wide test coverage.`;
+        `${data.repo} · Tracking: ${(data.branches || []).join(", ")}. ${data.selection}. Latest run per workflow and branch, with up to ${data.history?.runs_per_workflow || 5} recent runs from the past ${data.window_days} days (push, schedule, manual). Historical flake evidence is labeled separately from current failures.`;
       if (data.policy_url) byId("scope").append(" ", anchor("Support policy", data.policy_url));
+    }
+    if (data.history) {
+      byId("history").textContent =
+        `History: ${data.history.sampled_runs} of ${data.history.selected_runs} selected runs have individual test outcomes.`;
+      const explanation = node("details");
+      explanation.append(
+        node("summary", "How findings are classified"),
+        node(
+          "p",
+          "Likely flaky: passed after a retry, or both passed and failed on the same commit. Likely broken: currently failing in at least two sampled runs with no observed pass. Different commits can reflect fixes or regressions. These are clues, not proof; missing tests and green workflows never count as individual passes.",
+        ),
+      );
+      byId("history").append(explanation);
     }
     for (const warning of [data.error, ...(data.warnings || [])].filter(Boolean)) {
       byId("notices").append(node("p", warning, "alert"));
     }
-    const groups = data.groups || [];
+    if (data.history?.gaps?.length) {
+      const gaps = node("details");
+      gaps.append(
+        node("summary", `${data.history.gaps.length} runs with incomplete report coverage`),
+      );
+      const list = node("ul");
+      for (const gap of data.history.gaps) {
+        const item = node("li");
+        item.append(anchor(`${gap.branch} · ${gap.workflow} · run ${gap.run_id}`, gap.url));
+        item.append(node("p", gap.notes.join(" · ")));
+        list.append(item);
+      }
+      gaps.append(list);
+      byId("notices").append(gaps);
+    }
+    const filter = byId("classification").value;
+    const groups = (data.groups || []).filter(
+      (group) => filter === "all" || group.assessments?.some((a) => a.classification === filter),
+    );
     if (byId("group").value === "test") {
       if (!groups.length && data.synced_at) {
         byId("results").append(
           node(
             "p",
-            data.incomplete
-              ? "No confirmed failing tests in the available reports. Inspect Branch / workflow for missing reports and infrastructure failures."
-              : "No confirmed failing tests in the selected runs.",
+            filter !== "all"
+              ? "No findings match this filter."
+              : data.incomplete
+                ? "No failing or likely flaky tests in the available reports. Inspect Branch / workflow for missing reports and infrastructure failures."
+                : "No failing or likely flaky tests in the selected runs.",
             "empty",
           ),
         );
@@ -87,15 +127,38 @@
       for (const group of groups.slice(0, limit)) {
         const card = node("article", undefined, "upstream-card");
         card.append(node("h3", group.test));
+        const badges = node("div", undefined, "pr-badges");
+        for (const classification of new Set(
+          (group.assessments || []).map((a) => a.classification),
+        )) {
+          badges.append(
+            node(
+              "span",
+              classifications[classification] || classification,
+              `badge ${classification === "likely_broken" ? "red" : "amber"}`,
+            ),
+          );
+        }
+        card.append(badges);
         card.append(
           node(
             "p",
-            `${new Set(group.occurrences.map((entry) => entry.branch)).size} branches · ${group.occurrences.length} report occurrences`,
+            `${new Set(group.occurrences.map((entry) => entry.branch)).size} branches · ${group.occurrences.length} report observations`,
           ),
         );
+        for (const assessment of group.assessments || []) {
+          card.append(
+            node(
+              "p",
+              `${assessment.branch} · ${assessment.workflow} · ${assessment.artifact} · ${assessment.report}: ${classifications[assessment.classification]} — ${assessment.reason} ${assessment.failures} failed / ${assessment.passes} passed observations (${assessment.retry_passes} passed after retry). ${assessment.currently_failing ? "Failing in latest run." : "Historical signal; no confirmed failure in the latest run."}`,
+            ),
+          );
+        }
         const list = node("ul");
         for (const value of group.occurrences) list.append(occurrence(value));
-        card.append(list);
+        const evidence = node("details");
+        evidence.append(node("summary", "Pass / fail evidence"), list);
+        card.append(evidence);
         byId("results").append(card);
       }
       if (groups.length > limit) {
@@ -107,6 +170,13 @@
         byId("results").append(more);
       }
     } else {
+      if (filter !== "all")
+        byId("results").append(
+          node(
+            "p",
+            "The finding filter applies to the Test grouping. All latest workflow runs are shown below.",
+          ),
+        );
       for (const branch of data.branches || []) {
         byId("results").append(node("h3", branch));
         for (const run of (data.runs || []).filter((entry) => entry.branch === branch)) {
@@ -157,6 +227,10 @@
     }
   }
   byId("group").onchange = () => {
+    limit = 50;
+    render();
+  };
+  byId("classification").onchange = () => {
     limit = 50;
     render();
   };

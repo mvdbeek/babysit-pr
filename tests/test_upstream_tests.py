@@ -1,6 +1,7 @@
 """Isolated experimental collector with fake responses and a fake gh executable."""
 
 import copy
+import html
 import io
 import json
 import os
@@ -24,6 +25,19 @@ def archive(body=None, name="run_api_tests.html"):
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as output:
         output.writestr(name, FIXTURE.read_bytes() if body is None else body)
     return buffer.getvalue()
+
+
+def outcomes_report(tests):
+    blob = json.dumps(
+        {
+            "tests": {
+                name: [{"result": result} for result in results] for name, results in tests.items()
+            }
+        }
+    )
+    return (
+        f'<div id="data-container" data-jsonblob="{html.escape(blob, quote=True)}"></div>'.encode()
+    )
 
 
 def run(run_id=10, branch="dev", **changes):
@@ -52,11 +66,13 @@ class FakeGitHub:
         self.no_artifacts = False
         self.calls = []
         self.report = archive()
+        self.reports = {}
 
     def __call__(self, endpoint, raw=False):
         self.calls.append(endpoint)
         if endpoint.endswith("/zip"):
-            return self.report
+            artifact_id = int(endpoint.split("/")[-2])
+            return self.reports.get(artifact_id // 10, self.report)
         path = urlsplit(endpoint).path
         if path.endswith("/actions/runs"):
             branch = parse_qs(urlsplit(endpoint).query)["branch"][0]
@@ -116,7 +132,7 @@ def test_structured_report_preserves_parameter_identity_and_retry_outcome():
 def test_grouping_across_branches_and_cache_reuses_only_current_artifacts():
     fake = FakeGitHub()
     value, cache = collect(fake)
-    assert len(value["groups"]) == 3
+    assert len(value["groups"]) == 4
     assert {o["branch"] for o in value["groups"][0]["occurrences"]} == {"dev", "release_26.1"}
     assert value["groups"][0]["occurrences"][0]["jobs"][0]["url"].endswith("/job/42")
     assert value["budget"]["downloads"] == 2
@@ -124,8 +140,129 @@ def test_grouping_across_branches_and_cache_reuses_only_current_artifacts():
     assert second["budget"]["downloads"] == 0
     assert second["groups"] == value["groups"]
     fake.runs = [run(conclusion="success")]
+    fake.report = archive(outcomes_report({"tests/test.py::test_pass": ["Passed"]}))
     cleared, retained = collect(fake, cache, ["dev"])
-    assert cleared["groups"] == [] and retained == {}
+    assert cleared["groups"] == []
+    assert retained["run:10"]["row"]["failures"] == []
+
+
+@pytest.mark.parametrize(
+    "latest,older,same_sha,expected",
+    [
+        (["Passed"], ["Failed"], True, "likely_flaky"),
+        (["Failed"], ["Passed"], True, "likely_flaky"),
+        (["Failed"], ["Passed"], False, "mixed"),
+        (["Failed"], ["Failed"], False, "likely_broken"),
+        (["Passed"], ["Failed"], False, None),
+        (["Rerun", "Passed"], ["Passed"], False, "likely_flaky"),
+        (["Failed"], ["Skipped"], True, "insufficient"),
+        (["Failed"], ["Rerun"], True, "insufficient"),
+    ],
+)
+def test_history_classification_requires_explicit_comparable_evidence(
+    latest, older, same_sha, expected
+):
+    nodeid = "tests/test_example.py::test_case[param]"
+    fake = FakeGitHub(
+        [
+            run(11, conclusion="success" if latest[-1] == "Passed" else "failure"),
+            run(10, head_sha="a" * 40 if same_sha else "b" * 40),
+        ]
+    )
+    fake.reports = {
+        11: archive(outcomes_report({nodeid: latest})),
+        10: archive(outcomes_report({nodeid: older})),
+    }
+    value, _ = collect(fake, branches=["dev"])
+    assert len(value["groups"]) == (1 if expected else 0)
+    if expected:
+        group = value["groups"][0]
+        assert group["assessments"][0]["classification"] == expected
+        assert group["assessments"][0]["currently_failing"] == (latest[-1] == "Failed")
+        assert group["occurrences"][0]["current"]
+        assert group["occurrences"][0]["run_id"] == 11
+    assert [r["run_id"] for r in value["runs"]] == [11]
+
+
+@pytest.mark.parametrize("dimension", ["branch", "workflow", "artifact", "report", "parameter"])
+def test_flake_evidence_does_not_cross_test_contexts(dimension):
+    changes = (
+        {"branch": "release_26.1"}
+        if dimension == "branch"
+        else {"workflow_id": 2}
+        if dimension == "workflow"
+        else {}
+    )
+    fake = FakeGitHub([run(11), run(10, **changes)])
+    nodeid = "tests/test_example.py::test_case[a]"
+    fake.reports = {
+        11: archive(outcomes_report({nodeid: ["Failed"]})),
+        10: archive(
+            outcomes_report(
+                {nodeid.replace("[a]", "[b]") if dimension == "parameter" else nodeid: ["Passed"]}
+            ),
+            name="run_unit_tests.html" if dimension == "report" else "run_api_tests.html",
+        ),
+    }
+
+    def fetch(endpoint, **kwargs):
+        result = fake(endpoint, **kwargs)
+        if dimension == "artifact" and "/runs/10/artifacts" in endpoint:
+            data = json.loads(result)
+            data["artifacts"][0]["name"] = "API test results (3.12, 1)"
+            return json.dumps(data).encode()
+        return result
+
+    value, _ = collect(fetch)
+    assert len(value["groups"]) == 1
+    assert value["groups"][0]["assessments"][0]["classification"] == "insufficient"
+
+
+def test_green_workflow_without_test_report_does_not_prove_a_pass():
+    fake = FakeGitHub([run(11), run(10, conclusion="success")])
+    fake.report = archive(outcomes_report({"tests/test.py::test_case": ["Failed"]}))
+
+    def fetch(endpoint, **kwargs):
+        if "/runs/10/artifacts" in endpoint:
+            return b'{"artifacts": []}'
+        return fake(endpoint, **kwargs)
+
+    value, _ = collect(fetch, branches=["dev"])
+    assessment = value["groups"][0]["assessments"][0]
+    assert assessment["classification"] == "insufficient" and assessment["passes"] == 0
+    assert value["history"]["gaps"] and value["incomplete"]
+
+
+def test_history_is_bounded_deduplicated_and_cache_advances_download_budget():
+    fake = FakeGitHub([*[run(i) for i in range(1, 8)], run(7)])
+    fake.report = archive(outcomes_report({"tests/test.py::test_case": ["Failed"]}))
+    api = upstream.Budget(fake)
+    api.downloads = 11
+    first, cache = upstream.collect({"branches": ["dev"]}, api, NOW, {})
+    assert first["history"]["selected_runs"] == upstream.HISTORY_RUNS
+    assert first["history"]["sampled_runs"] == 1 and first["incomplete"]
+    second, _ = collect(fake, cache, ["dev"])
+    assert second["budget"]["downloads"] == upstream.HISTORY_RUNS - 1
+    assert second["groups"][0]["assessments"][0]["failures"] == upstream.HISTORY_RUNS
+    assert len(second["groups"][0]["occurrences"]) == upstream.HISTORY_RUNS
+
+
+def test_retry_pass_with_teardown_error_is_still_a_failure():
+    outcomes = upstream.report_outcomes(
+        outcomes_report({"tests/test.py::test_case": ["Rerun", "Passed", "Error"]})
+    )
+    assert outcomes[0]["summary"] == "Error"
+
+
+def test_revalidated_run_cache_expires_and_does_not_keep_removed_runs():
+    fake = FakeGitHub([run()])
+    _, cache = collect(fake, branches=["dev"])
+    cache["run:10"]["observed_at"] -= 4 * upstream.INTERVAL
+    refreshed, cache = collect(fake, cache, ["dev"])
+    assert refreshed["budget"]["downloads"] == 1
+    fake.runs = [run(11, status="in_progress", conclusion=None)]
+    value, retained = collect(fake, cache, ["dev"])
+    assert not value["groups"] and not retained
 
 
 @pytest.mark.parametrize(
@@ -312,17 +449,19 @@ def test_background_single_flight_cache_restart_and_error_isolation(tmp_path):
     assert plugin.snapshot()["loading"]
     gate.set()
     wait_for_refresh(plugin)
-    assert len(plugin.value["groups"]) == 3
+    assert len(plugin.value["groups"]) == 4
     assert len(fake.calls) == 5
     original = copy.deepcopy(plugin.value)
     second = upstream.UpstreamTests(tmp_path, fake)
     assert second.value == original
+    assert second.next_poll == original["synced_at"] + upstream.INTERVAL
 
     def fail(*args, **kwargs):
         raise ValueError("offline")
 
     second.config = {"repo": "invalid"}
     second.fetch = fail
+    second.next_poll = 0
     second.snapshot()
     wait_for_refresh(second)
     state = second.snapshot()
