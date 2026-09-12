@@ -113,15 +113,11 @@ An empty run list means waiting for CI, not success. Details and examples are in
    replaced, busy, or different-worktree pane blocks launches; never silently
    fall back to a background agent. Use `--headless` only if explicitly requested.
 
-4. **Manual exit is this user's default preference.** Return the watch ID and
-   exact `release_argv` command, quoted as shell arguments. The user exits the original CLI
-   with Ctrl-D and runs it in the remaining shell. Report `awaiting_release`;
-   never run manual release inside the original live agent. A headless caller
-   may release after its original process exits. Repairs exit automatically.
-   After release, leave the pane's shell prompt empty for watcher-owned launches.
-   Pause the watch before typing commands or manually resuming the agent there.
-5. Only for Codex, and when automatic exit is requested, use herdr to hand off
-   and exit this CLI. Claude currently uses the manual initial exit above; its
+4. **Automatic handoff is the default for Codex in herdr.** A watch/babysit
+   request includes scheduling the initial exit and release; do not ask for
+   separate confirmation or stop at `awaiting_release` when automatic handoff
+   is available. Respect an explicit request for manual exit or live foreground
+   monitoring. Claude currently uses the manual initial exit below; its
    subsequent repairs and continuations still exit automatically.
    Identify this session's explicit pane ID using `herdr agent list` and
    `herdr pane process-info --pane
@@ -129,7 +125,7 @@ PANE`; never assume the currently focused pane is this agent. Match the
    worktree and conversation; if ambiguous, use the manual fallback below.
 
    ```sh
-   python3 <skill-dir>/scripts/pr_supervisor.py handoff WATCH_ID --pane PANE
+   python3 <skill-dir>/scripts/pr_supervisor.py --home STATE_DIR handoff WATCH_ID --pane PANE
    ```
 
    The helper validates the process and starts a detached handoff. After this
@@ -142,12 +138,17 @@ PANE`; never assume the currently focused pane is this agent. Match the
    the shell, pane, worktree, and saved conversation. Do not claim monitoring is
    already active while the handoff is pending.
 
-   Outside herdr, or if identity, a pending dialog, or the UI prevents automatic
-   handoff, explain the concrete reason and provide the exact `release_argv`
-   command, quoted as shell arguments. The user exits Codex with Ctrl-D and runs
-   it in the remaining shell. If an automatic handoff is still pending, pause
-   the watch first to cancel it. **Never run manual release inside the original
-   live agent.** A headless caller may release after its original process exits.
+5. **Manual fallback:** for an explicit manual-exit request, Claude, or when
+   running outside herdr or identity/UI checks prevent automatic handoff,
+   explain the concrete reason and return the watch ID, `awaiting_release`
+   status, and exact `release_argv` command, quoted as shell arguments. The user
+   exits the original CLI with Ctrl-D and runs it in the remaining shell. If an
+   automatic handoff is still pending, pause the watch first to cancel it and
+   report `paused` instead. **Never run manual release inside the original live
+   agent.** A headless caller may release after its original process exits.
+   After either handoff, leave the pane's shell prompt empty for watcher-owned
+   launches. Pause the watch before typing commands or manually resuming the
+   agent there. Repairs exit automatically.
 
 For controls, restart behavior, logs, sandbox constraints, and reattachment, read
 [references/supervisor.md](references/supervisor.md). In Claude invoke

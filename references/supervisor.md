@@ -7,10 +7,11 @@ subcommand; use one home to share the global concurrency limit.
 
 ## Ownership
 
-Registration is inactive. Manual Ctrl-D followed by the returned `release_argv`
-command is the user's preferred initial handoff. Repairs exit automatically.
-For explicitly requested automatic exit in herdr, `handoff WATCH_ID --pane PANE` schedules a
-detached helper from the registered conversation. Include its unique marker in
+Registration is inactive. Automatic exit and release is the default for Codex
+in herdr when handing off a watch; no separate automatic-exit request is needed.
+Respect an explicit manual-exit or live foreground monitoring preference.
+Using the shared `--home`, `handoff WATCH_ID --pane PANE` schedules a detached
+helper from the registered conversation. Include its unique marker in
 the final response and finish the turn. The helper verifies the saved turn has
 completed, the marker is visible in the target pane, the original foreground
 process is unchanged, and the composer is empty. It sends Ctrl-D once, preserves
@@ -66,20 +67,32 @@ dashboard while monitoring continues. `--port PORT` changes the port;
 `--home PATH` before `dashboard` selects an existing watcher state directory.
 An absent database shows an empty dashboard; access failures show an error.
 
-Private tailnet access on this machine uses Tailscale Serve:
+Private tailnet access on this machine uses a Tailscale Service hosted by the
+Mac mini, which is tagged `tag:server` (service hosts must be tagged nodes):
 
 ```sh
-python3 <skill-dir>/scripts/pr_supervisor.py --home /private/tmp/babysit-pr-mvandenb dashboard --allow-host mac-mini.tailfb45be.ts.net:8443
-tailscale serve --bg --https=8443 http://127.0.0.1:8765
+python3 <skill-dir>/scripts/pr_supervisor.py --home /private/tmp/babysit-pr-mvandenb dashboard --allow-host babysitter.tailfb45be.ts.net
+tailscale serve --service=svc:babysitter --https=443 http://127.0.0.1:8765
 ```
 
 The current running watcher uses `/private/tmp/babysit-pr-mvandenb`; use the same
 `--home` for its dashboard and controls. This temporary location may be removed
 by system cleanup; do not start an empty default queue and mistake it for this one.
-Open `https://mac-mini.tailfb45be.ts.net:8443/` from the tailnet. The Python
-server stays bound to loopback. Serve provides private HTTPS; do not enable
-Funnel. Port 443 already hosts another service. Disable only this route with
-`tailscale serve --https=8443 off`. The dashboard process must remain running.
+Open `https://babysitter.tailfb45be.ts.net/` from the tailnet. The Python server
+stays bound to loopback and accepts only the listed Host header; the former node
+route on `mac-mini:8443` has been removed. Services are tailnet-only and cannot be
+exposed through Funnel; do not enable Funnel on this node either. The policy file's
+`autoApprovers.services` approves `svc:babysitter` and `svc:collie` for `tag:server`;
+a service must be defined on the admin console Services page before the host
+advertisement registers. Remove the route with `tailscale serve clear svc:babysitter`.
+The dashboard process must remain running.
+
+Collie is published the same way as `svc:collie` at `https://collie.tailfb45be.ts.net/`
+(`tailscale serve --service=svc:collie --https=443 http://127.0.0.1:8787`), with
+`COLLIE_PUBLIC_HOSTS=collie.tailfb45be.ts.net`, `COLLIE_SKIP_SERVE=1`, and
+`COLLIE_PUBLIC_URL=https://collie.tailfb45be.ts.net` in
+`~/.config/collie/.env` so Collie accepts that Host and no longer publishes its own
+`mac-mini` route on restart.
 
 ```sh
 python3 <skill-dir>/scripts/pr_supervisor.py status
