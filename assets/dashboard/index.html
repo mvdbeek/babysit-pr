@@ -158,6 +158,7 @@
           </label>
         </div>
         <p id="pr-sync" class="pr-sync" role="status">Loading your open PRs…</p>
+        <p id="pr-changes" class="pr-sync" role="status" hidden></p>
         <div id="pr-alert" class="alert" role="status" hidden></div>
         <div class="pr-mobile-sort">
           <label for="pr-sort">Sort by</label>
@@ -225,6 +226,7 @@
                     Last updated
                   </button>
                 </th>
+                <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody id="pr-list"></tbody>
@@ -236,5 +238,25 @@
         <span>Local dashboard · refreshes every 5 seconds</span><span id="state-home"></span>
       </footer>
     </main>
+    <dialog id="ci-dialog" aria-labelledby="ci-title">
+      <button id="ci-close" type="button" aria-label="Close CI details">Close</button>
+      <h2 id="ci-title">CI details</h2>
+      <p id="ci-meta" role="status"></p>
+      <p id="ci-error" role="alert"></p>
+      <div id="ci-links"></div>
+      <div id="ci-content"></div>
+    </dialog>
+    <dialog id="workspace-dialog" aria-labelledby="workspace-title">
+      <button id="workspace-close" type="button" aria-label="Close workspace actions">Close</button>
+      <h2 id="workspace-title">Workspace actions</h2>
+      <div id="workspace-content"></div>
+      <p id="workspace-error" role="alert"></p>
+      <p id="workspace-progress" role="status"></p>
+      <div id="workspace-result"></div>
+      <details>
+        <summary>Operation log</summary>
+        <pre id="workspace-log"></pre>
+      </details>
+    </dialog>
   </body>
 </html>

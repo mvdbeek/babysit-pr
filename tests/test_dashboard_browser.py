@@ -403,3 +403,741 @@ def test_ci_filters_match_each_displayed_state(page: Page, dashboard_site) -> No
         expect(page.locator("#pr-list .pr-title")).to_have_text(state)
     page.get_by_label("Filter pull requests by CI").select_option("all")
     expect(page.locator("#pr-list tr")).to_have_count(7)
+
+
+@pytest.fixture
+def workspace_routes(page):
+    target = {
+        "path": "/fixture/checkout",
+        "workspace_id": "w1",
+        "name": "Renamed workspace",
+        "agent_status": "working",
+        "url": "https://mac-mini.tailfb45be.ts.net/space/w1",
+    }
+    info = {
+        "matches": [target],
+        "suggestions": [],
+        "clones": ["/fixture/repo"],
+        "preferred_clone": None,
+        "destination": "/fixture/new",
+        "operation": None,
+    }
+    snapshot = {"prs": {"pr-one": info, "pr-two": copy.deepcopy(info)}, "error": None}
+    requests = []
+    page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+
+    def action(route):
+        body = route.request.post_data_json
+        requests.append(body)
+        if body["action"] == "copy":
+            route.fulfill(json={"command": "herdr workspace focus w1"})
+        elif body["action"] in {"open", "focus"}:
+            route.fulfill(json={"result": target})
+        else:
+            op = {
+                "id": "op1",
+                "status": "running",
+                "message": "Fetching PR",
+                "log": "Fetch started",
+            }
+            info["operation"] = op
+            route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-action", action)
+    return info, snapshot, requests
+
+
+def test_workspace_single_open_and_explicit_native_menu(page, dashboard_site, workspace_routes):
+    url, _ = dashboard_site
+    _, _, requests = workspace_routes
+    page.goto(url + "/#prs")
+    page.evaluate("window.open = () => { window.opened = {location: {}}; return window.opened; }")
+    row = page.locator("#pr-list tr").first
+    row.get_by_role("button", name="Open workspace", exact=True).click()
+    expect(page.locator("#workspace-result a")).to_have_attribute(
+        "href", "https://mac-mini.tailfb45be.ts.net/space/w1"
+    )
+    assert page.evaluate("window.opened.location.href").endswith("/space/w1")
+    assert requests == [
+        {"id": "pr-one", "action": "open", "path": "/fixture/checkout", "workspace_id": "w1"}
+    ]
+    expect(page.locator("#workspace-dialog")).not_to_be_visible()
+    row.get_by_text("More actions", exact=True).click()
+    with page.expect_response("**/api/workspace-action"):
+        row.get_by_role("button", name="Focus in herdr", exact=True).click()
+    expect(row.get_by_role("button", name="Copy command", exact=True)).to_be_visible()
+    assert requests[-1]["action"] == "focus"
+
+
+def test_workspace_chooser_names_status_and_reopen(page, dashboard_site, workspace_routes):
+    url, _ = dashboard_site
+    info, _, requests = workspace_routes
+    info["matches"].append(
+        {
+            **info["matches"][0],
+            "workspace_id": None,
+            "path": "/fixture/other",
+            "name": "Other checkout",
+            "agent_status": "No workspace",
+        }
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Open workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_contain_text("Renamed workspace")
+    expect(dialog).to_contain_text("working")
+    expect(dialog).to_contain_text("Other checkout")
+    assert not requests
+    dialog.get_by_role("button", name="Reopen workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1] == {"id": "pr-one", "action": "reopen", "path": "/fixture/other"}
+
+
+def test_workspace_create_required_task_agent_progress_and_errors(
+    page, dashboard_site, workspace_routes
+):
+    url, _ = dashboard_site
+    info, _, requests = workspace_routes
+    info["matches"] = []
+    info["clones"] = ["/fixture/one", "/fixture/two"]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog.get_by_label("Agent", exact=True)).to_have_value("codex")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    assert not requests
+    dialog.get_by_label("Local clone").select_option("/fixture/two")
+    dialog.get_by_label("Task", exact=True).fill("Fix 'quotes'\nsecond line")
+    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    page.screenshot(path="reports/workspace-desktop.png")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Fetching PR")
+    expect(dialog.get_by_role("button", name="Create workspace", exact=True)).to_be_disabled()
+    assert requests[-1]["agent"] == "claude" and requests[-1]["clone"] == "/fixture/two"
+    assert requests[-1]["task"] == "Fix 'quotes'\nsecond line"
+    info["operation"].update(status="failed", message="Fetch failed", log="network unavailable")
+    page.evaluate("refreshWorkspaces()")
+    expect(page.locator("#workspace-progress")).to_contain_text("Fetch failed")
+    expect(dialog.get_by_role("button", name="Create workspace", exact=True)).to_be_enabled()
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Fetching PR")
+    assert requests[-1]["retry"] is True
+    info["operation"].update(
+        status="complete",
+        message="Workspace ready",
+        result={"url": "https://mac-mini.tailfb45be.ts.net/space/w1"},
+    )
+    page.evaluate("refreshWorkspaces()")
+    expect(dialog.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://mac-mini.tailfb45be.ts.net/space/w1"
+    )
+
+
+def test_clone_destination_mobile_and_protected_action_error(
+    page, dashboard_site, workspace_routes
+):
+    url, _ = dashboard_site
+    info, _, requests = workspace_routes
+    info.update(matches=[], clones=[])
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Clone and create", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_contain_text("Clone test/alpha into /fixture/new")
+    assert not requests
+    dialog.get_by_label("Task", exact=True).fill("Fix the issue")
+    page.route(
+        "**/api/workspace-action",
+        lambda route: route.fulfill(
+            status=403, json={"error": "This action requires the configured dashboard"}
+        ),
+    )
+    dialog.get_by_role("button", name="Clone and create", exact=True).click()
+    expect(dialog.get_by_role("alert")).to_contain_text("configured dashboard")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path="reports/workspace-mobile.png")
+    dialog.get_by_role("button", name="Close workspace actions").click()
+    expect(dialog).not_to_be_visible()
+
+
+@pytest.fixture
+def ci_routes(page):
+    checks = {
+        "value": {
+            "sha": "a" * 40,
+            "state": "FAILURE",
+            "truncated": False,
+            "checks": [
+                {
+                    "id": "bad",
+                    "name": "pytest (Python 3.14)",
+                    "state": "FAILURE",
+                    "bucket": "fail",
+                    "workflow": "Unit tests",
+                    "url": "https://github.com/test/alpha/actions/runs/1/job/2",
+                    "description": "",
+                    "has_details": True,
+                },
+                {
+                    "id": "good",
+                    "name": "lint",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "workflow": "Lint",
+                    "url": "https://github.com/test/alpha/runs/3",
+                    "description": "",
+                    "has_details": False,
+                },
+            ],
+        },
+        "synced_at": 1789146000,
+        "error": None,
+        "refreshing": False,
+        "stale": False,
+    }
+    failure = {
+        "value": {
+            "title": "1 failed test",
+            "summary": "test_cache_atomic failed",
+            "text": "",
+            "annotations": [
+                {
+                    "title": "test_cache_atomic",
+                    "message": '<img src=x onerror="window.injected=true"> AssertionError',
+                    "path": "tests/test_cache.py",
+                    "line": 12,
+                }
+            ],
+            "truncated": False,
+        },
+        "error": None,
+        "refreshing": False,
+    }
+    requests = []
+
+    def handler(route):
+        requests.append(route.request.url)
+        route.fulfill(json=failure if "check=" in route.request.url else checks)
+
+    page.route("**/api/pr-ci?*", handler)
+    return checks, failure, requests
+
+
+def test_ci_details_are_lazy_show_jobs_and_reported_tests(page, dashboard_site, ci_routes):
+    url, _ = dashboard_site
+    _, _, requests = ci_routes
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    assert not requests
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    dialog = page.get_by_role("dialog", name="test/alpha #8 · CI")
+    expect(dialog).to_contain_text("Failing checks (1)")
+    expect(dialog.get_by_role("link", name="pytest (Python 3.14)", exact=True)).to_have_attribute(
+        "href", "https://github.com/test/alpha/actions/runs/1/job/2"
+    )
+    expect(dialog).to_contain_text("Unit tests")
+    expect(dialog).to_contain_text("Cached for 5 minutes")
+    assert len(requests) == 1
+    dialog.get_by_text("Reported failure details", exact=True).click()
+    expect(dialog).to_contain_text("test_cache_atomic failed")
+    expect(dialog).to_contain_text("tests/test_cache.py:12")
+    expect(dialog.locator("img")).to_have_count(0)
+    assert page.evaluate("window.injected === undefined")
+    assert len(requests) == 2
+    dialog.get_by_text("Reported failure details", exact=True).click()
+    dialog.get_by_text("Reported failure details", exact=True).click()
+    assert len(requests) == 2
+    page.screenshot(path="reports/ci-desktop.png")
+
+
+def test_ci_mobile_partial_results_and_missing_failure_output(page, dashboard_site, ci_routes):
+    url, _ = dashboard_site
+    checks, failure, _ = ci_routes
+    checks["value"]["truncated"] = True
+    failure["value"].update(title="", summary="", text="", annotations=[])
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(url + "/#prs")
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_contain_text("list is incomplete")
+    dialog.get_by_text("Reported failure details", exact=True).click()
+    expect(dialog).to_contain_text("did not publish failure messages")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path="reports/ci-mobile.png")
+    dialog.get_by_role("button", name="Close CI details").click()
+    expect(dialog).not_to_be_visible()
+
+
+def test_ci_stale_error_and_no_checks_are_distinct(page, dashboard_site, ci_routes):
+    url, _ = dashboard_site
+    checks, _, _ = ci_routes
+    checks.update(error="GitHub rate limited", stale=True)
+    page.goto(url + "/#prs")
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    expect(page.locator("#ci-error")).to_contain_text("rate limited")
+    expect(page.locator("#ci-meta")).to_contain_text("Saved results may be out of date")
+    expect(page.locator("#ci-content")).to_contain_text("pytest (Python 3.14)")
+    page.get_by_role("button", name="Close CI details").click()
+    checks["value"]["checks"] = []
+    checks.update(error=None, stale=False)
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    expect(page.locator("#ci-content")).to_contain_text("No checks reported")
+
+
+def test_ci_close_cancels_loading_polls(page, dashboard_site, ci_routes):
+    url, _ = dashboard_site
+    checks, _, requests = ci_routes
+    checks.update(value=None, refreshing=True)
+    page.goto(url + "/#prs")
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    expect(page.locator("#ci-meta")).to_contain_text("Loading checks")
+    page.get_by_role("button", name="Close CI details").click()
+    page.wait_for_timeout(2200)
+    assert len(requests) == 1
+
+
+def test_ci_automatic_log_progress_test_names_and_stream(page, dashboard_site, ci_routes):
+    url, _ = dashboard_site
+    results = [
+        {"state": "downloading", "message": "Downloading failed-job log", "refreshing": True},
+        {
+            "state": "ready",
+            "message": "Cached job log",
+            "refreshing": False,
+            "value": {
+                "tests": ["tests/test_cache.py::test_atomic"],
+                "failed_steps": ["Run pytest"],
+                "text": '<img src=x onerror="window.injected=true"> AssertionError: cache missing',
+                "truncated": True,
+                "excerpt": True,
+            },
+        },
+    ]
+    requests = []
+
+    def handler(route):
+        requests.append(route.request.url)
+        if "page=" in route.request.url:
+            route.fulfill(
+                json={
+                    "page": 1,
+                    "pages": 1,
+                    "text": results[1]["value"]["text"],
+                    "line_start": 1,
+                    "line_end": 1,
+                    "truncated": True,
+                }
+            )
+        else:
+            route.fulfill(json=results[min(len(requests) - 1, 1)])
+
+    page.route("**/api/pr-ci-log?*", handler)
+    page.goto(url + "/#prs")
+    assert not requests
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    assert not requests
+    dialog.get_by_text("Downloaded test log", exact=True).click()
+    expect(dialog).to_contain_text("Downloading failed-job log")
+    expect(dialog).to_contain_text("Downloads continue with the browser closed")
+    expect(dialog).to_contain_text("Detected test failures")
+    expect(dialog).to_contain_text("tests/test_cache.py::test_atomic")
+    expect(dialog).to_contain_text("Run pytest")
+    expect(dialog).to_contain_text("this log is incomplete")
+    expect(dialog.locator("img")).to_have_count(0)
+    expect(dialog.locator(".ci-log-viewer pre")).to_contain_text("AssertionError: cache missing")
+    expect(dialog.get_by_role("link", name="Download cached log")).to_have_count(0)
+    expect(dialog.locator(".ci-log-viewer button")).to_have_count(0)
+    expect(dialog.locator(".ci-log-viewer")).to_contain_text(
+        "End of cached log · This log is incomplete"
+    )
+    assert len(requests) == 3
+    page.screenshot(path="reports/ci-logs-desktop.png")
+
+
+@pytest.mark.parametrize(
+    "state,message",
+    [
+        ("queued", "Hourly download budget reached; queued for the next available slot"),
+        ("unavailable", "Job log unavailable after three attempts"),
+        ("unsupported", "Automatic logs are available for failed GitHub Actions jobs."),
+    ],
+)
+def test_ci_log_mobile_budget_and_unavailable_states(
+    page, dashboard_site, ci_routes, state, message
+):
+    url, _ = dashboard_site
+    page.route(
+        "**/api/pr-ci-log?*",
+        lambda route: route.fulfill(
+            json={
+                "state": state,
+                "message": message,
+                "refreshing": False,
+                "error": "Job logs expired" if state == "unavailable" else None,
+            }
+        ),
+    )
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(url + "/#prs")
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_text("Downloaded test log", exact=True).click()
+    expect(dialog).to_contain_text(message)
+    if state == "unavailable":
+        expect(dialog).to_contain_text("Job logs expired")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/ci-logs-mobile-{state}.png")
+
+
+@pytest.fixture
+def visit_routes(page, dashboard_site):
+    url, _ = dashboard_site
+    snapshot = page.request.get(url + "/api/prs").json()
+    page.route("**/api/prs", lambda route: route.fulfill(json=snapshot))
+    return snapshot
+
+
+def saved_visit(page, login="fixture"):
+    return page.evaluate(
+        "login => JSON.parse(localStorage.getItem(`babysit-pr:seen-prs:v1:${login}`))", login
+    )
+
+
+def test_pr_visit_highlights_fields_and_new_rows_until_next_visit(
+    page, dashboard_site, visit_routes
+):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    expect(page.locator(".pr-changed, .pr-new")).to_have_count(0)
+    expect(page.locator("#pr-changes")).to_contain_text("from this visit onward")
+    assert saved_visit(page)["prs"]["pr-one"]["ci"] == "FAILURE"
+    visit_routes["synced_at"] += 1
+    visit_routes["prs"][0].update(ci="SUCCESS", review_decision="APPROVED", head_sha="b" * 40)
+    new = copy.deepcopy(visit_routes["prs"][1])
+    new.update(id="pr-new", title="A newly discovered PR", number=10)
+    visit_routes["prs"].append(new)
+    page.reload()
+    expect(page.locator("#pr-changes")).to_contain_text("1 new · 1 updated")
+    changed = page.locator(".pr-changed")
+    expect(changed.locator(".pr-change-note")).to_have_text("CI · Review · New commits")
+    expect(changed.locator(".pr-field-changed")).to_have_count(3)
+    expect(changed.locator(".pr-approved")).to_have_text("Approved")
+    expect(page.locator(".pr-new .pr-change-badge")).to_have_text("New")
+    assert saved_visit(page)["prs"]["pr-one"]["ci"] == "SUCCESS"
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(changed).to_have_count(1)
+    page.get_by_label("Search pull requests").fill("missing")
+    expect(page.locator(".pr-changed")).to_have_count(0)
+    page.get_by_label("Search pull requests").fill("")
+    expect(changed).to_have_count(1)
+    page.screenshot(path="reports/pr-visit-desktop.png")
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path="reports/pr-visit-mobile.png")
+    page.reload()
+    expect(page.locator("#pr-changes")).to_contain_text("No changes since your last visit")
+    expect(page.locator(".pr-changed, .pr-new")).to_have_count(0)
+
+
+def test_watcher_tab_does_not_consume_pr_changes(page, dashboard_site, visit_routes):
+    url, _ = dashboard_site
+    page.goto(url)
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    assert saved_visit(page) is None
+    page.get_by_role("tab", name="Pull requests", exact=True).click()
+    expect(page.locator("#pr-changes")).to_be_visible()
+    old = saved_visit(page)
+    page.get_by_role("tab", name="Watcher", exact=True).click()
+    visit_routes["synced_at"] += 1
+    visit_routes["prs"][0]["ci"] = "SUCCESS"
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#pr-list tr").first).to_contain_text("Passed")
+    assert saved_visit(page) == old
+    page.get_by_role("tab", name="Pull requests", exact=True).click()
+    expect(page.locator(".pr-changed")).to_have_count(1)
+    assert saved_visit(page)["prs"]["pr-one"]["ci"] == "SUCCESS"
+
+
+def test_pr_visits_ignore_role_order_and_show_other_activity(page, dashboard_site, visit_routes):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    visit_routes["prs"][0]["roles"].reverse()
+    visit_routes["synced_at"] += 1
+    page.reload()
+    expect(page.locator(".pr-changed")).to_have_count(0)
+    visit_routes["prs"][0]["updated_at"] = "2026-09-12T12:00:00Z"
+    visit_routes["synced_at"] += 1
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator(".pr-change-note")).to_have_text("PR activity changed")
+    expect(page.locator(".pr-updated.pr-field-changed")).to_have_count(1)
+
+
+def test_failed_or_inflight_sync_does_not_replace_saved_visit(page, dashboard_site, visit_routes):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    old = saved_visit(page)
+    visit_routes["synced_at"] += 1
+    visit_routes["prs"][0]["ci"] = "SUCCESS"
+    visit_routes["error"] = "Offline"
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#pr-alert")).to_contain_text("Offline")
+    assert saved_visit(page) == old
+    visit_routes.update(error=None, refreshing=True)
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#pr-sync")).to_contain_text("Syncing")
+    assert saved_visit(page) == old
+    visit_routes["refreshing"] = False
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#pr-sync")).not_to_contain_text("Syncing")
+    assert saved_visit(page)["prs"]["pr-one"]["ci"] == "SUCCESS"
+
+
+def test_visit_storage_accounts_and_older_tabs_are_isolated(page, dashboard_site, visit_routes):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    old = saved_visit(page)
+    newer = copy.deepcopy(old)
+    newer["synced_at"] += 20
+    page.evaluate(
+        "v => localStorage.setItem('babysit-pr:seen-prs:v1:fixture', JSON.stringify(v))", newer
+    )
+    visit_routes["synced_at"] += 1
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    assert saved_visit(page) == newer
+    page.reload()
+    expect(page.locator("#pr-changes")).to_contain_text("Waiting for a current PR snapshot")
+    expect(page.locator(".pr-changed, .pr-new")).to_have_count(0)
+    assert saved_visit(page) == newer
+    visit_routes["login"] = "second-account"
+    visit_routes["prs"][0]["ci"] = "SUCCESS"
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator("#pr-sync")).to_contain_text("@second-account")
+    expect(page.locator(".pr-changed, .pr-new")).to_have_count(0)
+    assert saved_visit(page) == newer
+    assert saved_visit(page, "second-account")["prs"]["pr-one"]["ci"] == "SUCCESS"
+
+
+@pytest.mark.parametrize("mode", ["blocked", "corrupt"])
+def test_unavailable_or_corrupt_visit_storage_keeps_dashboard_usable(
+    page, dashboard_site, visit_routes, mode
+):
+    url, _ = dashboard_site
+    if mode == "blocked":
+        page.add_init_script(
+            "Storage.prototype.getItem = () => { throw new DOMException('blocked', 'SecurityError'); };"
+        )
+    else:
+        page.add_init_script("localStorage.setItem('babysit-pr:seen-prs:v1:fixture', '{broken');")
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    expect(page.locator(".pr-changed, .pr-new")).to_have_count(0)
+    if mode == "blocked":
+        expect(page.locator("#pr-changes")).to_contain_text("storage is unavailable")
+    else:
+        assert saved_visit(page)["prs"]["pr-one"]["ci"] == "FAILURE"
+    visit_routes["prs"][0]["ci"] = "SUCCESS"
+    visit_routes["synced_at"] += 1
+    page.get_by_role("button", name="Refresh", exact=True).click()
+    expect(page.locator(".pr-changed")).to_have_count(1)
+
+
+@pytest.fixture
+def paged_log_routes(page, ci_routes):
+    requests = []
+    state = {"fail": False, "delay": False, "pending": [], "short": False}
+
+    def handler(route):
+        from urllib.parse import parse_qs, urlsplit
+
+        params = parse_qs(urlsplit(route.request.url).query)
+        requests.append(params)
+        if "page" not in params:
+            route.fulfill(
+                json={
+                    "state": "ready",
+                    "message": "Cached job log",
+                    "refreshing": False,
+                    "value": {
+                        "tests": ["test_atomic"],
+                        "failed_steps": ["Run tests"],
+                        "text": "Failure excerpt only",
+                        "truncated": False,
+                        "excerpt": True,
+                    },
+                }
+            )
+            return
+        if state["delay"]:
+            state["pending"].append(route)
+            return
+        if state["fail"]:
+            route.fulfill(status=503, json={"error": "Cached log temporarily unavailable"})
+            return
+        number = int(params["page"][0])
+        route.fulfill(
+            json={
+                "page": number,
+                "pages": 3,
+                "text": log_page_text(number, state["short"]),
+                "line_start": number * 100 - 99,
+                "line_end": number * 100,
+                "truncated": False,
+            }
+        )
+
+    page.route("**/api/pr-ci-log?*", handler)
+    return requests, state
+
+
+def log_page_text(number, short=False):
+    return f"Full log page {number}\n<img src=x onerror=alert(1)>\n" + (
+        "" if short else "ordinary log output\n" * 100
+    )
+
+
+def open_scrolling_log(page, url):
+    page.goto(url + "/#prs")
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    page.get_by_text("Downloaded test log", exact=True).click()
+    expect(page.locator(".ci-log-viewer pre")).to_contain_text("Full log page 1")
+
+
+def scroll_log_to_end(page):
+    page.locator(".ci-log-viewer pre").evaluate("node => { node.scrollTop = node.scrollHeight; }")
+
+
+def test_log_scroll_appends_pages_preserves_position_and_has_no_controls(
+    page, dashboard_site, paged_log_routes
+):
+    url, _ = dashboard_site
+    requests, _ = paged_log_routes
+    open_scrolling_log(page, url)
+    viewer = page.locator(".ci-log-viewer")
+    output = viewer.locator("pre")
+    expect(viewer.locator("button, input, a, img")).to_have_count(0)
+    expect(page.get_by_role("button", name="Read full cached log", exact=True)).to_have_count(0)
+    expect(page.get_by_role("link", name="Download cached log", exact=True)).to_have_count(0)
+    assert [q["page"][0] for q in requests if "page" in q] == ["1"]
+    old_top = output.evaluate(
+        "node => { node.scrollTop = node.scrollHeight; return node.scrollTop; }"
+    )
+    expect(output).to_contain_text("Full log page 2")
+    assert abs(output.evaluate("node => node.scrollTop") - old_top) <= 1
+    assert output.text_content() == log_page_text(1) + log_page_text(2)
+    scroll_log_to_end(page)
+    expect(viewer).to_contain_text("End of cached log")
+    assert output.text_content() == "".join(log_page_text(n) for n in range(1, 4))
+    scroll_log_to_end(page)
+    page.wait_for_timeout(200)
+    assert [q["page"][0] for q in requests if "page" in q] == ["1", "2", "3"]
+    assert not any("download" in q for q in requests)
+    page.screenshot(path="reports/ci-log-scroll-desktop.png")
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path="reports/ci-log-scroll-mobile.png")
+
+
+def test_log_scroll_fills_short_pages_automatically(page, dashboard_site, paged_log_routes):
+    url, _ = dashboard_site
+    requests, state = paged_log_routes
+    state["short"] = True
+    open_scrolling_log(page, url)
+    expect(page.locator(".ci-log-viewer")).to_contain_text("End of cached log")
+    assert page.locator(".ci-log-viewer pre").text_content() == "".join(
+        log_page_text(n, True) for n in range(1, 4)
+    )
+    assert [q["page"][0] for q in requests if "page" in q] == ["1", "2", "3"]
+
+
+def test_log_scroll_retries_transparently_and_keeps_loaded_output(
+    page, dashboard_site, paged_log_routes
+):
+    url, _ = dashboard_site
+    requests, state = paged_log_routes
+    open_scrolling_log(page, url)
+    state["fail"] = True
+    scroll_log_to_end(page)
+    viewer = page.locator(".ci-log-viewer")
+    expect(viewer).to_contain_text("Cached log temporarily unavailable")
+    expect(viewer).to_contain_text("Retrying")
+    assert viewer.locator("pre").text_content() == log_page_text(1)
+    state["fail"] = False
+    expect(viewer.locator("pre")).to_contain_text("Full log page 2")
+    assert viewer.locator("pre").text_content() == log_page_text(1) + log_page_text(2)
+    expect(viewer.locator("button")).to_have_count(0)
+    assert [q["page"][0] for q in requests if "page" in q] == ["1", "2", "2"]
+
+
+def test_log_scroll_bounds_retries_and_reopening_allows_recovery(
+    page, dashboard_site, paged_log_routes
+):
+    url, _ = dashboard_site
+    requests, state = paged_log_routes
+    open_scrolling_log(page, url)
+    state["fail"] = True
+    scroll_log_to_end(page)
+    expect(page.locator(".ci-log-viewer")).to_contain_text(
+        "Collapse and reopen this log to retry", timeout=10000
+    )
+    assert [q["page"][0] for q in requests if "page" in q] == ["1", "2", "2", "2"]
+    state["fail"] = False
+    page.get_by_text("Downloaded test log", exact=True).click()
+    page.get_by_text("Downloaded test log", exact=True).click()
+    expect(page.locator(".ci-log-viewer pre")).to_contain_text("Full log page 2")
+
+
+def test_collapsed_log_does_not_fetch_until_reopened(page, dashboard_site, paged_log_routes):
+    url, _ = dashboard_site
+    requests, _ = paged_log_routes
+    open_scrolling_log(page, url)
+    page.get_by_text("Downloaded test log", exact=True).click()
+    page.locator(".ci-log-viewer pre").dispatch_event("scroll")
+    page.wait_for_timeout(200)
+    assert [q["page"][0] for q in requests if "page" in q] == ["1"]
+    page.get_by_text("Downloaded test log", exact=True).click()
+    scroll_log_to_end(page)
+    expect(page.locator(".ci-log-viewer pre")).to_contain_text("Full log page 2")
+
+
+def test_log_scroll_serializes_requests_and_closing_cancels_pending_read(
+    page, dashboard_site, paged_log_routes
+):
+    url, _ = dashboard_site
+    requests, state = paged_log_routes
+    open_scrolling_log(page, url)
+    state["delay"] = True
+    scroll_log_to_end(page)
+    expect(page.locator(".ci-log-viewer")).to_contain_text("Loading more")
+    for _ in range(5):
+        page.locator(".ci-log-viewer pre").dispatch_event("scroll")
+    assert [q["page"][0] for q in requests if "page" in q] == ["1", "2"]
+    with page.expect_event("requestfailed", predicate=lambda request: "page=2" in request.url):
+        page.get_by_role("button", name="Close CI details", exact=True).click()
+    expect(page.get_by_role("dialog")).not_to_be_visible()
+    state["delay"] = False
+    state["pending"][0].fulfill(
+        json={
+            "page": 2,
+            "pages": 3,
+            "text": "Late output",
+            "line_start": 101,
+            "line_end": 200,
+            "truncated": False,
+        }
+    )
+    page.get_by_role("link", name="CI Failed for test/alpha #8", exact=True).click()
+    page.get_by_text("Downloaded test log", exact=True).click()
+    expect(page.locator(".ci-log-viewer pre")).to_contain_text("Full log page 1")
+    expect(page.locator(".ci-log-viewer pre")).not_to_contain_text("Late output")

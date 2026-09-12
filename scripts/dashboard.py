@@ -5,13 +5,17 @@ import argparse
 import json
 import re
 import sqlite3
+import subprocess
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from pr_ci import CiDetails
+from pr_ci_logs import BackgroundLogs
 from pr_overview import Overview
+from pr_workspaces import Workspaces
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
@@ -171,9 +175,15 @@ class DashboardServer(ThreadingHTTPServer):
         port: int,
         allowed_hosts: tuple[str, ...] | list[str] = (),
         overview: Overview | None = None,
+        workspaces=None,
+        ci=None,
+        ci_logs=None,
     ) -> None:
         self.home = home
         self.overview = overview
+        self.workspaces = workspaces
+        self.ci = ci
+        self.ci_logs = ci_logs
         self.allowed_hosts = set(allowed_hosts)
         super().__init__(("127.0.0.1", port), Handler)
 
@@ -213,7 +223,7 @@ class Handler(BaseHTTPRequestHandler):
         # are allowed. Check Origin too, including for trusted tailnet proxies.
         if (
             host not in allowed
-            or action not in {"cancel", "feedback"}
+            or action not in {"cancel", "feedback", "workspace-action"}
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
         ):
@@ -224,7 +234,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 1024 or self.headers.get("Content-Type") != "application/json":
+            if (
+                not 0 < length <= (200000 if action == "workspace-action" else 1024)
+                or self.headers.get("Content-Type") != "application/json"
+            ):
                 raise ValueError("Expected a small JSON action request")
             self.connection.settimeout(5)
             request = json.loads(self.rfile.read(length))
@@ -234,6 +247,11 @@ class Handler(BaseHTTPRequestHandler):
                 or not request["id"]
             ):
                 raise ValueError("Supply a watch ID")
+            if action == "workspace-action":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(200, self.server.workspaces.action(request))
+                return
             if action == "feedback":
                 job = handle_feedback(self.server.home, request["id"], request.get("token"))
             else:
@@ -241,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"job": job})
         except ValueError as exc:
             self.send_json(400, {"error": str(exc)})
-        except (OSError, sqlite3.Error) as exc:
+        except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.send_json(503, {"error": f"Cannot update watch: {exc}"})
 
     def do_GET(self):
@@ -273,6 +291,43 @@ class Handler(BaseHTTPRequestHandler):
                         "error": "PR overview is not enabled",
                     },
                 )
+            elif route.path == "/api/pr-ci-log":
+                if not self.server.ci_logs:
+                    raise ValueError("Background job logs are not enabled")
+                query = parse_qs(route.query, keep_blank_values=True)
+                pr_id, check_id = query.get("id", [""])[0], query.get("check", [""])[0]
+                if "page" in query:
+                    if len(query["page"]) != 1 or "download" in query:
+                        raise ValueError("Supply one log page without a download parameter")
+                    self.send_json(
+                        200,
+                        self.server.ci_logs.log_page(pr_id, check_id, int(query["page"][0])),
+                    )
+                elif query.get("download") == ["1"]:
+                    self.send_body(
+                        200,
+                        self.server.ci_logs.raw_log(pr_id, check_id),
+                        "text/plain; charset=utf-8",
+                    )
+                else:
+                    self.send_json(200, self.server.ci_logs.snapshot(pr_id, check_id))
+            elif route.path == "/api/pr-ci":
+                if not self.server.ci:
+                    raise ValueError("CI details are not enabled")
+                query = parse_qs(route.query)
+                self.send_json(
+                    200,
+                    self.server.ci.snapshot(
+                        query.get("id", [""])[0], query.get("check", [None])[0]
+                    ),
+                )
+            elif route.path == "/api/workspaces":
+                self.send_json(
+                    200,
+                    self.server.workspaces.snapshot()
+                    if self.server.workspaces
+                    else {"prs": {}, "error": "Workspace actions are not enabled"},
+                )
             elif route.path == "/api/log":
                 query = parse_qs(route.query)
                 self.send_json(
@@ -296,12 +351,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_body(200, (ASSETS / filename).read_bytes(), mime + "; charset=utf-8")
         except ValueError as exc:
             self.send_json(400, {"error": str(exc)})
-        except (OSError, sqlite3.Error) as exc:
+        except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.send_json(503, {"error": f"Cannot read watcher data: {exc}"})
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
-    with DashboardServer(home, port, allowed_hosts, overview=Overview(home)) as server:
+    overview = Overview(home)
+    workspaces = Workspaces(home, overview, lambda: read_jobs(home))
+    ci = CiDetails(home, overview)
+    ci_logs = BackgroundLogs(home, overview, ci)
+    with DashboardServer(
+        home,
+        port,
+        allowed_hosts,
+        overview=overview,
+        workspaces=workspaces,
+        ci=ci,
+        ci_logs=ci_logs,
+    ) as server:
+        ci_logs.start()
         url = f"http://127.0.0.1:{server.server_port}"
         print(
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",
@@ -313,6 +381,8 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            ci_logs.close()
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@ def pr(key="one", updated="2026-09-11T12:00:00Z", ci="SUCCESS", **extra):
         "title": "A PR",
         "url": f"https://github.com/test/repo/pull/{key}",
         "repository": {"nameWithOwner": "test/repo"},
+        "headRepository": {"nameWithOwner": "fork/repo"},
+        "headRefName": "feature",
+        "headRefOid": "a" * 40,
         "author": {"login": "alice"},
         "updatedAt": updated,
         "createdAt": "2025-01-02T09:00:00Z",
@@ -53,6 +56,11 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
     first = result["prs"][0]
     assert first["roles"] == ["author", "assignee", "reviewer"]
     assert first["ci"] == "FAILURE"
+    assert (first["head_repo"], first["head_branch"], first["head_sha"]) == (
+        "fork/repo",
+        "feature",
+        "a" * 40,
+    )
     assert first["opened_at"] == "2025-01-02T09:00:00Z"
     assert first["updated_at"] == "2026-09-11T13:00:00Z"
     assert result["prs"][1]["ci"] == "NONE"

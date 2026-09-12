@@ -263,6 +263,15 @@ aside {
   background: currentColor;
   border-radius: 50%;
 }
+.pr-approved:before {
+  content: "✓";
+  width: auto;
+  height: auto;
+  background: none;
+}
+.pr-readiness .badge + .badge {
+  margin-left: 6px;
+}
 .green {
   color: var(--green);
   background: #e8f3eb;
@@ -815,4 +824,146 @@ button:disabled {
   .pr-filters {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+
+.pr-actions {
+  min-width: 145px;
+}
+.pr-actions small {
+  display: block;
+  max-width: 220px;
+  overflow-wrap: anywhere;
+}
+#workspace-dialog {
+  width: min(640px, 92vw);
+  max-height: 90vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  color: var(--ink);
+  background: var(--paper);
+}
+#workspace-dialog::backdrop {
+  background: #0008;
+}
+#workspace-close {
+  float: right;
+}
+#workspace-dialog form {
+  display: grid;
+  gap: 10px;
+}
+#workspace-dialog textarea,
+#workspace-dialog select {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+}
+#workspace-dialog p,
+#workspace-dialog small {
+  overflow-wrap: anywhere;
+}
+#workspace-error {
+  color: var(--red);
+}
+.workspace-choice {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.workspace-choice small {
+  display: block;
+  margin: 6px 0;
+}
+.workspace-choice details {
+  margin-top: 8px;
+}
+#workspace-log {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 540px) {
+  .pr-table .pr-actions {
+    grid-column: 1 / -1;
+  }
+}
+
+#ci-dialog {
+  width: min(780px, 94vw);
+  max-height: 90vh;
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  background: var(--paper);
+}
+#ci-dialog::backdrop {
+  background: #0008;
+}
+#ci-close {
+  float: right;
+}
+#ci-title {
+  overflow-wrap: anywhere;
+  margin-right: 70px;
+}
+#ci-meta,
+.ci-item small {
+  color: var(--muted);
+}
+#ci-error,
+.ci-error {
+  color: var(--red);
+}
+.ci-group {
+  margin-top: 20px;
+}
+.ci-item {
+  border-bottom: 1px solid var(--line);
+  padding: 10px 0;
+  overflow-wrap: anywhere;
+}
+.ci-item .check {
+  padding: 6px 0;
+}
+.ci-reported {
+  margin-top: 10px;
+}
+.ci-reported pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 350px;
+  overflow: auto;
+}
+.ci-annotation small {
+  display: block;
+}
+.ci-annotation {
+  padding: 10px 0;
+}
+
+.pr-table .pr-new {
+  background: #f0f7f0;
+}
+.pr-table .pr-changed {
+  background: #fffbef;
+}
+.pr-table .pr-field-changed {
+  background: #fff0c9;
+}
+.pr-change-badge {
+  margin-top: 8px;
+}
+.pr-change-note {
+  display: block;
+  margin-top: 5px;
+  color: #755729;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.ci-log-viewer pre {
+  min-height: 80px;
+  overflow-anchor: none;
 }

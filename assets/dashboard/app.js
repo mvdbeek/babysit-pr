@@ -470,8 +470,8 @@ async function handleFeedback(job) {
     render();
   }
 }
-async function get(url) {
-  const r = await fetch(url, { cache: "no-store" });
+async function get(url, signal) {
+  const r = await fetch(url, { cache: "no-store", signal });
   const result = await r.json();
   if (!r.ok) throw Error(result.error || `HTTP ${r.status}`);
   return result;
@@ -518,8 +518,17 @@ const prColumns = {
 };
 let prSort = "updated_at",
   prAscending = false;
+function prReviewBadges(pr) {
+  const badges = pr.draft ? [["Draft", ""]] : [];
+  if (pr.review_decision === "APPROVED") badges.push(["Approved", "green pr-approved"]);
+  else if (!pr.draft) badges.push(["Ready for review", "blue"]);
+  return badges;
+}
 function prSortValue(pr) {
-  if (prSort === "readiness") return pr.draft ? "Draft" : "Ready for review";
+  if (prSort === "readiness")
+    return prReviewBadges(pr)
+      .map(([label]) => label)
+      .join(" · ");
   if (prSort === "roles")
     return pr.roles
       .map((role) => roleNames[role] || role)
@@ -581,9 +590,100 @@ function updatePRRepositories(prs) {
   select.replaceChildren(...options);
   select.value = selected;
 }
+const prVisits = new Map();
+const prChangeFields = {
+  repo: "Repository",
+  title: "Title",
+  author: "Author",
+  ci: "CI",
+  review_decision: "Review",
+  draft: "Draft status",
+  roles: "Your role",
+  head_sha: "New commits",
+};
+function prVisitSnapshot() {
+  return {
+    synced_at: prData.synced_at,
+    prs: Object.fromEntries(
+      prData.prs.map((pr) => [
+        pr.id,
+        Object.fromEntries(
+          [...Object.keys(prChangeFields), "updated_at"].map((field) => [
+            field,
+            field === "roles" ? [...(pr.roles || [])].sort() : (pr[field] ?? null),
+          ]),
+        ),
+      ]),
+    ),
+  };
+}
+function readPRVisit(key) {
+  const saved = JSON.parse(localStorage.getItem(key));
+  return saved &&
+    Number.isFinite(saved.synced_at) &&
+    saved.prs &&
+    typeof saved.prs === "object" &&
+    !Array.isArray(saved.prs)
+    ? saved
+    : null;
+}
+function currentPRVisit() {
+  if (document.hidden || $("prs-panel").hidden || !prData.login || !prData.synced_at) return null;
+  const key = `babysit-pr:seen-prs:v1:${prData.login}`;
+  if (!prVisits.has(key)) {
+    let baseline = null;
+    let storage = true;
+    try {
+      baseline = readPRVisit(key);
+    } catch (error) {
+      storage = error instanceof SyntaxError;
+    }
+    prVisits.set(key, {
+      key,
+      baseline: baseline || prVisitSnapshot(),
+      first: !baseline,
+      storage,
+      saved: null,
+    });
+  }
+  return prVisits.get(key);
+}
+function rememberPRVisit(visit) {
+  if (!visit || !visit.storage || prData.error || prData.refreshing) return;
+  const snapshot = prVisitSnapshot();
+  if (snapshot.synced_at < visit.baseline.synced_at) return;
+  const serialized = JSON.stringify(snapshot);
+  if (serialized === visit.saved) return;
+  try {
+    let latest = null;
+    try {
+      latest = readPRVisit(visit.key);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+    }
+    // A slower tab must not overwrite a newer snapshot saved by another tab.
+    if (!latest || latest.synced_at <= snapshot.synced_at)
+      localStorage.setItem(visit.key, serialized);
+    visit.saved = serialized;
+  } catch {
+    visit.storage = false;
+  }
+}
+function prChanges(pr, visit) {
+  if (!visit || prData.synced_at < visit.baseline.synced_at) return null;
+  const old = Object.hasOwn(visit.baseline.prs, pr.id) ? visit.baseline.prs[pr.id] : null;
+  if (!old || typeof old !== "object") return { isNew: true, fields: [] };
+  const fields = Object.keys(prChangeFields).filter((field) => {
+    const value = field === "roles" ? [...(pr.roles || [])].sort() : (pr[field] ?? null);
+    return JSON.stringify(old[field] ?? null) !== JSON.stringify(value);
+  });
+  if (!fields.length && old.updated_at === (pr.updated_at ?? null)) return null;
+  return { isNew: false, fields };
+}
 function renderPRs() {
   if (!prData) return;
   const prs = prData.prs || [];
+  const visit = currentPRVisit();
   updatePRRepositories(prs);
   const query = $("pr-search").value.toLowerCase();
   const role = $("pr-role").value;
@@ -617,6 +717,8 @@ function renderPRs() {
     issues.join(" ") +
     (prData.error && sync ? " Showing saved results; they may be out of date." : "");
   $("pr-list").replaceChildren();
+  let newCount = 0,
+    changedCount = 0;
   for (const pr of visible) {
     const row = el("tr");
     const title = el("td");
@@ -628,9 +730,8 @@ function renderPRs() {
       pr.author ? link(pr.author, `https://github.com/${pr.author}`) : el("span", "Unknown"),
     );
     const readiness = el("td", undefined, "pr-readiness");
-    readiness.append(
-      el("span", pr.draft ? "Draft" : "Ready for review", `badge ${pr.draft ? "" : "blue"}`),
-    );
+    for (const [label, color] of prReviewBadges(pr))
+      readiness.append(el("span", label, `badge ${color}`));
     const roles = el("td");
     const tags = el("div", undefined, "pr-roles");
     for (const value of pr.roles) tags.append(el("span", roleNames[value] || value, "badge"));
@@ -640,15 +741,69 @@ function renderPRs() {
     const checksLink = link(label, `${pr.url}/checks`);
     checksLink.className = `badge ${color}`;
     checksLink.setAttribute("aria-label", `CI ${label} for ${pr.repo} #${pr.number}`);
+    checksLink.onclick = (event) => {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      openPRCI(pr);
+    };
     checks.append(checksLink);
     const opened = prDate(pr.opened_at, "Opened", "pr-opened");
     const updated = prDate(pr.updated_at, "Updated", "pr-updated");
     const repo = el("td", undefined, "pr-repo");
     repo.append(link(pr.repo, `https://github.com/${pr.repo}`));
     title.className = "pr-description";
-    row.append(repo, title, author, readiness, roles, checks, opened, updated);
+    const changes = prChanges(pr, visit);
+    if (changes) {
+      row.className = changes.isNew ? "pr-new" : "pr-changed";
+      if (changes.isNew) newCount += 1;
+      else changedCount += 1;
+      title.append(
+        el(
+          "span",
+          changes.isNew ? "New" : "Updated",
+          `badge ${changes.isNew ? "blue" : "amber"} pr-change-badge`,
+        ),
+      );
+      title.append(
+        el(
+          "small",
+          changes.isNew
+            ? "Since your last visit"
+            : changes.fields.length
+              ? changes.fields.map((field) => prChangeFields[field]).join(" · ")
+              : "PR activity changed",
+          "pr-change-note",
+        ),
+      );
+      const cells = {
+        repo,
+        title,
+        author,
+        ci: checks,
+        review_decision: readiness,
+        draft: readiness,
+        roles,
+        head_sha: updated,
+      };
+      for (const field of changes.fields) cells[field].classList.add("pr-field-changed");
+      if (!changes.isNew && !changes.fields.length) updated.classList.add("pr-field-changed");
+    }
+    row.append(repo, title, author, readiness, roles, checks, opened, updated, workspaceCell(pr));
     $("pr-list").append(row);
   }
+  rememberPRVisit(visit);
+  $("pr-changes").hidden = !visit;
+  $("pr-changes").textContent = !visit
+    ? ""
+    : !visit.storage
+      ? "Changes are tracked for this visit only; browser storage is unavailable."
+      : prData.synced_at < visit.baseline.synced_at
+        ? "Waiting for a current PR snapshot to compare with your last visit."
+        : newCount || changedCount
+          ? `Since your last visit: ${newCount} new · ${changedCount} updated in this view.`
+          : visit.first
+            ? "Changes will be highlighted from this visit onward, in this browser."
+            : "No changes since your last visit in this view.";
   $("pr-empty").hidden = visible.length > 0;
   $("pr-empty").textContent = prs.length
     ? "No matching pull requests."
@@ -698,6 +853,7 @@ function showPage(name) {
     $(`${page}-tab`).setAttribute("aria-selected", String(active));
     $(`${page}-tab`).tabIndex = active ? 0 : -1;
   }
+  if (name === "prs") renderPRs();
 }
 function pageFromURL() {
   showPage(window.location.hash === "#prs" ? "prs" : "watcher");
@@ -706,6 +862,7 @@ for (const page of ["watcher", "prs"]) {
   $(`${page}-tab`).onclick = () => {
     window.location.hash = page;
     showPage(page);
+    void refreshWorkspaces();
   };
   $(`${page}-tab`).onkeydown = (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -752,9 +909,582 @@ $("service-details").ontoggle = () => {
   if ($("service-details").open) serviceLog();
 };
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();
+  if (!document.hidden) {
+    refresh();
+    void refreshWorkspaces();
+  }
 });
 setInterval(() => {
   if (!document.hidden) refresh();
 }, 5000);
 refresh();
+
+let workspaceData = { prs: {} },
+  workspaceBusy = false;
+async function refreshWorkspaces() {
+  if (workspaceBusy || document.hidden || $("prs-panel").hidden) return;
+  workspaceBusy = true;
+  try {
+    workspaceData = await get("/api/workspaces");
+    renderPRs();
+    updateWorkspaceOperation();
+  } catch (error) {
+    workspaceData.error = error.message;
+  } finally {
+    workspaceBusy = false;
+  }
+}
+let workspaceDialogPR = null;
+function workspaceButton(label, callback) {
+  const button = el("button", label);
+  button.type = "button";
+  button.onclick = callback;
+  return button;
+}
+function workspaceCell(pr) {
+  const cell = el("td", undefined, "pr-actions");
+  const info = workspaceData.prs[pr.id];
+  const matches = info?.matches || [];
+  const label = matches.some((m) => m.workspace_id)
+    ? "Open workspace"
+    : matches.length
+      ? "Reopen workspace"
+      : info?.clones.length
+        ? "Create workspace"
+        : "Clone and create";
+  const button = workspaceButton(info ? label : "Workspace actions", () => {
+    if (matches.length === 1 && matches[0].workspace_id) {
+      void chooseWorkspace(pr, matches[0], "open");
+    } else void workspaceDialog(pr);
+  });
+  cell.append(button);
+  if (matches.length === 1) {
+    const menu = el("details");
+    menu.append(el("summary", "More actions"));
+    if (matches[0].workspace_id)
+      menu.append(
+        workspaceButton("Focus in herdr", () => chooseWorkspace(pr, matches[0], "focus")),
+      );
+    menu.append(workspaceButton("Copy command", () => chooseWorkspace(pr, matches[0], "copy")));
+    cell.append(menu);
+  }
+  if (info?.operation) cell.append(el("small", info.operation.message));
+  return cell;
+}
+async function workspaceRequest(pr, action, params = {}) {
+  const response = await fetch("/api/workspace-action", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-action" },
+    body: JSON.stringify({ id: pr.id, action, ...params }),
+  });
+  const value = await response.json();
+  if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+  return value;
+}
+function workspaceError(error) {
+  $("workspace-error").textContent = error.message;
+}
+async function chooseWorkspace(pr, target, action) {
+  const opened = action === "open" ? window.open("about:blank", "_blank") : null;
+  if (opened) opened.opener = null;
+  $("workspace-error").textContent = "";
+  const params = { path: target.path };
+  if (target.workspace_id) params.workspace_id = target.workspace_id;
+  try {
+    const value = await workspaceRequest(pr, action, params);
+    if (action === "copy") {
+      await navigator.clipboard.writeText(value.command);
+      $("workspace-error").textContent = "Command copied";
+    } else if (value.result && action === "open") {
+      if (opened) opened.location.href = value.result.url;
+      else {
+        await workspaceDialog(pr);
+        $("workspace-error").textContent = "Use Open in Collie to continue.";
+      }
+      $("workspace-result").replaceChildren(link("Open in Collie", value.result.url));
+    } else if (value.operation) {
+      workspaceData.prs[pr.id].operation = value.operation;
+      updateWorkspaceOperation();
+    }
+  } catch (error) {
+    if (opened) opened.close();
+    if (!$("workspace-dialog").open) await workspaceDialog(pr);
+    workspaceError(error);
+  }
+}
+async function workspaceDialog(pr) {
+  workspaceDialogPR = pr.id;
+  $("workspace-title").textContent = `${pr.repo} #${pr.number}`;
+  $("workspace-error").textContent = "";
+  $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
+  $("workspace-result").replaceChildren();
+  $("workspace-progress").textContent = "";
+  $("workspace-log").textContent = "";
+  if (!$("workspace-dialog").open) $("workspace-dialog").showModal();
+  try {
+    // Discovery is shared and cached; every action revalidates the selected target.
+    workspaceData = await get("/api/workspaces");
+    if (workspaceDialogPR !== pr.id) return;
+    const info = workspaceData.prs[pr.id];
+    if (workspaceData.error) throw Error(workspaceData.error);
+    if (workspaceData.synced_at === null)
+      throw Error("Local discovery is still running. Try again in a moment.");
+    if (!info) throw Error("Workspace discovery is unavailable. Try again after refreshing.");
+    const body = $("workspace-content");
+    body.replaceChildren();
+    if (info.matches.length) {
+      body.append(el("p", "Choose a checkout. Opening a workspace preserves its current agent."));
+      for (const target of info.matches) {
+        const row = el("section", undefined, "workspace-choice");
+        row.append(
+          el("strong", target.name),
+          el("small", `${target.agent_status} · ${target.path}`),
+        );
+        row.append(
+          workspaceButton(target.workspace_id ? "Open workspace" : "Reopen workspace", () =>
+            chooseWorkspace(pr, target, target.workspace_id ? "open" : "reopen"),
+          ),
+        );
+        const menu = el("details");
+        menu.append(el("summary", "More actions"));
+        if (target.workspace_id)
+          menu.append(
+            workspaceButton("Focus in herdr", () => chooseWorkspace(pr, target, "focus")),
+          );
+        menu.append(workspaceButton("Copy command", () => chooseWorkspace(pr, target, "copy")));
+        row.append(menu);
+        body.append(row);
+      }
+    } else {
+      const form = el("form");
+      const clone = el("select");
+      clone.id = "workspace-clone";
+      for (const path of info.clones) {
+        const option = el("option", path);
+        option.value = path;
+        clone.append(option);
+      }
+      if (info.preferred_clone) clone.value = info.preferred_clone;
+      if (info.clones.length > 1 && !info.preferred_clone) {
+        const option = el("option", "Choose a local clone");
+        option.value = "";
+        clone.prepend(option);
+        clone.value = "";
+      }
+      clone.required = true;
+      const agent = el("select");
+      agent.id = "workspace-agent";
+      for (const value of ["codex", "claude"]) {
+        const option = el("option", value === "codex" ? "Codex" : "Claude");
+        option.value = value;
+        agent.append(option);
+      }
+      const task = el("textarea");
+      task.id = "workspace-task";
+      task.required = true;
+      task.maxLength = 32000;
+      task.rows = 6;
+      function field(text, input) {
+        const label = el("label", text);
+        label.htmlFor = input.id;
+        form.append(label, input);
+      }
+      if (info.clones.length) field("Local clone", clone);
+      else
+        form.append(
+          el(
+            "p",
+            info.destination
+              ? `Clone ${pr.repo} into ${info.destination}`
+              : "Both clone destinations already exist. Move conflicting content before trying again.",
+          ),
+        );
+      field("Agent", agent);
+      field("Task", task);
+      const submit = el("button", info.clones.length ? "Create workspace" : "Clone and create");
+      submit.type = "submit";
+      submit.disabled = !info.clones.length && !info.destination;
+      form.append(submit);
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        if (!task.value.trim()) {
+          task.setCustomValidity("Enter a task");
+          task.reportValidity();
+          return;
+        }
+        submit.disabled = true;
+        $("workspace-error").textContent = "";
+        try {
+          const value = await workspaceRequest(
+            pr,
+            info.clones.length ? "create" : "clone-and-create",
+            {
+              agent: agent.value,
+              task: task.value,
+              ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
+              retry: workspaceData.prs[pr.id]?.operation?.status === "failed",
+            },
+          );
+          workspaceData.prs[pr.id].operation = value.operation;
+          updateWorkspaceOperation();
+        } catch (error) {
+          workspaceError(error);
+          submit.disabled = false;
+        }
+      };
+      task.oninput = () => task.setCustomValidity("");
+      body.append(form);
+      if (info.suggestions.length)
+        body.append(el("p", `Unverified branch-name suggestions: ${info.suggestions.join(", ")}`));
+    }
+    updateWorkspaceOperation();
+  } catch (error) {
+    workspaceError(error);
+  }
+}
+function updateWorkspaceOperation() {
+  if (!workspaceDialogPR || !$("workspace-dialog").open) return;
+  const op = workspaceData.prs[workspaceDialogPR]?.operation;
+  if (!op) return;
+  $("workspace-progress").textContent = `${op.status}: ${op.message}`;
+  $("workspace-log").textContent = op.log || "";
+  if (op.result?.url) $("workspace-result").replaceChildren(link("Open in Collie", op.result.url));
+  const submit = $("workspace-content").querySelector("button[type=submit]");
+  if (submit) submit.disabled = op.status !== "failed";
+}
+$("workspace-close").onclick = () => $("workspace-dialog").close();
+setInterval(refreshWorkspaces, 15000);
+void refreshWorkspaces();
+
+let ciGeneration = 0;
+const ciTimers = new Set();
+const ciCleanups = new Set();
+function stopCILoads() {
+  ciGeneration++;
+  for (const timer of ciTimers) clearTimeout(timer);
+  ciTimers.clear();
+  for (const cleanup of ciCleanups) cleanup();
+  ciCleanups.clear();
+}
+async function loadCI(url, generation, render, fail, attempt = 0) {
+  if (generation !== ciGeneration || !$("ci-dialog").open) return;
+  try {
+    if (!document.hidden && !$("prs-panel").hidden) {
+      const result = await get(url);
+      if (generation !== ciGeneration || !$("ci-dialog").open) return;
+      render(result);
+      if (!result.refreshing) return;
+    }
+    if (attempt >= 100)
+      throw Error("CI is taking longer than expected. Close and reopen to check again.");
+    const timer = setTimeout(() => {
+      ciTimers.delete(timer);
+      void loadCI(url, generation, render, fail, attempt + 1);
+    }, 2000);
+    ciTimers.add(timer);
+  } catch (error) {
+    if (generation === ciGeneration) fail(error.message);
+  }
+}
+function ciReportedFailure(pr, check) {
+  const detail = el("details", undefined, "ci-reported");
+  detail.append(el("summary", "Reported failure details"));
+  const body = el("div");
+  detail.append(body);
+  let loaded = false;
+  detail.ontoggle = () => {
+    if (!detail.open || loaded) return;
+    loaded = true;
+    body.replaceChildren(el("p", "Loading reported failures…"));
+    const url = `/api/pr-ci?id=${encodeURIComponent(pr.id)}&check=${encodeURIComponent(check.id)}`;
+    void loadCI(
+      url,
+      ciGeneration,
+      (result) => {
+        if (!result.value && result.refreshing) return;
+        body.replaceChildren();
+        if (result.error) body.append(el("p", result.error, "ci-error"));
+        if (!result.value) return;
+        const value = result.value;
+        if (value.title) body.append(el("strong", value.title));
+        for (const text of [value.summary, value.text].filter(Boolean))
+          body.append(el("pre", text));
+        for (const annotation of value.annotations) {
+          const entry = el("article", undefined, "ci-annotation");
+          entry.append(el("strong", annotation.title || annotation.level));
+          if (annotation.path) entry.append(el("small", `${annotation.path}:${annotation.line}`));
+          entry.append(el("pre", annotation.message));
+          body.append(entry);
+        }
+        if (!value.summary && !value.text && !value.annotations.length)
+          body.append(
+            el(
+              "p",
+              "This check did not publish failure messages. Open the job on GitHub for its test output.",
+            ),
+          );
+        if (value.truncated)
+          body.append(
+            el(
+              "p",
+              "Showing a limited excerpt and the first 20 annotations. Open the job for the full output.",
+            ),
+          );
+      },
+      (message) => body.replaceChildren(el("p", message, "ci-error")),
+    );
+  };
+  return detail;
+}
+function openPRCI(pr) {
+  stopCILoads();
+  $("ci-title").textContent = `${pr.repo} #${pr.number} · CI`;
+  $("ci-meta").textContent = "Loading checks…";
+  $("ci-error").textContent = "";
+  $("ci-links").replaceChildren(link("All checks on GitHub", `${pr.url}/checks`));
+  $("ci-content").replaceChildren();
+  if (!$("ci-dialog").open) $("ci-dialog").showModal();
+  let rendered = null;
+  void loadCI(
+    `/api/pr-ci?id=${encodeURIComponent(pr.id)}`,
+    ciGeneration,
+    (result) => {
+      $("ci-error").textContent = result.error || "";
+      $("ci-meta").textContent = result.refreshing
+        ? result.busy
+          ? "Other CI details are loading; waiting for a slot…"
+          : "Loading checks…"
+        : "Details are fetched on demand and cached for 5 minutes.";
+      if (!result.value) return;
+      $("ci-meta").textContent =
+        `Commit ${result.value.sha.slice(0, 12)} · Fetched ${new Date(result.synced_at * 1000).toLocaleString()}${result.stale || result.error ? " · Saved results may be out of date" : " · Cached for 5 minutes"}${result.refreshing ? " · Updating…" : ""}`;
+      const key = JSON.stringify(result.value);
+      if (key === rendered) return;
+      rendered = key;
+      const content = $("ci-content");
+      content.replaceChildren();
+      const checks = result.value.checks;
+      if (!checks.length) content.append(el("p", "No checks reported for this commit."));
+      for (const [bucket, label] of [
+        ["fail", "Failing checks"],
+        ["pending", "Pending checks"],
+        ["cancel", "Cancelled checks"],
+        ["pass", "Passed checks"],
+        ["skipping", "Skipped / neutral checks"],
+      ]) {
+        const group = checks.filter((check) => check.bucket === bucket);
+        if (!group.length) continue;
+        const section = el("section", undefined, "ci-group");
+        section.append(el("h3", `${label} (${group.length})`));
+        for (const check of group) {
+          const item = el("article", undefined, "ci-item");
+          item.append(checkRow(check.name, check.url, check.bucket, check.workflow));
+          item.append(el("small", check.state.replaceAll("_", " ")));
+          if (check.description) item.append(el("p", check.description));
+          if (check.has_details) {
+            item.append(ciReportedFailure(pr, check));
+            item.append(ciDownloadedLog(pr, check));
+          }
+          section.append(item);
+        }
+        content.append(section);
+      }
+      if (result.value.truncated)
+        content.prepend(
+          el(
+            "p",
+            "Showing the first 300 checks. The list is incomplete; open All checks on GitHub to see the rest.",
+            "ci-error",
+          ),
+        );
+    },
+    (message) => {
+      $("ci-error").textContent = message;
+      $("ci-meta").textContent = "Could not load CI details.";
+    },
+  );
+}
+$("ci-close").onclick = () => $("ci-dialog").close();
+$("ci-dialog").onclick = (event) => {
+  const dialog = $("ci-dialog");
+  if (event.target !== dialog) return;
+  const bounds = dialog.getBoundingClientRect();
+  if (
+    event.clientX < bounds.left ||
+    event.clientX > bounds.right ||
+    event.clientY < bounds.top ||
+    event.clientY > bounds.bottom
+  )
+    dialog.close();
+};
+$("ci-dialog").onclose = stopCILoads;
+
+function ciDownloadedLog(pr, check) {
+  const detail = el("details", undefined, "ci-reported");
+  detail.append(el("summary", "Downloaded test log"));
+  const body = el("div");
+  detail.append(body);
+  let loaded = false;
+  detail.ontoggle = () => {
+    if (!detail.open || loaded) return;
+    loaded = true;
+    body.replaceChildren(el("p", "Checking the background download…"));
+    const url = `/api/pr-ci-log?id=${encodeURIComponent(pr.id)}&check=${encodeURIComponent(check.id)}`;
+    void loadCI(
+      url,
+      ciGeneration,
+      (result) => {
+        body.replaceChildren(el("p", result.message));
+        if (result.error) body.append(el("p", result.error, "ci-error"));
+        if (!result.value) {
+          if (["queued", "downloading", "error"].includes(result.state))
+            body.append(el("small", "Downloads continue with the browser closed."));
+          return;
+        }
+        const value = result.value;
+        if (value.failed_steps.length)
+          body.append(el("p", `Failed steps: ${value.failed_steps.join(", ")}`));
+        if (value.tests.length) {
+          body.append(el("h4", "Detected test failures"));
+          const list = el("ul");
+          for (const test of value.tests) list.append(el("li", test));
+          body.append(list);
+        } else
+          body.append(el("p", "No individual test names were detected. The job output is below."));
+        if (value.truncated)
+          body.append(
+            el("p", "Download stopped at the 8 MiB limit; this log is incomplete.", "ci-error"),
+          );
+        body.append(ciLogStream(url, detail));
+      },
+      (message) => body.replaceChildren(el("p", message, "ci-error")),
+    );
+  };
+  return detail;
+}
+
+function ciLogStream(url, detail) {
+  const viewer = el("div", undefined, "ci-log-viewer");
+  const output = el("pre", "");
+  output.tabIndex = 0;
+  output.setAttribute("aria-label", "Cached job log output");
+  const status = el("p", "Loading log…", "pr-sync");
+  status.setAttribute("role", "status");
+  const error = el("p", "", "ci-error");
+  error.setAttribute("role", "alert");
+  error.hidden = true;
+  viewer.append(output, status, error);
+  const generation = ciGeneration;
+  let page = 0,
+    pages = null,
+    loading = false,
+    disposed = false;
+  let failures = 0,
+    retryTimer = null,
+    frame = null,
+    controller = null;
+  function active() {
+    return (
+      !disposed &&
+      generation === ciGeneration &&
+      viewer.isConnected &&
+      detail.open &&
+      $("ci-dialog").open &&
+      !document.hidden &&
+      !$("prs-panel").hidden &&
+      output.getClientRects().length
+    );
+  }
+  function maybeLoad() {
+    if (
+      !active() ||
+      loading ||
+      retryTimer !== null ||
+      failures >= 3 ||
+      (pages !== null && page >= pages)
+    )
+      return;
+    if (output.scrollHeight - output.scrollTop - output.clientHeight <= 160) void loadMore();
+  }
+  function schedule() {
+    if (frame !== null) cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => {
+      frame = null;
+      maybeLoad();
+    });
+  }
+  async function loadMore() {
+    loading = true;
+    controller = new AbortController();
+    output.setAttribute("aria-busy", "true");
+    status.textContent = page ? "Loading more…" : "Loading log…";
+    error.hidden = true;
+    try {
+      const result = await get(`${url}&page=${page + 1}`, controller.signal);
+      if (disposed || generation !== ciGeneration || !viewer.isConnected) return;
+      if (
+        result.page !== page + 1 ||
+        !Number.isInteger(result.pages) ||
+        result.pages < result.page ||
+        typeof result.text !== "string"
+      )
+        throw Error("Could not read the cached log response");
+      const scrollTop = output.scrollTop;
+      output.append(document.createTextNode(result.text));
+      output.scrollTop = scrollTop;
+      page = result.page;
+      pages = result.pages;
+      failures = 0;
+      if (page === pages) {
+        if (!output.textContent) output.textContent = "The cached job log is empty.";
+        status.textContent = result.truncated
+          ? "End of cached log · This log is incomplete."
+          : "End of cached log";
+      } else status.textContent = "Scroll for more";
+      schedule();
+    } catch (failure) {
+      if (disposed || failure.name === "AbortError") return;
+      failures += 1;
+      error.textContent = failure.message;
+      error.hidden = false;
+      status.textContent =
+        failures < 3
+          ? "Could not load more. Retrying…"
+          : "Could not load more. Collapse and reopen this log to retry.";
+      if (failures < 3)
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          maybeLoad();
+        }, failures * 2000);
+    } finally {
+      loading = false;
+      controller = null;
+      output.setAttribute("aria-busy", "false");
+    }
+  }
+  function reopen() {
+    if (detail.open) {
+      failures = 0;
+      maybeLoad();
+    }
+  }
+  const observer = new ResizeObserver(maybeLoad);
+  observer.observe(output);
+  output.addEventListener("scroll", maybeLoad);
+  detail.addEventListener("toggle", reopen);
+  document.addEventListener("visibilitychange", maybeLoad);
+  const cleanup = () => {
+    disposed = true;
+    controller?.abort();
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    if (frame !== null) cancelAnimationFrame(frame);
+    observer.disconnect();
+    detail.removeEventListener("toggle", reopen);
+    document.removeEventListener("visibilitychange", maybeLoad);
+    output.removeEventListener("scroll", maybeLoad);
+    ciCleanups.delete(cleanup);
+  };
+  ciCleanups.add(cleanup);
+  schedule();
+  return viewer;
+}

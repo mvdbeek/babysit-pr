@@ -19,6 +19,8 @@ query($query: String!, $cursor: String) {
     nodes { ... on PullRequest {
       id number title url createdAt updatedAt state isDraft reviewDecision
       repository { nameWithOwner }
+      headRepository { nameWithOwner }
+      headRefName headRefOid
       author { login }
       statusCheckRollup { state }
     } }
@@ -73,6 +75,9 @@ def collect():
                     "url": node["url"],
                     "repo": node["repository"]["nameWithOwner"],
                     "author": (node.get("author") or {}).get("login"),
+                    "head_repo": (node.get("headRepository") or {}).get("nameWithOwner"),
+                    "head_branch": node.get("headRefName"),
+                    "head_sha": node.get("headRefOid"),
                     "updated_at": node["updatedAt"],
                     "opened_at": node["createdAt"],
                     "draft": node["isDraft"],
