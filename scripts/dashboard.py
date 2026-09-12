@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
 from pr_ci_logs import BackgroundLogs
 from pr_overview import Overview
@@ -178,9 +179,11 @@ class DashboardServer(ThreadingHTTPServer):
         workspaces=None,
         ci=None,
         ci_logs=None,
+        issues: IssueOverview | None = None,
     ) -> None:
         self.home = home
         self.overview = overview
+        self.issues = issues
         self.workspaces = workspaces
         self.ci = ci
         self.ci_logs = ci_logs
@@ -291,6 +294,17 @@ class Handler(BaseHTTPRequestHandler):
                         "error": "PR overview is not enabled",
                     },
                 )
+            elif route.path == "/api/issues":
+                self.send_json(
+                    200,
+                    self.server.issues.snapshot()
+                    if self.server.issues
+                    else {
+                        "issues": [],
+                        "synced_at": None,
+                        "error": "Issue overview is not enabled",
+                    },
+                )
             elif route.path == "/api/pr-ci-log":
                 if not self.server.ci_logs:
                     raise ValueError("Background job logs are not enabled")
@@ -326,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
                     200,
                     self.server.workspaces.snapshot()
                     if self.server.workspaces
-                    else {"prs": {}, "error": "Workspace actions are not enabled"},
+                    else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
                 )
             elif route.path == "/api/log":
                 query = parse_qs(route.query)
@@ -357,7 +371,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
     overview = Overview(home)
-    workspaces = Workspaces(home, overview, lambda: read_jobs(home))
+    issues = IssueOverview(home)
+    workspaces = Workspaces(home, overview, lambda: read_jobs(home), issues=issues)
     ci = CiDetails(home, overview)
     ci_logs = BackgroundLogs(home, overview, ci)
     with DashboardServer(
@@ -368,6 +383,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         workspaces=workspaces,
         ci=ci,
         ci_logs=ci_logs,
+        issues=issues,
     ) as server:
         ci_logs.start()
         url = f"http://127.0.0.1:{server.server_port}"

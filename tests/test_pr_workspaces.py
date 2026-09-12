@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 import dashboard
+import issue_overview
 import pr_workspaces as pw
 import pytest
 from pr_overview import Overview
@@ -33,7 +34,11 @@ def local(tmp_path, monkeypatch):
     head = tmp_path / "head.git"
     git("clone", "--bare", str(clone), str(head))
     config = tmp_path / "gitconfig"
-    config.write_text(f'[url "{head}"]\n\tinsteadOf = https://github.com/fork/repo.git\n')
+    # Both the fork (wtpr) and the base repository (wti fetches origin) resolve offline.
+    config.write_text(
+        f'[url "{head}"]\n\tinsteadOf = https://github.com/fork/repo.git\n'
+        f'[url "{head}"]\n\tinsteadOf = https://github.com/base/repo.git\n'
+    )
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     bin_dir = tmp_path / "bin"
@@ -46,6 +51,7 @@ def local(tmp_path, monkeypatch):
         "WORKSPACE_HELPER", str(Path(__file__).resolve().parents[1] / "scripts/worktree.zsh")
     )
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("FAKE_ZSH_LOG", str(tmp_path / "zsh-calls.json"))
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
 
     def executable(name, body):
@@ -59,6 +65,9 @@ def local(tmp_path, monkeypatch):
 if sys.argv[1:3] == ['repo','clone']:
  subprocess.check_call(['git','clone',os.environ['FAKE_HEAD'],sys.argv[4]])
  subprocess.check_call(['git','-C',sys.argv[4],'remote','set-url','origin','https://github.com/base/repo.git'])
+elif sys.argv[3:5] == ['issue','view']:
+ assert sys.argv[1:3] == ['-R','base/repo'] and sys.argv[5] == '12', sys.argv
+ print('12\\tCrash on start!')
 else:
  print('fork\\trepo\\tfeature')
 """,
@@ -101,10 +110,11 @@ p.write_text(json.dumps(data))
         )
     executable(
         "zsh",
-        """import os,sys
+        """import json,os,sys
 assert sys.argv[1]=='-lic'
-assert sys.argv[2]=='export WT_MULTIPLEXER=herdr; wtpr "$@"'
-os.execv('/bin/zsh',['zsh','-fc','source "$WORKSPACE_HELPER"; export WT_MULTIPLEXER=herdr; wtpr "$@"','fixture',*sys.argv[4:]])
+helper={'export WT_MULTIPLEXER=herdr; wtpr "$@"':'wtpr','export WT_MULTIPLEXER=herdr; wti "$@"':'wti'}[sys.argv[2]]
+with open(os.environ['FAKE_ZSH_LOG'],'a') as f: f.write(json.dumps([helper,*sys.argv[4:]])+'\\n')
+os.execv('/bin/zsh',['zsh','-fc','source "$WORKSPACE_HELPER"; export WT_MULTIPLEXER=herdr; '+helper+' "$@"','fixture',*sys.argv[4:]])
 """,
     )
     overview = Overview(tmp_path / "state")
@@ -119,8 +129,20 @@ os.execv('/bin/zsh',['zsh','-fc','source "$WORKSPACE_HELPER"; export WT_MULTIPLE
         "head_sha": git("rev-parse", "HEAD"),
     }
     overview.value["prs"] = [pr]
+    issues = issue_overview.Overview(tmp_path / "state")
+    issues.next_poll = float("inf")
+    issues.value["issues"] = [
+        {
+            "id": "I_one",
+            "repo": "base/repo",
+            "number": 12,
+            "title": "Crash on start!",
+            "url": "https://github.com/base/repo/issues/12",
+            "linked_prs": [],
+        }
+    ]
     jobs = []
-    manager = pw.Workspaces(tmp_path / "state", overview, lambda: jobs, src)
+    manager = pw.Workspaces(tmp_path / "state", overview, lambda: jobs, src, issues=issues)
     return manager, pr, git, state, jobs
 
 
@@ -433,3 +455,174 @@ def test_recover_reservation_before_association_was_saved(local):
         db.execute("DELETE FROM associations")
     restarted = pw.Workspaces(manager.home, manager.overview, lambda: [], manager.src)
     assert restarted.describe(pr, restarted.scan())["operation"]["status"] == "complete"
+
+
+def issue_of(manager):
+    return {**manager.issues.value["issues"][0], "kind": "issue"}
+
+
+def zsh_calls():
+    path = Path(os.environ["FAKE_ZSH_LOG"])
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_issue_branch_matches_its_repository_and_only_suggests_elsewhere(local):
+    manager, pr, git, state, _ = local
+    issue = issue_of(manager)
+    assert pw.canonical(issue) == "https://github.com/base/repo/issues/12"
+    git("branch", "issue-12-any-slug")
+    git("branch", "issue-120")
+    here = make_checkout(local, "issue-12-any-slug", "issue-12-any-slug")
+    make_checkout(local, "issue-120", "issue-120")
+    other = manager.src / "second"
+    git("clone", str(manager.src / "repo"), str(other))
+    git("remote", "set-url", "origin", "https://github.com/fork/repo.git", cwd=other)
+    git("switch", "-c", "issue-12", cwd=other)
+    space(state, here, manager.src / "repo")
+    manager.scan()  # The snapshot serves the cached inventory and refreshes lazily.
+    snapshot = manager.snapshot()
+    info = snapshot["issues"]["I_one"]
+    assert [m["path"] for m in info["matches"]] == [str(here)]
+    assert info["matches"][0]["workspace_id"] == "w99" and info["matches"][0]["linked_pr"] is None
+    assert info["suggestions"] == [str(other)]
+    assert info["clones"] == [str(manager.src / "repo")]
+    assert set(snapshot["prs"]) == {"PR_one"}
+    assert not snapshot["prs"]["PR_one"]["matches"]
+    # Opening revalidates the issue checkout the same way as a PR checkout.
+    result = manager.action(
+        {"id": "I_one", "action": "open", "path": str(here), "workspace_id": "w99"}
+    )
+    assert result["result"]["url"].endswith("/space/w99")
+    with pytest.raises(ValueError, match="Workspace changed"):
+        manager.action({"id": "I_one", "action": "open", "path": str(other), "workspace_id": "w99"})
+
+
+def test_linked_pr_checkout_counts_as_the_issue_workspace(local):
+    manager, pr, git, _, _ = local
+    manager.issues.value["issues"][0]["linked_prs"] = [
+        {**pr, "state": "OPEN", "draft": False, "title": "Fix crash"}
+    ]
+    path = make_checkout(local)
+    issue = issue_of(manager)
+    matches, suggestions = manager.matches(issue, manager.scan())
+    assert not matches and not suggestions
+    git("remote", "add", "fork", "git@github.com:fork/repo.git")
+    matches, _ = manager.matches(issue, manager.scan())
+    assert [(m["path"], m["linked_pr"]) for m in matches] == [(str(path), 7)]
+    with pytest.raises(ValueError, match="already exists"):
+        manager.action({"id": "I_one", "action": "create", "task": "Fix"})
+
+
+def test_issue_creation_uses_wti_with_dashboard_flags_and_allocates_suffixes(local):
+    manager, _, git, state, _ = local
+    collision = manager.src / "worktrees/repo/issue-12-crash-on-start"
+    collision.mkdir(parents=True)
+    request = {"id": "I_one", "action": "create", "agent": "claude", "task": "Fix 'it'"}
+    first = manager.action(request)["operation"]
+    assert manager.action(request)["operation"]["id"] == first["id"]
+    op = finish(manager, "I_one")
+    assert op["status"] == "complete", op
+    assert Path(op["path"]) == manager.src / "worktrees/repo/issue-12-crash-on-start-2"
+    assert op["branch"] == "issue-12-crash-on-start-2"
+    assert git("symbolic-ref", "--short", "HEAD", cwd=op["path"]) == op["branch"]
+    assert git("rev-parse", "HEAD", cwd=op["path"]) == git("rev-parse", "main")
+    prompt = manager.home / "workspace-prompts" / op["id"]
+    assert zsh_calls() == [
+        [
+            "wti",
+            "--claude",
+            "--no-focus",
+            "--name",
+            "issue-12-crash-on-start-2",
+            "--repo-path",
+            str(manager.src / "repo"),
+            "--worktree-root",
+            str(manager.src / "worktrees/repo"),
+            "--prompt-file",
+            str(prompt),
+            "https://github.com/base/repo/issues/12",
+        ]
+    ]
+    data = json.loads(state.read_text())
+    assert len(data["agents"]) == 1 and data["agents"][0]["agent"] == "claude"
+    assert data["agents"][0]["task"] == "Fix 'it'\n\nIssue: https://github.com/base/repo/issues/12"
+    assert "--no-focus" in next(c for c in data["calls"] if c[:2] == ["worktree", "open"])
+    assert not (collision / "anything").exists() and not any(collision.iterdir())
+    manager.scan()
+    info = manager.snapshot()["issues"]["I_one"]
+    assert info["matches"][0]["path"] == op["path"] and info["operation"]["status"] == "complete"
+    # A PR creation still goes through wtpr with the PR prompt wording.
+    manager.action({"id": "PR_one", "action": "create", "task": "Fix"})
+    assert finish(manager, "PR_one")["status"] == "complete"
+    assert zsh_calls()[-1][0] == "wtpr"
+    assert json.loads(state.read_text())["agents"][-1]["task"].endswith(
+        "Pull request: https://github.com/base/repo/pull/7"
+    )
+
+
+def test_issue_recovery_after_restart_does_not_need_head_provenance(local):
+    manager, _, _, _, _ = local
+    manager.action({"id": "I_one", "action": "create", "task": "Fix"})
+    op = finish(manager, "I_one")
+    assert op["status"] == "complete", op
+    manager.save_operation(op, status="running")
+    with manager.db() as db:
+        db.execute("DELETE FROM associations")
+    restarted = pw.Workspaces(
+        manager.home, manager.overview, lambda: [], manager.src, issues=manager.issues
+    )
+    issue = issue_of(manager)
+    assert restarted.describe(issue, restarted.scan())["operation"]["status"] == "complete"
+    with restarted.db() as db:
+        assert (
+            db.execute("SELECT count(*) FROM associations WHERE pr=?", ("I_one",)).fetchone()[0]
+            == 1
+        )
+
+
+def test_http_serves_issues_and_dispatches_workspace_actions_by_id(local):
+    manager, _, _, state, _ = local
+    with dashboard.DashboardServer(
+        manager.home, 0, overview=manager.overview, workspaces=manager, issues=manager.issues
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+
+            def request(method, path, body=None):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=15)
+                conn.request(
+                    method,
+                    path,
+                    json.dumps(body) if body else None,
+                    {"Content-Type": "application/json", "X-Babysit-Action": "workspace-action"},
+                )
+                response = conn.getresponse()
+                result = response.status, json.loads(response.read())
+                conn.close()
+                return result
+
+            status, issues = request("GET", "/api/issues")
+            assert status == 200 and [i["number"] for i in issues["issues"]] == [12]
+            assert "prs" not in issues
+            status, prs = request("GET", "/api/prs")
+            assert status == 200 and [p["number"] for p in prs["prs"]] == [7]
+            status, spaces = request("GET", "/api/workspaces")
+            assert status == 200 and set(spaces["issues"]) == {"I_one"}
+            assert set(spaces["prs"]) == {"PR_one"}
+            status, result = request(
+                "POST",
+                "/api/workspace-action",
+                {"id": "I_one", "action": "open", "path": "/nowhere", "workspace_id": "w1"},
+            )
+            assert status == 400 and "Workspace changed" in result["error"]
+            status, result = request(
+                "POST",
+                "/api/workspace-action",
+                {"id": "I_missing", "action": "create", "task": "x"},
+            )
+            assert status == 400 and "Unknown PR or issue" in result["error"]
+            assert not json.loads(state.read_text())["agents"]
+        finally:
+            server.shutdown()
+            thread.join()

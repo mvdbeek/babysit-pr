@@ -1,4 +1,9 @@
-"""Local PR checkout discovery and durable, asynchronous workspace operations."""
+"""Local PR/issue checkout discovery and durable, asynchronous workspace operations.
+
+A *target* is a PR or issue record from the overviews plus a ``kind`` field. PRs are
+matched to checkouts by verified head provenance; issues by a ``wti``-style
+``issue-<number>`` branch in the issue's repository or by a linked PR's verified head.
+"""
 
 import contextlib
 import copy
@@ -16,6 +21,8 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote
+
+from issue_overview import branch_number
 
 COLLIE_URL = "https://collie.tailfb45be.ts.net"
 POLL_SECONDS = 15
@@ -102,19 +109,51 @@ def checkout(path):
         return None
 
 
-def canonical(pr):
+def is_issue(target):
+    return target.get("kind") == "issue"
+
+
+def canonical(target):
     if (
-        not SLUG.fullmatch(pr.get("repo", ""))
-        or pr["repo"].split("/")[1] in {".", ".."}
-        or not isinstance(pr.get("number"), int)
-        or pr["number"] < 1
+        not SLUG.fullmatch(target.get("repo", ""))
+        or target["repo"].split("/")[1] in {".", ".."}
+        or not isinstance(target.get("number"), int)
+        or target["number"] < 1
     ):
-        raise ValueError("Invalid PR repository or number")
-    return f"https://github.com/{pr['repo']}/pull/{pr['number']}"
+        raise ValueError("Invalid repository or number")
+    path = "issues" if is_issue(target) else "pull"
+    return f"https://github.com/{target['repo']}/{path}/{target['number']}"
 
 
-def same_repository(pr, item):
-    return bool({pr["repo"].lower(), (pr.get("head_repo") or "").lower()} & set(item["remotes"]))
+def repositories(target):
+    """Every repository slug a checkout for this target may legitimately track."""
+    slugs = {target["repo"].lower(), (target.get("head_repo") or "").lower()}
+    for pr in target.get("linked_prs") or []:
+        slugs.update({pr["repo"].lower(), (pr.get("head_repo") or "").lower()})
+    return slugs - {""}
+
+
+def same_repository(target, item):
+    return bool(repositories(target) & set(item["remotes"]))
+
+
+def verified_issue(issue, item):
+    """A `wti`-style branch for this issue number, in a checkout of the issue's repository."""
+    return branch_number(item["branch"]) == issue["number"] and issue["repo"].lower() in set(
+        item["remotes"]
+    )
+
+
+def linked_checkout(issue, item):
+    """The linked PR whose verified head this checkout carries, if any."""
+    return next((pr for pr in issue.get("linked_prs") or [] if verified_head(pr, item)), None)
+
+
+def issue_name(issue):
+    """The `wti` default branch name: issue-<number>-<title slug>."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(issue.get("title") or "").lower()).strip("-")
+    slug = slug[:60].rstrip("-")
+    return f"issue-{issue['number']}" + (f"-{slug}" if slug else "")
 
 
 def verified_head(pr, item):
@@ -138,10 +177,11 @@ def verified_head(pr, item):
 
 
 class Workspaces:
-    def __init__(self, home, overview, jobs, src=None):
+    def __init__(self, home, overview, jobs, src=None, issues=None):
         self.home = Path(home)
         self.src = Path(src) if src else Path.home() / "src"
         self.overview = overview
+        self.issues = issues
         self.jobs = jobs
         self.lock = threading.RLock()
         self.inventory_lock = threading.Lock()
@@ -179,12 +219,23 @@ class Workspaces:
         finally:
             db.close()
 
-    def pr(self, key):
-        pr = next((p for p in self.overview.snapshot()["prs"] if p["id"] == key), None)
-        if pr is None:
-            raise ValueError("Unknown PR; refresh the PR overview")
-        canonical(pr)
-        return pr
+    def targets(self):
+        """Every PR and issue currently known to the overviews, tagged with its kind."""
+        found: list[dict] = []
+        for kind, overview in (("pr", self.overview), ("issue", self.issues)):
+            if overview is not None:
+                found.extend(
+                    {**item, "kind": kind} for item in overview.snapshot()[overview.kind.key]
+                )
+        return found
+
+    def target(self, key):
+        # GraphQL node ids are globally unique, so one id names one PR or issue.
+        target = next((t for t in self.targets() if t["id"] == key), None)
+        if target is None:
+            raise ValueError("Unknown PR or issue; refresh the overview")
+        canonical(target)
+        return target
 
     def scan(self):
         with self.inventory_lock:
@@ -196,10 +247,9 @@ class Workspaces:
                 roots.update(p.resolve() for p in self.src.iterdir() if (p / ".git").is_dir())
             items = {}
             clones = []
-            wanted = {p["repo"].lower() for p in self.overview.snapshot()["prs"]}
-            wanted.update(
-                (p.get("head_repo") or "").lower() for p in self.overview.snapshot()["prs"]
-            )
+            wanted: set[str] = set()
+            for target in self.targets():
+                wanted.update(repositories(target))
             for root in sorted(roots):
                 try:
                     urls = git(root, "config", "--get-regexp", r"^remote\..*\.url$")
@@ -270,23 +320,35 @@ class Workspaces:
         watches = self.jobs()
         matches, suggestions = [], []
         for item in inventory["checkouts"]:
-            if not same_repository(pr, item):
+            same = same_repository(pr, item)
+            if not same and not is_issue(pr):
                 continue
             prior = saved.get(item["path"], {})
-            associated = (
+            associated = same and (
                 prior.get("common") == item["common"]
                 and prior.get("branch") == item["branch"]
                 and prior.get("head_repo") == pr.get("head_repo")
                 and prior.get("head_branch") == pr.get("head_branch")
             )
-            bound = any(
+            bound = same and any(
                 w.get("url", "").rstrip("/") == canonical(pr)
                 and str(Path(w.get("cwd") or "/missing").resolve()) == item["path"]
                 and (w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"))
                 == item["branch"]
                 for w in watches
             )
-            if associated or bound or verified_head(pr, item):
+            linked = None
+            if is_issue(pr):
+                verified = same and verified_issue(pr, item)
+                if not verified:
+                    linked = linked_checkout(pr, item)
+                    verified = linked is not None
+                # A branch name alone is only a hint when the repository does not agree.
+                suggested = not same and branch_number(item["branch"]) == pr["number"]
+            else:
+                verified = verified_head(pr, item)
+                suggested = item["branch"] == pr.get("head_branch")
+            if associated or bound or verified:
                 workspaces = [
                     w
                     for w in inventory["workspaces"]
@@ -304,9 +366,10 @@ class Workspaces:
                             if workspace
                             else "No workspace",
                             "url": f"{COLLIE_URL}/space/{quote(wid, safe='')}" if wid else None,
+                            "linked_pr": linked["number"] if linked else None,
                         }
                     )
-            elif item["branch"] == pr.get("head_branch"):
+            elif suggested:
                 suggestions.append(item["path"])
         return matches, suggestions
 
@@ -343,7 +406,7 @@ class Workspaces:
                 item
                 and item["common"] == op["common"]
                 and item["branch"] == op["branch"]
-                and item["upstream"] == [(pr.get("head_repo") or "").lower(), pr.get("head_branch")]
+                and (is_issue(pr) or item["upstream"] == self.expected_upstream(pr))
             ):
                 self.association(pr, item)
         matches, suggestions = self.matches(pr, inventory)
@@ -380,14 +443,22 @@ class Workspaces:
             "operation": op,
         }
 
+    @staticmethod
+    def expected_upstream(pr):
+        return [(pr.get("head_repo") or "").lower(), pr.get("head_branch")]
+
     def snapshot(self):
         with self.lock:
             if time.monotonic() >= self.next_poll and not self.refreshing:
                 self.refreshing = True
                 threading.Thread(target=self.refresh, daemon=True).start()
             inventory = copy.deepcopy(self.inventory)
+        described: dict[str, dict] = {"prs": {}, "issues": {}}
+        for target in self.targets():
+            key = "issues" if is_issue(target) else "prs"
+            described[key][target["id"]] = self.describe(target, inventory)
         return {
-            "prs": {p["id"]: self.describe(p, inventory) for p in self.overview.snapshot()["prs"]},
+            **described,
             "error": inventory["error"],
             "refreshing": self.refreshing,
             "synced_at": inventory["synced_at"],
@@ -434,7 +505,7 @@ class Workspaces:
                 raise ValueError(f"Expected text for {field}")
         if "retry" in request and not isinstance(request["retry"], bool):
             raise ValueError("Expected a retry flag")
-        pr = self.pr(request["id"])
+        pr = self.target(request["id"])
         action = request["action"]
         with self.lock:
             if action in {"create", "clone-and-create", "reopen"}:
@@ -509,7 +580,9 @@ class Workspaces:
                     or "\0" in request["task"]
                 ):
                     raise ValueError("Supply a task of 1–32,000 characters")
-                if not pr.get("head_repo") or not pr.get("head_branch") or not pr.get("head_sha"):
+                if not is_issue(pr) and not (
+                    pr.get("head_repo") and pr.get("head_branch") and pr.get("head_sha")
+                ):
                     raise ValueError("Refresh GitHub metadata before creating a workspace")
                 if action == "create":
                     clone = request.get("clone") or info["preferred_clone"]
@@ -620,7 +693,7 @@ class Workspaces:
                     )
                 main = checkout(clone)
                 if not main or pr["repo"].lower() not in main["remotes"]:
-                    raise ValueError("Local clone no longer belongs to the PR base repository")
+                    raise ValueError("Local clone no longer belongs to the base repository")
                 with self.db() as db:
                     db.execute(
                         "INSERT OR REPLACE INTO clones VALUES (?,?)",
@@ -636,7 +709,12 @@ class Workspaces:
                     )
                 else:
                     owner, repo = pr["repo"].split("/")
-                    prefix = f"pr-{owner}-{pr['number']}"
+                    if is_issue(pr):
+                        helper, subject = "wti", "Issue"
+                        prefix = issue_name(pr)
+                    else:
+                        helper, subject = "wtpr", "Pull request"
+                        prefix = f"pr-{owner}-{pr['number']}"
                     name = prefix
                     base = self.src / "worktrees" / repo
                     n = 1
@@ -648,14 +726,14 @@ class Workspaces:
                         common=main["common"],
                         path=str(base / name),
                         branch=name,
-                        message="Fetching PR and starting the selected agent",
+                        message=f"Fetching {subject.lower()} and starting the selected agent",
                     )
                     prompts = self.home / "workspace-prompts"
                     prompts.mkdir(mode=0o700, exist_ok=True)
                     prompt = prompts / op["id"]
                     fd = os.open(prompt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(fd, "w") as stream:
-                        stream.write(f"{task}\n\nPull request: {canonical(pr)}\n")
+                        stream.write(f"{task}\n\n{subject}: {canonical(pr)}\n")
                     args = [
                         f"--{op['agent']}",
                         "--no-focus",
@@ -674,7 +752,7 @@ class Workspaces:
                         op,
                         "zsh",
                         "-lic",
-                        'export WT_MULTIPLEXER=herdr; wtpr "$@"',
+                        f'export WT_MULTIPLEXER=herdr; {helper} "$@"',
                         "pr-workspaces",
                         *args,
                         timeout=600,
@@ -687,7 +765,8 @@ class Workspaces:
                             "Resulting checkout did not match the recorded repository and branch"
                         )
                     # wtpr records head provenance after checkout, before submitting the task.
-                    if item["upstream"] != [pr["head_repo"].lower(), pr["head_branch"]]:
+                    # wti branches from the default branch, so only name and repository apply.
+                    if not is_issue(pr) and item["upstream"] != self.expected_upstream(pr):
                         raise ValueError("Resulting checkout has unexpected PR head provenance")
                     self.association(pr, item)
                 for _ in range(30):
