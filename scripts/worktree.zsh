@@ -276,13 +276,13 @@ EOF
 _wti_help() {
   cat <<'EOF'
 usage:
-  wti [--codex|--claude] [-r repo] <issue-number|issue-url> [branch-name]
+  wti [--codex|--claude] [-r repo] [--name name] [--no-focus] <issue-number|issue-url> [branch-name]
   wri [--codex|--claude] [-r repo] <issue-number|issue-url> [branch-name]
   wtissue [--codex|--claude] [-r repo] <issue-number|issue-url> [branch-name]
   wt [--codex|--claude] [-r repo] issue <issue-number|issue-url> [branch-name]
 
 Create or open a worktree for a GitHub issue. If branch-name is omitted,
-the branch is generated from the issue number and title.
+the branch is generated from the issue number and title (issue-<number>-<slug>).
 
 options:
   --codex       start Codex in the left pane
@@ -290,6 +290,10 @@ options:
   -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
+  --name <name>           reserve a new worktree and branch with this explicit name
+  --no-focus              leave native herdr focus unchanged
+  --repo-path <path>      use this main clone (overrides -r location)
+  --worktree-root <path>  parent directory for the new checkout
   -h, --help    show this help
 EOF
 }
@@ -359,23 +363,34 @@ wt() {
   _wt_session "$dir" "$branch" "$agent" "$prompt" "$repo"
 }
 
-# usage: wti [--codex|--claude] [-r repo] <issue-number|issue-url> [branch-name]
+# usage: wti [--codex|--claude] [-r repo] [--name name] [--no-focus] <issue-number|issue-url> [branch-name]
 #        wt [--codex|--claude] issue <issue-number|issue-url> [branch-name] also works
 wti() {
-  local repo=galaxy repo_override= slug= agent=claude prompt=
+  local repo=galaxy repo_override= slug= agent=claude prompt= name= repo_path= worktree_root=
+  local WT_NO_FOCUS=0 WT_REPO_PATH=
   while [[ "$1" == -* ]]; do
     case "$1" in
       --codex) agent=codex; shift ;;
       --claude) agent=claude; shift ;;
-      -r) repo="$2"; repo_override=1; shift 2 ;;
-      -p|--prompt) prompt="$2"; shift 2 ;;
-      -F|--prompt-file) prompt="$(_wt_read_prompt_file "$2")" || return 1; shift 2 ;;
+      --no-focus) WT_NO_FOCUS=1; shift ;;
+      --name|--repo-path|--worktree-root|-r|-p|--prompt|-F|--prompt-file)
+        [[ $# -ge 2 && -n "$2" ]] || { print -u2 "wti: $1 needs a value"; return 1; }
+        case "$1" in
+          --name) name="$2" ;;
+          --repo-path) repo_path="$2" ;;
+          --worktree-root) worktree_root="$2" ;;
+          -r) repo="$2"; repo_override=1 ;;
+          -p|--prompt) prompt="$2" ;;
+          -F|--prompt-file) prompt="$(_wt_read_prompt_file "$2")" || return 1 ;;
+        esac
+        shift 2 ;;
       -h|--help) _wti_help; return 0 ;;
       *) print -u2 "wti: unknown option: $1"; _wti_help >&2; return 1 ;;
     esac
   done
   local issue="$1"
-  local name="$2"
+  # A positional branch name may reuse an existing checkout; --name reserves a new one.
+  local requested="${2:-$name}"
   # accept a full issue URL, e.g. https://github.com/owner/repo/issues/12345
   if [[ "$issue" == *github.com/*/issues/* ]]; then
     local rest="${issue##*github.com/}"   # owner/repo/issues/12345/...
@@ -387,16 +402,22 @@ wti() {
     [[ -n "$repo_override" ]] || repo="$url_repo"   # unless -r was given, target ~/src/<url_repo>
   fi
   if [[ ! "$issue" =~ ^[0-9]+$ ]]; then
-    echo "wti: expected an issue number or GitHub issue URL" >&2
+    print -u2 "wti: expected an issue number or GitHub issue URL"
     return 1
   fi
-  if [[ ! -d "$HOME/src/$repo/.git" ]]; then
-    echo "wti: no local clone at ~/src/$repo (needed to attach a worktree)" >&2
+  repo_path="${repo_path:-$HOME/src/$repo}"
+  WT_REPO_PATH="$repo_path"
+  worktree_root="${worktree_root:-$HOME/src/worktrees/$repo}"
+  if [[ ! -d "$repo_path/.git" ]]; then
+    print -u2 "wti: no main clone at $repo_path (needed to attach a worktree)"
     return 1
+  fi
+  if [[ -n "$name" ]] && { [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || [[ "$name" == *..* ]]; }; then
+    print -u2 "wti: --name must be a simple worktree name"; return 1
   fi
   if [[ -z "$slug" ]]; then
-    slug=$(git -C "$HOME/src/$repo" config --get remote.upstream.url 2>/dev/null \
-        || git -C "$HOME/src/$repo" config --get remote.origin.url)
+    slug=$(git -C "$repo_path" config --get remote.upstream.url 2>/dev/null \
+        || git -C "$repo_path" config --get remote.origin.url) || return 1
     slug="${slug#https://github.com/}"
     slug="${slug#git@github.com:}"
     slug="${slug%.git}"
@@ -406,23 +427,32 @@ wti() {
     -q '[.number, .title] | @tsv') || return
   local number title title_slug branch dir base
   IFS=$'\t' read -r number title <<< "$info"
-  if [[ -n "$name" ]]; then
-    branch="$name"
+  if [[ -n "$requested" ]]; then
+    branch="$requested"
   else
     title_slug=$(print -r -- "$title" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-//; s/-$//; s/^(.{60}).*/\1/; s/-$//')
     branch="issue-$number${title_slug:+-$title_slug}"
   fi
-  dir="$HOME/src/worktrees/$repo/$branch"
-  if [[ -d "$dir" ]]; then _wt_session "$dir" "$branch" "$agent" "$prompt" "$repo"; return; fi
-  base=$(git -C "$HOME/src/$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+  dir="$worktree_root/$branch"
+  if [[ -e "$dir" || -L "$dir" ]]; then
+    # Explicit dashboard names reserve new resources and never reuse a directory.
+    if [[ -n "$name" ]]; then
+      print -u2 "wti: explicit worktree destination already exists: $dir"; return 1
+    fi
+    _wt_session "$dir" "$branch" "$agent" "$prompt" "$repo"; return
+  fi
+  if [[ -n "$name" ]] && git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+    print -u2 "wti: explicit branch already exists: $branch"; return 1
+  fi
+  base=$(git -C "$repo_path" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
   base="${base#origin/}"
   [[ -n "$base" ]] || base=main
-  mkdir -p "$HOME/src/worktrees/$repo" &&
-  git -C "$HOME/src/$repo" fetch origin "$base" &&
-  if git -C "$HOME/src/$repo" show-ref --verify --quiet "refs/heads/$branch"; then
-    git -C "$HOME/src/$repo" worktree add "$dir" "$branch"
+  mkdir -p "$worktree_root" &&
+  git -C "$repo_path" fetch origin "$base" &&
+  if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$repo_path" worktree add "$dir" "$branch"
   else
-    git -C "$HOME/src/$repo" worktree add -b "$branch" "$dir" "origin/$base"
+    git -C "$repo_path" worktree add -b "$branch" "$dir" "origin/$base"
   fi &&
   _wt_session "$dir" "$branch" "$agent" "$prompt" "$repo"
 }
