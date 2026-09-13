@@ -1,8 +1,8 @@
 """Opt-in workspace inventory experiment with explicit, bounded cleanup.
 
 Lists linked Git worktrees joined with their herdr workspaces and agents, resolves the
-GitHub state of the pull request or issue each checkout belongs to, and performs only
-explicitly requested cleanup: exit agents, close the herdr workspace, remove the
+GitHub state of the pull request or issue each checkout belongs to, opens workspace
+containers for existing checkouts, and performs explicitly requested cleanup: exit agents, close the herdr workspace, remove the
 worktree, delete the local branch. It never starts an agent, pushes, or repairs
 anything, and its collection and cleanup failures stay inside this experiment.
 """
@@ -606,6 +606,41 @@ class WorkspaceOverview:
             )
             rows[-1]["status"] = "missing" if missing else row_status(rows[-1])
         return rows
+
+    def open_workspace(self, request):
+        """Open a listed workspace, creating only its herdr container when absent."""
+        key = request.get("key")
+        if set(request) != {"key"} or not isinstance(key, str) or not 0 < len(key) <= 1024:
+            raise ValueError("Supply a workspace key")
+        with self.lock:
+            if not self.enabled:
+                raise ValueError("The workspace experiment is disabled")
+            if not any(row["key"] == key for row in self.value["workspaces"]):
+                raise ValueError("Unknown workspace; refresh the list")
+        row = self.resolve(key)
+        if row is None:
+            raise ValueError("Workspace changed; refresh the list")
+        with self.lock_file(row["repo_root"] or key).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            row = self.resolve(key)
+            if row is None:
+                raise ValueError("Workspace changed; refresh the list")
+            if not row["workspace_ids"]:
+                if row["missing"] or not row["repo_root"]:
+                    raise ValueError("The checkout is unavailable; refresh the list")
+                herdr(
+                    "worktree",
+                    "open",
+                    "--cwd",
+                    row["repo_root"],
+                    "--path",
+                    row["path"],
+                    "--no-focus",
+                )
+                row = self.resolve(key)
+                if row is None or not row["workspace_ids"]:
+                    raise ValueError("Workspace was not found after opening; refresh the list")
+            return {"url": row["workspace_url"]}
 
     # Cleanup -------------------------------------------------------------------
 

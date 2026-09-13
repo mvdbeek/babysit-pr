@@ -1,5 +1,6 @@
 """Workspace experiment browser coverage against temporary servers and a stubbed cleanup."""
 
+import copy
 import threading
 import time
 
@@ -101,14 +102,54 @@ WORKSPACES = [
 ]
 
 
+@pytest.mark.parametrize(
+    "name,label", [("merged-work", "Open workspace"), ("open-work", "Create workspace")]
+)
+def test_workspace_open_button_and_popup_fallback(page, site, name, label):
+    url, _, _ = site
+    requests = []
+
+    def action(route):
+        requests.append(route.request.post_data_json)
+        route.fulfill(json={"url": "https://collie.tailfb45be.ts.net/space/w1"})
+
+    page.route("**/api/workspace-open", action)
+    page.goto(url + "/#workspaces")
+    page.evaluate("window.open = () => null")
+    row = page.locator("#ws-list tr").filter(has=page.get_by_text(name, exact=True))
+    row.get_by_role("button", name=label, exact=True).click()
+    expect(row.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://collie.tailfb45be.ts.net/space/w1"
+    )
+    expect(row.get_by_role("button", name="Open workspace", exact=True)).to_be_enabled()
+    assert requests == [{"key": f"/src/worktrees/repo/{name}"}]
+
+
+def test_workspace_open_error_can_retry(page, site):
+    url, _, _ = site
+    page.route(
+        "**/api/workspace-open",
+        lambda route: route.fulfill(status=400, json={"error": "Workspace changed"}),
+    )
+    page.goto(url + "/#workspaces")
+    page.evaluate("window.open = () => ({close() {window.closedPopup = true;}})")
+    row = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    row.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(row.get_by_role("alert")).to_have_text("Workspace changed")
+    expect(row.get_by_role("button", name="Create workspace", exact=True)).to_be_enabled()
+    assert page.evaluate("window.closedPopup")
+
+
 @pytest.fixture
-def site(tmp_path):
+def site(tmp_path, monkeypatch):
     directory = tmp_path / "experiments" / "workspaces"
     directory.mkdir(parents=True)
     (directory / "config.json").write_text('{"enabled": true}')
     plugin = wso.WorkspaceOverview(tmp_path, lambda endpoint: pytest.fail("no GitHub call"))
     plugin.next_poll = float("inf")
     plugin.value = {"workspaces": WORKSPACES, "warnings": [], "synced_at": time.time()}
+    # Cleanup schedules a rescan; keep that background scan inside the fixture too.
+    monkeypatch.setattr(type(plugin), "collect", lambda self: copy.deepcopy(self.value))
     removed: list = []
 
     def remove(self, job, index, target):

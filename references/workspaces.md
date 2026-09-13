@@ -20,6 +20,12 @@ Every **linked worktree** of a scanned clone is a workspace, joined with any her
 
 The base repository is the `upstream` remote when one exists, otherwise `origin` or, when `origin` is a fork, its parent. That answer is cached for a day; a failed or budget-exhausted lookup is never cached as an answer.
 
+## Opening a workspace
+
+The **Actions** column offers **Open workspace** for an existing herdr workspace and **Create workspace** for a checkout without one. Both open Collie in a new tab, with an **Open in Collie** fallback link if popups are blocked. Creation attaches a herdr workspace to the listed checkout without starting an agent or changing native focus. Existing agents are preserved. The action revalidates the listed checkout and shares the cleanup/creation lock so repeated clicks reuse the workspace instead of duplicating it. Errors appear beside the button and can be retried.
+
+`POST /api/workspace-open` accepts a listed workspace `key` with the `X-Babysit-Action: workspace-open` header and the dashboard's usual origin protections. The server resolves the checkout and Collie URL; the client supplies no command or destination.
+
 ## How pull requests and issues are matched
 
 A checkout is matched to the pull request and issue it belongs to, from evidence the repository agrees with (a name-derived pull request and a branch-derived one can both appear when they differ):
@@ -65,6 +71,6 @@ Loading, stale results, an empty inventory, per-repository warnings, and API err
 
 Set `"enabled": false` (or remove its config file) and restart the dashboard. This hides the tab and stops all scanning. The experiment directory can then be deleted without touching watcher, PR, or issue state.
 
-To remove the code, delete `scripts/workspace_overview.py`, `assets/dashboard/workspaces.js`, `assets/dashboard/workspaces.css`, its two test modules, and this document. Remove the small integration hooks in `scripts/dashboard.py` (construction, injected server field, one endpoint, one POST action, two assets), `assets/dashboard/index.html` (scripts/style, tab, panel, dialog), and the `workspaces` page entry/visibility event in `app.js`. It reuses the Git discovery helpers in `scripts/pr_workspaces.py` in one direction only; nothing in the watcher, overview, or workspace-action code depends on this module.
+To remove the code, delete `scripts/workspace_overview.py`, `assets/dashboard/workspaces.js`, `assets/dashboard/workspaces.css`, its two test modules, and this document. Remove the small integration hooks in `scripts/dashboard.py` (construction, injected server field, one endpoint, two POST actions, two assets), `assets/dashboard/index.html` (scripts/style, tab, panel, dialog), and the `workspaces` page entry/visibility event in `app.js`. It reuses the Git discovery helpers in `scripts/pr_workspaces.py` in one direction only; nothing in the watcher, overview, or workspace-action code depends on this module.
 
 Validation uses temporary clones with real worktrees, fake herdr and agent executables, fake GitHub responses, isolated state directories, and temporary browser servers. Screenshots cover the desktop and mobile listing and the confirmation dialog. Run all checks with `uv run --locked tox`.

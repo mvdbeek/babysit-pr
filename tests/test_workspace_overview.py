@@ -636,3 +636,37 @@ def test_a_failing_snapshot_stays_inside_the_experiment(server, monkeypatch):
         200,
         {"enabled": True, "error": "Workspace experiment unavailable"},
     )
+
+
+@pytest.mark.parametrize("name,workspace_id", [("merged-work", "w1"), ("dirty-work", "w3")])
+def test_open_workspace_reuses_or_creates_without_touching_agents(server, site, name, workspace_id):
+    port, plugin = server
+    _, _, _, worktrees, state, _ = site
+    plugin.value = plugin.collect()
+    before = read(state)["agents"]
+    for _ in range(2):
+        status, value = request(
+            port, "/api/workspace-open", {"key": str(worktrees / name)}, action="workspace-open"
+        )
+        assert status == 200 and value == {"url": f"{wso.COLLIE_URL}/space/{workspace_id}"}
+    opened = calls(state, ["worktree", "open"])
+    assert len(opened) == (0 if name == "merged-work" else 1)
+    if opened:
+        assert "--no-focus" in opened[0]
+    assert read(state)["agents"] == before
+    assert not calls(state, ["workspace", "focus"])
+    assert (worktrees / "dirty-work" / "scratch.txt").read_text() == "left behind"
+
+
+def test_open_workspace_rejects_unknown_removed_and_disabled(site):
+    plugin, _, _, worktrees, _, git = site
+    plugin.value = plugin.collect()
+    with pytest.raises(ValueError, match="Unknown workspace"):
+        plugin.open_workspace({"key": "/not-listed"})
+    key = str(worktrees / "issue-12-crash")
+    git("worktree", "remove", key)
+    with pytest.raises(ValueError, match="changed"):
+        plugin.open_workspace({"key": key})
+    plugin.enabled = False
+    with pytest.raises(ValueError, match="disabled"):
+        plugin.open_workspace({"key": str(worktrees / "merged-work")})

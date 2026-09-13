@@ -231,7 +231,8 @@ class Handler(BaseHTTPRequestHandler):
         # are allowed. Check Origin too, including for trusted tailnet proxies.
         if (
             host not in allowed
-            or action not in {"cancel", "feedback", "workspace-action", "workspace-cleanup"}
+            or action
+            not in {"cancel", "feedback", "workspace-action", "workspace-cleanup", "workspace-open"}
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
         ):
@@ -245,7 +246,11 @@ class Handler(BaseHTTPRequestHandler):
             if (
                 not 0
                 < length
-                <= (200000 if action in {"workspace-action", "workspace-cleanup"} else 1024)
+                <= (
+                    200000
+                    if action in {"workspace-action", "workspace-cleanup", "workspace-open"}
+                    else 1024
+                )
                 or self.headers.get("Content-Type") != "application/json"
             ):
                 raise ValueError("Expected a small JSON action request")
@@ -253,12 +258,16 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
-            if action == "workspace-cleanup":
-                # Experimental cleanup owns its validation behind its own boundary.
+            if action in {"workspace-cleanup", "workspace-open"}:
+                # Experimental workspace actions own their validation.
                 if not self.server.workspace_overview:
                     raise ValueError("The workspace experiment is disabled")
                 try:
-                    value = self.server.workspace_overview.cleanup(request)
+                    value = (
+                        self.server.workspace_overview.open_workspace(request)
+                        if action == "workspace-open"
+                        else self.server.workspace_overview.cleanup(request)
+                    )
                 except ValueError:
                     raise
                 except Exception:

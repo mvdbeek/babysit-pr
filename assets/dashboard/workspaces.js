@@ -20,6 +20,8 @@
   let pending = null;
   const selected = new Set();
   const names = new Map();
+  const opening = new Set();
+  const openResults = new Map();
 
   function node(tag, text, className) {
     const element = document.createElement(tag);
@@ -136,7 +138,52 @@
     cleanup.append(badge(text, tone));
     for (const item of entry.blockers) cleanup.append(node("small", item.text, "pr-meta"));
     line.append(cleanup);
+    const actions = node("td", undefined, "pr-actions");
+    const button = node(
+      "button",
+      opening.has(entry.key)
+        ? "Opening…"
+        : entry.workspace_ids.length || openResults.get(entry.key)?.url
+          ? "Open workspace"
+          : "Create workspace",
+    );
+    button.type = "button";
+    button.disabled = opening.has(entry.key) || (!entry.workspace_ids.length && entry.missing);
+    button.onclick = () => openWorkspace(entry);
+    actions.append(button);
+    const result = openResults.get(entry.key);
+    if (result?.url) actions.append(anchor("Open in Collie", result.url));
+    if (result?.error) {
+      const error = node("small", result.error);
+      error.setAttribute("role", "alert");
+      actions.append(error);
+    }
+    line.append(actions);
     return line;
+  }
+  async function openWorkspace(entry) {
+    const opened = window.open("about:blank", "_blank");
+    if (opened) opened.opener = null;
+    opening.add(entry.key);
+    openResults.delete(entry.key);
+    render();
+    try {
+      const response = await fetch("/api/workspace-open", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-open" },
+        body: JSON.stringify({ key: entry.key }),
+      });
+      const value = await response.json();
+      if (!response.ok || value.error) throw new Error(value.error || `HTTP ${response.status}`);
+      openResults.set(entry.key, value);
+      if (opened) opened.location.href = value.url;
+    } catch (error) {
+      if (opened) opened.close();
+      openResults.set(entry.key, { error: error.message });
+    } finally {
+      opening.delete(entry.key);
+      render();
+    }
   }
   function repoOptions() {
     const select = byId("ws-repo");
