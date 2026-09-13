@@ -359,3 +359,91 @@ def test_corrupt_notification_storage_recovers(page, inbox):
     packets["prs"]["synced_at"] += 1
     refresh(page)
     count(page, 1)
+
+
+def test_silence_button_persists_and_mutes_watcher_and_pr_updates(page, inbox):
+    url, packets = inbox
+    preferences = {"login": "fixture", "silenced": []}
+    page.route("**/api/notification-preferences", lambda route: route.fulfill(json=preferences))
+
+    def toggle(route):
+        request = route.request.post_data_json
+        assert request["login"] == "fixture"
+        preferences["silenced"] = [request["url"]] if request["silenced"] else []
+        route.fulfill(json=preferences)
+
+    page.route("**/api/notification-silence", toggle)
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(url + "/#prs")
+    button = page.get_by_role("button", name="Silence notifications for test/alpha #8", exact=True)
+    button.click()
+    button = page.get_by_role(
+        "button", name="Unsilence notifications for test/alpha #8", exact=True
+    )
+    expect(button).to_have_attribute("aria-pressed", "true")
+    expect(button).to_be_focused()
+    page.screenshot(path="reports/notification-silence-mobile.png")
+    page.get_by_role("tab", name="Watcher", exact=True).click()
+    packets["prs"]["prs"][0]["title"] = "Muted update"
+    packets["prs"]["synced_at"] += 1
+    packets["status"]["jobs"][0].update(
+        status="blocked", updated_at=packets["status"]["jobs"][0]["updated_at"] + 1
+    )
+    refresh(page)
+    count(page, 0)
+    page.reload()
+    count(page, 0)
+    page.get_by_role("tab", name="Pull requests", exact=True).click()
+    button.click()
+    expect(
+        page.get_by_role("button", name="Silence notifications for test/alpha #8", exact=True)
+    ).to_have_attribute("aria-pressed", "false")
+    page.get_by_role("tab", name="Watcher", exact=True).click()
+    refresh(page)
+    count(page, 0)
+    packets["prs"]["prs"][0]["title"] = "Notify again"
+    packets["prs"]["synced_at"] += 1
+    refresh(page)
+    count(page, 1)
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+
+def test_own_actions_and_progress_are_quiet_but_outcomes_notify(page, inbox):
+    url, packets = inbox
+    page.goto(url)
+    count(page, 0)
+    job = packets["status"]["jobs"][0]
+    before = job["status"]
+    job.update(status="stopped", updated_at=job["updated_at"] + 1)
+    job["notification_actions"] = [
+        {"at": job["updated_at"], "before": {"status": before}, "after": {"status": "stopped"}}
+    ]
+    refresh(page)
+    count(page, 0)
+    job.update(
+        status="running",
+        attempts=job.get("attempts", 0) + 1,
+        updated_at=job["updated_at"] + 1,
+        check_details=[{"name": "a", "bucket": "pass"}, {"name": "b", "bucket": "pending"}],
+    )
+    packets["prs"]["prs"][0]["ci"] = "PENDING"
+    packets["prs"]["synced_at"] += 1
+    refresh(page)
+    count(page, 0)
+    job.update(
+        status="blocked",
+        updated_at=job["updated_at"] + 1,
+        check_details=[{"name": "a", "bucket": "pass"}, {"name": "b", "bucket": "fail"}],
+    )
+    refresh(page)
+    count(page, 1)
+
+
+def test_repair_completed_between_browser_polls_notifies(page, inbox):
+    url, packets = inbox
+    page.goto(url)
+    count(page, 0)
+    job = packets["status"]["jobs"][0]
+    job.update(attempts=job.get("attempts", 0) + 1, updated_at=job["updated_at"] + 1)
+    refresh(page)
+    count(page, 1)

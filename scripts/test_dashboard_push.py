@@ -63,6 +63,8 @@ def change(box, packets, clock, title="Changed"):
     packets["prs"]["synced_at"] += 20
     packets["prs"]["prs"][0]["title"] = title
     box.tick()
+    clock[0] += 31
+    box.tick()
 
 
 def test_quiet_baseline_grouping_and_durable_seen(inbox, tmp_path):
@@ -72,16 +74,16 @@ def test_quiet_baseline_grouping_and_durable_seen(inbox, tmp_path):
     change(box, packets, clock)
     packets["watcher"]["jobs"][0].update(status="running", updated_at=1021)
     box.tick()
-    assert [args[1]["count"] for args in sent] == [1, 1]
+    assert [args[1]["count"] for args in sent] == [1]
     view = read(box, identity)
     assert len(view["entries"]) == 1 and len(view["entries"][URL]["notes"]) == 2
     ack = {**identity, "seen": {URL: view["entries"][URL]["at"]}}
     assert box.action("push-seen", ack, ORIGIN)["count"] == 0
     box.tick()
-    assert len(sent) == 2  # Seeing updates does not produce a new background alert.
+    assert len(sent) == 1  # Seeing updates does not produce a new background alert.
     restored = PushInbox(tmp_path, lambda: copy.deepcopy(packets), lambda *args: sent.append(args))
     restored.tick()
-    assert read(restored, identity)["count"] == 0 and len(sent) == 2
+    assert read(restored, identity)["count"] == 0 and len(sent) == 1
     assert box.config() == restored.config()
     assert box.path.stat().st_mode & 0o777 == 0o600
     assert box.key_path.stat().st_mode & 0o777 == 0o600
@@ -309,3 +311,224 @@ def test_http_push_routes_enforce_origin_and_token(server, inbox):
     assert post("push-seen", {**identity, "seen": {}})[0] == 200
     assert post("push-unsubscribe", identity)[0] == 200
     assert post("push-read", identity)[0] == 400
+
+
+def test_ci_progress_and_duplicate_sources_produce_one_settled_alert(inbox):
+    box, packets, sent, clock, identity, _ = inbox
+    pr = packets["prs"]["prs"][0]
+    job = packets["watcher"]["jobs"][0]
+    pr["head_sha"] = job["sha"] = "commit"
+    box.tick()
+    sent.clear()
+    box.action(
+        "push-seen", {**identity, "seen": {URL: read(box, identity)["entries"][URL]["at"]}}, ORIGIN
+    )
+    for number in range(3):
+        clock[0] += 20
+        pr["ci"] = "PENDING"
+        packets["prs"]["synced_at"] = clock[0]
+        job.update(
+            updated_at=clock[0],
+            summary=f"{number} checks completed",
+            check_details=[
+                {"name": "a", "bucket": "pass" if number else "pending"},
+                {"name": "b", "bucket": "pending"},
+            ],
+        )
+        box.tick()
+    assert read(box, identity)["count"] == 0 and not sent
+    clock[0] += 20
+    job.update(
+        updated_at=clock[0],
+        check_details=[{"name": "a", "bucket": "pass"}, {"name": "b", "bucket": "fail"}],
+    )
+    box.tick()
+    assert read(box, identity)["count"] == 1 and not sent
+    clock[0] += 31
+    box.tick()
+    assert len(sent) == 1
+    clock[0] += 300
+    pr["ci"] = "FAILURE"
+    packets["prs"]["synced_at"] = clock[0]
+    box.tick()
+    clock[0] += 31
+    box.tick()
+    assert len(sent) == 1  # The overview catching up is the same CI outcome.
+
+
+def test_repair_progress_is_quiet_and_outcome_is_coalesced(inbox):
+    box, packets, sent, clock, identity, _ = inbox
+    job = packets["watcher"]["jobs"][0]
+    for attempt in range(1, 4):
+        clock[0] += 20
+        job.update(
+            status="running", attempts=attempt, summary=f"Repair {attempt}", updated_at=clock[0]
+        )
+        box.tick()
+        assert read(box, identity)["count"] == 0
+    clock[0] += 20
+    job.update(status="blocked", summary="Needs help", updated_at=clock[0])
+    box.tick()
+    clock[0] += 10
+    job.update(summary="Repair finished, needs help", updated_at=clock[0])
+    box.tick()
+    assert not sent
+    clock[0] += 21
+    box.tick()
+    assert len(sent) == 1
+
+
+def test_silence_persists_for_all_devices_and_unsilence_does_not_replay(inbox, tmp_path):
+    box, packets, sent, clock, identity, _ = inbox
+    other = box.subscribe({"login": "fixture", "subscription": subscription("second")}, ORIGIN)
+    change(box, packets, clock)
+    muted = {"login": "fixture", "url": URL, "silenced": True}
+    assert box.silence(muted)["silenced"] == [URL]
+    assert (
+        read(box, identity)["count"]
+        == read(box, {"login": "fixture", "token": other["token"]})["count"]
+        == 0
+    )
+    sent.clear()
+    change(box, packets, clock, "Quiet update")
+    packets["watcher"]["jobs"][0].update(status="blocked", updated_at=clock[0])
+    box.tick()
+    clock[0] += 40
+    box.tick()
+    assert not sent and read(box, identity)["count"] == 0
+    restored = PushInbox(tmp_path, lambda: copy.deepcopy(packets), lambda *args: sent.append(args))
+    assert restored.preferences()["silenced"] == [URL]
+    # Include an unseen poll when unsilencing, then subscribe a fresh device.
+    packets["prs"]["prs"][0]["title"] = "Last quiet update"
+    packets["prs"]["synced_at"] += 1
+    restored.silence({**muted, "silenced": False})
+    restored.tick()
+    clock[0] += 40
+    restored.tick()
+    assert not sent and read(restored, identity)["count"] == 0
+    change(restored, packets, clock, "Notify again")
+    assert len(sent) == 2 and read(restored, identity)["count"] == 1
+    with pytest.raises(ValueError):
+        restored.silence({**muted, "login": "other"})
+    with pytest.raises(ValueError):
+        restored.silence({**muted, "url": URL.replace("pull", "issues")})
+
+
+def test_notification_attribution_preserves_unrelated_and_existing_updates(inbox):
+    from dashboard_push import notification_fields
+
+    box, packets, sent, clock, identity, _ = inbox
+    job = packets["watcher"]["jobs"][0]
+    clock[0] += 20
+    job.update(
+        status="stopped",
+        summary="Stopped by user",
+        updated_at=clock[0],
+        notification_actions=[
+            {
+                "at": clock[0],
+                "before": {"status": "watching"},
+                "after": {"status": "stopped"},
+            }
+        ],
+    )
+    box.tick()
+    assert not sent and read(box, identity)["count"] == 0
+    change(box, packets, clock)
+    job.update(summary="Own action", updated_at=clock[0])
+    box.tick()
+    assert read(box, identity)["count"] == 1  # Never acknowledge earlier unseen activity.
+    old = {"at": 1, "values": {"updated_at": "2026-01-01", "title": "Before", "ci": "PENDING"}}
+    sample = {
+        "values": {"updated_at": "2026-01-02", "title": "After", "ci": "SUCCESS"},
+        "activity": {
+            "since": "2025-01-01",
+            "events": [{"type": "RenamedTitleEvent", "actor": "fixture", "at": "2026-01-02"}],
+        },
+    }
+    assert notification_fields("prs", sample, old, "fixture") == {"ci"}
+    sample["activity"]["events"][0]["actor"] = "someone-else"
+    assert notification_fields("prs", sample, old, "fixture") == {"ci", "title", "updated_at"}
+    sample["activity"]["events"][0].update(actor="fixture", type="PullRequestCommit")
+    assert "updated_at" in notification_fields("prs", sample, old, "fixture")
+    sample["activity"]["since"] = "2026-01-02"
+    assert "updated_at" in notification_fields("prs", sample, old, "fixture")
+
+
+def test_own_feedback_addition_is_quiet_but_edits_and_other_authors_notify():
+    from dashboard_push import notification_fields
+
+    own = {"kind": "issue_comment", "id": 1, "body": "Own comment"}
+    old = {"at": 1, "values": {"feedback": []}}
+    sample = {"values": {"feedback": [own]}, "feedback_authors": [{**own, "author": "fixture"}]}
+    assert not notification_fields("watcher", sample, old, "fixture")
+    old["values"]["feedback"] = [{**own, "body": "Before edit"}]
+    assert notification_fields("watcher", sample, old, "fixture") == {"feedback"}
+    old["values"]["feedback"] = []
+    sample["feedback_authors"][0]["author"] = "reviewer"
+    assert notification_fields("watcher", sample, old, "fixture") == {"feedback"}
+
+
+def test_notification_preferences_http_validation(server, inbox):
+    box, _, _, _, _, _ = inbox
+    server.push = box
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    conn.request("GET", "/api/notification-preferences")
+    response = conn.getresponse()
+    assert response.status == 200 and json.loads(response.read())["silenced"] == []
+    conn.close()
+    for origin, data, expected in [
+        ("https://evil.test", {"login": "fixture", "url": URL, "silenced": True}, 403),
+        (None, {"login": "other", "url": URL, "silenced": True}, 400),
+        (None, {"login": "fixture", "url": URL, "silenced": True}, 200),
+        (None, {"login": "fixture", "url": URL, "silenced": False}, 200),
+    ]:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+        headers = {"Content-Type": "application/json", "X-Babysit-Action": "notification-silence"}
+        if origin:
+            headers["Origin"] = origin
+        conn.request("POST", "/api/notification-silence", json.dumps(data), headers)
+        response = conn.getresponse()
+        assert response.status == expected
+        response.read()
+        conn.close()
+
+
+def test_upgrade_of_saved_check_details_is_quiet():
+    from dashboard_push import notification_fields
+
+    old = {"at": 1, "values": {"checks": [{"name": "test", "bucket": "pass"}]}}
+    assert not notification_fields("watcher", {"values": {"checks": "SUCCESS"}}, old, "fixture")
+
+
+def test_attribution_requires_a_complete_known_timeline():
+    from latest_activity import notification_activity
+
+    node = {
+        "createdAt": "2026-01-01",
+        "timelineItems": {
+            "nodes": [
+                {
+                    "__typename": "IssueComment",
+                    "author": {"login": "fixture"},
+                    "createdAt": "2026-01-02",
+                },
+            ]
+        },
+    }
+    activity = notification_activity(node)
+    assert activity["since"] == "2026-01-01"
+    assert any(event["actor"] == "fixture" for event in activity["events"])
+    node["timelineItems"]["nodes"].append({"__typename": "UnknownEvent"})
+    assert notification_activity(node) is None
+
+
+def test_repair_completed_between_polls_still_notifies(inbox):
+    box, packets, sent, clock, identity, _ = inbox
+    clock[0] += 20
+    packets["watcher"]["jobs"][0].update(status="watching", attempts=1, updated_at=clock[0])
+    box.tick()
+    assert read(box, identity)["count"] == 1 and not sent
+    clock[0] += 31
+    box.tick()
+    assert len(sent) == 1

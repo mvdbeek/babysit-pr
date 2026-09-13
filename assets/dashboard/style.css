@@ -833,7 +833,8 @@ button:disabled {
   padding: 12px 4px;
   vertical-align: top;
 }
-.item-pin {
+.item-pin,
+.notification-silence {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -853,6 +854,7 @@ button:disabled {
   stroke-width: 1.5;
   stroke-linejoin: round;
 }
+.notification-silence:hover,
 .item-pin:hover,
 .item-pin[aria-pressed="true"] {
   color: var(--green);
@@ -928,7 +930,8 @@ button:disabled {
     width: 44px;
     padding: 0;
   }
-  .item-pin {
+  .item-pin,
+  .notification-silence {
     width: 44px;
     height: 44px;
   }
@@ -1342,4 +1345,22 @@ button:disabled {
 .notification-target {
   outline: 2px solid var(--green);
   outline-offset: -2px;
+}
+
+.notification-silence {
+  display: flex;
+  margin-top: 6px;
+}
+.notification-silence svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.notification-silence[aria-pressed="true"] {
+  color: var(--amber);
+  background: var(--bg);
 }

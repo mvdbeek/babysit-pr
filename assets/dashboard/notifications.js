@@ -7,7 +7,95 @@
   let watcherSnapshot = null;
   let renderedList = null;
   const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-  const blank = () => ({ baselines: {}, entries: {} });
+  const blank = () => ({ baselines: {}, entries: {}, outcomes: {} });
+  const ownActivityFields = {
+    IssueComment: ["comments", "updated_at"],
+    ContentEdited: ["updated_at"],
+    RenamedTitleEvent: ["title", "updated_at"],
+    AssignedEvent: ["assignees", "roles", "updated_at"],
+    UnassignedEvent: ["assignees", "roles", "updated_at"],
+    LabeledEvent: ["labels", "updated_at"],
+    UnlabeledEvent: ["labels", "updated_at"],
+    ReadyForReviewEvent: ["draft", "updated_at"],
+    ConvertToDraftEvent: ["draft", "updated_at"],
+    ReviewRequestedEvent: ["roles", "updated_at"],
+    ReviewRequestRemovedEvent: ["roles", "updated_at"],
+    PullRequestReview: ["review_decision", "updated_at"],
+    ReviewDismissedEvent: ["review_decision", "updated_at"],
+    HeadRefForcePushedEvent: ["head_sha", "updated_at"],
+  };
+
+  function notificationFields(source, sample, old, values) {
+    if (source === "watcher" && old) {
+      const checks = JSON.parse(old.values.checks || "null");
+      if (Array.isArray(checks)) old.values.checks = JSON.stringify(checkResult(checks));
+    }
+    const fields = new Set(
+      Object.keys(values).filter((field) => old?.values[field] !== values[field]),
+    );
+    if (source === "prs" && !["SUCCESS", "FAILURE", "ERROR"].includes(sample.values.ci))
+      fields.delete("ci");
+    if (source === "watcher") {
+      if (sample.values.status === "running") {
+        fields.delete("attempts");
+        fields.delete("status");
+      }
+      if (!["SUCCESS", "FAILURE", "ERROR"].includes(sample.values.checks)) fields.delete("checks");
+      fields.delete("summary");
+      if (!old) return [...fields];
+      for (const field of fields) {
+        const actionField =
+          { approved: "feedback_approved", outcome: "pr_outcome" }[field] || field;
+        let expected = old.values[field];
+        for (const action of sample.actions || []) {
+          if (
+            action.at * 1000 >= old.at &&
+            Object.hasOwn(action.before, actionField) &&
+            expected === JSON.stringify(action.before[actionField])
+          )
+            expected = JSON.stringify(action.after[actionField]);
+        }
+        if (expected === values[field]) fields.delete(field);
+      }
+      const key = (item) => `${item.kind}:${item.id}`;
+      const previous = new Map(
+        JSON.parse(old.values.feedback || "[]").map((item) => [key(item), JSON.stringify(item)]),
+      );
+      const current = new Map(
+        (sample.values.feedback || []).map((item) => [key(item), JSON.stringify(item)]),
+      );
+      const authors = new Map(
+        (sample.feedbackAuthors || []).map((item) => [key(item), item.author?.toLowerCase()]),
+      );
+      const added = [...current.keys()].filter((id) => !previous.has(id));
+      if (
+        added.length &&
+        [...previous].every(([id, body]) => current.get(id) === body) &&
+        added.every((id) => authors.get(id) === account.login.toLowerCase())
+      )
+        fields.delete("feedback");
+      return [...fields];
+    }
+    const history = sample.activity;
+    const cursor = old && JSON.parse(old.values.updated_at || "null");
+    const updated = sample.values.updated_at;
+    if (!old || !history?.since || !cursor || !updated || history.since > cursor)
+      return [...fields];
+    const events = history.events.filter((event) => event.at > cursor);
+    if (
+      !events.length ||
+      !events.some((event) => event.at >= updated) ||
+      events.some(
+        (event) =>
+          event.actor?.toLowerCase() !== account.login.toLowerCase() ||
+          !ownActivityFields[event.type],
+      )
+    )
+      return [...fields];
+    for (const event of events)
+      for (const field of ownActivityFields[event.type]) fields.delete(field);
+    return [...fields];
+  }
 
   function subject(raw) {
     try {
@@ -31,6 +119,7 @@
     const value = JSON.parse(localStorage.getItem(key));
     if (!object(value) || !object(value.baselines) || !object(value.entries)) return blank();
     const result = blank();
+    if (object(value.outcomes)) result.outcomes = value.outcomes;
     for (const source of ["prs", "issues", "watcher"]) {
       if (!object(value.baselines[source])) continue;
       result.baselines[source] = {};
@@ -88,13 +177,108 @@
     account = accounts.get(login);
     window.dashboardPush?.account(login);
     sync();
+    try {
+      account.silenced = JSON.parse(localStorage.getItem(`${account.key}:silenced`)) || [];
+    } catch {
+      account.silenced = [];
+    }
+    refreshPreferences();
     render();
+  }
+
+  function isSilenced(url) {
+    return account?.silenced?.includes(subject(url)?.key) || false;
+  }
+
+  function applyPreferences(target, value) {
+    if (value.login !== target.login || !Array.isArray(value.silenced)) return;
+    const changed = JSON.stringify(target.silenced) !== JSON.stringify(value.silenced);
+    target.silenced = value.silenced;
+    try {
+      localStorage.setItem(`${target.key}:silenced`, JSON.stringify(value.silenced));
+    } catch {
+      /* Server preferences still persist. */
+    }
+    if (account !== target) return;
+    sync();
+    for (const url of target.silenced) {
+      const entry = target.state.entries[url];
+      if (entry) entry.seenAt = entry.at;
+    }
+    save();
+    render();
+    if (changed) window.dispatchEvent(new Event("notification-preferences"));
+  }
+
+  async function refreshPreferences(target = account) {
+    if (!target || target.loadingPreferences) return;
+    target.loadingPreferences = true;
+    try {
+      const response = await fetch("/api/notification-preferences");
+      if (response.ok) applyPreferences(target, await response.json());
+    } catch {
+      /* Keep the last saved preferences while offline. */
+    } finally {
+      target.loadingPreferences = false;
+    }
+  }
+
+  function silenceButton(url) {
+    const button = node("button", undefined, "notification-silence");
+    button.type = "button";
+    button.dataset.url = url;
+    const muted = isSilenced(url);
+    const label = `${muted ? "Unsilence" : "Silence"} notifications for ${subject(url)?.label || "PR"}`;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-pressed", String(muted));
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute(
+      "d",
+      "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" + (muted ? "M2 2l20 20" : ""),
+    );
+    svg.append(path);
+    button.append(svg);
+    button.onclick = async () => {
+      const target = account;
+      button.disabled = true;
+      try {
+        const response = await fetch("/api/notification-silence", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Babysit-Action": "notification-silence",
+          },
+          body: JSON.stringify({ login: target.login, url, silenced: !muted }),
+        });
+        const value = await response.json();
+        if (!response.ok)
+          throw new Error(value.error || "Could not change notification preferences");
+        applyPreferences(target, value);
+        if (account === target) {
+          seen([url]);
+          [...document.querySelectorAll(".notification-silence")]
+            .find((item) => item.dataset.url === url)
+            ?.focus({ preventScroll: true });
+        }
+      } catch (error) {
+        window.alert(error.message);
+      } finally {
+        button.disabled = false;
+      }
+    };
+    return button;
   }
 
   function recent() {
     return Object.entries(
       window.dashboardPush?.entries(account?.login) || account?.state.entries || {},
-    ).sort((a, b) => b[1].at - a[1].at || a[0].localeCompare(b[0]));
+    )
+      .map(([url, entry]) => [url, isSilenced(url) ? { ...entry, seenAt: entry.at } : entry])
+      .sort((a, b) => b[1].at - a[1].at || a[0].localeCompare(b[0]));
   }
 
   function save() {
@@ -232,9 +416,23 @@
           JSON.stringify(value ?? null),
         ]),
       );
-      const fields = Object.keys(values).filter((field) => old?.values[field] !== values[field]);
+      const fields = notificationFields(source, sample, old, values);
       baseline[item.key] = { at: sample.at, values };
-      const changed = initialized && (!old || fields.length > 0);
+      const ciField = source === "prs" ? "ci" : source === "watcher" ? "checks" : null;
+      const result = sample.values[ciField];
+      if (["SUCCESS", "FAILURE", "ERROR"].includes(result) && (!old || fields.includes(ciField))) {
+        const outcome = JSON.stringify({
+          sha: sample.values[source === "prs" ? "head_sha" : "sha"] ?? null,
+          result,
+        });
+        if (account.state.outcomes[item.key] === outcome) {
+          const index = fields.indexOf(ciField);
+          if (index !== -1) fields.splice(index, 1);
+        }
+        account.state.outcomes[item.key] = outcome;
+      }
+      if (isSilenced(item.key)) continue;
+      const changed = initialized && fields.length > 0;
       let entry = account.state.entries[item.key];
       if (!entry && !changed && initialized) continue;
       if (!entry)
@@ -265,6 +463,33 @@
     render();
   }
 
+  function checkResult(checks) {
+    if (!checks.length) return "NONE";
+    if (
+      checks.some(
+        (check) =>
+          check.bucket === "pending" ||
+          [
+            "PENDING",
+            "QUEUED",
+            "IN_PROGRESS",
+            "EXPECTED",
+            "WAITING",
+            "REQUESTED",
+            "PENDING_APPROVAL",
+          ].includes(check.state),
+      )
+    )
+      return "PENDING";
+    return checks.some(
+      (check) =>
+        ["fail", "cancel"].includes(check.bucket) ||
+        ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"].includes(check.state),
+    )
+      ? "FAILURE"
+      : "SUCCESS";
+  }
+
   function watcher(payload) {
     if (payload.error) return;
     watcherSnapshot = payload;
@@ -276,6 +501,8 @@
         title: job.branch,
         at: (job.updated_at || 0) * 1000,
         seedAt: (job.updated_at || 0) * 1000,
+        actions: job.notification_actions,
+        feedbackAuthors: job.feedback,
         values: {
           status: job.status,
           summary: job.summary,
@@ -284,9 +511,7 @@
           attempts: job.attempts,
           approved: job.feedback_approved,
           feedback: (job.feedback || []).map(({ kind, id, body }) => ({ kind, id, body })),
-          checks: (job.check_details || [])
-            .map(({ name, bucket, state }) => ({ name, bucket, state }))
-            .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+          checks: checkResult(job.check_details || []),
         },
         summary: job.summary || `Watcher: ${job.status}`,
       })),
@@ -339,6 +564,7 @@
       (payload[kind] || []).map((item) => ({
         url: item.url,
         title: item.title,
+        activity: item.notification_activity,
         at: payload.synced_at * 1000,
         seedAt: Date.parse(item.updated_at) || payload.synced_at * 1000,
         values: Object.fromEntries(
@@ -385,6 +611,7 @@
   window.dashboardNotifications = {
     overview,
     watcher,
+    silenceButton,
     seen,
     render,
     unseen: () =>
@@ -403,5 +630,8 @@
         ]),
       ),
   };
+  setInterval(() => {
+    if (!document.hidden) refreshPreferences();
+  }, 15000);
   if (new URLSearchParams(location.search).get("updates") === "1") dialog.showModal();
 })();

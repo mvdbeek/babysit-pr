@@ -1153,6 +1153,8 @@ function itemTable(spec) {
       const { cells, title, fields, updated } = spec.row(item);
       const pinCell = el("td", undefined, "item-pin-cell");
       pinCell.append(pinButton(item, pins));
+      if (spec.key === "prs" && window.dashboardNotifications?.silenceButton)
+        pinCell.append(window.dashboardNotifications.silenceButton(item.url));
       if (change) {
         row.classList.add(change.isNew ? "pr-new" : "pr-changed");
         title.append(
@@ -2336,3 +2338,5 @@ function ciLogStream(url, detail) {
 
 document.addEventListener("pointerdown", (event) => dismissSelect?.(event.target));
 for (const select of document.querySelectorAll("select")) searchableSelect(select);
+
+window.addEventListener("notification-preferences", () => prTable.render());

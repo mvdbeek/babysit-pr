@@ -50,6 +50,123 @@ FIELDS = {
         "checks": "CI",
     },
 }
+OWN_ACTIVITY_FIELDS = {
+    "IssueComment": {"comments", "updated_at"},
+    "ContentEdited": {"updated_at"},
+    "RenamedTitleEvent": {"title", "updated_at"},
+    "AssignedEvent": {"assignees", "roles", "updated_at"},
+    "UnassignedEvent": {"assignees", "roles", "updated_at"},
+    "LabeledEvent": {"labels", "updated_at"},
+    "UnlabeledEvent": {"labels", "updated_at"},
+    "ReadyForReviewEvent": {"draft", "updated_at"},
+    "ConvertToDraftEvent": {"draft", "updated_at"},
+    "ReviewRequestedEvent": {"roles", "updated_at"},
+    "ReviewRequestRemovedEvent": {"roles", "updated_at"},
+    "PullRequestReview": {"review_decision", "updated_at"},
+    "ReviewDismissedEvent": {"review_decision", "updated_at"},
+    "HeadRefForcePushedEvent": {"head_sha", "updated_at"},
+}
+
+
+def check_result(checks):
+    if not checks:
+        return "NONE"
+    if any(
+        check.get("bucket") == "pending"
+        or check.get("state")
+        in {
+            "PENDING",
+            "QUEUED",
+            "IN_PROGRESS",
+            "EXPECTED",
+            "WAITING",
+            "REQUESTED",
+            "PENDING_APPROVAL",
+        }
+        for check in checks
+    ):
+        return "PENDING"
+    return (
+        "FAILURE"
+        if any(
+            check.get("bucket") in {"fail", "cancel"}
+            or check.get("state")
+            in {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"}
+            for check in checks
+        )
+        else "SUCCESS"
+    )
+
+
+def notification_fields(source, sample, old, login):
+    values = sample["values"]
+    previous = dict(old["values"]) if old else {}
+    # Upgrade saved per-check fingerprints without announcing an existing result.
+    if source == "watcher" and isinstance(previous.get("checks"), list):
+        previous["checks"] = check_result(previous["checks"])
+    fields = {field for field in values if not old or previous.get(field) != values[field]}
+    if source == "prs" and values.get("ci") not in {"SUCCESS", "FAILURE", "ERROR"}:
+        fields.discard("ci")
+    if source == "watcher":
+        if values.get("status") == "running":
+            fields.discard("attempts")
+            fields.discard("status")
+        if values.get("checks") not in {"SUCCESS", "FAILURE", "ERROR"}:
+            fields.discard("checks")
+        fields.discard("summary")  # Poll wording alone is not a new outcome.
+        if not old:
+            return fields
+        for field in list(fields):
+            expected = previous.get(field)
+            for action in sample.get("actions", []):
+                if (
+                    action["at"] * 1000 >= old["at"]
+                    and field in action["before"]
+                    and expected == action["before"][field]
+                ):
+                    expected = action["after"][field]
+            if expected == values[field]:
+                fields.discard(field)
+        old_feedback = {
+            f"{item['kind']}:{item['id']}": item for item in previous.get("feedback", [])
+        }
+        current = {f"{item['kind']}:{item['id']}": item for item in values.get("feedback", [])}
+        authors = {
+            f"{item['kind']}:{item['id']}": (item.get("author") or "").lower()
+            for item in sample.get("feedback_authors", [])
+        }
+        added = current.keys() - old_feedback.keys()
+        if (
+            added
+            and all(current.get(key) == item for key, item in old_feedback.items())
+            and all(authors.get(key) == login.lower() for key in added)
+        ):
+            fields.discard("feedback")
+        return fields
+    history = sample.get("activity")
+    cursor = previous.get("updated_at")
+    updated = values.get("updated_at")
+    if (
+        not old
+        or not history
+        or not cursor
+        or not updated
+        or not history.get("since")
+        or history["since"] > cursor
+    ):
+        return fields
+    events = [event for event in history["events"] if event["at"] > cursor]
+    if (
+        not events
+        or max(event["at"] for event in events) < updated
+        or any(
+            (event.get("actor") or "").lower() != login.lower()
+            or event["type"] not in OWN_ACTIVITY_FIELDS
+            for event in events
+        )
+    ):
+        return fields
+    return fields - set().union(*(OWN_ACTIVITY_FIELDS[event["type"]] for event in events))
 
 
 def subject(raw):
@@ -81,13 +198,7 @@ def samples(source, payload):
                 {field: comment.get(field) for field in ("kind", "id", "body")}
                 for comment in item.get("feedback", [])
             ]
-            values["checks"] = sorted(
-                (
-                    {field: check.get(field) for field in ("name", "bucket", "state")}
-                    for check in item.get("check_details", [])
-                ),
-                key=lambda value: json.dumps(value),
-            )
+            values["checks"] = check_result(item.get("check_details", []))
         result.append(
             {
                 "url": url,
@@ -96,6 +207,9 @@ def samples(source, payload):
                 if source == "watcher"
                 else payload["synced_at"] * 1000,
                 "values": values,
+                "actions": item.get("notification_actions", []),
+                "activity": item.get("notification_activity"),
+                "feedback_authors": item.get("feedback", []),
             }
         )
         result[-1]["seed_at"] = result[-1]["at"]
@@ -109,7 +223,7 @@ def samples(source, payload):
     return result
 
 
-def observe(device, source, payload, now):
+def observe(device, source, payload, now, silenced=()):
     if not payload or payload.get("error") or payload.get("refreshing"):
         return
     if source != "watcher" and (
@@ -124,7 +238,24 @@ def observe(device, source, payload, now):
         if old and sample["at"] < old["at"]:
             continue
         baseline[url] = sample
-        changed = initialized and (not old or old["values"] != sample["values"])
+        changed_fields = notification_fields(source, sample, old, device["login"])
+        ci_field = "ci" if source == "prs" else "checks" if source == "watcher" else None
+        result = sample["values"].get(ci_field)
+        if result in {"SUCCESS", "FAILURE", "ERROR"} and (not old or ci_field in changed_fields):
+            outcome = {
+                "sha": sample["values"].get("head_sha" if source == "prs" else "sha"),
+                "result": result,
+            }
+            outcomes = device.setdefault("outcomes", {})
+            if outcomes.get(url) == outcome:
+                changed_fields.discard(ci_field)
+            outcomes[url] = outcome
+        if url in silenced:
+            entry = device["entries"].get(url)
+            if entry:
+                entry["seenAt"] = entry["at"]
+            continue
+        changed = initialized and bool(changed_fields)
         entry = device["entries"].get(url)
         if not entry and not changed and old:
             continue
@@ -138,12 +269,9 @@ def observe(device, source, payload, now):
         if source != "watcher" or "prs" not in entry["notes"]:
             entry["title"] = sample["title"]
         if changed:
+            entry["changedAt"] = now
             entry["at"] = max(now, entry["at"] + 1, entry["seenAt"] + 1)
-            fields = [
-                label
-                for field, label in FIELDS[source].items()
-                if not old or old["values"].get(field) != sample["values"][field]
-            ]
+            fields = [label for field, label in FIELDS[source].items() if field in changed_fields]
             entry["notes"][source] = {"at": entry["at"], "text": " · ".join(fields) + " updated"}
         elif source not in entry["notes"]:
             entry["notes"][source] = {"at": entry["at"], "text": "Recent activity"}
@@ -243,9 +371,19 @@ class PushInbox:
         self.stopping = threading.Event()
         self.worker: threading.Thread | None = None
         self.devices: dict[str, dict] = {}
+        self.silenced: dict[str, list[str]] = {}
         self.load_error = False
         try:
-            self.devices = json.loads(self.path.read_text())["devices"]
+            state = json.loads(self.path.read_text())
+            self.devices = state["devices"]
+            self.silenced = state.get("silenced", {})
+            if not isinstance(self.silenced, dict) or any(
+                not isinstance(login, str)
+                or not isinstance(urls, list)
+                or any(not subject(url) for url in urls)
+                for login, urls in self.silenced.items()
+            ):
+                raise ValueError("Invalid notification preferences")
             if not isinstance(self.devices, dict) or any(
                 not isinstance(value, dict) for value in self.devices.values()
             ):
@@ -262,8 +400,42 @@ class PushInbox:
         temp = self.path.with_suffix(".tmp")
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as stream:
-            json.dump({"devices": self.devices}, stream)
+            json.dump({"devices": self.devices, "silenced": self.silenced}, stream)
         temp.replace(self.path)
+
+    def preferences(self):
+        login = self.snapshots().get("prs", {}).get("login")
+        with self.lock:
+            return {"login": login, "silenced": list(self.silenced.get(login, []))}
+
+    def silence(self, request):
+        if self.load_error:
+            raise ValueError("The saved notification state needs repair")
+        packets = self.snapshots()
+        login = packets.get("prs", {}).get("login")
+        url = subject(request.get("url"))
+        if not login or request.get("login") != login:
+            raise ValueError("Wait for the PR overview to finish syncing")
+        if not url or "/pull/" not in url or not isinstance(request.get("silenced"), bool):
+            raise ValueError("Supply a PR and its notification preference")
+        with self.lock:
+            urls = set(self.silenced.get(login, []))
+            # Observe the current snapshot while muted, including when unsilencing,
+            # so activity during the quiet period cannot be replayed later.
+            for device in self.devices.values():
+                if device["login"] == login:
+                    for source, payload in packets.items():
+                        observe(device, source, payload, time.time() * 1000, urls | {url})
+                    entry = device["entries"].get(url)
+                    if entry:
+                        entry["seenAt"] = entry["at"]
+            if request["silenced"]:
+                urls.add(url)
+            else:
+                urls.discard(url)
+            self.silenced[login] = sorted(urls)
+            self.save()
+            return {"login": login, "silenced": sorted(urls)}
 
     def config(self):
         if self.load_error:
@@ -395,7 +567,7 @@ class PushInbox:
                 "failures": 0,
             }
             for source, payload in packets.items():
-                observe(device, source, payload, now)
+                observe(device, source, payload, now, self.silenced.get(login, []))
             for url, entry in history.items():
                 device["entries"][subject(url)] = {
                     "title": entry["title"],
@@ -423,6 +595,9 @@ class PushInbox:
                         )
                 if url in device["entries"]:
                     device["entries"][url]["seenAt"] = 0
+            for url in self.silenced.get(login, []):
+                if url in device["entries"]:
+                    device["entries"][url]["seenAt"] = device["entries"][url]["at"]
             device["sent"] = unread(device)
             token = secrets.token_urlsafe(32)
             self.devices[token] = device
@@ -444,7 +619,9 @@ class PushInbox:
                 if packets.get("prs", {}).get("login") != device["login"]:
                     continue
                 for source, payload in packets.items():
-                    observe(device, source, payload, now * 1000)
+                    observe(
+                        device, source, payload, now * 1000, self.silenced.get(device["login"], [])
+                    )
             if before != json.dumps(self.devices, sort_keys=True):
                 self.save()
             tokens = list(self.devices)
@@ -459,6 +636,14 @@ class PushInbox:
                     continue
                 pending = unread(device)
                 fresh = {url: at for url, at in pending.items() if at > device["sent"].get(url, 0)}
+                # Let a subject settle for 30 seconds; CI and repair outcomes arriving
+                # in adjacent polls become one alert. Other subjects do not delay it.
+                fresh = {
+                    url: at
+                    for url, at in fresh.items()
+                    if now * 1000 - device["entries"][url].get("changedAt", 0) >= 30000
+                    and url not in self.silenced.get(device["login"], [])
+                }
                 if not fresh:
                     continue
                 latest = max(fresh, key=lambda url: fresh[url])
@@ -490,7 +675,7 @@ class PushInbox:
             else:
                 with self.lock:
                     if device is not None and self.devices.get(token) is device:
-                        device["sent"].update(pending)
+                        device["sent"].update(fresh)
                         device["failures"] = 0
                         device["error"] = None
                         self.save()

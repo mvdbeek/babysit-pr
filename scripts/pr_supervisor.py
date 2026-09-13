@@ -237,6 +237,29 @@ def approved_feedback(job):
     return [item for item in job.get("pending_reviews", []) if feedback_token(item) in approved]
 
 
+def notification_values(job):
+    return {
+        "status": job.get("status"),
+        "summary": job.get("summary", ""),
+        "feedback_approved": len(approved_feedback(job)),
+        "feedback": [
+            {field: item.get(field) for field in ("kind", "id", "body")}
+            for item in job.get("pending_reviews", [])
+        ],
+    }
+
+
+def record_notification_action(job, before):
+    job["notification_actions"] = [
+        *job.get("notification_actions", [])[-9:],
+        {
+            "before": before,
+            "after": notification_values(job),
+            "at": time.time(),
+        },
+    ]
+
+
 def approve_feedback(db, key, token):
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -250,6 +273,7 @@ def approve_feedback(db, key, token):
         items = job["pending_reviews"]
         if not items or token != feedback_token(items):
             raise ValueError("Feedback changed; refresh and review the current batch")
+        before = notification_values(job)
         job.update(
             approved_reviews=[feedback_token(item) for item in items],
             epoch=job["epoch"] + 1,
@@ -257,6 +281,7 @@ def approve_feedback(db, key, token):
             next_poll=0,
             summary="Feedback approved; waiting for a fresh PR observation",
         )
+        record_notification_action(job, before)
         save_job(db, job)
     return job
 
@@ -273,6 +298,7 @@ def mark_feedback_addressed(db, key, token, item_key):
         item = next((v for v in items if f"{v['kind']}:{v['id']}" == item_key), None)
         if item is None:
             raise ValueError("Feedback item not found")
+        before = notification_values(job)
         state = job.setdefault("watcher_state", {})
         state.setdefault("seen_feedback_content_versions", {})[item_key] = (
             watch.feedback_content_version(item)
@@ -290,6 +316,7 @@ def mark_feedback_addressed(db, key, token, item_key):
         job.update(epoch=job["epoch"] + 1, dispatch_ready=False, next_poll=0)
         if job["status"] == "watching":
             job["summary"] = "Feedback marked addressed; waiting for a fresh PR observation"
+        record_notification_action(job, before)
         save_job(db, job)
     return job
 
@@ -330,12 +357,14 @@ def stop_watch(db, key):
         job = get_job(db, key)
         if job["status"] in {"stopped", "closed"} or job.get("stop_after_run"):
             return job
+        before = notification_values(job)
         job["epoch"] += 1
         job["dispatch_ready"] = False
         if job["status"] == "running":
             job.update(stop_after_run=True, summary="Finishing current repair before stopping")
         else:
             job.update(status="stopped", summary="Watch cancelled")
+        record_notification_action(job, before)
         save_job(db, job)
     return job
 

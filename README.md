@@ -23,6 +23,25 @@ or a highlighted PR/issue row. Links reveal the item even when filters or pagina
 would hide it. Phone alerts also open the source of the latest update. **Mark all
 seen** is above the notification log.
 
+Notifications skip the immediate effects of cancelling watches, approving feedback,
+and marking feedback addressed. Your own newly added review comments and GitHub
+activity are also skipped when the available timeline identifies you and covers
+the interval since the last snapshot. CI results, repair outcomes, other people's
+activity, and changes with uncertain attribution still notify. Commit authorship
+alone does not prove who pushed a change. Existing unread updates are retained;
+the suppression applies to the new change, rather than marking the whole item seen.
+
+PR rows have a bell button to **Silence notifications** for that PR, including its
+watcher. This preference persists on the dashboard server and applies to every
+device on the account until you unsilence it. Silencing clears that PR's unread
+notification. Updates observed while silenced are not replayed when you unsilence
+it. PR list change highlights still work independently.
+
+CI alerts summarize the completed checks for a commit; individual check progress
+and repair starts/retries are quiet. Repair outcomes still notify. Push delivery
+waits for 30 seconds without another update to the same PR/issue, combining nearby
+updates into one alert and one inbox item.
+
 For **iPhone Home Screen badges and background alerts**, run the dashboard with
 the optional Web Push dependency:
 

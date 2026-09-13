@@ -149,3 +149,25 @@ def latest_activity(node):
         )
     known = [item for item in candidates if item and item["at"]]
     return max(known, key=lambda item: item["at"], default=None)
+
+
+def notification_activity(node):
+    """Bound the attribution window; incomplete timelines must not suppress alerts."""
+    timeline = node.get("timelineItems")
+    if timeline is None:
+        return None
+    nodes = timeline.get("nodes") or []
+    events = [timeline_activity(event) if event else None for event in nodes]
+    if any(event is None for event in events):
+        return None
+    since = (
+        min((event["at"] for event in events if event), default=node.get("createdAt"))
+        if len(nodes) >= 5
+        else node.get("createdAt")
+    )
+    if len(nodes) < 5:
+        events.append(
+            activity("Opened", actor_name(node.get("author")), "opened this", node.get("createdAt"))
+        )
+    events.append(content_edit(node, "edited the description"))
+    return {"since": since, "events": [event for event in events if event and event["at"]]}

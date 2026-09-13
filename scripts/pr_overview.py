@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from latest_activity import activity_fragment, latest_activity
+from latest_activity import activity_fragment, latest_activity, notification_activity
 
 POLL_SECONDS = 300
 ROLES = {"author": "author", "assignee": "assignee", "reviewer": "review-involves"}
@@ -56,6 +56,7 @@ def pr_record(node, roles):
         "head_sha": node.get("headRefOid"),
         "updated_at": node["updatedAt"],
         "latest_activity": latest_activity(node),
+        "notification_activity": notification_activity(node),
         "opened_at": node["createdAt"],
         "draft": node["isDraft"],
         "review_decision": node.get("reviewDecision"),

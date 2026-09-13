@@ -54,6 +54,7 @@ def present_job(job):
         "feedback": feedback,
         "feedback_token": feedback_token(feedback),
         "feedback_approved": len(approved_feedback(job)),
+        "notification_actions": job.get("notification_actions", []),
         "cleanup_ready": bool(
             job.get("cleanup_ready")
             or (job.get("status") == "closed" and (pr.get("closed") or pr.get("merged")))
@@ -250,6 +251,7 @@ class Handler(BaseHTTPRequestHandler):
                 "push-unsubscribe",
                 "push-read",
                 "push-seen",
+                "notification-silence",
             }
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
@@ -277,6 +279,11 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
+            if action == "notification-silence":
+                if not self.server.push:
+                    raise ValueError("Notification preferences are unavailable")
+                self.send_json(200, self.server.push.silence(request))
+                return
             if action.startswith("push-"):
                 if not self.server.push:
                     raise ValueError("Web Push is not enabled")
@@ -341,6 +348,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route.path == "/api/status":
                 self.send_json(200, status(self.server.home))
+            elif route.path == "/api/notification-preferences":
+                self.send_json(
+                    200,
+                    self.server.push.preferences()
+                    if self.server.push
+                    else {"login": None, "silenced": []},
+                )
             elif route.path == "/api/push-config":
                 self.send_json(
                     200, self.server.push.config() if self.server.push else {"available": False}

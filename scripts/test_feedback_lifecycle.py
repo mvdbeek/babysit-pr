@@ -184,3 +184,29 @@ def test_mark_addressed_does_not_interfere_with_running_or_ended_watches(tmp_pat
         )
     assert supervisor.get_job(db, j["id"])["pending_reviews"] == j["pending_reviews"]
     db.close()
+
+
+@pytest.mark.parametrize("action", ["approve", "addressed", "stop"])
+def test_user_actions_persist_precise_notification_transitions(tmp_path, action):
+    import dashboard
+    from dashboard_push import notification_fields, samples
+
+    db = supervisor.open_db(tmp_path)
+    job = feedback_job()
+    job["url"] = "https://github.com/test/repo/pull/1"
+    persist(db, job)
+    before = samples("watcher", {"jobs": [dashboard.present_job(job)]})[0]
+    token = supervisor.feedback_token(job["pending_reviews"])
+    if action == "approve":
+        supervisor.approve_feedback(db, job["id"], token)
+    elif action == "addressed":
+        item = job["pending_reviews"][0]
+        supervisor.mark_feedback_addressed(db, job["id"], token, f"{item['kind']}:{item['id']}")
+    else:
+        supervisor.stop_watch(db, job["id"])
+    after = samples(
+        "watcher", {"jobs": [dashboard.present_job(supervisor.get_job(db, job["id"]))]}
+    )[0]
+    assert not notification_fields("watcher", after, before, "fixture")
+    assert after["actions"][-1]["before"] != after["actions"][-1]["after"]
+    db.close()
