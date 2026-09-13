@@ -267,6 +267,27 @@ Path(args[args.index('-o') + 1]).write_text(json.dumps({'status': 'waiting', 'su
     db.close()
 
 
+def test_reregister_keeps_feedback_history_and_pending_items(harness):
+    h = harness
+    old = h["job"]
+    old.update(status="stopped", pending_reviews=[{"kind": "review", "id": "pending"}])
+    old["watcher_state"] = {
+        "seen_review_ids": ["handled", "pending"],
+        "seen_feedback_content_versions": {"review:handled": "fingerprint"},
+        "retries_by_sha": {"old": 3},
+    }
+    with h["db"]:
+        supervisor.save_job(h["db"], old)
+    new = supervisor.register(h["db"], h["args"])
+    assert new["pending_reviews"] == old["pending_reviews"]
+    assert new["watcher_state"]["seen_review_ids"] == ["handled", "pending"]
+    assert new["watcher_state"]["seen_feedback_content_versions"] == {
+        "review:handled": "fingerprint"
+    }
+    assert "retries_by_sha" not in new["watcher_state"]
+    assert new["attempts"] == 0 and not new.get("approved_reviews")
+
+
 def start_service(h):
     log = (h["home"] / "test-service.log").open("a")
     proc = subprocess.Popen(

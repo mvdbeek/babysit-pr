@@ -2,6 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const ended = new Set(["closed", "stopped"]);
 const attention = new Set(["blocked", "awaiting_release", "handoff"]);
+let navigationTarget = null;
 let data = null,
   selected = null,
   tab = "checks",
@@ -383,6 +384,15 @@ function render() {
       selected = job.id;
       detailKey = null;
       render();
+      window.dashboardNotifications?.seen([job.url]);
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        $("detail").scrollIntoView({
+          behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+            ? "instant"
+            : "smooth",
+          block: "start",
+        });
+      }
     };
     $("list").append(row);
   }
@@ -439,6 +449,9 @@ function renderDetail() {
     return;
   }
   // Keep log selection, scroll, and keyboard focus stable across quiet refreshes.
+  if (!document.hidden && !$("watcher-panel").hidden) {
+    window.dashboardNotifications?.seen([job.url]);
+  }
   const key = JSON.stringify([
     job,
     tab,
@@ -542,13 +555,21 @@ function renderDetail() {
       );
       if (item.path) entry.append(el("small", `${item.path}${item.line ? `:${item.line}` : ""}`));
       entry.append(el("p", item.body || "(No comment text)"));
+      if (["watching", "paused", "blocked"].includes(job.status)) {
+        const addressed = el("button", "Mark addressed");
+        addressed.type = "button";
+        addressed.title = "Remove this item from pending feedback without starting a repair";
+        addressed.disabled = approving.has(job.id);
+        addressed.onclick = () => handleFeedback(job, `${item.kind}:${item.id}`);
+        entry.append(addressed);
+      }
       section.append(entry);
     }
     if (!ended.has(job.status)) {
       const button = el(
         "button",
         approving.has(job.id)
-          ? "Approving…"
+          ? "Updating…"
           : job.feedback_approved
             ? "Feedback queued"
             : "Handle feedback",
@@ -675,16 +696,21 @@ async function cancelWatch(job) {
     render();
   }
 }
-async function handleFeedback(job) {
+async function handleFeedback(job, item = null) {
   if (approving.has(job.id)) return;
   approving.add(job.id);
   feedbackErrors.delete(job.id);
   renderDetail();
   try {
-    const response = await fetch("/api/feedback", {
+    const action = item === null ? "feedback" : "feedback-addressed";
+    const response = await fetch(`/api/${action}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Babysit-Action": "feedback" },
-      body: JSON.stringify({ id: job.id, token: job.feedback_token }),
+      headers: { "Content-Type": "application/json", "X-Babysit-Action": action },
+      body: JSON.stringify({
+        id: job.id,
+        token: job.feedback_token,
+        ...(item === null ? {} : { item }),
+      }),
     });
     const result = await response.json();
     if (!response.ok) throw Error(result.error || `HTTP ${response.status}`);
@@ -692,7 +718,7 @@ async function handleFeedback(job) {
   } catch (error) {
     feedbackErrors.set(
       job.id,
-      `Could not confirm approval: ${error.message}. Refresh to check the watch’s status.`,
+      `Could not update feedback: ${error.message}. Refresh to check the watch’s status.`,
     );
   } finally {
     approving.delete(job.id);
@@ -1013,6 +1039,19 @@ function itemTable(spec) {
     return table.visits.get(key);
   }
   function rememberVisit(visit) {
+    if (
+      visit &&
+      !table.data.error &&
+      !table.data.refreshing &&
+      table.data.synced_at >= visit.baseline.synced_at
+    ) {
+      window.dashboardNotifications?.seen(
+        items().map((item) => item.url),
+        table.data.login,
+        spec.key,
+        table.data.synced_at * 1000,
+      );
+    }
     if (!visit || !visit.storage || table.data.error || table.data.refreshing) return;
     const snapshot = visitSnapshot();
     if (snapshot.synced_at < visit.baseline.synced_at) return;
@@ -1107,11 +1146,17 @@ function itemTable(spec) {
       // Change counts cover the whole filtered list; only the current window gets rows.
       if (index >= table.limit) continue;
       const row = el("tr");
+      if (table.focusedId === item.id) {
+        row.classList.add("notification-target");
+        row.tabIndex = -1;
+      }
       const { cells, title, fields, updated } = spec.row(item);
       const pinCell = el("td", undefined, "item-pin-cell");
       pinCell.append(pinButton(item, pins));
+      if (spec.key === "prs" && window.dashboardNotifications?.silenceButton)
+        pinCell.append(window.dashboardNotifications.silenceButton(item.url));
       if (change) {
-        row.className = change.isNew ? "pr-new" : "pr-changed";
+        row.classList.add(change.isNew ? "pr-new" : "pr-changed");
         title.append(
           el(
             "span",
@@ -1149,12 +1194,14 @@ function itemTable(spec) {
       rows.push(stable);
     }
     const list = id("list");
+    const restoreFocus = renderedRows.get(table.focusedId)?.row === document.activeElement;
     const retained = new Set(rows);
     for (const child of [...list.children]) if (!retained.has(child)) child.remove();
     for (const [index, row] of rows.entries()) {
       if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
     }
     renderedRows = nextRows;
+    if (restoreFocus) renderedRows.get(table.focusedId)?.row.focus({ preventScroll: true });
     const remaining = visible.length - rows.length;
     id("more").hidden = remaining <= 0;
     id("more-button").textContent =
@@ -1186,7 +1233,9 @@ function itemTable(spec) {
     table.busy = true;
     try {
       table.data = await get(spec.endpoint);
+      window.dashboardNotifications?.overview(spec.key, table.data, spec.changeFields, changeValue);
       render();
+      revealNotification(spec.key);
     } catch (error) {
       id("alert").hidden = false;
       id("alert").textContent =
@@ -1222,7 +1271,21 @@ function itemTable(spec) {
       if (entries.some((entry) => entry.isIntersecting)) showMore();
     }).observe(id("more"));
   }
-  return Object.assign(table, { items, render, refresh });
+  function reveal(url) {
+    const item = items().find((item) => sameSubject(item.url, url));
+    if (!item) return false;
+    id("search").value = "";
+    for (const name of spec.filters) {
+      id(name).value = "all";
+      syncSelect(id(name));
+    }
+    table.limit = Math.max(table.limit, items().length);
+    table.focusedId = item.id;
+    render();
+    focusNotification(renderedRows.get(item.id).row);
+    return true;
+  }
+  return Object.assign(table, { items, render, refresh, reveal });
 }
 
 const prTable = itemTable({
@@ -1460,7 +1523,9 @@ async function refresh() {
   busy = true;
   try {
     data = await get("/api/status");
+    window.dashboardNotifications?.watcher(data);
     render();
+    revealNotification("watcher");
     if ($("service-details").open) await serviceLog();
   } catch (e) {
     $("alert").hidden = false;
@@ -1492,9 +1557,81 @@ function overviewVisible() {
 function pageFromURL() {
   const name = window.location.hash.slice(1);
   showPage(pages.includes(name) ? name : "watcher");
+  const item = new URLSearchParams(location.search).get("item");
+  navigationTarget =
+    item &&
+    /^https:\/\/github\.com\/[^/]+\/[^/]+\/(pull|issues|tree)\/[^?#]+$/.test(item) &&
+    ["prs", "issues", "watcher"].includes(name)
+      ? { page: name, url: item }
+      : null;
+  $("navigation-status").hidden = true;
+  if (navigationTarget) revealNotification(name);
 }
+function sameSubject(left, right) {
+  if (!left || !right) return false;
+  const normalize = (url) =>
+    url
+      .replace(/\/$/, "")
+      .replace(/^(https:\/\/github\.com\/[^/]+\/[^/]+)\//, (prefix) => prefix.toLowerCase());
+  return normalize(left) === normalize(right);
+}
+function focusNotification(element) {
+  element.tabIndex = -1;
+  element.focus({ preventScroll: true });
+  element.scrollIntoView({
+    block: "center",
+    inline: "nearest",
+    behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
+  });
+}
+function revealNotification(page) {
+  if (!navigationTarget || navigationTarget.page !== page) return;
+  const target = navigationTarget;
+  const table = page === "prs" ? prTable : page === "issues" ? issueTable : null;
+  if (
+    table
+      ? !table.data?.synced_at || table.data.refreshing || table.data.error
+      : !data || data.error
+  )
+    return;
+  navigationTarget = null;
+  let found = false;
+  if (table) found = table.reveal(target.url);
+  else {
+    const job = data.jobs.find((job) => sameSubject(job.url, target.url));
+    if (job) {
+      $("search").value = "";
+      $("filter").value = "all";
+      syncSelect($("filter"));
+      selected = job.id;
+      detailKey = null;
+      render();
+      focusNotification($("detail"));
+      found = true;
+    }
+  }
+  $("navigation-status").hidden = found;
+  $("navigation-status").textContent = found
+    ? ""
+    : "This item is no longer in the current dashboard view.";
+  window.dashboardNotifications?.seen([target.url]);
+}
+window.dashboardNavigation = {
+  open(href) {
+    const url = new URL(href, location.href);
+    if (url.origin !== location.origin) return;
+    history.pushState(null, "", url);
+    pageFromURL();
+  },
+};
+window.addEventListener("popstate", pageFromURL);
 for (const page of pages) {
   $(`${page}-tab`).onclick = () => {
+    const url = new URL(location.href);
+    url.searchParams.delete("item");
+    url.searchParams.delete("updates");
+    history.replaceState(null, "", url);
+    navigationTarget = null;
     window.location.hash = page;
     showPage(page);
     void refreshWorkspaces();
@@ -2201,3 +2338,5 @@ function ciLogStream(url, detail) {
 
 document.addEventListener("pointerdown", (event) => dismissSelect?.(event.target));
 for (const select of document.querySelectorAll("select")) searchableSelect(select);
+
+window.addEventListener("notification-preferences", () => prTable.render());

@@ -54,6 +54,7 @@ def present_job(job):
         "feedback": feedback,
         "feedback_token": feedback_token(feedback),
         "feedback_approved": len(approved_feedback(job)),
+        "notification_actions": job.get("notification_actions", []),
         "cleanup_ready": bool(
             job.get("cleanup_ready")
             or (job.get("status") == "closed" and (pr.get("closed") or pr.get("merged")))
@@ -131,12 +132,17 @@ def cancel_watch(home, job_id):
         db.close()
 
 
-def handle_feedback(home, job_id, token):
-    from pr_supervisor import approve_feedback
+def handle_feedback(home, job_id, token, addressed_key=None):
+    from pr_supervisor import approve_feedback, mark_feedback_addressed
 
     db = sqlite3.connect((home / "queue.sqlite").as_uri() + "?mode=rw", uri=True, timeout=2)
     try:
-        return present_job(approve_feedback(db, job_id, token))
+        job = (
+            approve_feedback(db, job_id, token)
+            if addressed_key is None
+            else mark_feedback_addressed(db, job_id, token, addressed_key)
+        )
+        return present_job(job)
     finally:
         db.close()
 
@@ -183,6 +189,7 @@ class DashboardServer(ThreadingHTTPServer):
         issues: IssueOverview | None = None,
         upstream_tests=None,
         workspace_overview=None,
+        push=None,
     ) -> None:
         self.home = home
         self.overview = overview
@@ -192,6 +199,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.workspaces = workspaces
         self.ci = ci
         self.ci_logs = ci_logs
+        self.push = push
         self.allowed_hosts = set(allowed_hosts)
         super().__init__(("127.0.0.1", port), Handler)
 
@@ -232,7 +240,19 @@ class Handler(BaseHTTPRequestHandler):
         if (
             host not in allowed
             or action
-            not in {"cancel", "feedback", "workspace-action", "workspace-cleanup", "workspace-open"}
+            not in {
+                "cancel",
+                "feedback",
+                "feedback-addressed",
+                "workspace-action",
+                "workspace-cleanup",
+                "workspace-open",
+                "push-subscribe",
+                "push-unsubscribe",
+                "push-read",
+                "push-seen",
+                "notification-silence",
+            }
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
         ):
@@ -248,7 +268,8 @@ class Handler(BaseHTTPRequestHandler):
                 < length
                 <= (
                     200000
-                    if action in {"workspace-action", "workspace-cleanup", "workspace-open"}
+                    if action.startswith("push-")
+                    or action in {"workspace-action", "workspace-cleanup", "workspace-open"}
                     else 1024
                 )
                 or self.headers.get("Content-Type") != "application/json"
@@ -258,6 +279,18 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
+            if action == "notification-silence":
+                if not self.server.push:
+                    raise ValueError("Notification preferences are unavailable")
+                self.send_json(200, self.server.push.silence(request))
+                return
+            if action.startswith("push-"):
+                if not self.server.push:
+                    raise ValueError("Web Push is not enabled")
+                self.send_json(
+                    200, self.server.push.action(action, request, origin or f"http://{host}")
+                )
+                return
             if action in {"workspace-cleanup", "workspace-open"}:
                 # Experimental workspace actions own their validation.
                 if not self.server.workspace_overview:
@@ -283,6 +316,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if action == "feedback":
                 job = handle_feedback(self.server.home, request["id"], request.get("token"))
+            elif action == "feedback-addressed":
+                if not isinstance(request.get("item"), str) or not request["item"]:
+                    raise ValueError("Supply a feedback item")
+                job = handle_feedback(
+                    self.server.home, request["id"], request.get("token"), request["item"]
+                )
             else:
                 job = cancel_watch(self.server.home, request["id"])
             self.send_json(200, {"job": job})
@@ -309,6 +348,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route.path == "/api/status":
                 self.send_json(200, status(self.server.home))
+            elif route.path == "/api/notification-preferences":
+                self.send_json(
+                    200,
+                    self.server.push.preferences()
+                    if self.server.push
+                    else {"login": None, "silenced": []},
+                )
+            elif route.path == "/api/push-config":
+                self.send_json(
+                    200, self.server.push.config() if self.server.push else {"available": False}
+                )
             elif route.path == "/api/upstream-tests":
                 # Experimental failures must stay outside the main dashboard boundary.
                 try:
@@ -412,6 +462,12 @@ class Handler(BaseHTTPRequestHandler):
                     "/favicon.png": ("favicon.png", "image/png"),
                     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
                     "/app.js": ("app.js", "text/javascript"),
+                    "/notifications.js": ("notifications.js", "text/javascript"),
+                    "/push.js": ("push.js", "text/javascript"),
+                    "/sw.js": ("sw.js", "text/javascript"),
+                    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+                    "/icon-192.png": ("icon-192.png", "image/png"),
+                    "/icon-512.png": ("icon-512.png", "image/png"),
                     "/upstream-tests.js": ("upstream-tests.js", "text/javascript"),
                     "/upstream-tests.css": ("upstream-tests.css", "text/css"),
                     "/workspaces.js": ("workspaces.js", "text/javascript"),
@@ -431,6 +487,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
+    from dashboard_push import PushInbox
     from upstream_tests import UpstreamTests
     from workspace_overview import WorkspaceOverview
 
@@ -441,6 +498,10 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
     workspaces = Workspaces(home, overview, lambda: read_jobs(home), issues=issues)
     ci = CiDetails(home, overview)
     ci_logs = BackgroundLogs(home, overview, ci)
+    push = PushInbox(
+        home,
+        lambda: {"prs": overview.snapshot(), "issues": issues.snapshot(), "watcher": status(home)},
+    )
     with DashboardServer(
         home,
         port,
@@ -452,8 +513,10 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         issues=issues,
         upstream_tests=upstream_tests,
         workspace_overview=workspace_overview,
+        push=push,
     ) as server:
         ci_logs.start()
+        push.start()
         url = f"http://127.0.0.1:{server.server_port}"
         print(
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",
@@ -466,6 +529,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         except KeyboardInterrupt:
             pass
         finally:
+            push.close()
             ci_logs.close()
 
 

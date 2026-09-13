@@ -4,6 +4,84 @@ A shared watcher that waits for GitHub CI and PR activity without keeping coding
 
 The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
 
+On mobile, selecting a watch card scrolls to its details and actions. Background
+refreshes leave the scroll position alone; reduced-motion settings are respected.
+
+The header bell counts unseen items across the watcher, PR, and issue views. Its
+log shows the 10 most recently updated items, combining repeated updates to the
+same PR or issue into one entry, including updates seen in both the watcher and
+PR overview. Older unseen items still contribute to the count. Opening the bell
+does not clear it: open an entry, visit its PR/issue list (or watch details), or
+choose **Mark all seen**. History uses the existing per-account visit baseline and
+is saved in this browser, with seen state shared between tabs. The first snapshot
+without prior history starts quietly. Updates come from existing dashboard
+snapshots, including changes discovered on reopening; no extra GitHub polling is
+added, and intermediate changes while the dashboard is closed may not be captured.
+
+Notification entries open their latest source inside Babysitter: a selected watch
+or a highlighted PR/issue row. Links reveal the item even when filters or pagination
+would hide it. Phone alerts also open the source of the latest update. **Mark all
+seen** is above the notification log.
+
+Notifications skip the immediate effects of cancelling watches, approving feedback,
+and marking feedback addressed. Your own newly added review comments and GitHub
+activity are also skipped when the available timeline identifies you and covers
+the interval since the last snapshot. CI results, repair outcomes, other people's
+activity, and changes with uncertain attribution still notify. Commit authorship
+alone does not prove who pushed a change. Existing unread updates are retained;
+the suppression applies to the new change, rather than marking the whole item seen.
+
+PR rows have a bell button to **Silence notifications** for that PR, including its
+watcher. This preference persists on the dashboard server and applies to every
+device on the account until you unsilence it. Silencing clears that PR's unread
+notification. Updates observed while silenced are not replayed when you unsilence
+it. PR list change highlights still work independently.
+
+CI alerts summarize the completed checks for a commit; individual check progress
+and repair starts/retries are quiet. Repair outcomes still notify. Push delivery
+waits for 30 seconds without another update to the same PR/issue, combining nearby
+updates into one alert and one inbox item.
+
+For **iPhone Home Screen badges and background alerts**, run the dashboard with
+the optional Web Push dependency:
+
+```sh
+uv run --locked --extra push python scripts/pr_supervisor.py --home /path/to/state dashboard --allow-host your-dashboard.ts.net
+```
+
+Open the dashboard over HTTPS, add it to the Home Screen, then open that app and
+choose **bell → Enable notifications → Allow**. If an older Home Screen shortcut
+opens in Safari, remove the shortcut and add it again. The cat icon's badge uses
+the same grouped unseen count as the bell; opening the bell alone does not clear
+it. **Disable notifications** removes this device's server subscription.
+
+Subscribed devices keep their inbox and seen state on the dashboard server, so
+updates continue while the phone app is closed. Each device has its own seen
+state. The dashboard process must remain running and connected to GitHub and the
+push service. Its worker checks the existing snapshots every 15 seconds and keeps
+the existing overview refresh schedule active; updates can arrive after the next
+GitHub refresh. The ten most recent items are displayed, while older unread items
+still count. Failed deliveries retry with backoff; expired subscriptions can be
+enabled again. Apple requires background pushes to display an alert as well as
+updating the badge. Alerts replace the previous Babysitter alert in browsers that
+support notification tags.
+
+Push subscriptions, device inboxes, and VAPID signing keys are stored in private
+`dashboard-push.json` and `dashboard-vapid.pem` files under the state directory.
+Keep both files across restarts. Payloads are encrypted for the subscribed device;
+only Apple, Google, and Mozilla push endpoints are accepted. No Apple developer
+account or third-party notification service account is needed. Browser-only
+notifications continue to work without installing the `push` extra.
+
+Feedback handled by a successful repair stays handled when code moves to another
+line or the same PR watch is re-registered. Changes to the comment text still need
+fresh approval. Resolved GitHub review threads and empty reviews are removed from
+pending feedback on the next successful poll. For feedback already addressed in
+code but still unresolved on GitHub, use **Mark addressed** on the individual item.
+This clears that item locally without starting a repair or changing GitHub; it
+requires the displayed batch to still be current. Blocked repairs retain their
+feedback until handled successfully or explicitly marked addressed.
+
 ## Your pull requests
 
 The dashboard opens on the **Watcher** tab. Use **Pull requests** to switch to the
@@ -253,10 +331,15 @@ wti [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|u
 wtpr [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
 ```
 
-`wt <branch>` opens a branch that is already checked out where it already lives --
-the main clone for `wt main`, or a worktree created under a different directory
-name -- instead of failing on git's refusal to check the same branch out twice. The
-reused path is reported on stderr.
+For branch worktrees, `wt` fetches the base from `origin` when that remote exists.
+Without `origin`, it uses the requested local base instead: for example,
+`wt -r repo main my-feature` creates `my-feature` from local `main` without network
+access. Existing local branches are reused, and existing worktrees are reopened.
+
+A branch that is already checked out is opened where it already lives -- the main
+clone for `wt main`, or a worktree created under a different directory name --
+instead of failing on git's refusal to check the same branch out twice. The reused
+path is reported on stderr.
 
 To use it from a shell, put `scripts/` on `PATH` or symlink the three launchers into
 a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `tmux`,

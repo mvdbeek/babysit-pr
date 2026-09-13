@@ -54,9 +54,15 @@ const fixture = { jobs: [job], daemon: { health: "healthy", max_workers: 2 }, ho
 const requests = [];
 const context = vm.createContext({
   URL,
+  URLSearchParams,
+  location: { search: "" },
   console,
   fixture,
-  window: { location: { hash: "" }, addEventListener() {} },
+  window: {
+    location: { hash: "" },
+    addEventListener() {},
+    matchMedia: () => ({ matches: false }),
+  },
   document: {
     querySelectorAll: () => [],
     getElementById: get,

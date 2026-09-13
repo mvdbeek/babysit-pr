@@ -3,7 +3,7 @@
 import re
 
 import pr_overview
-from latest_activity import activity_fragment, latest_activity
+from latest_activity import activity_fragment, latest_activity, notification_activity
 
 ROLES = {
     "author": "author",
@@ -68,6 +68,7 @@ def issue_record(node, roles):
         "comments": (node.get("comments") or {}).get("totalCount", 0),
         "updated_at": node["updatedAt"],
         "latest_activity": latest_activity(node),
+        "notification_activity": notification_activity(node),
         "opened_at": node["createdAt"],
         "roles": roles,
         "linked_prs": [linked_pr(p) for p in linked if p],

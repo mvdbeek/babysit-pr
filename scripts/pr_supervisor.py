@@ -192,10 +192,19 @@ def ingest(job, snapshot, state):
     job["next_poll"] = time.time() + job["poll_seconds"]
     # Persist unseen feedback and its upstream cursor in the SAME transaction.
     # A crash or a full worker queue must not silently consume review events.
-    pending = {f"{v['kind']}:{v['id']}": v for v in job["pending_reviews"]}
+    inactive = set(snapshot.get("inactive_review_keys", []))
+    pending = {
+        f"{v['kind']}:{v['id']}": v
+        for v in job["pending_reviews"]
+        if f"{v['kind']}:{v['id']}" not in inactive
+    }
     for item in snapshot.get("new_review_items", []):
         pending[f"{item['kind']}:{item['id']}"] = item
     job["pending_reviews"] = list(pending.values())
+    pending_tokens = {feedback_token(item) for item in job["pending_reviews"]}
+    job["approved_reviews"] = [
+        token for token in job.get("approved_reviews", []) if token in pending_tokens
+    ]
     pr = snapshot["pr"]
     if pr["closed"] or pr["merged"]:
         job["status"] = "closed"
@@ -228,6 +237,29 @@ def approved_feedback(job):
     return [item for item in job.get("pending_reviews", []) if feedback_token(item) in approved]
 
 
+def notification_values(job):
+    return {
+        "status": job.get("status"),
+        "summary": job.get("summary", ""),
+        "feedback_approved": len(approved_feedback(job)),
+        "feedback": [
+            {field: item.get(field) for field in ("kind", "id", "body")}
+            for item in job.get("pending_reviews", [])
+        ],
+    }
+
+
+def record_notification_action(job, before):
+    job["notification_actions"] = [
+        *job.get("notification_actions", [])[-9:],
+        {
+            "before": before,
+            "after": notification_values(job),
+            "at": time.time(),
+        },
+    ]
+
+
 def approve_feedback(db, key, token):
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -241,6 +273,7 @@ def approve_feedback(db, key, token):
         items = job["pending_reviews"]
         if not items or token != feedback_token(items):
             raise ValueError("Feedback changed; refresh and review the current batch")
+        before = notification_values(job)
         job.update(
             approved_reviews=[feedback_token(item) for item in items],
             epoch=job["epoch"] + 1,
@@ -248,6 +281,42 @@ def approve_feedback(db, key, token):
             next_poll=0,
             summary="Feedback approved; waiting for a fresh PR observation",
         )
+        record_notification_action(job, before)
+        save_job(db, job)
+    return job
+
+
+def mark_feedback_addressed(db, key, token, item_key):
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        job = get_job(db, key)
+        if job["status"] not in {"watching", "paused", "blocked"} or job.get("branch"):
+            raise ValueError("Feedback cannot be marked addressed in this watch state")
+        items = job["pending_reviews"]
+        if not items or token != feedback_token(items):
+            raise ValueError("Feedback changed; refresh and review the current batch")
+        item = next((v for v in items if f"{v['kind']}:{v['id']}" == item_key), None)
+        if item is None:
+            raise ValueError("Feedback item not found")
+        before = notification_values(job)
+        state = job.setdefault("watcher_state", {})
+        state.setdefault("seen_feedback_content_versions", {})[item_key] = (
+            watch.feedback_content_version(item)
+        )
+        seen_key = {
+            "issue_comment": "seen_issue_comment_ids",
+            "review_comment": "seen_review_comment_ids",
+            "review": "seen_review_ids",
+        }[item["kind"]]
+        state[seen_key] = sorted(set(state.get(seen_key, [])) | {str(item["id"])})
+        job["pending_reviews"] = [v for v in items if v is not item]
+        job["approved_reviews"] = [
+            value for value in job.get("approved_reviews", []) if value != feedback_token(item)
+        ]
+        job.update(epoch=job["epoch"] + 1, dispatch_ready=False, next_poll=0)
+        if job["status"] == "watching":
+            job["summary"] = "Feedback marked addressed; waiting for a fresh PR observation"
+        record_notification_action(job, before)
         save_job(db, job)
     return job
 
@@ -288,12 +357,14 @@ def stop_watch(db, key):
         job = get_job(db, key)
         if job["status"] in {"stopped", "closed"} or job.get("stop_after_run"):
             return job
+        before = notification_values(job)
         job["epoch"] += 1
         job["dispatch_ready"] = False
         if job["status"] == "running":
             job.update(stop_after_run=True, summary="Finishing current repair before stopping")
         else:
             job.update(status="stopped", summary="Watch cancelled")
+        record_notification_action(job, before)
         save_job(db, job)
     return job
 
@@ -851,7 +922,9 @@ def register(db, args):
     key = hashlib.sha256(pr["url"].encode()).hexdigest()[:16]
     with db:
         db.execute("BEGIN IMMEDIATE")
-        for old in jobs(db):
+        existing = jobs(db)
+        previous: dict[str, Any] = next((old for old in existing if old["id"] == key), {})
+        for old in existing:
             if old["status"] not in {"stopped", "closed"} and (
                 old["id"] == key or old["cwd"] == cwd or old["session_id"] == sid
             ):
@@ -880,8 +953,20 @@ def register(db, args):
             "attempts": 0,
             "poll_errors": 0,
             "next_poll": 0,
-            "watcher_state": {},
-            "pending_reviews": [],
+            "watcher_state": {
+                name: copy.deepcopy(value)
+                for name, value in previous.get("watcher_state", {}).items()
+                if name
+                in {
+                    "seen_issue_comment_ids",
+                    "seen_review_comment_ids",
+                    "seen_review_ids",
+                    "seen_feedback_versions",
+                    "seen_feedback_content_versions",
+                    "resolved_review_comment_ids",
+                }
+            },
+            "pending_reviews": copy.deepcopy(previous.get("pending_reviews", [])),
             "handled": [],
             "epoch": 0,
             "dispatch_ready": False,

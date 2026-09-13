@@ -1167,6 +1167,43 @@ def test_wt_branch_worktree_and_dispatch(repo):
     assert result.stdout.startswith("usage:\n  wtpr")
 
 
+@pytest.mark.parametrize("other_remote", [False, True])
+def test_wt_local_branch_worktrees_without_origin(repo, monkeypatch, other_remote):
+    home, git, _ = repo
+    git("remote", "remove", "origin")
+    if other_remote:
+        git("remote", "add", "upstream", str(home / "missing-remote.git"))
+    monkeypatch.setenv("WT_MULTIPLEXER", "none")
+    git("commit", "--allow-empty", "-m", "local-only commit")
+    root = home / "src/worktrees/repo"
+
+    result = run_tool("wt", "-r", "repo", "main", "local-new")
+    path = root / "local-new"
+    assert result.stdout.strip() == str(path)
+    assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "local-new"
+    assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "main")
+    assert run_tool("wt", "-r", "repo", "main", "local-new").stdout == result.stdout
+
+    run_tool("wt", "-r", "repo", "feature")
+    assert git("symbolic-ref", "--short", "HEAD", cwd=root / "feature") == "feature"
+    assert git("rev-parse", "HEAD", cwd=root / "feature") == git("rev-parse", "feature")
+    assert git("rev-parse", "feature") != git("rev-parse", "main")
+
+    result = run_tool("wt", "-r", "repo", "missing-base", "invalid", check=False)
+    assert result.returncode == 1
+    assert "git worktree failed" in result.stderr
+    assert not (root / "invalid").exists()
+
+
+def test_wt_does_not_hide_origin_fetch_failure(repo):
+    home, git, _ = repo
+    git("remote", "set-url", "origin", str(home / "missing-remote.git"))
+    result = run_tool("wt", "-r", "repo", "main", "fetch-failed", check=False)
+    assert result.returncode == 1
+    assert "git fetch failed" in result.stderr
+    assert not (home / "src/worktrees/repo/fetch-failed").exists()
+
+
 def test_auto_selects_running_herdr_then_tmux_then_none(repo, monkeypatch):
     home, git, state = repo
     monkeypatch.delenv("WT_MULTIPLEXER")
