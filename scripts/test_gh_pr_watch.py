@@ -167,6 +167,7 @@ def test_pending_review_feedback_surfaces_only_after_publication(monkeypatch):
         raise AssertionError(f"unexpected endpoint: {endpoint}")
 
     monkeypatch.setattr(gh_pr_watch, "gh_api_list_paginated", fake_list)
+    monkeypatch.setattr(gh_pr_watch, "resolved_review_comment_ids", lambda *args: set())
 
     assert (
         gh_pr_watch.fetch_new_review_items(

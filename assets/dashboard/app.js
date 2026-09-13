@@ -383,6 +383,15 @@ function render() {
       selected = job.id;
       detailKey = null;
       render();
+      window.dashboardNotifications?.seen([job.url]);
+      if (window.matchMedia("(max-width: 900px)").matches) {
+        $("detail").scrollIntoView({
+          behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+            ? "instant"
+            : "smooth",
+          block: "start",
+        });
+      }
     };
     $("list").append(row);
   }
@@ -439,6 +448,9 @@ function renderDetail() {
     return;
   }
   // Keep log selection, scroll, and keyboard focus stable across quiet refreshes.
+  if (!document.hidden && !$("watcher-panel").hidden) {
+    window.dashboardNotifications?.seen([job.url]);
+  }
   const key = JSON.stringify([
     job,
     tab,
@@ -542,13 +554,21 @@ function renderDetail() {
       );
       if (item.path) entry.append(el("small", `${item.path}${item.line ? `:${item.line}` : ""}`));
       entry.append(el("p", item.body || "(No comment text)"));
+      if (["watching", "paused", "blocked"].includes(job.status)) {
+        const addressed = el("button", "Mark addressed");
+        addressed.type = "button";
+        addressed.title = "Remove this item from pending feedback without starting a repair";
+        addressed.disabled = approving.has(job.id);
+        addressed.onclick = () => handleFeedback(job, `${item.kind}:${item.id}`);
+        entry.append(addressed);
+      }
       section.append(entry);
     }
     if (!ended.has(job.status)) {
       const button = el(
         "button",
         approving.has(job.id)
-          ? "Approving…"
+          ? "Updating…"
           : job.feedback_approved
             ? "Feedback queued"
             : "Handle feedback",
@@ -675,16 +695,21 @@ async function cancelWatch(job) {
     render();
   }
 }
-async function handleFeedback(job) {
+async function handleFeedback(job, item = null) {
   if (approving.has(job.id)) return;
   approving.add(job.id);
   feedbackErrors.delete(job.id);
   renderDetail();
   try {
-    const response = await fetch("/api/feedback", {
+    const action = item === null ? "feedback" : "feedback-addressed";
+    const response = await fetch(`/api/${action}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Babysit-Action": "feedback" },
-      body: JSON.stringify({ id: job.id, token: job.feedback_token }),
+      headers: { "Content-Type": "application/json", "X-Babysit-Action": action },
+      body: JSON.stringify({
+        id: job.id,
+        token: job.feedback_token,
+        ...(item === null ? {} : { item }),
+      }),
     });
     const result = await response.json();
     if (!response.ok) throw Error(result.error || `HTTP ${response.status}`);
@@ -692,7 +717,7 @@ async function handleFeedback(job) {
   } catch (error) {
     feedbackErrors.set(
       job.id,
-      `Could not confirm approval: ${error.message}. Refresh to check the watch’s status.`,
+      `Could not update feedback: ${error.message}. Refresh to check the watch’s status.`,
     );
   } finally {
     approving.delete(job.id);
@@ -1013,6 +1038,19 @@ function itemTable(spec) {
     return table.visits.get(key);
   }
   function rememberVisit(visit) {
+    if (
+      visit &&
+      !table.data.error &&
+      !table.data.refreshing &&
+      table.data.synced_at >= visit.baseline.synced_at
+    ) {
+      window.dashboardNotifications?.seen(
+        items().map((item) => item.url),
+        table.data.login,
+        spec.key,
+        table.data.synced_at * 1000,
+      );
+    }
     if (!visit || !visit.storage || table.data.error || table.data.refreshing) return;
     const snapshot = visitSnapshot();
     if (snapshot.synced_at < visit.baseline.synced_at) return;
@@ -1186,6 +1224,7 @@ function itemTable(spec) {
     table.busy = true;
     try {
       table.data = await get(spec.endpoint);
+      window.dashboardNotifications?.overview(spec.key, table.data, spec.changeFields, changeValue);
       render();
     } catch (error) {
       id("alert").hidden = false;
@@ -1460,6 +1499,7 @@ async function refresh() {
   busy = true;
   try {
     data = await get("/api/status");
+    window.dashboardNotifications?.watcher(data);
     render();
     if ($("service-details").open) await serviceLog();
   } catch (e) {

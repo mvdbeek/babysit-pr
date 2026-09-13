@@ -4,6 +4,60 @@ A shared watcher that waits for GitHub CI and PR activity without keeping coding
 
 The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
 
+On mobile, selecting a watch card scrolls to its details and actions. Background
+refreshes leave the scroll position alone; reduced-motion settings are respected.
+
+The header bell counts unseen items across the watcher, PR, and issue views. Its
+log shows the 10 most recently updated items, combining repeated updates to the
+same PR or issue into one entry, including updates seen in both the watcher and
+PR overview. Older unseen items still contribute to the count. Opening the bell
+does not clear it: open an entry, visit its PR/issue list (or watch details), or
+choose **Mark all seen**. History uses the existing per-account visit baseline and
+is saved in this browser, with seen state shared between tabs. The first snapshot
+without prior history starts quietly. Updates come from existing dashboard
+snapshots, including changes discovered on reopening; no extra GitHub polling is
+added, and intermediate changes while the dashboard is closed may not be captured.
+
+For **iPhone Home Screen badges and background alerts**, run the dashboard with
+the optional Web Push dependency:
+
+```sh
+uv run --locked --extra push python scripts/pr_supervisor.py --home /path/to/state dashboard --allow-host your-dashboard.ts.net
+```
+
+Open the dashboard over HTTPS, add it to the Home Screen, then open that app and
+choose **bell → Enable notifications → Allow**. If an older Home Screen shortcut
+opens in Safari, remove the shortcut and add it again. The cat icon's badge uses
+the same grouped unseen count as the bell; opening the bell alone does not clear
+it. **Disable notifications** removes this device's server subscription.
+
+Subscribed devices keep their inbox and seen state on the dashboard server, so
+updates continue while the phone app is closed. Each device has its own seen
+state. The dashboard process must remain running and connected to GitHub and the
+push service. Its worker checks the existing snapshots every 15 seconds and keeps
+the existing overview refresh schedule active; updates can arrive after the next
+GitHub refresh. The ten most recent items are displayed, while older unread items
+still count. Failed deliveries retry with backoff; expired subscriptions can be
+enabled again. Apple requires background pushes to display an alert as well as
+updating the badge. Alerts replace the previous Babysitter alert in browsers that
+support notification tags.
+
+Push subscriptions, device inboxes, and VAPID signing keys are stored in private
+`dashboard-push.json` and `dashboard-vapid.pem` files under the state directory.
+Keep both files across restarts. Payloads are encrypted for the subscribed device;
+only Apple, Google, and Mozilla push endpoints are accepted. No Apple developer
+account or third-party notification service account is needed. Browser-only
+notifications continue to work without installing the `push` extra.
+
+Feedback handled by a successful repair stays handled when code moves to another
+line or the same PR watch is re-registered. Changes to the comment text still need
+fresh approval. Resolved GitHub review threads and empty reviews are removed from
+pending feedback on the next successful poll. For feedback already addressed in
+code but still unresolved on GitHub, use **Mark addressed** on the individual item.
+This clears that item locally without starting a repair or changing GitHub; it
+requires the displayed batch to still be current. Blocked repairs retain their
+feedback until handled successfully or explicitly marked addressed.
+
 ## Your pull requests
 
 The dashboard opens on the **Watcher** tab. Use **Pull requests** to switch to the

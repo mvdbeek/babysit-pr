@@ -4,10 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Babysitter</title>
+    <meta name="theme-color" content="#f4f5f1" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Babysitter" />
+    <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/favicon.png" type="image/png" sizes="32x32" />
     <link rel="icon" href="/cat.svg" type="image/svg+xml" sizes="any" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
     <link rel="stylesheet" href="/style.css" />
+    <script src="/push.js" defer></script>
+    <script src="/notifications.js" defer></script>
     <script src="/app.js" defer></script>
     <script src="/upstream-tests.js" defer></script>
     <link rel="stylesheet" href="/upstream-tests.css" />
@@ -23,11 +29,52 @@
           <p>CI keeps moving. Agents work when needed.</p>
         </div>
       </div>
-      <div class="connection">
-        <span id="health" class="badge">Connecting</span
-        ><small id="updated">Reading watcher state…</small>
+      <div class="header-tools">
+        <div class="connection">
+          <span id="health" class="badge">Connecting</span
+          ><small id="updated">Reading watcher state…</small>
+        </div>
+        <button
+          id="notifications-toggle"
+          type="button"
+          aria-label="Notifications, no unseen updates"
+          aria-haspopup="dialog"
+          aria-controls="notifications-dialog"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="22"
+            height="22"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.7"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />
+          </svg>
+          <span id="notifications-count" hidden aria-hidden="true"></span>
+        </button>
       </div>
     </header>
+    <dialog id="notifications-dialog" aria-labelledby="notifications-title">
+      <div class="notifications-heading">
+        <h2 id="notifications-title">Recent updates</h2>
+        <button id="notifications-close" type="button" aria-label="Close notifications">×</button>
+      </div>
+      <p class="notifications-caption">
+        The 10 most recently updated items, grouped by PR or issue.
+      </p>
+      <p id="notifications-status" class="notifications-caption"></p>
+      <ol id="notifications-list"></ol>
+      <p id="notifications-empty">Updates will appear here as the dashboard syncs.</p>
+      <button id="notifications-seen" type="button">Mark all seen</button>
+      <div class="notifications-push">
+        <button id="notifications-push-enable" type="button" hidden>Enable notifications</button>
+        <p id="notifications-push-status" class="notifications-caption" role="status"></p>
+      </div>
+    </dialog>
     <main>
       <div class="page-tabs" role="tablist" aria-label="Dashboard views">
         <button

@@ -56,7 +56,11 @@ const context = vm.createContext({
   URL,
   console,
   fixture,
-  window: { location: { hash: "" }, addEventListener() {} },
+  window: {
+    location: { hash: "" },
+    addEventListener() {},
+    matchMedia: () => ({ matches: false }),
+  },
   document: {
     querySelectorAll: () => [],
     getElementById: get,

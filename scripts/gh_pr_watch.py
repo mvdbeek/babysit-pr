@@ -607,6 +607,70 @@ def normalize_issue_comments(items):
     return out
 
 
+def resolved_review_comment_ids(pr, comments):
+    comments = [item for item in comments if isinstance(item, dict) and item.get("id")]
+    if not comments:
+        return set()
+    owner, name = pr["repo"].split("/", 1)
+    query = """query($owner:String!, $name:String!, $number:Int!, $cursor:String) {
+      repository(owner:$owner, name:$name) { pullRequest(number:$number) {
+        reviewThreads(first:100, after:$cursor) {
+          nodes { isResolved comments(first:1) { nodes { databaseId } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      } }
+    }"""
+    resolved_roots = set()
+    cursors = set()
+    cursor = None
+    while True:
+        args = [
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+            "-F",
+            f"number={pr['number']}",
+        ]
+        if cursor is not None:
+            args.extend(["-f", f"cursor={cursor}"])
+        payload = gh_json(args, repo=pr["repo"])
+        try:
+            if payload.get("errors"):
+                raise ValueError("GraphQL returned errors")
+            connection = payload["data"]["repository"]["pullRequest"]["reviewThreads"]
+            for thread in connection["nodes"]:
+                if not isinstance(thread["isResolved"], bool):
+                    raise ValueError("Missing thread resolution state")
+                if thread["isResolved"]:
+                    root = thread["comments"]["nodes"][0]["databaseId"]
+                    if root is None:
+                        raise ValueError("Missing thread root comment")
+                    resolved_roots.add(str(root))
+            page = connection["pageInfo"]
+            if not isinstance(page["hasNextPage"], bool):
+                raise ValueError("Missing review thread pagination")
+            if page["hasNextPage"] is False:
+                break
+            cursor = page["endCursor"]
+            if not cursor or cursor in cursors:
+                raise ValueError("Invalid review thread pagination")
+            cursors.add(cursor)
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise GhCommandError(f"Unable to read review thread resolution: {exc}") from exc
+    # REST replies point to the thread's original comment, so one root per
+    # thread covers every reply without a second, nested pagination loop.
+    return {
+        str(item["id"])
+        for item in comments
+        if str(item.get("in_reply_to_id") or item["id"]) in resolved_roots
+    }
+
+
 def normalize_review_comments(items, review_states):
     out = []
     for item in items:
@@ -684,6 +748,11 @@ def is_trusted_human_review_author(item, authenticated_login):
     return association in TRUSTED_AUTHOR_ASSOCIATIONS
 
 
+def feedback_content_version(item):
+    content = {key: item.get(key) for key in ("kind", "id", "author", "body")}
+    return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
 def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
     repo = pr["repo"]
     pr_number = pr["number"]
@@ -712,11 +781,20 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
     review_comment_items = normalize_review_comments(review_comment_payload, review_states)
     review_items = normalize_reviews(review_payload)
     all_items = issue_items + review_comment_items + review_items
+    resolved = resolved_review_comment_ids(pr, review_comment_payload)
+    inactive = {f"review_comment:{item_id}" for item_id in resolved}
+    inactive.update(
+        f"{item['kind']}:{item['id']}" for item in all_items if not item["body"].strip()
+    )
 
     seen_issue = {str(x) for x in state.get("seen_issue_comment_ids") or []}
     seen_review_comment = {str(x) for x in state.get("seen_review_comment_ids") or []}
     seen_review = {str(x) for x in state.get("seen_review_ids") or []}
     seen_review_comment.difference_update(pending_review_comment_ids)
+    # Reopened threads need fresh approval even if their text did not change.
+    seen_review_comment.difference_update(
+        set(state.get("resolved_review_comment_ids", [])) - resolved
+    )
     seen_review.difference_update(pending_review_ids)
 
     # On a brand-new state file, surface existing review activity instead of
@@ -724,6 +802,7 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
     # feedback when monitoring starts after comments were posted.
 
     versions = state.setdefault("seen_feedback_versions", {})
+    content_versions = state.setdefault("seen_feedback_content_versions", {})
     new_items = []
     for item in all_items:
         item_id = item.get("id")
@@ -743,15 +822,24 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
         version = hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()
         previous = versions.get(version_key)
         versions[version_key] = version
+        content_version = feedback_content_version(item)
+        previous_content = content_versions.get(version_key)
+        content_versions[version_key] = content_version
         seen = {
             "issue_comment": seen_issue,
             "review_comment": seen_review_comment,
             "review": seen_review,
         }[kind]
-        if item_id in seen and (previous is None or previous == version):
+        unchanged = (
+            previous_content == content_version
+            if previous_content is not None
+            else previous is None or previous == version
+        )
+        if item_id in seen and unchanged:
             continue
 
-        new_items.append(item)
+        if version_key not in inactive:
+            new_items.append(item)
         if kind == "issue_comment":
             seen_issue.add(item_id)
         elif kind == "review_comment":
@@ -769,6 +857,8 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
     state["seen_issue_comment_ids"] = sorted(seen_issue)
     state["seen_review_comment_ids"] = sorted(seen_review_comment)
     state["seen_review_ids"] = sorted(seen_review)
+    state["resolved_review_comment_ids"] = sorted(resolved)
+    state["inactive_review_keys"] = sorted(inactive)
     return new_items
 
 
@@ -948,6 +1038,7 @@ def collect_snapshot(args, state=None, persist=True):
         "failed_runs": failed_runs,
         "failed_jobs": failed_jobs,
         "new_review_items": new_review_items,
+        "inactive_review_keys": [] if branch else state.get("inactive_review_keys", []),
         "actions": actions,
         "retry_state": {
             "current_sha_retries_used": retries_used,

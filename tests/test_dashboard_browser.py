@@ -685,6 +685,46 @@ def test_page_tabs_scroll_without_wrapping(page: Page, dashboard_site, width: in
     assert tabs.evaluate("el => el.scrollLeft === 0")
 
 
+@pytest.mark.parametrize(
+    "width,motion", [(390, "reduce"), (390, "no-preference"), (1280, "reduce")]
+)
+def test_watch_selection_scrolls_to_details_only_on_mobile(
+    page: Page, dashboard_site, width, motion
+):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 844})
+    page.emulate_media(reduced_motion=motion)
+    page.goto(url)
+    page.get_by_role("button", name="test/repo, feature,", exact=False).click()
+    expect(page.locator("#detail h2")).to_be_in_viewport()
+    if width == 390:
+        page.wait_for_function("window.scrollY > 0")
+        if motion == "reduce":
+            page.screenshot(path="reports/mobile-watch-details.png")
+            page.evaluate("window.scrollTo(0, 0)")
+            with page.expect_response("**/api/status"):
+                page.get_by_role("button", name="Refresh", exact=True).click()
+            assert page.evaluate("window.scrollY") == 0
+    else:
+        assert page.evaluate("window.scrollY") == 0
+
+
+def test_mark_feedback_addressed_without_starting_a_repair(page: Page, dashboard_site):
+    url, home = dashboard_site
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.emulate_media(reduced_motion="reduce")
+    page.goto(url)
+    page.get_by_role("button", name="test/repo, feature,", exact=False).click()
+    page.get_by_role("button", name="Mark addressed", exact=True).click()
+    expect(page.locator(".feedback-section")).to_have_count(0)
+    job = read_job(home, "feedback")
+    assert job["pending_reviews"] == [] and job["approved_reviews"] == []
+    assert job["status"] == "watching" and job["attempts"] == 0
+    page.reload()
+    page.get_by_role("button", name="test/repo, feature,", exact=False).click()
+    expect(page.locator(".feedback-section")).to_have_count(0)
+
+
 def test_mobile_cleanup_attention_and_offline_state(page: Page, dashboard_site) -> None:
     url, home = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})
