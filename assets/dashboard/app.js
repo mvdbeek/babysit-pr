@@ -835,6 +835,7 @@ const PAGE_SIZE = 50;
 
 function itemTable(spec) {
   const id = (suffix) => $(`${spec.prefix}-${suffix}`);
+  let renderedRows = new Map();
   const table = {
     data: null,
     busy: false,
@@ -905,7 +906,7 @@ function itemTable(spec) {
         }
       }
       render();
-      // Rendering replaces rows. Keep keyboard focus on the moved control, or
+      // Keep keyboard focus on the moved control, or
       // on pagination if unpinning moved the item outside the rendered window.
       const moved = [...id("list").querySelectorAll(".item-pin")].find(
         (node) => node.dataset.itemId === item.id,
@@ -1096,6 +1097,7 @@ function itemTable(spec) {
     let newCount = 0,
       changedCount = 0;
     const rows = [];
+    const nextRows = new Map();
     for (const [index, item] of visible.entries()) {
       const change = changes(item, visit);
       if (change) {
@@ -1132,9 +1134,27 @@ function itemTable(spec) {
         if (!change.isNew && !change.fields.length) updated.classList.add("pr-field-changed");
       }
       row.append(pinCell, ...cells, workspaceCell(item));
-      rows.push(row);
+      // Keep the original link between mouse-down and mouse-up during quiet polls.
+      // Compare callback inputs too: identical markup can still carry new action data.
+      const key = JSON.stringify([
+        item,
+        workspaceInfo(item),
+        (item.linked_prs || []).map((pr) =>
+          prTable.items().find((known) => known.repo === pr.repo && known.number === pr.number),
+        ),
+      ]);
+      const previous = renderedRows.get(item.id);
+      const stable = previous?.key === key && previous.row.isEqualNode(row) ? previous.row : row;
+      nextRows.set(item.id, { key, row: stable });
+      rows.push(stable);
     }
-    id("list").replaceChildren(...rows);
+    const list = id("list");
+    const retained = new Set(rows);
+    for (const child of [...list.children]) if (!retained.has(child)) child.remove();
+    for (const [index, row] of rows.entries()) {
+      if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+    }
+    renderedRows = nextRows;
     const remaining = visible.length - rows.length;
     id("more").hidden = remaining <= 0;
     id("more-button").textContent =

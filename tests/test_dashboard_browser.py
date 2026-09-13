@@ -173,6 +173,32 @@ def read_job(home: Path, key: str) -> dict:
         db.close()
 
 
+@pytest.mark.parametrize("kind,prefix", [("prs", "pr"), ("issues", "issue")])
+@pytest.mark.parametrize("refresh", ["overview", "workspaces"])
+def test_link_click_survives_background_refresh(
+    page: Page, dashboard_site, kind: str, prefix: str, refresh: str
+) -> None:
+    url, _ = dashboard_site
+    page.goto(url + "/#" + kind)
+    link = page.locator(f"#{prefix}-list .pr-title").first
+    expect(link).to_be_visible()
+    # Finish initial workspace discovery before starting the click.
+    page.evaluate(
+        "async () => { while (workspaceBusy) await new Promise(r => setTimeout(r, 10)); }"
+    )
+    target = link.get_attribute("href")
+    page.context.route("https://github.com/**", lambda route: route.fulfill(body="Opened"))
+    link.hover()
+    page.mouse.down()
+    if refresh == "overview":
+        page.evaluate(f"() => {prefix}Table.refresh()")
+    else:
+        page.evaluate("() => refreshWorkspaces()")
+    with page.expect_popup(timeout=3000) as opened:
+        page.mouse.up()
+    expect(opened.value).to_have_url(target)
+
+
 @pytest.mark.parametrize("width", [1440, 768, 390, 320])
 def test_header_branding_and_status_fit_at_all_widths(page: Page, dashboard_site, width):
     url, home = dashboard_site
