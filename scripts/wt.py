@@ -69,6 +69,7 @@ usage:
 
 Open or create a Git worktree, then attach a multiplexer session.
 Numeric arguments are treated as PR numbers.
+Without an origin remote, branches are created from the requested local base.
 
 The multiplexer is chosen by $WT_MULTIPLEXER (herdr|tmux|cmux|none|auto), set
 in the env or as a KEY=VALUE line in ~/.config/worktree/config; "auto" (default)
@@ -650,13 +651,17 @@ class Tool:
         return value
 
     def add_worktree(self, repo_path: str, directory: str, branch: str, base: str) -> None:
-        """Reuse an existing local branch, else create one from ``origin/<base>``."""
+        """Reuse a local branch, else create from the remote or local base."""
         os.makedirs(os.path.dirname(directory), exist_ok=True)
-        self.git_action(repo_path, "fetch", "origin", base)
+        remotes = self.git_value(repo_path, "remote").splitlines()
+        start_point = base
+        if "origin" in remotes:
+            self.git_action(repo_path, "fetch", "origin", base)
+            start_point = f"origin/{base}"
         if self.branch_exists(repo_path, branch):
             self.git_action(repo_path, "worktree", "add", directory, branch)
         else:
-            self.git_action(repo_path, "worktree", "add", "-b", branch, directory, f"origin/{base}")
+            self.git_action(repo_path, "worktree", "add", "-b", branch, directory, start_point)
 
     # -- multiplexers --
 

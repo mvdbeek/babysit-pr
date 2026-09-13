@@ -331,6 +331,11 @@ wti [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|u
 wtpr [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
 ```
 
+For branch worktrees, `wt` fetches the base from `origin` when that remote exists.
+Without `origin`, it uses the requested local base instead: for example,
+`wt -r repo main my-feature` creates `my-feature` from local `main` without network
+access. Existing local branches are reused, and existing worktrees are reopened.
+
 To use it from a shell, put `scripts/` on `PATH` or symlink the three launchers into
 a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `tmux`,
 `cmux`, `none` or `auto` (the default) from the environment or from `KEY=VALUE` lines
