@@ -13,6 +13,7 @@ import dashboard
 import issue_overview
 import pr_workspaces as pw
 import pytest
+from conftest import install_fakes
 from pr_overview import Overview
 
 
@@ -44,13 +45,11 @@ def local(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    install_fakes(bin_dir)
     state = tmp_path / "herdr.json"
     state.write_text(json.dumps({"workspaces": [], "agents": [], "calls": []}))
     monkeypatch.setenv("FAKE_HERDR", str(state))
     monkeypatch.setenv("FAKE_HEAD", str(head))
-    monkeypatch.setenv(
-        "WORKSPACE_HELPER", str(Path(__file__).resolve().parents[1] / "scripts/worktree.zsh")
-    )
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
@@ -74,75 +73,7 @@ def local(tmp_path, monkeypatch):
             }
         )
     )
-    monkeypatch.setenv("FAKE_ZSH_LOG", str(tmp_path / "zsh-calls.json"))
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
-
-    def executable(name, body):
-        p = bin_dir / name
-        p.write_text(f"#!{sys.executable}\n" + body)
-        p.chmod(0o700)
-
-    executable(
-        "gh",
-        """import os,sys,subprocess
-if sys.argv[1:3] == ['repo','clone']:
- subprocess.check_call(['git','clone',os.environ['FAKE_HEAD'],sys.argv[4]])
- subprocess.check_call(['git','-C',sys.argv[4],'remote','set-url','origin','https://github.com/base/repo.git'])
-elif sys.argv[3:5] == ['issue','view']:
- assert sys.argv[1:3] == ['-R','base/repo'] and sys.argv[5] == '12', sys.argv
- print('12\\tCrash on start!')
-else:
- print('fork\\trepo\\tfeature')
-""",
-    )
-    executable(
-        "herdr",
-        """import json,os,sys,subprocess
-from pathlib import Path
-p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text()); a=sys.argv[1:]
-data['calls'].append(a)
-result={}
-if a[:2] == ['workspace','list']: result={'workspaces':data['workspaces']}
-elif a[:2] == ['agent','list']: result={'agents':data['agents']}
-elif a[:2] == ['worktree','open']:
- path=a[a.index('--path')+1]; root=a[a.index('--cwd')+1]
- existing=next((w for w in data['workspaces'] if w['worktree']['checkout_path']==path),None)
- if existing: wid=existing['workspace_id']
- else:
-  wid='w'+str(len(data['workspaces'])+1)
-  data['workspaces'].append({'workspace_id':wid,'label':a[a.index('--label')+1] if '--label' in a else 'Reopened','agent_status':'unknown','worktree':{'repo_root':root,'checkout_path':path}})
- result={'already_open':bool(existing),'root_pane':{'pane_id':wid+':p1'}}
-elif a[:2] == ['pane','run']:
- w=next(w for w in data['workspaces'] if a[2].startswith(w['workspace_id']+':'))
- p.write_text(json.dumps(data))
- env={**os.environ,'FAKE_WORKSPACE':w['workspace_id']}
- subprocess.check_call(['/bin/zsh','-fc',a[3]],cwd=w['worktree']['checkout_path'],env=env)
- sys.exit(0)
-p.write_text(json.dumps(data)); print(json.dumps({'result':result}))
-""",
-    )
-    for agent in ["codex", "claude"]:
-        executable(
-            agent,
-            """import json,os,sys
-from pathlib import Path
-p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
-data['agents'].append({'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]})
-p.write_text(json.dumps(data))
-""",
-        )
-    executable(
-        "zsh",
-        """import json,os,sys
-assert sys.argv[1]=='-lic'
-command=sys.argv[2]
-bundled=command.startswith('source "$1" || exit; shift; ')
-helper='wti' if command.endswith('wti "$@"') else 'wtpr'
-args=sys.argv[5:] if bundled else sys.argv[4:]
-with open(os.environ['FAKE_ZSH_LOG'],'a') as f: f.write(json.dumps([helper,*args])+'\\n')
-os.execv('/bin/zsh',['zsh','-fc','source "$WORKSPACE_HELPER"; '+command,'fixture',*sys.argv[4:]])
-""",
-    )
     overview = Overview(tmp_path / "state")
     overview.next_poll = float("inf")
     pr = {
@@ -557,9 +488,18 @@ def issue_of(manager):
     return {**manager.issues.value["issues"][0], "kind": "issue"}
 
 
-def zsh_calls():
-    path = Path(os.environ["FAKE_ZSH_LOG"])
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+def helper_calls(manager):
+    """Record the wt.py command lines the manager launches (helper name and arguments)."""
+    calls = []
+    original = manager.run_logged
+
+    def run_logged(op, *args, **kwargs):
+        if len(args) > 1 and args[1] == pw.WORKTREE_HELPER:
+            calls.append([str(a) for a in args[2:]])
+        return original(op, *args, **kwargs)
+
+    manager.run_logged = run_logged
+    return calls
 
 
 def test_issue_branch_matches_its_repository_and_only_suggests_elsewhere(local):
@@ -611,6 +551,7 @@ def test_linked_pr_checkout_counts_as_the_issue_workspace(local):
 
 def test_issue_creation_uses_wti_with_dashboard_flags_and_allocates_suffixes(local):
     manager, _, git, state, _ = local
+    calls = helper_calls(manager)
     collision = manager.src / "worktrees/repo/issue-12-crash-on-start"
     collision.mkdir(parents=True)
     request = {"id": "I_one", "action": "create", "agent": "claude", "task": "Fix 'it'"}
@@ -623,7 +564,7 @@ def test_issue_creation_uses_wti_with_dashboard_flags_and_allocates_suffixes(loc
     assert git("symbolic-ref", "--short", "HEAD", cwd=op["path"]) == op["branch"]
     assert git("rev-parse", "HEAD", cwd=op["path"]) == git("rev-parse", "main")
     prompt = manager.home / "workspace-prompts" / op["id"]
-    assert zsh_calls() == [
+    assert calls == [
         [
             "wti",
             "--claude",
@@ -640,6 +581,7 @@ def test_issue_creation_uses_wti_with_dashboard_flags_and_allocates_suffixes(loc
         ]
     ]
     data = json.loads(state.read_text())
+    assert data["gh"] == [["-R", "base/repo", "issue", "view", "12", "--json", "number,title"]]
     assert len(data["agents"]) == 1 and data["agents"][0]["agent"] == "claude"
     assert data["agents"][0]["task"] == "Fix 'it'\n\nIssue: https://github.com/base/repo/issues/12"
     assert "--no-focus" in next(c for c in data["calls"] if c[:2] == ["worktree", "open"])
@@ -650,7 +592,7 @@ def test_issue_creation_uses_wti_with_dashboard_flags_and_allocates_suffixes(loc
     # A PR creation still goes through wtpr with the PR prompt wording.
     manager.action({"id": "PR_one", "action": "create", "task": "Fix"})
     assert finish(manager, "PR_one")["status"] == "complete"
-    assert zsh_calls()[-1][0] == "wtpr"
+    assert calls[-1][0] == "wtpr"
     assert json.loads(state.read_text())["agents"][-1]["task"].endswith(
         "Pull request: https://github.com/base/repo/pull/7"
     )
@@ -806,36 +748,13 @@ def test_model_effort_validation_has_no_side_effects(local, extra):
     assert not list(manager.src.glob("worktrees/**/*"))
 
 
-@pytest.mark.parametrize("key", ["PR_one", "I_one"])
-def test_overrides_use_bundled_helper_without_installing(local, monkeypatch, tmp_path, key):
-    manager, _, _, state, _ = local
-    old = tmp_path / "old.zsh"
-    old.write_text('wtpr() { touch "$HOME/INJECTED"; }; wti() { wtpr; }\n')
-    monkeypatch.setenv("WORKSPACE_HELPER", str(old))
-    manager.action({"id": key, "action": "create", "task": "Fix", "model": "fixture-codex"})
-    op = finish(manager, key)
-    assert op["status"] == "complete", op["log"]
-    assert not (tmp_path / "INJECTED").exists()
-    assert json.loads(state.read_text())["agents"][0]["argv"][:2] == ["--model", "fixture-codex"]
-    assert old.read_text() == 'wtpr() { touch "$HOME/INJECTED"; }; wti() { wtpr; }\n'
-
-
 @pytest.mark.parametrize("helper", ["wt", "wtpr", "wti"])
 @pytest.mark.parametrize(
     "option,value", [("--model", "$(touch INJECTED)"), ("--effort", 'high";touch INJECTED')]
 )
 def test_helper_rejects_injection_before_git(local, helper, option, value, tmp_path):
     result = subprocess.run(
-        [
-            "/bin/zsh",
-            "-fc",
-            'source "$WORKSPACE_HELPER"; "$@"',
-            "fixture",
-            helper,
-            option,
-            value,
-            "7",
-        ],
+        [sys.executable, pw.WORKTREE_HELPER, helper, option, value, "7"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -843,6 +762,8 @@ def test_helper_rejects_injection_before_git(local, helper, option, value, tmp_p
     assert result.returncode != 0
     assert "invalid" in result.stderr
     assert not (tmp_path / "INJECTED").exists()
+    # Rejected before any git or gh call: the fake gh recorded nothing.
+    assert "gh" not in json.loads(local[3].read_text())
 
 
 def test_codex_catalog_missing_malformed_and_hidden(local):
@@ -880,16 +801,10 @@ def test_codex_catalog_missing_malformed_and_hidden(local):
     }
 
 
-def test_bundled_helper_path_is_argv_and_preserves_shell_agent_wrapper(
-    local, monkeypatch, tmp_path
-):
+def test_pane_shell_agent_wrapper_applies_to_typed_command(local, monkeypatch, tmp_path):
     manager, _, _, state, _ = local
-    # A relocated installation path is data, including shell metacharacters.
-    scripts = tmp_path / "scripts ' $(touch INJECTED)"
-    scripts.mkdir()
-    shutil.copyfile(Path(pw.__file__).with_name("worktree.zsh"), scripts / "worktree.zsh")
-    monkeypatch.setattr(pw, "__file__", str(scripts / "pr_workspaces.py"))
-    # The terminal shell can still resolve the user's alias before the executable.
+    # The helper types a bare `codex …` line into the pane's interactive shell, so the
+    # user's own alias or wrapper function resolves before the executable.
     startup = tmp_path / "terminal-startup.zsh"
     startup.write_text('alias codex="codex --profile fixture-profile"\n')
     herdr = Path(os.environ["PATH"].split(":")[0]) / "herdr"
