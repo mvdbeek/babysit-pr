@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from dashboard_push import PushInbox, deliver, validate_subscription
+from dashboard_push import PushInbox, deliver, destination, validate_subscription
 from test_dashboard_cancel import server as server
 
 ORIGIN = "https://babysitter.example"
@@ -227,6 +227,15 @@ def test_rejects_arbitrary_push_destinations(endpoint):
 def test_accepts_apple_push_subdomains(host):
     value = {**subscription(), "endpoint": f"https://{host}/test"}
     assert validate_subscription(value) == value
+
+
+@pytest.mark.parametrize("source", ["prs", "issues", "watcher"])
+def test_notification_link_uses_latest_source(source):
+    from urllib.parse import parse_qs, urlsplit
+
+    route = urlsplit(destination(URL, {"notes": {"prs": {"at": 1}, source: {"at": 2}}}))
+    assert route.path == "/" and route.fragment == source
+    assert parse_qs(route.query)["item"] == [URL]
 
 
 @pytest.mark.parametrize(

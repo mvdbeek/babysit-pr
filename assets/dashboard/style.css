@@ -1339,3 +1339,7 @@ button:disabled {
   margin-top: 16px;
   padding-top: 16px;
 }
+.notification-target {
+  outline: 2px solid var(--green);
+  outline-offset: -2px;
+}

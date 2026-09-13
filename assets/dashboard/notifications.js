@@ -144,6 +144,20 @@
     return result;
   }
 
+  function destination(key, entry) {
+    const source = Object.entries(entry.notes).sort(
+      (a, b) => b[1].at - a[1].at || Number(b[0] === "watcher") - Number(a[0] === "watcher"),
+    )[0]?.[0];
+    const page = ["prs", "issues", "watcher"].includes(source)
+      ? source
+      : subject(key)?.kind === "Issue"
+        ? "issues"
+        : subject(key)?.kind === "Branch"
+          ? "watcher"
+          : "prs";
+    return `/?item=${encodeURIComponent(key)}#${page}`;
+  }
+
   function render() {
     const ordered = recent();
     const unseen = ordered.filter(([, entry]) => entry.seenAt < entry.at).length;
@@ -168,10 +182,11 @@
       const item = subject(key);
       const row = node("li", undefined, entry.seenAt < entry.at ? "notification-unseen" : "");
       const anchor = node("a", undefined, "notification-link");
-      anchor.href = key;
-      anchor.target = "_blank";
-      anchor.rel = "noopener noreferrer";
-      anchor.append(node("small", `${item.kind} · ${item.label}`), node("strong", entry.title));
+      anchor.href = destination(key, entry);
+      anchor.append(
+        node("small", `${anchor.hash === "#watcher" ? "Watcher" : item.kind} · ${item.label}`),
+        node("strong", entry.title),
+      );
       const notes = Object.values(entry.notes).sort((a, b) => b.at - a.at);
       anchor.append(node("span", [...new Set(notes.map((note) => note.text))].join(" · ")));
       const date = new Date(entry.at);
@@ -181,13 +196,19 @@
       );
       time.dateTime = date.toISOString();
       anchor.append(time);
-      anchor.onclick = () => {
+      anchor.onclick = (event) => {
+        if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+          return;
+        event.preventDefault();
+        const href = anchor.href;
         window.dashboardPush?.seen([key]);
         sync();
         if (account.state.entries[key])
           account.state.entries[key].seenAt = account.state.entries[key].at;
         save();
         render();
+        dialog.close();
+        window.dashboardNavigation.open(href);
       };
       row.append(anchor);
       return row;

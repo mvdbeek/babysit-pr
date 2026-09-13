@@ -54,8 +54,11 @@ def test_notifications_group_sources_and_keep_unread_until_acknowledged(page, in
     count(page, 1)
     page.locator("#notifications-toggle").click()
     count(page, 1)
-    entries = page.locator("#notifications-list a[href='https://github.com/test/alpha/pull/8']")
+    entries = page.locator("#notifications-list a[href*='test%2Falpha%2Fpull%2F8']")
     expect(entries).to_have_count(1)
+    expect(entries).to_have_attribute(
+        "href", "/?item=https%3A%2F%2Fgithub.com%2Ftest%2Falpha%2Fpull%2F8#watcher"
+    )
     expect(entries).to_contain_text("CI changed")
     expect(entries).to_contain_text("Watch status changed")
     page.get_by_role("button", name="Mark all seen", exact=True).click()
@@ -156,6 +159,10 @@ def test_notification_layout_keyboard_and_plain_text(page, inbox, width):
     page.locator("#notifications-toggle").focus()
     page.keyboard.press("Enter")
     expect(page.get_by_role("dialog", name="Recent updates")).to_be_visible()
+    assert (
+        page.locator("#notifications-seen").bounding_box()["y"]
+        < page.locator("#notifications-list").bounding_box()["y"]
+    )
     expect(page.locator("#notifications-list img")).to_have_count(0)
     assert page.evaluate("window.injected === undefined")
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -236,18 +243,84 @@ def test_opening_one_notification_marks_only_that_item_seen(page, inbox):
     url, packets = inbox
     page.goto(url)
     count(page, 0)
-    for item in packets["prs"]["prs"]:
-        item["title"] += " changed"
+    packets["prs"]["prs"][0]["title"] += " changed"
+    packets["issues"]["issues"][0]["title"] += " changed"
     packets["prs"]["synced_at"] += 1
+    packets["issues"]["synced_at"] += 1
     refresh(page)
     count(page, 2)
     page.locator("#notifications-toggle").click()
-    link = page.locator("#notifications-list a[href='https://github.com/test/alpha/pull/8']")
-    # Exercise the click handler without navigating to live GitHub.
-    link.evaluate("a => a.addEventListener('click', event => event.preventDefault())")
+    link = page.locator("#notifications-list a[href*='test%2Falpha%2Fpull%2F8']")
     link.click()
     count(page, 1)
+    expect(page.locator("#notifications-dialog")).to_be_hidden()
+    expect(page.get_by_role("tab", name="Pull requests", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(page.locator("#pr-list tr.notification-target")).to_be_focused()
+    page.locator("#notifications-toggle").click()
     expect(page.locator("#notifications-list .notification-unseen")).to_have_count(1)
+
+
+@pytest.mark.parametrize("source", ["prs", "issues", "watcher"])
+def test_notification_deep_link_reveals_source_after_reload(page, inbox, source):
+    from urllib.parse import quote
+
+    url, packets = inbox
+    item = packets["status"]["jobs"][0] if source == "watcher" else packets[source][source][0]
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{url}/?item={quote(item['url'], safe='')}#{source}")
+    panel = "Pull requests" if source == "prs" else "Issues" if source == "issues" else "Watcher"
+    expect(page.get_by_role("tab", name=panel, exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    target = page.locator(
+        "#detail"
+        if source == "watcher"
+        else f"#{'pr' if source == 'prs' else 'issue'}-list tr.notification-target"
+    )
+    expect(target).to_be_focused()
+    expect(page.locator("#navigation-status")).to_be_hidden()
+    assert page.url.startswith(url)
+
+
+def test_notification_target_overrides_search_and_missing_item_is_explained(page, inbox):
+    url, _ = inbox
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(2)
+    page.locator("#pr-search").fill("no matching PR")
+    expect(page.locator("#pr-list tr")).to_have_count(0)
+    page.evaluate(
+        "dashboardNavigation.open('/?item=https%3A%2F%2Fgithub.com%2Ftest%2Falpha%2Fpull%2F8#prs')"
+    )
+    expect(page.locator("#pr-search")).to_have_value("")
+    expect(page.locator("#pr-list tr.notification-target")).to_be_focused()
+    page.evaluate(
+        "dashboardNavigation.open('/?item=https%3A%2F%2Fgithub.com%2Ftest%2Falpha%2Fpull%2F999#prs')"
+    )
+    expect(page.locator("#navigation-status")).to_contain_text("no longer")
+
+
+def test_notification_reveals_item_beyond_first_page(page, inbox):
+    from urllib.parse import quote
+
+    url, packets = inbox
+    template = packets["prs"]["prs"][0]
+    packets["prs"]["prs"] = [
+        {
+            **template,
+            "id": f"pr-{i}",
+            "number": i,
+            "title": f"PR {i}",
+            "url": f"https://github.com/test/alpha/pull/{i}",
+        }
+        for i in range(120)
+    ]
+    target = packets["prs"]["prs"][-1]
+    page.goto(f"{url}/?item={quote(target['url'], safe='')}#prs")
+    row = page.locator("#pr-list tr.notification-target")
+    expect(row).to_contain_text("PR 119")
+    expect(row).to_be_focused()
 
 
 def test_seen_state_syncs_between_browser_tabs(page, inbox):

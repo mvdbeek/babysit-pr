@@ -39,6 +39,16 @@ async function badge(count) {
   }
 }
 
+function notificationURL(raw) {
+  const fallback = new URL("/?updates=1", self.location.origin).href;
+  try {
+    const url = new URL(raw || fallback, self.location.origin);
+    return url.origin === self.location.origin && url.pathname === "/" ? url.href : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 self.addEventListener("install", (event) => event.waitUntil(self.skipWaiting()));
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
 self.addEventListener("message", (event) => {
@@ -99,7 +109,7 @@ self.addEventListener("push", (event) => {
             : "Your dashboard is up to date.",
           icon: "/icon-192.png",
           tag: "babysitter-updates",
-          data: { url: "/?updates=1" },
+          data: { url: notificationURL(payload.url) },
         }),
       ]);
       for (const client of await self.clients.matchAll({
@@ -114,12 +124,12 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil(
     (async () => {
-      const url = new URL("/?updates=1", self.location.origin).href;
+      const url = notificationURL(event.notification.data?.url);
       const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const client of clients) {
         if (new URL(client.url).origin === self.location.origin) {
-          await client.navigate(url);
-          return client.focus();
+          await client.focus();
+          return client.navigate(url);
         }
       }
       return self.clients.openWindow(url);

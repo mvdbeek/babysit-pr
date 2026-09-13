@@ -156,8 +156,12 @@ def test_manifest_and_real_service_worker_background_badge(page, inbox):
         self.dispatchEvent(event); await Promise.all(promises);
       };
     }""")
-    worker.evaluate("testEvent('push', {data: {json: () => ({count: 4, revision: 100})}})")
+    target = "/?item=https%3A%2F%2Fgithub.com%2Ftest%2Falpha%2Fpull%2F8#prs"
+    worker.evaluate(
+        "url => testEvent('push', {data: {json: () => ({count: 4, revision: 100, url})}})", target
+    )
     assert worker.evaluate("testBadges.at(-1)") == 4
+    assert worker.evaluate("testNotifications.at(-1).options.data.url") == url + target
     assert worker.evaluate("testNotifications.at(-1).options.body").startswith("4 unseen items")
     # An already queued older push must not resurrect a badge cleared in the app.
     worker.evaluate(
@@ -166,5 +170,17 @@ def test_manifest_and_real_service_worker_background_badge(page, inbox):
     worker.evaluate("testEvent('push', {data: {json: () => ({count: 4, revision: 100})}})")
     assert worker.evaluate("testBadges.at(-1)") == 0
     assert worker.evaluate("testNotifications.length") == 2
+    # Synthetic notification clicks cannot grant the browser's window-focus permission.
+    # Keep real client navigation, but stub the OS focus boundary like notification display.
+    worker.evaluate("WindowClient.prototype.focus = async function() { return this; }")
+    worker.evaluate(
+        "url => testEvent('notificationclick', {notification: {data: {url}, close() {}}})", target
+    )
+    expect(page).to_have_url(url + target)
+    expect(page.locator("#pr-list tr.notification-target")).to_be_focused()
+    assert (
+        worker.evaluate("notificationURL('https://github.com/test/alpha/pull/8')")
+        == url + "/?updates=1"
+    )
     page.goto(url + "/?updates=1")
     expect(page.get_by_role("dialog", name="Recent updates")).to_be_visible()

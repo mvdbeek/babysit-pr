@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 LOG = logging.getLogger(__name__)
 PUSH_HOSTS = {"web.push.apple.com", "fcm.googleapis.com", "updates.push.services.mozilla.com"}
@@ -160,6 +160,17 @@ def unread(device):
         for url, entry in device["entries"].items()
         if entry["at"] > entry["seenAt"]
     }
+
+
+def destination(url, entry):
+    source = max(
+        entry["notes"],
+        key=lambda source: (entry["notes"][source]["at"], source == "watcher"),
+        default="",
+    )
+    if source not in FIELDS:
+        source = "issues" if "/issues/" in url else "watcher" if "/tree/" in url else "prs"
+    return f"/?item={quote(url, safe='')}#{source}"
 
 
 def validate_subscription(value):
@@ -456,7 +467,7 @@ class PushInbox:
                     "title": "Babysitter",
                     "body": f"{len(pending)} unseen items · {entry['title'][:140]}",
                     "count": len(pending),
-                    "url": "/?updates=1",
+                    "url": destination(latest, entry),
                     "revision": now * 1000,
                 }
                 sending = copy.deepcopy(device)

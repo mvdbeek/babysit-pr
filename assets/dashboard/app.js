@@ -2,6 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const ended = new Set(["closed", "stopped"]);
 const attention = new Set(["blocked", "awaiting_release", "handoff"]);
+let navigationTarget = null;
 let data = null,
   selected = null,
   tab = "checks",
@@ -1145,11 +1146,15 @@ function itemTable(spec) {
       // Change counts cover the whole filtered list; only the current window gets rows.
       if (index >= table.limit) continue;
       const row = el("tr");
+      if (table.focusedId === item.id) {
+        row.classList.add("notification-target");
+        row.tabIndex = -1;
+      }
       const { cells, title, fields, updated } = spec.row(item);
       const pinCell = el("td", undefined, "item-pin-cell");
       pinCell.append(pinButton(item, pins));
       if (change) {
-        row.className = change.isNew ? "pr-new" : "pr-changed";
+        row.classList.add(change.isNew ? "pr-new" : "pr-changed");
         title.append(
           el(
             "span",
@@ -1187,12 +1192,14 @@ function itemTable(spec) {
       rows.push(stable);
     }
     const list = id("list");
+    const restoreFocus = renderedRows.get(table.focusedId)?.row === document.activeElement;
     const retained = new Set(rows);
     for (const child of [...list.children]) if (!retained.has(child)) child.remove();
     for (const [index, row] of rows.entries()) {
       if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
     }
     renderedRows = nextRows;
+    if (restoreFocus) renderedRows.get(table.focusedId)?.row.focus({ preventScroll: true });
     const remaining = visible.length - rows.length;
     id("more").hidden = remaining <= 0;
     id("more-button").textContent =
@@ -1226,6 +1233,7 @@ function itemTable(spec) {
       table.data = await get(spec.endpoint);
       window.dashboardNotifications?.overview(spec.key, table.data, spec.changeFields, changeValue);
       render();
+      revealNotification(spec.key);
     } catch (error) {
       id("alert").hidden = false;
       id("alert").textContent =
@@ -1261,7 +1269,21 @@ function itemTable(spec) {
       if (entries.some((entry) => entry.isIntersecting)) showMore();
     }).observe(id("more"));
   }
-  return Object.assign(table, { items, render, refresh });
+  function reveal(url) {
+    const item = items().find((item) => sameSubject(item.url, url));
+    if (!item) return false;
+    id("search").value = "";
+    for (const name of spec.filters) {
+      id(name).value = "all";
+      syncSelect(id(name));
+    }
+    table.limit = Math.max(table.limit, items().length);
+    table.focusedId = item.id;
+    render();
+    focusNotification(renderedRows.get(item.id).row);
+    return true;
+  }
+  return Object.assign(table, { items, render, refresh, reveal });
 }
 
 const prTable = itemTable({
@@ -1501,6 +1523,7 @@ async function refresh() {
     data = await get("/api/status");
     window.dashboardNotifications?.watcher(data);
     render();
+    revealNotification("watcher");
     if ($("service-details").open) await serviceLog();
   } catch (e) {
     $("alert").hidden = false;
@@ -1532,9 +1555,81 @@ function overviewVisible() {
 function pageFromURL() {
   const name = window.location.hash.slice(1);
   showPage(pages.includes(name) ? name : "watcher");
+  const item = new URLSearchParams(location.search).get("item");
+  navigationTarget =
+    item &&
+    /^https:\/\/github\.com\/[^/]+\/[^/]+\/(pull|issues|tree)\/[^?#]+$/.test(item) &&
+    ["prs", "issues", "watcher"].includes(name)
+      ? { page: name, url: item }
+      : null;
+  $("navigation-status").hidden = true;
+  if (navigationTarget) revealNotification(name);
 }
+function sameSubject(left, right) {
+  if (!left || !right) return false;
+  const normalize = (url) =>
+    url
+      .replace(/\/$/, "")
+      .replace(/^(https:\/\/github\.com\/[^/]+\/[^/]+)\//, (prefix) => prefix.toLowerCase());
+  return normalize(left) === normalize(right);
+}
+function focusNotification(element) {
+  element.tabIndex = -1;
+  element.focus({ preventScroll: true });
+  element.scrollIntoView({
+    block: "center",
+    inline: "nearest",
+    behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
+  });
+}
+function revealNotification(page) {
+  if (!navigationTarget || navigationTarget.page !== page) return;
+  const target = navigationTarget;
+  const table = page === "prs" ? prTable : page === "issues" ? issueTable : null;
+  if (
+    table
+      ? !table.data?.synced_at || table.data.refreshing || table.data.error
+      : !data || data.error
+  )
+    return;
+  navigationTarget = null;
+  let found = false;
+  if (table) found = table.reveal(target.url);
+  else {
+    const job = data.jobs.find((job) => sameSubject(job.url, target.url));
+    if (job) {
+      $("search").value = "";
+      $("filter").value = "all";
+      syncSelect($("filter"));
+      selected = job.id;
+      detailKey = null;
+      render();
+      focusNotification($("detail"));
+      found = true;
+    }
+  }
+  $("navigation-status").hidden = found;
+  $("navigation-status").textContent = found
+    ? ""
+    : "This item is no longer in the current dashboard view.";
+  window.dashboardNotifications?.seen([target.url]);
+}
+window.dashboardNavigation = {
+  open(href) {
+    const url = new URL(href, location.href);
+    if (url.origin !== location.origin) return;
+    history.pushState(null, "", url);
+    pageFromURL();
+  },
+};
+window.addEventListener("popstate", pageFromURL);
 for (const page of pages) {
   $(`${page}-tab`).onclick = () => {
+    const url = new URL(location.href);
+    url.searchParams.delete("item");
+    url.searchParams.delete("updates");
+    history.replaceState(null, "", url);
+    navigationTarget = null;
     window.location.hash = page;
     showPage(page);
     void refreshWorkspaces();

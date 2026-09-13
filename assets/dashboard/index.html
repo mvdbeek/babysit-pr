@@ -67,15 +67,16 @@
         The 10 most recently updated items, grouped by PR or issue.
       </p>
       <p id="notifications-status" class="notifications-caption"></p>
+      <button id="notifications-seen" type="button">Mark all seen</button>
       <ol id="notifications-list"></ol>
       <p id="notifications-empty">Updates will appear here as the dashboard syncs.</p>
-      <button id="notifications-seen" type="button">Mark all seen</button>
       <div class="notifications-push">
         <button id="notifications-push-enable" type="button" hidden>Enable notifications</button>
         <p id="notifications-push-status" class="notifications-caption" role="status"></p>
       </div>
     </dialog>
     <main>
+      <p id="navigation-status" role="status" hidden></p>
       <div class="page-tabs" role="tablist" aria-label="Dashboard views">
         <button
           id="watcher-tab"

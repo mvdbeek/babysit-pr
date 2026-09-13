@@ -18,6 +18,11 @@ without prior history starts quietly. Updates come from existing dashboard
 snapshots, including changes discovered on reopening; no extra GitHub polling is
 added, and intermediate changes while the dashboard is closed may not be captured.
 
+Notification entries open their latest source inside Babysitter: a selected watch
+or a highlighted PR/issue row. Links reveal the item even when filters or pagination
+would hide it. Phone alerts also open the source of the latest update. **Mark all
+seen** is above the notification log.
+
 For **iPhone Home Screen badges and background alerts**, run the dashboard with
 the optional Web Push dependency:
 
