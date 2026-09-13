@@ -213,6 +213,41 @@ def test_slug_from_remote_url(url):
     assert wt.slug_from_remote_url(url) == "galaxyproject/galaxy"
 
 
+def test_parse_worktree_list_keeps_branches_and_skips_bare_and_detached():
+    listing = (
+        "worktree /home/u/src/repo\nHEAD aaa\nbranch refs/heads/main\n"
+        "\nworktree /home/u/src/worktrees/repo/topic\nHEAD bbb\n"
+        "branch refs/heads/topic\nlocked\n"
+        "\nworktree /home/u/src/worktrees/repo/gone\nHEAD ccc\ndetached\nprunable gitdir\n"
+        "\nworktree /home/u/src/repo.git\nbare\n"
+    )
+    assert wt.parse_worktree_list(listing) == {
+        "main": "/home/u/src/repo",
+        "topic": "/home/u/src/worktrees/repo/topic",
+    }
+    assert wt.parse_worktree_list("") == {}
+    # A branch line without a preceding worktree line is not a checkout.
+    assert wt.parse_worktree_list("branch refs/heads/main\n") == {}
+
+
+def test_existing_checkout_ignores_missing_directories(tmp_path):
+    live = tmp_path / "live"
+    live.mkdir()
+    listing = (
+        f"worktree {live}\nHEAD aaa\nbranch refs/heads/main\n"
+        f"\nworktree {tmp_path / 'gone'}\nHEAD bbb\nbranch refs/heads/stale\n"
+    )
+    runner = FakeRunner(
+        [(["git", "-C", "/clone", "worktree", "list"], wt.Completed(0, listing, ""))]
+    )
+    t = tool(runner)
+    assert t.existing_checkout("/clone", "main") == str(live)
+    assert t.existing_checkout("/clone", "stale") == ""
+    assert t.existing_checkout("/clone", "absent") == ""
+    failing = FakeRunner([(["git"], wt.Completed(128, "", "not a repository"))])
+    assert tool(failing).existing_checkout("/clone", "main") == ""
+
+
 @pytest.mark.parametrize(
     "title,expected",
     [
@@ -1116,6 +1151,13 @@ def test_wt_branch_worktree_and_dispatch(repo):
     assert (
         git("symbolic-ref", "--short", "HEAD", cwd=home / "src/worktrees/repo/feature") == "feature"
     )
+    # `main` is checked out in the main clone, so wt opens that instead of adding a
+    # second checkout, which git would refuse anyway.
+    result = run_tool("wt", "-r", "repo", "main")
+    assert f"wt: main is already checked out at {home}/src/repo; opening that" in result.stderr
+    assert not (home / "src/worktrees/repo/main").exists()
+    opened = [c for c in state_of(state)["calls"] if c[:2] == ["worktree", "open"]]
+    assert opened[-1][opened[-1].index("--path") + 1] == str(home / "src/repo")
     # The PR head branch now has a checkout of its own, so wtpr reattaches to it.
     run_tool("wt", "-r", "repo", "7")
     opened = [c for c in state_of(state)["calls"] if c[:2] == ["worktree", "open"]]

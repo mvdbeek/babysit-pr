@@ -253,6 +253,11 @@ wti [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|u
 wtpr [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
 ```
 
+`wt <branch>` opens a branch that is already checked out where it already lives --
+the main clone for `wt main`, or a worktree created under a different directory
+name -- instead of failing on git's refusal to check the same branch out twice. The
+reused path is reported on stderr.
+
 To use it from a shell, put `scripts/` on `PATH` or symlink the three launchers into
 a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `tmux`,
 `cmux`, `none` or `auto` (the default) from the environment or from `KEY=VALUE` lines

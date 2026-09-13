@@ -68,7 +68,9 @@ usage:
   wt [opts] issue <issue-number|issue-url> [branch-name]
 
 Open or create a Git worktree, then attach a multiplexer session.
-Numeric arguments are treated as PR numbers.
+Numeric arguments are treated as PR numbers. A branch that is already checked
+out -- in the main clone or in a worktree under another name -- is opened where
+it is instead of being checked out a second time.
 
 The multiplexer is chosen by $WT_MULTIPLEXER (herdr|tmux|cmux|none|auto), set
 in the env or as a KEY=VALUE line in ~/.config/worktree/config; "auto" (default)
@@ -282,6 +284,25 @@ def slug_from_remote_url(url: str) -> str:
     for prefix in ("https://github.com/", "git@github.com:", "ssh://git@github.com/"):
         slug = slug.removeprefix(prefix)
     return slug.removesuffix("/").removesuffix(".git")
+
+
+def parse_worktree_list(output: str) -> dict[str, str]:
+    """``branch -> checkout path`` from ``git worktree list --porcelain``.
+
+    The main clone is listed alongside the linked worktrees. Bare and detached
+    entries carry no ``branch`` line and so contribute nothing.
+    """
+    checkouts: dict[str, str] = {}
+    path = ""
+    for line in output.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            path = value
+        elif key == "branch" and path:
+            checkouts.setdefault(value.removeprefix("refs/heads/"), path)
+        elif not key:
+            path = ""
+    return checkouts
 
 
 def title_slug(title: str) -> str:
@@ -649,6 +670,14 @@ class Tool:
             raise WtError(f"{command}: unexpected gh reply")
         return value
 
+    def existing_checkout(self, repo_path: str, branch: str) -> str:
+        """Where ``branch`` is already checked out, if anywhere: the main clone or a worktree."""
+        result = self.git_query(repo_path, "worktree", "list", "--porcelain")
+        if result.returncode:
+            return ""
+        path = parse_worktree_list(result.stdout).get(branch, "")
+        return path if path and os.path.isdir(path) else ""
+
     def add_worktree(self, repo_path: str, directory: str, branch: str, base: str) -> None:
         """Reuse an existing local branch, else create one from ``origin/<base>``."""
         os.makedirs(os.path.dirname(directory), exist_ok=True)
@@ -829,7 +858,15 @@ class Tool:
         repo_path = os.path.join(self.home, "src", options.repo)
         directory = os.path.join(self.home, "src", "worktrees", options.repo, branch)
         if not os.path.isdir(directory):
-            self.add_worktree(repo_path, directory, branch, base)
+            # Git refuses to check a branch out twice, and a second checkout would be
+            # the wrong thing anyway: work where the branch already lives. That covers
+            # the main clone (wt main) as well as a worktree created under another name.
+            existing = self.existing_checkout(repo_path, branch)
+            if existing:
+                self.warn(f"wt: {branch} is already checked out at {existing}; opening that")
+                directory = existing
+            else:
+                self.add_worktree(repo_path, directory, branch, base)
         self.open_session(options, directory, branch, repo_path)
 
     def run_wti(self, options: Options) -> None:
