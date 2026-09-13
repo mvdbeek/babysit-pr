@@ -184,11 +184,14 @@ existing checkout can be reopened without another agent. Previous operations sta
 in the database's `operation_history` table.
 
 Dashboard-created checkouts use `~/src/worktrees/<repo>/pr-<base-owner>-<number>`,
-with an unused numeric suffix for collisions. The adapter invokes `wtpr` through
-`zsh -lic`, forces herdr, and selects the agent explicitly, retaining the user's
-interactive-shell Safehouse wrappers. Task text plus the canonical PR URL is stored
-in a private file under `workspace-prompts/` outside the checkout and passed with
-`--prompt-file`. No PR comments or CI watches are added.
+with an unused numeric suffix for collisions. The adapter runs the repository's
+portable worktree helper, `scripts/wt.py` (see [Worktree helper](#worktree-helper)),
+as `wtpr` directly with `WT_MULTIPLEXER=herdr` and selects the agent explicitly. No
+login shell wraps the helper: the user's interactive-shell Safehouse wrappers still
+apply because the helper types the agent command into the herdr pane's interactive
+shell rather than running the agent itself. Task text plus the canonical PR URL is
+stored in a private file under `workspace-prompts/` outside the checkout and passed
+with `--prompt-file`. No PR comments or CI watches are added.
 
 **Model (optional)** and **Reasoning effort (optional)** each start at **Default**.
 Blank fields are omitted from the launch command; the dashboard never writes agent
@@ -211,18 +214,15 @@ choices use the documented `fable`, `opus`, `sonnet`, and `haiku` aliases; Haiku
 no explicit effort choices. Aliases and supported levels require a current Claude
 Code CLI and may be restricted or remapped by local/provider configuration.
 
-When either override is selected, the adapter sources the repository's
-`scripts/worktree.zsh` by an absolute path passed as a separate shell argument in
-the child `zsh -lic`, then invokes `wtpr` or `wti`. This preserves login-shell agent
-wrappers and requires **no installed-helper update or personal dotfile edits**.
-Keep `worktree.zsh` alongside `pr_workspaces.py` when distributing the scripts.
-All-default launches continue using the installed helper with its existing
-`--name`, `--no-focus`, `--repo-path`, `--worktree-root`, and `--prompt-file` support.
-The shipped helper also accepts `wt --model/--effort` for terminal use, and applies
-these flags only when starting a new session. Codex receives `--model` and
+Overrides are passed to the helper as `--model`/`--effort` next to `--name`,
+`--no-focus`, `--repo-path`, `--worktree-root` and `--prompt-file`. The helper
+validates both values syntactically before any Git or GitHub call and applies them
+only when starting a new session. Codex receives `--model` and
 `-c 'model_reasoning_effort="…"'`; Claude receives `--model` and `--effort`.
 CLI configuration precedence and organization policies still apply, including
 Codex managed new-thread defaults that can change when either override is supplied.
+Keep `wt.py` alongside `pr_workspaces.py` when distributing the scripts; there is
+no separate installed helper to update.
 
 References (verified against installed CLI help and official documentation):
 
@@ -235,6 +235,46 @@ References (verified against installed CLI help and official documentation):
   aliases, model-specific efforts, and fallback/organization restrictions.
 - [Claude CLI reference](https://code.claude.com/docs/en/cli-usage) documents session
   `--model` and `--effort` flags.
+
+## Worktree helper
+
+`scripts/wt.py` is a portable, stdlib-only Python implementation of the `wt`, `wti`
+and `wtpr` shell helpers (with `wri`/`wtissue` as `wti` aliases). The `scripts/wt`,
+`scripts/wti` and `scripts/wtpr` symlinks dispatch on their own name; `wt.py wtpr …`
+with a leading subcommand does the same. It creates (or reattaches to) a worktree
+under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, then
+opens it in a multiplexer with the selected agent started in the left pane:
+
+```sh
+wt [--codex|--claude] [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
+wt [opts] <pr-number>                 # same as wtpr
+wt [opts] issue <number|url> [branch] # same as wti
+wti [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
+wtpr [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
+```
+
+To use it from a shell, put `scripts/` on `PATH` or symlink the three launchers into
+a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `tmux`,
+`cmux`, `none` or `auto` (the default) from the environment or from `KEY=VALUE` lines
+in `~/.config/worktree/config` (`$XDG_CONFIG_HOME` is honoured; the environment wins).
+`auto` uses herdr when `herdr` is installed and either `HERDR_ENV=1` is set or
+`herdr status server --json` reports a running server, then cmux when
+`CMUX_SURFACE_ID` is set, then tmux, then `none`. A program cannot change its
+caller's directory, so with `none` the helper prints the worktree path on stdout
+(everything else goes to stderr); a shell function turns that into a `cd`:
+
+```sh
+wt() { local d; d="$(WT_MULTIPLEXER=none command wt "$@")" && cd "$d"; }
+```
+
+Prompts (`-p`, `-F`) are staged in a private `$TMPDIR/wt-prompt.*` file and the
+typed agent command reads it back with `"$(cat '…')"`, so the line the multiplexer
+types stays short whatever the prompt's size (canonical tty input silently drops
+lines over 1024 bytes on macOS). A prompt only applies to a session being created;
+reattaching to an existing worktree warns on stderr that the prompt was ignored.
+Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
+the planning code without processes and the whole tool against temporary
+repositories with fake `gh`, `herdr`, `tmux`, `cmux` and agent executables.
 
 ## Issue workspace actions
 
@@ -258,7 +298,7 @@ An issue's workspaces are checkouts that match one of these rules:
   issue's workspace and are labelled **via PR #n** in the Actions cell and chooser.
 
 **Create workspace** for an issue requires a task and an agent, exactly like PRs,
-and needs no head metadata. The adapter invokes `wti` through `zsh -lic` with
+and needs no head metadata. The adapter runs the same helper as `wti` with
 `--codex|--claude --no-focus --name <name> --repo-path <clone> --worktree-root
 <root> --prompt-file <file> <issue-url>`. The worktree and branch name is `wti`'s
 own default, `issue-<number>-<title-slug>` (or `issue-<number>` when the title yields
@@ -269,7 +309,7 @@ no slug), with a numeric suffix for collisions; the branch starts from the clone
 
 ## Development
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, and zsh. Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, and zsh (only to syntax-check the Safehouse launcher and as the fake herdr pane shell in tests; the worktree helper itself is plain Python). Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.
 
 Run every local check through tox:
 

@@ -17,6 +17,7 @@ import selectors
 import shlex
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -27,6 +28,8 @@ import workspace_agents
 from issue_overview import branch_number
 
 COLLIE_URL = "https://collie.tailfb45be.ts.net"
+# The portable wt/wti/wtpr implementation shipped next to this module.
+WORKTREE_HELPER = str(Path(__file__).resolve().with_name("wt.py"))
 POLL_SECONDS = 15
 SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 
@@ -720,7 +723,7 @@ class Workspaces:
             worker.start()
             return {"operation": copy.deepcopy(op)}
 
-    def run_logged(self, op, *args, pass_fds=(), timeout=600):
+    def run_logged(self, op, *args, pass_fds=(), timeout=600, env=None):
         """Stream bounded command output into the operation database while it runs."""
         started = time.monotonic()
         with subprocess.Popen(
@@ -728,6 +731,7 @@ class Workspaces:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             pass_fds=pass_fds,
+            env=env,
         ) as proc:
             assert proc.stdout is not None
             with selectors.DefaultSelector() as selector:
@@ -849,22 +853,21 @@ class Workspaces:
                         str(prompt),
                         canonical(pr),
                     ]
-                    command = f'export WT_MULTIPLEXER=herdr; {helper} "$@"'
-                    if overrides:
-                        # Source our helper only in this child login shell. Keep the user's
-                        # agent wrappers, without requiring an installed helper update.
-                        command = 'source "$1" || exit; shift; ' + command
-                        args.insert(0, str(Path(__file__).resolve().with_name("worktree.zsh")))
+                    # The helper is a plain Python program run directly: no login shell
+                    # wraps it. The user's interactive agent wrappers (for example the
+                    # Safehouse `claude` function) still apply, because the helper never
+                    # runs the agent itself: it types the agent command into the herdr
+                    # pane's interactive shell, which loads the user's own startup files.
                     launching = True
                     self.run_logged(
                         op,
-                        "zsh",
-                        "-lic",
-                        command,
-                        "pr-workspaces",
+                        sys.executable,
+                        WORKTREE_HELPER,
+                        helper,
                         *args,
                         timeout=600,
                         pass_fds=(lock.fileno(),),
+                        env={**os.environ, "WT_MULTIPLEXER": "herdr"},
                     )
                     self.save_operation(op, message="Verifying checkout and agent startup")
                     item = checkout(op["path"])
