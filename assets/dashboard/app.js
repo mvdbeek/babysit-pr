@@ -1472,7 +1472,7 @@ async function refresh() {
     busy = false;
   }
 }
-const pages = ["watcher", "prs", "issues", "upstream"];
+const pages = ["watcher", "prs", "issues", "workspaces", "upstream"];
 function showPage(name) {
   for (const page of pages) {
     const active = page === name;
@@ -1482,6 +1482,7 @@ function showPage(name) {
   }
   if (name === "prs") prTable.render();
   if (name === "issues") issueTable.render();
+  if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));
   if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
 }
 function overviewVisible() {

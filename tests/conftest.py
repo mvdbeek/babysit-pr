@@ -46,6 +46,14 @@ elif a[:2] == ['worktree','open']:
   data['workspaces'].append({'workspace_id':wid,'label':a[a.index('--label')+1] if '--label' in a else 'Reopened','agent_status':'unknown','worktree':{'repo_root':root,'checkout_path':path}})
  result={'already_open':bool(existing),'root_pane':{'pane_id':wid+':p1'}}
  if os.environ.get('FAKE_HERDR_NO_ROOT'): result={'already_open':False}
+elif a[:2] == ['workspace','close']:
+ data['workspaces']=[w for w in data['workspaces'] if w['workspace_id']!=a[2]]
+ data['agents']=[g for g in data['agents'] if g.get('workspace_id')!=a[2]]
+ if os.environ.get('FAKE_HERDR_CLOSE_ERROR'):
+  p.write_text(json.dumps(data)); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_CLOSE_ERROR']}})); sys.exit(1)
+elif a[:2] == ['agent','send-keys']:
+ if not os.environ.get('FAKE_HERDR_KEEP_AGENT'):
+  data['agents']=[g for g in data['agents'] if g.get('pane_id')!=a[2]]
 elif a[:2] == ['pane','run']:
  w=next(w for w in data['workspaces'] if a[2].startswith(w['workspace_id']+':'))
  p.write_text(json.dumps(data))

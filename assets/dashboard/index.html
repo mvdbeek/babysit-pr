@@ -8,6 +8,8 @@
     <script src="/app.js" defer></script>
     <script src="/upstream-tests.js" defer></script>
     <link rel="stylesheet" href="/upstream-tests.css" />
+    <script src="/workspaces.js" defer></script>
+    <link rel="stylesheet" href="/workspaces.css" />
   </head>
   <body>
     <header>
@@ -55,6 +57,17 @@
           Issues
         </button>
         <button
+          id="workspaces-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="workspaces-panel"
+          tabindex="-1"
+          hidden
+        >
+          Workspaces <span class="count">Experiment</span>
+        </button>
+        <button
           id="upstream-tab"
           type="button"
           role="tab"
@@ -66,6 +79,72 @@
           Upstream tests <span class="count">Experiment</span>
         </button>
       </div>
+      <section
+        id="workspaces-panel"
+        class="pr-overview"
+        role="tabpanel"
+        aria-labelledby="workspaces-tab"
+        tabindex="0"
+        hidden
+      >
+        <div class="toolbar">
+          <h2>Your workspaces <span id="ws-count" class="count">0</span></h2>
+          <div class="filters">
+            <input
+              id="ws-search"
+              type="search"
+              placeholder="Find a workspace, branch or repo…"
+              aria-label="Search workspaces"
+            />
+            <button id="ws-refresh" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="pr-filters">
+          <label for="ws-repo"
+            >Repository
+            <select id="ws-repo" aria-label="Filter workspaces by repository">
+              <option value="all">All repositories</option>
+            </select>
+          </label>
+          <label for="ws-status"
+            >Status
+            <select id="ws-status" aria-label="Filter workspaces by cleanup status">
+              <option value="all">All workspaces</option>
+              <option value="ready">Ready to clean up</option>
+              <option value="active">Open pull request or issue</option>
+              <option value="unlinked">No linked item</option>
+              <option value="blocked">Needs an override</option>
+              <option value="protected">Protected</option>
+              <option value="missing">Checkout missing</option>
+              <option value="agents">Has an agent</option>
+            </select>
+          </label>
+        </div>
+        <p id="ws-status-line" class="pr-sync" role="status">Loading your workspaces…</p>
+        <div id="ws-notices" role="status"></div>
+        <div class="ws-batch">
+          <label><input id="ws-all" type="checkbox" /> Select all shown</label>
+          <span id="ws-selected">0 selected</span>
+          <button id="ws-cleanup" type="button" disabled>Clean up selected</button>
+        </div>
+        <div class="pr-table-wrap">
+          <table class="pr-table ws-table">
+            <thead>
+              <tr>
+                <th class="ws-select" scope="col" aria-label="Select"></th>
+                <th scope="col">Workspace</th>
+                <th scope="col">Repository / branch</th>
+                <th scope="col">Pull request / issue</th>
+                <th scope="col">Agents</th>
+                <th scope="col">Local state</th>
+                <th scope="col">Cleanup</th>
+              </tr>
+            </thead>
+            <tbody id="ws-list"></tbody>
+          </table>
+          <p id="ws-empty" class="pr-empty" hidden></p>
+        </div>
+      </section>
       <section
         id="upstream-panel"
         role="tabpanel"
@@ -462,6 +541,16 @@
       <p id="ci-error" role="alert"></p>
       <div id="ci-links"></div>
       <div id="ci-content"></div>
+    </dialog>
+    <dialog id="ws-dialog" aria-labelledby="ws-dialog-title">
+      <h2 id="ws-dialog-title">Clean up workspaces</h2>
+      <p id="ws-dialog-intro"></p>
+      <div id="ws-dialog-content"></div>
+      <p id="ws-dialog-error" role="alert"></p>
+      <div class="ws-dialog-actions">
+        <button id="ws-cancel" type="button">Cancel</button>
+        <button id="ws-confirm" type="button">Clean up</button>
+      </div>
     </dialog>
     <dialog id="workspace-dialog" aria-labelledby="workspace-title">
       <button id="workspace-close" type="button" aria-label="Close workspace actions">Close</button>

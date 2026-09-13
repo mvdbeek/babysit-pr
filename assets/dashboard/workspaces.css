@@ -1,0 +1,148 @@
+#workspaces-panel {
+  min-width: 0;
+}
+#ws-status-line,
+#ws-notices {
+  overflow-wrap: anywhere;
+}
+/* The dashboard sizes text inputs globally; checkboxes must stay checkbox-sized. */
+#workspaces-panel input[type="checkbox"],
+#ws-dialog input[type="checkbox"] {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--green);
+}
+.ws-batch {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.ws-batch label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ws-batch #ws-selected {
+  color: var(--muted);
+}
+.ws-batch button {
+  margin-left: auto;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--red);
+}
+.ws-batch button:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+.ws-table .ws-select {
+  width: 34px;
+}
+.ws-table td {
+  overflow-wrap: anywhere;
+}
+.ws-table td small {
+  display: block;
+  color: var(--muted);
+}
+.ws-agent {
+  font-size: 13px;
+}
+.ws-table .badge + small {
+  margin-top: 4px;
+}
+#ws-dialog {
+  width: min(680px, 92vw);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 22px;
+  color: var(--ink);
+  background: var(--paper);
+}
+#ws-dialog::backdrop {
+  background: rgb(37 52 47 / 45%);
+}
+#ws-dialog h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+#ws-dialog-intro {
+  color: var(--muted);
+  line-height: 1.6;
+}
+.ws-target {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.ws-target strong,
+.ws-target small {
+  display: block;
+}
+.ws-target .badge {
+  margin: 4px 0;
+}
+.ws-target label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--amber);
+}
+#ws-dialog-error {
+  color: var(--red);
+}
+.ws-dialog-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+.ws-dialog-actions button {
+  padding: 8px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+}
+#ws-confirm {
+  color: var(--red);
+}
+@media (max-width: 650px) {
+  .page-tabs:has(#workspaces-tab:not([hidden])) {
+    flex-wrap: wrap;
+  }
+  #workspaces-panel .filters,
+  .ws-batch {
+    flex-wrap: wrap;
+  }
+  .ws-batch button {
+    margin-left: 0;
+  }
+}
+@media (max-width: 540px) {
+  .ws-table .ws-select {
+    position: absolute;
+    top: 14px;
+    left: 10px;
+    width: 28px;
+    padding: 0;
+  }
+  .ws-table td:nth-child(2) {
+    grid-column: 1 / -1;
+  }
+  #workspaces-panel input[type="checkbox"] {
+    width: 22px;
+    height: 22px;
+  }
+}

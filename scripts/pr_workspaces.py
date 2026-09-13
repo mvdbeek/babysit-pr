@@ -123,16 +123,17 @@ def checkout(path):
         return None
 
 
-def clone_worktrees(root, wanted):
+def clone_worktrees(root, wanted=None):
     """The clone at ``root`` and its attached worktrees, or None when not a wanted clone.
 
     Three Git calls per clone replace five per worktree: the shared config supplies
     remotes and branch upstreams, ``worktree list`` supplies every path, head and
     branch. Bare, detached and prunable entries are skipped, as ``checkout`` skips them.
+    ``wanted`` of None accepts every clone, for callers that inventory all of them.
     """
     config = repo_config(root)
     remotes = remote_slugs(config)
-    if not wanted.intersection(remotes.values()):
+    if wanted is not None and not wanted.intersection(remotes.values()):
         return None
     try:
         toplevel, common = git(

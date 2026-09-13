@@ -182,11 +182,13 @@ class DashboardServer(ThreadingHTTPServer):
         ci_logs=None,
         issues: IssueOverview | None = None,
         upstream_tests=None,
+        workspace_overview=None,
     ) -> None:
         self.home = home
         self.overview = overview
         self.issues = issues
         self.upstream_tests = upstream_tests
+        self.workspace_overview = workspace_overview
         self.workspaces = workspaces
         self.ci = ci
         self.ci_logs = ci_logs
@@ -229,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
         # are allowed. Check Origin too, including for trusted tailnet proxies.
         if (
             host not in allowed
-            or action not in {"cancel", "feedback", "workspace-action"}
+            or action not in {"cancel", "feedback", "workspace-action", "workspace-cleanup"}
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
         ):
@@ -241,17 +243,29 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if (
-                not 0 < length <= (200000 if action == "workspace-action" else 1024)
+                not 0
+                < length
+                <= (200000 if action in {"workspace-action", "workspace-cleanup"} else 1024)
                 or self.headers.get("Content-Type") != "application/json"
             ):
                 raise ValueError("Expected a small JSON action request")
             self.connection.settimeout(5)
             request = json.loads(self.rfile.read(length))
-            if (
-                not isinstance(request, dict)
-                or not isinstance(request.get("id"), str)
-                or not request["id"]
-            ):
+            if not isinstance(request, dict):
+                raise ValueError("Expected a JSON action request")
+            if action == "workspace-cleanup":
+                # Experimental cleanup owns its validation behind its own boundary.
+                if not self.server.workspace_overview:
+                    raise ValueError("The workspace experiment is disabled")
+                try:
+                    value = self.server.workspace_overview.cleanup(request)
+                except ValueError:
+                    raise
+                except Exception:
+                    value = {"error": "Workspace experiment unavailable"}
+                self.send_json(200, value)
+                return
+            if not isinstance(request.get("id"), str) or not request["id"]:
                 raise ValueError("Supply a watch ID")
             if action == "workspace-action":
                 if not self.server.workspaces:
@@ -298,6 +312,20 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     self.send_json(
                         200, {"enabled": True, "error": "Upstream test experiment unavailable"}
+                    )
+            elif route.path == "/api/workspace-overview":
+                # Experimental inventory must stay outside the main dashboard boundary.
+                try:
+                    if self.server.workspace_overview:
+                        if parse_qs(route.query).get("refresh") == ["1"]:
+                            self.server.workspace_overview.request_refresh()
+                        value = self.server.workspace_overview.snapshot()
+                    else:
+                        value = {"enabled": False}
+                    self.send_json(200, value)
+                except Exception:
+                    self.send_json(
+                        200, {"enabled": True, "error": "Workspace experiment unavailable"}
                     )
             elif route.path == "/api/prs":
                 self.send_json(
@@ -374,6 +402,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/app.js": ("app.js", "text/javascript"),
                     "/upstream-tests.js": ("upstream-tests.js", "text/javascript"),
                     "/upstream-tests.css": ("upstream-tests.css", "text/css"),
+                    "/workspaces.js": ("workspaces.js", "text/javascript"),
+                    "/workspaces.css": ("workspaces.css", "text/css"),
                     "/style.css": ("style.css", "text/css"),
                 }
                 if route.path not in files:
@@ -389,8 +419,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
     from upstream_tests import UpstreamTests
+    from workspace_overview import WorkspaceOverview
 
     upstream_tests = UpstreamTests(home)
+    workspace_overview = WorkspaceOverview(home, jobs=lambda: read_jobs(home))
     overview = Overview(home)
     issues = IssueOverview(home)
     workspaces = Workspaces(home, overview, lambda: read_jobs(home), issues=issues)
@@ -406,6 +438,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         ci_logs=ci_logs,
         issues=issues,
         upstream_tests=upstream_tests,
+        workspace_overview=workspace_overview,
     ) as server:
         ci_logs.start()
         url = f"http://127.0.0.1:{server.server_port}"
