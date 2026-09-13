@@ -18,6 +18,7 @@ class Node {
   setAttribute(key, value) {
     this.attributes[key] = value;
   }
+  scrollIntoView() {}
 }
 const nodes = new Map();
 const get = (id) => {

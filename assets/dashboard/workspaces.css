@@ -119,9 +119,6 @@
   color: var(--red);
 }
 @media (max-width: 650px) {
-  .page-tabs:has(#workspaces-tab:not([hidden])) {
-    flex-wrap: wrap;
-  }
   #workspaces-panel .filters,
   .ws-batch {
     flex-wrap: wrap;

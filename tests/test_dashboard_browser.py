@@ -655,6 +655,36 @@ def test_cancel_keeps_history_and_running_repairs_finish_first(page: Page, dashb
     assert job["status"] == "running" and job["stop_after_run"]
 
 
+@pytest.mark.parametrize("width", [390, 1280])
+def test_page_tabs_scroll_without_wrapping(page: Page, dashboard_site, width: int) -> None:
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 844})
+    for endpoint in ("workspace-overview", "upstream-tests"):
+        page.route(f"**/api/{endpoint}*", lambda route: route.fulfill(json={"enabled": True}))
+    page.goto(url)
+    tabs = page.get_by_role("tablist", name="Dashboard views")
+    expect(page.locator("#upstream-tab")).to_be_visible()
+    expect(page.locator("#workspaces-tab")).to_be_visible()
+    assert tabs.get_by_role("tab").evaluate_all(
+        "tabs => new Set(tabs.map(tab => tab.offsetTop)).size === 1"
+    )
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    assert page.locator(".mark").evaluate("img => img.complete && img.naturalWidth > 0")
+    page.screenshot(path=f"reports/cat-tabs-{width}.png")
+    if width == 390:
+        assert tabs.evaluate("el => el.scrollWidth > el.clientWidth")
+    page.locator("#watcher-tab").focus()
+    page.keyboard.press("End")
+    expect(page.locator("#upstream-tab")).to_be_focused()
+    expect(page.locator("#upstream-tab")).to_have_attribute("aria-selected", "true")
+    assert page.locator("#upstream-tab").evaluate(
+        "el => el.getBoundingClientRect().right <= el.parentElement.getBoundingClientRect().right + 1"
+    )
+    page.keyboard.press("Home")
+    expect(page.locator("#watcher-tab")).to_be_focused()
+    assert tabs.evaluate("el => el.scrollLeft === 0")
+
+
 def test_mobile_cleanup_attention_and_offline_state(page: Page, dashboard_site) -> None:
     url, home = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})

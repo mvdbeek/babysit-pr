@@ -408,6 +408,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 files = {
                     "/": ("index.html", "text/html"),
+                    "/cat.svg": ("cat.svg", "image/svg+xml"),
+                    "/favicon.png": ("favicon.png", "image/png"),
+                    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
                     "/app.js": ("app.js", "text/javascript"),
                     "/upstream-tests.js": ("upstream-tests.js", "text/javascript"),
                     "/upstream-tests.css": ("upstream-tests.css", "text/css"),
@@ -419,7 +422,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(404, {"error": "Not found"})
                     return
                 filename, mime = files[route.path]
-                self.send_body(200, (ASSETS / filename).read_bytes(), mime + "; charset=utf-8")
+                content_type = mime + ("; charset=utf-8" if mime.startswith("text/") else "")
+                self.send_body(200, (ASSETS / filename).read_bytes(), content_type)
         except ValueError as exc:
             self.send_json(400, {"error": str(exc)})
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:

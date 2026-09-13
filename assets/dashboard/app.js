@@ -1480,6 +1480,7 @@ function showPage(name) {
     $(`${page}-tab`).setAttribute("aria-selected", String(active));
     $(`${page}-tab`).tabIndex = active ? 0 : -1;
   }
+  $(`${name}-tab`).scrollIntoView({ block: "nearest", inline: "nearest" });
   if (name === "prs") prTable.render();
   if (name === "issues") issueTable.render();
   if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));

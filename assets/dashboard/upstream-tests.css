@@ -38,9 +38,6 @@
   color: var(--muted);
 }
 @media (max-width: 650px) {
-  .page-tabs:has(#upstream-tab:not([hidden])) {
-    flex-wrap: wrap;
-  }
   #upstream-panel .filters {
     flex-wrap: wrap;
   }

@@ -69,18 +69,10 @@ header {
   gap: 16px;
 }
 .mark {
-  display: grid;
-  place-items: center;
-  background: var(--ink);
-  color: #e5f0a3;
-  width: 34px;
-  height: 34px;
+  display: block;
+  width: 38px;
+  height: 38px;
   flex-shrink: 0;
-  border-radius: 10px;
-  font:
-    bold 25px Georgia,
-    serif;
-  padding-bottom: 4px;
 }
 h1 {
   font-size: 20px;
@@ -818,16 +810,25 @@ button:disabled {
 
 .page-tabs {
   display: flex;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
   gap: 8px;
   border-bottom: 1px solid var(--line);
   margin-bottom: 28px;
 }
 .page-tabs button {
+  flex: 0 0 auto;
+  white-space: nowrap;
   padding: 12px 18px;
   border: 0;
   border-radius: 7px 7px 0 0;
   background: transparent;
   color: var(--muted);
+}
+.page-tabs button:focus-visible {
+  outline-offset: -3px;
 }
 .page-tabs button[aria-selected="true"] {
   color: var(--green);
