@@ -455,6 +455,8 @@ def test_latest_activity_display_refresh_and_fallback(page, dashboard_site, kind
     page.route(f"**/api/{kind}", lambda route: route.fulfill(json=snapshot))
     page.goto(f"{url}/#{kind}")
     rows = page.locator(f"#{prefix}-list tr")
+    if width == 390:
+        rows.first.locator(".pr-details-toggle").click()
     detail = rows.first.locator(".pr-activity")
     expect(detail).to_contain_text("Latest activity")
     expect(detail.get_by_role("link", name="dependabot[bot] commented")).to_have_attribute(
@@ -698,7 +700,7 @@ def test_watch_selection_scrolls_to_details_only_on_mobile(
     page.get_by_role("button", name="test/repo, feature,", exact=False).click()
     expect(page.locator("#detail h2")).to_be_in_viewport()
     if width == 390:
-        page.wait_for_function("window.scrollY > 0")
+        page.wait_for_function("() => window.scrollY > 0")
         if motion == "reduce":
             page.screenshot(path="reports/mobile-watch-details.png")
             page.evaluate("window.scrollTo(0, 0)")
@@ -902,8 +904,9 @@ def test_each_pr_column_sorts_both_directions(page: Page, dashboard_site, column
     )
 
 
+@pytest.mark.parametrize("width", [390, 320])
 def test_pr_metadata_and_mobile_sort_survive_refresh_and_filtering(
-    page: Page, dashboard_site
+    page: Page, dashboard_site, width
 ) -> None:
     url, _ = dashboard_site
     page.goto(url + "/#prs")
@@ -913,7 +916,35 @@ def test_pr_metadata_and_mobile_sort_survive_refresh_and_filtering(
     expect(page.locator(".pr-opened time").first).to_have_attribute(
         "datetime", "2025-01-01T10:00:00Z"
     )
-    page.set_viewport_size({"width": 390, "height": 844})
+    page.set_viewport_size({"width": width, "height": 844})
+    filters = page.locator("#pr-filters-toggle")
+    expect(filters).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#pr-filters")).to_be_hidden()
+    first = page.locator("#pr-list tr").first
+    assert first.bounding_box()["y"] < 300
+    refresh = page.get_by_role("button", name="Refresh", exact=True)
+    assert refresh.bounding_box()["width"] == 44
+    assert refresh.bounding_box()["y"] == page.locator("#pr-search").bounding_box()["y"]
+    expect(first.locator(".pr-opened")).to_be_hidden()
+    first.locator(".pr-details-toggle").click()
+    expect(first.locator(".pr-opened")).to_be_visible()
+    page.evaluate("prTable.refresh()")
+    expect(first.locator(".pr-details-toggle")).to_have_attribute("aria-expanded", "true")
+    expect(first.locator(".pr-opened")).to_be_visible()
+    first.locator(".pr-details-toggle").click()
+    page.screenshot(path=f"reports/pr-mobile-compact-{width}.png", full_page=True)
+    filters.click()
+    choose_option(
+        page.get_by_role("combobox", name="Filter pull requests by repository"), "test/beta"
+    )
+    expect(filters).to_have_text("Filters · 1")
+    filters.click()
+    page.evaluate("prTable.refresh()")
+    expect(filters).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#pr-list tr")).to_have_count(1)
+    filters.click()
+    choose_option(page.get_by_role("combobox", name="Filter pull requests by repository"), "all")
+    filters.click()
     choose_option(page.get_by_role("combobox", name="Sort by", exact=True), "author")
     expect(page.locator(".pr-author").first).to_have_text("colleague")
     page.get_by_role("button", name="Ascending", exact=True).click()
@@ -969,6 +1000,7 @@ def test_pr_filters_combine_and_keep_repository_selection_on_refresh(
     page.get_by_role("button", name="Refresh", exact=True).click()
     expect(rows).to_have_count(1)
     page.set_viewport_size({"width": 390, "height": 844})
+    page.locator("#pr-filters-toggle").click()
     expect(repo).to_be_visible()
     expect(review).to_be_visible()
     expect(ci).to_be_visible()
@@ -2297,6 +2329,8 @@ def test_searchable_long_plain_text_choices_and_layout(page, dashboard_site, wid
     page.route("**/api/issues", lambda route: route.fulfill(json=snapshot))
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{url}/#issues")
+    if width == 390:
+        page.locator("#issue-filters-toggle").click()
     picker = page.get_by_role("combobox", name="Filter issues by label", exact=True)
     picker.fill("TEAM/")
     option = page.get_by_role("option")

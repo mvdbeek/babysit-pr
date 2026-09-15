@@ -147,7 +147,29 @@
               placeholder="Find a workspace, branch or repo…"
               aria-label="Search workspaces"
             />
-            <button id="ws-refresh" type="button">Refresh</button>
+            <button
+              id="ws-refresh"
+              class="refresh-icon"
+              type="button"
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"
+                />
+              </svg>
+            </button>
           </div>
         </div>
         <div class="pr-filters">
@@ -224,7 +246,29 @@
                 <option value="insufficient">Insufficient history</option>
               </select>
             </div>
-            <button id="upstream-refresh" type="button">Refresh</button>
+            <button
+              id="upstream-refresh"
+              class="refresh-icon"
+              type="button"
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"
+                />
+              </svg>
+            </button>
           </div>
         </div>
         <p id="upstream-status" role="status">Loading experiment…</p>
@@ -259,7 +303,29 @@
               <option value="attention">Needs attention</option>
               <option value="all">All watches</option>
               <option value="ended">Ended</option></select
-            ><button id="refresh">Refresh</button>
+            ><button
+              id="refresh"
+              class="refresh-icon"
+              type="button"
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"
+                />
+              </svg>
+            </button>
           </div>
         </div>
         <div class="workspace">
@@ -306,10 +372,55 @@
               placeholder="Find a PR or repo…"
               aria-label="Search pull requests"
             />
-            <button id="pr-refresh" type="button">Refresh</button>
+            <button
+              id="pr-refresh"
+              class="refresh-icon"
+              type="button"
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"
+                />
+              </svg>
+            </button>
           </div>
         </div>
-        <div class="pr-filters">
+        <div class="pr-mobile-sort">
+          <button
+            id="pr-filters-toggle"
+            class="filters-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="pr-filters"
+          >
+            Filters
+          </button>
+          <label for="pr-sort">Sort by</label>
+          <select id="pr-sort">
+            <option value="repo">Repository</option>
+            <option value="title">Pull request</option>
+            <option value="author">Author</option>
+            <option value="readiness">Review status</option>
+            <option value="roles">Your role</option>
+            <option value="ci">CI</option>
+            <option value="opened_at">Opened</option>
+            <option value="updated_at" selected>Last updated</option>
+          </select>
+          <button id="pr-sort-direction" type="button">Descending</button>
+        </div>
+        <div id="pr-filters" class="pr-filters">
           <label for="pr-repo"
             >Repository
             <select id="pr-repo" aria-label="Filter pull requests by repository">
@@ -351,20 +462,7 @@
         <p id="pr-pins-status" class="pr-sync" role="status" hidden></p>
         <p id="pr-changes" class="pr-sync" role="status" hidden></p>
         <div id="pr-alert" class="alert" role="status" hidden></div>
-        <div class="pr-mobile-sort">
-          <label for="pr-sort">Sort by</label>
-          <select id="pr-sort">
-            <option value="repo">Repository</option>
-            <option value="title">Pull request</option>
-            <option value="author">Author</option>
-            <option value="readiness">Review status</option>
-            <option value="roles">Your role</option>
-            <option value="ci">CI</option>
-            <option value="opened_at">Opened</option>
-            <option value="updated_at" selected>Last updated</option>
-          </select>
-          <button id="pr-sort-direction" type="button">Descending</button>
-        </div>
+
         <div class="pr-table-wrap">
           <table class="pr-table">
             <thead>
@@ -447,10 +545,56 @@
               placeholder="Find an issue, label or repo…"
               aria-label="Search issues"
             />
-            <button id="issue-refresh" type="button">Refresh</button>
+            <button
+              id="issue-refresh"
+              class="refresh-icon"
+              type="button"
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"
+                />
+              </svg>
+            </button>
           </div>
         </div>
-        <div class="pr-filters">
+        <div class="pr-mobile-sort">
+          <button
+            id="issue-filters-toggle"
+            class="filters-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="issue-filters"
+          >
+            Filters
+          </button>
+          <label for="issue-sort">Sort issues by</label>
+          <select id="issue-sort">
+            <option value="repo">Repository</option>
+            <option value="title">Issue</option>
+            <option value="author">Author</option>
+            <option value="assignees">Assignees</option>
+            <option value="roles">Your role</option>
+            <option value="comments">Comments</option>
+            <option value="linked_prs">Linked PRs</option>
+            <option value="opened_at">Opened</option>
+            <option value="updated_at" selected>Last updated</option>
+          </select>
+          <button id="issue-sort-direction" type="button">Descending</button>
+        </div>
+        <div id="issue-filters" class="pr-filters">
           <label for="issue-repo"
             >Repository
             <select id="issue-repo" aria-label="Filter issues by repository">
@@ -486,21 +630,7 @@
         <p id="issue-pins-status" class="pr-sync" role="status" hidden></p>
         <p id="issue-changes" class="pr-sync" role="status" hidden></p>
         <div id="issue-alert" class="alert" role="status" hidden></div>
-        <div class="pr-mobile-sort">
-          <label for="issue-sort">Sort issues by</label>
-          <select id="issue-sort">
-            <option value="repo">Repository</option>
-            <option value="title">Issue</option>
-            <option value="author">Author</option>
-            <option value="assignees">Assignees</option>
-            <option value="roles">Your role</option>
-            <option value="comments">Comments</option>
-            <option value="linked_prs">Linked PRs</option>
-            <option value="opened_at">Opened</option>
-            <option value="updated_at" selected>Last updated</option>
-          </select>
-          <button id="issue-sort-direction" type="button">Descending</button>
-        </div>
+
         <div class="pr-table-wrap">
           <table class="pr-table">
             <thead>

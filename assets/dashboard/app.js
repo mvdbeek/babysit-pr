@@ -869,6 +869,7 @@ function itemTable(spec) {
     ascending: false,
     visits: new Map(),
     pins: new Map(),
+    expandedDetails: new Set(),
     optionKeys: new Map(),
     limit: PAGE_SIZE,
   };
@@ -1121,13 +1122,32 @@ function itemTable(spec) {
     );
     id("sort").value = table.sort;
     syncSelect(id("sort"));
-    id("sort-direction").textContent = table.ascending ? "Ascending" : "Descending";
+    id("sort-direction").textContent = table.ascending ? "↑" : "↓";
+    id("sort-direction").setAttribute("aria-label", table.ascending ? "Ascending" : "Descending");
+    id("sort-direction").title =
+      `${table.ascending ? "Ascending" : "Descending"}; reverse sort order`;
+    const activeFilters = spec.filters.filter((name) => filters[name] !== "all").length;
+    id("filters-toggle").textContent = activeFilters ? `Filters · ${activeFilters}` : "Filters";
     id("count").textContent = `${visible.length} / ${all.length}`;
     const sync = table.data.synced_at
       ? new Date(table.data.synced_at * 1000).toLocaleString()
       : null;
-    id("sync").textContent =
-      `${table.data.login ? `@${table.data.login} · ` : ""}${spec.text.open} · Sorted by ${spec.columns[table.sort]} (${table.ascending ? "ascending" : "descending"}) · ${sync ? `Synced ${sync}` : "Not synced yet"}${table.data.refreshing ? " · Syncing…" : " · GitHub refreshes every 5 minutes"}`;
+    id("sync").replaceChildren(
+      el(
+        "span",
+        `${table.data.login ? `@${table.data.login} · ` : ""}${spec.text.open} · Sorted by ${spec.columns[table.sort]} (${table.ascending ? "ascending" : "descending"}) · ${sync ? `Synced ${sync}` : "Not synced yet"}${table.data.refreshing ? " · Syncing…" : " · GitHub refreshes every 5 minutes"}`,
+        "sync-full",
+      ),
+      el(
+        "span",
+        table.data.refreshing
+          ? "Syncing…"
+          : sync
+            ? `Synced ${ago(table.data.synced_at)}`
+            : "Not synced yet",
+        "sync-compact",
+      ),
+    );
     const problems = [table.data.error, ...(table.data.warnings || [])].filter(Boolean);
     id("alert").hidden = !problems.length;
     id("alert").textContent =
@@ -1151,6 +1171,23 @@ function itemTable(spec) {
         row.tabIndex = -1;
       }
       const { cells, title, fields, updated } = spec.row(item);
+      const dates = updated.parentElement;
+      const expanded = table.expandedDetails.has(item.id);
+      dates.classList.toggle("dates-expanded", expanded);
+      const detailsToggle = el("button", expanded ? "Less" : "Details", "pr-details-toggle");
+      detailsToggle.type = "button";
+      detailsToggle.setAttribute("aria-expanded", String(expanded));
+      detailsToggle.setAttribute(
+        "aria-label",
+        `Dates and activity for ${spec.text.short} ${item.repo} #${item.number}`,
+      );
+      detailsToggle.onclick = () => {
+        if (expanded) table.expandedDetails.delete(item.id);
+        else table.expandedDetails.add(item.id);
+        render();
+        renderedRows.get(item.id)?.row.querySelector(".pr-details-toggle").focus();
+      };
+      dates.append(detailsToggle);
       const pinCell = el("td", undefined, "item-pin-cell");
       pinCell.append(pinButton(item, pins));
       if (spec.key === "prs" && window.dashboardNotifications?.silenceButton)
@@ -1219,6 +1256,15 @@ function itemTable(spec) {
             : visit.first
               ? "Changes will be highlighted from this visit onward, in this browser."
               : "No changes since your last visit in this view.";
+    id("changes").classList.toggle(
+      "pr-quiet",
+      Boolean(
+        visit?.storage &&
+        !newCount &&
+        !changedCount &&
+        table.data.synced_at >= visit.baseline.synced_at,
+      ),
+    );
     id("empty").hidden = visible.length > 0;
     id("empty").textContent = all.length
       ? spec.text.noMatch
@@ -1261,6 +1307,11 @@ function itemTable(spec) {
   }
   id("sort").onchange = () => sort(id("sort").value);
   id("sort-direction").onclick = () => sort(table.sort, true);
+  id("filters-toggle").onclick = () => {
+    const expanded = id("filters-toggle").getAttribute("aria-expanded") !== "true";
+    id("filters-toggle").setAttribute("aria-expanded", String(expanded));
+    id("filters").classList.toggle("filters-expanded", expanded);
+  };
   id("refresh").onclick = refresh;
   id("search").oninput = restart;
   for (const name of spec.filters) id(name).onchange = restart;
