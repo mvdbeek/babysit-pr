@@ -21,7 +21,8 @@ def stop_group(proc, grace=0):
             except subprocess.TimeoutExpired:
                 pass
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # ESRCH once the leader is reaped; macOS answers EPERM while it is still a zombie.
         pass
     finally:
         proc.wait()

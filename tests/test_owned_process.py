@@ -107,3 +107,22 @@ def test_group_cleanup_does_not_kill_unrelated_processes(tmp_path):
             assert unrelated.poll() is None
         finally:
             unrelated.kill()
+
+
+def test_cleanup_tolerates_an_exited_but_unreaped_leader():
+    """A caller may leave the block after EOF without waiting; the zombie is reaped quietly."""
+    with owned_process.command(
+        [sys.executable, "-c", "print('done')"], stdout=subprocess.PIPE, text=True
+    ) as proc:
+        assert proc.stdout is not None
+        assert proc.stdout.read() == "done\n"
+        deadline = time.monotonic() + 5
+        while proc.returncode is None and time.monotonic() < deadline:
+            # Poll the kernel state without reaping so cleanup meets the zombie itself.
+            try:
+                if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT):
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(0.01)
+    assert proc.returncode == 0
