@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+import owned_process
 import workspace_agents
 from issue_overview import branch_number
 
@@ -35,10 +36,9 @@ SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=()):
-    result = subprocess.run(
+    result = owned_process.run(
         list(map(str, args)),
         cwd=cwd,
-        capture_output=True,
         text=True,
         timeout=timeout,
         pass_fds=pass_fds,
@@ -727,7 +727,7 @@ class Workspaces:
     def run_logged(self, op, *args, pass_fds=(), timeout=600, env=None):
         """Stream bounded command output into the operation database while it runs."""
         started = time.monotonic()
-        with subprocess.Popen(
+        with owned_process.command(
             list(map(str, args)),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -739,8 +739,6 @@ class Workspaces:
                 selector.register(proc.stdout, selectors.EVENT_READ)
                 while True:
                     if time.monotonic() - started > timeout:
-                        proc.kill()
-                        proc.wait()
                         raise subprocess.TimeoutExpired(args, timeout)
                     if selector.select(0.2):
                         chunk = os.read(proc.stdout.fileno(), 4096)
@@ -752,12 +750,7 @@ class Workspaces:
                     elif proc.poll() is not None:
                         break
             remaining = max(0.1, timeout - (time.monotonic() - started))
-            try:
-                code = proc.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                raise
+            code = proc.wait(timeout=remaining)
             if code:
                 raise ValueError(op["log"][-4000:] or f"Command exited with status {code}")
 

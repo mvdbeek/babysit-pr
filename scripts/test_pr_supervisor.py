@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -143,6 +144,11 @@ def wait_until(predicate, timeout=20):
 
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
+    # Fixture commits must not invoke the user's signing agent or Git hooks.
+    config = tmp_path / "gitconfig"
+    config.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     subprocess.run(["git", "init", "-b", "feature", str(worktree)], check=True, capture_output=True)
@@ -402,6 +408,53 @@ def test_timeout_kills_agent_and_blocks_watch(harness):
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGHUP])
+def test_headless_guardian_signal_cleans_up_agent(harness, stop_signal):
+    h = harness
+    state = json.loads(h["state"].read_text())
+    state["hang"] = True
+    h["state"].write_text(json.dumps(state))
+    job = h["job"]
+    attempt = str(uuid.uuid4())
+    folder = h["home"] / "runs" / attempt
+    folder.mkdir(parents=True)
+    job.update(status="running", attempt=attempt, snapshot=snapshot(), repair_timeout=60)
+    job["snapshot"]["pr"]["head_sha"] = supervisor.git(h["worktree"], "rev-parse", "HEAD")
+    with h["db"]:
+        supervisor.save_job(h["db"], job)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(supervisor.SCRIPT),
+            "--home",
+            str(h["home"]),
+            "_repair",
+            job["id"],
+            attempt,
+        ]
+    )
+    agent_pid = None
+    try:
+        wait_until(lambda: h["calls"].exists() and h["calls"].read_text().strip())
+        agent_pid = json.loads(h["calls"].read_text())["pid"]
+        proc.send_signal(stop_signal)
+        proc.wait(timeout=10)
+        with pytest.raises(ProcessLookupError):
+            os.kill(agent_pid, 0)
+        outcome = json.loads((folder / "result.json").read_text())
+        assert outcome["status"] == "blocked"
+        assert "interrupted" in outcome["summary"]
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        if agent_pid is not None:
+            try:
+                os.killpg(agent_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_duplicate_registration_and_wrong_session_refused(harness):

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import gh_pr_watch as watch
+import owned_process
 
 SCRIPT = Path(__file__).resolve()
 SKILL = SCRIPT.parent.parent
@@ -528,17 +529,19 @@ def run_repair(home, job_id, attempt):
             json.dump({"pid": os.getpid()}, receipt)
     except FileExistsError:
         return
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt()
+
+    previous_handlers = {
+        sig: signal.signal(sig, interrupted) for sig in (signal.SIGHUP, signal.SIGTERM)
+    }
     try:
         if job.get("pane"):
             import pane_runner
 
             pane_runner.verify_runner(job)
 
-            def interrupted(signum, frame):
-                raise KeyboardInterrupt()
-
-            signal.signal(signal.SIGHUP, interrupted)
-            signal.signal(signal.SIGTERM, interrupted)
             print(f"\nBabysitter: resuming {job['session_id']} for {job['summary']}\n", flush=True)
         # Per-session locks are shared by every supervisor home on this machine.
         if job.get("agent") == "claude":
@@ -625,25 +628,18 @@ def run_repair(home, job_id, attempt):
     except KeyboardInterrupt:
         result = {
             "status": "blocked",
-            "summary": "Pane repair interrupted; inspect before resuming",
+            "summary": "Repair interrupted; inspect before resuming",
         }
     except Exception as exc:
         result = {"status": "blocked", "summary": str(exc)}
     finally:
+        # A second stop request must not interrupt cleanup and orphan the agent.
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
         if proc is not None:
             # Only the process group created for this bounded repair is owned.
             # Also clean up background children after a normally exiting CLI.
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                if proc.poll() is None:
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+            owned_process.stop_group(proc, grace=5)
         if output_thread is not None:
             output_thread.join(timeout=5)
         if live_log is not None:
@@ -656,6 +652,8 @@ def run_repair(home, job_id, attempt):
                 flush=True,
             )
         db.close()
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 def start_repair(db, home, job):

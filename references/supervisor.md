@@ -129,6 +129,13 @@ Repair guardians survive watcher restarts and enforce their own timeouts. The
 restarted service reconciles durable results without replaying ambiguous pushes.
 A missing result after timeout plus a grace period blocks for inspection.
 
+Repair guardians clean up their agent's process group on completion, timeout,
+SIGTERM, and SIGHUP, including headless repairs. Bounded workspace and herdr
+commands likewise clean up their own process groups on exit or errors. This
+does not cover children that deliberately detach into another process group,
+or a guardian killed with SIGKILL. A process parented by launchd is not by itself
+evidence of a leak: terminal prompt plugins can intentionally detach workers.
+
 ## Fork and branch CI
 
 To continue the original task after green CI, add `--on-green 'AUTHORIZED_TASK'`

@@ -11,6 +11,7 @@ import time
 import uuid
 from pathlib import Path
 
+import owned_process
 import pr_supervisor as supervisor
 
 SCRIPT = Path(__file__).resolve()
@@ -24,7 +25,7 @@ class ScreenNotReady(RuntimeError):
 
 
 def herdr(*args):
-    proc = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=15)
+    proc = owned_process.run(["herdr", *args], text=True, timeout=15)
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "herdr failed")
     return proc.stdout

@@ -19,6 +19,10 @@ from pr_overview import Overview
 
 @pytest.fixture
 def local(tmp_path, monkeypatch):
+    config = tmp_path / "gitconfig"
+    config.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     src = tmp_path / "src"
     src.mkdir()
     clone = src / "repo"
@@ -35,14 +39,11 @@ def local(tmp_path, monkeypatch):
     git("remote", "add", "origin", "https://github.com/base/repo.git")
     head = tmp_path / "head.git"
     git("clone", "--bare", str(clone), str(head))
-    config = tmp_path / "gitconfig"
     # Both the fork (wtpr) and the base repository (wti fetches origin) resolve offline.
     config.write_text(
         f'[url "{head}"]\n\tinsteadOf = https://github.com/fork/repo.git\n'
         f'[url "{head}"]\n\tinsteadOf = https://github.com/base/repo.git\n'
     )
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     install_fakes(bin_dir)
