@@ -262,6 +262,17 @@ def test_a_failed_repository_lookup_is_not_cached_as_an_answer(site):
     assert rows(plugin)["merged-work"]["repo"] == BASE
 
 
+def test_refresh_only_fetches_expired_github_links(site):
+    plugin, fake, *_ = site
+    plugin.collect()
+    fake.calls.clear()
+    plugin.links[f"{BASE}#head#fork:merged-work"]["checked_at"] -= wso.SETTLED_TTL
+    plugin.collect()
+    assert fake.calls == [
+        f"repos/{BASE}/pulls?state=all&per_page=5&sort=created&direction=desc&head=fork:merged-work"
+    ]
+
+
 def finish(plugin, started=None):
     assert started is None or started["cleanup"]["status"] in {"running", "complete"}
     deadline = time.monotonic() + 30
@@ -560,15 +571,147 @@ def test_the_cache_survives_a_restart_and_an_old_format_is_discarded(site):
     assert (plugin.directory / "cache.json").stat().st_mode & 0o777 == 0o600
     restarted = wso.WorkspaceOverview(plugin.home, fake)
     assert restarted.links == plugin.links and restarted.bases == plugin.bases
+    assert restarted.value == plugin.value
+    assert restarted.next_poll == plugin.value["synced_at"] + wso.INTERVAL
+    snapshot = restarted.snapshot()
+    assert snapshot["workspaces"] == plugin.value["workspaces"]
+    assert not snapshot["loading"] and not snapshot["stale"]
     saved = json.loads((plugin.directory / "cache.json").read_text())
     (plugin.directory / "cache.json").write_text(json.dumps({**saved, "version": 0}))
-    assert not wso.WorkspaceOverview(plugin.home, fake).links
+    outdated = wso.WorkspaceOverview(plugin.home, fake)
+    assert not outdated.links and not outdated.value["workspaces"]
+
+
+def test_restart_shows_inventory_while_one_background_refresh_runs(site, monkeypatch):
+    plugin, fake, *_ = site
+    plugin._refresh()
+    plugin.value["synced_at"] -= wso.INTERVAL
+    plugin.save()
+    restarted = wso.WorkspaceOverview(plugin.home, fake)
+    gate = threading.Event()
+    finished = threading.Event()
+    scans = []
+
+    def collect(publish=None):
+        scans.append(True)
+        assert gate.wait(timeout=10)
+        return {"workspaces": [], "warnings": []}
+
+    refresh = restarted._refresh
+
+    def complete_refresh():
+        try:
+            refresh()
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(restarted, "collect", collect)
+    monkeypatch.setattr(restarted, "_refresh", complete_refresh)
+    try:
+        for _ in range(3):
+            snapshot = restarted.snapshot()
+            assert snapshot["workspaces"] == plugin.value["workspaces"]
+            assert snapshot["synced_at"] == plugin.value["synced_at"]
+            assert snapshot["loading"] and snapshot["stale"]
+            assert snapshot["cleanup"] is None
+    finally:
+        gate.set()
+        assert finished.wait(timeout=10)
+    assert len(scans) == 1
+    snapshot = restarted.snapshot()
+    assert not snapshot["workspaces"] and not snapshot["loading"] and not snapshot["stale"]
+    assert snapshot["synced_at"] >= plugin.value["synced_at"]
+    assert wso.WorkspaceOverview(plugin.home, fake).value == restarted.value
+
+
+def test_finished_rows_appear_before_a_slow_checkout_and_only_complete_scans_are_saved(
+    site, monkeypatch
+):
+    plugin, fake, _, worktrees, _, _ = site
+    plugin._refresh()
+    previous = plugin.value
+    changed = worktrees / "issue-12-crash"
+    (changed / "new-work.txt").write_text("new edit")
+    gate = threading.Event()
+    published = threading.Event()
+    inspect = wso.local_state
+    publish = plugin.publish_row
+
+    def local_state(path, branch=None):
+        if Path(path).name == "merged-work":
+            assert gate.wait(timeout=10)
+        return inspect(path, branch)
+
+    def publish_row(row):
+        publish(row)
+        if row["path"] == str(changed):
+            published.set()
+
+    monkeypatch.setattr(wso, "local_state", local_state)
+    monkeypatch.setattr(plugin, "publish_row", publish_row)
+    plugin.loading = True
+    plugin.next_poll = time.time() + wso.INTERVAL
+    worker = threading.Thread(target=plugin._refresh)
+    worker.start()
+    try:
+        assert published.wait(timeout=10)
+        snapshot = plugin.snapshot()
+        assert snapshot["loading"] and snapshot["synced_at"] == previous["synced_at"]
+        row = next(row for row in snapshot["workspaces"] if row["path"] == str(changed))
+        assert row["changes"] == 1
+        assert len(snapshot["workspaces"]) == len(previous["workspaces"])
+        assert wso.WorkspaceOverview(plugin.home, fake).value == previous
+        # A cleanup finishing during the scan must still trigger its requested rescan.
+        plugin.next_poll = 0
+    finally:
+        gate.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive() and not plugin.loading and plugin.error is None
+    assert plugin.next_poll == 0
+    assert wso.WorkspaceOverview(plugin.home, fake).value == plugin.value
+
+
+@pytest.mark.parametrize("change", ["src", "roots", "override", "legacy"])
+def test_cached_inventory_is_only_restored_for_the_same_scan_scope(site, tmp_path, change):
+    plugin, fake, *_ = site
+    plugin._refresh()
+    config = dict(plugin.config)
+    options = {}
+    if change == "override":
+        options["src"] = tmp_path / "other"
+    elif change == "legacy":
+        saved = json.loads((plugin.directory / "cache.json").read_text())
+        saved.pop("scope")
+        saved.pop("value")
+        (plugin.directory / "cache.json").write_text(json.dumps(saved))
+    else:
+        config[change] = str(tmp_path / "other") if change == "src" else [str(tmp_path / "other")]
+        (plugin.directory / "config.json").write_text(json.dumps(config))
+    restarted = wso.WorkspaceOverview(plugin.home, fake, **options)
+    assert restarted.links == plugin.links
+    assert not restarted.value["workspaces"] and restarted.next_poll == 0
+
+
+def test_cleanup_revalidates_a_checkout_from_restored_inventory(site):
+    plugin, fake, _, worktrees, state, _ = site
+    plugin._refresh()
+    restarted = wso.WorkspaceOverview(plugin.home, fake)
+    target = worktrees / "merged-work"
+    row = next(row for row in restarted.value["workspaces"] if row["path"] == str(target))
+    assert row["status"] == "ready"
+    (target / "new-work.txt").write_text("Created after the cached scan")
+    results = finish(restarted, restarted.cleanup({"targets": [{"key": str(target)}]}))
+    assert results[str(target)]["status"] == "skipped"
+    assert "uncommitted" in results[str(target)]["message"]
+    assert (target / "new-work.txt").exists()
+    assert not calls(state, ["workspace", "close"])
 
 
 def test_a_refresh_failure_keeps_the_previous_inventory_and_reports_it(site, monkeypatch):
     plugin, *_ = site
     plugin._refresh()
     kept = plugin.value["workspaces"]
+    plugin = wso.WorkspaceOverview(plugin.home, plugin.fetch)
     monkeypatch.setattr(
         wso.WorkspaceOverview, "inventory", lambda *args: (_ for _ in ()).throw(OSError("no herdr"))
     )

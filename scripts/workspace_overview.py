@@ -231,6 +231,7 @@ class WorkspaceOverview:
         self.bases: dict = {}
         self.job: dict | None = None
         self.value: dict = {"workspaces": [], "warnings": [], "synced_at": None}
+        self.partial: dict | None = None
         self.src = Path(src).expanduser() if src else Path.home() / "src"
         self.roots: list[Path] = []
         try:
@@ -250,10 +251,27 @@ class WorkspaceOverview:
                 if cache.get("version") == CACHE_VERSION:
                     self.links = cache.get("links") or {}
                     self.bases = cache.get("bases") or {}
+                    value = cache.get("value")
+                    if (
+                        cache.get("scope") == self.inventory_scope()
+                        and isinstance(value, dict)
+                        and isinstance(value.get("workspaces"), list)
+                        and isinstance(value.get("warnings"), list)
+                        and isinstance(value.get("synced_at"), (int, float))
+                        and 0 < value["synced_at"] <= time.time()
+                    ):
+                        self.value = value
+                        self.next_poll = value["synced_at"] + INTERVAL
         except Exception as exc:
             self.error = f"Experiment configuration/cache unavailable: {exc}"
 
     # Inventory -----------------------------------------------------------------
+
+    def inventory_scope(self):
+        return {
+            "src": str(self.src.resolve()),
+            "roots": sorted({str(root.resolve()) for root in self.roots}),
+        }
 
     def snapshot(self):
         with self.lock:
@@ -262,14 +280,14 @@ class WorkspaceOverview:
                 self.next_poll = time.time() + INTERVAL
                 threading.Thread(target=self._refresh, daemon=True).start()
             return {
-                **copy.deepcopy(self.value),
+                **copy.deepcopy(self.partial if self.partial is not None else self.value),
                 "enabled": self.enabled,
                 "loading": self.loading,
                 "error": self.error,
                 "cleanup": copy.deepcopy(self.job),
                 "stale": bool(
                     self.value.get("synced_at")
-                    and (self.error or time.time() - self.value["synced_at"] >= 3 * INTERVAL)
+                    and (self.error or time.time() - self.value["synced_at"] >= INTERVAL)
                 ),
             }
 
@@ -282,17 +300,36 @@ class WorkspaceOverview:
 
     def _refresh(self):
         try:
-            value = self.collect()
+            with self.lock:
+                self.partial = copy.deepcopy(self.value)
+            value = self.collect(publish=self.publish_row)
             value["synced_at"] = time.time()
             with self.lock:
                 self.value, self.error = value, None
+                self.partial = None
+                if self.next_poll:
+                    self.next_poll = value["synced_at"] + INTERVAL
             self.save()
         except Exception as exc:
             with self.lock:
                 self.error = f"Workspace inventory failed: {exc}"
         finally:
             with self.lock:
+                self.partial = None
                 self.loading = False
+
+    def publish_row(self, row):
+        """Expose completed rows during a scan; only a complete inventory is persisted."""
+        with self.lock:
+            if self.partial is None:
+                return
+            rows = {entry["key"]: entry for entry in self.partial["workspaces"]}
+            rows[row["key"]] = row
+            self.partial["workspaces"] = self.sorted_rows(rows.values())
+
+    @staticmethod
+    def sorted_rows(rows):
+        return sorted(rows, key=lambda row: (row["repo"] or "~", row["name"].lower(), row["key"]))
 
     def save(self):
         with self.lock:
@@ -306,7 +343,13 @@ class WorkspaceOverview:
                 if value.get("checked_at", 0) >= cutoff
             }
             payload = json.dumps(
-                {"version": CACHE_VERSION, "links": self.links, "bases": self.bases}
+                {
+                    "version": CACHE_VERSION,
+                    "links": self.links,
+                    "bases": self.bases,
+                    "scope": self.inventory_scope(),
+                    "value": self.value,
+                }
             )
         if len(payload.encode()) > MAX_STATE:
             with self.lock:
@@ -432,7 +475,7 @@ class WorkspaceOverview:
             if job.get("cwd") and job.get("status") not in {"closed", "stopped"}
         }
 
-    def collect(self):
+    def collect(self, publish=None):
         warnings: list[str] = []
         clones, checkouts, spaces, agents = self.inventory(warnings)
         watched = self.watched_checkouts()
@@ -449,36 +492,41 @@ class WorkspaceOverview:
             warnings.append(f"{len(selected)} checkouts found; showing the first {MAX_WORKTREES}.")
             selected = selected[:MAX_WORKTREES]
         budget = Budget(self.fetch)
+        rows = self.orphan_rows(spaces, agents, checkouts)
+        for row in rows:
+            if publish:
+                publish(row)
+        # Resolve each clone once per scan, sharing its answer across all its worktrees.
+        bases = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            states = dict(
-                zip(
-                    selected,
-                    pool.map(
-                        lambda path: local_state(path, checkouts[path].get("branch")), selected
-                    ),
-                    strict=True,
+            pending = {
+                pool.submit(local_state, path, checkouts[path].get("branch")): path
+                for path in selected
+            }
+            for future in concurrent.futures.as_completed(pending):
+                path = pending[future]
+                item = checkouts[path]
+                main = path in clones
+                root = str(Path(item["common"]).parent)
+                clone = clones.get(root)
+                if root not in bases:
+                    bases[root] = self.base_repo(clone, budget, warnings) if clone else (None, None)
+                base, owner = bases[root]
+                if main:
+                    links: list[dict] = []
+                    stale = False
+                elif base:
+                    links, stale = self.resolve_links(item, base, owner, budget, warnings)
+                else:
+                    links, stale = [], True
+                row = self.row(
+                    item, future.result(), links, stale, spaces, agents, watched, base, main
                 )
-            )
-        rows = []
-        for path in selected:
-            item = checkouts[path]
-            main = path in clones
-            clone = clones.get(str(Path(item["common"]).parent))
-            base, owner = self.base_repo(clone, budget, warnings) if clone else (None, None)
-            if main:
-                links: list[dict] = []
-                stale = False
-            elif base:
-                links, stale = self.resolve_links(item, base, owner, budget, warnings)
-            else:
-                links, stale = [], True
-            rows.append(
-                self.row(item, states[path], links, stale, spaces, agents, watched, base, main)
-            )
-        rows.extend(self.orphan_rows(spaces, agents, checkouts))
-        rows.sort(key=lambda row: (row["repo"] or "~", row["name"].lower(), row["key"]))
+                rows.append(row)
+                if publish:
+                    publish(row)
         return {
-            "workspaces": rows,
+            "workspaces": self.sorted_rows(rows),
             "warnings": warnings,
             "calls": budget.calls,
             "src": str(self.src),

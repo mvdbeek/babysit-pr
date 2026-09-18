@@ -149,7 +149,7 @@ def site(tmp_path, monkeypatch):
     plugin.next_poll = float("inf")
     plugin.value = {"workspaces": WORKSPACES, "warnings": [], "synced_at": time.time()}
     # Cleanup schedules a rescan; keep that background scan inside the fixture too.
-    monkeypatch.setattr(type(plugin), "collect", lambda self: copy.deepcopy(self.value))
+    monkeypatch.setattr(type(plugin), "collect", lambda self, **kwargs: copy.deepcopy(self.value))
     removed: list = []
 
     def remove(self, job, index, target):
