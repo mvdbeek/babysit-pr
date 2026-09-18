@@ -261,7 +261,7 @@ def test_github_query_is_json_read_only_and_errors_are_visible(monkeypatch):
             [], 0, json.dumps({"data": {"node": {"id": "run1"}}}), ""
         )
     )
-    monkeypatch.setattr(ci.subprocess, "run", command)
+    monkeypatch.setattr(ci.owned_process, "run", command)
     assert ci.graphql(ci.FAILURE_QUERY, {"id": "run1"}) == {"id": "run1"}
     args, kwargs = command.call_args
     assert args[0] == ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"]

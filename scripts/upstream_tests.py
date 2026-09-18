@@ -17,6 +17,8 @@ from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
+import owned_process
+
 POLICY = "https://github.com/galaxyproject/galaxy/blob/dev/SECURITY.md"
 MAX_ARCHIVE = 8 * 1024 * 1024
 MAX_REPORT = 32 * 1024 * 1024
@@ -42,7 +44,7 @@ def gh_bytes(endpoint, limit=MAX_ARCHIVE, timeout=30, raw=False):
     started = time.monotonic()
     with (
         tempfile.TemporaryFile() as errors,
-        subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errors) as process,
+        owned_process.command(args, stdout=subprocess.PIPE, stderr=errors) as process,
     ):
         assert process.stdout is not None
         try:

@@ -96,7 +96,7 @@ def test_search_limit_names_issues(monkeypatch):
 
 def test_fragment_is_sent_in_the_graphql_query(monkeypatch):
     run = Mock(return_value=Mock(returncode=0, stdout='{"data": {"ok": true}}'))
-    monkeypatch.setattr(pr_overview.subprocess, "run", run)
+    monkeypatch.setattr(pr_overview.owned_process, "run", run)
     pr_overview.github_page("is:issue", None, issue_overview.ISSUE_FRAGMENT)
     sent = run.call_args.kwargs["input"]
     assert "closedByPullRequestsReferences" in sent and "on PullRequest" not in sent

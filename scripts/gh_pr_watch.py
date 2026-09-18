@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
+import owned_process
+
 FAILED_RUN_CONCLUSIONS = {
     "failure",
     "timed_out",
@@ -121,7 +123,7 @@ def gh_text(args, repo=None, cwd=None):
         cmd.extend(["-R", repo])
     cmd.extend(args)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+        proc = owned_process.run(cmd, text=True, timeout=30, cwd=cwd)
         if (
             args[:2] == ["pr", "checks"]
             and proc.returncode == 1

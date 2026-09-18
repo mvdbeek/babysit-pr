@@ -11,6 +11,8 @@ from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 
+import owned_process
+
 TTL = 300
 ERROR_TTL = 60
 MAX_ENTRIES = 128
@@ -52,10 +54,9 @@ query($id: ID!) {
 
 
 def graphql(query, variables):
-    result = subprocess.run(
+    result = owned_process.run(
         ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"],
         input=json.dumps({"query": query, "variables": variables}),
-        capture_output=True,
         text=True,
         timeout=45,
     )

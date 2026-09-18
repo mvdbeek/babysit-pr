@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import owned_process
 from latest_activity import activity_fragment, latest_activity, notification_activity
 
 POLL_SECONDS = 300
@@ -91,11 +92,10 @@ PRS = Kind(
 
 def github_page(query, cursor=None, fragment=PR_FRAGMENT):
     payload = {"query": QUERY % fragment, "variables": {"query": query, "cursor": cursor}}
-    result = subprocess.run(
+    result = owned_process.run(
         ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"],
         input=json.dumps(payload),
         text=True,
-        capture_output=True,
         timeout=45,
     )
     if result.returncode:
