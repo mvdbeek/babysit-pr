@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import gh_pr_watch as watch
+import github_cli
 import owned_process
 
 SCRIPT = Path(__file__).resolve()
@@ -582,6 +583,10 @@ def run_repair(home, job_id, attempt):
             for key in ("CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
                 env.pop(key, None)
             env["BABYSIT_PR_REPAIR"] = job_id
+            # Unattended agents must fail fast instead of parking git or gh on a prompt.
+            # The token itself stays out of agent environments; agents authenticate as
+            # the user does.
+            env.update(github_cli.NON_INTERACTIVE)
             live_log = (folder / "agent.log").open("wb")
             with prompt_path.open() as prompt:
                 proc = subprocess.Popen(

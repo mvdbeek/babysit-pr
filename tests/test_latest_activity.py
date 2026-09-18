@@ -4,6 +4,7 @@ import json
 from unittest.mock import Mock
 
 import issue_overview
+import owned_process
 import pr_overview
 import pytest
 from latest_activity import latest_activity, timeline_activity
@@ -166,7 +167,7 @@ def test_missing_actor_and_empty_or_missing_timeline():
 def test_collect_includes_activity_in_existing_requests(monkeypatch, module, factory, calls):
     node = factory(timelineItems={"nodes": [comment()]})
     run = Mock(return_value=Mock(returncode=0, stdout=json.dumps({"data": page([node])})))
-    monkeypatch.setattr(pr_overview.owned_process, "run", run)
+    monkeypatch.setattr(owned_process, "run", run)
     result = module.collect()
     key = "prs" if module is pr_overview else "issues"
     assert result[key][0]["latest_activity"]["actor"] == "alice"

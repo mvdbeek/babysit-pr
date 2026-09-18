@@ -11,7 +11,7 @@ from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 
-import owned_process
+import github_cli
 
 TTL = 300
 ERROR_TTL = 60
@@ -54,7 +54,7 @@ query($id: ID!) {
 
 
 def graphql(query, variables):
-    result = owned_process.run(
+    result = github_cli.run(
         ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"],
         input=json.dumps({"query": query, "variables": variables}),
         text=True,

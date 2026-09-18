@@ -11,6 +11,7 @@ import time
 import uuid
 
 import gh_pr_watch as watch
+import owned_process
 import pr_supervisor as supervisor
 import pytest
 
@@ -125,7 +126,7 @@ def test_closed_pr_never_dispatches_and_empty_checks_not_green():
 @pytest.mark.parametrize("code", [1, 8])
 def test_failed_or_pending_checks_payload_is_not_a_transport_error(monkeypatch, code):
     monkeypatch.setattr(
-        watch.owned_process, "run", lambda *a, **kw: subprocess.CompletedProcess(a, code, "[]", "")
+        owned_process, "run", lambda *a, **kw: subprocess.CompletedProcess(a, code, "[]", "")
     )
     assert watch.gh_json(["pr", "checks", "1", "--json", "name"]) == []
     with pytest.raises(watch.GhCommandError):

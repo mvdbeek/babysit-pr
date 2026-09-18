@@ -23,6 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import quote
 
+import github_cli
 from pr_workspaces import COLLIE_URL, SLUG, clone_worktrees, herdr, remote_slugs, repo_config, run
 
 INTERVAL = 300  # Local rescan cadence; GitHub state has its own freshness window.
@@ -59,9 +60,8 @@ def git(path, *args, timeout=60):
 
 def gh_json(endpoint, timeout=20):
     """One bounded, read-only GitHub REST call through the authenticated `gh`."""
-    result = subprocess.run(
+    result = github_cli.run(
         ["gh", "api", "--hostname", "github.com", endpoint],
-        capture_output=True,
         text=True,
         timeout=timeout,
     )

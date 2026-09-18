@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+import github_cli
 import owned_process
 import workspace_agents
 from issue_overview import branch_number
@@ -36,13 +37,15 @@ SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=()):
-    result = owned_process.run(
-        list(map(str, args)),
-        cwd=cwd,
-        text=True,
-        timeout=timeout,
-        pass_fds=pass_fds,
-    )
+    argv = list(map(str, args))
+    # git may call the gh credential helper; both get the shared token and never prompt.
+    if argv[0] == "gh":
+        result = github_cli.run(argv, cwd=cwd, text=True, timeout=timeout, pass_fds=pass_fds)
+    else:
+        env = github_cli.environment() if argv[0] == "git" else None
+        result = owned_process.run(
+            argv, cwd=cwd, env=env, text=True, timeout=timeout, pass_fds=pass_fds
+        )
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Command failed")[-4000:].strip())
     return result.stdout.strip()
@@ -727,7 +730,8 @@ class Workspaces:
     def run_logged(self, op, *args, pass_fds=(), timeout=600, env=None):
         """Stream bounded command output into the operation database while it runs."""
         started = time.monotonic()
-        with owned_process.command(
+        # Clones and the worktree helper talk to GitHub: shared token, no prompts.
+        with github_cli.command(
             list(map(str, args)),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

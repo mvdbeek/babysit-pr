@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import owned_process
+import github_cli
 
 DISCOVERIES_PER_HOUR = 12
 DOWNLOADS_PER_HOUR = 20
@@ -64,7 +64,7 @@ def job_target(check):
 
 def read_job(target):
     endpoint = f"repos/{target['repo']}/actions/jobs/{target['job_id']}"
-    result = owned_process.run(
+    result = github_cli.run(
         ["gh", "api", "--hostname", "github.com", endpoint],
         text=True,
         timeout=30,
@@ -81,7 +81,7 @@ def download_log(target, *, timeout=90, limit=MAX_LOG_BYTES):
     chunks = bytearray()
     with (
         tempfile.TemporaryFile() as errors,
-        owned_process.command(
+        github_cli.command(
             ["gh", "api", "--hostname", "github.com", endpoint],
             stdout=subprocess.PIPE,
             stderr=errors,

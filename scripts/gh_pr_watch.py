@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-import owned_process
+import github_cli
 
 FAILED_RUN_CONCLUSIONS = {
     "failure",
@@ -123,7 +123,7 @@ def gh_text(args, repo=None, cwd=None):
         cmd.extend(["-R", repo])
     cmd.extend(args)
     try:
-        proc = owned_process.run(cmd, text=True, timeout=30, cwd=cwd)
+        proc = github_cli.run(cmd, text=True, timeout=30, cwd=cwd)
         if (
             args[:2] == ["pr", "checks"]
             and proc.returncode == 1

@@ -209,8 +209,12 @@ It sources the existing `~/.config/safehouse/safe.env`, uses the verified
 same `--dangerously-skip-permissions` option as the user's shell function.
 Safehouse supplies containment; `dontAsk` must not override that existing setup.
 Missing configuration or a Safehouse failure aborts; there is no unsandboxed
-fallback. The launcher passes the repair marker and existing cmux environment
-names, without widening directory grants. A saved plan mode is still preserved.
+fallback. The launcher passes the repair marker, existing cmux environment
+names, and the non-interactive git/gh settings (`GIT_TERMINAL_PROMPT=0`,
+`GH_PROMPT_DISABLED`, `GH_NO_UPDATE_NOTIFIER`, `GCM_INTERACTIVE=never`) that
+every repair receives, without widening directory grants. The shared GitHub
+token the supervisor uses for its own polling is not passed to agents. A saved
+plan mode is still preserved.
 
 `--claude-command` permits an explicit alternative argv prefix; those jobs keep
 `dontAsk` unless separately configured. The `safehouse` permission setting is

@@ -106,6 +106,12 @@ def install_fakes(bin_dir: Path) -> None:
         path.chmod(0o700)
 
 
+@pytest.fixture(autouse=True)
+def github_token_from_env(monkeypatch):
+    """No test opens the system keyring: gh gets its token from the environment."""
+    monkeypatch.setenv("GH_TOKEN", "gho_fixture_token_0000000000000000000000")
+
+
 @pytest.fixture
 def fake_tools(tmp_path, monkeypatch):
     """Fake executables first on PATH plus the JSON state file recording their calls."""

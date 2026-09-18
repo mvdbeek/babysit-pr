@@ -5,6 +5,7 @@ import subprocess
 import threading
 from unittest.mock import Mock
 
+import owned_process
 import pr_overview as overview
 import pytest
 
@@ -98,7 +99,7 @@ def test_invalid_refresh_is_rejected(monkeypatch, responses, message):
 
 def test_github_command_uses_json_stdin_and_reports_api_failures(monkeypatch):
     run = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps({"data": page()}), ""))
-    monkeypatch.setattr(overview.owned_process, "run", run)
+    monkeypatch.setattr(owned_process, "run", run)
     assert overview.github_page("is:open", "cursor") == page()
     args, kwargs = run.call_args
     assert args[0] == ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"]
