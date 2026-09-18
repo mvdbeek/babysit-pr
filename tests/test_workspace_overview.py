@@ -431,6 +431,43 @@ def test_cleanup_never_removes_a_main_checkout_or_a_watched_checkout(site):
     assert Path(target).exists()
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["closed", "stopped", "watching", "paused", "blocked", "running", "handoff", None, "unknown"],
+)
+def test_only_ended_watches_release_checkout_protection(site, status):
+    plugin, _, _, worktrees, _, _ = site
+    target = str(worktrees / "merged-work")
+    plugin.jobs = lambda: [{"cwd": target, "status": status}]
+    ended = status in {"closed", "stopped"}
+    for row in (rows(plugin)["merged-work"], plugin.resolve(target)):
+        assert row["removable"] == ended
+        assert any(item["kind"] == "watch" for item in row["blockers"]) != ended
+
+
+@pytest.mark.parametrize("status", ["closed", "stopped"])
+def test_cleanup_rechecks_watch_status_after_inventory(site, status):
+    plugin, _, _, worktrees, state, _ = site
+    target = str(worktrees / "merged-work")
+    jobs = [{"cwd": target, "status": status}]
+    plugin.jobs = lambda: jobs
+    assert rows(plugin)["merged-work"]["removable"]
+
+    # A second watch can reserve the same checkout after the list was rendered.
+    jobs.append({"cwd": target, "status": "running", "stop_after_run": True})
+    results = finish(plugin, plugin.cleanup({"targets": [{"key": target}]}))
+    assert results[target]["status"] == "skipped"
+    assert "watch" in results[target]["message"]
+    assert Path(target).exists()
+    assert not calls(state, ["workspace", "close", "w1"])
+
+    jobs[-1]["status"] = "stopped"
+    results = finish(plugin, plugin.cleanup({"targets": [{"key": target}]}))
+    assert results[target]["status"] == "done"
+    assert not Path(target).exists()
+    assert calls(state, ["workspace", "close", "w1"])
+
+
 def test_a_missing_checkout_only_closes_its_workspace(site):
     plugin, _, _, _, state, _ = site
     results = finish(plugin, plugin.cleanup({"targets": [{"key": "workspace:w2"}]}))

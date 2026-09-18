@@ -424,10 +424,18 @@ class WorkspaceOverview:
                 links.append(link)
         return links, stale
 
+    def watched_checkouts(self):
+        """Ended watches remain in history but no longer reserve their checkout."""
+        return {
+            str(Path(job["cwd"]).resolve())
+            for job in self.jobs()
+            if job.get("cwd") and job.get("status") not in {"closed", "stopped"}
+        }
+
     def collect(self):
         warnings: list[str] = []
         clones, checkouts, spaces, agents = self.inventory(warnings)
-        watched = {str(Path(j["cwd"]).resolve()) for j in self.jobs() if j.get("cwd")}
+        watched = self.watched_checkouts()
         opened = {
             str(Path(space["worktree"]["checkout_path"]).resolve())
             for space in spaces
@@ -497,7 +505,7 @@ class WorkspaceOverview:
             )
         if watch:
             blockers.append(
-                blocker("watch", "A registered watch uses this checkout; cancel the watch first")
+                blocker("watch", "An unfinished watch uses this checkout; cancel the watch first")
             )
         if state["error"]:
             blockers.append(blocker("unknown", state["error"]))
@@ -732,7 +740,7 @@ class WorkspaceOverview:
         item = next((entry for entry in items if entry["path"] == key), None)
         if not item:
             return None
-        watched = {str(Path(job["cwd"]).resolve()) for job in self.jobs() if job.get("cwd")}
+        watched = self.watched_checkouts()
         return self.row(
             item,
             local_state(key, item.get("branch")),

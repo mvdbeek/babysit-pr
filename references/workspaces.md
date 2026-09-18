@@ -48,7 +48,7 @@ Local state is read without touching it: `git status --porcelain` for uncommitte
 - local state that could not be verified
 - a clone's own checkout, where only the herdr workspace is closed
 
-Two conditions can never be overridden: a checkout a **registered watch** is using (cancel the watch in the Watcher tab first) and a herdr workspace whose checkout lies outside the scanned clones. A cleanup target whose clone is not one the scan reaches is refused outright, however the request arrives, so the blast radius is never wider than the list. Everything recorded here is re-read immediately before anything is removed, so a stale selection is never acted on; a workspace that changed in the meantime is skipped or fails rather than removed on old evidence.
+Two conditions can never be overridden: a checkout an **unfinished watch** is using (cancel the watch in the Watcher tab first) and a herdr workspace whose checkout lies outside the scanned clones. Watches marked `closed` or `stopped` remain in history but no longer protect their checkout; paused, blocked, and running watches still do, including a repair finishing after cancellation. A cleanup target whose clone is not one the scan reaches is refused outright, however the request arrives, so the blast radius is never wider than the list. Everything recorded here is re-read immediately before anything is removed, so a stale selection is never acted on; a workspace that changed in the meantime is skipped or fails rather than removed on old evidence.
 
 ## What a cleanup does
 
