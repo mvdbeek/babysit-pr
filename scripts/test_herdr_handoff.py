@@ -16,6 +16,11 @@ EMPTY = "› \x1b[2mAsk Codex to do anything\x1b[0m"
     [
         (EMPTY, True),
         (EMPTY + "  ⠁⣀", True),
+        (EMPTY.replace("› ", "›⠁"), True),
+        (EMPTY.replace("› ", "› ⠁ ⣀ "), True),
+        ("›⠁Ask Codex to do anything", False),
+        (EMPTY.replace("› ", "› draft ⠁ "), False),
+        (EMPTY.replace("› ", "›⠁") + " draft", False),
         ("› Ask Codex to do anything", False),
         ("› \x1b[38;2;2;2;2mAsk Codex to do anything", False),
         ("› \x1b[48;2;30;30;30m\x1b[2mAsk Codex to do anything", True),
@@ -125,8 +130,10 @@ def rig(tmp_path, monkeypatch):
     db.close()
 
 
-def test_success_exits_once_then_releases(rig):
+@pytest.mark.parametrize("padding", [" ", "⠁", " ⠁ ⣀ "])
+def test_success_exits_once_then_releases(rig, padding):
     target, home, db, state = rig
+    state["screen"] = "[receipt]\n" + EMPTY.replace("› ", "›" + padding)
     handoff.perform(target, home, db)
     assert len(state["sent"]) == 1
     assert supervisor.get_job(db, "watch")["status"] == "watching"

@@ -93,7 +93,8 @@ def styled_chars(line: str) -> list[tuple[str, bool]]:
 
 def empty_composer(screen):
     # The supported Codex TUI renders its empty input placeholder in faint text.
-    # Unknown layouts fail closed. Braille after the placeholder is pet artwork.
+    # Unknown layouts fail closed. Animated Braille artwork can occupy the
+    # padding on either side of the placeholder; the placeholder must stay faint.
     candidates = []
     for line in screen.splitlines():
         chars = styled_chars(line)
@@ -105,7 +106,7 @@ def empty_composer(screen):
     chars, text = candidates[-1]
     marker = text.index("›")
     start = marker + 1
-    while start < len(text) and text[start].isspace():
+    while start < len(text) and (text[start].isspace() or "\u2800" <= text[start] <= "\u28ff"):
         start += 1
     placeholder = "Ask Codex to do anything"
     if not text[start:].startswith(placeholder):
