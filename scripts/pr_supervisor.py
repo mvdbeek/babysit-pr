@@ -1009,7 +1009,9 @@ def main():
     reg.add_argument("--poll-seconds", type=int, default=120)
     reg.add_argument("--max-repairs", type=int, default=5)
     reg.add_argument("--repair-timeout", type=int, default=1800)
-    handoff = sub.add_parser("handoff", help="Exit this Codex TUI once idle in herdr, then release")
+    handoff = sub.add_parser(
+        "handoff", help="Exit this Codex or Claude TUI once idle in herdr, then release"
+    )
     handoff.add_argument("id")
     handoff.add_argument("--pane", required=True)
     handoff.add_argument("--timeout", type=int, default=600)

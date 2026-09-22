@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Close one verified idle Codex TUI in herdr, then release its PR watch."""
+"""Close one verified idle Codex or Claude TUI in herdr, then release its PR watch."""
 
 import argparse
 import json
@@ -24,6 +24,16 @@ class ScreenNotReady(RuntimeError):
     """The final receipt or empty input has not finished rendering."""
 
 
+# Which TUI a watch was registered from: the conversation ID its CLI exports to
+# child processes, the foreground executable name, and the human label.
+AGENTS = {
+    "codex": dict(env="CODEX_THREAD_ID", process="codex", label="Codex"),
+    "claude": dict(env="CLAUDE_CODE_SESSION_ID", process="claude", label="Claude"),
+}
+CLAUDE_EXIT_HINT = "Press Ctrl-D again to exit"
+RULE = re.compile(r"^\s*─+\s*$")
+
+
 def herdr(*args):
     proc = owned_process.run(["herdr", *args], text=True, timeout=15)
     if proc.returncode:
@@ -45,7 +55,13 @@ def inspect(pane):
     return info, procs, agent
 
 
-def latest_turn(rollout, session_id):
+def latest_turn(rollout, session_id, agent="codex"):
+    if agent == "claude":
+        return latest_claude_turn(rollout, session_id)
+    return latest_codex_turn(rollout, session_id)
+
+
+def latest_codex_turn(rollout, session_id):
     meta, turn, complete = None, None, None
     with Path(rollout).open() as stream:
         for line in stream:
@@ -65,6 +81,44 @@ def latest_turn(rollout, session_id):
                     complete = None
     if meta != session_id or not turn:
         raise RuntimeError("Cannot identify the current turn in the registered rollout")
+    return turn, complete
+
+
+def latest_claude_turn(transcript, session_id):
+    """A turn is the last typed prompt; it is complete once its turn_duration record lands.
+
+    The completed text is the assistant text after the turn's final tool result, i.e. the
+    response the user sees, which must carry the handoff marker.
+    """
+    turn, complete, seen = None, None, False
+    texts: list[str] = []
+    with Path(transcript).open() as stream:
+        for line in stream:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # the writer may still be appending the final line
+            if item.get("isSidechain"):
+                continue  # subagent traffic never ends the main conversation's turn
+            kind = item.get("type")
+            if kind in {"user", "assistant"}:
+                if item.get("sessionId") != session_id:
+                    raise RuntimeError("Claude transcript session ID does not match")
+                seen = True
+                complete = None
+            content = (item.get("message") or {}).get("content")
+            blocks = content if isinstance(content, list) else []
+            if kind == "user":
+                if any(b.get("type") == "tool_result" for b in blocks):
+                    texts = []  # tool output: the final response restarts after it
+                elif not item.get("isMeta"):  # injected context is not a new prompt
+                    turn, complete, texts = item.get("uuid"), None, []
+            elif kind == "assistant":
+                texts.extend(b.get("text", "") for b in blocks if b.get("type") == "text")
+            elif kind == "system" and item.get("subtype") == "turn_duration" and turn:
+                complete = "\n".join(texts)
+    if not seen or not turn:
+        raise RuntimeError("Cannot identify the current turn in the registered transcript")
     return turn, complete
 
 
@@ -91,7 +145,13 @@ def styled_chars(line: str) -> list[tuple[str, bool]]:
     return out
 
 
-def empty_composer(screen):
+def empty_composer(screen, agent="codex"):
+    if agent == "claude":
+        return empty_claude_composer(screen)
+    return empty_codex_composer(screen)
+
+
+def empty_codex_composer(screen):
     # The supported Codex TUI renders its empty input placeholder in faint text.
     # Unknown layouts fail closed. Animated Braille artwork can occupy the
     # padding on either side of the placeholder; the placeholder must stay faint.
@@ -117,18 +177,44 @@ def empty_composer(screen):
     )
 
 
+def empty_claude_composer(screen):
+    # Claude draws its composer between two horizontal rules: a "❯" prompt line, then any
+    # wrapped continuation lines of a draft. Only a faint placeholder may follow the prompt.
+    # Unknown layouts fail closed.
+    lines = screen.splitlines()
+    prompt = None
+    for index, line in enumerate(lines):
+        if SGR.sub("", line).lstrip().startswith("❯"):
+            prompt = index
+    if prompt is None:
+        return False
+    if prompt == 0 or not RULE.fullmatch(SGR.sub("", lines[prompt - 1])):
+        return False
+    chars = styled_chars(lines[prompt])
+    text = "".join(c for c, _ in chars)
+    if any(not (c.isspace() or dim) for c, dim in chars[text.index("❯") + 1 :]):
+        return False
+    for line in lines[prompt + 1 :]:
+        plain = SGR.sub("", line)
+        if plain.strip():
+            return bool(RULE.match(plain))
+    return False
+
+
 def verify_identity(target, info, procs):
+    agent = target.get("agent", "codex")
+    label = AGENTS[agent]["label"]
     if info["terminal_id"] != target["terminal_id"] or procs["shell_pid"] != target["shell_pid"]:
         raise RuntimeError("Pane terminal or shell changed; handoff cancelled")
     matches = [p for p in procs["foreground_processes"] if p["pid"] == target["agent_pid"]]
     if (
         len(matches) != 1
         or matches[0].get("argv") != target["agent_argv"]
-        or info.get("agent") != "codex"
+        or info.get("agent") != agent
     ):
-        raise RuntimeError("Original Codex process changed; handoff cancelled")
+        raise RuntimeError(f"Original {label} process changed; handoff cancelled")
     if Path(matches[0].get("cwd", "")).resolve() != Path(target["cwd"]).resolve():
-        raise RuntimeError("Original Codex cwd changed")
+        raise RuntimeError(f"Original {label} cwd changed")
 
 
 def fingerprint(path):
@@ -136,17 +222,21 @@ def fingerprint(path):
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
-def verify_screen(target, info, screen):
+def verify_screen(target, info, screen, *, confirming=False):
     plain = SGR.sub("", screen)
     if info.get("scroll", {}).get("offset_from_bottom", 0) != 0:
         raise RuntimeError("Terminal is scrolled; leave it under user control")
+    agent = target.get("agent", "codex")
     if "Queued follow-up inputs" in plain or "esc to interrupt" in plain:
         raise RuntimeError("Queued input or background work is visible; agent left open")
-    if not empty_composer(screen):
+    if (CLAUDE_EXIT_HINT in plain and not confirming) or "Press Ctrl-C again" in plain:
+        raise RuntimeError("Exit keys are already being pressed in this pane; handoff cancelled")
+    if not empty_composer(screen, agent):
+        prompt_char = "❯" if agent == "claude" else "›"
         prompts = [
             line.lstrip()[1:].strip()
             for line in plain.splitlines()
-            if line.lstrip().startswith("›")
+            if line.lstrip().startswith(prompt_char)
         ]
         if prompts and prompts[-1]:
             raise RuntimeError("Composer contains input or an unknown layout; no exit key sent")
@@ -155,30 +245,36 @@ def verify_screen(target, info, screen):
         raise ScreenNotReady("Final receipt is not yet visible; no exit key sent")
 
 
+def read_screen(pane):
+    return herdr("agent", "read", pane, "--source", "visible", "--lines", "100", "--format", "ansi")
+
+
 def schedule(db, home, args):
     job = supervisor.get_job(db, args.id)
-    if job.get("agent", "codex") != "codex":
-        raise ValueError(
-            "Automatic initial exit currently supports Codex; exit Claude manually before release"
-        )
-    if os.environ.get("CODEX_THREAD_ID") != job["session_id"]:
-        raise ValueError("Schedule the handoff from the registered Codex conversation")
+    agent = job.get("agent", "codex")
+    spec = AGENTS.get(agent)
+    if spec is None:
+        raise ValueError("Automatic initial exit supports Codex and Claude; exit manually first")
+    if os.environ.get(spec["env"]) != job["session_id"]:
+        raise ValueError(f"Schedule the handoff from the registered {spec['label']} conversation")
     if job["status"] not in {"awaiting_release", "paused"}:
         raise ValueError("Watch must be awaiting release or paused before handoff")
-    turn, complete = latest_turn(job["rollout"], job["session_id"])
+    turn, complete = latest_turn(job["rollout"], job["session_id"], agent)
     if complete is not None:
         raise ValueError("Schedule from an active turn, before its final response")
     info, procs, _ = inspect(args.pane)
     matches = [
         p
         for p in procs["foreground_processes"]
-        if Path(p.get("argv0", "")).name == "codex"
+        if Path(p.get("argv0", "")).name == spec["process"]
         and Path(p.get("cwd", "")).resolve() == Path(job["cwd"]).resolve()
     ]
-    if info.get("agent") != "codex" or len(matches) != 1:
-        raise ValueError("Pane must contain exactly one Codex foreground process in this worktree")
+    if info.get("agent") != agent or len(matches) != 1:
+        raise ValueError(
+            f"Pane must contain exactly one {spec['label']} foreground process in this worktree"
+        )
     if matches[0]["pid"] == procs["shell_pid"]:
-        raise ValueError("Codex is the pane root process; exiting could close the pane")
+        raise ValueError(f"{spec['label']} is the pane root process; exiting could close the pane")
     if info.get("agent_status") == "blocked":
         raise ValueError(
             "Pane has a pending dialog/question; use manual handoff after resolving it"
@@ -186,6 +282,7 @@ def schedule(db, home, args):
     token = uuid.uuid4().hex
     target = {
         "job_id": job["id"],
+        "agent": agent,
         "session_id": job["session_id"],
         "rollout": job["rollout"],
         "cwd": job["cwd"],
@@ -250,6 +347,7 @@ def schedule(db, home, args):
 def perform(target, home, db):
     audit = home / "handoffs" / f"{target['token']}.audit.json"
     diagnostics: dict[str, str] = {}
+    agent = target.get("agent", "codex")
 
     def save(stage, **details):
         supervisor.watch.save_state(audit, {**target, **diagnostics, "stage": stage, **details})
@@ -293,16 +391,16 @@ def perform(target, home, db):
         settle_identity = None
         while True:
             still_owned()
-            info, procs, agent = inspect(target["pane_id"])
+            info, procs, state = inspect(target["pane_id"])
             verify_identity(target, info, procs)
-            turn, complete = latest_turn(target["rollout"], target["session_id"])
+            turn, complete = latest_turn(target["rollout"], target["session_id"], agent)
             if turn != target["turn_id"]:
                 raise RuntimeError("A new turn started; handoff cancelled")
             if info.get("agent_status") == "blocked":
                 raise RuntimeError("Dialog or question is pending; handoff cancelled")
             if settle_deadline is not None and (
                 info.get("agent_status") not in {"idle", "done"}
-                or (agent.get("state_change_seq"), fingerprint(target["rollout"]))
+                or (state.get("state_change_seq"), fingerprint(target["rollout"]))
                 != settle_identity
                 or complete is None
             ):
@@ -316,7 +414,7 @@ def perform(target, home, db):
                     if settle_deadline is None:
                         settle_deadline = min(deadline, time.monotonic() + SCREEN_SETTLE_TIMEOUT)
                         settle_identity = (
-                            agent.get("state_change_seq"),
+                            state.get("state_change_seq"),
                             fingerprint(target["rollout"]),
                         )
                     try:
@@ -334,23 +432,51 @@ def perform(target, home, db):
                 raise RuntimeError("Timed out waiting for the final response; agent left open")
             time.sleep(1)
         before = fingerprint(target["rollout"])
-        info2, procs2, agent2 = inspect(target["pane_id"])
+        info2, procs2, state2 = inspect(target["pane_id"])
         verify_identity(target, info2, procs2)
         screen2 = check_screen(info2)
         if (
             info2.get("agent_status") not in {"idle", "done"}
-            or agent.get("state_change_seq") is None
-            or agent2.get("state_change_seq") != agent.get("state_change_seq")
+            or state.get("state_change_seq") is None
+            or state2.get("state_change_seq") != state.get("state_change_seq")
             or target["marker"] not in SGR.sub("", screen2)
-            or not empty_composer(screen2)
+            or not empty_composer(screen2, agent)
             or fingerprint(target["rollout"]) != before
-            or latest_turn(target["rollout"], target["session_id"]) != (turn, complete)
+            or latest_turn(target["rollout"], target["session_id"], agent) != (turn, complete)
         ):
             raise RuntimeError("Session or input changed before exit; handoff cancelled")
         still_owned()
         save("exit_sent", screen_before=screen2)
-        # Send once. Never repeat: a second Ctrl-D could close the shell.
+        # Never repeat blindly: a Ctrl-D that reaches the shell could close it. Claude asks
+        # for a second press within about a second; it goes only to the still-running TUI.
         herdr("agent", "send-keys", target["pane_id"], "ctrl+d")
+        if agent == "claude":
+            confirmation_deadline = time.monotonic() + 0.75
+            while time.monotonic() < confirmation_deadline:
+                still_owned()
+                info3, procs3, _ = inspect(target["pane_id"])
+                if not any(p["pid"] == target["agent_pid"] for p in procs3["foreground_processes"]):
+                    break  # Already exiting; never send a confirmation to the shell.
+                verify_identity(target, info3, procs3)
+                if (
+                    info3.get("agent_status") not in {"idle", "done"}
+                    or info3.get("scroll", {}).get("offset_from_bottom", 0) != 0
+                    or fingerprint(target["rollout"]) != before
+                    or latest_turn(target["rollout"], target["session_id"], agent)
+                    != (turn, complete)
+                ):
+                    raise RuntimeError(
+                        "Session changed before exit confirmation; handoff cancelled"
+                    )
+                confirmation = read_screen(target["pane_id"])
+                # Reuse every input check, allowing only our own exit confirmation hint.
+                verify_screen(target, info3, confirmation, confirming=True)
+                if CLAUDE_EXIT_HINT in SGR.sub("", confirmation):
+                    still_owned()
+                    save("exit_repeated", screen_before=confirmation)
+                    herdr("agent", "send-keys", target["pane_id"], "ctrl+d")
+                    break
+                time.sleep(0.05)
         deadline = time.monotonic() + 20
         while True:
             still_owned()

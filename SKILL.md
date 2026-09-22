@@ -84,7 +84,8 @@ An empty run list means waiting for CI, not success. Details and examples are in
    or infer a session from cwd alone. The helper validates the rollout's ID/cwd
    and preserves the last recorded model and sandbox mode. Use the same external
    sandbox/launcher when required by the user's setup; see the reference below.
-   For Claude, pass `--agent claude --session SESSION_UUID` and, when needed,
+   For Claude, use `CLAUDE_CODE_SESSION_ID` from the current tool environment
+   when available. Pass `--agent claude --session SESSION_UUID` and, when needed,
    `--rollout /absolute/claude/transcript.jsonl`. Use an explicitly known session
    ID from Claude/herdr session metadata or its transcript, corroborated by the
    conversation and worktree; never select merely the newest transcript. Claude
@@ -113,12 +114,12 @@ An empty run list means waiting for CI, not success. Details and examples are in
    replaced, busy, or different-worktree pane blocks launches; never silently
    fall back to a background agent. Use `--headless` only if explicitly requested.
 
-4. **Automatic handoff is the default for Codex in herdr.** A watch/babysit
-   request includes scheduling the initial exit and release; do not ask for
-   separate confirmation or stop at `awaiting_release` when automatic handoff
-   is available. Respect an explicit request for manual exit or live foreground
-   monitoring. Claude currently uses the manual initial exit below; its
-   subsequent repairs and continuations still exit automatically.
+4. **Automatic handoff is the default for Codex and Claude in herdr.** A
+   watch/babysit request includes scheduling the initial exit and release; do
+   not ask for separate confirmation or stop at `awaiting_release` when
+   automatic handoff is available. Respect an explicit request for manual exit
+   or live foreground monitoring. Subsequent repairs and continuations exit
+   automatically as well.
    Identify this session's explicit pane ID using `herdr agent list` and
    `herdr pane process-info --pane
 PANE`; never assume the currently focused pane is this agent. Match the
@@ -133,13 +134,15 @@ PANE`; never assume the currently focused pane is this agent. Match the
    watch ID, say automatic handoff is scheduled, and include the returned
    `final_response_marker` verbatim on its own plain line. Keep this response
    short so the marker stays visible. The helper waits for that final response,
-   verifies an idle TUI with an empty composer, sends Ctrl-D once, and releases
-   monitoring only after confirming the original process exited. It preserves
+   verifies an idle TUI with an empty composer, sends Ctrl-D (repeated once for
+   Claude's confirmation prompt, only while that process is still in the
+   foreground), and releases monitoring only after confirming the original
+   process exited. It preserves
    the shell, pane, worktree, and saved conversation. Do not claim monitoring is
    already active while the handoff is pending.
 
-5. **Manual fallback:** for an explicit manual-exit request, Claude, or when
-   running outside herdr or identity/UI checks prevent automatic handoff,
+5. **Manual fallback:** for an explicit manual-exit request, or when running
+   outside herdr or identity/UI checks prevent automatic handoff,
    explain the concrete reason and return the watch ID, `awaiting_release`
    status, and exact `release_argv` command, quoted as shell arguments. The user
    exits the original CLI with Ctrl-D and runs it in the remaining shell. If an

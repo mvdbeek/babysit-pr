@@ -8,25 +8,34 @@ subcommand; use one home to share the global concurrency limit.
 ## Ownership
 
 Registration is inactive. Automatic exit and release is the default for Codex
-in herdr when handing off a watch; no separate automatic-exit request is needed.
+and Claude in herdr when handing off a watch; no separate automatic-exit
+request is needed.
 Respect an explicit manual-exit or live foreground monitoring preference.
 Using the shared `--home`, `handoff WATCH_ID --pane PANE` schedules a detached
 helper from the registered conversation. Include its unique marker in
 the final response and finish the turn. The helper verifies the saved turn has
 completed, the marker is visible in the target pane, the original foreground
-process is unchanged, and the composer is empty. It sends Ctrl-D once, preserves
+process is unchanged, and the composer is empty. It sends Ctrl-D, confirms Claude’s exit prompt if needed, preserves
 the shell/pane, and releases only after the original process has exited.
 
-Automatic handoff supports the Codex TUI's faint “Ask Codex to do anything”
-placeholder. Draft input, queued questions, dialogs, scrollback, a new turn, or an
-unknown layout cancels the handoff. Checks immediately before sending reduce the
-window for input races; herdr does not offer an atomic conditional key send.
-After turn completion, a missing final marker or blank/missing input area gets
-up to five seconds to render, bounded by the handoff timeout. Each retry rechecks
-ownership, process identity, and unchanged idle session state. Draft input and
-other cancellation conditions still stop immediately. The audit retains the
-first and last failed ANSI screens and the latest screen for diagnosis.
-Avoid typing into the pane during the brief handoff. Automatic initial exit is Codex-only; Claude uses manual Ctrl-D and release.
+Automatic handoff recognizes the Codex TUI's faint “Ask Codex to do anything”
+placeholder and Claude's empty “❯” prompt between its two horizontal rules. A
+Codex turn is complete at its rollout `task_complete` event, a Claude turn at
+the transcript's `turn_duration` record. Draft input, queued questions, dialogs,
+scrollback, a new turn, or an unknown layout cancels the handoff. Checks
+immediately before sending reduce the window for input races; herdr does not
+offer an atomic conditional key send. After turn completion, a missing final
+marker or blank/missing input area gets up to five seconds to render, bounded
+by the handoff timeout. Each retry rechecks ownership, process identity, and
+unchanged idle session state. Draft input and other cancellation conditions
+still stop immediately. The audit retains the first and last failed ANSI
+screens and the latest screen for diagnosis. Avoid typing into the pane during
+the brief handoff. Claude asks for a second Ctrl-D within about a second; the
+helper repeats the key only while the original Claude process is still the pane
+foreground and shows that hint. Before confirming, it rechecks ownership,
+process identity, transcript state, and the empty composer; it never repeats
+a key after observing the shell. As with the initial key, these checks cannot
+eliminate the race between inspection and key delivery.
 
 Otherwise, exit the original CLI with Ctrl-D and run the returned `release_argv`
 command. A headless caller may release after its original agent process exits.
