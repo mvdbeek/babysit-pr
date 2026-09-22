@@ -1215,7 +1215,7 @@ function itemTable(spec) {
         for (const field of change.fields) fields[field].classList.add("pr-field-changed");
         if (!change.isNew && !change.fields.length) updated.classList.add("pr-field-changed");
       }
-      row.append(pinCell, ...cells, workspaceCell(item));
+      row.append(pinCell, ...cells, workspaceCell({ ...item, kind: spec.prefix }));
       // Keep the original link between mouse-down and mouse-up during quiet polls.
       // Compare callback inputs too: identical markup can still carry new action data.
       const key = JSON.stringify([
@@ -1777,6 +1777,17 @@ function workspaceCell(item) {
   cell.append(workspaceControls(item));
   return cell;
 }
+function handleTaskButton(item) {
+  return workspaceButton(item.kind === "issue" ? "Handle issue" : "Handle failing tests", () => {
+    $("ci-dialog").close();
+    void workspaceDialog(item, true);
+  });
+}
+function defaultHandleTask(item) {
+  return item.kind === "issue"
+    ? `Investigate and resolve ${item.url}. Read the issue and relevant code, implement the fix, and run the appropriate tests. Summarize the changes and validation.`
+    : `Investigate and fix the failing tests and CI checks for ${item.url}. Inspect the latest check results and failure logs, reproduce the failures where possible, fix their root causes, and run the relevant tests. Summarize the changes, validation, and any remaining failures.`;
+}
 function workspaceControls(item) {
   const cell = el("div", undefined, "workspace-actions");
   const info = workspaceInfo(item);
@@ -1796,6 +1807,7 @@ function workspaceControls(item) {
     } else void workspaceDialog(item);
   });
   cell.append(button);
+  if (item.kind === "issue" || item.ci === "FAILURE") cell.append(handleTaskButton(item));
   button.disabled = item.kind === "watch" && !!info && !matches.length;
   if (button.disabled) button.title = "The watch’s registered checkout is no longer available.";
   if (matches.length === 1) {
@@ -1853,7 +1865,7 @@ async function chooseWorkspace(item, target, action) {
     workspaceError(error);
   }
 }
-async function workspaceDialog(item) {
+async function workspaceDialog(item, handling = false) {
   workspaceDialogItem = item;
   $("workspace-title").textContent =
     item.kind === "watch"
@@ -1876,7 +1888,7 @@ async function workspaceDialog(item) {
     if (!info) throw Error("Workspace discovery is unavailable. Try again after refreshing.");
     const body = $("workspace-content");
     body.replaceChildren();
-    if (info.matches.length) {
+    if (info.matches.length && !handling) {
       body.append(el("p", "Choose a checkout. Opening a workspace preserves its current agent."));
       for (const target of info.matches) {
         const row = el("section", undefined, "workspace-choice");
@@ -1967,6 +1979,9 @@ async function workspaceDialog(item) {
       task.required = true;
       task.maxLength = 32000;
       task.rows = 6;
+      if (handling) task.value = defaultHandleTask(item);
+      if (handling && info.matches.length)
+        form.append(el("p", "Start the selected agent in a new workspace for this task."));
       function field(text, input) {
         const label = el("label", text);
         label.htmlFor = input.id;
@@ -1987,7 +2002,11 @@ async function workspaceDialog(item) {
       field("Reasoning effort (optional)", effort);
       form.append(settingsNote);
       field("Task", task);
-      const submit = el("button", info.clones.length ? "Create workspace" : "Clone and create");
+      const submit = el(
+        "button",
+        handling ? "Handle" : info.clones.length ? "Create workspace" : "Clone and create",
+      );
+      submit.dataset.handling = String(handling);
       submit.type = "submit";
       submit.disabled = !info.clones.length && !info.destination;
       form.append(submit);
@@ -2003,7 +2022,7 @@ async function workspaceDialog(item) {
         try {
           const value = await workspaceRequest(
             item,
-            info.clones.length ? "create" : "clone-and-create",
+            handling ? "handle" : info.clones.length ? "create" : "clone-and-create",
             {
               agent: agent.value,
               ...(model.value ? { model: model.value } : {}),
@@ -2041,7 +2060,9 @@ function updateWorkspaceOperation() {
   $("workspace-log").textContent = op.log || "";
   if (op.result?.url) $("workspace-result").replaceChildren(link("Open in Collie", op.result.url));
   const submit = $("workspace-content").querySelector("button[type=submit]");
-  if (submit) submit.disabled = op.status !== "failed";
+  if (submit)
+    submit.disabled =
+      op.status !== "failed" && !(submit.dataset.handling === "true" && op.status === "complete");
   syncWorkspacePolling();
 }
 let workspacePoll = null;
@@ -2173,6 +2194,7 @@ function openPRCI(pr) {
       const content = $("ci-content");
       content.replaceChildren();
       const checks = result.value.checks;
+      if (checks.some((check) => check.bucket === "fail")) content.append(handleTaskButton(pr));
       if (!checks.length) content.append(el("p", "No checks reported for this commit."));
       for (const [bucket, label] of [
         ["fail", "Failing checks"],

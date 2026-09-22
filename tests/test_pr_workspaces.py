@@ -861,3 +861,28 @@ def test_reopen_ignores_creation_overrides(local, key):
     assert op["status"] == "complete", op["log"]
     assert op["model"] is None and op["effort"] is None and op["agent"] is None
     assert not json.loads(state.read_text())["agents"]
+
+
+def test_handle_starts_separate_workspace_with_selected_settings(local):
+    manager, pr, _, state, _ = local
+    manager.action({"id": pr["id"], "action": "create", "task": "Original task"})
+    original = finish(manager, pr["id"])
+    request = {
+        "id": pr["id"],
+        "action": "handle",
+        "task": "Fix failing tests",
+        "agent": "codex",
+        "model": "fixture-codex",
+        "effort": "high",
+    }
+    started = manager.action(request)["operation"]
+    assert started["id"] != original["id"]
+    result = finish(manager, pr["id"])
+    assert result["status"] == "complete", result
+    assert result["path"] != original["path"]
+    assert result["model"] == "fixture-codex"
+    assert result["effort"] == "high"
+    agents = json.loads(state.read_text())["agents"]
+    assert len(agents) == 2
+    assert agents[0]["task"].startswith("Original task")
+    assert agents[1]["task"].startswith("Fix failing tests")

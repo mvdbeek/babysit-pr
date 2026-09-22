@@ -2488,3 +2488,38 @@ def test_existing_workspace_has_no_model_controls(page, dashboard_site, request,
         "action": "reopen",
         "path": "/fixture/checkout",
     }
+
+
+@pytest.mark.parametrize("kind", ["pr", "issue"])
+def test_handle_shared_prompt_and_agent_controls(page, dashboard_site, request, kind):
+    info, snapshot, requests = request.getfixturevalue(
+        "workspace_routes" if kind == "pr" else "issue_workspace_routes"
+    )
+    snapshot["agent_choices"] = {
+        "claude": {"models": [{"id": "opus", "efforts": ["high"]}], "efforts": ["high"]}
+    }
+    url, _ = dashboard_site
+    page.goto(url + ("/#prs" if kind == "pr" else "/#issues"))
+    rows = page.locator("#pr-list tr" if kind == "pr" else "#issue-list tr")
+    if kind == "pr":
+        expect(rows.last.get_by_role("button", name="Handle failing tests")).to_have_count(0)
+    rows.first.get_by_role(
+        "button", name="Handle failing tests" if kind == "pr" else "Handle issue"
+    ).click()
+    dialog = page.locator("#workspace-dialog")
+    task = dialog.get_by_role("textbox", name="Task", exact=True)
+    assert task.input_value().startswith("Investigate")
+    assert "https://github.com/test/alpha/" in task.input_value()
+    dialog.get_by_role("combobox", name="Agent", exact=True).select_option("claude")
+    choose_option(dialog.get_by_role("combobox", name="Model (optional)", exact=True), "opus")
+    choose_option(
+        dialog.get_by_role("combobox", name="Reasoning effort (optional)", exact=True), "high"
+    )
+    task.fill("Fix this and validate the regression")
+    dialog.get_by_role("button", name="Handle", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1]["action"] == "handle"
+    assert requests[-1]["task"] == "Fix this and validate the regression"
+    assert requests[-1]["agent"] == "claude"
+    assert requests[-1]["model"] == "opus"
+    assert requests[-1]["effort"] == "high"

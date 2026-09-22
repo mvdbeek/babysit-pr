@@ -585,6 +585,7 @@ class Workspaces:
                 "focus",
                 "copy",
                 "create",
+                "handle",
                 "clone-and-create",
             }
         ):
@@ -596,15 +597,16 @@ class Workspaces:
             raise ValueError("Expected a retry flag")
         pr = self.target(request["id"])
         action = request["action"]
-        if pr.get("kind") == "watch" and action in {"create", "clone-and-create"}:
+        if pr.get("kind") == "watch" and action in {"create", "clone-and-create", "handle"}:
             raise ValueError("Watch actions can only open or reopen the registered checkout")
         with self.lock:
-            if action in {"create", "clone-and-create", "reopen"}:
+            if action in {"create", "clone-and-create", "reopen", "handle"}:
                 existing = self.operation(pr["id"])
                 if existing and (
                     existing["status"] in {"queued", "running"}
                     or (
                         action != "reopen"
+                        and not (action == "handle" and existing["status"] == "complete")
                         and not (existing["status"] == "failed" and request.get("retry"))
                     )
                 ):
@@ -661,7 +663,7 @@ class Workspaces:
                     raise ValueError("Use Reopen workspace for this checkout")
                 clone = str(Path(target["common"]).parent)
             else:
-                if info["matches"]:
+                if info["matches"] and action != "handle":
                     raise ValueError("A verified checkout already exists; open or reopen it")
                 if request.get("agent", "codex") not in {"codex", "claude"}:
                     raise ValueError("Select Codex or Claude")
@@ -680,7 +682,7 @@ class Workspaces:
                     pr.get("head_repo") and pr.get("head_branch") and pr.get("head_sha")
                 ):
                     raise ValueError("Refresh GitHub metadata before creating a workspace")
-                if action == "create":
+                if action == "create" or (action == "handle" and info["clones"]):
                     clone = request.get("clone") or info["preferred_clone"]
                     if not clone and len(info["clones"]) == 1:
                         clone = info["clones"][0]
@@ -712,6 +714,7 @@ class Workspaces:
                     previous = json.loads(row[0])
                     if previous["status"] in {"queued", "running"} or (
                         action != "reopen"
+                        and not (action == "handle" and previous["status"] == "complete")
                         and (previous["status"] != "failed" or not request.get("retry"))
                     ):
                         return {"operation": previous}
@@ -768,10 +771,12 @@ class Workspaces:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 self.save_operation(op, status="running", message="Revalidating local resources")
                 info = self.describe(pr, self.scan())
-                if op["action"] != "reopen" and info["matches"]:
+                if op["action"] not in {"reopen", "handle"} and info["matches"]:
                     raise ValueError("A checkout appeared while queued; open or reopen it")
                 clone = Path(op["clone"])
-                if op["action"] == "clone-and-create":
+                if op["action"] == "clone-and-create" or (
+                    op["action"] == "handle" and not info["clones"]
+                ):
                     if os.path.lexists(clone):
                         raise ValueError("Clone destination now exists; nothing was overwritten")
                     clone.parent.mkdir(parents=True, exist_ok=True)

@@ -229,6 +229,13 @@ destination before submission. It clones the base repository using the existing
 `gh` authentication into `~/src/<repo>`, or `~/src/<owner>--<repo>` when the first
 path is occupied. Existing content is never overwritten.
 
+PRs with failing CI also offer **Handle failing tests** in the Actions column and
+CI details. Issues offer **Handle issue** through the same dialog. Both prefill an
+editable task and reuse the agent, model, and reasoning-effort selectors. **Handle**
+starts a new workspace, including when a matching checkout already exists, so an
+existing agent keeps its task. An in-progress launch is reused; after completion,
+a later Handle submission can start another task in a separate checkout.
+
 One shared inventory refreshes every 15 seconds while the PR tab is visible.
 GitHub metadata, including head repository, branch and SHA, retains its five-minute
 refresh. Matches use saved associations, watcher bindings, or verified Git head
