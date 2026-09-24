@@ -2552,3 +2552,83 @@ def test_handle_shared_prompt_and_agent_controls(page, dashboard_site, request, 
     assert requests[-1]["agent"] == "claude"
     assert requests[-1]["model"] == "opus"
     assert requests[-1]["effort"] == "high"
+
+
+def test_handle_review_comments_for_authored_prs_with_feedback(
+    page, dashboard_site, workspace_routes
+):
+    info, snapshot, requests = workspace_routes
+    base = {"repo": "test/alpha", "ci": "SUCCESS", "draft": False, "author": "fixture"}
+    prs = [
+        {
+            **base,
+            "id": "pr-one",
+            "number": 8,
+            "title": "Threads",
+            "roles": ["author"],
+            "url": "https://github.com/test/alpha/pull/8",
+            "unresolved_threads": 3,
+        },
+        {
+            **base,
+            "id": "pr-two",
+            "number": 9,
+            "title": "Requested",
+            "roles": ["author"],
+            "url": "https://github.com/test/alpha/pull/9",
+            "review_decision": "CHANGES_REQUESTED",
+        },
+        {
+            **base,
+            "id": "pr-three",
+            "number": 10,
+            "title": "Theirs",
+            "roles": ["reviewer"],
+            "url": "https://github.com/test/alpha/pull/10",
+            "unresolved_threads": 1,
+        },
+        {
+            **base,
+            "id": "pr-four",
+            "number": 11,
+            "title": "Settled",
+            "roles": ["author"],
+            "url": "https://github.com/test/alpha/pull/11",
+            "review_decision": "APPROVED",
+        },
+    ]
+    snapshot["prs"].update({"pr-three": copy.deepcopy(info), "pr-four": copy.deepcopy(info)})
+    page.route("**/api/prs", lambda route: route.fulfill(json={"prs": prs, "synced_at": 1234}))
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    rows = page.locator("#pr-list tr")
+    expect(rows).to_have_count(4)
+    handle = "Handle review comments"
+    threads = rows.filter(has_text="Threads")
+    expect(threads.locator(".pr-readiness")).to_contain_text("3 unresolved threads")
+    requested = rows.filter(has_text="Requested")
+    expect(requested.locator(".pr-readiness")).to_contain_text("Changes requested")
+    expect(requested.locator(".pr-readiness")).not_to_contain_text("Ready for review")
+    expect(requested.get_by_role("button", name=handle)).to_have_count(1)
+    # Reviewers see the feedback count but cannot handle someone else's review.
+    theirs = rows.filter(has_text="Theirs")
+    expect(theirs.locator(".pr-readiness")).to_contain_text("1 unresolved thread")
+    expect(theirs.get_by_role("button", name=handle)).to_have_count(0)
+    expect(rows.filter(has_text="Settled").get_by_role("button", name=handle)).to_have_count(0)
+
+    review_filter = page.get_by_role("combobox", name="Filter pull requests by review status")
+    choose_option(review_filter, "feedback")
+    expect(rows).to_have_count(3)
+    expect(page.locator("#pr-list")).not_to_contain_text("Settled")
+    choose_option(review_filter, "all")
+
+    threads.get_by_role("button", name=handle).click()
+    dialog = page.locator("#workspace-dialog")
+    task = dialog.get_by_role("textbox", name="Task", exact=True)
+    assert task.input_value().startswith("Address the review feedback on ")
+    assert "https://github.com/test/alpha/pull/8" in task.input_value()
+    assert "Do not reply to or resolve threads" in task.input_value()
+    dialog.get_by_role("button", name="Handle", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1]["action"] == "handle" and requests[-1]["id"] == "pr-one"
+    assert requests[-1]["task"].startswith("Address the review feedback")

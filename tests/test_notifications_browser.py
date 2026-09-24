@@ -447,3 +447,47 @@ def test_repair_completed_between_browser_polls_notifies(page, inbox):
     job.update(attempts=job.get("attempts", 0) + 1, updated_at=job["updated_at"] + 1)
     refresh(page)
     count(page, 1)
+
+
+def test_review_thread_count_added_after_baselines_is_not_a_change(page, inbox):
+    url, packets = inbox
+    # Visit the PR tab once so both notification and visit baselines exist.
+    page.goto(url + "/#prs")
+    count(page, 0)
+    expect(page.locator("#pr-changes")).to_contain_text("from this visit onward")
+    page.get_by_role("tab", name="Watcher").click()
+    # Rewrite stored notification and visit baselines as they were before the field existed.
+    page.evaluate(
+        """() => {
+          const strip = (value) => {
+            if (!value || typeof value !== "object") return;
+            delete value.unresolved_threads;
+            Object.values(value).forEach(strip);
+          };
+          for (const key of Object.keys(localStorage)) {
+            try {
+              const value = JSON.parse(localStorage.getItem(key));
+              strip(value);
+              localStorage.setItem(key, JSON.stringify(value));
+            } catch {}
+          }
+        }"""
+    )
+    assert "unresolved_threads" not in json.dumps(
+        page.evaluate("() => Object.values(localStorage)")
+    )
+    first, second = packets["prs"]["prs"]
+    first["unresolved_threads"] = 0
+    packets["prs"]["synced_at"] += 1
+    page.goto(url)
+    count(page, 0)
+    second["unresolved_threads"] = 2
+    packets["prs"]["synced_at"] += 1
+    refresh(page)
+    count(page, 1)
+    page.locator("#notifications-toggle").click()
+    expect(page.locator("#notifications-list")).to_contain_text("Review threads changed")
+    page.keyboard.press("Escape")
+    page.get_by_role("tab", name="Pull requests").click()
+    expect(page.locator(".pr-new")).to_have_count(0)
+    expect(page.locator(".pr-changed .pr-change-note")).to_have_text(["Review threads"])

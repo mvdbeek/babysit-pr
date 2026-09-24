@@ -230,8 +230,12 @@ destination before submission. It clones the base repository using the existing
 path is occupied. Existing content is never overwritten.
 
 PRs with failing CI also offer **Handle failing tests** in the Actions column and
-CI details. Issues offer **Handle issue** through the same dialog. Both prefill an
-editable task and reuse the agent, model, and reasoning-effort selectors. **Handle**
+CI details. Issues offer **Handle issue** through the same dialog. PRs you authored
+offer **Handle review comments** when a reviewer requested changes or review threads
+remain unresolved; the Review status column shows both, and the **Needs changes**
+filter lists them. Its task asks the agent to address the feedback without replying
+to or resolving threads on GitHub. Each Handle action prefills an
+editable task and reuses the agent, model, and reasoning-effort selectors. **Handle**
 starts a new workspace, including when a matching checkout already exists, so an
 existing agent keeps its task. An in-progress launch is reused; after completion,
 a later Handle submission can start another task in a separate checkout.

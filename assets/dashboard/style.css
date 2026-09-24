@@ -403,8 +403,13 @@ aside {
   height: auto;
   background: none;
 }
+/* Stack review badges so extra ones (threads) do not widen the column. */
+.pr-readiness .badge {
+  display: flex;
+  width: fit-content;
+}
 .pr-readiness .badge + .badge {
-  margin-left: 6px;
+  margin-top: 4px;
 }
 .green {
   color: var(--green);

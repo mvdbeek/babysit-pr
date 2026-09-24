@@ -31,7 +31,10 @@
       if (Array.isArray(checks)) old.values.checks = JSON.stringify(checkResult(checks));
     }
     const fields = new Set(
-      Object.keys(values).filter((field) => old?.values[field] !== values[field]),
+      // A field added after the baseline was stored reads as null, not as a change.
+      Object.keys(values).filter(
+        (field) => !old || (old.values[field] ?? "null") !== values[field],
+      ),
     );
     if (source === "prs" && !["SUCCESS", "FAILURE", "ERROR"].includes(sample.values.ci))
       fields.delete("ci");

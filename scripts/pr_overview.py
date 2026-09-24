@@ -27,6 +27,7 @@ PR_FRAGMENT = (
       headRefName headRefOid
       author { login }
       statusCheckRollup { state }
+      reviewThreads(last: 100) { nodes { isResolved } }
     """
     + activity_fragment(pull_request=True)
     + "}"
@@ -61,6 +62,11 @@ def pr_record(node, roles):
         "opened_at": node["createdAt"],
         "draft": node["isDraft"],
         "review_decision": node.get("reviewDecision"),
+        # Outdated threads still count: GitHub keeps them open until someone resolves them.
+        "unresolved_threads": sum(
+            not thread["isResolved"]
+            for thread in (node.get("reviewThreads") or {}).get("nodes") or []
+        ),
         "roles": roles,
         "ci": rollup.get("state", "UNKNOWN") if rollup else "NONE",
     }

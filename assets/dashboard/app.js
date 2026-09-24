@@ -849,8 +849,17 @@ function sortedNames(values) {
 function prReviewBadges(pr) {
   const badges = pr.draft ? [["Draft", ""]] : [];
   if (pr.review_decision === "APPROVED") badges.push(["Approved", "green pr-approved"]);
+  else if (pr.review_decision === "CHANGES_REQUESTED") badges.push(["Changes requested", "red"]);
   else if (!pr.draft) badges.push(["Ready for review", "blue"]);
+  if (pr.unresolved_threads)
+    badges.push([
+      `${pr.unresolved_threads} unresolved thread${pr.unresolved_threads === 1 ? "" : "s"}`,
+      "amber",
+    ]);
   return badges;
+}
+function prNeedsChanges(pr) {
+  return pr.review_decision === "CHANGES_REQUESTED" || pr.unresolved_threads > 0;
 }
 
 // One sortable, filterable overview table with "since your last visit" highlighting.
@@ -1373,11 +1382,17 @@ const prTable = itemTable({
     author: "Author",
     ci: "CI",
     review_decision: "Review",
+    unresolved_threads: "Review threads",
     draft: "Draft status",
     roles: "Your role",
     head_sha: "New commits",
   },
-  changeValue: (pr, field) => (field === "roles" ? sortedNames(pr.roles) : undefined),
+  changeValue(pr, field) {
+    if (field === "roles") return sortedNames(pr.roles);
+    // Zero threads equals an absent count, so snapshots saved before it existed stay quiet.
+    if (field === "unresolved_threads") return pr.unresolved_threads || null;
+    return undefined;
+  },
   sortValue(pr, column) {
     if (column === "readiness")
       return prReviewBadges(pr)
@@ -1399,7 +1414,8 @@ const prTable = itemTable({
     (f.role === "all" || pr.roles.includes(f.role)) &&
     (f.ci === "all" || pr.ci === f.ci || (f.ci === "UNKNOWN" && !ciStates[pr.ci])) &&
     (f.repo === "all" || pr.repo === f.repo) &&
-    (f.review === "all" || (f.review === "draft" ? pr.draft : !pr.draft)),
+    (f.review === "all" ||
+      (f.review === "feedback" ? prNeedsChanges(pr) : f.review === "draft" ? pr.draft : !pr.draft)),
   searchText: (pr) => `${pr.repo} ${pr.title} ${pr.number} ${pr.author || ""}`,
   row(pr) {
     const title = el("td", undefined, "pr-description");
@@ -1425,6 +1441,7 @@ const prTable = itemTable({
         author,
         ci: checks,
         review_decision: readiness,
+        unresolved_threads: readiness,
         draft: readiness,
         roles,
         head_sha: updated,
@@ -1777,16 +1794,29 @@ function workspaceCell(item) {
   cell.append(workspaceControls(item));
   return cell;
 }
-function handleTaskButton(item) {
-  return workspaceButton(item.kind === "issue" ? "Handle issue" : "Handle failing tests", () => {
+const handleTasks = {
+  issue: [
+    "Handle issue",
+    (url) =>
+      `Investigate and resolve ${url}. Read the issue and relevant code, implement the fix, and run the appropriate tests. Summarize the changes and validation.`,
+  ],
+  ci: [
+    "Handle failing tests",
+    (url) =>
+      `Investigate and fix the failing tests and CI checks for ${url}. Inspect the latest check results and failure logs, reproduce the failures where possible, fix their root causes, and run the relevant tests. Summarize the changes, validation, and any remaining failures.`,
+  ],
+  review: [
+    "Handle review comments",
+    (url) =>
+      `Address the review feedback on ${url}. Read the submitted reviews and every unresolved review thread, including outdated ones, make the requested changes where they are sound, and run the relevant tests. Do not reply to or resolve threads on GitHub. Summarize each comment with what you changed, or why you did not.`,
+  ],
+};
+function handleTaskButton(item, kind) {
+  const [label, task] = handleTasks[kind];
+  return workspaceButton(label, () => {
     $("ci-dialog").close();
-    void workspaceDialog(item, true);
+    void workspaceDialog(item, task(item.url));
   });
-}
-function defaultHandleTask(item) {
-  return item.kind === "issue"
-    ? `Investigate and resolve ${item.url}. Read the issue and relevant code, implement the fix, and run the appropriate tests. Summarize the changes and validation.`
-    : `Investigate and fix the failing tests and CI checks for ${item.url}. Inspect the latest check results and failure logs, reproduce the failures where possible, fix their root causes, and run the relevant tests. Summarize the changes, validation, and any remaining failures.`;
 }
 function workspaceControls(item) {
   const cell = el("div", undefined, "workspace-actions");
@@ -1807,7 +1837,11 @@ function workspaceControls(item) {
     } else void workspaceDialog(item);
   });
   cell.append(button);
-  if (item.kind === "issue" || item.ci === "FAILURE") cell.append(handleTaskButton(item));
+  if (item.kind === "issue") cell.append(handleTaskButton(item, "issue"));
+  if (item.kind === "pr" && item.ci === "FAILURE") cell.append(handleTaskButton(item, "ci"));
+  // Review feedback is addressed to the PR's author, so only their rows offer it.
+  if (item.kind === "pr" && item.roles?.includes("author") && prNeedsChanges(item))
+    cell.append(handleTaskButton(item, "review"));
   button.disabled = item.kind === "watch" && !!info && !matches.length;
   if (button.disabled) button.title = "The watch’s registered checkout is no longer available.";
   if (matches.length === 1) {
@@ -1865,7 +1899,8 @@ async function chooseWorkspace(item, target, action) {
     workspaceError(error);
   }
 }
-async function workspaceDialog(item, handling = false) {
+// `handling` is the prefilled task text of a Handle action, or empty for plain creation.
+async function workspaceDialog(item, handling = "") {
   workspaceDialogItem = item;
   $("workspace-title").textContent =
     item.kind === "watch"
@@ -1979,7 +2014,7 @@ async function workspaceDialog(item, handling = false) {
       task.required = true;
       task.maxLength = 32000;
       task.rows = 6;
-      if (handling) task.value = defaultHandleTask(item);
+      if (handling) task.value = handling;
       if (handling && info.matches.length)
         form.append(el("p", "Start the selected agent in a new workspace for this task."));
       function field(text, input) {
@@ -2006,7 +2041,7 @@ async function workspaceDialog(item, handling = false) {
         "button",
         handling ? "Handle" : info.clones.length ? "Create workspace" : "Clone and create",
       );
-      submit.dataset.handling = String(handling);
+      submit.dataset.handling = String(Boolean(handling));
       submit.type = "submit";
       submit.disabled = !info.clones.length && !info.destination;
       form.append(submit);
@@ -2194,7 +2229,8 @@ function openPRCI(pr) {
       const content = $("ci-content");
       content.replaceChildren();
       const checks = result.value.checks;
-      if (checks.some((check) => check.bucket === "fail")) content.append(handleTaskButton(pr));
+      if (checks.some((check) => check.bucket === "fail"))
+        content.append(handleTaskButton(pr, "ci"));
       if (!checks.length) content.append(el("p", "No checks reported for this commit."));
       for (const [bucket, label] of [
         ["fail", "Failing checks"],

@@ -71,6 +71,17 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
     assert result["login"] == "alice" and not result["warnings"]
 
 
+def test_counts_unresolved_review_threads_including_outdated(monkeypatch):
+    threads = {"nodes": [{"isResolved": False}, {"isResolved": True}, {"isResolved": False}]}
+    nodes = [pr(reviewThreads=threads, reviewDecision="CHANGES_REQUESTED"), pr("bare")]
+    monkeypatch.setattr(overview, "github_page", lambda *args: page(nodes))
+    found = {item["id"]: item for item in overview.collect()["prs"]}
+    assert found["one"]["unresolved_threads"] == 2
+    assert found["one"]["review_decision"] == "CHANGES_REQUESTED"
+    assert found["bare"]["unresolved_threads"] == 0
+    assert "reviewThreads(last: 100) { nodes { isResolved } }" in overview.PR_FRAGMENT
+
+
 def test_empty_search(monkeypatch):
     monkeypatch.setattr(overview, "github_page", lambda *args: page([]))
     assert overview.collect()["prs"] == []
