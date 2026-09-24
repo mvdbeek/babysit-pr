@@ -849,12 +849,14 @@ function sortedNames(values) {
 function prReviewBadges(pr) {
   const badges = pr.draft ? [["Draft", ""]] : [];
   if (pr.review_decision === "APPROVED") badges.push(["Approved", "green pr-approved"]);
-  else if (pr.review_decision === "CHANGES_REQUESTED") badges.push(["Changes requested", "red"]);
+  else if (pr.review_decision === "CHANGES_REQUESTED")
+    badges.push(["Changes requested", "red", true]);
   else if (!pr.draft) badges.push(["Ready for review", "blue"]);
   if (pr.unresolved_threads)
     badges.push([
       `${pr.unresolved_threads} unresolved thread${pr.unresolved_threads === 1 ? "" : "s"}`,
       "amber",
+      true,
     ]);
   return badges;
 }
@@ -1424,8 +1426,10 @@ const prTable = itemTable({
     title.append(titleLink, el("span", `#${pr.number}`, "pr-meta"));
     const author = authorCell(pr.author);
     const readiness = el("td", undefined, "pr-readiness");
-    for (const [label, color] of prReviewBadges(pr))
-      readiness.append(el("span", label, `badge ${color}`));
+    for (const [label, color, feedback] of prReviewBadges(pr))
+      readiness.append(
+        feedback ? reviewBadge(pr, label, color) : el("span", label, `badge ${color}`),
+      );
     const roles = rolesCell(pr.roles);
     const checks = el("td");
     checks.append(ciBadge(pr));
@@ -2141,7 +2145,7 @@ async function loadCI(url, generation, render, fail, attempt = 0) {
       if (!result.refreshing) return;
     }
     if (attempt >= 100)
-      throw Error("CI is taking longer than expected. Close and reopen to check again.");
+      throw Error("Loading is taking longer than expected. Close and reopen to check again.");
     const timer = setTimeout(() => {
       ciTimers.delete(timer);
       void loadCI(url, generation, render, fail, attempt + 1);
@@ -2268,6 +2272,103 @@ function openPRCI(pr) {
     (message) => {
       $("ci-error").textContent = message;
       $("ci-meta").textContent = "Could not load CI details.";
+    },
+  );
+}
+// Review feedback shares the CI dialog and its polling; only an explicit click fetches it.
+function reviewBadge(pr, label, color) {
+  const badge = link(label, `${pr.url}/files`);
+  badge.className = `badge ${color}`;
+  badge.setAttribute("aria-label", `${label}: show review feedback for ${pr.repo} #${pr.number}`);
+  badge.onclick = (event) => {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    openPRReviews(pr);
+  };
+  return badge;
+}
+function reviewComment(comment, cls) {
+  const item = el("article", undefined, cls);
+  const head = el("small");
+  const when = Date.parse(comment.at) ? ago(Date.parse(comment.at) / 1000) : "on GitHub";
+  head.append(`${comment.author || "Someone"} · `);
+  head.append(comment.url ? link(when, comment.url) : when);
+  item.append(head, el("p", comment.body || "(no text)", "review-body"));
+  return item;
+}
+function openPRReviews(pr) {
+  stopCILoads();
+  $("ci-title").textContent = `${pr.repo} #${pr.number} · Review feedback`;
+  $("ci-meta").textContent = "Loading review feedback…";
+  $("ci-error").textContent = "";
+  $("ci-links").replaceChildren(link("Files changed on GitHub", `${pr.url}/files`));
+  $("ci-content").replaceChildren();
+  if (!$("ci-dialog").open) $("ci-dialog").showModal();
+  let rendered = null;
+  void loadCI(
+    `/api/pr-reviews?id=${encodeURIComponent(pr.id)}`,
+    ciGeneration,
+    (result) => {
+      $("ci-error").textContent = result.error || "";
+      if (!result.value) {
+        $("ci-meta").textContent = result.busy
+          ? "Other details are loading; waiting for a slot…"
+          : result.refreshing
+            ? "Loading review feedback…"
+            : "Could not load review feedback.";
+        return;
+      }
+      $("ci-meta").textContent =
+        `Fetched ${new Date(result.synced_at * 1000).toLocaleString()}${result.refreshing ? " · Updating…" : ""}`;
+      const key = JSON.stringify(result.value);
+      if (key === rendered) return;
+      rendered = key;
+      const { reviews, threads, truncated } = result.value;
+      const content = $("ci-content");
+      content.replaceChildren();
+      if (pr.roles?.includes("author"))
+        content.append(handleTaskButton({ ...pr, kind: "pr" }, "review"));
+      if (reviews.length) {
+        const section = el("section", undefined, "ci-group");
+        section.append(el("h3", `Reviews (${reviews.length})`));
+        for (const review of reviews) {
+          const item = reviewComment(review, "ci-item");
+          const state = {
+            CHANGES_REQUESTED: ["Changes requested", "red"],
+            APPROVED: ["Approved", "green"],
+          }[review.state];
+          if (state) item.prepend(el("span", state[0], `badge ${state[1]}`));
+          section.append(item);
+        }
+        content.append(section);
+      }
+      const section = el("section", undefined, "ci-group");
+      section.append(el("h3", `Unresolved threads (${threads.length}${truncated ? "+" : ""})`));
+      if (!threads.length) section.append(el("p", "No unresolved review threads."));
+      for (const thread of threads) {
+        const item = el("article", undefined, "ci-item");
+        const where = el(
+          "strong",
+          `${thread.path || "Conversation"}${thread.line ? `:${thread.line}` : ""}`,
+          "review-path",
+        );
+        item.append(where);
+        if (thread.outdated) item.append(el("span", "Outdated", "badge"));
+        for (const comment of thread.comments)
+          item.append(reviewComment(comment, "review-comment"));
+        if (thread.more_comments)
+          item.append(el("small", `${thread.more_comments} more comment(s) on GitHub`));
+        section.append(item);
+      }
+      if (truncated)
+        section.append(
+          el("p", "Only the latest 100 threads are shown; open GitHub for the rest.", "ci-error"),
+        );
+      content.append(section);
+    },
+    (message) => {
+      $("ci-error").textContent = message;
+      $("ci-meta").textContent = "Could not load review feedback.";
     },
   );
 }

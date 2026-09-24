@@ -1,4 +1,7 @@
-"""Bounded CI metadata shared by on-demand details and background log collection."""
+"""Bounded CI metadata shared by on-demand details and background log collection.
+
+The same bounded cache also serves on-demand review feedback for the PR overview.
+"""
 
 import copy
 import hashlib
@@ -51,6 +54,29 @@ query($id: ID!) {
   } }
 }
 """
+REVIEWS_QUERY = """
+query($id: ID!) {
+  node(id: $id) { ... on PullRequest {
+    updatedAt
+    reviews(last: 30) {
+      nodes { state body url submittedAt author { login } }
+    }
+    reviewThreads(last: 100) {
+      totalCount
+      nodes {
+        isResolved isOutdated path line originalLine
+        comments(first: 20) {
+          totalCount
+          nodes { body url createdAt author { login } }
+        }
+      }
+    }
+  } }
+}
+"""
+MAX_BODY = 4000
+# One cached review entry stays small however busy the PR: later text is left to GitHub.
+MAX_REVIEW_TEXT = 200_000
 
 
 def graphql(query, variables):
@@ -180,6 +206,68 @@ def collect_failure(check_id, sha):
     }
 
 
+def collect_reviews(pr):
+    """Submitted reviews with something to say, and every unresolved thread's comments."""
+    budget = MAX_REVIEW_TEXT
+
+    def body(text):
+        nonlocal budget
+        text = text or ""
+        if budget <= 0:
+            return "(Not shown here; open it on GitHub.)"
+        kept = text[: min(MAX_BODY, budget)]
+        budget -= len(kept)
+        return kept + ("…" if len(kept) < len(text) else "")
+
+    node = graphql(REVIEWS_QUERY, {"id": pr["id"]})
+    if not node:
+        raise ValueError("GitHub no longer returns this PR")
+    reviews = [
+        {
+            "state": review["state"],
+            "author": (review.get("author") or {}).get("login"),
+            "body": body(review.get("body")),
+            "url": review.get("url"),
+            "at": review.get("submittedAt"),
+        }
+        for review in (node.get("reviews") or {}).get("nodes") or []
+        # Inline-only reviews have an empty body; their comments appear in the threads.
+        if review and ((review.get("body") or "").strip() or review["state"] == "CHANGES_REQUESTED")
+    ]
+    connection = node.get("reviewThreads") or {"nodes": [], "totalCount": 0}
+    threads = []
+    for thread in connection["nodes"]:
+        if not thread or thread["isResolved"]:
+            continue
+        connection_comments = thread.get("comments") or {"nodes": [], "totalCount": 0}
+        comments = [
+            {
+                "author": (c.get("author") or {}).get("login"),
+                "body": body(c.get("body")),
+                "url": c.get("url"),
+                "at": c.get("createdAt"),
+            }
+            for c in connection_comments["nodes"]
+            if c
+        ]
+        threads.append(
+            {
+                "path": thread.get("path"),
+                "line": thread.get("line") or thread.get("originalLine"),
+                "outdated": bool(thread.get("isOutdated")),
+                "comments": comments,
+                "more_comments": max(0, connection_comments["totalCount"] - len(comments)),
+            }
+        )
+    return {
+        # The overview's timestamp, not GitHub's current one, decides when this is outdated.
+        "for_updated_at": pr.get("updated_at"),
+        "reviews": reviews[::-1],
+        "threads": threads,
+        "truncated": connection["totalCount"] > len(connection["nodes"]),
+    }
+
+
 class CiDetails:
     """One shared cache, two workers maximum; only explicit detail requests schedule work."""
 
@@ -201,14 +289,16 @@ class CiDetails:
             json.dumps([2, login, pr["id"], pr["head_sha"], check_id]).encode()
         ).hexdigest()
 
-    def snapshot(self, pr_id, check_id=None):
+    def snapshot(self, pr_id, check_id=None, reviews=False):
         overview = self.overview.snapshot()
         pr = next((p for p in overview["prs"] if p["id"] == pr_id), None)
         if not pr or not pr.get("head_sha"):
             raise ValueError("Unknown PR or missing head commit; refresh the PR overview")
-        key = self.key(overview.get("login"), pr, check_id)
+        key = self.key(overview.get("login"), pr, ":reviews" if reviews else check_id)
         with self.lock:
-            if check_id:
+            if reviews:
+                loader = partial(collect_reviews, copy.deepcopy(pr))
+            elif check_id:
                 parent = self.entries.get(self.key(overview.get("login"), pr), {}).get("value")
                 if not parent or not any(
                     c["id"] == check_id and c["has_details"] for c in parent["checks"]
@@ -222,7 +312,10 @@ class CiDetails:
             entry = self.entries.get(
                 key, {"value": None, "error": None, "synced_at": None, "expires_at": 0}
             )
-            expired = time.time() >= entry["expires_at"]
+            expired = time.time() >= entry["expires_at"] or (
+                # New activity moves updated_at: refetch now instead of waiting out the TTL.
+                reviews and (entry["value"] or {}).get("for_updated_at") != pr.get("updated_at")
+            )
             busy = False
             if expired and key not in self.workers:
                 if len(self.workers) >= MAX_WORKERS:

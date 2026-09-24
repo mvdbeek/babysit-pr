@@ -2632,3 +2632,108 @@ def test_handle_review_comments_for_authored_prs_with_feedback(
     expect(page.locator("#workspace-progress")).to_contain_text("running")
     assert requests[-1]["action"] == "handle" and requests[-1]["id"] == "pr-one"
     assert requests[-1]["task"].startswith("Address the review feedback")
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_review_feedback_badge_shows_comments_as_text(
+    page, dashboard_site, workspace_routes, width
+):
+    base = {"repo": "test/alpha", "ci": "SUCCESS", "draft": False, "author": "fixture"}
+    prs = [
+        {
+            **base,
+            "id": "pr-one",
+            "number": 8,
+            "title": "Mine",
+            "roles": ["author"],
+            "url": "https://github.com/test/alpha/pull/8",
+            "unresolved_threads": 1,
+            "review_decision": "CHANGES_REQUESTED",
+            "head_sha": "a" * 40,
+        },
+        {
+            **base,
+            "id": "pr-two",
+            "number": 9,
+            "title": "Theirs",
+            "roles": ["reviewer"],
+            "url": "https://github.com/test/alpha/pull/9",
+            "unresolved_threads": 1,
+            "head_sha": "b" * 40,
+        },
+    ]
+    feedback = {
+        "value": {
+            "reviews": [
+                {
+                    "state": "CHANGES_REQUESTED",
+                    "author": "rev",
+                    "body": "Needs a test",
+                    "url": "https://github.com/r/1",
+                    "at": "2026-09-24T10:00:00Z",
+                }
+            ],
+            "threads": [
+                {
+                    "path": "lib/a.py",
+                    "line": 12,
+                    "outdated": True,
+                    "more_comments": 2,
+                    "comments": [
+                        {
+                            "author": "rev",
+                            "url": "https://github.com/c/1",
+                            "at": "2026-09-24T10:00:00Z",
+                            "body": '<img src=x onerror="window.injected=true"> rename',
+                        }
+                    ],
+                }
+            ],
+            "truncated": False,
+        },
+        "synced_at": 1789146000,
+        "error": None,
+        "refreshing": False,
+    }
+    requested = []
+
+    def reviews(route):
+        requested.append(route.request.url)
+        route.fulfill(json=feedback)
+
+    page.route("**/api/prs", lambda route: route.fulfill(json={"prs": prs, "synced_at": 1234}))
+    page.route("**/api/pr-reviews*", reviews)
+    page.set_viewport_size({"width": width, "height": 900})
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    rows = page.locator("#pr-list tr")
+    expect(rows).to_have_count(2)
+    assert not requested  # Nothing is fetched until a badge is clicked.
+    badge = rows.filter(has_text="Mine").get_by_role(
+        "link", name="1 unresolved thread", exact=False
+    )
+    expect(badge).to_have_attribute("href", "https://github.com/test/alpha/pull/8/files")
+    badge.click()
+    dialog = page.locator("#ci-dialog")
+    expect(dialog.locator("#ci-title")).to_have_text("test/alpha #8 · Review feedback")
+    expect(dialog).to_contain_text("Needs a test")
+    expect(dialog).to_contain_text("lib/a.py:12")
+    expect(dialog).to_contain_text("Outdated")
+    expect(dialog).to_contain_text("2 more comment(s) on GitHub")
+    expect(dialog.locator(".review-body").last).to_have_text(
+        '<img src=x onerror="window.injected=true"> rename'
+    )
+    assert dialog.locator("img").count() == 0 and not page.evaluate("window.injected")
+    assert "id=pr-one" in requested[-1]
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/review-feedback-{width}.png")
+    dialog.get_by_role("button", name="Handle review comments").click()
+    task = page.locator("#workspace-dialog").get_by_role("textbox", name="Task", exact=True)
+    assert task.input_value().startswith("Address the review feedback on ")
+    page.locator("#workspace-dialog").get_by_role("button", name="Close").first.click()
+    # Reviewers can read the feedback but are not offered to handle it.
+    rows.filter(has_text="Theirs").get_by_role(
+        "link", name="1 unresolved thread", exact=False
+    ).click()
+    expect(dialog.locator("#ci-title")).to_have_text("test/alpha #9 · Review feedback")
+    expect(dialog.get_by_role("button", name="Handle review comments")).to_have_count(0)

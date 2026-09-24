@@ -428,6 +428,11 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 else:
                     self.send_json(200, self.server.ci_logs.snapshot(pr_id, check_id))
+            elif route.path == "/api/pr-reviews":
+                if not self.server.ci:
+                    raise ValueError("Review details are not enabled")
+                query = parse_qs(route.query)
+                self.send_json(200, self.server.ci.snapshot(query.get("id", [""])[0], reviews=True))
             elif route.path == "/api/pr-ci":
                 if not self.server.ci:
                     raise ValueError("CI details are not enabled")

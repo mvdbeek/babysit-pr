@@ -233,7 +233,9 @@ PRs with failing CI also offer **Handle failing tests** in the Actions column an
 CI details. Issues offer **Handle issue** through the same dialog. PRs you authored
 offer **Handle review comments** when a reviewer requested changes or review threads
 remain unresolved; the Review status column shows both, and the **Needs changes**
-filter lists them. Its task asks the agent to address the feedback without replying
+filter lists them. Clicking either badge opens the review summaries and every
+unresolved thread's comments, fetched on demand and cached like CI details until the
+PR next changes. Its task asks the agent to address the feedback without replying
 to or resolving threads on GitHub. Each Handle action prefills an
 editable task and reuses the agent, model, and reasoning-effort selectors. **Handle**
 starts a new workspace, including when a matching checkout already exists, so an

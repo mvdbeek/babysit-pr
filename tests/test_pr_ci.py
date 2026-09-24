@@ -306,3 +306,151 @@ def test_ci_http_protection_and_no_prefetch(cache, monkeypatch):
         finally:
             server.shutdown()
             thread.join()
+
+
+def comment(text, author="reviewer"):
+    return {
+        "body": text,
+        "url": f"https://github.com/c/{len(text)}",
+        "createdAt": "2026-09-24T10:00:00Z",
+        "author": {"login": author},
+    }
+
+
+def test_collect_reviews_keeps_only_feedback_and_unresolved_threads(monkeypatch):
+    node = {
+        "updatedAt": "2026-09-24T10:00:00Z",
+        "reviews": {
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "body": "",
+                    "url": "u1",
+                    "submittedAt": "t1",
+                    "author": None,
+                },
+                {
+                    "state": "CHANGES_REQUESTED",
+                    "body": "",
+                    "url": "u2",
+                    "submittedAt": "t2",
+                    "author": {"login": "a"},
+                },
+                {
+                    "state": "APPROVED",
+                    "body": "x" * 5000,
+                    "url": "u3",
+                    "submittedAt": "t3",
+                    "author": {"login": "b"},
+                },
+                None,
+            ]
+        },
+        "reviewThreads": {
+            "totalCount": 150,
+            "nodes": [
+                {
+                    "isResolved": True,
+                    "isOutdated": False,
+                    "path": "done.py",
+                    "line": 1,
+                    "comments": {"totalCount": 1, "nodes": [comment("resolved")]},
+                },
+                {
+                    "isResolved": False,
+                    "isOutdated": True,
+                    "path": "a.py",
+                    "line": None,
+                    "originalLine": 7,
+                    "comments": {"totalCount": 25, "nodes": [comment("please fix"), None]},
+                },
+            ],
+        },
+    }
+    calls = []
+    monkeypatch.setattr(ci, "graphql", lambda query, variables: calls.append(variables) or node)
+    value = ci.collect_reviews({"id": "pr1"})
+    assert calls == [{"id": "pr1"}]
+    # Newest first; an inline-only COMMENTED review has nothing of its own to show.
+    assert [r["url"] for r in value["reviews"]] == ["u3", "u2"]
+    assert value["reviews"][0]["body"] == "x" * ci.MAX_BODY + "…"
+    assert value["for_updated_at"] is None
+    assert value["reviews"][1]["author"] == "a"
+    [thread] = value["threads"]
+    assert (thread["path"], thread["line"], thread["outdated"]) == ("a.py", 7, True)
+    assert [c["body"] for c in thread["comments"]] == ["please fix"]
+    assert thread["more_comments"] == 24 and value["truncated"] is True
+    assert "mutation" not in ci.REVIEWS_QUERY
+
+
+def test_review_details_are_lazy_and_refetch_after_new_activity(cache, monkeypatch):
+    fetch = Mock(
+        side_effect=lambda pr: {"threads": [], "reviews": [], "for_updated_at": pr["updated_at"]}
+    )
+    monkeypatch.setattr(ci, "collect_reviews", fetch)
+    cache.overview.value["prs"][0]["updated_at"] = "2026-09-24T10:00:00Z"
+    assert cache.snapshot("pr1", reviews=True)["refreshing"]
+    wait(cache)
+    assert cache.snapshot("pr1", reviews=True)["value"]["threads"] == []
+    assert not cache.snapshot("pr1", reviews=True)["refreshing"] and fetch.call_count == 1
+    # CI details for the same PR are a separate cache entry.
+    monkeypatch.setattr(ci, "collect_checks", Mock(return_value={"checks": [], "sha": SHA}))
+    cache.snapshot("pr1")
+    wait(cache)
+    assert fetch.call_count == 1
+    entries = len(cache.entries)
+    # New activity refetches before the TTL, keeps showing the old feedback meanwhile,
+    # and replaces the PR's one review entry instead of adding another.
+    cache.overview.value["prs"][0]["updated_at"] = "2026-09-24T11:00:00Z"
+    stale = cache.snapshot("pr1", reviews=True)
+    assert stale["refreshing"] and stale["stale"] and stale["value"] is not None
+    wait(cache)
+    current = cache.snapshot("pr1", reviews=True)
+    assert current["value"]["for_updated_at"] == "2026-09-24T11:00:00Z"
+    assert not current["refreshing"] and fetch.call_count == 2
+    assert len(cache.entries) == entries
+
+
+def test_review_text_is_bounded_per_entry(monkeypatch):
+    thread = {
+        "isResolved": False,
+        "path": "a.py",
+        "line": 1,
+        "comments": {"totalCount": 20, "nodes": [comment("y" * 5000) for _ in range(20)]},
+    }
+    node = {"reviews": {"nodes": []}, "reviewThreads": {"totalCount": 100, "nodes": [thread] * 100}}
+    monkeypatch.setattr(ci, "graphql", lambda query, variables: node)
+    value = ci.collect_reviews({"id": "pr1", "updated_at": "t"})
+    bodies = [c["body"] for t in value["threads"] for c in t["comments"]]
+    assert len("".join(bodies)) < ci.MAX_REVIEW_TEXT + 60 * len(bodies)
+    assert bodies[-1] == "(Not shown here; open it on GitHub.)"
+    assert value["for_updated_at"] == "t"
+
+
+def test_review_http_route_is_protected(cache, monkeypatch):
+    fetch = Mock(return_value={"reviews": [], "threads": [], "truncated": False})
+    monkeypatch.setattr(ci, "collect_reviews", fetch)
+    with dashboard.DashboardServer(
+        cache.path.parent, 0, overview=cache.overview, ci=cache
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+
+            def request(path, headers=None):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                conn.request("GET", path, headers=headers or {})
+                response = conn.getresponse()
+                value = response.status, json.loads(response.read())
+                conn.close()
+                return value
+
+            assert request("/api/pr-reviews?id=pr1", {"Host": "evil.test"})[0] == 403
+            assert not fetch.called
+            assert request("/api/pr-reviews?id=pr1")[0] == 200
+            wait(cache)
+            assert request("/api/pr-reviews?id=pr1")[1]["value"]["threads"] == []
+            assert request("/api/pr-reviews?id=unknown")[0] == 400
+        finally:
+            server.shutdown()
+            thread.join()

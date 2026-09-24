@@ -1195,6 +1195,34 @@ button:disabled {
   max-height: 350px;
   overflow: auto;
 }
+.review-path {
+  display: block;
+  margin-bottom: 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.review-path + .badge {
+  margin-bottom: 6px;
+}
+.review-comment {
+  margin-top: 8px;
+  padding-left: 12px;
+  border-left: 3px solid var(--line);
+}
+.ci-item > .badge + small {
+  display: block;
+  margin-top: 6px;
+}
+.review-body {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow: auto;
+  font-size: 13px;
+  line-height: 1.5;
+}
 .ci-annotation small {
   display: block;
 }
