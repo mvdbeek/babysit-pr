@@ -273,8 +273,10 @@ existing checkout can be reopened without another agent. Previous operations sta
 in the database's `operation_history` table.
 
 Dashboard-created checkouts use `~/src/worktrees/<repo>/pr-<base-owner>-<number>`,
-with an unused numeric suffix for collisions. The adapter runs the repository's
-portable worktree helper, `scripts/wt.py` (see [Worktree helper](#worktree-helper)),
+with an unused numeric suffix for collisions. That name lets the Workspaces tab link
+the checkout back to its PR; herdr instead labels the workspace
+`pr-<repo>-<head-branch>` (plus the same suffix) so it is recognizable. The adapter
+runs the repository's portable worktree helper, `scripts/wt.py` (see [Worktree helper](#worktree-helper)),
 as `wtpr` directly with `WT_MULTIPLEXER=herdr` and selects the agent explicitly. No
 login shell wraps the helper: the user's interactive-shell Safehouse wrappers still
 apply because the helper types the agent command into the herdr pane's interactive
@@ -338,8 +340,8 @@ opens it in a multiplexer with the selected agent started in the left pane:
 wt [--codex|--claude] [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
-wti [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
-wtpr [opts] [--name n] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
+wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
+wtpr [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
 ```
 
 For branch worktrees, `wt` fetches the base from `origin` when that remote exists.

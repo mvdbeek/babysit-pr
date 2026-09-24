@@ -825,6 +825,10 @@ class Workspaces:
                     while os.path.lexists(base / name) or self.branch_exists(clone, name):
                         n += 1
                         name = f"{prefix}-{n}"
+                    # herdr shows the label; the branch keeps `pr-<owner>-<number>`,
+                    # which the Workspaces tab uses to link the checkout back to its PR.
+                    head = None if is_issue(pr) else pr.get("head_branch")
+                    label = ["--label", f"pr-{repo}-{head}{name[len(prefix) :]}"] if head else []
                     self.save_operation(
                         op,
                         common=main["common"],
@@ -848,6 +852,7 @@ class Workspaces:
                         "--no-focus",
                         "--name",
                         name,
+                        *label,
                         "--repo-path",
                         str(clone),
                         "--worktree-root",

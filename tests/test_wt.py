@@ -70,6 +70,8 @@ def test_parse_args_shared_options_and_positionals(tmp_path):
             "--no-focus",
             "--name",
             "pr-base-7",
+            "--label",
+            "pr-repo-feature",
             "--repo-path",
             "/clone",
             "--worktree-root",
@@ -81,6 +83,7 @@ def test_parse_args_shared_options_and_positionals(tmp_path):
     )
     assert parsed.agent == "codex" and parsed.model == "gpt-5" and parsed.effort == "high"
     assert parsed.focus is False and parsed.name == "pr-base-7"
+    assert parsed.label == "pr-repo-feature"
     assert parsed.repo_path == "/clone" and parsed.worktree_root == "/root"
     assert parsed.prompt == "Fix it" and parsed.positional == ["7"]
     assert parsed.repo == "galaxy" and parsed.repo_override is False
@@ -472,6 +475,17 @@ def test_resolve_command():
     assert wt.resolve_command("wt", ["wt", "base"]) == ("wt", ["base"])
     assert wt.resolve_command("wt.py", ["issue", "12"]) == ("wt", ["issue", "12"])
     assert wt.resolve_command("python", ["7"]) == ("wt", ["7"])
+
+
+def test_herdr_label_overrides_the_branch_name_and_is_sanitized():
+    reply = json.dumps({"result": {"already_open": False, "root_pane": {"pane_id": "w1:p1"}}})
+    runner = FakeRunner(
+        [(["herdr", "worktree", "open"], wt.Completed(0, reply, ""))], executables={"herdr"}
+    )
+    t = tool(runner, {"HOME": "/home/u", "WT_MULTIPLEXER": "herdr"})
+    t.open_session(options(label="pr-repo-fix/odd name"), "/wt/pr-base-7", "pr-base-7", "/clone")
+    opened = runner.calls[0][0]
+    assert opened[opened.index("--label") + 1] == "pr-repo-fix-odd-name"
 
 
 def test_herdr_session_plan_for_a_new_workspace():

@@ -278,7 +278,10 @@ def test_creation_selected_agent_task_quoting_no_focus_and_duplicate(local, agen
     assert data["agents"][0]["task"] == task + "\n\nPull request: " + pr["url"]
     assert not (Path(op["path"]) / "SHOULD_NOT_EXIST").exists()
     assert Path(op["path"]).name == "pr-base-7"
-    assert "--no-focus" in next(c for c in data["calls"] if c[:2] == ["worktree", "open"])
+    opened = next(c for c in data["calls"] if c[:2] == ["worktree", "open"])
+    assert "--no-focus" in opened
+    # herdr shows repository and head branch; the branch keeps the PR number for linking.
+    assert opened[opened.index("--label") + 1] == "pr-repo-feature"
     assert not any("--focus" in c or c[:2] == ["workspace", "focus"] for c in data["calls"])
     prompt = manager.home / "workspace-prompts" / op["id"]
     assert prompt.stat().st_mode & 0o777 == 0o600
@@ -286,7 +289,7 @@ def test_creation_selected_agent_task_quoting_no_focus_and_duplicate(local, agen
 
 
 def test_collision_allocates_suffix_and_never_reuses_directory(local):
-    manager, pr, _, _, _ = local
+    manager, pr, _, state, _ = local
     collision = manager.src / "worktrees/repo/pr-base-7"
     collision.mkdir(parents=True)
     (collision / "keep").write_text("unrelated")
@@ -295,6 +298,10 @@ def test_collision_allocates_suffix_and_never_reuses_directory(local):
     assert op["status"] == "complete", op
     assert Path(op["path"]).name == "pr-base-7-2"
     assert (collision / "keep").read_text() == "unrelated"
+    opened = next(
+        c for c in json.loads(state.read_text())["calls"] if c[:2] == ["worktree", "open"]
+    )
+    assert opened[opened.index("--label") + 1] == "pr-repo-feature-2"
 
 
 def test_clone_destination_conflicts_and_clone_create(local):

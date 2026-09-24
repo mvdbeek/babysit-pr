@@ -49,13 +49,14 @@ VALUE_OPTIONS = {
     "--model": "model",
     "--effort": "effort",
     "--name": "name",
+    "--label": "label",
     "--repo-path": "repo_path",
     "--worktree-root": "worktree_root",
 }
 WT_OPTIONS = frozenset(
     {"--codex", "--claude", "--model", "--effort", "-r", "-p", "--prompt", "-F", "--prompt-file"}
 )
-DASHBOARD_OPTIONS = frozenset({"--no-focus", "--name", "--repo-path", "--worktree-root"})
+DASHBOARD_OPTIONS = frozenset({"--no-focus", "--name", "--label", "--repo-path", "--worktree-root"})
 OPTIONS = {
     "wt": WT_OPTIONS,
     "wti": WT_OPTIONS | DASHBOARD_OPTIONS,
@@ -118,6 +119,7 @@ options:
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --name <name>           reserve a new worktree and branch with this explicit name
+  --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
   --worktree-root <path>  parent directory for the new checkout
@@ -141,6 +143,7 @@ options:
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --name <name>           reserve a new worktree and branch with this explicit name
+  --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
   --worktree-root <path>  parent directory for the new checkout
@@ -179,6 +182,7 @@ class Options:
         "model",
         "effort",
         "name",
+        "label",
         "repo_path",
         "worktree_root",
         "focus",
@@ -193,6 +197,7 @@ class Options:
         self.model = ""
         self.effort = ""
         self.name = ""
+        self.label = ""
         self.repo_path = ""
         self.worktree_root = ""
         self.focus = True
@@ -738,7 +743,7 @@ class Tool:
         # idempotent and reports already_open.
         focus = "--focus" if options.focus else "--no-focus"
         argv = ["herdr", "worktree", "open", "--cwd", repo_path, "--path", directory]
-        argv += ["--label", sanitize_session_name(name), focus]
+        argv += ["--label", sanitize_session_name(options.label or name), focus]
         result = self.runner.run(argv)
         if result.returncode:
             detail = herdr_error_message(result.stdout + result.stderr)
