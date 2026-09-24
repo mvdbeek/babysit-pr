@@ -707,7 +707,7 @@ class Tool:
         )
 
     def open_session(self, options: Options, directory: str, name: str, repo_path: str) -> None:
-        """Left pane runs the agent, right pane is a spare terminal.
+        """Left pane runs the agent, right pane is a spare terminal (herdr: the agent only).
 
         The prompt only applies to a session being created; an existing one already
         has an agent in it, so reattaching warns and ignores the prompt.
@@ -754,10 +754,8 @@ class Tool:
         if not reply.root_pane:
             raise WtError(f"wt: herdr did not return a root pane for {directory}")
         command = self.command_for(options)
-        split = ["pane", "split", reply.root_pane, "--direction", "right", "--cwd", directory]
-        result = self.runner.run(["herdr", *split, "--no-focus"])
-        if result.returncode:
-            raise WtError(f"wt: herdr pane split failed: {result.stderr.strip()}".rstrip(": "))
+        # No spare terminal split here: the reviewr plugin already splits a pane into
+        # every new worktree workspace, so a second one would sit empty.
         # pane run submits text + Enter; the pty buffers it until the new shell reads it.
         result = self.runner.run(["herdr", "pane", "run", reply.root_pane, command])
         if result.returncode:

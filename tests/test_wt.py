@@ -513,17 +513,6 @@ def test_herdr_session_plan_for_a_new_workspace():
         [
             "herdr",
             "pane",
-            "split",
-            "w1:p1",
-            "--direction",
-            "right",
-            "--cwd",
-            "/wt/pr-base-7",
-            "--no-focus",
-        ],
-        [
-            "herdr",
-            "pane",
             "run",
             "w1:p1",
             'codex --model gpt-5 -c \'model_reasoning_effort="high"\' "$(cat /tmp/wt-prompt.fixture)"',
@@ -568,18 +557,6 @@ def test_herdr_session_failures():
         executables={"herdr"},
     )
     with pytest.raises(wt.WtError, match="did not return a root pane for /wt/x"):
-        tool(runner, {"WT_MULTIPLEXER": "herdr"}).open_session(options(), "/wt/x", "x", "/clone")
-    runner = FakeRunner(
-        [
-            (
-                ["herdr", "worktree", "open"],
-                wt.Completed(0, '{"result":{"root_pane":{"pane_id":"p"}}}', ""),
-            ),
-            (["herdr", "pane", "split"], wt.Completed(1, "", "split denied")),
-        ],
-        executables={"herdr"},
-    )
-    with pytest.raises(wt.WtError, match="pane split failed: split denied"):
         tool(runner, {"WT_MULTIPLEXER": "herdr"}).open_session(options(), "/wt/x", "x", "/clone")
     runner = FakeRunner(
         [
