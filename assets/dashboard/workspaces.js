@@ -83,7 +83,7 @@
     return cell;
   }
   function localCell(row) {
-    const cell = node("td");
+    const cell = node("td", undefined, "ws-local");
     if (row.missing) {
       cell.append(node("span", "Checkout no longer exists"));
       return cell;

@@ -56,6 +56,25 @@
   display: block;
   color: var(--muted);
 }
+/* Once the table has room, break local state and actions only between words, never
+   inside a SHA or label; narrower screens keep breaking anywhere to avoid side-scrolling. */
+@media (min-width: 1280px) {
+  .ws-table .ws-local {
+    overflow-wrap: normal;
+  }
+  .ws-table .ws-local small,
+  .ws-table .ws-agent,
+  .ws-table .pr-actions button {
+    white-space: nowrap;
+  }
+}
+#ws-notices .alert {
+  padding: 8px 14px;
+  margin-bottom: 8px;
+}
+#ws-notices:not(:empty) {
+  margin-bottom: 12px;
+}
 .ws-agent {
   font-size: 13px;
 }

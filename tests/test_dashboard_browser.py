@@ -687,6 +687,35 @@ def test_page_tabs_scroll_without_wrapping(page: Page, dashboard_site, width: in
     assert tabs.evaluate("el => el.scrollLeft === 0")
 
 
+@pytest.mark.parametrize("width,content", [(1440, 1296), (2560, 2000), (3840, 2000)])
+def test_large_screens_widen_content_and_grow_tables(page, dashboard_site, width, content):
+    url, _ = dashboard_site
+    prs = [
+        {
+            "id": f"pr-{n}",
+            "repo": "test/repo",
+            "title": f"Change {n}",
+            "number": n,
+            "url": f"https://github.com/test/repo/pull/{n}",
+            "roles": ["author"],
+            "ci": "SUCCESS",
+        }
+        for n in range(1, 41)
+    ]
+    page.route("**/api/prs", lambda route: route.fulfill(json={"prs": prs, "synced_at": 1234}))
+    page.set_viewport_size({"width": width, "height": 1400})
+    page.goto(url + "/#prs")
+    expect(page.locator("#pr-list tr")).to_have_count(40)
+    box = page.locator("#prs-panel").bounding_box()
+    assert box and abs(box["width"] - content) <= 1
+    # The header and the page body share one content column.
+    brand = page.locator(".brand").bounding_box()
+    assert brand and abs(brand["x"] - box["x"]) <= 1
+    wrap = page.locator("#prs-panel .pr-table-wrap").bounding_box()
+    assert wrap and wrap["height"] >= 1400 - 96 - 1
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
 @pytest.mark.parametrize(
     "width,motion", [(390, "reduce"), (390, "no-preference"), (1280, "reduce")]
 )

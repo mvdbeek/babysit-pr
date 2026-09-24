@@ -9,6 +9,7 @@
   --red: #ae4941;
   --amber: #966927;
   --blue: #386d9f;
+  --page-width: 2000px;
   font-family:
     Inter,
     ui-sans-serif,
@@ -50,7 +51,8 @@ summary:focus-visible {
   outline-offset: 3px;
 }
 header {
-  padding: 12px 5%;
+  /* Header and main share one content column: 5% gutters, capped at --page-width. */
+  padding: 12px max(5%, calc((100% - var(--page-width)) / 2));
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -233,9 +235,7 @@ small {
   font-size: 11px;
 }
 main {
-  max-width: 1600px;
-  padding: 30px 5%;
-  margin: auto;
+  padding: 30px max(5%, calc((100% - var(--page-width)) / 2));
 }
 .metrics {
   display: grid;
@@ -609,12 +609,6 @@ footer {
 [hidden] {
   display: none !important;
 }
-@media (min-width: 1400px) {
-  header {
-    padding-left: max(5%, calc((100% - 1440px) / 2));
-    padding-right: max(5%, calc((100% - 1440px) / 2));
-  }
-}
 @media (max-width: 900px) {
   .workspace {
     grid-template-columns: 1fr;
@@ -644,7 +638,7 @@ footer {
 }
 @media (max-width: 540px) {
   header {
-    padding: 8px 5%;
+    padding-block: 8px;
     gap: 8px;
   }
   header p {
@@ -786,7 +780,8 @@ button:disabled {
   font-size: 12px;
 }
 .pr-table-wrap {
-  max-height: 560px;
+  /* Tall screens show more rows; the sticky header stays inside this scroller. */
+  max-height: max(560px, calc(100vh - 96px));
   overflow: auto;
   background: var(--paper);
   border: 1px solid var(--line);
