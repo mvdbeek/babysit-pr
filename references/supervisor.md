@@ -201,6 +201,10 @@ for branch/SHA filters and run metadata.
 For Codex, registration records the rollout's latest model and sandbox mode. Repairs use
 noninteractive approval policy `never`; permission failures become blockers.
 Workspace-write adds the linked worktree's git common directory for commits.
+A launcher that runs through Agent Safehouse always gets `danger-full-access`:
+Seatbelt profiles cannot nest, so Codex's own sandbox fails every command with
+`sandbox_apply: Operation not permitted`, and Safehouse already contains the
+process, just as the user's `safe codex` shell function does.
 Start the watcher under the same authorized external sandbox as the original
 session. For a verified existing launcher, use a JSON argv prefix:
 

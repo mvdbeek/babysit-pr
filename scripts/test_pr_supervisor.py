@@ -599,3 +599,19 @@ def test_global_limit_queues_second_repair(harness, tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+def test_safehouse_codex_repairs_skip_nested_codex_sandbox(tmp_path):
+    safehouse = {
+        "session_id": "sid",
+        "cwd": str(tmp_path),
+        "sandbox": "workspace-write",
+        "codex_command": ["/home/u/.local/bin/safehouse", "--enable=x", "codex"],
+    }
+    argv = supervisor.command_for(safehouse, tmp_path)
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+    assert "--add-dir" not in argv
+    assert argv[-3:] == ["resume", "sid", "-"]
+    plain = {**safehouse, "sandbox": "read-only", "codex_command": ["/usr/bin/codex"]}
+    argv = supervisor.command_for(plain, tmp_path)
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
