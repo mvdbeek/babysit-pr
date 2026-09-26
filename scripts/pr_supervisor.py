@@ -29,6 +29,10 @@ import sentry_llm
 SCRIPT = Path(__file__).resolve()
 SKILL = SCRIPT.parent.parent
 TERMINAL = {"stopped", "closed", "blocked"}
+# Idle watches are not polled for CI, so their PR is checked separately: a merge or
+# close must end them without anyone cancelling by hand.
+IDLE = {"blocked", "paused", "awaiting_release"}
+LIFECYCLE_SECONDS = 600
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -352,6 +356,43 @@ def actionable(job):
     if pr["closed"] or pr["merged"]:
         return False
     return bool(approved_feedback(job) or set(wake_keys(job)) - set(job["handled"]))
+
+
+def lifecycle_due(jobs, checking, next_check, now):
+    """Idle PR watches whose merge/close state is due for a check."""
+    return [
+        job
+        for job in jobs
+        if job["status"] in IDLE
+        and not job.get("branch")
+        and job["id"] not in checking
+        and now >= next_check.get(job["id"], 0)
+    ]
+
+
+def close_if_ended(db, key, subject):
+    """Close an idle watch whose PR merged or closed; active watches decide for themselves."""
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        job = get_job(db, key)
+        if (
+            job["status"] not in IDLE
+            or job.get("branch")
+            or not (subject.get("merged") or subject.get("closed"))
+        ):
+            return job
+        job["epoch"] += 1
+        job["dispatch_ready"] = False
+        job.update(
+            status="closed",
+            summary="PR merged; ready for cleanup"
+            if subject.get("merged")
+            else "PR closed; ready for cleanup",
+            cleanup_ready=True,
+            approved_reviews=[],
+        )
+        save_job(db, job)
+    return job
 
 
 def stop_watch(db, key):
@@ -761,6 +802,8 @@ def serve(home, max_workers):
         # The opt-in Sentry experiment's LLM queue runs here, in the user's session.
         sentry_worker = sentry_llm.Worker(home)
         sentry_error: str | None = None
+        checking: dict[str, concurrent.futures.Future] = {}
+        next_check: dict[str, float] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             while True:
                 for key, (future, epoch) in list(polling.items()):
@@ -786,6 +829,20 @@ def serve(home, max_workers):
                                 job["status"] = "blocked"
                         save_job(db, job)
                         emit({"id": key, "status": job["status"], "summary": job["summary"]})
+                for key, future in list(checking.items()):
+                    if not future.done():
+                        continue
+                    del checking[key]
+                    try:
+                        job = close_if_ended(db, key, future.result())
+                    except Exception:
+                        continue  # Transient GitHub errors: the next interval retries.
+                    if job["status"] == "closed":
+                        emit({"id": key, "status": "closed", "summary": job["summary"]})
+                now = time.time()
+                for job in lifecycle_due(jobs(db), checking, next_check, now):
+                    next_check[job["id"]] = now + LIFECYCLE_SECONDS
+                    checking[job["id"]] = pool.submit(current_subject, copy.deepcopy(job))
                 for job in jobs(db):
                     if job["status"] != "running":
                         continue

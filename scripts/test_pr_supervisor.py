@@ -123,6 +123,51 @@ def test_closed_pr_never_dispatches_and_empty_checks_not_green():
     assert "green" not in supervisor.ingest(job(), s, {})["summary"]
 
 
+@pytest.mark.parametrize("status", ["blocked", "paused", "awaiting_release"])
+def test_idle_watch_closes_when_its_pr_merges_or_closes(tmp_path, status):
+    db = supervisor.open_db(tmp_path)
+    with db:
+        supervisor.save_job(db, {**job(), "status": status, "epoch": 3, "approved_reviews": ["t"]})
+    open_pr = {"merged": False, "closed": False}
+    assert supervisor.close_if_ended(db, "job", open_pr)["status"] == status
+    closed = supervisor.close_if_ended(db, "job", {"merged": True, "closed": True})
+    assert closed["status"] == "closed" and closed["summary"] == "PR merged; ready for cleanup"
+    assert closed["cleanup_ready"] and closed["epoch"] == 4 and closed["approved_reviews"] == []
+    assert supervisor.get_job(db, "job")["status"] == "closed"
+    db.close()
+
+
+@pytest.mark.parametrize("status", ["watching", "running", "handoff", "stopped", "closed"])
+def test_lifecycle_check_leaves_active_and_ended_watches_alone(tmp_path, status):
+    db = supervisor.open_db(tmp_path)
+    with db:
+        supervisor.save_job(db, {**job(), "status": status, "epoch": 0})
+        supervisor.save_job(
+            db, {**job(), "id": "branch", "status": "blocked", "branch": "dev", "epoch": 0}
+        )
+    ended = {"merged": False, "closed": True}
+    assert supervisor.close_if_ended(db, "job", ended)["status"] == status
+    assert supervisor.close_if_ended(db, "branch", ended)["status"] == "blocked"
+    db.close()
+
+
+def test_lifecycle_due_selects_idle_pr_watches_once_per_interval():
+    watches = [
+        {**job(), "id": "a", "status": "blocked"},
+        {**job(), "id": "b", "status": "watching"},
+        {**job(), "id": "c", "status": "paused", "branch": "dev"},
+        {**job(), "id": "d", "status": "awaiting_release"},
+        {**job(), "id": "e", "status": "paused"},
+    ]
+    due = supervisor.lifecycle_due(watches, {"d": object()}, {"e": 200.0}, 100.0)
+    assert [w["id"] for w in due] == ["a"]
+    assert [w["id"] for w in supervisor.lifecycle_due(watches, {}, {"e": 200.0}, 300.0)] == [
+        "a",
+        "d",
+        "e",
+    ]
+
+
 @pytest.mark.parametrize("code", [1, 8])
 def test_failed_or_pending_checks_payload_is_not_a_transport_error(monkeypatch, code):
     monkeypatch.setattr(

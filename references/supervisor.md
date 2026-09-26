@@ -281,7 +281,10 @@ Do not use an agent to click its own approval button.
 
 Merge/closure comes from structured GitHub PR fields. It marks the watch closed
 and **Ready for cleanup**, without fetching comments or CI and without launching
-an agent. Dashboard **Needs attention** includes these ended watches. This means
+an agent. Watches that are not polled for CI (blocked, paused, or awaiting release) have
+their PR state checked every 10 minutes, and on restart. A merge or close ends them the
+same way; running and actively watched PRs are left to their own observation. Dashboard
+**Needs attention** includes these ended watches. This means
 PR monitoring is finished, not that local files have been checked for safe removal.
 No session, pane, branch, worktree, or historical watch is automatically deleted.
 Branch-only watches have no PR closure event; register a PR watch when appropriate.
