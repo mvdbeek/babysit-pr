@@ -1771,7 +1771,9 @@ function setWorkspaceOperation(item, operation) {
   if (info) info.operation = operation;
 }
 async function refreshWorkspaces() {
-  if (workspaceBusy || document.hidden || (!overviewVisible() && $("watcher-panel").hidden)) return;
+  // An open workspace dialog follows its operation from any tab (Sentry opens it too).
+  const visible = overviewVisible() || !$("watcher-panel").hidden || $("workspace-dialog").open;
+  if (workspaceBusy || document.hidden || !visible) return;
   workspaceBusy = true;
   try {
     workspaceData = await get("/api/workspaces");

@@ -601,9 +601,10 @@ def test_an_existing_issue_is_linked_instead_of_created(page, site, errors):
 def test_handle_opens_the_workspace_dialog_with_a_prefilled_task(page, site, errors):
     url, _ = site
     submitted = []
-    page.route(
-        "**/api/workspaces",
-        lambda route: route.fulfill(
+    operation = {"value": None}
+
+    def workspaces(route):
+        route.fulfill(
             json={
                 "prs": {},
                 "issues": {},
@@ -615,7 +616,7 @@ def test_handle_opens_the_workspace_dialog_with_a_prefilled_task(page, site, err
                         "clones": ["/src/galaxy"],
                         "preferred_clone": "/src/galaxy",
                         "destination": None,
-                        "operation": None,
+                        "operation": operation["value"],
                     }
                 },
                 "agent_choices": {
@@ -626,8 +627,9 @@ def test_handle_opens_the_workspace_dialog_with_a_prefilled_task(page, site, err
                 "refreshing": False,
                 "synced_at": 1,
             }
-        ),
-    )
+        )
+
+    page.route("**/api/workspaces", workspaces)
 
     def action(route):
         submitted.append(route.request.post_data_json)
@@ -650,6 +652,19 @@ def test_handle_opens_the_workspace_dialog_with_a_prefilled_task(page, site, err
     )
     dialog.get_by_role("button", name="Handle").click()
     expect(page.locator("#workspace-progress")).to_have_text("queued: Queued")
+    # The dialog keeps polling from the Sentry tab until the operation finishes.
+    operation["value"] = {
+        "status": "complete",
+        "message": "Workspace ready — Open in Collie",
+        "result": {"url": "https://collie.tailfb45be.ts.net/space/w1"},
+        "log": "started",
+    }
+    expect(page.locator("#workspace-progress")).to_have_text(
+        "complete: Workspace ready — Open in Collie", timeout=10000
+    )
+    expect(dialog.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://collie.tailfb45be.ts.net/space/w1"
+    )
     assert submitted[0]["id"] == "sentry:a1"
     assert submitted[0]["action"] == "handle"
     assert submitted[0]["clone"] == "/src/galaxy"
