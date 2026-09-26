@@ -52,13 +52,16 @@ VALUE_OPTIONS = {
     "--label": "label",
     "--repo-path": "repo_path",
     "--worktree-root": "worktree_root",
+    "--agent-arg": "agent_args",
 }
 WT_OPTIONS = frozenset(
     {"--codex", "--claude", "--model", "--effort", "-r", "-p", "--prompt", "-F", "--prompt-file"}
 )
-DASHBOARD_OPTIONS = frozenset({"--no-focus", "--name", "--label", "--repo-path", "--worktree-root"})
+DASHBOARD_OPTIONS = frozenset(
+    {"--no-focus", "--name", "--label", "--repo-path", "--worktree-root", "--agent-arg"}
+)
 OPTIONS = {
-    "wt": WT_OPTIONS,
+    "wt": WT_OPTIONS | DASHBOARD_OPTIONS,
     "wti": WT_OPTIONS | DASHBOARD_OPTIONS,
     "wtpr": WT_OPTIONS | DASHBOARD_OPTIONS,
 }
@@ -89,6 +92,11 @@ options:
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   -h, --help    show this help
+
+dashboard options (a new branch from the remote default branch unless <base> is given):
+  wt --name <branch> [--repo-path <clone>] [--worktree-root <dir>] [--label <label>]
+     [--no-focus] [--agent-arg <word>]... [<base>]
+  --agent-arg <word>      append one word to the agent command line (repeatable)
 
 The prompt only applies to a session being created; if one is already running for
 the worktree it is reattached and the prompt is ignored (with a warning).
@@ -186,6 +194,7 @@ class Options:
         "repo_path",
         "worktree_root",
         "focus",
+        "agent_args",
         "positional",
     )
 
@@ -201,6 +210,7 @@ class Options:
         self.repo_path = ""
         self.worktree_root = ""
         self.focus = True
+        self.agent_args: list[str] = []
         self.positional: list[str] = []
 
 
@@ -247,6 +257,10 @@ def parse_args(
             elif field == "repo":
                 options.repo = value
                 options.repo_override = True
+            elif field == "agent_args":
+                if any(ord(char) < 32 or char == "\x7f" for char in value):
+                    raise WtError(f"{command}: --agent-arg must not contain control characters")
+                options.agent_args.append(value)
             else:
                 setattr(options, field, value)
             args.pop(0)
@@ -327,7 +341,7 @@ def sanitize_session_name(name: str) -> str:
     return UNSAFE.sub("-", name)
 
 
-def agent_words(agent: str, model: str, effort: str) -> list[str]:
+def agent_words(agent: str, model: str, effort: str, extra: Sequence[str] = ()) -> list[str]:
     words = [agent]
     if model:
         words += ["--model", model]
@@ -336,7 +350,7 @@ def agent_words(agent: str, model: str, effort: str) -> list[str]:
             words += ["-c", f'model_reasoning_effort="{effort}"']
         else:
             words += ["--effort", effort]
-    return words
+    return [*words, *extra]
 
 
 def stage_prompt(prompt: str, tmpdir: str | None = None) -> str:
@@ -365,6 +379,7 @@ def agent_command(
     model: str = "",
     effort: str = "",
     stage: Callable[[str], str] = stage_prompt,
+    extra: Sequence[str] = (),
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -379,10 +394,13 @@ def agent_command(
     command-substitution output is not re-scanned, so the content needs no escaping.
     Only the *path* is shell-quoted.
     """
-    command = " ".join(shlex.quote(word) for word in agent_words(agent, model, effort))
+    command = " ".join(shlex.quote(word) for word in agent_words(agent, model, effort, extra))
     if not prompt:
         return command
-    return f'{command} "$(cat {shlex.quote(stage(prompt))})"'
+    # Extra words may end in a variadic option (Claude's --mcp-config <configs...>) that
+    # would swallow the prompt; `--` ends option parsing before it.
+    separator = " --" if extra else ""
+    return f'{command}{separator} "$(cat {shlex.quote(stage(prompt))})"'
 
 
 def read_config(path: str) -> dict[str, str]:
@@ -708,7 +726,12 @@ class Tool:
 
     def command_for(self, options: Options) -> str:
         return agent_command(
-            options.agent, options.prompt, options.model, options.effort, self.stage
+            options.agent,
+            options.prompt,
+            options.model,
+            options.effort,
+            self.stage,
+            options.agent_args,
         )
 
     def open_session(self, options: Options, directory: str, name: str, repo_path: str) -> None:
@@ -851,6 +874,9 @@ class Tool:
     def run_wt(self, options: Options) -> None:
         validate_agent_options(options.agent, options.model, options.effort)
         args = options.positional
+        if options.name:
+            self.reserve_wt(options)
+            return
         if not args:
             raise UsageError("wt", "wt: expected a branch, PR number or 'issue'")
         if args[0] in ("issue", "i"):
@@ -863,8 +889,9 @@ class Tool:
             return
         base = args[0]
         branch = args[1] if len(args) > 1 else base
-        repo_path = os.path.join(self.home, "src", options.repo)
-        directory = os.path.join(self.home, "src", "worktrees", options.repo, branch)
+        repo_path = options.repo_path or os.path.join(self.home, "src", options.repo)
+        root = options.worktree_root or os.path.join(self.home, "src", "worktrees", options.repo)
+        directory = os.path.join(root, branch)
         if not os.path.isdir(directory):
             # Git refuses to check a branch out twice, and a second checkout would be
             # the wrong thing anyway: work where the branch already lives. That covers
@@ -875,6 +902,31 @@ class Tool:
                 directory = existing
             else:
                 self.add_worktree(repo_path, directory, branch, base)
+        self.open_session(options, directory, branch, repo_path)
+
+    def reserve_wt(self, options: Options) -> None:
+        """``wt --name``: a new branch and worktree for the dashboard, never a reused one."""
+        args = options.positional
+        if len(args) > 1:
+            raise UsageError("wt", "wt: --name takes at most one base branch")
+        validate_name(options.name, "wt")
+        repo_path = options.repo_path or os.path.join(self.home, "src", options.repo)
+        root = options.worktree_root or os.path.join(self.home, "src", "worktrees", options.repo)
+        if not os.path.isdir(os.path.join(repo_path, ".git")):
+            raise WtError(f"wt: no main clone at {repo_path} (needed to attach a worktree)")
+        branch = options.name
+        directory = os.path.join(root, branch)
+        if os.path.lexists(directory):
+            raise WtError(f"wt: explicit worktree destination already exists: {directory}")
+        if self.branch_exists(repo_path, branch):
+            raise WtError(f"wt: explicit branch already exists: {branch}")
+        base = args[0] if args else ""
+        if not base:
+            head = self.git_query(
+                repo_path, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"
+            )
+            base = head.stdout.strip().removeprefix("origin/") if not head.returncode else "main"
+        self.add_worktree(repo_path, directory, branch, base)
         self.open_session(options, directory, branch, repo_path)
 
     def run_wti(self, options: Options) -> None:

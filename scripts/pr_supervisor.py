@@ -24,6 +24,7 @@ from typing import Any
 import gh_pr_watch as watch
 import github_cli
 import owned_process
+import sentry_llm
 
 SCRIPT = Path(__file__).resolve()
 SKILL = SCRIPT.parent.parent
@@ -757,6 +758,9 @@ def serve(home, max_workers):
             {"pid": os.getpid(), "started_at": time.time(), "max_workers": max_workers},
         )
         polling: dict[str, tuple[concurrent.futures.Future, int]] = {}
+        # The opt-in Sentry experiment's LLM queue runs here, in the user's session.
+        sentry_worker = sentry_llm.Worker(home)
+        sentry_error: str | None = None
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             while True:
                 for key, (future, epoch) in list(polling.items()):
@@ -837,6 +841,13 @@ def serve(home, max_workers):
                             running.append(job)
                             busy_cwds.add(job["cwd"])
                             busy_sessions.add(job["session_id"])
+                try:
+                    sentry_worker.tick()
+                    sentry_error = None
+                except Exception as exc:  # An experiment must never stop the supervisor.
+                    if str(exc) != sentry_error:
+                        sentry_error = str(exc)
+                        print(f"Sentry experiment worker failed: {exc}", flush=True)
                 watch.save_state(home / "heartbeat.json", {"time": time.time(), "pid": os.getpid()})
                 time.sleep(1)
 

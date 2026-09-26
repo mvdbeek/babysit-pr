@@ -1609,7 +1609,7 @@ async function refresh() {
     busy = false;
   }
 }
-const pages = ["watcher", "prs", "issues", "workspaces", "upstream"];
+const pages = ["watcher", "prs", "issues", "workspaces", "upstream", "sentry"];
 function showPage(name) {
   for (const page of pages) {
     const active = page === name;
@@ -1622,6 +1622,7 @@ function showPage(name) {
   if (name === "issues") issueTable.render();
   if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));
   if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
+  if (name === "sentry") window.dispatchEvent(new Event("sentry-visible"));
 }
 function overviewVisible() {
   return !$("prs-panel").hidden || !$("issues-panel").hidden;
@@ -1761,7 +1762,8 @@ function workspaceInfo(item) {
   return (
     workspaceData.prs?.[item.id] ??
     workspaceData.issues?.[item.id] ??
-    workspaceData.watches?.[item.id]
+    workspaceData.watches?.[item.id] ??
+    workspaceData.sentry?.[item.id]
   );
 }
 function setWorkspaceOperation(item, operation) {
@@ -1909,7 +1911,9 @@ async function workspaceDialog(item, handling = "") {
   $("workspace-title").textContent =
     item.kind === "watch"
       ? `${item.repo} · ${item.branch || "Watched PR"}`
-      : `${item.repo} #${item.number}`;
+      : item.kind === "sentry"
+        ? `${item.repo} · ${item.short_id}`
+        : `${item.repo} #${item.number}`;
   $("workspace-error").textContent = "";
   $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
   $("workspace-result").replaceChildren();

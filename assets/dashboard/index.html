@@ -19,6 +19,8 @@
     <link rel="stylesheet" href="/upstream-tests.css" />
     <script src="/workspaces.js" defer></script>
     <link rel="stylesheet" href="/workspaces.css" />
+    <script src="/sentry.js" defer></script>
+    <link rel="stylesheet" href="/sentry.css" />
   </head>
   <body>
     <header>
@@ -128,6 +130,17 @@
           hidden
         >
           Upstream tests <span class="count">Experiment</span>
+        </button>
+        <button
+          id="sentry-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="sentry-panel"
+          tabindex="-1"
+          hidden
+        >
+          Sentry <span class="count">Experiment</span>
         </button>
       </div>
       <section
@@ -276,6 +289,99 @@
         <div id="upstream-history"></div>
         <div id="upstream-notices" role="status"></div>
         <div id="upstream-results"></div>
+      </section>
+      <section
+        id="sentry-panel"
+        class="pr-overview"
+        role="tabpanel"
+        aria-labelledby="sentry-tab"
+        tabindex="0"
+        hidden
+      >
+        <div class="toolbar">
+          <h2>Sentry issues <span id="sentry-count" class="count">0</span></h2>
+          <div class="filters">
+            <input
+              id="sentry-search"
+              type="search"
+              placeholder="Find an issue, culprit or server…"
+              aria-label="Search Sentry issues"
+            />
+            <button
+              id="sentry-refresh"
+              class="refresh-icon"
+              type="button"
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="pr-filters">
+          <label for="sentry-repo"
+            >Repository or server
+            <select id="sentry-repo" aria-label="Filter Sentry issues by repository">
+              <option value="all">All repositories</option>
+            </select>
+          </label>
+          <label for="sentry-severity"
+            >Severity
+            <select id="sentry-severity" aria-label="Filter Sentry issues by severity">
+              <option value="all">All severities</option>
+              <option value="critical">Critical</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+          </label>
+          <label for="sentry-state"
+            >Status
+            <select id="sentry-state" aria-label="Filter Sentry issues by status">
+              <option value="all">All statuses</option>
+              <option value="new">New</option>
+              <option value="regressed">Regressed</option>
+              <option value="escalating">Escalating</option>
+              <option value="ongoing">Ongoing</option>
+            </select>
+          </label>
+        </div>
+        <p id="sentry-status" class="pr-sync" role="status">Loading Sentry issues…</p>
+        <p id="sentry-llm" class="pr-sync" hidden></p>
+        <div id="sentry-notices" role="status"></div>
+        <div class="pr-table-wrap">
+          <table class="pr-table sentry-table">
+            <thead>
+              <tr>
+                <th scope="col">Severity</th>
+                <th scope="col">Issue</th>
+                <th scope="col">Servers</th>
+                <th scope="col">Impact</th>
+                <th scope="col">Seen</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="sentry-list"></tbody>
+          </table>
+          <p id="sentry-more" class="pr-more" hidden>
+            <button id="sentry-more-button" type="button">Show 50 more</button>
+          </p>
+          <p id="sentry-empty" class="pr-empty" hidden></p>
+        </div>
       </section>
       <section id="watcher-panel" role="tabpanel" aria-labelledby="watcher-tab" tabindex="0">
         <div id="alert" class="alert" role="status" hidden></div>
@@ -733,6 +839,41 @@
       <div class="ws-dialog-actions">
         <button id="ws-cancel" type="button">Cancel</button>
         <button id="ws-confirm" type="button">Clean up</button>
+      </div>
+    </dialog>
+    <dialog id="sentry-publish-dialog" aria-labelledby="sentry-publish-heading">
+      <button id="sentry-publish-close" type="button" aria-label="Close GitHub issue draft">
+        Close
+      </button>
+      <h2 id="sentry-publish-heading">Publish to GitHub</h2>
+      <p id="sentry-publish-meta"></p>
+      <p id="sentry-publish-status" role="status"></p>
+      <p id="sentry-publish-public" class="alert" hidden>
+        This repository is public. Everything in the issue will be visible to anyone.
+      </p>
+      <p id="sentry-publish-existing" hidden></p>
+      <p id="sentry-publish-findings" class="alert" role="alert" hidden></p>
+      <details id="sentry-publish-draft" hidden>
+        <summary>Server draft before sanitizing (read-only)</summary>
+        <pre id="sentry-publish-draft-text"></pre>
+      </details>
+      <div id="sentry-publish-form" hidden>
+        <label for="sentry-publish-title">Title</label>
+        <input id="sentry-publish-title" type="text" maxlength="256" />
+        <label for="sentry-publish-body">Body</label>
+        <textarea id="sentry-publish-body" rows="12"></textarea>
+        <div id="sentry-publish-redactions"></div>
+        <div id="sentry-publish-concerns"></div>
+        <label class="sentry-reviewed"
+          ><input id="sentry-publish-reviewed" type="checkbox" /> I reviewed the sanitized
+          text</label
+        >
+      </div>
+      <p id="sentry-publish-error" role="alert"></p>
+      <div id="sentry-publish-result"></div>
+      <div class="sentry-dialog-actions">
+        <button id="sentry-publish-redraft" type="button" hidden>Try again</button>
+        <button id="sentry-publish-create" type="button" disabled>Create GitHub issue</button>
       </div>
     </dialog>
     <dialog id="workspace-dialog" aria-labelledby="workspace-title">

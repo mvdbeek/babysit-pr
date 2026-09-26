@@ -1,0 +1,240 @@
+#sentry-panel {
+  min-width: 0;
+}
+#sentry-status,
+#sentry-llm,
+#sentry-notices {
+  overflow-wrap: anywhere;
+}
+#sentry-llm.sentry-warn {
+  color: var(--amber);
+}
+#sentry-notices .alert {
+  padding: 8px 14px;
+  margin-bottom: 8px;
+}
+#sentry-notices:not(:empty) {
+  margin-bottom: 12px;
+}
+#sentry-panel .pr-filters {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.sentry-table td {
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.sentry-table .sentry-issue {
+  width: 34%;
+  min-width: 220px;
+}
+.sentry-table .sentry-severity {
+  width: 190px;
+}
+.sentry-table small {
+  display: block;
+  margin-top: 3px;
+}
+.sentry-score {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.sentry-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 8px 0 6px;
+}
+.sentry-chip {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.sentry-llm-badge {
+  margin-top: 4px;
+}
+.sentry-llm-badge.sentry-disagrees {
+  color: var(--red);
+  background: #faeeeb;
+  box-shadow: inset 0 0 0 1px var(--red);
+}
+.sentry-issue > a {
+  font:
+    12px ui-monospace,
+    SFMono-Regular,
+    monospace;
+}
+.sentry-title {
+  margin: 4px 0;
+}
+.sentry-notes {
+  margin-top: 8px;
+}
+.sentry-notes p,
+.sentry-notes li {
+  margin: 6px 0;
+  line-height: 1.5;
+}
+.sentry-notes ul {
+  padding-left: 18px;
+}
+.sentry-servers div + div {
+  margin-top: 6px;
+}
+.sentry-impact strong {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.sentry-action-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.sentry-actions button {
+  padding: 6px 10px;
+}
+.sentry-actions small {
+  color: var(--red);
+  max-width: 220px;
+}
+#sentry-publish-dialog {
+  width: min(720px, 94vw);
+  max-height: 90vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  color: var(--ink);
+  background: var(--paper);
+}
+#sentry-publish-dialog::backdrop {
+  background: #0008;
+}
+#sentry-publish-close {
+  float: right;
+}
+#sentry-publish-dialog h2 {
+  margin-bottom: 8px;
+}
+#sentry-publish-dialog h3 {
+  margin: 12px 0 4px;
+  font-size: 13px;
+}
+#sentry-publish-dialog p,
+#sentry-publish-dialog li {
+  overflow-wrap: anywhere;
+}
+#sentry-publish-meta,
+#sentry-publish-status {
+  color: var(--muted);
+}
+#sentry-publish-draft {
+  margin: 12px 0;
+}
+#sentry-publish-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+#sentry-publish-form > label {
+  color: var(--muted);
+  font-size: 12px;
+}
+#sentry-publish-title,
+#sentry-publish-body {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+}
+#sentry-publish-body {
+  font:
+    12px/1.55 ui-monospace,
+    SFMono-Regular,
+    monospace;
+}
+#sentry-publish-form .sentry-reviewed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 13px;
+}
+#sentry-publish-reviewed {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--green);
+}
+.sentry-review-list ul {
+  padding-left: 20px;
+  margin: 0;
+  font-size: 12px;
+}
+#sentry-publish-error {
+  color: var(--red);
+}
+#sentry-publish-error:empty {
+  display: none;
+}
+.sentry-dialog-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+#sentry-publish-create:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+@media (max-width: 700px) {
+  #sentry-panel .toolbar {
+    align-items: flex-start;
+  }
+  #sentry-panel .filters {
+    flex-wrap: wrap;
+  }
+  #sentry-panel .pr-filters {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sentry-table thead {
+    display: none;
+  }
+  .sentry-table tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 12px;
+    padding: 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .sentry-table td {
+    display: block;
+    width: auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+  }
+  .sentry-table .sentry-issue {
+    order: -1;
+    width: auto;
+    min-width: 0;
+    grid-column: 1 / -1;
+  }
+  .sentry-table .sentry-severity {
+    width: auto;
+  }
+  .sentry-table .sentry-actions {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
+  .sentry-action-list {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+}

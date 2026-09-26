@@ -93,10 +93,26 @@ def test_parse_args_shared_options_and_positionals(tmp_path):
     assert wt.parse_args("wti", ["--claude", "12"]).agent == "claude"
 
 
-@pytest.mark.parametrize("flag", ["--name", "--no-focus", "--repo-path", "--worktree-root"])
-def test_wt_rejects_dashboard_options(flag):
-    with pytest.raises(wt.UsageError, match="unknown option"):
-        wt.parse_args("wt", [flag, "x", "base"])
+def test_agent_args_are_repeatable_words_after_the_agent(tmp_path):
+    parsed = wt.parse_args(
+        "wt", ["--name", "n", "--agent-arg", "--mcp-config", "--agent-arg", "/p q.json"]
+    )
+    assert parsed.agent_args == ["--mcp-config", "/p q.json"] and parsed.positional == []
+    assert wt.parse_args("wti", ["--agent-arg", "x", "12"]).agent_args == ["x"]
+    with pytest.raises(wt.WtError, match="control characters"):
+        wt.parse_args("wt", ["--agent-arg", "a\nb", "base"])
+
+    def stage(prompt):
+        return "/tmp/prompt"
+
+    # Extra words come last and `--` stops a variadic option from taking the prompt.
+    assert wt.agent_command("claude", "go", "", "", stage, ["--mcp-config", "/p q.json"]) == (
+        "claude --mcp-config '/p q.json' -- \"$(cat /tmp/prompt)\""
+    )
+    assert wt.agent_command("claude", "go", "opus", "high", stage, ["--x"]) == (
+        'claude --model opus --effort high --x -- "$(cat /tmp/prompt)"'
+    )
+    assert wt.agent_command("claude", "", "", "", stage, ["--x"]) == "claude --x"
 
 
 @pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
@@ -1103,6 +1119,42 @@ def test_wti_default_naming_reattach_and_explicit_name_rules(repo):
     run_tool("wtissue", "-r", "repo", "12", "feature")
     assert (
         git("symbolic-ref", "--short", "HEAD", cwd=home / "src/worktrees/repo/feature") == "feature"
+    )
+
+
+def test_wt_name_reserves_a_new_branch_from_the_default_or_given_base(repo):
+    home, git, state = repo
+    run_tool(
+        "wt",
+        "--codex",
+        "--no-focus",
+        "--name",
+        "sentry-x-1",
+        "--label",
+        "sentry-repo-X-1",
+        "--agent-arg",
+        "--flag",
+        "-r",
+        "repo",
+        "-p",
+        "Fix",
+    )
+    path = home / "src/worktrees/repo/sentry-x-1"
+    assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "sentry-x-1"
+    assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "main")
+    data = state_of(state)
+    assert data["agents"][0]["argv"][0] == "--flag" and data["agents"][0]["task"] == "Fix"
+    opened = next(c for c in data["calls"] if c[:2] == ["worktree", "open"])
+    assert opened[opened.index("--label") + 1] == "sentry-repo-X-1" and "--no-focus" in opened
+    result = run_tool("wt", "-r", "repo", "--name", "sentry-x-1", check=False)
+    assert "explicit worktree destination already exists" in result.stderr
+    result = run_tool("wt", "-r", "repo", "--name", "feature", check=False)
+    assert result.stderr.strip() == "wt: explicit branch already exists: feature"
+    result = run_tool("wt", "-r", "repo", "--name", "y", "a", "b", check=False)
+    assert "at most one base branch" in result.stderr
+    run_tool("wt", "-r", "repo", "--name", "from-feature", "feature")
+    assert git("rev-parse", "HEAD", cwd=home / "src/worktrees/repo/from-feature") == git(
+        "rev-parse", "feature"
     )
 
 

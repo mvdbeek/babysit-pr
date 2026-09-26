@@ -190,11 +190,13 @@ class DashboardServer(ThreadingHTTPServer):
         upstream_tests=None,
         workspace_overview=None,
         push=None,
+        sentry=None,
     ) -> None:
         self.home = home
         self.overview = overview
         self.issues = issues
         self.upstream_tests = upstream_tests
+        self.sentry = sentry
         self.workspace_overview = workspace_overview
         self.workspaces = workspaces
         self.ci = ci
@@ -247,6 +249,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-action",
                 "workspace-cleanup",
                 "workspace-open",
+                "sentry-action",
                 "push-subscribe",
                 "push-unsubscribe",
                 "push-read",
@@ -269,7 +272,8 @@ class Handler(BaseHTTPRequestHandler):
                 <= (
                     200000
                     if action.startswith("push-")
-                    or action in {"workspace-action", "workspace-cleanup", "workspace-open"}
+                    or action
+                    in {"workspace-action", "workspace-cleanup", "workspace-open", "sentry-action"}
                     else 1024
                 )
                 or self.headers.get("Content-Type") != "application/json"
@@ -290,6 +294,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(
                     200, self.server.push.action(action, request, origin or f"http://{host}")
                 )
+                return
+            if action == "sentry-action":
+                # Experimental Sentry actions own their validation and failure boundary.
+                if not self.server.sentry:
+                    raise ValueError("The Sentry experiment is disabled")
+                try:
+                    value = self.server.sentry.action(request)
+                except ValueError:
+                    raise
+                except Exception:
+                    value = {"error": "Sentry experiment unavailable"}
+                self.send_json(200, value)
                 return
             if action in {"workspace-cleanup", "workspace-open"}:
                 # Experimental workspace actions own their validation.
@@ -372,6 +388,18 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(
                         200, {"enabled": True, "error": "Upstream test experiment unavailable"}
                     )
+            elif route.path == "/api/sentry":
+                # Experimental failures must stay outside the main dashboard boundary.
+                try:
+                    if self.server.sentry:
+                        if parse_qs(route.query).get("refresh") == ["1"]:
+                            self.server.sentry.request_refresh()
+                        value = self.server.sentry.snapshot()
+                    else:
+                        value = {"enabled": False}
+                    self.send_json(200, value)
+                except Exception:
+                    self.send_json(200, {"enabled": True, "error": "Sentry experiment unavailable"})
             elif route.path == "/api/workspace-overview":
                 # Experimental inventory must stay outside the main dashboard boundary.
                 try:
@@ -477,6 +505,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/upstream-tests.css": ("upstream-tests.css", "text/css"),
                     "/workspaces.js": ("workspaces.js", "text/javascript"),
                     "/workspaces.css": ("workspaces.css", "text/css"),
+                    "/sentry.js": ("sentry.js", "text/javascript"),
+                    "/sentry.css": ("sentry.css", "text/css"),
                     "/style.css": ("style.css", "text/css"),
                 }
                 if route.path not in files:
@@ -493,6 +523,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=()):
     from dashboard_push import PushInbox
+    from sentry_issues import SentryIssues
     from upstream_tests import UpstreamTests
     from workspace_overview import WorkspaceOverview
 
@@ -500,7 +531,14 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
     workspace_overview = WorkspaceOverview(home, jobs=lambda: read_jobs(home))
     overview = Overview(home)
     issues = IssueOverview(home)
-    workspaces = Workspaces(home, overview, lambda: read_jobs(home), issues=issues)
+    sentry = SentryIssues(home)
+    workspaces = Workspaces(
+        home,
+        overview,
+        lambda: read_jobs(home),
+        issues=issues,
+        sentry=sentry if sentry.enabled else None,
+    )
     ci = CiDetails(home, overview)
     ci_logs = BackgroundLogs(home, overview, ci)
     push = PushInbox(
@@ -519,6 +557,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         upstream_tests=upstream_tests,
         workspace_overview=workspace_overview,
         push=push,
+        sentry=sentry,
     ) as server:
         ci_logs.start()
         push.start()
