@@ -85,13 +85,14 @@ Private tailnet access on this machine uses a Tailscale Service hosted by the
 Mac mini, which is tagged `tag:server` (service hosts must be tagged nodes):
 
 ```sh
-python3 <skill-dir>/scripts/pr_supervisor.py --home /private/tmp/babysit-pr-mvandenb dashboard --allow-host babysitter.tailfb45be.ts.net
+python3 <skill-dir>/scripts/pr_supervisor.py dashboard --allow-host babysitter.tailfb45be.ts.net
 tailscale serve --service=svc:babysitter --https=443 http://127.0.0.1:8765
 ```
 
-The current running watcher uses `/private/tmp/babysit-pr-mvandenb`; use the same
-`--home` for its dashboard and controls. This temporary location may be removed
-by system cleanup; do not start an empty default queue and mistake it for this one.
+The running watcher uses the default home, `~/.local/state/babysit-pr`, so commands
+need no `--home`. It moved there on 2026-09-26 because macOS `tmp_cleaner` deletes
+`/tmp` files that go unread for three days. `/private/tmp/babysit-pr-mvandenb` is a
+compatibility symlink to it until the next reboot; do not create a new home there.
 Open `https://babysitter.tailfb45be.ts.net/` from the tailnet. The Python server
 stays bound to loopback and accepts only the listed Host header; the former node
 route on `mac-mini:8443` has been removed. Services are tailnet-only and cannot be
