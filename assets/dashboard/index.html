@@ -359,6 +359,14 @@
               <option value="ongoing">Ongoing</option>
             </select>
           </label>
+          <label for="sentry-work"
+            >Work
+            <select id="sentry-work" aria-label="Filter Sentry issues by work">
+              <option value="all">All issues</option>
+              <option value="handled">Being handled</option>
+              <option value="unhandled">Not handled yet</option>
+            </select>
+          </label>
         </div>
         <p id="sentry-status" class="pr-sync" role="status">Loading Sentry issues…</p>
         <p id="sentry-llm" class="pr-sync" hidden></p>

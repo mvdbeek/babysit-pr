@@ -1000,6 +1000,48 @@ class Workspaces:
                 self.workers.pop(pr["id"], None)
                 self.next_poll = 0
 
+    def sentry_state(self):
+        """Handle progress per Sentry target, without scanning checkouts.
+
+        Reads the durable operations and associations plus the cached herdr inventory,
+        so the Sentry tab can poll it every few seconds; /api/workspaces rescans.
+        """
+        with self.db() as db:
+            operations = {
+                key: json.loads(data)
+                for key, data in db.execute(
+                    "SELECT pr,data FROM operations WHERE pr LIKE 'sentry:%'"
+                )
+            }
+            paths: dict[str, list[str]] = {}
+            for key, path in db.execute(
+                "SELECT pr,path FROM associations WHERE pr LIKE 'sentry:%'"
+            ):
+                paths.setdefault(key, []).append(path)
+        inventory = self.inventory
+        live = {w.get("workspace_id") for w in inventory.get("workspaces", [])}
+        state = {}
+        for key in operations.keys() | paths.keys():
+            op = operations.get(key) or {}
+            result = op.get("result") or {}
+            path = next(
+                (c for c in [op.get("path"), *paths.get(key, [])] if c and os.path.isdir(c)),
+                None,
+            )
+            # The cached inventory can predate this Handle (the Sentry tab never rescans):
+            # trust a result recorded after the last scan, otherwise require the workspace.
+            synced = inventory.get("synced_at") or 0
+            open_space = result.get("workspace_id") in live or (op.get("updated_at") or 0) > synced
+            state[key] = {
+                "status": op.get("status"),
+                "message": op.get("message"),
+                "agent": op.get("agent"),
+                "updated_at": op.get("updated_at") or op.get("created_at"),
+                "path": path,
+                "workspace_url": result.get("url") if path and open_space else None,
+            }
+        return state
+
     def sentry_context(self, target, agent):
         """The brief's Sentry facts, and the agent flags that load the Sentry MCP server.
 

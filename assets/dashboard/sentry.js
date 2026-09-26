@@ -99,6 +99,8 @@
       return false;
     if (bucket !== "all" && entry.bucket !== bucket) return false;
     if (state !== "all" && entry.substatus !== state) return false;
+    const work = byId("work").value;
+    if (work !== "all" && (work === "handled") !== Boolean(working(entry))) return false;
     if (!term) return true;
     return [
       entry.title,
@@ -137,6 +139,21 @@
       `Put \`Fixes ${entry.short_id}\` in the commit message. ` +
       "Do not resolve or change the issue in Sentry. Summarize the root cause, the fix and the validation."
     );
+  }
+  // Handle progress from the server: a queued/running launch or a checkout that exists.
+  function working(entry) {
+    const handling = entry.handling;
+    if (!handling) return null;
+    if (["queued", "running"].includes(handling.status))
+      return { label: "Starting agent…", tone: "amber", detail: handling.message };
+    if (handling.path)
+      return {
+        label: handling.workspace_url ? "Being handled" : "Checkout exists",
+        tone: "blue",
+        detail: handling.path.split("/").pop(),
+        url: handling.workspace_url,
+      };
+    return null; // A failed launch is shown as an error next to Handle, not as work.
   }
   function handle(entry) {
     const item = {
@@ -253,7 +270,27 @@
     const td = node("td", undefined, "pr-actions sentry-actions");
     const cell = node("div", undefined, "sentry-action-list");
     td.append(cell);
-    cell.append(button("Handle", () => handle(entry)));
+    const work = working(entry);
+    if (work) {
+      const state = node("div", undefined, "sentry-work");
+      state.append(badge(work.label, work.tone));
+      if (work.detail) state.append(node("small", work.detail, "pr-meta"));
+      if (work.url) state.append(anchor("Open workspace", work.url));
+      cell.append(state);
+    }
+    const starting = ["queued", "running"].includes(entry.handling?.status);
+    const handleButton = button(work && !starting ? "Handle again" : "Handle", () => handle(entry));
+    handleButton.disabled = starting;
+    if (starting) handleButton.title = "An agent is being started for this issue.";
+    cell.append(handleButton);
+    if (["failed", "uncertain"].includes(entry.handling?.status) && !work) {
+      const failed = node(
+        "small",
+        `Last Handle ${entry.handling.status}: ${entry.handling.message || ""}`,
+      );
+      failed.className = "sentry-work-error";
+      cell.append(failed);
+    }
     const issue = entry.publish?.url || entry.publish?.existing?.url;
     if (issue) cell.append(anchor("Open GitHub issue", issue));
     else cell.append(button("Publish to GitHub", () => openPublish(entry)));
@@ -573,6 +610,7 @@
   byId("repo").onchange = refilter;
   byId("severity").onchange = refilter;
   byId("state").onchange = refilter;
+  byId("work").onchange = refilter;
   byId("refresh").onclick = () => refresh(true);
   byId("more-button").onclick = () => {
     limit += 50;

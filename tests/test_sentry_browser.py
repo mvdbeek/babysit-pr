@@ -687,3 +687,43 @@ def test_a_failed_sanitizer_run_can_be_tried_again(page, site, errors):
     )
     expect(dialog.get_by_role("button", name="Try again")).to_be_hidden()
     assert [r["action"] for r in fake.requests] == ["publish-draft", "publish-draft"]
+
+
+def test_handled_issues_show_their_work_and_can_be_filtered(page, site, errors):
+    url, fake = site
+    fake.find("a1")["handling"] = {
+        "status": "complete",
+        "message": "Workspace ready — Open in Collie",
+        "agent": "codex",
+        "updated_at": 1,
+        "path": "/src/worktrees/galaxy/sentry-galaxy-main-1a",
+        "workspace_url": "https://collie.tailfb45be.ts.net/space/w7",
+    }
+    starting = fake.value["groups"][1]
+    starting["handling"] = {"status": "running", "message": "Fetching Sentry issue", "path": None}
+    failed = fake.value["groups"][2]
+    failed["handling"] = {"status": "failed", "message": "clone refused", "path": None}
+    page.goto(url + "/#sentry")
+    handled = row(page, "GALAXY-MAIN-1A")
+    expect(handled.locator(".sentry-work")).to_contain_text("Being handled")
+    expect(handled.locator(".sentry-work")).to_contain_text("sentry-galaxy-main-1a")
+    expect(handled.get_by_role("link", name="Open workspace")).to_have_attribute(
+        "href", "https://collie.tailfb45be.ts.net/space/w7"
+    )
+    expect(handled.get_by_role("button", name="Handle again")).to_be_enabled()
+    busy = row(page, starting["short_id"])
+    expect(busy.locator(".sentry-work")).to_contain_text("Starting agent…")
+    expect(busy.get_by_role("button", name="Handle", exact=True)).to_be_disabled()
+    broken = row(page, failed["short_id"])
+    expect(broken.locator(".sentry-work")).to_have_count(0)
+    expect(broken).to_contain_text("Last Handle failed: clone refused")
+    choose_option(page.get_by_role("combobox", name="Filter Sentry issues by work"), "handled")
+    expect(rows(page)).to_have_count(2)
+    choose_option(page.get_by_role("combobox", name="Filter Sentry issues by work"), "unhandled")
+    expect(rows(page)).to_have_count(len(fake.value["groups"]) - 2)
+    # A worktree that exists without its herdr workspace still counts, without a link.
+    fake.find("a1")["handling"]["workspace_url"] = None
+    choose_option(page.get_by_role("combobox", name="Filter Sentry issues by work"), "all")
+    page.locator("#sentry-refresh").click()
+    expect(handled.locator(".sentry-work")).to_contain_text("Checkout exists")
+    expect(handled.get_by_role("link", name="Open workspace")).to_have_count(0)

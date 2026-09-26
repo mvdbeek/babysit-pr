@@ -1,6 +1,7 @@
 """Handle for Sentry issue groups: temporary clones, fake herdr/agents, no live workspaces."""
 
 import json
+import time
 from pathlib import Path
 
 import pr_workspaces as pw
@@ -171,3 +172,44 @@ def test_sentry_target_rejects_bad_repository_and_short_id(sentry):
 
     manager.sentry.targets = broken
     assert manager.snapshot()["sentry"] == {} and "PR_one" in manager.snapshot()["prs"]
+
+
+def test_sentry_state_reports_handle_progress_without_scanning(sentry):
+    manager, _, _, _, _ = sentry
+    assert manager.sentry_state() == {}
+    manager.action({"id": "sentry:abc123", "action": "handle", "agent": "codex", "task": "Fix"})
+    op = finish(manager, "sentry:abc123")
+    manager.scan = None  # sentry_state must not rescan.
+    state = manager.sentry_state()["sentry:abc123"]
+    assert state["status"] == "complete" and state["agent"] == "codex"
+    assert state["path"] == op["path"] and state["workspace_url"].startswith(pw.COLLIE_URL)
+    # A closed herdr workspace keeps the checkout but loses its link.
+    manager.inventory = {**manager.inventory, "workspaces": [], "synced_at": time.time()}
+    state = manager.sentry_state()["sentry:abc123"]
+    assert state["path"] == op["path"] and state["workspace_url"] is None
+    # A removed worktree no longer counts as ongoing work.
+    import shutil
+
+    shutil.rmtree(op["path"])
+    assert manager.sentry_state()["sentry:abc123"]["path"] is None
+
+
+def test_attach_handling_is_best_effort():
+    import dashboard
+
+    class Workspaces:
+        def __init__(self, value):
+            self.value = value
+
+        def sentry_state(self):
+            if isinstance(self.value, Exception):
+                raise self.value
+            return self.value
+
+    value = {"groups": [{"key": "a"}, {"key": "b"}]}
+    dashboard.attach_handling(value, Workspaces({"sentry:a": {"status": "running"}}))
+    assert [g.get("handling") for g in value["groups"]] == [{"status": "running"}, None]
+    untouched = {"groups": [{"key": "a"}]}
+    dashboard.attach_handling(untouched, Workspaces(RuntimeError("db locked")))
+    dashboard.attach_handling(untouched, None)
+    assert untouched == {"groups": [{"key": "a"}]}

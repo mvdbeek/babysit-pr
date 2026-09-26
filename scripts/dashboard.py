@@ -174,6 +174,18 @@ def tail_log(home, kind, job_id=None):
         return {"text": "This log is not available yet.", "truncated": False}
 
 
+def attach_handling(value, workspaces):
+    """Mark Sentry groups that Handle already started work on; best effort."""
+    if not workspaces or not value.get("groups"):
+        return
+    try:
+        state = workspaces.sentry_state()
+    except Exception:
+        return
+    for group in value["groups"]:
+        group["handling"] = state.get(f"sentry:{group['key']}")
+
+
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -395,6 +407,7 @@ class Handler(BaseHTTPRequestHandler):
                         if parse_qs(route.query).get("refresh") == ["1"]:
                             self.server.sentry.request_refresh()
                         value = self.server.sentry.snapshot()
+                        attach_handling(value, self.server.workspaces)
                     else:
                         value = {"enabled": False}
                     self.send_json(200, value)
