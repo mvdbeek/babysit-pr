@@ -307,8 +307,13 @@ function visibleJobs() {
         (filter === "active" && !ended.has(j.status)) ||
         (filter === "ended" && ended.has(j.status)) ||
         (filter === "attention" && needsAttention(j))) &&
-      `${j.repo} ${j.ci_repo} ${j.branch} ${j.number || ""} ${j.summary}`.toLowerCase().includes(q),
+      `${j.title || ""} ${j.repo} ${j.ci_repo} ${j.branch} ${j.number || ""} ${j.summary}`
+        .toLowerCase()
+        .includes(q),
   );
+}
+function watchSubject(job) {
+  return `${job.repo}${job.kind === "pr" && job.number ? ` #${job.number}` : ""}`;
 }
 function render() {
   if (!data) return;
@@ -354,24 +359,17 @@ function render() {
     row.setAttribute("aria-pressed", selected === job.id);
     row.setAttribute(
       "aria-label",
-      `${job.repo}, ${job.branch || "pending first poll"}, ${names[job.status] || job.status}`,
+      `${job.title ? `${job.title}, ` : ""}${job.repo}, ${job.branch || "pending first poll"}, ${names[job.status] || job.status}`,
     );
     const top = el("div", undefined, "watch-top");
-    top.append(
-      el(
-        "span",
-        `${job.repo}${job.kind === "pr" && job.number ? ` #${job.number}` : ""}`,
-        "watch-title",
-      ),
-      watchBadges(job),
-    );
+    top.append(el("span", job.title || watchSubject(job), "watch-title"), watchBadges(job));
     const bottom = el("div", undefined, "watch-bottom");
     bottom.append(ciSummary(job), el("span", ago(job.last_poll)));
     row.append(
       top,
       el(
         "div",
-        `${job.kind === "branch" ? "Branch" : "PR"} · ${job.branch || "Awaiting first poll"}`,
+        `${job.title ? watchSubject(job) : job.kind === "branch" ? "Branch" : "PR"} · ${job.branch || "Awaiting first poll"}`,
         "branch",
       ),
       el("p", job.summary || "Waiting for the first observation.", "watch-summary"),
@@ -473,8 +471,10 @@ function renderDetail() {
     watchBadges(job),
   );
   const title = el("h2");
-  title.append(link(job.branch || job.repo, job.url));
-  head.append(top, title, el("p", job.summary));
+  title.append(link(job.title || job.branch || job.repo, job.url));
+  head.append(top, title);
+  if (job.title) head.append(el("div", `${watchSubject(job)} · ${job.branch}`, "branch"));
+  head.append(el("p", job.summary));
   head.append(workspaceControls({ ...job, id: `watch:${job.id}`, kind: "watch" }));
   if (job.stop_after_run || job.pause_after_run)
     head.append(

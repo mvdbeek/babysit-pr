@@ -1151,6 +1151,30 @@ def test_watcher_pr_review_state(page, dashboard_site, draft, outcome, branch, l
             expect(target.get_by_text(label, exact=True)).to_be_visible()
 
 
+def test_watches_are_titled_by_their_pr_title(page: Page, dashboard_site) -> None:
+    url, home = dashboard_site
+    db = supervisor.open_db(home)
+    with db:
+        job = supervisor.get_job(db, "feedback")
+        job["snapshot"]["pr"]["title"] = '<img src=x onerror="window.injected=true"> Fix CI'
+        supervisor.save_job(db, job)
+    db.close()
+    page.goto(url)
+    row = page.locator("#list .watch").filter(has_text="Fix CI")
+    expect(row.locator(".watch-title")).to_have_text(
+        '<img src=x onerror="window.injected=true"> Fix CI'
+    )
+    expect(row.locator(".branch")).to_have_text("test/repo #1 · feature")
+    untitled = page.locator("#list .watch").filter(has_text="test/running")
+    expect(untitled.locator(".watch-title")).to_have_text("test/running #1")
+    row.click()
+    expect(page.locator("#detail h2 a")).to_contain_text("Fix CI")
+    expect(page.locator("#detail .detail-head .branch")).to_have_text("test/repo #1 · feature")
+    page.locator("#search").fill("fix ci")
+    expect(page.locator("#list .watch")).to_have_count(1)
+    assert page.evaluate("window.injected") is None
+
+
 @pytest.fixture
 def workspace_routes(page):
     target = {

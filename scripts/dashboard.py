@@ -66,6 +66,7 @@ def present_job(job):
         "branch": job.get("branch") or pr.get("head_branch"),
         "kind": "branch" if job.get("branch") else "pr",
         "number": pr.get("number"),
+        "title": pr.get("title") if not job.get("branch") else None,
         "draft": pr.get("draft") if not job.get("branch") else None,
         "ci_repo": ci.get("repo") or job.get("ci_repo") or job.get("repo"),
         "sha": pr.get("head_sha"),

@@ -171,7 +171,7 @@ def parse_pr_spec(pr_spec):
 
 def pr_view_fields():
     return (
-        "number,url,state,isDraft,mergedAt,closedAt,headRefName,headRefOid,"
+        "number,title,url,state,isDraft,mergedAt,closedAt,headRefName,headRefOid,"
         "headRepository,headRepositoryOwner,baseRefOid,mergeable,mergeStateStatus,reviewDecision"
     )
 
@@ -201,6 +201,7 @@ def resolve_pr(pr_spec, repo_override=None, cwd=None):
 
     return {
         "number": int(data["number"]),
+        "title": str(data.get("title") or ""),
         "url": pr_url,
         "repo": repo,
         "head_repo": extract_repo_from_pr_view(data),
