@@ -656,14 +656,14 @@ def test_handle_opens_the_workspace_dialog_with_a_prefilled_task(page, site, err
     operation["value"] = {
         "status": "complete",
         "message": "Workspace ready — Open in Collie",
-        "result": {"url": "https://collie.tailfb45be.ts.net/space/w1"},
+        "result": {"url": "https://collie.example.ts.net/space/w1"},
         "log": "started",
     }
     expect(page.locator("#workspace-progress")).to_have_text(
         "complete: Workspace ready — Open in Collie", timeout=10000
     )
     expect(dialog.get_by_role("link", name="Open in Collie")).to_have_attribute(
-        "href", "https://collie.tailfb45be.ts.net/space/w1"
+        "href", "https://collie.example.ts.net/space/w1"
     )
     assert submitted[0]["id"] == "sentry:a1"
     assert submitted[0]["action"] == "handle"
@@ -697,7 +697,7 @@ def test_handled_issues_show_their_work_and_can_be_filtered(page, site, errors):
         "agent": "codex",
         "updated_at": 1,
         "path": "/src/worktrees/galaxy/sentry-galaxy-main-1a",
-        "workspace_url": "https://collie.tailfb45be.ts.net/space/w7",
+        "workspace_url": "https://collie.example.ts.net/space/w7",
     }
     starting = fake.value["groups"][1]
     starting["handling"] = {"status": "running", "message": "Fetching Sentry issue", "path": None}
@@ -708,7 +708,7 @@ def test_handled_issues_show_their_work_and_can_be_filtered(page, site, errors):
     expect(handled.locator(".sentry-work")).to_contain_text("Being handled")
     expect(handled.locator(".sentry-work")).to_contain_text("sentry-galaxy-main-1a")
     expect(handled.get_by_role("link", name="Open workspace")).to_have_attribute(
-        "href", "https://collie.tailfb45be.ts.net/space/w7"
+        "href", "https://collie.example.ts.net/space/w7"
     )
     expect(handled.get_by_role("button", name="Handle again")).to_be_enabled()
     busy = row(page, starting["short_id"])

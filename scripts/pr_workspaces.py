@@ -29,7 +29,8 @@ import owned_process
 import workspace_agents
 from issue_overview import branch_number
 
-COLLIE_URL = "https://collie.tailfb45be.ts.net"
+# Collie's own setting for the URL it is reached at; unset means its loopback default.
+COLLIE_URL = (os.environ.get("COLLIE_PUBLIC_URL") or "http://127.0.0.1:8787").rstrip("/")
 # The portable wt/wti/wtpr implementation shipped next to this module.
 WORKTREE_HELPER = str(Path(__file__).resolve().with_name("wt.py"))
 POLL_SECONDS = 15

@@ -81,33 +81,36 @@ dashboard while monitoring continues. `--port PORT` changes the port;
 `--home PATH` before `dashboard` selects an existing watcher state directory.
 An absent database shows an empty dashboard; access failures show an error.
 
-Private tailnet access on this machine uses a Tailscale Service hosted by the
-Mac mini, which is tagged `tag:server` (service hosts must be tagged nodes):
+For private tailnet access, publish the dashboard as a Tailscale Service from a
+host tagged, for example, `tag:server` (service hosts must be tagged nodes). With
+`TAILNET` standing for your tailnet's DNS name:
 
 ```sh
-python3 <skill-dir>/scripts/pr_supervisor.py dashboard --allow-host babysitter.tailfb45be.ts.net
+python3 <skill-dir>/scripts/pr_supervisor.py dashboard --allow-host babysitter.TAILNET.ts.net
 tailscale serve --service=svc:babysitter --https=443 http://127.0.0.1:8765
 ```
 
-The running watcher uses the default home, `~/.local/state/babysit-pr`, so commands
-need no `--home`. It moved there on 2026-09-26 because macOS `tmp_cleaner` deletes
-`/tmp` files that go unread for three days. `/private/tmp/babysit-pr-mvandenb` is a
-compatibility symlink to it until the next reboot; do not create a new home there.
-Open `https://babysitter.tailfb45be.ts.net/` from the tailnet. The Python server
-stays bound to loopback and accepts only the listed Host header; the former node
-route on `mac-mini:8443` has been removed. Services are tailnet-only and cannot be
-exposed through Funnel; do not enable Funnel on this node either. The policy file's
-`autoApprovers.services` approves `svc:babysitter` and `svc:collie` for `tag:server`;
-a service must be defined on the admin console Services page before the host
-advertisement registers. Remove the route with `tailscale serve clear svc:babysitter`.
-The dashboard process must remain running.
+The watcher's default home is `~/.local/state/babysit-pr`, so commands need no
+`--home`. Keep the home out of `/tmp`: macOS `tmp_cleaner` deletes `/tmp` files
+that go unread for three days.
+Open `https://babysitter.TAILNET.ts.net/` from the tailnet. The Python server
+stays bound to loopback and accepts only the listed Host header. Services are
+tailnet-only and cannot be exposed through Funnel; do not enable Funnel on the
+host either. A policy file's `autoApprovers.services` can approve `svc:babysitter`
+and `svc:collie` for `tag:server`; a service must be defined on the admin console
+Services page before the host advertisement registers. Remove the route with
+`tailscale serve clear svc:babysitter`. The dashboard process must remain running.
 
-Collie is published the same way as `svc:collie` at `https://collie.tailfb45be.ts.net/`
+Collie can be published the same way as `svc:collie` at `https://collie.TAILNET.ts.net/`
 (`tailscale serve --service=svc:collie --https=443 http://127.0.0.1:8787`), with
-`COLLIE_PUBLIC_HOSTS=collie.tailfb45be.ts.net`, `COLLIE_SKIP_SERVE=1`, and
-`COLLIE_PUBLIC_URL=https://collie.tailfb45be.ts.net` in
-`~/.config/collie/.env` so Collie accepts that Host and no longer publishes its own
-`mac-mini` route on restart.
+`COLLIE_PUBLIC_HOSTS=collie.TAILNET.ts.net`, `COLLIE_SKIP_SERVE=1`, and
+`COLLIE_PUBLIC_URL=https://collie.TAILNET.ts.net` in Collie's `.env` so Collie
+accepts that Host and does not publish its own node route on restart.
+
+Dashboard workspace links point at `COLLIE_PUBLIC_URL` from the dashboard's own
+environment, falling back to Collie's loopback default `http://127.0.0.1:8787`.
+Set the same value for the dashboard process, for example in its launchd plist's
+`EnvironmentVariables`.
 
 ```sh
 python3 <skill-dir>/scripts/pr_supervisor.py status

@@ -63,7 +63,7 @@ WORKSPACES = [
         links=[link("pr", 7, "merged", "Merged work")],
         status="ready",
         workspace_ids=["w1"],
-        workspace_url="https://collie.tailfb45be.ts.net/space/w1",
+        workspace_url="https://collie.example.ts.net/space/w1",
         agents=[{"agent": "codex", "status": "idle", "pane": "w1:p1"}],
     ),
     row("open-work", links=[link("pr", 8, "open", "Open work")], status="active"),
@@ -111,7 +111,7 @@ def test_workspace_open_button_and_popup_fallback(page, site, name, label):
 
     def action(route):
         requests.append(route.request.post_data_json)
-        route.fulfill(json={"url": "https://collie.tailfb45be.ts.net/space/w1"})
+        route.fulfill(json={"url": "https://collie.example.ts.net/space/w1"})
 
     page.route("**/api/workspace-open", action)
     page.goto(url + "/#workspaces")
@@ -119,7 +119,7 @@ def test_workspace_open_button_and_popup_fallback(page, site, name, label):
     row = page.locator("#ws-list tr").filter(has=page.get_by_text(name, exact=True))
     row.get_by_role("button", name=label, exact=True).click()
     expect(row.get_by_role("link", name="Open in Collie")).to_have_attribute(
-        "href", "https://collie.tailfb45be.ts.net/space/w1"
+        "href", "https://collie.example.ts.net/space/w1"
     )
     expect(row.get_by_role("button", name="Open workspace", exact=True)).to_be_enabled()
     assert requests == [{"key": f"/src/worktrees/repo/{name}"}]
@@ -182,7 +182,7 @@ def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, w
         "href", f"https://github.com/{BASE}/pull/7"
     )
     expect(page.get_by_role("link", name="merged-work")).to_have_attribute(
-        "href", "https://collie.tailfb45be.ts.net/space/w1"
+        "href", "https://collie.example.ts.net/space/w1"
     )
     page.screenshot(path=f"reports/workspaces-{width}.png", full_page=True)
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")

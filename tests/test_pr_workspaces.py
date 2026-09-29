@@ -17,6 +17,31 @@ from conftest import install_fakes
 from pr_overview import Overview
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "http://127.0.0.1:8787"),
+        ("", "http://127.0.0.1:8787"),
+        ("https://collie.example.ts.net/", "https://collie.example.ts.net"),
+    ],
+)
+def test_collie_url_comes_from_collie_public_url(value, expected):
+    env = {k: v for k, v in os.environ.items() if k != "COLLIE_PUBLIC_URL"}
+    if value is not None:
+        env["COLLIE_PUBLIC_URL"] = value
+    code = "import pr_workspaces; print(pr_workspaces.COLLIE_URL)"
+    scripts = Path(pw.__file__).parent
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=scripts,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == expected
+
+
 @pytest.fixture
 def local(tmp_path, monkeypatch):
     config = tmp_path / "gitconfig"

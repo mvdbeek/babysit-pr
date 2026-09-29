@@ -1182,7 +1182,7 @@ def workspace_routes(page):
         "workspace_id": "w1",
         "name": "Renamed workspace",
         "agent_status": "working",
-        "url": "https://mac-mini.tailfb45be.ts.net/space/w1",
+        "url": "https://collie.example.ts.net/space/w1",
     }
     info = {
         "matches": [target],
@@ -1277,7 +1277,7 @@ def test_workspace_single_open_and_explicit_native_menu(page, dashboard_site, wo
     row = page.locator("#pr-list tr").first
     row.get_by_role("button", name="Open workspace", exact=True).click()
     expect(page.locator("#workspace-result a")).to_have_attribute(
-        "href", "https://mac-mini.tailfb45be.ts.net/space/w1"
+        "href", "https://collie.example.ts.net/space/w1"
     )
     assert page.evaluate("window.opened.location.href").endswith("/space/w1")
     assert requests == [
@@ -1351,11 +1351,11 @@ def test_workspace_create_required_task_agent_progress_and_errors(
     info["operation"].update(
         status="complete",
         message="Workspace ready",
-        result={"url": "https://mac-mini.tailfb45be.ts.net/space/w1"},
+        result={"url": "https://collie.example.ts.net/space/w1"},
     )
     page.evaluate("refreshWorkspaces()")
     expect(dialog.get_by_role("link", name="Open in Collie")).to_have_attribute(
-        "href", "https://mac-mini.tailfb45be.ts.net/space/w1"
+        "href", "https://collie.example.ts.net/space/w1"
     )
 
 
@@ -2197,7 +2197,7 @@ def issue_workspace_routes(page):
         "workspace_id": "w7",
         "name": "Fix 30 workspace",
         "agent_status": "idle",
-        "url": "https://mac-mini.tailfb45be.ts.net/space/w7",
+        "url": "https://collie.example.ts.net/space/w7",
         "linked_pr": 8,
     }
     snapshot = {
@@ -2259,17 +2259,17 @@ def test_issue_workspace_create_and_linked_pr_match(page, dashboard_site, issue_
     info["operation"].update(
         status="complete",
         message="Workspace ready",
-        result={"url": "https://mac-mini.tailfb45be.ts.net/space/w8"},
+        result={"url": "https://collie.example.ts.net/space/w8"},
     )
     page.evaluate("refreshWorkspaces()")
     expect(dialog.get_by_role("link", name="Open in Collie")).to_have_attribute(
-        "href", "https://mac-mini.tailfb45be.ts.net/space/w8"
+        "href", "https://collie.example.ts.net/space/w8"
     )
     dialog.get_by_role("button", name="Close workspace actions").click()
     page.evaluate("window.open = () => { window.opened = {location: {}}; return window.opened; }")
     rows.last.get_by_role("button", name="Open workspace", exact=True).click()
     expect(page.locator("#workspace-result a")).to_have_attribute(
-        "href", "https://mac-mini.tailfb45be.ts.net/space/w7"
+        "href", "https://collie.example.ts.net/space/w7"
     )
     assert requests[-1] == {
         "id": "issue-two",

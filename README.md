@@ -215,8 +215,8 @@ Missing or unrelated checkouts show **Workspace unavailable**.
 
 ## PR workspace actions
 
-The **Actions** column opens a verified workspace in
-[Collie](https://collie.tailfb45be.ts.net). Multiple matches open a chooser with
+The **Actions** column opens a verified workspace in Collie, at `COLLIE_PUBLIC_URL`
+from the dashboard's environment (default `http://127.0.0.1:8787`). Multiple matches open a chooser with
 workspace names and agent status. **More actions** offers **Focus in herdr** and
 **Copy command**. Opening never sends a task to an existing agent. Only the explicit
 native focus action changes herdr focus; creation finishes with an **Open in Collie** link.
