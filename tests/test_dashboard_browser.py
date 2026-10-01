@@ -1435,6 +1435,13 @@ def test_workspace_dialog_closes_on_backdrop_click_and_polls_running_operation(
     # Clicking inside the dialog box keeps it open; clicking the backdrop closes it.
     dialog.get_by_role("heading").click()
     expect(dialog).to_be_visible()
+    # Selecting text and releasing past the box edge keeps it open too.
+    heading = dialog.get_by_role("heading").bounding_box()
+    page.mouse.move(heading["x"] + 2, heading["y"] + heading["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(2, 2, steps=5)
+    page.mouse.up()
+    expect(dialog).to_be_visible()
     page.mouse.click(2, 2)
     expect(dialog).not_to_be_visible()
     page.locator("#pr-list tr").first.get_by_role(

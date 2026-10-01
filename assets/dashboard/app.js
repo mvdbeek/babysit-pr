@@ -262,16 +262,25 @@ function ago(value) {
 }
 function closeOnBackdropClick(dialog) {
   // A click on the backdrop targets the dialog element itself but lands outside its box.
-  dialog.onclick = (event) => {
-    if (event.target !== dialog) return;
+  // Both the press and the release must be there: a text selection dragged out of the
+  // box also fires a click on the dialog, and that must not close it.
+  const onBackdrop = (event) => {
+    if (event.target !== dialog) return false;
     const bounds = dialog.getBoundingClientRect();
-    if (
+    return (
       event.clientX < bounds.left ||
       event.clientX > bounds.right ||
       event.clientY < bounds.top ||
       event.clientY > bounds.bottom
-    )
-      dialog.close();
+    );
+  };
+  let pressedOnBackdrop = false;
+  dialog.onpointerdown = (event) => {
+    pressedOnBackdrop = onBackdrop(event);
+  };
+  dialog.onclick = (event) => {
+    if (pressedOnBackdrop && onBackdrop(event)) dialog.close();
+    pressedOnBackdrop = false;
   };
 }
 function link(label, url) {
