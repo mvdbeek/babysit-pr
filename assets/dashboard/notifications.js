@@ -594,16 +594,25 @@
   };
   byId("close").onclick = () => dialog.close();
   byId("seen").onclick = markAllSeen;
-  dialog.addEventListener("click", (event) => {
-    if (event.target !== dialog) return;
+  // Close only when both press and release land on the backdrop, so a text selection
+  // dragged out of the box (which also fires a click on the dialog) keeps it open.
+  const onBackdrop = (event) => {
+    if (event.target !== dialog) return false;
     const rect = dialog.getBoundingClientRect();
-    if (
+    return (
       event.clientX < rect.left ||
       event.clientX > rect.right ||
       event.clientY < rect.top ||
       event.clientY > rect.bottom
-    )
-      dialog.close();
+    );
+  };
+  let pressedOnBackdrop = false;
+  dialog.addEventListener("pointerdown", (event) => {
+    pressedOnBackdrop = onBackdrop(event);
+  });
+  dialog.addEventListener("click", (event) => {
+    if (pressedOnBackdrop && onBackdrop(event)) dialog.close();
+    pressedOnBackdrop = false;
   });
   window.addEventListener("storage", (event) => {
     if (account && (event.key === account.key || event.key === null)) {
