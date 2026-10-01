@@ -286,6 +286,14 @@ shell rather than running the agent itself. Task text plus the canonical PR URL 
 stored in a private file under `workspace-prompts/` outside the checkout and passed
 with `--prompt-file`. No PR comments or CI watches are added.
 
+**Previous prompts**, under the Task field, searches the tasks you started earlier
+workspaces with (every word you type must appear, in any order and case) and copies a
+chosen one into the Task field; **Forget** removes one. Tasks are kept in
+`pr-workspaces.sqlite` and the picker offers the 500 most recently used; repeating a
+task counts another use rather than adding a duplicate. A Handle prefill submitted
+unedited is left out, because it is regenerated for each item. The first start after
+upgrading seeds the history from the briefs already in `workspace-prompts/`.
+
 **Model (optional)** and **Reasoning effort (optional)** each start at **Default**.
 Blank fields are omitted from the launch command; the dashboard never writes agent
 configuration or adds model instructions to the task. Model and effort choices reset

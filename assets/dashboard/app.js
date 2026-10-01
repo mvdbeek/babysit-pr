@@ -1907,6 +1907,100 @@ async function chooseWorkspace(item, target, action) {
     workspaceError(error);
   }
 }
+// Past tasks to search and reuse; loaded when the picker is first opened.
+function promptHistory(task) {
+  const box = el("details", undefined, "prompt-history");
+  const summary = el("summary", "Previous prompts");
+  const search = el("input");
+  search.type = "search";
+  search.placeholder = "Search previous prompts";
+  search.setAttribute("aria-label", "Search previous prompts");
+  const list = el("ul");
+  const status = el("small");
+  status.setAttribute("role", "status");
+  box.append(summary, search, status, list);
+  let prompts = null;
+  async function load() {
+    status.textContent = "Loading…";
+    try {
+      const response = await fetch("/api/workspace-prompts");
+      const value = await response.json();
+      if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+      prompts = value.prompts;
+      render();
+    } catch (error) {
+      status.textContent = `Cannot load previous prompts: ${error.message}`;
+    }
+  }
+  async function forget(entry) {
+    try {
+      const response = await fetch("/api/workspace-prompt-forget", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Babysit-Action": "workspace-prompt-forget",
+        },
+        body: JSON.stringify({ text: entry.text }),
+      });
+      const value = await response.json();
+      if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+      prompts = value.prompts;
+      render();
+    } catch (error) {
+      status.textContent = `Cannot forget the prompt: ${error.message}`;
+    }
+  }
+  function render() {
+    // Every word must appear, in any order and case.
+    const words = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+    const found = prompts.filter((entry) => {
+      const text = entry.text.toLowerCase();
+      return words.every((word) => text.includes(word));
+    });
+    status.textContent = !prompts.length
+      ? "Tasks you start workspaces with appear here."
+      : found.length
+        ? `${found.length} of ${prompts.length} prompts`
+        : "No previous prompt matches.";
+    list.replaceChildren(
+      ...found.slice(0, 50).map((entry) => {
+        const row = el("li");
+        const use = el("button", entry.text, "prompt-use");
+        use.type = "button";
+        use.title = "Use this prompt as the task";
+        use.onclick = () => {
+          task.value = entry.text;
+          task.setCustomValidity("");
+          box.open = false;
+          task.focus();
+        };
+        const meta = el(
+          "small",
+          `${entry.uses > 1 ? `Used ${entry.uses} times, last` : "Used"} ${new Date(entry.used_at * 1000).toLocaleDateString()}`,
+        );
+        const remove = el("button", "Forget", "prompt-forget");
+        remove.type = "button";
+        remove.setAttribute("aria-label", "Forget this prompt");
+        remove.onclick = () => void forget(entry);
+        row.append(use, meta, remove);
+        return row;
+      }),
+    );
+  }
+  search.oninput = () => prompts && render();
+  // Enter in the search box picks the first match instead of submitting the form.
+  search.onkeydown = (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    list.querySelector(".prompt-use")?.click();
+  };
+  box.ontoggle = () => {
+    if (!box.open) return;
+    search.focus();
+    if (!prompts) void load();
+  };
+  return box;
+}
 // `handling` is the prefilled task text of a Handle action, or empty for plain creation.
 async function workspaceDialog(item, handling = "") {
   workspaceDialogItem = item;
@@ -2047,6 +2141,7 @@ async function workspaceDialog(item, handling = "") {
       field("Reasoning effort (optional)", effort);
       form.append(settingsNote);
       field("Task", task);
+      form.append(promptHistory(task));
       const submit = el(
         "button",
         handling ? "Handle" : info.clones.length ? "Create workspace" : "Clone and create",
@@ -2073,6 +2168,7 @@ async function workspaceDialog(item, handling = "") {
               ...(model.value ? { model: model.value } : {}),
               ...(effort.value ? { effort: effort.value } : {}),
               task: task.value,
+              ...(handling && task.value === handling ? { prefilled: true } : {}),
               ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
               retry: workspaceInfo(item)?.operation?.status === "failed",
             },
