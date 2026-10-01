@@ -190,6 +190,16 @@ def clone_worktrees(root, wanted=None):
     return (main, items) if main else None
 
 
+def workspaces_by_path(inventory):
+    """Herdr workspaces grouped by resolved checkout path, in listing order."""
+    spaces: dict[str, list] = {}
+    for w in inventory["workspaces"]:
+        if w.get("worktree"):
+            path = str(Path(w["worktree"]["checkout_path"]).resolve())
+            spaces.setdefault(path, []).append(w)
+    return spaces
+
+
 def is_issue(target):
     return target.get("kind") == "issue"
 
@@ -255,6 +265,10 @@ def issue_name(issue):
     return f"issue-{issue['number']}" + (f"-{slug}" if slug else "")
 
 
+# (repository, commit, HEAD) -> whether HEAD contains the commit; immutable, so cached.
+ANCESTRY: dict[tuple[str, str, str], bool] = {}
+
+
 def verified_head(pr, item):
     head_repo = (pr.get("head_repo") or "").lower()
     branch = pr.get("head_branch")
@@ -268,11 +282,16 @@ def verified_head(pr, item):
     sha = pr.get("head_sha", "")
     if not re.fullmatch(r"[a-fA-F0-9]{40}", sha):
         return False
-    try:
-        git(item["path"], "merge-base", "--is-ancestor", sha, "HEAD")
-        return True
-    except ValueError:
-        return False
+    key = (item["common"], sha.lower(), item.get("sha") or "")
+    if not key[2] or key not in ANCESTRY:
+        try:
+            git(item["path"], "merge-base", "--is-ancestor", sha, "HEAD")
+            ANCESTRY[key] = True
+        except ValueError:
+            ANCESTRY[key] = False
+        if len(ANCESTRY) > 10000:
+            ANCESTRY.clear()
+    return ANCESTRY[key]
 
 
 class Workspaces:
@@ -512,27 +531,39 @@ class Workspaces:
                 scheduled.setdefault(task["target"], []).append(
                     {"id": task["id"], "start_at": task["start_at"]}
                 )
+        watches = self.jobs()
         return {
             "associations": associations,
             "clones": clones,
             "operations": operations,
             "scheduled": scheduled,
-            "watches": self.jobs(),
+            "watches": watches,
+            # (PR URL, checkout path, branch) per watch, indexed once rather than
+            # rescanned for every target and checkout of a snapshot.
+            "bound": {
+                (
+                    (w.get("url") or "").rstrip("/"),
+                    str(Path(w.get("cwd") or "/missing").resolve()),
+                    w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"),
+                )
+                for w in watches
+            },
         }
 
     def matches(self, pr, inventory, state=None):
         if state is None:
             state = self.state()
         saved = state["associations"].get(pr["id"], {})
-        watches = state["watches"]
+        url = spaces = None
         matches, suggestions = [], []
         issue = is_issue(pr)
         watch = pr.get("kind") == "watch"
         sentry = is_sentry(pr)
         repos = repositories(pr)  # Hoisted: snapshots compare every target with every checkout.
         linked_prs = (pr.get("linked_prs") or []) if issue else []
+        cwd = str(Path(pr["cwd"]).resolve()) if watch else None
         for item in inventory["checkouts"]:
-            if watch and str(Path(pr["cwd"]).resolve()) != item["path"]:
+            if watch and cwd != item["path"]:
                 continue
             # Hundreds of Sentry groups are described per snapshot: skip cheaply.
             if sentry and not (item["branch"] or "").startswith("sentry-"):
@@ -547,18 +578,10 @@ class Workspaces:
                 and prior.get("head_repo") == pr.get("head_repo")
                 and prior.get("head_branch") == pr.get("head_branch")
             )
-            bound = (
-                same
-                and not watch
-                and not sentry
-                and any(
-                    w.get("url", "").rstrip("/") == canonical(pr)
-                    and str(Path(w.get("cwd") or "/missing").resolve()) == item["path"]
-                    and (w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"))
-                    == item["branch"]
-                    for w in watches
-                )
-            )
+            bound = False
+            if same and not watch and not sentry:
+                url = url or canonical(pr)
+                bound = (url, item["path"], item["branch"]) in state["bound"]
             linked = None
             if watch:
                 verified = same
@@ -577,13 +600,9 @@ class Workspaces:
                 verified = verified_head(pr, item)
                 suggested = item["branch"] == pr.get("head_branch")
             if associated or bound or verified:
-                workspaces = [
-                    w
-                    for w in inventory["workspaces"]
-                    if w.get("worktree")
-                    and str(Path(w["worktree"]["checkout_path"]).resolve()) == item["path"]
-                ]
-                for workspace in workspaces or [None]:
+                if spaces is None:
+                    spaces = state.get("spaces") or workspaces_by_path(inventory)
+                for workspace in spaces.get(item["path"]) or [None]:
                     wid = workspace["workspace_id"] if workspace else None
                     matches.append(
                         {
@@ -687,7 +706,7 @@ class Workspaces:
                 threading.Thread(target=self.refresh, daemon=True).start()
             inventory = copy.deepcopy(self.inventory)
         described: dict[str, dict] = {"prs": {}, "issues": {}, "watches": {}, "sentry": {}}
-        state = self.state()
+        state = {**self.state(), "spaces": workspaces_by_path(inventory)}
         for target in self.targets():
             key = (
                 "watches"

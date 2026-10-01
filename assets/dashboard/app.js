@@ -1770,7 +1770,12 @@ setInterval(() => {
 refresh();
 
 let workspaceData = { prs: {}, issues: {}, watches: {} },
-  workspaceBusy = false;
+  workspaceBusy = false,
+  workspaceLoadedAt = 0;
+async function loadWorkspaces() {
+  workspaceData = await get("/api/workspaces");
+  workspaceLoadedAt = Date.now();
+}
 // Overview ids are globally unique; watch ids carry a separate prefix.
 function workspaceInfo(item) {
   return (
@@ -1790,7 +1795,7 @@ async function refreshWorkspaces() {
   if (workspaceBusy || document.hidden || !visible) return;
   workspaceBusy = true;
   try {
-    workspaceData = await get("/api/workspaces");
+    await loadWorkspaces();
     prTable.render();
     issueTable.render();
     renderDetail();
@@ -2033,9 +2038,17 @@ async function workspaceDialog(item, handling = "") {
   $("workspace-log").textContent = "";
   if (!$("workspace-dialog").open) $("workspace-dialog").showModal();
   try {
-    // Discovery is shared and cached; every action revalidates the selected target.
-    workspaceData = await get("/api/workspaces");
-    if (workspaceDialogItem !== item) return;
+    // Discovery is shared and cached; every action revalidates the selected target,
+    // so a recent background refresh opens the dialog without waiting for another.
+    const fresh =
+      Date.now() - workspaceLoadedAt < 30000 &&
+      !workspaceData.error &&
+      workspaceData.synced_at != null &&
+      workspaceInfo(item);
+    if (!fresh) {
+      await loadWorkspaces();
+      if (workspaceDialogItem !== item) return;
+    }
     const info = workspaceInfo(item);
     if (workspaceData.error) throw Error(workspaceData.error);
     if (workspaceData.synced_at === null)
