@@ -1126,6 +1126,84 @@ button:disabled {
 #workspace-error {
   color: var(--red);
 }
+#workspace-dialog input[type="datetime-local"] {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+}
+.workspace-later {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  width: fit-content;
+}
+#workspace-dialog .workspace-later input {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  flex: none;
+}
+.workspace-start {
+  display: grid;
+  gap: 6px;
+}
+.workspace-start[hidden] {
+  display: none;
+}
+.scheduled-heading {
+  font-size: 14px;
+  margin: 18px 0 8px;
+}
+.scheduled-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+}
+.scheduled-task {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  overflow-wrap: anywhere;
+}
+.scheduled-task button {
+  justify-self: start;
+}
+.scheduled-when {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.scheduled-subject {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.scheduled-title,
+.scheduled-settings,
+.scheduled-message {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+}
+.scheduled-text pre {
+  white-space: pre-wrap;
+  font-size: 12px;
+  max-height: 240px;
+  overflow: auto;
+}
+#scheduled-error {
+  color: var(--red);
+}
+#scheduled-error:empty {
+  display: none;
+}
 .workspace-choice {
   padding: 12px 0;
   border-bottom: 1px solid var(--line);

@@ -110,6 +110,17 @@
           Issues
         </button>
         <button
+          id="scheduled-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="scheduled-panel"
+          tabindex="-1"
+          hidden
+        >
+          Scheduled <span id="scheduled-tab-count" class="count" hidden>0</span>
+        </button>
+        <button
           id="workspaces-tab"
           type="button"
           role="tab"
@@ -143,6 +154,28 @@
           Sentry <span class="count">Experiment</span>
         </button>
       </div>
+      <section
+        id="scheduled-panel"
+        class="pr-overview"
+        role="tabpanel"
+        aria-labelledby="scheduled-tab"
+        tabindex="0"
+        hidden
+      >
+        <div class="toolbar">
+          <h2>Scheduled tasks <span id="scheduled-count" class="count">0</span></h2>
+        </div>
+        <p id="scheduled-status" class="pr-sync" role="status">Loading scheduled tasks…</p>
+        <p id="scheduled-error" role="alert"></p>
+        <h3 class="scheduled-heading">Waiting to start</h3>
+        <ol id="scheduled-pending" class="scheduled-list"></ol>
+        <p id="scheduled-empty" class="pr-sync">
+          Nothing is waiting. Choose <strong>Start later</strong> when creating a workspace or
+          handling an item to schedule a task.
+        </p>
+        <h3 class="scheduled-heading" id="scheduled-history-heading" hidden>Recent</h3>
+        <ol id="scheduled-history" class="scheduled-list"></ol>
+      </section>
       <section
         id="workspaces-panel"
         class="pr-overview"

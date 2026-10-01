@@ -11,6 +11,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import selectors
@@ -48,6 +49,12 @@ HANDLE_PREFILLS = re.compile(
     r"|Address the review feedback on \S+\. Read the submitted reviews .* why you did not\."
     r"|Investigate and fix Sentry issue .* Summarize the root cause, the fix and the validation\."
 )
+# Scheduled launches: how far ahead, how late a start is still wanted, and how much is kept.
+SCHEDULE_HORIZON = 30 * 86400
+SCHEDULE_MISSED_AFTER = 86400
+SCHEDULE_PENDING_LIMIT = 100
+SCHEDULE_HISTORY = 50
+SCHEDULE_POLL_SECONDS = 30
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=()):
@@ -310,8 +317,24 @@ class Workspaces:
             )
             if fresh:
                 self.import_prompts(db)
+            db.execute("CREATE TABLE IF NOT EXISTS scheduled (id TEXT PRIMARY KEY, data TEXT)")
+            # A launch the previous process claimed but never recorded may have started.
+            for key, data in db.execute(
+                "SELECT id,data FROM scheduled WHERE json_extract(data,'$.status')='starting'"
+            ).fetchall():
+                task = json.loads(data)
+                task.update(
+                    status="uncertain",
+                    updated_at=time.time(),
+                    message="The dashboard stopped while starting this task. Check the item's workspace before scheduling it again.",
+                )
+                db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), key))
         # A fresh process must inspect resources; it never resubmits an uncertain launch.
         self.workers: dict[str, threading.Thread] = {}
+        self.started_at = time.time()
+        self.scheduler: threading.Thread | None = None
+        self.wake = threading.Event()
+        self.stopping = threading.Event()
 
     @contextlib.contextmanager
     def db(self):
@@ -481,10 +504,19 @@ class Workspaces:
             operations = {
                 key: json.loads(data) for key, data in db.execute("SELECT pr,data FROM operations")
             }
+            scheduled: dict[str, list] = {}
+            for (data,) in db.execute(
+                "SELECT data FROM scheduled WHERE json_extract(data,'$.status')='scheduled'"
+            ):
+                task = json.loads(data)
+                scheduled.setdefault(task["target"], []).append(
+                    {"id": task["id"], "start_at": task["start_at"]}
+                )
         return {
             "associations": associations,
             "clones": clones,
             "operations": operations,
+            "scheduled": scheduled,
             "watches": self.jobs(),
         }
 
@@ -639,6 +671,9 @@ class Workspaces:
             "preferred_clone": choice if choice in clones else None,
             "destination": None if pr.get("kind") == "watch" else self.destination(pr),
             "operation": op,
+            "scheduled": sorted(
+                state.get("scheduled", {}).get(pr["id"], []), key=lambda t: t["start_at"]
+            ),
         }
 
     @staticmethod
@@ -696,6 +731,7 @@ class Workspaces:
             "task",
             "retry",
             "prefilled",
+            "start_at",
         }
         if (
             set(request) - allowed
@@ -712,20 +748,36 @@ class Workspaces:
             }
         ):
             raise ValueError("Invalid workspace action parameters")
-        for field in allowed - {"retry", "prefilled"}:
+        for field in allowed - {"retry", "prefilled", "start_at"}:
             if field in request and not isinstance(request[field], str):
                 raise ValueError(f"Expected text for {field}")
         for field in ("retry", "prefilled"):
             if field in request and not isinstance(request[field], bool):
                 raise ValueError(f"Expected a {field} flag")
+        scheduling = "start_at" in request
+        if scheduling:
+            start = request["start_at"]
+            now = time.time()
+            if (
+                isinstance(start, bool)
+                or not isinstance(start, (int, float))
+                or not math.isfinite(start)
+                or not now - 60 <= start <= now + SCHEDULE_HORIZON
+            ):
+                raise ValueError("Choose a start time within the next 30 days")
+            if request["action"] not in {"create", "clone-and-create", "handle"}:
+                raise ValueError("Only tasks that start an agent can be scheduled")
         pr = self.target(request["id"])
         action = request["action"]
+        chosen = False  # Whether the launch uses an existing local clone.
         if pr.get("kind") == "watch" and action in {"create", "clone-and-create", "handle"}:
             raise ValueError("Watch actions can only open or reopen the registered checkout")
         if is_sentry(pr) and action in {"create", "clone-and-create"}:
             raise ValueError("Use Handle to start work on a Sentry issue")
         with self.lock:
-            if action in {"create", "clone-and-create", "reopen", "handle"}:
+            # A launch running now does not block one scheduled for later; the scheduler
+            # waits for it to finish before starting the scheduled task.
+            if action in {"create", "clone-and-create", "reopen", "handle"} and not scheduling:
                 existing = self.operation(pr["id"])
                 if existing and (
                     existing["status"] in {"queued", "running"}
@@ -810,6 +862,7 @@ class Workspaces:
                 ):
                     raise ValueError("Refresh GitHub metadata before creating a workspace")
                 if action == "create" or (action == "handle" and info["clones"]):
+                    chosen = True
                     clone = request.get("clone") or info["preferred_clone"]
                     if not clone and len(info["clones"]) == 1:
                         clone = info["clones"][0]
@@ -819,6 +872,8 @@ class Workspaces:
                     clone = info["destination"]
                     if info["clones"] or not clone or request.get("destination") != clone:
                         raise ValueError("Clone destination changed; refresh before confirming")
+            if scheduling:
+                return {"scheduled": self.schedule(pr, action, request, clone if chosen else None)}
             op = {
                 "id": str(uuid.uuid4()),
                 "pr": pr["id"],
@@ -858,7 +913,223 @@ class Workspaces:
                 # operation without an owner and marks it uncertain.
                 self.workers[pr["id"]] = worker
             worker.start()
-            return {"operation": copy.deepcopy(op)}
+            # `started` tells the scheduler this call created the operation it returns.
+            return {"operation": copy.deepcopy(op), "started": True}
+
+    # -- scheduled launches --
+
+    def schedule(self, pr, action, request, clone=None):
+        """Record a validated launch request to start at ``request["start_at"]``.
+
+        ``clone`` is the existing clone chosen now; the launch keeps it even if another
+        clone becomes preferred before the task starts.
+        """
+        now = time.time()
+        saved = {
+            key: request[key]
+            # `prefilled` keeps an unedited Handle prefill out of prompt history at launch.
+            for key in ("id", "agent", "model", "effort", "task", "destination", "prefilled")
+            if request.get(key)
+        }
+        saved["action"] = action
+        if clone:
+            saved["clone"] = clone
+        task = {
+            "id": str(uuid.uuid4()),
+            "target": pr["id"],
+            "status": "scheduled",
+            "start_at": float(request["start_at"]),
+            "created_at": now,
+            "updated_at": now,
+            "message": "Scheduled",
+            "request": saved,
+            "subject": {
+                key: pr.get(key)
+                for key in ("kind", "repo", "number", "title", "url", "short_id")
+                if pr.get(key) is not None
+            },
+        }
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            (pending,) = db.execute(
+                "SELECT count(*) FROM scheduled WHERE json_extract(data,'$.status')='scheduled'"
+            ).fetchone()
+            if pending >= SCHEDULE_PENDING_LIMIT:
+                raise ValueError(
+                    f"At most {SCHEDULE_PENDING_LIMIT} tasks can wait to start; cancel one first"
+                )
+            db.execute("INSERT INTO scheduled VALUES (?,?)", (task["id"], json.dumps(task)))
+        self.wake.set()
+        return task
+
+    def save_scheduled(self, db, task, **changes):
+        task.update(changes, updated_at=time.time())
+        db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), task["id"]))
+        # Keep every pending task and only the most recent finished ones.
+        db.execute(
+            """DELETE FROM scheduled WHERE json_extract(data,'$.status')!='scheduled'
+               AND id NOT IN (SELECT id FROM scheduled
+                              WHERE json_extract(data,'$.status')!='scheduled'
+                              ORDER BY json_extract(data,'$.updated_at') DESC LIMIT ?)""",
+            (SCHEDULE_HISTORY,),
+        )
+
+    def scheduled_tasks(self):
+        """Pending tasks soonest first, then recently finished ones newest first."""
+        with self.db() as db:
+            tasks = [json.loads(data) for (data,) in db.execute("SELECT data FROM scheduled")]
+            started = [t["operation_id"] for t in tasks if t.get("operation_id")]
+            history = dict(
+                db.execute(
+                    f"SELECT id,data FROM operation_history WHERE id IN ({','.join('?' * len(started))})",
+                    started,
+                ).fetchall()
+            )
+        for task in tasks:
+            # The launch's own progress, so the list shows whether its agent came up.
+            if task.get("operation_id") in history:
+                op = json.loads(history[task["operation_id"]])
+                result = op.get("result") or {}
+                task["operation"] = {
+                    "status": op.get("status"),
+                    "message": op.get("message"),
+                    "url": result.get("url"),
+                }
+        pending = sorted(
+            (t for t in tasks if t["status"] == "scheduled"), key=lambda t: t["start_at"]
+        )
+        done = sorted(
+            (t for t in tasks if t["status"] != "scheduled"),
+            key=lambda t: t["updated_at"],
+            reverse=True,
+        )
+        return {"enabled": True, "time": time.time(), "tasks": pending + done}
+
+    def cancel_scheduled(self, key):
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM scheduled WHERE id=?", (key,)).fetchone()
+            if not row:
+                raise ValueError("Unknown scheduled task; refresh the dashboard")
+            task = json.loads(row[0])
+            if task["status"] != "scheduled":
+                raise ValueError(f"This task is already {task['status']} and cannot be cancelled")
+            self.save_scheduled(db, task, status="cancelled", message="Cancelled")
+        self.wake.set()
+        return task
+
+    def listed(self, task):
+        """Whether the list a task's item comes from has loaded since the dashboard started.
+
+        Until then a missing item says nothing about whether it is gone: a list restored
+        from the disk cache can predate the item.
+        """
+        kind = task["subject"].get("kind")
+        source = {"pr": self.overview, "issue": self.issues, "sentry": self.sentry}.get(kind)
+        return source is None or (source.snapshot().get("synced_at") or 0) > self.started_at
+
+    def run_due(self, now=None):
+        """Start every scheduled task whose time has come, one at a time."""
+        now = time.time() if now is None else now
+        with self.db() as db:
+            due = [
+                task
+                for task in (
+                    json.loads(data) for (data,) in db.execute("SELECT data FROM scheduled")
+                )
+                if task["status"] == "scheduled" and task["start_at"] <= now
+            ]
+        for key in [t["id"] for t in due if self.listed(t)]:
+            with self.db() as db:
+                # Claim under a write lock so a cancellation either wins or sees "starting".
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM scheduled WHERE id=?", (key,)).fetchone()
+                task = json.loads(row[0]) if row else None
+                if not task or task["status"] != "scheduled":
+                    continue
+                if now - task["start_at"] > SCHEDULE_MISSED_AFTER:
+                    self.save_scheduled(
+                        db,
+                        task,
+                        status="missed",
+                        message="Not started: it could not start within a day of its scheduled time",
+                    )
+                    continue
+                if task["target"] in self.workers:
+                    continue  # Another launch for this item is still running; try again later.
+                self.save_scheduled(db, task, status="starting", message="Starting")
+            try:
+                if not any(t["id"] == task["target"] for t in self.targets()):
+                    raise ValueError("the item is no longer listed on the dashboard")
+                value = self.action({**task["request"], "retry": True})
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                sqlite3.Error,
+                subprocess.SubprocessError,
+            ) as exc:
+                changes: dict = {"status": "failed", "message": f"Not started: {exc}"}
+            except Exception as exc:
+                # The launch may have begun; never retry it, as after a restart.
+                changes = {
+                    "status": "uncertain",
+                    "message": f"Starting failed unexpectedly ({exc}). Check the item's workspace before scheduling it again.",
+                }
+            else:
+                op = value.get("operation") or {}
+                if value.get("started"):
+                    changes = {
+                        "status": "started",
+                        "operation_id": op["id"],
+                        "launched_at": time.time(),
+                        "message": "Started",
+                    }
+                elif op.get("status") == "complete":
+                    changes = {
+                        "status": "failed",
+                        "message": "Not started: a workspace was already created for this item. Open it, or schedule Handle instead.",
+                    }
+                else:
+                    changes = {
+                        "status": "failed",
+                        "message": f"Not started: an earlier launch for this item is {op.get('status')} ({op.get('message')})",
+                    }
+            with self.db() as db:
+                self.save_scheduled(db, task, **changes)
+
+    def next_due(self):
+        with self.db() as db:
+            (due,) = db.execute(
+                "SELECT min(json_extract(data,'$.start_at')) FROM scheduled "
+                "WHERE json_extract(data,'$.status')='scheduled'"
+            ).fetchone()
+        return due
+
+    def start(self):
+        """Start the background thread that launches scheduled tasks."""
+        if self.scheduler is None:
+            self.scheduler = threading.Thread(target=self.schedule_loop, daemon=True)
+            self.scheduler.start()
+
+    def close(self):
+        self.stopping.set()
+        self.wake.set()
+
+    def schedule_loop(self):
+        while not self.stopping.is_set():
+            # Cleared before the pass, so a task scheduled during it wakes the next wait.
+            self.wake.clear()
+            try:
+                self.run_due()
+                due = self.next_due()
+            except Exception:
+                # The scheduler must outlive any single failure; the next pass retries.
+                due = None
+            now = time.time()
+            # A due task waiting on another launch for its item is rechecked every 5 seconds.
+            delay = SCHEDULE_POLL_SECONDS if due is None else 5 if due <= now else due - now
+            self.wake.wait(min(SCHEDULE_POLL_SECONDS, delay))
 
     def run_logged(self, op, *args, pass_fds=(), timeout=600, env=None):
         """Stream bounded command output into the operation database while it runs."""

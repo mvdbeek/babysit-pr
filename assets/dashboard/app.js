@@ -3,6 +3,10 @@ const $ = (id) => document.getElementById(id);
 const ended = new Set(["closed", "stopped"]);
 const attention = new Set(["blocked", "awaiting_release", "handoff"]);
 let navigationTarget = null;
+// Declared early: opening the dashboard on #scheduled refreshes it during startup.
+let scheduledData = null,
+  scheduledBusy = false;
+const scheduledCancelling = new Set();
 let data = null,
   selected = null,
   tab = "checks",
@@ -1609,7 +1613,7 @@ async function refresh() {
     busy = false;
   }
 }
-const pages = ["watcher", "prs", "issues", "workspaces", "upstream", "sentry"];
+const pages = ["watcher", "prs", "issues", "scheduled", "workspaces", "upstream", "sentry"];
 function showPage(name) {
   for (const page of pages) {
     const active = page === name;
@@ -1620,6 +1624,7 @@ function showPage(name) {
   $(`${name}-tab`).scrollIntoView({ block: "nearest", inline: "nearest" });
   if (name === "prs") prTable.render();
   if (name === "issues") issueTable.render();
+  if (name === "scheduled") void refreshScheduled();
   if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));
   if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
   if (name === "sentry") window.dispatchEvent(new Event("sentry-visible"));
@@ -1864,6 +1869,8 @@ function workspaceControls(item) {
     if (matches[0].linked_pr) cell.append(el("small", `Via PR #${matches[0].linked_pr}`));
   }
   if (info?.operation) cell.append(el("small", info.operation.message));
+  if (info?.scheduled?.length)
+    cell.append(el("small", `Scheduled for ${scheduleTime(info.scheduled[0].start_at)}`));
   return cell;
 }
 async function workspaceRequest(item, action, params = {}) {
@@ -2142,19 +2149,67 @@ async function workspaceDialog(item, handling = "") {
       form.append(settingsNote);
       field("Task", task);
       form.append(promptHistory(task));
-      const submit = el(
-        "button",
-        handling ? "Handle" : info.clones.length ? "Create workspace" : "Clone and create",
-      );
+      const later = el("input");
+      later.id = "workspace-later";
+      later.type = "checkbox";
+      const laterLabel = el("label", undefined, "workspace-later");
+      laterLabel.append(later, " Start later");
+      const startAt = el("input");
+      startAt.id = "workspace-start-at";
+      startAt.type = "datetime-local";
+      startAt.step = 60;
+      const startLabel = el("label", "Start at");
+      startLabel.htmlFor = startAt.id;
+      const startNote = el("small");
+      const startFields = el("div", undefined, "workspace-start");
+      startFields.append(startLabel, startAt, startNote);
+      startFields.hidden = true;
+      form.append(laterLabel, startFields);
+      for (const pending of info.scheduled ?? [])
+        form.append(el("small", `Already scheduled for ${scheduleTime(pending.start_at)}`));
+      const label = handling
+        ? "Handle"
+        : info.clones.length
+          ? "Create workspace"
+          : "Clone and create";
+      const submit = el("button", label);
       submit.dataset.handling = String(Boolean(handling));
       submit.type = "submit";
       submit.disabled = !info.clones.length && !info.destination;
       form.append(submit);
+      later.onchange = () => {
+        startFields.hidden = !later.checked;
+        submit.textContent = later.checked ? "Schedule" : label;
+        submit.dataset.later = String(later.checked);
+        updateWorkspaceOperation();
+        if (later.checked && !startAt.value) {
+          // Default to the next whole quarter hour at least an hour from now.
+          const start = new Date(Date.now() + 3600000);
+          start.setMinutes(Math.ceil(start.getMinutes() / 15) * 15, 0, 0);
+          startAt.value = localDateTime(start);
+        }
+        startAt.min = localDateTime(new Date());
+        startAt.max = localDateTime(new Date(Date.now() + 30 * 86400000));
+        startAt.oninput();
+      };
+      startAt.oninput = () => {
+        startAt.setCustomValidity("");
+        const start = new Date(startAt.value);
+        startNote.textContent = Number.isNaN(start.getTime())
+          ? ""
+          : `Starts ${until(start.getTime() / 1000)}, at ${scheduleTime(start.getTime() / 1000)} in this browser’s time zone.`;
+      };
       form.onsubmit = async (event) => {
         event.preventDefault();
         if (!task.value.trim()) {
           task.setCustomValidity("Enter a task");
           task.reportValidity();
+          return;
+        }
+        const start = later.checked ? new Date(startAt.value).getTime() / 1000 : null;
+        if (later.checked && !(start > Date.now() / 1000)) {
+          startAt.setCustomValidity("Choose a time in the future");
+          startAt.reportValidity();
           return;
         }
         submit.disabled = true;
@@ -2170,9 +2225,18 @@ async function workspaceDialog(item, handling = "") {
               task: task.value,
               ...(handling && task.value === handling ? { prefilled: true } : {}),
               ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
+              ...(later.checked ? { start_at: start } : {}),
               retry: workspaceInfo(item)?.operation?.status === "failed",
             },
           );
+          if (value.scheduled) {
+            // One click schedules one task; reopen the dialog to schedule another.
+            submit.dataset.scheduled = "true";
+            $("workspace-progress").textContent =
+              `Scheduled for ${scheduleTime(value.scheduled.start_at)}. Find it in the Scheduled tab.`;
+            void refreshScheduled();
+            return;
+          }
           setWorkspaceOperation(item, value.operation);
           updateWorkspaceOperation();
         } catch (error) {
@@ -2203,7 +2267,11 @@ function updateWorkspaceOperation() {
   const submit = $("workspace-content").querySelector("button[type=submit]");
   if (submit)
     submit.disabled =
-      op.status !== "failed" && !(submit.dataset.handling === "true" && op.status === "complete");
+      submit.dataset.scheduled === "true" ||
+      // A launch in progress does not block scheduling another for later.
+      (!(submit.dataset.later === "true" && ["queued", "running"].includes(op.status)) &&
+        op.status !== "failed" &&
+        !(submit.dataset.handling === "true" && op.status === "complete"));
   syncWorkspacePolling();
 }
 let workspacePoll = null;
@@ -2226,6 +2294,154 @@ $("workspace-dialog").onclose = syncWorkspacePolling;
 closeOnBackdropClick($("workspace-dialog"));
 setInterval(refreshWorkspaces, 15000);
 void refreshWorkspaces();
+
+function localDateTime(date) {
+  // The value format of a datetime-local input, in this browser's time zone.
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+function scheduleTime(seconds) {
+  return new Date(seconds * 1000).toLocaleString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+function until(seconds) {
+  const left = Math.round((seconds - Date.now() / 1000) / 60);
+  if (left < 1) return "now";
+  if (left < 60) return `in ${left} min`;
+  if (left < 48 * 60) {
+    const hours = Math.floor(left / 60);
+    return `in ${hours} h${left % 60 ? ` ${left % 60} min` : ""}`;
+  }
+  return `in ${Math.round(left / 1440)} days`;
+}
+const scheduledNames = {
+  scheduled: ["Waiting", "blue"],
+  starting: ["Starting", "blue"],
+  started: ["Started", "green"],
+  cancelled: ["Cancelled", ""],
+  failed: ["Not started", "red"],
+  missed: ["Missed", "amber"],
+  uncertain: ["Check workspace", "amber"],
+};
+function scheduledSubject(task) {
+  const subject = task.subject || {};
+  const name =
+    subject.kind === "sentry"
+      ? `${subject.repo} · ${subject.short_id}`
+      : `${subject.repo} #${subject.number}`;
+  const heading = el("div", undefined, "scheduled-subject");
+  heading.append(subject.url ? link(name, subject.url) : el("span", name));
+  if (subject.title) heading.append(el("span", subject.title, "scheduled-title"));
+  return heading;
+}
+function scheduledCard(task) {
+  const card = el("li", undefined, "scheduled-task");
+  card.dataset.status = task.status;
+  const [label, color] = scheduledNames[task.status] || [task.status, ""];
+  const head = el("div", undefined, "scheduled-when");
+  head.append(el("strong", scheduleTime(task.start_at)));
+  if (task.status === "scheduled") head.append(el("span", until(task.start_at), "pr-sync"));
+  head.append(el("span", label, `badge ${color}`));
+  card.append(head, scheduledSubject(task));
+  const request = task.request || {};
+  const action =
+    request.action === "handle"
+      ? "Handle"
+      : request.action === "clone-and-create"
+        ? "Clone and create workspace"
+        : "Create workspace";
+  const agent = request.agent === "claude" ? "Claude" : "Codex";
+  card.append(
+    el(
+      "small",
+      [action, agent, request.model, request.effort && `${request.effort} effort`]
+        .filter(Boolean)
+        .join(" · "),
+      "scheduled-settings",
+    ),
+  );
+  const details = el("details", undefined, "scheduled-text");
+  details.append(el("summary", "Task"), el("pre", request.task || ""));
+  card.append(details);
+  if (task.status !== "scheduled") {
+    const outcome = el("p", task.message, "scheduled-message");
+    if (task.launched_at) outcome.append(` at ${scheduleTime(task.launched_at)}`);
+    if (task.operation) outcome.append(` · ${task.operation.status}: ${task.operation.message}`);
+    card.append(outcome);
+    if (task.operation?.url) card.append(link("Open in Collie", task.operation.url));
+  } else {
+    const cancel = el("button", scheduledCancelling.has(task.id) ? "Cancelling…" : "Cancel");
+    cancel.type = "button";
+    cancel.disabled = scheduledCancelling.has(task.id);
+    cancel.onclick = () => cancelScheduled(task);
+    card.append(cancel);
+  }
+  return card;
+}
+function renderScheduled() {
+  const tasks = scheduledData?.tasks ?? [];
+  const pending = tasks.filter((task) => task.status === "scheduled");
+  const history = tasks.filter((task) => task.status !== "scheduled");
+  $("scheduled-tab").hidden = !scheduledData?.enabled;
+  $("scheduled-tab-count").hidden = !pending.length;
+  $("scheduled-tab-count").textContent = pending.length;
+  $("scheduled-count").textContent = pending.length;
+  $("scheduled-status").textContent = !scheduledData
+    ? "Loading scheduled tasks…"
+    : "Tasks start at their time while the dashboard is running. A task due while it was stopped starts when it returns, up to a day late.";
+  $("scheduled-pending").replaceChildren(...pending.map(scheduledCard));
+  $("scheduled-empty").hidden = !scheduledData || pending.length > 0;
+  $("scheduled-history-heading").hidden = !history.length;
+  $("scheduled-history").replaceChildren(...history.map(scheduledCard));
+}
+async function refreshScheduled() {
+  if (scheduledBusy || document.hidden) return;
+  scheduledBusy = true;
+  try {
+    scheduledData = await get("/api/scheduled-tasks");
+    $("scheduled-error").textContent = "";
+    // The tab only exists while workspace actions do; leave it if it disappears.
+    if (!scheduledData.enabled && !$("scheduled-panel").hidden) showPage("watcher");
+    renderScheduled();
+  } catch (error) {
+    $("scheduled-error").textContent = `Cannot load scheduled tasks: ${error.message}`;
+  } finally {
+    scheduledBusy = false;
+  }
+}
+async function cancelScheduled(task) {
+  if (scheduledCancelling.has(task.id)) return;
+  scheduledCancelling.add(task.id);
+  $("scheduled-error").textContent = "";
+  renderScheduled();
+  try {
+    const response = await fetch("/api/schedule-cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Babysit-Action": "schedule-cancel" },
+      body: JSON.stringify({ id: task.id }),
+    });
+    const value = await response.json();
+    if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+    scheduledData.tasks = scheduledData.tasks.map((t) => (t.id === task.id ? value.task : t));
+  } catch (error) {
+    $("scheduled-error").textContent = `Could not cancel: ${error.message}`;
+  } finally {
+    scheduledCancelling.delete(task.id);
+    renderScheduled();
+    void refreshScheduled();
+    void refreshWorkspaces();
+  }
+}
+setInterval(() => {
+  if (!$("scheduled-panel").hidden) renderScheduled(); // Keep "in N min" current.
+  void refreshScheduled();
+}, 15000);
+void refreshScheduled();
 
 let ciGeneration = 0;
 const ciTimers = new Set();

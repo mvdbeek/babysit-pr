@@ -260,6 +260,7 @@ class Handler(BaseHTTPRequestHandler):
                 "feedback",
                 "feedback-addressed",
                 "workspace-action",
+                "schedule-cancel",
                 "workspace-cleanup",
                 "workspace-open",
                 "workspace-prompt-forget",
@@ -354,6 +355,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.server.workspaces:
                     raise ValueError("Workspace actions are not enabled")
                 self.send_json(200, self.server.workspaces.action(request))
+                return
+            if action == "schedule-cancel":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(
+                    200, {"task": self.server.workspaces.cancel_scheduled(request["id"])}
+                )
                 return
             if action == "feedback":
                 job = handle_feedback(self.server.home, request["id"], request.get("token"))
@@ -509,6 +517,14 @@ class Handler(BaseHTTPRequestHandler):
                     200,
                     self.server.workspaces.prompts() if self.server.workspaces else {"prompts": []},
                 )
+            elif route.path == "/api/scheduled-tasks":
+                # Cheap: reads only the workspace database, so any tab may poll it.
+                self.send_json(
+                    200,
+                    self.server.workspaces.scheduled_tasks()
+                    if self.server.workspaces
+                    else {"enabled": False, "tasks": []},
+                )
             elif route.path == "/api/log":
                 query = parse_qs(route.query)
                 self.send_json(
@@ -592,6 +608,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
     ) as server:
         ci_logs.start()
         push.start()
+        workspaces.start()
         url = f"http://127.0.0.1:{server.server_port}"
         print(
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",
@@ -604,6 +621,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         except KeyboardInterrupt:
             pass
         finally:
+            workspaces.close()
             push.close()
             ci_logs.close()
 
