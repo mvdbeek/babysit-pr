@@ -1359,6 +1359,62 @@ def test_workspace_create_required_task_agent_progress_and_errors(
     )
 
 
+def test_workspace_previous_prompts_search_use_and_forget(page, dashboard_site, workspace_routes):
+    url, _ = dashboard_site
+    info, _, requests = workspace_routes
+    info["matches"] = []
+    prompts = [
+        {"text": "Review this PR\nfocus on tests", "uses": 3, "used_at": 1_700_000_000},
+        {"text": "Rebase onto main and fix conflicts", "uses": 1, "used_at": 1_690_000_000},
+    ]
+    loads, forgotten = [], []
+    page.route(
+        "**/api/workspace-prompts",
+        lambda route: (loads.append(1), route.fulfill(json={"prompts": prompts})),
+    )
+
+    def forget(route):
+        forgotten.append(route.request.post_data_json)
+        assert route.request.headers["x-babysit-action"] == "workspace-prompt-forget"
+        prompts[:] = [p for p in prompts if p["text"] != forgotten[-1]["text"]]
+        route.fulfill(json={"prompts": prompts})
+
+    page.route("**/api/workspace-prompt-forget", forget)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    assert not loads  # History loads only once the picker is opened.
+    dialog.get_by_text("Previous prompts", exact=True).click()
+    search = dialog.get_by_role("searchbox", name="Search previous prompts")
+    expect(search).to_be_focused()
+    expect(dialog.locator(".prompt-use")).to_have_count(2)
+    expect(dialog.locator(".prompt-history li").first).to_contain_text("Used 3 times")
+    search.fill("TESTS review")
+    expect(dialog.locator(".prompt-use")).to_have_count(1)
+    search.fill("nothing like this")
+    expect(dialog.get_by_text("No previous prompt matches.")).to_be_visible()
+    search.fill("review")
+    search.press("Enter")
+    task = dialog.get_by_label("Task", exact=True)
+    expect(task).to_have_value("Review this PR\nfocus on tests")
+    expect(task).to_be_focused()
+    assert not requests  # Picking a prompt never submits the form.
+    dialog.get_by_text("Previous prompts", exact=True).click()
+    search.fill("")
+    dialog.locator(".prompt-history li").filter(has_text="Rebase").get_by_role(
+        "button", name="Forget this prompt"
+    ).click()
+    expect(dialog.locator(".prompt-use")).to_have_count(1)
+    assert forgotten == [{"text": "Rebase onto main and fix conflicts"}]
+    assert len(loads) == 1
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Fetching PR")
+    assert requests[-1]["task"] == "Review this PR\nfocus on tests"
+    assert "prefilled" not in requests[-1]
+
+
 def test_workspace_dialog_closes_on_backdrop_click_and_polls_running_operation(
     page, dashboard_site, workspace_routes
 ):
@@ -2573,6 +2629,7 @@ def test_handle_shared_prompt_and_agent_controls(page, dashboard_site, request, 
     expect(page.locator("#workspace-progress")).to_contain_text("running")
     assert requests[-1]["action"] == "handle"
     assert requests[-1]["task"] == "Fix this and validate the regression"
+    assert "prefilled" not in requests[-1]  # Edited prefills join prompt history.
     assert requests[-1]["agent"] == "claude"
     assert requests[-1]["model"] == "opus"
     assert requests[-1]["effort"] == "high"
@@ -2656,6 +2713,7 @@ def test_handle_review_comments_for_authored_prs_with_feedback(
     expect(page.locator("#workspace-progress")).to_contain_text("running")
     assert requests[-1]["action"] == "handle" and requests[-1]["id"] == "pr-one"
     assert requests[-1]["task"].startswith("Address the review feedback")
+    assert requests[-1]["prefilled"] is True
 
 
 @pytest.mark.parametrize("width", [1440, 390])

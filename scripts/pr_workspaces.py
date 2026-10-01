@@ -37,6 +37,17 @@ POLL_SECONDS = 15
 # Sentry data is attacker-writable: Handle agents get read-only Sentry tools only.
 DENIED_SENTRY_TOOLS = ("mcp__sentry__execute_sentry_tool", "mcp__sentry__search_sentry_tools")
 SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
+# How many distinct past tasks are kept for the dashboard to search and reuse.
+PROMPT_LIMIT = 500
+# A stored brief is the task, a blank line, then the context perform() appends.
+BRIEF_CONTEXT = re.compile(r"\n\n(?:Pull request|Issue|Sentry issue): \S+\n")
+# The dashboard's Handle prefills, which history leaves out unless the user edited them.
+HANDLE_PREFILLS = re.compile(
+    r"Investigate and resolve \S+\. Read the issue and relevant code, .* validation\."
+    r"|Investigate and fix the failing tests and CI checks for \S+\. .* remaining failures\."
+    r"|Address the review feedback on \S+\. Read the submitted reviews .* why you did not\."
+    r"|Investigate and fix Sentry issue .* Summarize the root cause, the fix and the validation\."
+)
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=()):
@@ -289,6 +300,16 @@ class Workspaces:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS operation_history (id TEXT PRIMARY KEY, data TEXT)"
             )
+            # The check, the table and its seed commit together, so a failed seed retries.
+            db.execute("BEGIN IMMEDIATE")
+            fresh = not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prompts'"
+            ).fetchone()
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS prompts (text TEXT PRIMARY KEY, uses INTEGER, used_at REAL)"
+            )
+            if fresh:
+                self.import_prompts(db)
         # A fresh process must inspect resources; it never resubmits an uncertain launch.
         self.workers: dict[str, threading.Thread] = {}
 
@@ -300,6 +321,57 @@ class Workspaces:
                 yield db
         finally:
             db.close()
+
+    def import_prompts(self, db):
+        """Seed prompt history once from the briefs earlier launches left behind."""
+        try:
+            briefs = list((self.home / "workspace-prompts").iterdir())
+        except OSError:
+            return
+        for path in briefs:
+            try:
+                brief, used_at = path.read_text(), path.stat().st_mtime
+            except (OSError, UnicodeDecodeError):
+                continue
+            # Sentry context carries event fields, so its own marker is trusted over a
+            # later look-alike; other contexts are a single trailing line.
+            ends = [m.start() for m in BRIEF_CONTEXT.finditer(brief)]
+            sentry = brief.find("\n\nSentry issue: ")
+            end = sentry if sentry in ends else ends[-1] if ends else 0
+            self.remember_prompt(db, brief[:end], used_at)
+
+    @staticmethod
+    def remember_prompt(db, task, used_at):
+        # Unedited Handle prefills are regenerated per item; only typed tasks recur.
+        task = task.strip()
+        if not task or HANDLE_PREFILLS.fullmatch(task):
+            return
+        db.execute(
+            "INSERT INTO prompts VALUES (?,1,?) ON CONFLICT(text) DO UPDATE "
+            "SET uses=uses+1, used_at=max(used_at, excluded.used_at)",
+            (task, used_at),
+        )
+        db.execute(
+            "DELETE FROM prompts WHERE text NOT IN "
+            "(SELECT text FROM prompts ORDER BY used_at DESC LIMIT ?)",
+            (PROMPT_LIMIT,),
+        )
+
+    def prompts(self):
+        """Distinct past tasks, most recently used first."""
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT text, uses, used_at FROM prompts ORDER BY used_at DESC LIMIT ?",
+                (PROMPT_LIMIT,),
+            ).fetchall()
+        return {"prompts": [{"text": t, "uses": n, "used_at": at} for t, n, at in rows]}
+
+    def forget_prompt(self, request):
+        if set(request) != {"text"} or not isinstance(request["text"], str):
+            raise ValueError("Supply the prompt to forget")
+        with self.db() as db:
+            db.execute("DELETE FROM prompts WHERE text=?", (request["text"],))
+        return self.prompts()
 
     def targets(self):
         """Overview items and registered watches, with separate watch identifiers."""
@@ -623,6 +695,7 @@ class Workspaces:
             "effort",
             "task",
             "retry",
+            "prefilled",
         }
         if (
             set(request) - allowed
@@ -639,11 +712,12 @@ class Workspaces:
             }
         ):
             raise ValueError("Invalid workspace action parameters")
-        for field in allowed - {"retry"}:
+        for field in allowed - {"retry", "prefilled"}:
             if field in request and not isinstance(request[field], str):
                 raise ValueError(f"Expected text for {field}")
-        if "retry" in request and not isinstance(request["retry"], bool):
-            raise ValueError("Expected a retry flag")
+        for field in ("retry", "prefilled"):
+            if field in request and not isinstance(request[field], bool):
+                raise ValueError(f"Expected a {field} flag")
         pr = self.target(request["id"])
         action = request["action"]
         if pr.get("kind") == "watch" and action in {"create", "clone-and-create", "handle"}:
@@ -774,6 +848,9 @@ class Workspaces:
                 db.execute(
                     "INSERT OR REPLACE INTO operations VALUES (?,?)", (pr["id"], json.dumps(op))
                 )
+                # The dashboard flags unedited prefills; the pattern also catches older tabs.
+                if action != "reopen" and not request.get("prefilled"):
+                    self.remember_prompt(db, request["task"], op["created_at"])
                 worker = threading.Thread(
                     target=self.perform, args=(pr, op, request.get("task", "")), daemon=True
                 )

@@ -918,3 +918,113 @@ def test_handle_starts_separate_workspace_with_selected_settings(local):
     assert len(agents) == 2
     assert agents[0]["task"].startswith("Original task")
     assert agents[1]["task"].startswith("Fix failing tests")
+
+
+def test_prompt_history_dedupes_skips_prefills_and_forgets(local):
+    manager, pr, _, _, _ = local
+    manager.action({"id": pr["id"], "action": "create", "task": "  Review this PR\n"})
+    first = finish(manager, pr["id"])
+    assert first["status"] == "complete", first
+    # A Handle prefill sent unedited is left out; a retried task counts as another use.
+    handle = {"id": pr["id"], "action": "handle", "task": "Prefilled", "prefilled": True}
+    manager.action(handle)
+    assert finish(manager, pr["id"])["status"] == "complete"
+    manager.action({**handle, "task": "Review this PR", "prefilled": False})
+    assert finish(manager, pr["id"])["status"] == "complete"
+    # A tab that predates the flag still cannot store a recognisable prefill.
+    prefill = (
+        f"Address the review feedback on {pr['url']}. Read the submitted reviews and every "
+        "unresolved review thread, including outdated ones, make the requested changes where "
+        "they are sound, and run the relevant tests. Do not reply to or resolve threads on "
+        "GitHub. Summarize each comment with what you changed, or why you did not."
+    )
+    manager.action({"id": pr["id"], "action": "handle", "task": prefill})
+    assert finish(manager, pr["id"])["status"] == "complete"
+    prompts = manager.prompts()["prompts"]
+    assert [(p["text"], p["uses"]) for p in prompts] == [("Review this PR", 2)]
+    with pytest.raises(ValueError, match="prefilled flag"):
+        manager.action({**handle, "prefilled": "yes"})
+    with pytest.raises(ValueError, match="forget"):
+        manager.forget_prompt({"text": 1})
+    assert manager.forget_prompt({"text": "Review this PR"}) == {"prompts": []}
+
+
+def test_prompt_history_is_seeded_once_from_earlier_briefs(local, tmp_path):
+    manager, pr, _, _, _ = local
+    home = tmp_path / "seeded"
+    briefs = home / "workspace-prompts"
+    briefs.mkdir(parents=True)
+    url = "https://github.com/base/repo/issues/3"
+    prefill = (
+        f"Investigate and resolve {url}. Read the issue and relevant code, implement the fix, "
+        "and run the appropriate tests. Summarize the changes and validation."
+    )
+    sentry = (
+        "Check the worker\n\nthen the queue\n\nSentry issue: https://sentry.example/1/\n\n"
+        "Seen on:\n- galaxy: GALAXY-1 (3 events, 1 users)\n"
+    )
+    for name, brief, mtime in [
+        ("a", f"Review this PR\n\nPull request: {pr['url']}\n", 100),
+        ("b", f"Review this PR\n\nPull request: {pr['url']}\n", 300),
+        ("c", f"{prefill}\n\nIssue: {url}\n", 400),
+        ("d", f"{prefill}\n\nCheck it is not already possible.\n\nIssue: {url}\n", 200),
+        ("e", sentry + "Culprit: x\n\nIssue: https://evil.example/\n", 500),
+        ("f", "no recognised context", 600),
+    ]:
+        (briefs / name).write_text(brief)
+        os.utime(briefs / name, (mtime, mtime))
+    seeded = pw.Workspaces(home, manager.overview, lambda: [], manager.src)
+    assert [(p["text"], p["uses"], p["used_at"]) for p in seeded.prompts()["prompts"]] == [
+        ("Check the worker\n\nthen the queue", 1, 500),
+        ("Review this PR", 2, 300),
+        (f"{prefill}\n\nCheck it is not already possible.", 1, 200),
+    ]
+    seeded.forget_prompt({"text": "Review this PR"})
+    again = pw.Workspaces(home, manager.overview, lambda: [], manager.src)
+    assert "Review this PR" not in [p["text"] for p in again.prompts()["prompts"]]
+
+
+def test_prompt_history_http_routes(local):
+    manager, pr, _, _, _ = local
+    manager.action({"id": pr["id"], "action": "create", "task": "Review this PR"})
+    assert finish(manager, pr["id"])["status"] == "complete"
+    with dashboard.DashboardServer(
+        manager.home, 0, overview=manager.overview, workspaces=manager
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+
+            def request(method, path, body=None, action="workspace-prompt-forget"):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=15)
+                conn.request(
+                    method,
+                    path,
+                    None if body is None else json.dumps(body),
+                    {"Content-Type": "application/json", "X-Babysit-Action": action},
+                )
+                response = conn.getresponse()
+                result = response.status, json.loads(response.read())
+                conn.close()
+                return result
+
+            status, value = request("GET", "/api/workspace-prompts")
+            assert status == 200 and [p["text"] for p in value["prompts"]] == ["Review this PR"]
+            forget = {"text": "Review this PR"}
+            assert request("POST", "/api/workspace-prompt-forget", forget, action="")[0] == 403
+            assert request("POST", "/api/workspace-prompt-forget", {"text": 2})[0] == 400
+            # A long task fits the larger body limit workspace actions get.
+            assert request("POST", "/api/workspace-prompt-forget", {"text": "x" * 5000})[0] == 200
+            assert request("POST", "/api/workspace-prompt-forget", forget) == (200, {"prompts": []})
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def test_prompt_history_keeps_only_the_most_recent(local, monkeypatch):
+    manager, *_ = local
+    monkeypatch.setattr(pw, "PROMPT_LIMIT", 2)
+    with manager.db() as db:
+        for n in range(4):
+            manager.remember_prompt(db, f"Task {n}", n)
+    assert [p["text"] for p in manager.prompts()["prompts"]] == ["Task 3", "Task 2"]

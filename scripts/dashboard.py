@@ -262,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-action",
                 "workspace-cleanup",
                 "workspace-open",
+                "workspace-prompt-forget",
                 "sentry-action",
                 "push-subscribe",
                 "push-unsubscribe",
@@ -286,7 +287,13 @@ class Handler(BaseHTTPRequestHandler):
                     200000
                     if action.startswith("push-")
                     or action
-                    in {"workspace-action", "workspace-cleanup", "workspace-open", "sentry-action"}
+                    in {
+                        "workspace-action",
+                        "workspace-cleanup",
+                        "workspace-open",
+                        "workspace-prompt-forget",
+                        "sentry-action",
+                    }
                     else 1024
                 )
                 or self.headers.get("Content-Type") != "application/json"
@@ -335,6 +342,11 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     value = {"error": "Workspace experiment unavailable"}
                 self.send_json(200, value)
+                return
+            if action == "workspace-prompt-forget":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(200, self.server.workspaces.forget_prompt(request))
                 return
             if not isinstance(request.get("id"), str) or not request["id"]:
                 raise ValueError("Supply a watch ID")
@@ -491,6 +503,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.workspaces.snapshot()
                     if self.server.workspaces
                     else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
+                )
+            elif route.path == "/api/workspace-prompts":
+                self.send_json(
+                    200,
+                    self.server.workspaces.prompts() if self.server.workspaces else {"prompts": []},
                 )
             elif route.path == "/api/log":
                 query = parse_qs(route.query)
