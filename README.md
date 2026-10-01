@@ -242,6 +242,25 @@ starts a new workspace, including when a matching checkout already exists, so an
 existing agent keeps its task. An in-progress launch is reused; after completion,
 a later Handle submission can start another task in a separate checkout.
 
+### Scheduled tasks
+
+Tick **Start later** in the Create workspace, Clone and create, or Handle dialog to
+choose a start time (in the browser's time zone, up to 30 days ahead) and press
+**Schedule**. The request is checked as if it started now, then saved in the
+workspace database with the chosen clone, agent, model, effort and task; nothing is
+cloned or checked out until its time. A launch already running for the same item
+does not block scheduling: the task waits for it to finish, then starts.
+
+The **Scheduled** tab lists waiting tasks soonest first with **Cancel**, and the 50
+most recent outcomes: started (with the launch's progress and **Open in Collie**),
+cancelled, or not started with the reason, such as the item no longer being listed
+or a workspace already created for it. Rows with a waiting task show its start
+time. The dashboard process starts tasks, so it must be running: a task due while
+it was stopped starts when it returns, and one more than a day overdue is marked
+missed instead. If the dashboard stops while starting a task, the task is marked
+**Check workspace** and never started again automatically. At most 100 tasks can
+wait at once.
+
 One shared inventory refreshes every 15 seconds while the PR tab is visible.
 GitHub metadata, including head repository, branch and SHA, retains its five-minute
 refresh. Matches use saved associations, watcher bindings, or verified Git head

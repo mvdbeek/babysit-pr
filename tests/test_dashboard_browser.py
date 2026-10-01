@@ -2819,3 +2819,164 @@ def test_review_feedback_badge_shows_comments_as_text(
     ).click()
     expect(dialog.locator("#ci-title")).to_have_text("test/alpha #9 · Review feedback")
     expect(dialog.get_by_role("button", name="Handle review comments")).to_have_count(0)
+
+
+def test_handle_can_start_later_at_a_chosen_time(page, dashboard_site, workspace_routes):
+    info, snapshot, requests = workspace_routes
+    url, _ = dashboard_site
+
+    def action(route):
+        body = route.request.post_data_json
+        requests.append(body)
+        route.fulfill(json={"scheduled": {"id": "t1", "status": "scheduled", **body}})
+
+    page.route("**/api/workspace-action", action)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Handle failing tests").click()
+    dialog = page.locator("#workspace-dialog")
+    start = dialog.get_by_label("Start at")
+    expect(start).to_be_hidden()
+    dialog.get_by_label("Start later").check()
+    expect(start).to_be_visible()
+    assert start.input_value()  # Prefilled about an hour ahead.
+    expect(dialog.get_by_role("button", name="Schedule", exact=True)).to_be_visible()
+    # A time in the past is refused in the browser and never sent.
+    start.fill("2020-01-01T09:00")
+    dialog.get_by_role("button", name="Schedule", exact=True).click()
+    assert not requests
+    chosen = page.evaluate(
+        """() => {
+          const d = new Date(Date.now() + 2 * 86400000);
+          d.setHours(9, 30, 0, 0);
+          const pad = (n) => String(n).padStart(2, "0");
+          return [`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T09:30`,
+                  d.getTime() / 1000];
+        }"""
+    )
+    start.fill(chosen[0])
+    expect(dialog).to_contain_text("in this browser’s time zone")
+    page.screenshot(path="reports/schedule-dialog.png")
+    dialog.get_by_role("button", name="Schedule", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Scheduled for")
+    assert requests[-1]["action"] == "handle"
+    assert requests[-1]["start_at"] == chosen[1]
+    assert requests[-1]["task"].startswith("Investigate and fix the failing tests")
+    expect(dialog.get_by_role("button", name="Schedule", exact=True)).to_be_disabled()
+    # A launch in progress blocks starting another now, but not scheduling one.
+    info["operation"] = {"id": "op1", "status": "running", "message": "Fetching", "log": ""}
+    page.locator("#workspace-close").click()
+    page.locator("#pr-list tr").first.get_by_role("button", name="Handle failing tests").click()
+    expect(dialog.get_by_role("button", name="Handle", exact=True)).to_be_disabled()
+    dialog.get_by_label("Start later").check()
+    expect(dialog.get_by_role("button", name="Schedule", exact=True)).to_be_enabled()
+    # Unticking returns to an immediate launch without a start time.
+    dialog.get_by_label("Start later").uncheck()
+    expect(dialog.get_by_role("button", name="Handle", exact=True)).to_be_disabled()
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
+    url, _ = dashboard_site
+    now = time.time()
+    request = {
+        "id": "pr-one",
+        "action": "handle",
+        "agent": "claude",
+        "model": "opus",
+        "effort": "high",
+        "task": '<img src=x onerror="window.injected=true"> Fix CI overnight',
+    }
+    subject = {
+        "kind": "pr",
+        "repo": "test/alpha",
+        "number": 8,
+        "title": '<img src=x onerror="window.injected=true"> Test PR',
+        "url": "https://github.com/test/alpha/pull/8",
+    }
+    tasks = [
+        {
+            "id": "later",
+            "status": "scheduled",
+            "start_at": now + 7200,
+            "updated_at": now,
+            "message": "Scheduled",
+            "request": request,
+            "subject": subject,
+        },
+        {
+            "id": "done",
+            "status": "started",
+            "start_at": now - 3600,
+            "launched_at": now - 3590,
+            "updated_at": now - 3590,
+            "message": "Started",
+            "request": {**request, "action": "create", "agent": "codex", "model": None},
+            "subject": {**subject, "number": 9, "repo": "test/beta"},
+            "operation": {
+                "status": "complete",
+                "message": "Workspace ready",
+                "url": "https://collie.example.ts.net/space/w5",
+            },
+        },
+        {
+            "id": "gone",
+            "status": "failed",
+            "start_at": now - 7200,
+            "updated_at": now - 7200,
+            "message": "Not started: the item is no longer listed on the dashboard",
+            "request": request,
+            "subject": {"kind": "sentry", "repo": "test/gamma", "short_id": "GAMMA-1"},
+        },
+    ]
+    cancels = []
+    page.route(
+        "**/api/scheduled-tasks",
+        lambda route: route.fulfill(json={"enabled": True, "time": now, "tasks": tasks}),
+    )
+
+    def cancel(route):
+        body = route.request.post_data_json
+        cancels.append((route.request.headers.get("x-babysit-action"), body))
+        tasks[0] = {**tasks[0], "status": "cancelled", "message": "Cancelled"}
+        route.fulfill(json={"task": tasks[0]})
+
+    page.route("**/api/schedule-cancel", cancel)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url)
+    tab = page.get_by_role("tab", name="Scheduled 1")
+    tab.click()
+    expect(page).to_have_url(url + "/#scheduled")
+    pending = page.locator("#scheduled-pending li")
+    expect(pending).to_have_count(1)
+    expect(pending).to_contain_text("in 2 h")
+    expect(pending).to_contain_text("Handle · Claude · opus · high effort")
+    expect(pending.get_by_role("link", name="test/alpha #8")).to_have_attribute(
+        "href", "https://github.com/test/alpha/pull/8"
+    )
+    history = page.locator("#scheduled-history li")
+    expect(history).to_have_count(2)
+    expect(history.first).to_contain_text("Started at")
+    expect(history.first).to_contain_text("complete: Workspace ready")
+    expect(history.first.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://collie.example.ts.net/space/w5"
+    )
+    expect(history.last).to_contain_text("test/gamma · GAMMA-1")
+    expect(history.last).to_contain_text("no longer listed")
+    expect(history.get_by_role("button", name="Cancel")).to_have_count(0)
+    assert page.locator("#scheduled-panel img").count() == 0
+    assert not page.evaluate("window.injected")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/scheduled-tasks-{width}.png", full_page=True)
+    pending.get_by_role("button", name="Cancel").click()
+    expect(page.locator("#scheduled-history li")).to_have_count(3)
+    expect(page.locator("#scheduled-pending li")).to_have_count(0)
+    expect(page.locator("#scheduled-empty")).to_be_visible()
+    expect(page.get_by_role("tab", name="Scheduled", exact=True)).to_be_visible()
+    assert cancels == [("schedule-cancel", {"id": "later"})]
+
+
+def test_scheduled_tab_is_hidden_without_workspace_actions(page, dashboard_site):
+    url, _ = dashboard_site
+    page.goto(url + "/#scheduled")
+    expect(page.locator("#watcher-panel")).to_be_visible()
+    expect(page.get_by_role("tab", name="Scheduled")).to_be_hidden()

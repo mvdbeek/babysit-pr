@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import dashboard
@@ -1028,3 +1029,297 @@ def test_prompt_history_keeps_only_the_most_recent(local, monkeypatch):
         for n in range(4):
             manager.remember_prompt(db, f"Task {n}", n)
     assert [p["text"] for p in manager.prompts()["prompts"]] == ["Task 3", "Task 2"]
+
+
+def scheduled(manager, pr, start_at, **extra):
+    request = {"id": pr["id"], "action": "create", "task": "Later task", **extra}
+    return manager.action({**request, "start_at": start_at})["scheduled"]
+
+
+def scheduled_task(manager, key):
+    return next(t for t in manager.scheduled_tasks()["tasks"] if t["id"] == key)
+
+
+@pytest.fixture
+def synced(local):
+    manager, pr, git, state, jobs = local
+    manager.overview.value["synced_at"] = time.time()
+    manager.issues.value["synced_at"] = time.time()
+    return local
+
+
+def test_scheduled_task_starts_at_its_time_with_the_chosen_settings(synced):
+    manager, pr, _, state, _ = synced
+    start = time.time() + 3600
+    task = scheduled(manager, pr, start, agent="claude", model="opus", effort="high")
+    assert task["status"] == "scheduled" and task["subject"]["url"] == pr["url"]
+    assert task["request"]["clone"] == str(manager.src / "repo")
+    assert not json.loads(state.read_text())["agents"]
+    assert manager.operation(pr["id"]) is None
+    described = manager.describe(pr, manager.scan())
+    assert described["scheduled"] == [{"id": task["id"], "start_at": start}]
+
+    manager.run_due(now=start - 1)
+    assert scheduled_task(manager, task["id"])["status"] == "scheduled"
+    assert not json.loads(state.read_text())["agents"]
+
+    manager.run_due(now=start)
+    started = scheduled_task(manager, task["id"])
+    assert started["status"] == "started" and started["message"] == "Started"
+    op = finish(manager, pr["id"])
+    assert op["status"] == "complete", op["log"]
+    assert started["operation_id"] == op["id"]
+    assert (op["agent"], op["model"], op["effort"]) == ("claude", "opus", "high")
+    agents = json.loads(state.read_text())["agents"]
+    assert len(agents) == 1 and agents[0]["task"].startswith("Later task")
+    listed = scheduled_task(manager, task["id"])
+    assert listed["operation"]["status"] == "complete"
+    assert listed["operation"]["url"].endswith(op["result"]["workspace_id"])
+    assert manager.describe(pr, manager.scan())["scheduled"] == []
+    # A started task never runs twice.
+    manager.run_due(now=start + 60)
+    assert len(json.loads(state.read_text())["agents"]) == 1
+
+
+def test_scheduling_does_not_wait_for_or_block_a_running_launch(synced):
+    manager, pr, _, state, _ = synced
+    issue = issue_of(manager)
+    manager.action({"id": issue["id"], "action": "create", "task": "Now"})
+    # The issue's launch is still running; a Handle can still be scheduled for later.
+    task = scheduled(manager, issue, time.time() - 30, action="handle")
+    assert issue["id"] in manager.workers
+    manager.run_due()
+    assert scheduled_task(manager, task["id"])["status"] == "scheduled"
+    assert finish(manager, issue["id"])["status"] == "complete"
+    manager.run_due()
+    assert scheduled_task(manager, task["id"])["status"] == "started"
+    assert finish(manager, issue["id"])["status"] == "complete"
+    assert len(json.loads(state.read_text())["agents"]) == 2
+
+
+def test_cancelled_task_never_starts_and_cannot_be_cancelled_twice(synced):
+    manager, pr, _, state, _ = synced
+    task = scheduled(manager, pr, time.time() + 60)
+    assert manager.cancel_scheduled(task["id"])["status"] == "cancelled"
+    manager.run_due(now=time.time() + 120)
+    assert scheduled_task(manager, task["id"])["status"] == "cancelled"
+    assert manager.operation(pr["id"]) is None
+    with pytest.raises(ValueError, match="already cancelled"):
+        manager.cancel_scheduled(task["id"])
+    with pytest.raises(ValueError, match="Unknown scheduled task"):
+        manager.cancel_scheduled("missing")
+
+
+@pytest.mark.parametrize(
+    "start,action,error",
+    [
+        (True, "create", "start time"),
+        ("soon", "create", "start time"),
+        (float("nan"), "create", "start time"),
+        (-120, "create", "start time"),
+        (86400 * 31, "create", "start time"),
+        (60, "reopen", "Only tasks that start an agent"),
+    ],
+)
+def test_schedule_validation_has_no_side_effects(synced, start, action, error):
+    manager, pr, _, state, _ = synced
+    relative = isinstance(start, (int, float)) and not isinstance(start, bool)
+    request = {
+        "id": pr["id"],
+        "action": action,
+        "task": "x",
+        "start_at": time.time() + start if relative else start,
+    }
+    with pytest.raises(ValueError, match=error):
+        manager.action(request)
+    assert manager.scheduled_tasks()["tasks"] == []
+    assert manager.operation(pr["id"]) is None
+
+
+def test_schedule_validates_the_launch_before_recording_it(synced):
+    manager, pr, _, _, _ = synced
+    with pytest.raises(ValueError, match="Supply a task"):
+        manager.action({"id": pr["id"], "action": "create", "task": " ", "start_at": time.time()})
+    with pytest.raises(ValueError, match="Choose a verified local clone"):
+        scheduled(manager, pr, time.time() + 60, clone="/elsewhere")
+    assert manager.scheduled_tasks()["tasks"] == []
+
+
+def test_overdue_task_starts_late_but_one_missed_by_a_day_does_not(synced):
+    manager, pr, _, state, _ = synced
+    late = scheduled(manager, pr, time.time())
+    manager.run_due(now=time.time() + 3600)
+    assert scheduled_task(manager, late["id"])["status"] == "started"
+    assert finish(manager, pr["id"])["status"] == "complete"
+    issue = issue_of(manager)
+    missed = scheduled(manager, issue, time.time())
+    manager.run_due(now=time.time() + pw.SCHEDULE_MISSED_AFTER + 60)
+    assert scheduled_task(manager, missed["id"])["status"] == "missed"
+    assert manager.operation(issue["id"]) is None
+
+
+def test_task_waits_for_its_list_and_fails_when_the_item_is_gone(local):
+    manager, pr, _, state, _ = local
+    task = scheduled(manager, pr, time.time())
+    # A restarted dashboard has not listed PRs yet, or only from its disk cache:
+    # a missing PR proves nothing.
+    manager.overview.value["prs"] = []
+    manager.run_due()
+    assert scheduled_task(manager, task["id"])["status"] == "scheduled"
+    manager.overview.value["synced_at"] = manager.started_at - 60
+    manager.run_due()
+    assert scheduled_task(manager, task["id"])["status"] == "scheduled"
+    manager.overview.value["synced_at"] = time.time()
+    manager.run_due()
+    failed = scheduled_task(manager, task["id"])
+    assert failed["status"] == "failed" and "no longer listed" in failed["message"]
+    assert not json.loads(state.read_text())["agents"]
+
+
+def test_failed_launch_and_blocking_operation_are_reported(synced):
+    manager, pr, _, state, _ = synced
+    first = scheduled(manager, pr, time.time())
+    manager.action({"id": pr["id"], "action": "create", "task": "First"})
+    assert finish(manager, pr["id"])["status"] == "complete"
+    # A workspace exists now, so creating another one is refused when the task starts.
+    manager.run_due()
+    refused = scheduled_task(manager, first["id"])
+    assert refused["status"] == "failed" and "already created" in refused["message"]
+    task = scheduled(manager, issue_of(manager), time.time())
+    with manager.db() as db:
+        op = {"id": "stuck", "pr": "I_one", "status": "uncertain", "message": "Inspect it"}
+        db.execute("INSERT OR REPLACE INTO operations VALUES (?,?)", ("I_one", json.dumps(op)))
+    manager.run_due()
+    blocked = scheduled_task(manager, task["id"])
+    assert blocked["status"] == "failed" and "uncertain (Inspect it)" in blocked["message"]
+
+
+def test_unexpected_launch_error_is_uncertain_and_never_retried(synced, monkeypatch):
+    manager, pr, _, _, _ = synced
+    task = scheduled(manager, pr, time.time())
+
+    def broken(request):
+        raise RuntimeError("thread limit")
+
+    monkeypatch.setattr(manager, "action", broken)
+    manager.run_due()
+    result = scheduled_task(manager, task["id"])
+    assert result["status"] == "uncertain" and "thread limit" in result["message"]
+    monkeypatch.undo()
+    manager.run_due()
+    assert manager.operation(pr["id"]) is None
+
+
+def test_restart_marks_a_claimed_task_uncertain_and_never_starts_it(synced):
+    manager, pr, _, state, _ = synced
+    task = scheduled(manager, pr, time.time())
+    with manager.db() as db:
+        manager.save_scheduled(db, task, status="starting")
+    restarted = pw.Workspaces(
+        manager.home, manager.overview, lambda: [], manager.src, issues=manager.issues
+    )
+    restarted.run_due()
+    result = scheduled_task(restarted, task["id"])
+    assert result["status"] == "uncertain" and "Check the item's workspace" in result["message"]
+    assert restarted.operation(pr["id"]) is None
+
+
+def test_history_keeps_pending_tasks_and_recent_outcomes(synced, monkeypatch):
+    manager, pr, _, _, _ = synced
+    monkeypatch.setattr(pw, "SCHEDULE_HISTORY", 2)
+    keep = scheduled(manager, pr, time.time() + 600)
+    for _ in range(4):
+        manager.cancel_scheduled(scheduled(manager, pr, time.time() + 60)["id"])
+    tasks = manager.scheduled_tasks()["tasks"]
+    assert [t["status"] for t in tasks] == ["scheduled", "cancelled", "cancelled"]
+    assert tasks[0]["id"] == keep["id"]
+    monkeypatch.setattr(pw, "SCHEDULE_PENDING_LIMIT", 1)
+    with pytest.raises(ValueError, match="At most 1 tasks"):
+        scheduled(manager, pr, time.time() + 60)
+
+
+def test_scheduler_thread_starts_a_due_task(synced):
+    manager, pr, _, state, _ = synced
+    manager.start()
+    try:
+        task = scheduled(manager, pr, time.time())
+        for _ in range(100):
+            if scheduled_task(manager, task["id"])["status"] == "started":
+                break
+            time.sleep(0.1)
+        assert scheduled_task(manager, task["id"])["status"] == "started"
+        assert finish(manager, pr["id"])["status"] == "complete"
+    finally:
+        manager.close()
+        manager.scheduler.join(5)
+    assert not manager.scheduler.is_alive()
+
+
+def test_http_lists_and_cancels_scheduled_tasks(synced):
+    manager, pr, _, state, _ = synced
+    with dashboard.DashboardServer(
+        manager.home, 0, overview=manager.overview, workspaces=manager
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+
+            def request(method, path, action=None, body=None):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=15)
+                conn.request(
+                    method,
+                    path,
+                    json.dumps(body) if body else None,
+                    {"Content-Type": "application/json", "X-Babysit-Action": action or ""},
+                )
+                response = conn.getresponse()
+                result = response.status, json.loads(response.read())
+                conn.close()
+                return result
+
+            status, value = request(
+                "POST",
+                "/api/workspace-action",
+                "workspace-action",
+                {"id": pr["id"], "action": "create", "task": "Later", "start_at": time.time() + 60},
+            )
+            assert status == 200 and value["scheduled"]["status"] == "scheduled"
+            key = value["scheduled"]["id"]
+            status, listing = request("GET", "/api/scheduled-tasks")
+            assert status == 200 and listing["enabled"]
+            assert [t["id"] for t in listing["tasks"]] == [key]
+            # Cancellation needs the dashboard's own action header on its own path.
+            assert request("POST", "/api/schedule-cancel", None, {"id": key})[0] == 403
+            assert request("POST", "/api/schedule-cancel", "cancel", {"id": key})[0] == 404
+            status, value = request("POST", "/api/schedule-cancel", "schedule-cancel", {"id": key})
+            assert status == 200 and value["task"]["status"] == "cancelled"
+            status, value = request("POST", "/api/schedule-cancel", "schedule-cancel", {"id": key})
+            assert status == 400 and "already cancelled" in value["error"]
+            assert not json.loads(state.read_text())["agents"]
+        finally:
+            server.shutdown()
+            thread.join()
+    with dashboard.DashboardServer(manager.home, 0) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=15)
+            conn.request("GET", "/api/scheduled-tasks")
+            assert json.loads(conn.getresponse().read()) == {"enabled": False, "tasks": []}
+            conn.close()
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def test_scheduled_tasks_join_prompt_history_when_they_start(synced):
+    manager, pr, _, _, _ = synced
+    edited = scheduled(manager, pr, time.time(), task="Edited later task")
+    prefill = scheduled(manager, issue_of(manager), time.time(), action="handle", prefilled=True)
+    assert manager.prompts()["prompts"] == []
+    manager.run_due()
+    assert finish(manager, pr["id"])["status"] == "complete"
+    assert finish(manager, "I_one")["status"] == "complete"
+    assert scheduled_task(manager, edited["id"])["status"] == "started"
+    assert scheduled_task(manager, prefill["id"])["request"]["prefilled"] is True
+    assert [p["text"] for p in manager.prompts()["prompts"]] == ["Edited later task"]
