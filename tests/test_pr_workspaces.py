@@ -835,6 +835,55 @@ def test_codex_catalog_missing_malformed_and_hidden(local):
     }
 
 
+def test_codex_catalog_follows_the_installed_cli_version(local, monkeypatch):
+    import workspace_agents
+    from workspace_agents import catalog
+
+    manager = local[0]
+    cache = Path(os.environ["CODEX_HOME"]) / "models_cache.json"
+
+    def cached(version, *slugs):
+        models = [
+            {"slug": slug, "visibility": "list", "supported_reasoning_levels": [{"effort": "high"}]}
+            for slug in slugs
+        ]
+        cache.write_text(json.dumps({"client_version": version, "models": models}))
+
+    def installed(version):
+        monkeypatch.setenv("FAKE_AGENT_VERSION", f"codex-cli {version}")
+        workspace_agents._version.clear()
+
+    # A newer Codex (such as an auto-updated app-server daemon) cached models the
+    # installed CLI cannot use, and no list for the installed version is known yet.
+    installed("1.0.0")
+    cached("1.1.0", "newer-only")
+    choices = catalog(manager.home)["codex"]
+    assert choices["models"] == [] and "1.1.0" in choices["note"] and "1.0.0" in choices["note"]
+    with pytest.raises(ValueError, match="available model"):
+        manager.action({"id": "PR_one", "action": "create", "task": "Fix", "model": "newer-only"})
+    # The installed CLI's own catalog is offered and remembered ...
+    cached("1.0.0", "current")
+    assert [m["id"] for m in catalog(manager.home)["codex"]["models"]] == ["current"]
+    # ... and still offered while the other Codex owns the cache.
+    cached("1.1.0", "newer-only")
+    assert [m["id"] for m in catalog(manager.home)["codex"]["models"]] == ["current"]
+    assert "note" not in catalog(manager.home)["codex"]
+    manager.action({"id": "PR_one", "action": "create", "task": "Fix", "model": "current"})
+    op = finish(manager, "PR_one")
+    assert op["status"] == "complete", op["log"]
+    assert json.loads(local[3].read_text())["agents"][0]["argv"][:2] == ["--model", "current"]
+    # After upgrading the CLI, its own cache is accepted and the old list is not used.
+    installed("1.1.0")
+    assert [m["id"] for m in catalog(manager.home)["codex"]["models"]] == ["newer-only"]
+    # An unreadable version prefers the list last remembered for a known CLI ...
+    installed("unknown")
+    cached("2.0.0", "unverified")
+    assert [m["id"] for m in catalog(manager.home)["codex"]["models"]] == ["newer-only"]
+    # ... and only without one keeps the previous behaviour of trusting the cache.
+    (manager.home / workspace_agents.REMEMBERED).write_text('{"models": [{"id": "$(x)"}]}')
+    assert [m["id"] for m in catalog(manager.home)["codex"]["models"]] == ["unverified"]
+
+
 def test_pane_shell_agent_wrapper_applies_to_typed_command(local, monkeypatch, tmp_path):
     manager, _, _, state, _ = local
     # The helper types a bare `codex …` line into the pane's interactive shell, so the
@@ -1079,6 +1128,32 @@ def test_scheduled_task_starts_at_its_time_with_the_chosen_settings(synced):
     # A started task never runs twice.
     manager.run_due(now=start + 60)
     assert len(json.loads(state.read_text())["agents"]) == 1
+
+
+def test_scheduled_codex_model_is_rechecked_against_the_installed_cli(synced, monkeypatch):
+    import workspace_agents
+
+    manager, pr, _, state, _ = synced
+    monkeypatch.setenv("FAKE_AGENT_VERSION", "codex-cli 1.0.0")
+    workspace_agents._version.clear()
+    cache = Path(os.environ["CODEX_HOME"]) / "models_cache.json"
+    entry = {"visibility": "list", "supported_reasoning_levels": [{"effort": "high"}]}
+    cache.write_text(
+        json.dumps({"client_version": "1.0.0", "models": [{"slug": "fixture-codex", **entry}]})
+    )
+    start = time.time() + 3600
+    task = scheduled(manager, pr, start, agent="codex", model="fixture-codex")
+    # Meanwhile another Codex version rewrites the cache, and the installed CLI changes
+    # to one whose own catalog is not known: the saved model is no longer offered.
+    cache.write_text(
+        json.dumps({"client_version": "1.1.0", "models": [{"slug": "fixture-codex", **entry}]})
+    )
+    monkeypatch.setenv("FAKE_AGENT_VERSION", "codex-cli 0.9.0")
+    workspace_agents._version.clear()
+    manager.run_due(now=start)
+    failed = scheduled_task(manager, task["id"])
+    assert failed["status"] == "failed" and "available model" in failed["message"]
+    assert not json.loads(state.read_text())["agents"]
 
 
 def test_scheduling_does_not_wait_for_or_block_a_running_launch(synced):

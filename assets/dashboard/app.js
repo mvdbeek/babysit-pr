@@ -2136,6 +2136,7 @@ async function workspaceDialog(item, handling = "") {
         syncSelect(model);
         if (agent.value === "codex" && !choices?.models.length)
           settingsNote.textContent =
+            choices?.note ??
             "Default keeps your settings. Codex model choices need its local model cache.";
       }
       agent.onchange = updateModels;

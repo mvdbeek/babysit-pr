@@ -720,7 +720,7 @@ class Workspaces:
             described[key][target["id"]] = self.describe(target, inventory, state)
         return {
             **described,
-            "agent_choices": workspace_agents.catalog(),
+            "agent_choices": workspace_agents.catalog(self.home),
             "error": inventory["error"],
             "refreshing": self.refreshing,
             "synced_at": inventory["synced_at"],
@@ -867,6 +867,7 @@ class Workspaces:
                     request.get("agent", "codex"),
                     request.get("model", ""),
                     request.get("effort", ""),
+                    self.home,
                 )
                 if (
                     not request.get("task", "").strip()
