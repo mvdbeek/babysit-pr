@@ -65,6 +65,8 @@ p.write_text(json.dumps(data)); print(json.dumps({'result':result}))
 
 AGENT = """import json,os,sys
 from pathlib import Path
+if sys.argv[1:] == ['--version']:
+    print(os.environ.get('FAKE_AGENT_VERSION', 'fixture-cli 0.0.1')); sys.exit()
 p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
 data['agents'].append({'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]})
 p.write_text(json.dumps(data))

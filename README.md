@@ -326,10 +326,21 @@ remain in place. Open/reopen actions do not apply these settings to existing ses
 
 Codex choices come from picker-visible entries and supported reasoning levels in
 `$CODEX_HOME/models_cache.json` (normally `~/.codex/models_cache.json`). This is a
-read-only, local cache: the dashboard never starts Codex to discover models. A
-missing or incompatible cache leaves Default available; use Codex normally to
-populate its cache. Cache entries may become stale, and account/provider access is
-still enforced by Codex. No default model is inferred from cache ordering. Claude
+read-only, local cache: the dashboard never starts a Codex session to discover
+models. Codex fetches its catalog per client version and every Codex on the machine,
+including an auto-updated app-server daemon, rewrites the same cache, so the
+dashboard compares the cache's `client_version` with `codex --version` for the
+first `codex` on its PATH (re-checked every 10 minutes, sooner when that file is
+replaced).
+A matching list is offered and remembered in `codex-models.json` in the state
+directory; while a different version owns the cache, the remembered list for the
+installed CLI is offered instead, or only Default with a note when none is known.
+This keeps a model only a newer Codex accepts away from an older CLI, which rejects
+it as "not supported when using Codex with a ChatGPT account". When the version
+cannot be determined, the last remembered list is offered, or the cache as is. A missing or incompatible cache
+leaves Default available; use Codex normally to populate its cache. Cache entries
+may become stale, and account/provider access is still enforced by Codex. No
+default model is inferred from cache ordering. Claude
 choices use the documented `fable`, `opus`, `sonnet`, and `haiku` aliases; Haiku has
 no explicit effort choices. Aliases and supported levels require a current Claude
 Code CLI and may be restricted or remapped by local/provider configuration.
