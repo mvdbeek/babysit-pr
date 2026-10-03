@@ -55,7 +55,18 @@ VALUE_OPTIONS = {
     "--agent-arg": "agent_args",
 }
 WT_OPTIONS = frozenset(
-    {"--codex", "--claude", "--model", "--effort", "-r", "-p", "--prompt", "-F", "--prompt-file"}
+    {
+        "--codex",
+        "--claude",
+        "--docker",
+        "--model",
+        "--effort",
+        "-r",
+        "-p",
+        "--prompt",
+        "-F",
+        "--prompt-file",
+    }
 )
 DASHBOARD_OPTIONS = frozenset(
     {"--no-focus", "--name", "--label", "--repo-path", "--worktree-root", "--agent-arg"}
@@ -86,6 +97,7 @@ to it: wt() { local d; d="$(WT_MULTIPLEXER=none command wt "$@")" && cd "$d"; }
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of ~/src/galaxy
@@ -121,6 +133,7 @@ the branch is generated from the issue number and title (issue-<number>-<slug>).
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
@@ -145,6 +158,7 @@ handled by fetching the PR branch from the contributor repository.
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy
@@ -184,6 +198,7 @@ class Options:
 
     __slots__ = (
         "agent",
+        "docker",
         "repo",
         "repo_override",
         "prompt",
@@ -200,6 +215,7 @@ class Options:
 
     def __init__(self) -> None:
         self.agent = "claude"
+        self.docker = False
         self.repo = DEFAULT_REPO
         self.repo_override = False
         self.prompt = ""
@@ -245,6 +261,8 @@ def parse_args(
             options.agent = "codex"
         elif flag == "--claude":
             options.agent = "claude"
+        elif flag == "--docker":
+            options.docker = True
         elif flag == "--no-focus":
             options.focus = False
         else:
@@ -380,6 +398,7 @@ def agent_command(
     effort: str = "",
     stage: Callable[[str], str] = stage_prompt,
     extra: Sequence[str] = (),
+    docker: bool = False,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -393,8 +412,13 @@ def agent_command(
     ``agent … "$(cat '/path')"`` stays ~60 characters whatever the prompt's size, and
     command-substitution output is not re-scanned, so the content needs no escaping.
     Only the *path* is shell-quoted.
+
+    ``docker`` prefixes ``SAFE_ENABLE=docker``: the shell's ``safe`` wrapper around the
+    agent adds it to safehouse's ``--enable`` list, opening the Docker daemon socket.
     """
     command = " ".join(shlex.quote(word) for word in agent_words(agent, model, effort, extra))
+    if docker:
+        command = f"SAFE_ENABLE=docker {command}"
     if not prompt:
         return command
     # Extra words may end in a variadic option (Claude's --mcp-config <configs...>) that
@@ -732,6 +756,7 @@ class Tool:
             options.effort,
             self.stage,
             options.agent_args,
+            options.docker,
         )
 
     def open_session(self, options: Options, directory: str, name: str, repo_path: str) -> None:
