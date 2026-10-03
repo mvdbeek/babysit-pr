@@ -195,9 +195,17 @@ def configure(home, **changes):
     return directory
 
 
+class FrozenDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
+
+
 @pytest.fixture
 def plugin(tmp_path, monkeypatch):
     monkeypatch.delenv("SENTRY_ACCESS_TOKEN", raising=False)
+    # Fixture issues carry fixed dates; score them against NOW, not the wall clock.
+    monkeypatch.setattr(si, "datetime", FrozenDatetime)
     configure(tmp_path)
     fake, gh = FakeSentry(), FakeGh()
     value = si.SentryIssues(tmp_path, opener=fake, gh=gh)
