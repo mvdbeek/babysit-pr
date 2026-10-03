@@ -315,6 +315,17 @@ def test_agent_command_without_prompt_never_stages():
     )
 
 
+@pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
+def test_docker_prefixes_the_safehouse_enable_variable(command):
+    parsed = wt.parse_args(command, ["--docker", "--codex", "12"])
+    assert parsed.docker is True and parsed.agent == "codex"
+    assert wt.parse_args(command, ["12"]).docker is False
+    assert tool().command_for(options(docker=True, prompt="go")) == (
+        'SAFE_ENABLE=docker claude "$(cat /tmp/wt-prompt.fixture)"'
+    )
+    assert tool().command_for(options(prompt="go")) == 'claude "$(cat /tmp/wt-prompt.fixture)"'
+
+
 def test_agent_command_stages_prompt_and_quotes_only_the_path():
     staged = []
 

@@ -10,6 +10,7 @@ fi
 # Unattended repairs: git and gh inside the sandbox fail fast instead of prompting.
 quiet=$(printenv | sed -En 's/^(GIT_TERMINAL_PROMPT|GH_PROMPT_DISABLED|GH_NO_UPDATE_NOTIFIER|GCM_INTERACTIVE)=.*/\1/p' | paste -sd, -)
 [[ -z "$quiet" ]] || extra+=(--env-pass="$quiet")
+[[ -z "${SAFE_ENABLE:-}" ]] || extra+=(--enable="$SAFE_ENABLE")
 exec "$HOME/.local/bin/safehouse" --enable=playwright-chrome "${extra[@]}" \
   --append-profile "$HOME/.config/safehouse/python-ipc.sb" \
   claude --dangerously-skip-permissions "$@"
