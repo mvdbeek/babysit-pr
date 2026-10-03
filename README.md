@@ -261,6 +261,27 @@ missed instead. If the dashboard stops while starting a task, the task is marked
 **Check workspace** and never started again automatically. At most 100 tasks can
 wait at once.
 
+### Handling several issues
+
+Tick the checkbox beside each issue on the Issues tab, or **Select all shown** for
+the rows on screen, then press **Handle selected…**. The selection is
+kept across filters and refreshes. The dialog takes one agent, model, effort and
+task for the whole batch; `{url}` in the task becomes each issue's link. The issues
+start in table order, the first now (or at the **Start later** time) and each
+later one **Minutes between starts** after the previous; 0 starts them all at once.
+
+Each issue becomes its own scheduled Handle, so every one gets a separate worktree
+and agent and appears in the Scheduled tab, where it can be cancelled before it
+starts. An issue whose repository has several clones and no remembered choice asks
+for one; an issue that cannot start, such as one whose clone destinations are both
+taken, is listed as skipped. Issues that fail validation are reported and stay
+selected; the rest are scheduled and leave the selection. When several issues need
+the same new clone, the first clones it and the others wait for that clone, then
+start in it; a second repository of the same name is refused, since it would need
+that destination too. A batch takes at most 100 issues. Its task is remembered once
+in Previous prompts, as typed, when it is scheduled; `{url}` in a task picked in the
+single-item dialog becomes that item's link.
+
 One shared inventory refreshes every 15 seconds while the PR tab is visible.
 GitHub metadata, including head repository, branch and SHA, retains its five-minute
 refresh. Matches use saved associations, watcher bindings, or verified Git head

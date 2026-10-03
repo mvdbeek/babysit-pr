@@ -1151,6 +1151,63 @@ button:disabled {
 .workspace-start[hidden] {
   display: none;
 }
+.item-select {
+  width: 18px;
+  height: 18px;
+  margin: 5px;
+  accent-color: var(--green);
+}
+.batch-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 16px;
+}
+.batch-bar[hidden] {
+  display: none;
+}
+.batch-bar small {
+  color: var(--muted);
+}
+#issue-batch-handle {
+  margin-left: auto;
+}
+#workspace-dialog input[type="number"] {
+  width: 8em;
+  font: inherit;
+}
+.batch-items {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.batch-items li {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.batch-item-name {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.batch-item-name span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.batch-limit,
+.batch-items .batch-skipped .batch-item-when,
+.batch-items .batch-failed .batch-item-when {
+  color: var(--red);
+}
+.batch-items .batch-scheduled .batch-item-when {
+  color: var(--green);
+}
 .scheduled-heading {
   font-size: 14px;
   margin: 18px 0 8px;
@@ -1690,5 +1747,17 @@ button:disabled {
   }
   .metrics strong {
     font-size: 22px;
+  }
+}
+@media (max-width: 540px) {
+  .item-select {
+    flex: none;
+    margin: 13px;
+  }
+  .pr-table .item-pin-cell .item-pin {
+    flex: none;
+  }
+  #issue-batch-handle {
+    margin-left: 0;
   }
 }

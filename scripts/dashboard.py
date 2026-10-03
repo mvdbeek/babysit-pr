@@ -260,6 +260,7 @@ class Handler(BaseHTTPRequestHandler):
                 "feedback",
                 "feedback-addressed",
                 "workspace-action",
+                "workspace-batch",
                 "schedule-cancel",
                 "workspace-cleanup",
                 "workspace-open",
@@ -290,6 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                     or action
                     in {
                         "workspace-action",
+                        "workspace-batch",
                         "workspace-cleanup",
                         "workspace-open",
                         "workspace-prompt-forget",
@@ -348,6 +350,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.server.workspaces:
                     raise ValueError("Workspace actions are not enabled")
                 self.send_json(200, self.server.workspaces.forget_prompt(request))
+                return
+            if action == "workspace-batch":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(200, self.server.workspaces.batch(request))
                 return
             if not isinstance(request.get("id"), str) or not request["id"]:
                 raise ValueError("Supply a watch ID")

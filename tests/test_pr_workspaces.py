@@ -1398,3 +1398,210 @@ def test_scheduled_tasks_join_prompt_history_when_they_start(synced):
     assert scheduled_task(manager, edited["id"])["status"] == "started"
     assert scheduled_task(manager, prefill["id"])["request"]["prefilled"] is True
     assert [p["text"] for p in manager.prompts()["prompts"]] == ["Edited later task"]
+
+
+def second_issue(manager):
+    manager.issues.value["issues"].append(
+        {
+            "id": "I_two",
+            "repo": "base/repo",
+            "number": 13,
+            "title": "Slow exit",
+            "url": "https://github.com/base/repo/issues/13",
+            "linked_prs": [],
+        }
+    )
+
+
+def test_batch_handles_each_issue_in_its_own_workspace_at_staggered_times(synced):
+    manager, _, _, state, _ = synced
+    second_issue(manager)
+    start = time.time() + 60
+    value = manager.batch(
+        {
+            "items": [{"id": "I_one"}, {"id": "I_two"}],
+            "agent": "claude",
+            "task": "Resolve {url} carefully",
+            "start_at": start,
+            "interval": 1800,
+        }
+    )
+    tasks = [r["scheduled"] for r in value["results"]]
+    assert [r["id"] for r in value["results"]] == ["I_one", "I_two"]
+    assert [t["start_at"] for t in tasks] == [start, start + 1800]
+    assert [t["request"]["task"] for t in tasks] == [
+        "Resolve https://github.com/base/repo/issues/12 carefully",
+        "Resolve https://github.com/base/repo/issues/13 carefully",
+    ]
+    assert {t["request"]["action"] for t in tasks} == {"handle"}
+    assert {t["request"]["clone"] for t in tasks} == {str(manager.src / "repo")}
+    # The task is remembered once, as typed, rather than once per issue.
+    assert [p["text"] for p in manager.prompts()["prompts"]] == ["Resolve {url} carefully"]
+
+    manager.run_due(now=start)
+    assert scheduled_task(manager, tasks[0]["id"])["status"] == "started"
+    assert scheduled_task(manager, tasks[1]["id"])["status"] == "scheduled"
+    assert finish(manager, "I_one")["status"] == "complete"
+    manager.run_due(now=start + 1800)
+    assert scheduled_task(manager, tasks[1]["id"])["status"] == "started"
+    paths = {finish(manager, key)["path"] for key in ("I_one", "I_two")}
+    assert paths == {
+        str(manager.src / "worktrees/repo/issue-12-crash-on-start"),
+        str(manager.src / "worktrees/repo/issue-13-slow-exit"),
+    }
+    agents = json.loads(state.read_text())["agents"]
+    assert [a["agent"] for a in agents] == ["claude", "claude"]
+    assert [p["text"] for p in manager.prompts()["prompts"]] == ["Resolve {url} carefully"]
+
+
+def test_batch_starts_now_by_default_and_reports_items_it_cannot_schedule(synced):
+    manager, pr, _, _, _ = synced
+    second_issue(manager)
+    before = time.time()
+    value = manager.batch(
+        {
+            "items": [{"id": "I_one"}, {"id": "I_gone"}, {"id": "I_two"}],
+            "task": "Fix it",
+            "interval": 600,
+        }
+    )
+    first, gone, last = value["results"]
+    assert before <= first["scheduled"]["start_at"] <= time.time()
+    assert gone == {"id": "I_gone", "error": "Unknown PR or issue or watch; refresh the dashboard"}
+    assert last["scheduled"]["start_at"] == first["scheduled"]["start_at"] + 1200
+    # Each item is validated like a single Handle.
+    error = manager.batch({"items": [{"id": "I_one", "clone": "/elsewhere"}], "task": "Fix"})
+    assert error["results"] == [{"id": "I_one", "error": "Choose a verified local clone"}]
+
+
+@pytest.mark.parametrize(
+    "request_,error",
+    [
+        ({"items": []}, "Invalid batch"),
+        ({"items": [{"id": "I_one"}, {"id": "I_one"}]}, "Invalid batch"),
+        ({"items": [{"id": "I_one", "path": "/tmp"}]}, "Invalid batch"),
+        ({"items": [{"id": "I_one", "clone": ""}]}, "Invalid batch"),
+        ({"items": [{"id": "I_one"}], "action": "create"}, "Invalid batch"),
+        ({"items": [{"id": "I_one"}], "interval": 86401}, "at most a day"),
+        ({"items": [{"id": "I_one"}], "interval": -1}, "at most a day"),
+        ({"items": [{"id": "I_one"}], "interval": True}, "at most a day"),
+        ({"items": [{"id": "I_one"}], "start_at": "soon"}, "within the next 30 days"),
+        ({"items": [{"id": "I_one"}], "start_at": float("nan")}, "within the next 30 days"),
+        ({"items": [{"id": "I_one"}], "interval": float("inf")}, "at most a day"),
+        ({"items": [{"id": "I_one"}], "task": 5}, "Invalid batch"),
+        ({"items": [{"id": "I_one"}], "prefilled": "false"}, "Invalid batch"),
+        ({"items": [{"id": f"I_{n}"} for n in range(101)]}, "At most 100 tasks"),
+        ({"items": [{"id": "I_one"}], "start_at": 0}, "within the next 30 days"),
+        ({"items": [{"id": "I_one"}], "task": "  "}, "Supply a task"),
+        ({"items": [{"id": "I_one"}], "agent": "gpt"}, "Select Codex or Claude"),
+        ({"items": [{"id": "I_one"}], "model": "fixture-codex", "effort": "max"}, "effort"),
+    ],
+)
+def test_batch_validation_has_no_side_effects(synced, request_, error):
+    manager, _, _, state, _ = synced
+    with pytest.raises(ValueError, match=error):
+        manager.batch({"task": "Fix", **request_})
+    assert manager.scheduled_tasks()["tasks"] == []
+    assert manager.prompts()["prompts"] == []
+
+
+def test_batch_staggered_past_the_horizon_schedules_only_what_fits(synced):
+    manager, _, _, _, _ = synced
+    second_issue(manager)
+    value = manager.batch(
+        {
+            "items": [{"id": "I_one"}, {"id": "I_two"}],
+            "task": "Fix",
+            "start_at": time.time() + pw.SCHEDULE_HORIZON - 3600,
+            "interval": 7200,
+        }
+    )
+    assert "scheduled" in value["results"][0]
+    assert "within the next 30 days" in value["results"][1]["error"]
+
+
+def test_batch_items_without_a_clone_clone_once_and_share_it(synced):
+    manager, _, git, state, _ = synced
+    second_issue(manager)
+    git("remote", "set-url", "origin", "https://github.com/unrelated/repo.git")
+    destination = str(manager.src / "base--repo")
+    release = threading.Event()
+    perform = manager.perform
+
+    def held(*args):
+        release.wait(20)
+        return perform(*args)
+
+    manager.perform = held
+    value = manager.batch(
+        {
+            "items": [
+                {"id": "I_one", "destination": destination},
+                {"id": "I_two", "destination": destination},
+            ],
+            "task": "Fix",
+        }
+    )
+    first, second = (r["scheduled"] for r in value["results"])
+    manager.run_due()
+    # The second waits while the first clones the repository they share.
+    assert scheduled_task(manager, first["id"])["status"] == "started"
+    assert scheduled_task(manager, second["id"])["status"] == "scheduled"
+    release.set()
+    assert finish(manager, "I_one")["status"] == "complete"
+    manager.run_due()
+    assert scheduled_task(manager, second["id"])["status"] == "started"
+    op = finish(manager, "I_two")
+    assert op["status"] == "complete", op["log"]
+    assert op["clone"] == destination
+    assert not (manager.src / "base--repo-2").exists()
+    assert len(json.loads(state.read_text())["agents"]) == 2
+
+
+def test_http_dispatches_batches(synced):
+    manager, _, _, _, _ = synced
+    with dashboard.DashboardServer(
+        manager.home, 0, overview=manager.overview, workspaces=manager, issues=manager.issues
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=15)
+            body = {"items": [{"id": "I_one"}], "task": "Fix", "start_at": time.time() + 60}
+            conn.request(
+                "POST",
+                "/api/workspace-batch",
+                json.dumps(body),
+                {"Content-Type": "application/json", "X-Babysit-Action": "workspace-batch"},
+            )
+            response = conn.getresponse()
+            value = json.loads(response.read())
+            conn.close()
+            assert response.status == 200
+            assert value["results"][0]["scheduled"]["status"] == "scheduled"
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def test_batch_refuses_a_second_repository_cloning_into_the_same_destination(synced):
+    manager, _, git, _, _ = synced
+    second_issue(manager)
+    manager.issues.value["issues"][1].update(
+        repo="other/repo", url="https://github.com/other/repo/issues/13"
+    )
+    git("remote", "set-url", "origin", "https://github.com/unrelated/repo.git")
+    (manager.src / "repo").rename(manager.src / "unrelated")
+    destination = str(manager.src / "repo")
+    value = manager.batch(
+        {
+            "items": [
+                {"id": "I_one", "destination": destination},
+                {"id": "I_two", "destination": destination},
+            ],
+            "task": "Fix",
+        }
+    )
+    first, second = value["results"]
+    assert "scheduled" in first
+    assert second["error"].startswith(f"base/repo also clones into {destination}")

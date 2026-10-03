@@ -894,6 +894,8 @@ function itemTable(spec) {
     visits: new Map(),
     pins: new Map(),
     expandedDetails: new Set(),
+    // Ids chosen for a batch action, kept across filters, sorts and refreshes.
+    selected: new Set(),
     optionKeys: new Map(),
     limit: PAGE_SIZE,
   };
@@ -965,6 +967,35 @@ function itemTable(spec) {
       (moved || id("more-button")).focus();
     };
     return button;
+  }
+  function selectBox(item) {
+    const box = el("input", undefined, "item-select");
+    box.type = "checkbox";
+    box.dataset.itemId = item.id;
+    // The attribute, not just the property, so a changed selection replaces a stable row.
+    box.defaultChecked = table.selected.has(item.id);
+    box.setAttribute("aria-label", `Select ${spec.text.short} ${item.repo} #${item.number}`);
+    box.onchange = () => {
+      if (box.checked) table.selected.add(item.id);
+      else table.selected.delete(item.id);
+      render();
+      [...id("list").querySelectorAll(".item-select")]
+        .find((node) => node.dataset.itemId === item.id)
+        ?.focus();
+    };
+    return box;
+  }
+  // Pinned items first, then the chosen sort.
+  function ordered(list, pins = currentPins()) {
+    return list.sort(
+      (a, b) =>
+        Number(pins?.ids.has(b.id) || false) - Number(pins?.ids.has(a.id) || false) ||
+        compare(a, b),
+    );
+  }
+  // Selected items in the order the table lists them, including any filtered out.
+  function selection() {
+    return ordered(items().filter((item) => table.selected.has(item.id)));
   }
   function sortValue(item) {
     const column = table.sort;
@@ -1119,11 +1150,17 @@ function itemTable(spec) {
     const visible = all.filter(
       (item) => spec.visible(item, filters) && spec.searchText(item).toLowerCase().includes(query),
     );
-    visible.sort(
-      (a, b) =>
-        Number(pins?.ids.has(b.id) || false) - Number(pins?.ids.has(a.id) || false) ||
-        compare(a, b),
-    );
+    ordered(visible, pins);
+    table.shown = visible.slice(0, table.limit);
+    if (spec.batch) {
+      const known = new Set(all.map((item) => item.id));
+      for (const key of table.selected) if (!known.has(key)) table.selected.delete(key);
+      const count = table.selected.size;
+      id("batch").hidden = !count;
+      id("batch-count").textContent = `${count} selected`;
+      const hidden = selection().filter((item) => !visible.includes(item)).length;
+      id("batch-hidden").textContent = hidden ? `${hidden} not in this view` : "";
+    }
     pinStatus.hidden = !pins || pins.storage;
     pinStatus.textContent = pinStatus.hidden
       ? ""
@@ -1214,6 +1251,7 @@ function itemTable(spec) {
       dates.append(detailsToggle);
       const pinCell = el("td", undefined, "item-pin-cell");
       pinCell.append(pinButton(item, pins));
+      if (spec.batch) pinCell.append(selectBox(item));
       if (spec.key === "prs" && window.dashboardNotifications?.silenceButton)
         pinCell.append(window.dashboardNotifications.silenceButton(item.url));
       if (change) {
@@ -1244,6 +1282,7 @@ function itemTable(spec) {
       // Compare callback inputs too: identical markup can still carry new action data.
       const key = JSON.stringify([
         item,
+        table.selected.has(item.id),
         workspaceInfo(item),
         (item.linked_prs || []).map((pr) =>
           prTable.items().find((known) => known.repo === pr.repo && known.number === pr.number),
@@ -1340,6 +1379,21 @@ function itemTable(spec) {
   id("search").oninput = restart;
   for (const name of spec.filters) id(name).onchange = restart;
   id("more-button").onclick = showMore;
+  if (spec.batch) {
+    id("batch-all").onclick = () => {
+      for (const item of table.shown || []) table.selected.add(item.id);
+      render();
+    };
+    id("batch-clear").onclick = () => {
+      table.selected.clear();
+      render();
+    };
+    id("batch-handle").onclick = () =>
+      spec.batch(selection(), (done) => {
+        for (const key of done) table.selected.delete(key);
+        render();
+      });
+  }
   // A hidden sentinel never intersects, so this only fires with more rows to show.
   if (typeof IntersectionObserver === "function") {
     new IntersectionObserver((entries) => {
@@ -1501,6 +1555,7 @@ const issueTable = itemTable({
   dates: ["opened_at", "updated_at"],
   defaultSort: "updated_at",
   filters: ["role", "repo", "label", "linked"],
+  batch: (issues, done) => void batchDialog(issues, done),
   text: {
     short: "issue",
     open: "Open issues",
@@ -2022,6 +2077,104 @@ function promptHistory(task) {
   };
   return box;
 }
+// Agent, model and effort choices; the model and effort lists follow the agent.
+function agentFields() {
+  const agent = el("select");
+  agent.id = "workspace-agent";
+  for (const value of ["codex", "claude"]) {
+    const option = el("option", value === "codex" ? "Codex" : "Claude");
+    option.value = value;
+    agent.append(option);
+  }
+  const model = el("select");
+  model.id = "workspace-model";
+  const effort = el("select");
+  effort.id = "workspace-effort";
+  const settingsNote = el("small", "Default keeps the agent’s configured setting.");
+  function options(select, values) {
+    select.replaceChildren();
+    for (const value of ["", ...values]) {
+      const option = el("option", value || "Default");
+      option.value = value;
+      select.append(option);
+    }
+  }
+  function updateEfforts() {
+    const choices = workspaceData.agent_choices?.[agent.value];
+    const selected = choices?.models.find((choice) => choice.id === model.value);
+    const previous = effort.value;
+    options(effort, selected ? selected.efforts : (choices?.efforts ?? []));
+    if ([...effort.options].some((option) => option.value === previous)) effort.value = previous;
+    syncSelect(effort);
+    settingsNote.textContent =
+      !model.value && effort.value
+        ? "Effort support depends on the agent’s configured model."
+        : "Default keeps the agent’s configured setting.";
+  }
+  function updateModels() {
+    const choices = workspaceData.agent_choices?.[agent.value];
+    options(model, choices?.models.map((choice) => choice.id) ?? []);
+    effort.value = "";
+    updateEfforts();
+    syncSelect(model);
+    if (agent.value === "codex" && !choices?.models.length)
+      settingsNote.textContent =
+        choices?.note ??
+        "Default keeps your settings. Codex model choices need its local model cache.";
+  }
+  agent.onchange = updateModels;
+  model.onchange = updateEfforts;
+  effort.onchange = updateEfforts;
+  updateModels();
+  return { agent, model, effort, settingsNote };
+}
+// A Start later checkbox and the time it reveals. `startTime()` is null to start now,
+// the chosen time in seconds, or undefined after reporting an invalid time.
+function startLaterFields() {
+  const later = el("input");
+  later.id = "workspace-later";
+  later.type = "checkbox";
+  const laterLabel = el("label", undefined, "workspace-later");
+  laterLabel.append(later, " Start later");
+  const startAt = el("input");
+  startAt.id = "workspace-start-at";
+  startAt.type = "datetime-local";
+  startAt.step = 60;
+  const startLabel = el("label", "Start at");
+  startLabel.htmlFor = startAt.id;
+  const startNote = el("small");
+  const startFields = el("div", undefined, "workspace-start");
+  startFields.append(startLabel, startAt, startNote);
+  startFields.hidden = true;
+  later.addEventListener("change", () => {
+    startFields.hidden = !later.checked;
+    if (later.checked && !startAt.value) {
+      // Default to the next whole quarter hour at least an hour from now.
+      const start = new Date(Date.now() + 3600000);
+      start.setMinutes(Math.ceil(start.getMinutes() / 15) * 15, 0, 0);
+      startAt.value = localDateTime(start);
+    }
+    startAt.min = localDateTime(new Date());
+    startAt.max = localDateTime(new Date(Date.now() + 30 * 86400000));
+    startAt.dispatchEvent(new Event("input"));
+  });
+  startAt.addEventListener("input", () => {
+    startAt.setCustomValidity("");
+    const start = new Date(startAt.value);
+    startNote.textContent = Number.isNaN(start.getTime())
+      ? ""
+      : `Starts ${until(start.getTime() / 1000)}, at ${scheduleTime(start.getTime() / 1000)} in this browser’s time zone.`;
+  });
+  function startTime() {
+    if (!later.checked) return null;
+    const start = new Date(startAt.value).getTime() / 1000;
+    if (start > Date.now() / 1000) return start;
+    startAt.setCustomValidity("Choose a time in the future");
+    startAt.reportValidity();
+    return undefined;
+  }
+  return { later, laterLabel, startAt, startFields, startTime };
+}
 // `handling` is the prefilled task text of a Handle action, or empty for plain creation.
 async function workspaceDialog(item, handling = "") {
   workspaceDialogItem = item;
@@ -2095,54 +2248,7 @@ async function workspaceDialog(item, handling = "") {
         clone.value = "";
       }
       clone.required = true;
-      const agent = el("select");
-      agent.id = "workspace-agent";
-      for (const value of ["codex", "claude"]) {
-        const option = el("option", value === "codex" ? "Codex" : "Claude");
-        option.value = value;
-        agent.append(option);
-      }
-      const model = el("select");
-      model.id = "workspace-model";
-      const effort = el("select");
-      effort.id = "workspace-effort";
-      const settingsNote = el("small", "Default keeps the agent’s configured setting.");
-      function options(select, values) {
-        select.replaceChildren();
-        for (const value of ["", ...values]) {
-          const option = el("option", value || "Default");
-          option.value = value;
-          select.append(option);
-        }
-      }
-      function updateEfforts() {
-        const choices = workspaceData.agent_choices?.[agent.value];
-        const selected = choices?.models.find((choice) => choice.id === model.value);
-        const previous = effort.value;
-        options(effort, selected ? selected.efforts : (choices?.efforts ?? []));
-        if ([...effort.options].some((option) => option.value === previous))
-          effort.value = previous;
-        syncSelect(effort);
-        settingsNote.textContent =
-          !model.value && effort.value
-            ? "Effort support depends on the agent’s configured model."
-            : "Default keeps the agent’s configured setting.";
-      }
-      function updateModels() {
-        const choices = workspaceData.agent_choices?.[agent.value];
-        options(model, choices?.models.map((choice) => choice.id) ?? []);
-        effort.value = "";
-        updateEfforts();
-        syncSelect(model);
-        if (agent.value === "codex" && !choices?.models.length)
-          settingsNote.textContent =
-            choices?.note ??
-            "Default keeps your settings. Codex model choices need its local model cache.";
-      }
-      agent.onchange = updateModels;
-      model.onchange = updateEfforts;
-      effort.onchange = updateEfforts;
-      updateModels();
+      const { agent, model, effort, settingsNote } = agentFields();
       const task = el("textarea");
       task.id = "workspace-task";
       task.required = true;
@@ -2172,21 +2278,7 @@ async function workspaceDialog(item, handling = "") {
       form.append(settingsNote);
       field("Task", task);
       form.append(promptHistory(task));
-      const later = el("input");
-      later.id = "workspace-later";
-      later.type = "checkbox";
-      const laterLabel = el("label", undefined, "workspace-later");
-      laterLabel.append(later, " Start later");
-      const startAt = el("input");
-      startAt.id = "workspace-start-at";
-      startAt.type = "datetime-local";
-      startAt.step = 60;
-      const startLabel = el("label", "Start at");
-      startLabel.htmlFor = startAt.id;
-      const startNote = el("small");
-      const startFields = el("div", undefined, "workspace-start");
-      startFields.append(startLabel, startAt, startNote);
-      startFields.hidden = true;
+      const { later, laterLabel, startFields, startTime } = startLaterFields();
       form.append(laterLabel, startFields);
       for (const pending of info.scheduled ?? [])
         form.append(el("small", `Already scheduled for ${scheduleTime(pending.start_at)}`));
@@ -2200,28 +2292,11 @@ async function workspaceDialog(item, handling = "") {
       submit.type = "submit";
       submit.disabled = !info.clones.length && !info.destination;
       form.append(submit);
-      later.onchange = () => {
-        startFields.hidden = !later.checked;
+      later.addEventListener("change", () => {
         submit.textContent = later.checked ? "Schedule" : label;
         submit.dataset.later = String(later.checked);
         updateWorkspaceOperation();
-        if (later.checked && !startAt.value) {
-          // Default to the next whole quarter hour at least an hour from now.
-          const start = new Date(Date.now() + 3600000);
-          start.setMinutes(Math.ceil(start.getMinutes() / 15) * 15, 0, 0);
-          startAt.value = localDateTime(start);
-        }
-        startAt.min = localDateTime(new Date());
-        startAt.max = localDateTime(new Date(Date.now() + 30 * 86400000));
-        startAt.oninput();
-      };
-      startAt.oninput = () => {
-        startAt.setCustomValidity("");
-        const start = new Date(startAt.value);
-        startNote.textContent = Number.isNaN(start.getTime())
-          ? ""
-          : `Starts ${until(start.getTime() / 1000)}, at ${scheduleTime(start.getTime() / 1000)} in this browser’s time zone.`;
-      };
+      });
       form.onsubmit = async (event) => {
         event.preventDefault();
         if (!task.value.trim()) {
@@ -2229,12 +2304,8 @@ async function workspaceDialog(item, handling = "") {
           task.reportValidity();
           return;
         }
-        const start = later.checked ? new Date(startAt.value).getTime() / 1000 : null;
-        if (later.checked && !(start > Date.now() / 1000)) {
-          startAt.setCustomValidity("Choose a time in the future");
-          startAt.reportValidity();
-          return;
-        }
+        const start = startTime();
+        if (start === undefined) return;
         submit.disabled = true;
         $("workspace-error").textContent = "";
         try {
@@ -2245,10 +2316,10 @@ async function workspaceDialog(item, handling = "") {
               agent: agent.value,
               ...(model.value ? { model: model.value } : {}),
               ...(effort.value ? { effort: effort.value } : {}),
-              task: task.value,
+              task: task.value.replaceAll(BATCH_URL, item.url || BATCH_URL),
               ...(handling && task.value === handling ? { prefilled: true } : {}),
               ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
-              ...(later.checked ? { start_at: start } : {}),
+              ...(start ? { start_at: start } : {}),
               retry: workspaceInfo(item)?.operation?.status === "failed",
             },
           );
@@ -2276,6 +2347,215 @@ async function workspaceDialog(item, handling = "") {
         body.append(el("p", `Unverified branch-name suggestions: ${info.suggestions.join(", ")}`));
     }
     updateWorkspaceOperation();
+  } catch (error) {
+    workspaceError(error);
+  }
+}
+// Replaced by each issue's link when a batch is scheduled.
+const BATCH_URL = "{url}";
+// The scheduler's limit on waiting tasks.
+const BATCH_LIMIT = 100;
+// Handle several issues at once. Each gets its own worktree and agent through the
+// scheduler, `Minutes between starts` apart; `done` receives the ids that were scheduled.
+async function batchDialog(items, done) {
+  // Stands in for the dialog's item, so a dialog opened meanwhile wins the await below.
+  const owner = { batch: true };
+  workspaceDialogItem = owner;
+  $("workspace-title").textContent =
+    `Handle ${items.length} ${items.length === 1 ? "issue" : "issues"}`;
+  $("workspace-error").textContent = "";
+  $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
+  $("workspace-result").replaceChildren();
+  $("workspace-progress").textContent = "";
+  $("workspace-log").textContent = "";
+  if (!$("workspace-dialog").open) $("workspace-dialog").showModal();
+  try {
+    const fresh =
+      Date.now() - workspaceLoadedAt < 30000 &&
+      !workspaceData.error &&
+      workspaceData.synced_at != null;
+    if (!fresh) {
+      await loadWorkspaces();
+      if (workspaceDialogItem !== owner) return;
+    }
+    if (workspaceData.error) throw Error(workspaceData.error);
+    if (workspaceData.synced_at === null)
+      throw Error("Local discovery is still running. Try again in a moment.");
+    const form = el("form");
+    form.append(
+      el(
+        "p",
+        "Each issue gets its own worktree and agent. They start as scheduled tasks; follow them in the Scheduled tab.",
+      ),
+    );
+    function field(text, input) {
+      const label = el("label", text);
+      label.htmlFor = input.id;
+      form.append(label, input);
+    }
+    const { agent, model, effort, settingsNote } = agentFields();
+    field("Agent", agent);
+    field("Model (optional)", model);
+    field("Reasoning effort (optional)", effort);
+    form.append(settingsNote);
+    const template = handleTasks.issue[1](BATCH_URL);
+    const task = el("textarea");
+    task.id = "workspace-task";
+    task.required = true;
+    task.maxLength = 32000;
+    task.rows = 6;
+    task.value = template;
+    task.oninput = () => task.setCustomValidity("");
+    field("Task", task);
+    form.append(el("small", `${BATCH_URL} becomes each issue’s link.`), promptHistory(task));
+    const { later, laterLabel, startAt, startFields, startTime } = startLaterFields();
+    form.append(laterLabel, startFields);
+    const gap = el("input");
+    gap.id = "workspace-interval";
+    gap.type = "number";
+    gap.min = 0;
+    gap.max = 1440;
+    gap.step = 1;
+    gap.required = true;
+    gap.value = 30;
+    field("Minutes between starts", gap);
+    const list = el("ol", undefined, "batch-items");
+    const rows = items.map((item) => {
+      const info = workspaceInfo(item);
+      const row = el("li");
+      const name = el("div", undefined, "batch-item-name");
+      name.append(link(`${item.repo} #${item.number}`, item.url), el("span", item.title));
+      const when = el("small", undefined, "batch-item-when");
+      row.append(name, when);
+      const entry = { item, row, when, request: { id: item.id } };
+      if (!info) {
+        entry.skip = "Workspace discovery has not listed this issue yet.";
+      } else if (info.clones.length) {
+        const clone =
+          info.preferred_clone || (info.clones.length === 1 ? info.clones[0] : undefined);
+        if (clone) {
+          entry.request.clone = clone;
+          row.append(el("small", `In ${clone}`));
+        } else {
+          const select = el("select");
+          select.id = `batch-clone-${item.id}`;
+          select.required = true;
+          select.append(el("option", "Choose a local clone"));
+          select.firstChild.value = "";
+          for (const path of info.clones) {
+            const option = el("option", path);
+            option.value = path;
+            select.append(option);
+          }
+          const label = el("label", "Local clone");
+          label.htmlFor = select.id;
+          row.append(label, select);
+          entry.clone = select;
+        }
+      } else if (info.destination) {
+        entry.request.destination = info.destination;
+        row.append(el("small", `Clones ${item.repo} into ${info.destination}`));
+      } else {
+        entry.skip = "Both clone destinations already exist.";
+      }
+      if (info?.matches.length) row.append(el("small", "Has a workspace; this starts another."));
+      for (const pending of info?.scheduled ?? [])
+        row.append(el("small", `Already scheduled for ${scheduleTime(pending.start_at)}`));
+      if (entry.skip) {
+        row.classList.add("batch-skipped");
+        when.textContent = `Skipped: ${entry.skip}`;
+      }
+      list.append(row);
+      return entry;
+    });
+    const launching = rows.filter((entry) => !entry.skip);
+    form.append(list);
+    if (launching.length > BATCH_LIMIT)
+      form.append(
+        el(
+          "p",
+          `At most ${BATCH_LIMIT} tasks can wait to start. Select fewer issues.`,
+          "batch-limit",
+        ),
+      );
+    const submit = el(
+      "button",
+      `Schedule ${launching.length} ${launching.length === 1 ? "task" : "tasks"}`,
+    );
+    submit.type = "submit";
+    submit.disabled = !launching.length || launching.length > BATCH_LIMIT;
+    form.append(submit);
+    function updateTimes() {
+      const chosen = new Date(startAt.value).getTime();
+      const base = later.checked ? chosen : Date.now();
+      const minutes = Number(gap.value);
+      for (const [index, entry] of launching.entries()) {
+        entry.when.textContent =
+          !later.checked && (index === 0 || minutes === 0)
+            ? "Starts now"
+            : Number.isFinite(base) && gap.validity.valid
+              ? `Starts ${scheduleTime((base + index * minutes * 60000) / 1000)}`
+              : "";
+      }
+    }
+    later.addEventListener("change", updateTimes);
+    startAt.addEventListener("input", updateTimes);
+    gap.oninput = updateTimes;
+    updateTimes();
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      if (!task.value.trim()) {
+        task.setCustomValidity("Enter a task");
+        task.reportValidity();
+        return;
+      }
+      if (!gap.reportValidity()) return;
+      const start = startTime();
+      if (start === undefined) return;
+      submit.disabled = true;
+      $("workspace-error").textContent = "";
+      try {
+        const response = await fetch("/api/workspace-batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-batch" },
+          body: JSON.stringify({
+            items: launching.map((entry) =>
+              entry.clone ? { ...entry.request, clone: entry.clone.value } : entry.request,
+            ),
+            agent: agent.value,
+            ...(model.value ? { model: model.value } : {}),
+            ...(effort.value ? { effort: effort.value } : {}),
+            task: task.value,
+            ...(task.value === template ? { prefilled: true } : {}),
+            ...(start ? { start_at: start } : {}),
+            interval: Number(gap.value) * 60,
+          }),
+        });
+        const value = await response.json();
+        if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+        const scheduled = value.results.filter((result) => result.scheduled);
+        for (const result of value.results) {
+          const entry = launching.find((candidate) => candidate.item.id === result.id);
+          entry.when.textContent = result.scheduled
+            ? `Scheduled for ${scheduleTime(result.scheduled.start_at)}`
+            : `Not scheduled: ${result.error}`;
+          entry.row.classList.add(result.scheduled ? "batch-scheduled" : "batch-failed");
+        }
+        // One click schedules the batch; issues that failed stay selected to retry.
+        $("workspace-progress").textContent =
+          `Scheduled ${scheduled.length} of ${launching.length}. Find them in the Scheduled tab.`;
+        done(scheduled.map((result) => result.id));
+        void refreshScheduled();
+        void refreshWorkspaces();
+      } catch (error) {
+        workspaceError(error);
+        submit.disabled = false;
+      }
+    };
+    $("workspace-content").replaceChildren(form);
+    searchableSelect(model);
+    searchableSelect(effort);
+    for (const entry of rows) if (entry.clone) searchableSelect(entry.clone);
   } catch (error) {
     workspaceError(error);
   }

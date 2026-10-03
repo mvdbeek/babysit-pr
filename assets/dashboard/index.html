@@ -778,12 +778,19 @@
         <p id="issue-pins-status" class="pr-sync" role="status" hidden></p>
         <p id="issue-changes" class="pr-sync" role="status" hidden></p>
         <div id="issue-alert" class="alert" role="status" hidden></div>
+        <div id="issue-batch" class="batch-bar" hidden>
+          <span id="issue-batch-count" role="status"></span>
+          <small id="issue-batch-hidden"></small>
+          <button id="issue-batch-handle" type="button">Handle selected…</button>
+          <button id="issue-batch-all" type="button">Select all shown</button>
+          <button id="issue-batch-clear" type="button">Clear</button>
+        </div>
 
         <div class="pr-table-wrap">
           <table class="pr-table">
             <thead>
               <tr>
-                <th class="item-pin-cell" scope="col" aria-label="Pinned"></th>
+                <th class="item-pin-cell" scope="col" aria-label="Pinned and selected"></th>
                 <th id="issue-heading-repo" scope="col" aria-label="Repository" aria-sort="none">
                   <button id="issue-sort-repo" type="button" aria-label="Sort by Repository">
                     Repository
