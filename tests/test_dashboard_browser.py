@@ -2987,3 +2987,124 @@ def test_scheduled_tab_is_hidden_without_workspace_actions(page, dashboard_site)
     page.goto(url + "/#scheduled")
     expect(page.locator("#watcher-panel")).to_be_visible()
     expect(page.get_by_role("tab", name="Scheduled")).to_be_hidden()
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_batch_handle_selects_issues_and_staggers_their_starts(
+    page, dashboard_site, issue_workspace_routes, width
+):
+    url, _ = dashboard_site
+    _, snapshot, _ = issue_workspace_routes
+    snapshot["issues"]["issue-two"].update(
+        matches=[], clones=[], preferred_clone=None, destination="/fixture/src/beta"
+    )
+    batches = []
+
+    def batch(route):
+        body = route.request.post_data_json
+        batches.append(body)
+        route.fulfill(
+            json={
+                "results": [
+                    {
+                        "id": "issue-one",
+                        "scheduled": {"id": "t1", "status": "scheduled", "start_at": 2e9},
+                    },
+                    {"id": "issue-two", "error": "Choose a start time within the next 30 days"},
+                ]
+            }
+        )
+
+    page.route("**/api/workspace-batch", batch)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#issues")
+    bar = page.locator("#issue-batch")
+    expect(bar).to_be_hidden()
+    page.get_by_label("Select issue test/alpha #30").check()
+    expect(bar).to_be_visible()
+    expect(bar).to_contain_text("1 selected")
+    expect(page.get_by_label("Select issue test/alpha #30")).to_be_focused()
+    bar.get_by_role("button", name="Select all shown").click()
+    expect(bar).to_contain_text("2 selected")
+    # A selection survives filtering, and says how much of it is out of view.
+    if width < 540:
+        page.locator("#issue-filters-toggle").click()
+    choose_option(page.locator("#issue-repo").locator("..").get_by_role("combobox"), "test/beta")
+    expect(bar).to_contain_text("1 not in this view")
+    choose_option(page.locator("#issue-repo").locator("..").get_by_role("combobox"), "all")
+    bar.get_by_role("button", name="Handle selected…").click()
+
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog.locator("#workspace-title")).to_have_text("Handle 2 issues")
+    items = dialog.locator(".batch-items li")
+    expect(items).to_have_count(2)
+    expect(items.first).to_contain_text("test/alpha #30")
+    expect(items.first).to_contain_text("In /fixture/alpha")
+    expect(items.first).to_contain_text("Starts now")
+    expect(items.last).to_contain_text("Clones test/beta into /fixture/src/beta")
+    expect(items.last).to_contain_text("Starts ")
+    expect(items.last).not_to_contain_text("Starts now")
+    task = dialog.get_by_role("textbox", name="Task", exact=True)
+    assert task.input_value().startswith("Investigate and resolve {url}.")
+    assert page.evaluate("window.injected") is None
+    dialog.get_by_label("Minutes between starts").fill("0")
+    expect(items.last).to_contain_text("Starts now")
+    dialog.get_by_label("Minutes between starts").fill("45")
+    dialog.get_by_label("Start later").check()
+    expect(items.first).not_to_contain_text("Starts now")
+    page.screenshot(path=f"reports/batch-dialog-{width}.png")
+    dialog.get_by_role("button", name="Schedule 2 tasks").click()
+    expect(page.locator("#workspace-progress")).to_have_text(
+        "Scheduled 1 of 2. Find them in the Scheduled tab."
+    )
+    expect(items.first).to_contain_text("Scheduled for")
+    expect(items.last).to_contain_text("Not scheduled: Choose a start time")
+    expect(dialog.get_by_role("button", name="Schedule 2 tasks")).to_be_disabled()
+    (body,) = batches
+    assert body["items"] == [
+        {"id": "issue-one", "clone": "/fixture/alpha"},
+        {"id": "issue-two", "destination": "/fixture/src/beta"},
+    ]
+    assert body["interval"] == 2700 and body["agent"] == "codex"
+    assert body["prefilled"] is True and body["task"].startswith("Investigate and resolve {url}.")
+    assert body["start_at"] > time.time() + 3000
+    # Scheduled issues leave the selection; the one that failed stays to retry.
+    page.locator("#workspace-close").click()
+    expect(bar).to_contain_text("1 selected")
+    expect(page.get_by_label("Select issue test/beta #31")).to_be_checked()
+    expect(page.get_by_label("Select issue test/alpha #30")).not_to_be_checked()
+    bar.get_by_role("button", name="Clear").click()
+    expect(bar).to_be_hidden()
+
+
+def test_batch_needs_a_clone_choice_and_skips_issues_it_cannot_start(
+    page, dashboard_site, issue_workspace_routes
+):
+    url, _ = dashboard_site
+    _, snapshot, _ = issue_workspace_routes
+    snapshot["issues"]["issue-one"].update(
+        clones=["/fixture/a", "/fixture/b"], preferred_clone=None
+    )
+    snapshot["issues"]["issue-two"].update(matches=[], clones=[], destination=None)
+    batches = []
+
+    def batch(route):
+        batches.append(route.request.post_data_json)
+        route.fulfill(json={"results": [{"id": "issue-one", "scheduled": {"start_at": 2e9}}]})
+
+    page.route("**/api/workspace-batch", batch)
+    page.goto(url + "/#issues")
+    page.get_by_label("Select issue test/alpha #30").check()
+    page.get_by_label("Select issue test/beta #31").check()
+    page.locator("#issue-batch").get_by_role("button", name="Handle selected…").click()
+    dialog = page.locator("#workspace-dialog")
+    items = dialog.locator(".batch-items li")
+    expect(items.last).to_contain_text("Skipped: Both clone destinations already exist.")
+    submit = dialog.get_by_role("button", name="Schedule 1 task")
+    submit.click()
+    assert not batches  # The clone is still to be chosen.
+    choose_option(items.first.get_by_role("combobox", name="Local clone"), "/fixture/b")
+    submit.click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Scheduled 1 of 1")
+    assert batches[0]["items"] == [{"id": "issue-one", "clone": "/fixture/b"}]
+    assert "start_at" not in batches[0] and batches[0]["interval"] == 1800

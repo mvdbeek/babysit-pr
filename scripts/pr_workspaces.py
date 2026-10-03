@@ -55,6 +55,9 @@ SCHEDULE_MISSED_AFTER = 86400
 SCHEDULE_PENDING_LIMIT = 100
 SCHEDULE_HISTORY = 50
 SCHEDULE_POLL_SECONDS = 30
+# Batch Handle: the most a batch's starts may be spread apart, and its task's item link.
+BATCH_INTERVAL_LIMIT = 86400
+BATCH_URL = "{url}"
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=()):
@@ -736,7 +739,11 @@ class Workspaces:
             for a in herdr("agent", "list")["agents"]
         )
 
-    def action(self, request):
+    def action(self, request, inventory=None):
+        """Validate and perform one workspace action.
+
+        ``inventory`` lets a batch validate many items against a single fresh scan.
+        """
         allowed = {
             "id",
             "action",
@@ -807,7 +814,8 @@ class Workspaces:
                     )
                 ):
                     return {"operation": existing}
-            inventory = self.scan()  # A failed inventory must never authorize creation.
+            if inventory is None:
+                inventory = self.scan()  # A failed inventory must never authorize creation.
             info = self.describe(pr, inventory)
             if action in {"open", "focus", "copy", "reopen"}:
                 candidates = [
@@ -982,6 +990,106 @@ class Workspaces:
         self.wake.set()
         return task
 
+    def batch(self, request):
+        """Schedule Handle for several items, each in its own workspace.
+
+        The first starts at ``start_at`` (default now) and each later one ``interval``
+        seconds after the previous. ``{url}`` in the task becomes each item's link. Every
+        item is validated like a single scheduled Handle; one that fails is reported and
+        the others are still scheduled.
+        """
+        shared = {"agent", "model", "effort", "task", "prefilled"}
+        items = request.get("items")
+        interval = request.get("interval", 0)
+        if (
+            set(request) - shared - {"items", "start_at", "interval"}
+            or not isinstance(items, list)
+            or not items
+            or any(
+                not isinstance(item, dict)
+                or set(item) - {"id", "clone", "destination"}
+                or not all(isinstance(v, str) and v for v in item.values())
+                or "id" not in item
+                for item in items
+            )
+            or len({item["id"] for item in items}) != len(items)
+            or any(not isinstance(request.get(k, ""), str) for k in shared - {"prefilled"})
+            or not isinstance(request.get("prefilled", False), bool)
+        ):
+            raise ValueError("Invalid batch parameters")
+        if len(items) > SCHEDULE_PENDING_LIMIT:
+            raise ValueError(f"At most {SCHEDULE_PENDING_LIMIT} tasks can wait to start")
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not 0 <= interval <= BATCH_INTERVAL_LIMIT
+        ):
+            raise ValueError("Choose an interval of at most a day between starts")
+        start = request.get("start_at")
+        if start is not None and (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(start)
+            or not time.time() - 60 <= start <= time.time() + SCHEDULE_HORIZON
+        ):
+            raise ValueError("Choose a start time within the next 30 days")
+        task = request.get("task", "")
+        if not task.strip() or len(task) > 32000 or "\0" in task:
+            raise ValueError("Supply a task of 1–32,000 characters")
+        # Settings shared by every item are refused once rather than once per item.
+        if request.get("agent", "codex") not in {"codex", "claude"}:
+            raise ValueError("Select Codex or Claude")
+        workspace_agents.validate(
+            request.get("agent", "codex"),
+            request.get("model", ""),
+            request.get("effort", ""),
+            self.home,
+        )
+        # Each item's task differs only by its link: none joins prompt history at launch,
+        # and the task as typed is remembered once below.
+        settings = {key: request[key] for key in shared & request.keys()} | {"prefilled": True}
+        inventory = self.scan()  # A failed inventory must never authorize creation.
+        if start is None:
+            start = time.time()  # After the scan, which can be slow.
+        results = []
+        # New clone destinations by repository: two repositories of one name share the
+        # first candidate, and only the first item to clone into it can use it.
+        claimed: dict[str, str] = {}
+        for index, item in enumerate(items):
+            try:
+                target = self.target(item["id"])
+                repo = target["repo"].lower()
+                if "destination" in item and claimed.setdefault(item["destination"], repo) != repo:
+                    raise ValueError(
+                        f"{claimed[item['destination']]} also clones into {item['destination']}; "
+                        "handle this issue once that clone exists"
+                    )
+                value = self.action(
+                    {
+                        **settings,
+                        **item,
+                        "action": "handle",
+                        "task": task.replace(BATCH_URL, target.get("url") or ""),
+                        "start_at": start + index * interval,
+                    },
+                    inventory,
+                )
+            except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
+                # Report it with the items already scheduled rather than hide those.
+                results.append({"id": item["id"], "error": str(exc)})
+            else:
+                results.append({"id": item["id"], "scheduled": value["scheduled"]})
+        # Remembered when scheduled, since the tasks themselves never join the history.
+        if not request.get("prefilled") and any("scheduled" in r for r in results):
+            with self.db() as db:
+                self.remember_prompt(db, task, time.time())
+        return {"results": results}
+
+    def cloning(self):
+        """Clone paths that launches running in this process are using."""
+        ops = (self.operation(key) for key in list(self.workers))
+        return {op["clone"] for op in ops if op and op.get("clone")}
+
     def save_scheduled(self, db, task, **changes):
         task.update(changes, updated_at=time.time())
         db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), task["id"]))
@@ -1060,6 +1168,7 @@ class Workspaces:
                 if task["status"] == "scheduled" and task["start_at"] <= now
             ]
         for key in [t["id"] for t in due if self.listed(t)]:
+            cloning = self.cloning()
             with self.db() as db:
                 # Claim under a write lock so a cancellation either wins or sees "starting".
                 db.execute("BEGIN IMMEDIATE")
@@ -1077,6 +1186,10 @@ class Workspaces:
                     continue
                 if task["target"] in self.workers:
                     continue  # Another launch for this item is still running; try again later.
+                if task["request"].get("destination") in cloning:
+                    # A batch can hold several items whose repository had no clone; the first
+                    # clones it, and the rest start in that clone once it is there.
+                    continue
                 self.save_scheduled(db, task, status="starting", message="Starting")
             try:
                 if not any(t["id"] == task["target"] for t in self.targets()):
