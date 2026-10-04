@@ -1,4 +1,5 @@
-/* Read-only diff and agent transcript dialog for any checkout Collie can open. */
+/* Diff and agent transcript dialog for any checkout Collie can open, with diff comments
+   and follow-up messages sent to the workspace's agent. */
 (() => {
   const byId = (id) => document.getElementById(id);
   // The dialog shows one workspace at a time, re-fetched on demand. Every change starts
@@ -19,6 +20,34 @@
   }
   function date(value) {
     return value ? new Date(value * 1000).toLocaleString() : "never";
+  }
+  // Web links in agent text become anchors; everything else stays plain text.
+  const LINK = /https?:\/\/[^\s<>"'`]+/g;
+  function linkify(text) {
+    const fragment = document.createDocumentFragment();
+    let last = 0;
+    for (const match of String(text).matchAll(LINK)) {
+      // Sentence punctuation and an unmatched closing bracket end the link.
+      let url = match[0].replace(/[.,;:!?]+$/, "");
+      for (const [open, close] of ["()", "[]"]) {
+        while (url.endsWith(close) && url.split(open).length < url.split(close).length)
+          url = url.slice(0, -1);
+      }
+      fragment.append(String(text).slice(last, match.index));
+      const anchor = node("a", url);
+      anchor.href = url;
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      fragment.append(anchor);
+      last = match.index + url.length;
+    }
+    fragment.append(String(text).slice(last));
+    return fragment;
+  }
+  function linked(tag, text, className) {
+    const element = node(tag, undefined, className);
+    element.append(linkify(text));
+    return element;
   }
   function query(params) {
     return Object.entries(params)
@@ -50,14 +79,16 @@
       byId(id).setAttribute("aria-selected", String(viewer?.mode === mode));
     }
   }
-  // A view names a herdr workspace (anything Collie can open) or a Workspaces-tab row.
+  // A view names a Workspaces-tab row or a herdr workspace (anything Collie can open);
+  // only a herdr workspace has agents to message.
   function where(target) {
-    return target.workspace ? { workspace: target.workspace } : { key: target.key };
+    return target.key ? { key: target.key } : { workspace: target.workspace };
   }
   function openViewer(entry, mode) {
     viewer = { entry, mode, scope: "branch", base: null, session: null, data: null, nodes: [] };
     byId("ws-viewer-title").textContent = entry.name || "Workspace";
     resetViewer("Loading…");
+    openComposer(entry);
     const dialog = byId("ws-viewer");
     if (!dialog.open) dialog.showModal();
     void loadViewer();
@@ -121,12 +152,16 @@
   function refreshButton() {
     const button = node("button", "Refresh");
     button.type = "button";
-    button.onclick = () => change(() => {});
+    button.onclick = () => {
+      change(() => {});
+      if (viewer?.entry.workspace) void fetchAgents(viewer.entry);
+    };
     return button;
   }
   function choice(label, options, value, onchange) {
     const wrap = node("label", undefined, "ws-viewer-choice");
     const select = document.createElement("select");
+    select.setAttribute("aria-label", label);
     for (const [optionValue, text] of options) {
       const option = node("option", text);
       option.value = optionValue;
@@ -179,7 +214,9 @@
       (data.note ? `${data.note} ` : "") +
       `${files} file${files === 1 ? "" : "s"} changed, +${data.added} −${data.removed}` +
       (data.scope === "branch" ? ` since ${data.base}` : " since the last commit") +
-      (data.truncated ? ". The diff was cut short at its size limit." : "");
+      "." +
+      (data.truncated ? " The diff was cut short at its size limit." : "") +
+      (files && draft ? " Click a line to comment on it." : "");
     const content = byId("ws-viewer-content");
     content.replaceChildren();
     if (data.commits.length) {
@@ -189,7 +226,7 @@
       );
       for (const commit of data.commits) {
         const line = node("div", undefined, "ws-commit");
-        line.append(node("code", commit.sha.slice(0, 9)), " ", node("span", commit.subject));
+        line.append(node("code", commit.sha.slice(0, 9)), " ", linked("span", commit.subject));
         line.append(node("small", `${commit.author} · ${date(commit.time)}`, "pr-meta"));
         commits.append(line);
       }
@@ -213,7 +250,12 @@
       item.append(summary);
       const pre = node("pre", undefined, "ws-diff");
       const lines = document.createDocumentFragment();
+      // Line numbers follow the hunk headers: removed lines count on the old side,
+      // added lines on the new side, context lines on both.
+      let oldLine = 0;
+      let newLine = 0;
       for (const line of file.lines) {
+        const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
         const kind = line.startsWith("@@")
           ? "ws-hunk"
           : line.startsWith("+")
@@ -221,9 +263,39 @@
             : line.startsWith("-")
               ? "ws-del"
               : "";
-        lines.append(node("span", `${line}\n`, kind || undefined));
+        const span = node("span", `${line}\n`, kind || undefined);
+        if (hunk) {
+          oldLine = Number(hunk[1]);
+          newLine = Number(hunk[2]);
+        } else if (line.startsWith("+")) {
+          Object.assign(span.dataset, { side: "new", line: newLine++ });
+        } else if (line.startsWith("-")) {
+          Object.assign(span.dataset, { side: "old", line: oldLine++ });
+        } else if (line.startsWith(" ") || line === "") {
+          Object.assign(span.dataset, { side: "new", line: newLine++ });
+          oldLine++;
+        }
+        lines.append(span);
+        for (const comment of draft?.comments || []) {
+          if (
+            comment.path === file.path &&
+            comment.side === span.dataset.side &&
+            String(comment.line) === span.dataset.line
+          )
+            lines.append(commentNote(comment));
+        }
       }
       pre.append(lines);
+      if (draft) {
+        pre.onclick = (event) => commentOn(file, event);
+        pre.tabIndex = 0;
+        pre.setAttribute(
+          "aria-label",
+          `Diff of ${file.path}. Use the arrow keys to choose a line and Enter to comment on it.`,
+        );
+        pre.onkeydown = (event) => diffKeys(file, event);
+        for (const line of pre.querySelectorAll("span[data-line]")) line.tabIndex = -1;
+      }
       if (!file.lines.length) pre.append(node("span", "No text changes to show.\n", "ws-hunk"));
       if (file.truncated) pre.append(node("span", "… cut short\n", "ws-hunk"));
       item.append(pre);
@@ -350,7 +422,7 @@
   function toolOutput(item, entry) {
     item.querySelector(".ws-tool-output, .ws-tool-error")?.remove();
     if (entry.output !== null && entry.output !== undefined) {
-      item.append(node("pre", entry.output, entry.error ? "ws-tool-error" : "ws-tool-output"));
+      item.append(linked("pre", entry.output, entry.error ? "ws-tool-error" : "ws-tool-output"));
     }
   }
   function updateTool(item, entry) {
@@ -368,15 +440,373 @@
       const summary = node("summary");
       summary.append(node("strong", entry.name), " ", node("code", firstLine));
       if (entry.error) summary.append(badge("Error", "red"));
-      item.append(summary, node("pre", entry.input || ""));
+      item.append(summary, linked("pre", entry.input || ""));
       toolOutput(item, entry);
       return item;
     }
     const item = node("div", undefined, `ws-msg ws-${entry.role}`);
     item.append(node("strong", entry.role === "user" ? "Prompt" : agent, "ws-msg-who"));
-    item.append(node("div", entry.text, "ws-msg-text"));
+    item.append(linked("div", entry.text, "ws-msg-text"));
     return item;
   }
+
+  // Comments and follow-up messages ---------------------------------------------
+  // A draft (comments on diff lines plus a message) belongs to a herdr workspace's
+  // checkout and is kept in this browser until it is sent, so closing loses nothing.
+  // With no agent running, a message resumes one of the checkout's recorded sessions.
+  const MAX_MESSAGE = 32000;
+  let draft = null;
+  let agents = [];
+  let sessions = [];
+  let sending = false; // A send in flight keeps the button disabled through refreshes.
+  function draftKey(entry) {
+    return `ws-viewer-draft:${entry.workspace}`;
+  }
+  function loadDraft(entry) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(draftKey(entry)) || "null");
+      if (saved && Array.isArray(saved.comments) && typeof saved.message === "string") return saved;
+    } catch {
+      // Storage may be unavailable or hold something else; start empty.
+    }
+    return { comments: [], message: "", path: null };
+  }
+  function storeDraft(entry, value) {
+    try {
+      if (value.comments.length || value.message) {
+        localStorage.setItem(draftKey(entry), JSON.stringify(value));
+      } else localStorage.removeItem(draftKey(entry));
+    } catch {
+      // Without storage the draft lasts as long as the page.
+    }
+  }
+  function saveDraft() {
+    if (draft && viewer) storeDraft(viewer.entry, draft);
+  }
+  function openComposer(entry) {
+    const form = byId("ws-message");
+    byId("ws-message-status").textContent = "";
+    agents = [];
+    sessions = [];
+    if (!entry.workspace) {
+      // A checkout without a herdr workspace has no agent to talk to.
+      draft = null;
+      form.hidden = true;
+      return;
+    }
+    form.hidden = false;
+    draft = loadDraft(entry);
+    byId("ws-message-text").value = draft.message;
+    renderComments();
+    renderAgents("Looking for agents…");
+    void fetchAgents(entry);
+  }
+  async function fetchAgents(entry) {
+    try {
+      const value = await getJSON("/api/workspace-agents", { workspace: entry.workspace });
+      if (viewer?.entry !== entry) return;
+      if (draft.path && draft.path !== value.path) {
+        // The workspace ID now names another checkout: its old draft does not apply.
+        draft = { comments: [], message: "", path: value.path };
+        storeDraft(entry, draft);
+        byId("ws-message-text").value = "";
+        byId("ws-viewer-content")
+          .querySelectorAll(".ws-comment-note")
+          .forEach((note) => note.remove());
+        renderComments();
+        byId("ws-message-status").textContent = "A saved draft for another checkout was discarded.";
+      }
+      draft.path = value.path;
+      agents = value.agents;
+      sessions = value.sessions;
+      renderAgents();
+    } catch (error) {
+      if (viewer?.entry === entry) renderAgents(error.message);
+    }
+  }
+  function agentLabel(agent) {
+    return (
+      `${agent.agent || "agent"} · ${agent.status || "unknown"}` +
+      (agent.title ? ` · ${agent.title}` : "")
+    );
+  }
+  function renderAgents(message) {
+    const holder = byId("ws-message-agent");
+    // A refresh keeps the agent or session the reader picked, while it is still listed.
+    const picked = holder.querySelector("select")?.value;
+    const keep = (values) => (values.includes(picked) ? picked : values[0]);
+    holder.replaceChildren();
+    const send = byId("ws-message-send");
+    send.textContent = "Send to agent";
+    send.disabled = true;
+    if (message) {
+      holder.append(node("small", message, "pr-meta"));
+      return;
+    }
+    if (agents.length) {
+      send.disabled = sending;
+      holder.append(
+        agents.length === 1
+          ? node("small", `To ${agentLabel(agents[0])}`, "pr-meta")
+          : choice(
+              "Agent",
+              agents.map((agent) => [agent.pane, agentLabel(agent)]),
+              keep(agents.map((agent) => agent.pane)),
+              () => {},
+            ),
+      );
+      return;
+    }
+    if (!sessions.length) {
+      holder.append(
+        node("small", "No agent is running and no session was recorded here.", "pr-meta"),
+      );
+      return;
+    }
+    send.disabled = sending;
+    send.textContent = "Resume and send";
+    holder.append(
+      node("small", "No agent is running; the message resumes this session:", "pr-meta"),
+      choice(
+        "Resume",
+        sessions.map((session) => [
+          session.id,
+          // The babysit watcher resumes a watched session itself; resuming it is refused.
+          sessionLabel(session) + (session.watched ? " (babysit watch)" : ""),
+        ]),
+        keep(sessions.map((session) => session.id)),
+        () => {},
+      ),
+    );
+  }
+  function removeComment(id) {
+    draft.comments = draft.comments.filter((comment) => comment.id !== id);
+    saveDraft();
+    byId("ws-viewer-content")
+      .querySelectorAll(".ws-comment-note")
+      .forEach((note) => {
+        if (note.dataset.comment === id) note.remove();
+      });
+    renderComments();
+  }
+  function commentNote(comment) {
+    const note = node("div", undefined, "ws-comment-note");
+    note.dataset.comment = comment.id;
+    note.append(node("strong", "Comment"), " ", node("span", comment.text));
+    const remove = node("button", "Remove");
+    remove.type = "button";
+    remove.onclick = (event) => {
+      event.stopPropagation();
+      removeComment(comment.id);
+    };
+    note.append(remove);
+    return note;
+  }
+  function openCommentBox(file, span) {
+    if (!draft || span.nextElementSibling?.classList.contains("ws-comment-box")) return;
+    const box = node("div", undefined, "ws-comment-box");
+    const field = document.createElement("textarea");
+    field.rows = 3;
+    field.setAttribute("aria-label", `Comment on ${file.path} line ${span.dataset.line}`);
+    const add = node("button", "Add comment");
+    add.type = "button";
+    const cancel = node("button", "Cancel");
+    cancel.type = "button";
+    cancel.onclick = () => {
+      box.remove();
+      span.focus();
+    };
+    add.onclick = () => {
+      const text = field.value.trim();
+      if (!text) return;
+      const comment = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        path: file.path,
+        side: span.dataset.side,
+        line: Number(span.dataset.line),
+        code: span.textContent.replace(/\n$/, ""),
+        text,
+      };
+      draft.comments.push(comment);
+      saveDraft();
+      box.replaceWith(commentNote(comment));
+      renderComments();
+      span.focus();
+    };
+    box.addEventListener("click", (inner) => inner.stopPropagation());
+    box.addEventListener("keydown", (inner) => inner.stopPropagation());
+    box.append(field, add, cancel);
+    span.after(box);
+    field.focus();
+    // The composer sits over the bottom of the dialog; keep the new box in view.
+    box.scrollIntoView({ block: "center" });
+  }
+  // A single click on a line comments on it; a double or triple click selects text.
+  let pendingComment = null;
+  function commentOn(file, event) {
+    clearTimeout(pendingComment);
+    const span = event.target.closest("span[data-line]");
+    if (!span || event.detail > 1) return;
+    pendingComment = setTimeout(() => {
+      if (!String(window.getSelection())) openCommentBox(file, span);
+    }, 250);
+  }
+  // Keyboard: the diff is one tab stop; arrows move between lines, Enter comments.
+  function diffKeys(file, event) {
+    const lines = [...event.currentTarget.querySelectorAll("span[data-line]")];
+    const at = lines.indexOf(document.activeElement);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const next = at < 0 ? 0 : at + (event.key === "ArrowDown" ? 1 : -1);
+      lines[Math.max(0, Math.min(lines.length - 1, next))]?.focus();
+    } else if ((event.key === "Enter" || event.key === " ") && at >= 0) {
+      event.preventDefault();
+      openCommentBox(file, lines[at]);
+    }
+  }
+  function renderComments() {
+    const list = byId("ws-message-comments");
+    list.replaceChildren();
+    if (!draft?.comments.length) return;
+    const head = node("div", undefined, "ws-comment-head");
+    head.append(
+      node(
+        "strong",
+        `${draft.comments.length} diff comment${draft.comments.length === 1 ? "" : "s"} will be sent`,
+      ),
+    );
+    const clear = node("button", "Clear comments");
+    clear.type = "button";
+    clear.onclick = () => {
+      for (const comment of [...draft.comments]) removeComment(comment.id);
+    };
+    head.append(clear);
+    list.append(head);
+    for (const comment of draft.comments) {
+      const item = node("div", undefined, "ws-comment-chip");
+      const where = `${comment.path}:${comment.line}${comment.side === "old" ? " (removed)" : ""}`;
+      const remove = node("button", "Remove");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove comment on ${where}`);
+      remove.onclick = () => removeComment(comment.id);
+      item.append(node("code", where), " ", node("span", comment.text), remove);
+      list.append(item);
+    }
+  }
+  // The message the agent receives: each comment with its place and code, then the text.
+  function compose(comments, message) {
+    const parts = [];
+    if (comments.length) {
+      parts.push("Review comments on your changes:");
+      for (const comment of comments) {
+        const side = comment.side === "old" ? "removed line" : "line";
+        parts.push(`${comment.path}, ${side} ${comment.line}:\n> ${comment.code}\n${comment.text}`);
+      }
+    }
+    if (message.trim()) parts.push(message.trim());
+    return parts.join("\n\n");
+  }
+  async function sendMessage(event) {
+    event.preventDefault();
+    if (!viewer || !draft || sending) return;
+    const entry = viewer.entry;
+    const comments = [...draft.comments];
+    const message = byId("ws-message-text").value;
+    const text = compose(comments, message);
+    const status = byId("ws-message-status");
+    if (!text) {
+      status.textContent = "Write a message or add a comment first.";
+      return;
+    }
+    if (text.length > MAX_MESSAGE) {
+      status.textContent = `The message is ${text.length.toLocaleString()} characters; the limit is ${MAX_MESSAGE.toLocaleString()}.`;
+      return;
+    }
+    const picked = byId("ws-message-agent").querySelector("select")?.value;
+    const body = agents.length
+      ? { workspace: entry.workspace, pane: picked || agents[0].pane, text }
+      : { workspace: entry.workspace, resume: picked || sessions[0]?.id, text };
+    sending = true;
+    byId("ws-message-send").disabled = true;
+    status.textContent = body.resume ? "Resuming the session…" : "Sending…";
+    try {
+      const value = await deliver(body);
+      if (value.error) {
+        if (viewer?.entry === entry) status.textContent = value.error;
+        return;
+      }
+      clearSent(entry, comments, message);
+      if (viewer?.entry !== entry) return;
+      status.textContent =
+        value.warning ||
+        (value.resumed
+          ? `Resumed the session in ${value.pane} and sent the message.`
+          : `Sent to the agent in ${value.pane}.`);
+      // The transcript shows the new turn soon after.
+      if (viewer.mode === "transcript")
+        setTimeout(() => {
+          if (viewer?.entry === entry && viewer.mode === "transcript") change(() => {});
+        }, 3000);
+    } finally {
+      sending = false;
+      if (viewer?.entry === entry) void fetchAgents(entry);
+    }
+  }
+  // POST the message; an error result says whether anything may have been typed.
+  async function deliver(body) {
+    let response;
+    try {
+      response = await fetch("/api/workspace-message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-message" },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      // The request may have arrived before the connection dropped.
+      return {
+        error: "Delivery unknown: the connection dropped; check Collie before resending.",
+      };
+    }
+    let value;
+    try {
+      value = await response.json();
+    } catch {
+      return { error: `Delivery unknown: HTTP ${response.status}; check Collie before resending.` };
+    }
+    if (!response.ok || value.error)
+      return { error: `Not sent: ${value.error || response.status}` };
+    return value;
+  }
+  // Clear exactly what was sent, from storage and from whichever draft is now open (the
+  // dialog may have been reopened meanwhile); later edits stay.
+  function clearSent(entry, comments, message) {
+    const sent = new Set(comments.map((comment) => comment.id));
+    const prune = (value) => {
+      value.comments = value.comments.filter((comment) => !sent.has(comment.id));
+      if (value.message === message) value.message = "";
+      return value;
+    };
+    storeDraft(entry, prune(loadDraft(entry)));
+    if (!draft || viewer?.entry.workspace !== entry.workspace) return;
+    prune(draft);
+    saveDraft();
+    if (byId("ws-message-text").value === message) byId("ws-message-text").value = "";
+    byId("ws-viewer-content")
+      .querySelectorAll(".ws-comment-note")
+      .forEach((note) => {
+        if (sent.has(note.dataset.comment)) note.remove();
+      });
+    renderComments();
+  }
+  byId("ws-message").addEventListener("submit", sendMessage);
+  window.addEventListener("focus", () => {
+    if (viewer?.entry.workspace && byId("ws-viewer").open) void fetchAgents(viewer.entry);
+  });
+  byId("ws-message-text").addEventListener("input", () => {
+    if (!draft) return;
+    draft.message = byId("ws-message-text").value;
+    saveDraft();
+  });
   byId("ws-view-diff").onclick = () => setMode("diff");
   byId("ws-view-transcript").onclick = () => setMode("transcript");
   byId("ws-viewer-close").onclick = () => byId("ws-viewer").close();
@@ -401,7 +831,7 @@
       void loadViewer({ after: Math.max(data.start, data.total - 20) });
     }
   }, 10000);
-  // Diff and Transcript buttons for a target: {workspace} (a herdr workspace ID) or
+  // Diff and Transcript buttons for a target: {workspace} (a herdr workspace ID) and/or
   // {key} (a Workspaces-tab row), plus a name for the dialog title.
   // The pair is one element, so a narrow cell wraps it together.
   function buttons(target) {

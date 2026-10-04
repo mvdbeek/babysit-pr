@@ -902,6 +902,20 @@
       <p id="ws-viewer-meta" role="status"></p>
       <p id="ws-viewer-error" role="alert"></p>
       <div id="ws-viewer-content"></div>
+      <form id="ws-message" class="ws-message" hidden>
+        <div id="ws-message-comments"></div>
+        <label for="ws-message-text">Message the agent</label>
+        <textarea
+          id="ws-message-text"
+          rows="2"
+          placeholder="Follow-up instructions; diff comments are sent with them"
+        ></textarea>
+        <div class="ws-message-actions">
+          <div id="ws-message-agent"></div>
+          <button id="ws-message-send" type="submit">Send to agent</button>
+        </div>
+        <p id="ws-message-status" role="status"></p>
+      </form>
     </dialog>
     <dialog id="sentry-publish-dialog" aria-labelledby="sentry-publish-heading">
       <button id="sentry-publish-close" type="button" aria-label="Close GitHub issue draft">

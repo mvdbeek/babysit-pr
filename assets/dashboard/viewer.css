@@ -194,3 +194,126 @@
   gap: 6px;
   white-space: nowrap;
 }
+/* Diff comments and the follow-up composer. */
+.ws-diff span[data-line] {
+  cursor: pointer;
+}
+.ws-diff span[data-line]:hover {
+  outline: 1px solid #5f7d6c;
+  outline-offset: -1px;
+}
+.ws-comment-box,
+.ws-comment-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 4px 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  white-space: normal;
+  font:
+    13px/1.4 Inter,
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+}
+.ws-comment-box textarea {
+  flex: 1 1 100%;
+  font: inherit;
+}
+.ws-comment-note span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.ws-message {
+  position: sticky;
+  bottom: -20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 16px -24px -20px;
+  padding: 12px 24px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--paper);
+}
+.ws-message[hidden] {
+  display: none;
+}
+.ws-message textarea {
+  width: 100%;
+  font: inherit;
+  resize: vertical;
+}
+.ws-message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 8px;
+}
+#ws-message-comments {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 72px;
+  overflow: auto;
+  font-size: 13px;
+}
+#ws-message-comments:empty,
+#ws-message-status:empty {
+  display: none;
+}
+.ws-comment-chip {
+  overflow-wrap: anywhere;
+}
+#ws-message-status {
+  margin: 0;
+  color: var(--muted);
+}
+.ws-msg-text a,
+.ws-tool pre a {
+  overflow-wrap: anywhere;
+}
+.ws-tool pre a {
+  color: #9cc3e6;
+}
+.ws-comment-head,
+.ws-comment-chip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.ws-comment-chip span {
+  flex: 1;
+}
+.ws-comment-head button,
+.ws-comment-chip button {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+.ws-diff span[data-line]:focus {
+  outline: 2px solid #9cc3e6;
+  outline-offset: -2px;
+}
+.ws-message textarea {
+  max-height: 30vh;
+}
+/* Keep focused lines and comment boxes clear of the sticky composer. */
+#ws-viewer {
+  scroll-padding-bottom: 220px;
+}
+@media (max-width: 600px) {
+  /* A phone screen cannot spare the room: the composer follows the content instead. */
+  .ws-message {
+    position: static;
+  }
+  #ws-viewer {
+    scroll-padding-bottom: 0;
+  }
+}

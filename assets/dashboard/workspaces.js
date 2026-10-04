@@ -153,7 +153,13 @@
     actions.append(button);
     // Only scanned checkouts have a diff or transcripts to read.
     if (entry.key === entry.path && !entry.missing) {
-      actions.append(...window.workspaceViewer.buttons({ key: entry.key, name: entry.name }));
+      actions.append(
+        ...window.workspaceViewer.buttons({
+          key: entry.key,
+          workspace: entry.workspace_ids[0],
+          name: entry.name,
+        }),
+      );
     }
     const result = openResults.get(entry.key);
     if (result?.url) actions.append(anchor("Open in Collie", result.url));

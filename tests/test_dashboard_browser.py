@@ -3165,3 +3165,245 @@ def test_any_collie_workspace_offers_its_diff_and_transcript(
     page.locator("#list .watch").filter(has_text="test/repo").click()
     page.locator("#detail").get_by_role("button", name="Transcript", exact=True).click()
     expect(viewer).to_be_visible()
+
+
+COMMENT_DIFF = {
+    "scope": "branch",
+    "note": None,
+    "base": "origin/main",
+    "bases": [{"ref": "origin/main", "ahead": 1}],
+    "commits": [
+        {"sha": "abc123def456", "author": "A", "time": 1, "subject": "See https://example.com/c"}
+    ],
+    "files": [
+        {
+            "path": "app.py",
+            "old_path": None,
+            "status": "modified",
+            "binary": False,
+            "added": 1,
+            "removed": 1,
+            "lines": ["@@ -10,2 +10,2 @@", " context", "-old name", "+new name"],
+            "truncated": False,
+        }
+    ],
+    "untracked": [],
+    "untracked_more": 0,
+    "added": 1,
+    "removed": 1,
+    "truncated": False,
+}
+
+
+@pytest.fixture
+def viewer_routes(page, workspace_routes):
+    state = {
+        "agents": [
+            {"pane": "w1:p1", "agent": "codex", "status": "idle", "title": "Fix it"},
+            {"pane": "w1:p2", "agent": "claude", "status": "working", "title": None},
+        ],
+        "sessions": [
+            {"id": "s-new", "agent": "claude", "title": "Fix the crash", "updated": 2},
+            {"id": "s-old", "agent": "codex", "title": "Earlier", "updated": 1},
+        ],
+        "path": "/fixture/checkout",
+        "sent": [],
+    }
+    page.route("**/api/workspace-diff?*", lambda route: route.fulfill(json=COMMENT_DIFF))
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={"agents": state["agents"], "sessions": state["sessions"], "path": state["path"]}
+        ),
+    )
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": [
+                    {"role": "assistant", "text": "Opened https://github.com/o/r/pull/1)."},
+                    {
+                        "role": "tool",
+                        "name": "Bash",
+                        "input": "gh pr view",
+                        "output": "url: https://github.com/o/r/pull/1",
+                        "error": False,
+                    },
+                ],
+                "start": 0,
+                "total": 2,
+            }
+        ),
+    )
+
+    def message(route):
+        body = route.request.post_data_json
+        state["sent"].append((route.request.headers.get("x-babysit-action"), body))
+        if body.get("resume"):
+            route.fulfill(
+                json={"sent": True, "pane": "w1:p3", "resumed": body["resume"], "warning": None}
+            )
+        else:
+            route.fulfill(json={"sent": True, "pane": body["pane"], "warning": None})
+
+    page.route("**/api/workspace-message", message)
+    return state
+
+
+def test_diff_comments_and_a_follow_up_reach_the_chosen_agent(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    row = page.locator("#pr-list tr").first
+    row.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("Click a line to comment")
+    expect(viewer.locator(".ws-commit a")).to_have_attribute("href", "https://example.com/c")
+    viewer.locator(".ws-add").click()
+    viewer.get_by_label("Comment on app.py line 11").fill("Call it display_name")
+    viewer.get_by_role("button", name="Add comment").click()
+    expect(viewer.locator(".ws-comment-note")).to_contain_text("Call it display_name")
+    viewer.locator(".ws-del").click()
+    viewer.get_by_label("Comment on app.py line 11").fill("Keep a deprecation alias")
+    viewer.get_by_role("button", name="Add comment").click()
+    expect(page.locator("#ws-message-comments")).to_contain_text("2 diff comments will be sent")
+    # A draft survives closing and reopening the viewer.
+    page.keyboard.press("Escape")
+    row.get_by_role("button", name="Diff", exact=True).click()
+    expect(viewer.locator(".ws-comment-note")).to_have_count(2)
+    viewer.get_by_label("Message the agent").fill("Then rerun the tests.")
+    viewer.get_by_label("Agent", exact=True).select_option("w1:p2")
+    viewer.locator(".ws-add").click()  # An open comment box, for the screenshot.
+    page.screenshot(path="reports/viewer-comments.png")
+    viewer.get_by_role("button", name="Cancel").click()
+    viewer.get_by_role("button", name="Send to agent").click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p2.")
+    assert viewer_routes["sent"] == [
+        (
+            "workspace-message",
+            {
+                "workspace": "w1",
+                "pane": "w1:p2",
+                "text": "Review comments on your changes:\n\n"
+                "app.py, line 11:\n> +new name\nCall it display_name\n\n"
+                "app.py, removed line 11:\n> -old name\nKeep a deprecation alias\n\n"
+                "Then rerun the tests.",
+            },
+        )
+    ]
+    expect(viewer.locator(".ws-comment-note")).to_have_count(0)
+    expect(page.locator("#ws-message-comments")).to_be_empty()
+    expect(viewer.get_by_label("Message the agent")).to_have_value("")
+    page.keyboard.press("Escape")
+    row.get_by_role("button", name="Diff", exact=True).click()
+    expect(page.locator("#ws-message-comments")).to_be_empty()
+
+
+def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = viewer_routes["agents"][:1]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    link = viewer.locator(".ws-msg-text a")
+    expect(link).to_have_attribute("href", "https://github.com/o/r/pull/1")
+    expect(link).to_have_attribute("target", "_blank")
+    expect(viewer.locator(".ws-msg-text")).to_have_text("Opened https://github.com/o/r/pull/1).")
+    viewer.locator(".ws-tool summary").click()
+    expect(viewer.locator(".ws-tool-output a")).to_have_attribute(
+        "href", "https://github.com/o/r/pull/1"
+    )
+    expect(page.locator("#ws-message-agent")).to_have_text("To codex · idle · Fix it")
+    page.locator("#ws-message-text").fill("Thanks, now update the changelog")
+    viewer.get_by_role("button", name="Send to agent").click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
+    # The agent shown is the one addressed, even when it is the only one.
+    assert viewer_routes["sent"][0][1]["pane"] == "w1:p1"
+
+
+def test_an_exited_agent_is_resumed_with_the_message(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = []
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(page.locator("#ws-message-agent")).to_contain_text("No agent is running")
+    viewer_routes["sessions"][1]["watched"] = True
+    viewer.get_by_role("button", name="Refresh").click()
+    resume = viewer.get_by_label("Resume", exact=True)
+    expect(resume).to_have_value("s-new")
+    expect(resume.locator("option").last).to_contain_text("(babysit watch)")
+    resume.select_option("s-old")
+    # A refresh of the agent list keeps the session the reader picked.
+    page.evaluate("window.dispatchEvent(new Event('focus'))")
+    page.wait_for_timeout(300)
+    expect(resume).to_have_value("s-old")
+    viewer.get_by_label("Message the agent").fill("Pick this up again")
+    viewer.get_by_role("button", name="Resume and send").click()
+    expect(page.locator("#ws-message-status")).to_have_text(
+        "Resumed the session in w1:p3 and sent the message."
+    )
+    assert viewer_routes["sent"][0][1] == {
+        "workspace": "w1",
+        "resume": "s-old",
+        "text": "Pick this up again",
+    }
+
+
+def test_nothing_to_send_without_an_agent_or_a_session(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = []
+    viewer_routes["sessions"] = []
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    expect(page.locator("#ws-message-agent")).to_have_text(
+        "No agent is running and no session was recorded here."
+    )
+    expect(page.get_by_role("button", name="Send to agent")).to_be_disabled()
+
+
+def test_comments_by_keyboard_removal_and_word_selection(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    diff = viewer.locator("pre.ws-diff")
+    # Double-clicking a word selects it without opening a comment box.
+    viewer.locator(".ws-add").dblclick()
+    page.wait_for_timeout(400)
+    expect(viewer.locator(".ws-comment-box")).to_have_count(0)
+    diff.focus()
+    for _ in range(3):
+        page.keyboard.press("ArrowDown")
+    expect(viewer.locator(".ws-add")).to_be_focused()
+    page.keyboard.press("Enter")
+    field = viewer.get_by_label("Comment on app.py line 11")
+    expect(field).to_be_focused()
+    field.fill("By keyboard")
+    viewer.get_by_role("button", name="Add comment").click()
+    expect(viewer.locator(".ws-add")).to_be_focused()
+    chips = page.locator("#ws-message-comments")
+    expect(chips).to_contain_text("1 diff comment will be sent")
+    chips.get_by_role("button", name="Remove comment on app.py:11").click()
+    expect(chips).to_be_empty()
+    expect(viewer.locator(".ws-comment-note")).to_have_count(0)
+
+
+def test_a_draft_for_another_checkout_is_discarded(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    page.evaluate(
+        """localStorage.setItem('ws-viewer-draft:w1', JSON.stringify({
+            comments: [{id: 'x', path: 'other.py', side: 'new', line: 1, code: '+a', text: 'old'}],
+            message: 'stale', path: '/somewhere/else'}))"""
+    )
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    expect(page.locator("#ws-message-status")).to_have_text(
+        "A saved draft for another checkout was discarded."
+    )
+    expect(page.locator("#ws-message-comments")).to_be_empty()
+    expect(page.locator("#ws-message-text")).to_have_value("")

@@ -394,7 +394,9 @@ def test_diff_and_transcript_viewer(page, site, width):
     line.get_by_role("button", name="Diff", exact=True).click()
     dialog = page.locator("#ws-viewer")
     expect(dialog).to_be_visible()
-    expect(page.locator("#ws-viewer-meta")).to_have_text("2 files changed, +1 −1 since origin/main")
+    expect(page.locator("#ws-viewer-meta")).to_have_text(
+        "2 files changed, +1 −1 since origin/main."
+    )
     expect(dialog.locator(".ws-add")).to_contain_text("+new line")
     expect(dialog.locator(".ws-del")).to_have_text("-old line\n")
     expect(dialog.get_by_text("Binary", exact=True)).to_be_visible()
