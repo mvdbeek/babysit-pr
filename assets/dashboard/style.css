@@ -18,6 +18,9 @@
     "Segoe UI",
     sans-serif;
   font-size: 14px;
+  /* iOS otherwise enlarges the text of wide, unwrapped lines such as diffs. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 * {
   box-sizing: border-box;
