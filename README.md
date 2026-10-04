@@ -261,6 +261,17 @@ missed instead. If the dashboard stops while starting a task, the task is marked
 **Check workspace** and never started again automatically. At most 100 tasks can
 wait at once.
 
+A scheduled task's brief asks its agent to end its final response with a
+`[babysit-done:…]` line once the task is finished and nothing more is needed. The
+dashboard follows the session's first turn. When that turn's last line is the
+marker and the agent then stays idle, unchanged and untouched, with an empty input
+box, for at least 20 seconds, it presses Ctrl-D the same way an automatic watch
+handoff does. The pane, its shell and the worktree stay. A turn that ends any other
+way (for example with a question), any later turn, or a changed agent process
+leaves the agent open and stops watching. A draft in the input box or a scrolled
+terminal only delays the exit and restarts the 20 seconds. The Scheduled tab shows
+the result under **Agent:**. Tasks started immediately are never exited.
+
 ### Handling several issues
 
 Tick the checkbox beside each issue on the Issues tab, or **Select all shown** for
