@@ -286,14 +286,23 @@ def diff(path, scope="branch", base=None):
         log = git_text(
             path,
             "log",
+            "-z",
             f"--max-count={MAX_COMMITS}",
-            "--format=%H%x00%an%x00%at%x00%s",
+            "--format=%H%x00%an%x00%at%x00%s%x00%b",
             f"{since}..HEAD",
         )
-        for line in log.splitlines():
-            sha, author, when, subject = (line.split("\0") + ["", "", "", ""])[:4]
+        # NUL-delimited fields keep multiline bodies separate from other commits.
+        fields = log.split("\0")
+        for offset in range(0, len(fields) - 4, 5):
+            sha, author, when, subject, body = fields[offset : offset + 5]
             commits.append(
-                {"sha": sha[:12], "author": author, "time": int(when or 0), "subject": subject}
+                {
+                    "sha": sha[:12],
+                    "author": author,
+                    "time": int(when or 0),
+                    "subject": subject,
+                    "body": body.rstrip("\n"),
+                }
             )
     else:
         since = "HEAD"

@@ -3301,6 +3301,44 @@ def test_diff_comments_and_a_follow_up_reach_the_chosen_agent(page, dashboard_si
     expect(page.locator("#ws-message-comments")).to_be_empty()
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_commit_messages_expand_with_keyboard_and_preserve_body_text(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    data = copy.deepcopy(COMMENT_DIFF)
+    body = "Why this changed.\n\n  Indented detail <script>alert('x')</script>\n" + "x" * 200
+    body += "\n\nSee https://example.com/details"
+    data["commits"][0]["body"] = body
+    data["commits"].append(
+        {"sha": "def456abc123", "author": "B", "time": 2, "subject": "Subject only", "body": ""}
+    )
+    page.route("**/api/workspace-diff?*", lambda route: route.fulfill(json=data))
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    viewer.locator(".ws-commits > summary").click()
+    commit = viewer.locator(".ws-commit").first
+    message = commit.locator(".ws-commit-body")
+    expect(commit.locator("summary")).to_contain_text("See https://example.com/c")
+    expect(message).to_be_hidden()
+    commit.locator("summary").focus()
+    page.keyboard.press("Enter")
+    expect(message).to_be_visible()
+    assert message.text_content() == body
+    assert message.evaluate("el => getComputedStyle(el).whiteSpace") == "pre-wrap"
+    expect(message.locator("script")).to_have_count(0)
+    expect(message.get_by_role("link")).to_have_attribute("href", "https://example.com/details")
+    assert commit.evaluate("el => el.scrollWidth <= el.clientWidth")
+    expect(viewer.locator(".ws-commit").last).to_contain_text("Subject only")
+    expect(viewer.locator(".ws-commit").last.locator("summary")).to_have_count(0)
+    page.keyboard.press("Space")
+    expect(message).to_be_hidden()
+    commit.locator("summary").click()
+    expect(message).to_be_visible()
+
+
 def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
     page, dashboard_site, viewer_routes
 ):
