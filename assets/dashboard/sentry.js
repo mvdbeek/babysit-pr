@@ -279,7 +279,14 @@
       if (work.url) state.append(anchor("Open workspace", work.url));
       if (work.workspace && window.workspaceViewer)
         state.append(
-          ...window.workspaceViewer.buttons({ workspace: work.workspace, name: entry.short_id }),
+          ...window.workspaceViewer.buttons({
+            workspace: work.workspace,
+            name: entry.short_id,
+            links: [
+              { label: entry.short_id || "Sentry issue", url: entry.permalink, title: entry.title },
+              { label: "GitHub issue", url: entry.publish?.url || entry.publish?.existing?.url },
+            ],
+          }),
         );
       cell.append(state);
     }

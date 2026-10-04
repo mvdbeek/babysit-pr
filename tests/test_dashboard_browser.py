@@ -3335,6 +3335,7 @@ def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, v
     box = viewer.bounding_box()
     assert box == {"x": 0, "y": 0, "width": 390, "height": 844}
     assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+    expect(viewer.get_by_role("button", name="Full screen")).to_be_hidden()
     for field in ("#ws-message-text", "#ws-viewer select"):
         size = page.locator(field).first.evaluate("el => getComputedStyle(el).fontSize")
         assert size == "16px", field
@@ -3345,6 +3346,51 @@ def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, v
     adjust = page.evaluate("getComputedStyle(document.documentElement).textSizeAdjust")
     assert adjust == "100%"
     page.screenshot(path="reports/viewer-diff-mobile.png")
+
+
+def test_viewer_links_its_subject_goes_full_screen_and_closes_from_the_backdrop(
+    page, dashboard_site, viewer_routes, workspace_routes
+):
+    url, _ = dashboard_site
+    info, snapshot, _ = workspace_routes
+    snapshot["issues"] = {"issue-one": copy.deepcopy(info)}
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(url + "/#prs")
+    row = page.locator("#pr-list tr").first
+    row.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    links = viewer.locator("#ws-viewer-links a")
+    expect(links).to_have_text(["PR #8"])
+    expect(links.first).to_have_attribute("href", "https://github.com/test/alpha/pull/8")
+    expect(links.first).to_have_attribute("target", "_blank")
+    # Clicks inside, and a selection dragged out to the backdrop, keep the viewer open.
+    viewer.locator("#ws-viewer-title").click()
+    title = viewer.locator("#ws-viewer-title").bounding_box()
+    page.mouse.move(title["x"] + 5, title["y"] + 5)
+    page.mouse.down()
+    page.mouse.move(5, 5)
+    page.mouse.up()
+    expect(viewer).to_be_visible()
+    page.mouse.click(5, 5)
+    expect(viewer).to_be_hidden()
+    expect(row.get_by_role("button", name="Diff", exact=True)).to_be_focused()
+    # An issue links itself and the pull requests linked to it.
+    page.goto(url + "/#issues")
+    page.locator("#issue-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    expect(links).to_have_text(["Issue #30", "PR #8"])
+    expect(links.first).to_have_attribute("href", "https://github.com/test/alpha/issues/30")
+    full = viewer.get_by_role("button", name="Full screen")
+    expect(full).to_have_attribute("aria-pressed", "false")
+    full.click()
+    expect(full).to_have_attribute("aria-pressed", "true")
+    assert viewer.bounding_box() == {"x": 0, "y": 0, "width": 1280, "height": 900}
+    page.screenshot(path="reports/viewer-full-screen.png")
+    # The choice is remembered across a reload.
+    page.reload()
+    page.locator("#issue-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    assert viewer.bounding_box() == {"x": 0, "y": 0, "width": 1280, "height": 900}
+    full.click()
+    assert viewer.bounding_box()["width"] < 1280
 
 
 def test_an_exited_agent_is_resumed_with_the_message(page, dashboard_site, viewer_routes):

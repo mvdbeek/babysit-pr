@@ -892,8 +892,14 @@
       </div>
     </dialog>
     <dialog id="ws-viewer" aria-labelledby="ws-viewer-title">
-      <button id="ws-viewer-close" type="button" aria-label="Close workspace viewer">Close</button>
+      <div class="ws-viewer-actions">
+        <button id="ws-viewer-full" type="button" aria-pressed="false">Full screen</button>
+        <button id="ws-viewer-close" type="button" aria-label="Close workspace viewer">
+          Close
+        </button>
+      </div>
       <h2 id="ws-viewer-title">Workspace</h2>
+      <p id="ws-viewer-links"></p>
       <div class="ws-viewer-tabs" role="tablist" aria-label="Workspace view">
         <button id="ws-view-diff" type="button" role="tab">Diff</button>
         <button id="ws-view-transcript" type="button" role="tab">Transcript</button>
