@@ -9,7 +9,8 @@ When no agent runs there (usually it exited after finishing), the message can in
 resume one of the sessions recorded in that checkout: the agent's own resume command,
 with the message as its prompt, is typed into a new split of the workspace, the same way
 launches type their command, so the user's shell wrappers apply. A session already open
-in a pane, just resumed, or owned by a babysit watch is never resumed again.
+in a pane gets the message there; one just resumed or owned by a babysit watch is
+never resumed again.
 """
 
 import fcntl
@@ -106,6 +107,12 @@ def send(request, home=None):
     target = next((agent for agent in running if agent["pane"] == pane), None)
     if target is None:
         raise ValueError("That agent is no longer running; refresh")
+    return prompt(target, text)
+
+
+def prompt(target, text):
+    """Type the message into a running agent's pane and submit it."""
+    pane = target["pane"]
     if target["status"] == "blocked":
         raise ValueError("The agent is waiting on a question or approval; answer it in Collie")
     try:
@@ -185,11 +192,24 @@ def watch_jobs(home):
 
 
 def open_elsewhere(session_id):
-    """A pane herdr already sees running this session, in any workspace."""
-    for pane in herdr("pane", "list")["panes"]:
-        if (pane.get("agent_session") or {}).get("value") == session_id:
-            return pane.get("pane_id")
-    return None
+    """The running agent herdr sees on this session, in any workspace.
+
+    herdr keeps a pane's session after its agent exits back to the shell, so only a
+    pane that still hosts a recognized agent counts.
+    """
+    panes = {
+        pane.get("pane_id")
+        for pane in herdr("pane", "list")["panes"]
+        if (pane.get("agent_session") or {}).get("value") == session_id
+    }
+    return next(
+        (
+            {"pane": agent["pane_id"], "status": agent.get("agent_status")}
+            for agent in herdr("agent", "list")["agents"]
+            if agent.get("pane_id") in panes
+        ),
+        None,
+    )
 
 
 def prune(prompts):
@@ -227,7 +247,8 @@ def resume(workspace_id, session_id, text, home):
             )
         elsewhere = open_elsewhere(session_id)
         if elsewhere:
-            raise ValueError(f"This session is already open in pane {elsewhere}; message it there")
+            # Already running in another workspace: talk to that agent, never a second one.
+            return prompt(elsewhere, text)
         owner = watch_owner(session_id, chosen["agent"], home)
         if owner:
             raise ValueError(f"Not resumed: {owner}")
