@@ -1273,7 +1273,7 @@ def test_unexpected_launch_error_is_uncertain_and_never_retried(synced, monkeypa
     manager, pr, _, _, _ = synced
     task = scheduled(manager, pr, time.time())
 
-    def broken(request):
+    def broken(request, scheduled=False):
         raise RuntimeError("thread limit")
 
     monkeypatch.setattr(manager, "action", broken)
@@ -1313,6 +1313,21 @@ def test_history_keeps_pending_tasks_and_recent_outcomes(synced, monkeypatch):
         scheduled(manager, pr, time.time() + 60)
 
 
+def test_history_keeps_tasks_whose_agent_is_still_watched(synced, monkeypatch):
+    manager, pr, _, _, _ = synced
+    monkeypatch.setattr(pw, "SCHEDULE_HISTORY", 1)
+    start = time.time()
+    watched = scheduled(manager, pr, start)
+    manager.run_due(now=start)
+    finish(manager, pr["id"])
+    for _ in range(3):
+        later = scheduled(manager, pr, time.time() + 60, action="handle")
+        manager.cancel_scheduled(later["id"])
+    tasks = manager.scheduled_tasks()["tasks"]
+    assert watched["id"] in [t["id"] for t in tasks]
+    assert [t["status"] for t in tasks].count("cancelled") == 1
+
+
 def test_scheduler_thread_starts_a_due_task(synced):
     manager, pr, _, state, _ = synced
     manager.start()
@@ -1328,6 +1343,121 @@ def test_scheduler_thread_starts_a_due_task(synced):
         manager.close()
         manager.scheduler.join(5)
     assert not manager.scheduler.is_alive()
+
+
+def test_scheduled_launch_asks_its_agent_to_confirm_and_is_watched(synced, monkeypatch):
+    manager, pr, _, state, jobs = synced
+    start = time.time()
+    task = scheduled(manager, pr, start)
+    manager.run_due(now=start)
+    op = finish(manager, pr["id"])
+    assert op["status"] == "complete", op["log"]
+    brief = json.loads(state.read_text())["agents"][0]["task"]
+    assert brief.startswith("Later task") and f"\n{op['exit_marker']}\n" in brief
+    listed = scheduled_task(manager, task["id"])
+    assert listed["exit"] == {"state": "watching", "message": "Waiting for the agent to finish"}
+
+    seen = []
+
+    def step(record, launched, persist, now=None):
+        seen.append(launched["id"])
+        persist({**record, "state": "exiting", "target": {"pane_id": "w1:p1"}})
+        # The scheduler stops after "exiting" is durable; a restart must not resend.
+        raise SystemExit
+
+    monkeypatch.setattr(pw.workspace_exit, "step", step)
+    with pytest.raises(SystemExit):
+        manager.exit_finished()
+    assert seen == [op["id"]]
+    assert scheduled_task(manager, task["id"])["exit"]["state"] == "exiting"
+    # Progress never reorders the outcome list or exposes internal identity.
+    assert set(scheduled_task(manager, task["id"])["exit"]) == {"state", "message"}
+    assert scheduled_task(manager, task["id"])["updated_at"] == listed["updated_at"]
+
+    restarted = pw.Workspaces(
+        manager.home, manager.overview, lambda: jobs, manager.src, issues=manager.issues
+    )
+    after = scheduled_task(restarted, task["id"])["exit"]
+    assert after["state"] == "unconfirmed" and "check its pane" in after["message"]
+    restarted.exit_finished()  # Only watching tasks are stepped.
+    assert seen == [op["id"]]
+
+
+def test_exit_watch_saves_only_changed_progress(synced, monkeypatch):
+    manager, pr, _, state, _ = synced
+    start = time.time()
+    task = scheduled(manager, pr, start)
+    manager.run_due(now=start)
+    finish(manager, pr["id"])
+    writes = []
+    real = manager.db
+
+    def step(record, launched, persist, now=None):
+        return {**record, "state": "exited", "message": "Exited"}
+
+    monkeypatch.setattr(pw.workspace_exit, "step", step)
+    manager.exit_finished()
+    assert scheduled_task(manager, task["id"])["exit"] == {"state": "exited", "message": "Exited"}
+
+    def counting():
+        writes.append(1)
+        return real()
+
+    monkeypatch.setattr(manager, "db", counting)
+    manager.exit_finished()  # Nothing is watching any more: one read, no write.
+    assert len(writes) == 1
+
+
+def test_exit_claim_fails_when_another_dashboard_changed_the_watch(synced, monkeypatch):
+    manager, pr, _, state, _ = synced
+    start = time.time()
+    task = scheduled(manager, pr, start)
+    manager.run_due(now=start)
+    finish(manager, pr["id"])
+    claims = []
+
+    def step(record, launched, persist, now=None):
+        # Another dashboard on this home advances the same watch first.
+        with manager.db() as db:
+            row = json.loads(
+                db.execute("SELECT data FROM scheduled WHERE id=?", (task["id"],)).fetchone()[0]
+            )
+            row["exit"]["message"] = "Other dashboard"
+            db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(row), task["id"]))
+        try:
+            persist({**record, "state": "exiting"})
+        except pw.workspace_exit.Leave:
+            claims.append("refused")
+            raise
+        claims.append("claimed")
+        return record
+
+    monkeypatch.setattr(pw.workspace_exit, "step", step)
+    manager.exit_finished()  # The refusal stays inside this watch.
+    assert claims == ["refused"]
+    assert scheduled_task(manager, task["id"])["exit"] == {
+        "state": "watching",
+        "message": "Other dashboard",
+    }
+    # A pruned row is refused the same way, before any key could be sent.
+    with manager.db() as db:
+        db.execute("DELETE FROM scheduled WHERE id=?", (task["id"],))
+    monkeypatch.setattr(
+        pw.workspace_exit,
+        "step",
+        lambda record, launched, persist, now=None: persist({**record, "state": "exiting"}),
+    )
+    with pytest.raises(pw.workspace_exit.Leave):
+        manager.exit_one({"id": task["id"], "exit": pw.workspace_exit.watching()})
+
+
+def test_immediate_launch_is_never_exited(synced):
+    manager, pr, _, state, _ = synced
+    manager.action({"id": pr["id"], "action": "create", "task": "Now task"})
+    op = finish(manager, pr["id"])
+    assert op["status"] == "complete", op["log"]
+    assert "exit_marker" not in op
+    assert "babysit-done" not in json.loads(state.read_text())["agents"][0]["task"]
 
 
 def test_http_lists_and_cancels_scheduled_tasks(synced):

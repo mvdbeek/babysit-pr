@@ -1244,7 +1244,8 @@ button:disabled {
 }
 .scheduled-title,
 .scheduled-settings,
-.scheduled-message {
+.scheduled-message,
+.scheduled-exit {
   color: var(--muted);
   font-size: 13px;
   margin: 0;

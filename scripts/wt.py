@@ -807,8 +807,8 @@ class Tool:
         if not reply.root_pane:
             raise WtError(f"wt: herdr did not return a root pane for {directory}")
         command = self.command_for(options)
-        # No spare terminal split here: the reviewr plugin already splits a pane into
-        # every new worktree workspace, so a second one would sit empty.
+        # No spare terminal split here: reviewr's auto_open is off, so the workspace
+        # holds just the agent; open reviewr with its toggle action when wanted.
         # pane run submits text + Enter; the pty buffers it until the new shell reads it.
         result = self.runner.run(["herdr", "pane", "run", reply.root_pane, command])
         if result.returncode:

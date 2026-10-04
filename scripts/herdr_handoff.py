@@ -344,6 +344,62 @@ def schedule(db, home, args):
     }
 
 
+def send_exit(target, expected, before, owned, save):
+    """Press Ctrl-D in a verified idle TUI, then confirm its process exited.
+
+    ``expected`` is the (turn, complete) pair and ``before`` the transcript fingerprint the
+    caller verified; ``owned`` re-checks the caller's claim before every key. An
+    unconfirmed exit raises without pressing again.
+    """
+    agent = target.get("agent", "codex")
+    # Never repeat blindly: a Ctrl-D that reaches the shell could close it. Claude asks
+    # for a second press within about a second; it goes only to the still-running TUI.
+    herdr("agent", "send-keys", target["pane_id"], "ctrl+d")
+    if agent == "claude":
+        confirmation_deadline = time.monotonic() + 0.75
+        while time.monotonic() < confirmation_deadline:
+            owned()
+            info, procs, _ = inspect(target["pane_id"])
+            if not any(p["pid"] == target["agent_pid"] for p in procs["foreground_processes"]):
+                break  # Already exiting; never send a confirmation to the shell.
+            verify_identity(target, info, procs)
+            if (
+                info.get("agent_status") not in {"idle", "done"}
+                or info.get("scroll", {}).get("offset_from_bottom", 0) != 0
+                or fingerprint(target["rollout"]) != before
+                or latest_turn(target["rollout"], target["session_id"], agent) != expected
+            ):
+                raise RuntimeError("Session changed before exit confirmation; exit cancelled")
+            confirmation = read_screen(target["pane_id"])
+            # Reuse every input check, allowing only our own exit confirmation hint.
+            verify_screen(target, info, confirmation, confirming=True)
+            if CLAUDE_EXIT_HINT in SGR.sub("", confirmation):
+                owned()
+                save("exit_repeated", screen_before=confirmation)
+                herdr("agent", "send-keys", target["pane_id"], "ctrl+d")
+                break
+            time.sleep(0.05)
+    deadline = time.monotonic() + 20
+    while True:
+        owned()
+        info = result("pane", "get", target["pane_id"])["pane"]
+        procs = result("pane", "process-info", "--pane", target["pane_id"])["process_info"]
+        if (
+            info["terminal_id"] != target["terminal_id"]
+            or procs["shell_pid"] != target["shell_pid"]
+        ):
+            raise RuntimeError("Shell or terminal changed after exit")
+        foreground = procs["foreground_processes"]
+        if foreground and all(p["pid"] == target["shell_pid"] for p in foreground):
+            try:
+                os.kill(target["agent_pid"], 0)
+            except ProcessLookupError:
+                return
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Exit unconfirmed; no repeat key sent")
+        time.sleep(0.5)
+
+
 def perform(target, home, db):
     audit = home / "handoffs" / f"{target['token']}.audit.json"
     diagnostics: dict[str, str] = {}
@@ -447,55 +503,7 @@ def perform(target, home, db):
             raise RuntimeError("Session or input changed before exit; handoff cancelled")
         still_owned()
         save("exit_sent", screen_before=screen2)
-        # Never repeat blindly: a Ctrl-D that reaches the shell could close it. Claude asks
-        # for a second press within about a second; it goes only to the still-running TUI.
-        herdr("agent", "send-keys", target["pane_id"], "ctrl+d")
-        if agent == "claude":
-            confirmation_deadline = time.monotonic() + 0.75
-            while time.monotonic() < confirmation_deadline:
-                still_owned()
-                info3, procs3, _ = inspect(target["pane_id"])
-                if not any(p["pid"] == target["agent_pid"] for p in procs3["foreground_processes"]):
-                    break  # Already exiting; never send a confirmation to the shell.
-                verify_identity(target, info3, procs3)
-                if (
-                    info3.get("agent_status") not in {"idle", "done"}
-                    or info3.get("scroll", {}).get("offset_from_bottom", 0) != 0
-                    or fingerprint(target["rollout"]) != before
-                    or latest_turn(target["rollout"], target["session_id"], agent)
-                    != (turn, complete)
-                ):
-                    raise RuntimeError(
-                        "Session changed before exit confirmation; handoff cancelled"
-                    )
-                confirmation = read_screen(target["pane_id"])
-                # Reuse every input check, allowing only our own exit confirmation hint.
-                verify_screen(target, info3, confirmation, confirming=True)
-                if CLAUDE_EXIT_HINT in SGR.sub("", confirmation):
-                    still_owned()
-                    save("exit_repeated", screen_before=confirmation)
-                    herdr("agent", "send-keys", target["pane_id"], "ctrl+d")
-                    break
-                time.sleep(0.05)
-        deadline = time.monotonic() + 20
-        while True:
-            still_owned()
-            info = result("pane", "get", target["pane_id"])["pane"]
-            procs = result("pane", "process-info", "--pane", target["pane_id"])["process_info"]
-            if (
-                info["terminal_id"] != target["terminal_id"]
-                or procs["shell_pid"] != target["shell_pid"]
-            ):
-                raise RuntimeError("Shell or terminal changed after exit; watch was not released")
-            foreground = procs["foreground_processes"]
-            if foreground and all(p["pid"] == target["shell_pid"] for p in foreground):
-                try:
-                    os.kill(target["agent_pid"], 0)
-                except ProcessLookupError:
-                    break
-            if time.monotonic() >= deadline:
-                raise RuntimeError("Exit unconfirmed; no repeat key and no watch release")
-            time.sleep(0.5)
+        send_exit(target, (turn, complete), before, still_owned, save)
         with db:
             db.execute("BEGIN IMMEDIATE")
             job = still_owned()

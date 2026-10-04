@@ -2676,6 +2676,7 @@ function scheduledCard(task) {
     if (task.launched_at) outcome.append(` at ${scheduleTime(task.launched_at)}`);
     if (task.operation) outcome.append(` · ${task.operation.status}: ${task.operation.message}`);
     card.append(outcome);
+    if (task.exit) card.append(el("small", `Agent: ${task.exit.message}`, "scheduled-exit"));
     if (task.operation?.url) card.append(link("Open in Collie", task.operation.url));
   } else {
     const cancel = el("button", scheduledCancelling.has(task.id) ? "Cancelling…" : "Cancel");

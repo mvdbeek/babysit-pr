@@ -28,6 +28,7 @@ from urllib.parse import quote
 import github_cli
 import owned_process
 import workspace_agents
+import workspace_exit
 from issue_overview import branch_number
 
 # Collie's own setting for the URL it is reached at; unset means its loopback default.
@@ -349,6 +350,16 @@ class Workspaces:
                     status="uncertain",
                     updated_at=time.time(),
                     message="The dashboard stopped while starting this task. Check the item's workspace before scheduling it again.",
+                )
+                db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), key))
+            # An exit the previous process began may have pressed a key; never repeat it.
+            for key, data in db.execute(
+                "SELECT id,data FROM scheduled WHERE json_extract(data,'$.exit.state')='exiting'"
+            ).fetchall():
+                task = json.loads(data)
+                task["exit"].update(
+                    state="unconfirmed",
+                    message="The dashboard stopped while exiting the agent; check its pane.",
                 )
                 db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), key))
         # A fresh process must inspect resources; it never resubmits an uncertain launch.
@@ -739,10 +750,12 @@ class Workspaces:
             for a in herdr("agent", "list")["agents"]
         )
 
-    def action(self, request, inventory=None):
+    def action(self, request, inventory=None, scheduled=False):
         """Validate and perform one workspace action.
 
         ``inventory`` lets a batch validate many items against a single fresh scan.
+        ``scheduled`` marks a launch the scheduler started: its brief asks the agent to
+        confirm completion, so the agent can be exited once it is done.
         """
         allowed = {
             "id",
@@ -916,6 +929,8 @@ class Workspaces:
                 "log": "",
                 "created_at": time.time(),
             }
+            if scheduled and action != "reopen":
+                op["exit_marker"] = workspace_exit.new_marker()
             # Reserve the PR in SQLite before starting a thread (also across server instances).
             with self.db() as db:
                 db.execute("BEGIN IMMEDIATE")
@@ -1093,9 +1108,10 @@ class Workspaces:
     def save_scheduled(self, db, task, **changes):
         task.update(changes, updated_at=time.time())
         db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), task["id"]))
-        # Keep every pending task and only the most recent finished ones.
+        # Keep every pending or watched task and only the most recent finished ones.
         db.execute(
             """DELETE FROM scheduled WHERE json_extract(data,'$.status')!='scheduled'
+               AND coalesce(json_extract(data,'$.exit.state'),'') NOT IN ('watching','exiting')
                AND id NOT IN (SELECT id FROM scheduled
                               WHERE json_extract(data,'$.status')!='scheduled'
                               ORDER BY json_extract(data,'$.updated_at') DESC LIMIT ?)""",
@@ -1123,6 +1139,9 @@ class Workspaces:
                     "message": op.get("message"),
                     "url": result.get("url"),
                 }
+            if task.get("exit"):
+                # The pane identity and transcript paths are internal.
+                task["exit"] = {k: task["exit"][k] for k in ("state", "message")}
         pending = sorted(
             (t for t in tasks if t["status"] == "scheduled"), key=lambda t: t["start_at"]
         )
@@ -1194,7 +1213,7 @@ class Workspaces:
             try:
                 if not any(t["id"] == task["target"] for t in self.targets()):
                     raise ValueError("the item is no longer listed on the dashboard")
-                value = self.action({**task["request"], "retry": True})
+                value = self.action({**task["request"], "retry": True}, scheduled=True)
             except (
                 OSError,
                 ValueError,
@@ -1217,6 +1236,7 @@ class Workspaces:
                         "operation_id": op["id"],
                         "launched_at": time.time(),
                         "message": "Started",
+                        "exit": workspace_exit.watching(),
                     }
                 elif op.get("status") == "complete":
                     changes = {
@@ -1230,6 +1250,52 @@ class Workspaces:
                     }
             with self.db() as db:
                 self.save_scheduled(db, task, **changes)
+
+    def exit_finished(self, now=None):
+        """Exit the agents of started tasks that confirmed their task is done."""
+        with self.db() as db:
+            tasks = [
+                json.loads(data)
+                for (data,) in db.execute(
+                    "SELECT data FROM scheduled WHERE json_extract(data,'$.exit.state')='watching'"
+                )
+            ]
+        for task in tasks:
+            try:
+                self.exit_one(task, now)
+            except Exception:
+                continue  # One watch must not stop the others; the next pass retries it.
+
+    def exit_one(self, task, now=None):
+        op = self.operation_record(task.get("operation_id"))
+        saved = [json.dumps(task["exit"], sort_keys=True)]
+
+        def persist(record):
+            # Compare and swap: a key is sent only after this process claims the watch it
+            # read, so a second dashboard on this home, or a pruned row, sends nothing.
+            # Not save_scheduled: progress must not reorder the outcome list.
+            with self.db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM scheduled WHERE id=?", (task["id"],)).fetchone()
+                current = json.loads(row[0]) if row else None
+                if not current or json.dumps(current.get("exit"), sort_keys=True) != saved[0]:
+                    raise workspace_exit.Leave("This watch changed elsewhere; nothing was sent")
+                current["exit"] = record
+                db.execute(
+                    "UPDATE scheduled SET data=? WHERE id=?", (json.dumps(current), task["id"])
+                )
+            saved[0] = json.dumps(record, sort_keys=True)
+
+        record = workspace_exit.step(task["exit"], op, persist, now)
+        if json.dumps(record, sort_keys=True) != saved[0]:
+            persist(record)
+
+    def operation_record(self, key):
+        if not key:
+            return None
+        with self.db() as db:
+            row = db.execute("SELECT data FROM operation_history WHERE id=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def next_due(self):
         with self.db() as db:
@@ -1255,9 +1321,15 @@ class Workspaces:
             self.wake.clear()
             try:
                 self.run_due()
+            except Exception:
+                pass  # The scheduler must outlive any single failure; the next pass retries.
+            try:
+                self.exit_finished()
+            except Exception:
+                pass
+            try:
                 due = self.next_due()
             except Exception:
-                # The scheduler must outlive any single failure; the next pass retries.
                 due = None
             now = time.time()
             # A due task waiting on another launch for its item is rechecked every 5 seconds.
@@ -1389,6 +1461,8 @@ class Workspaces:
                         brief = f"{task}\n\n{context}"
                     else:
                         brief = f"{task}\n\n{subject}: {canonical(pr)}\n"
+                    if op.get("exit_marker"):
+                        brief += workspace_exit.brief(op["exit_marker"])
                     with os.fdopen(fd, "w") as stream:
                         stream.write(brief)
                     args = [
