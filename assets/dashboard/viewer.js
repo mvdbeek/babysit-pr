@@ -240,9 +240,13 @@
         node("summary", `${data.commits.length} commit${data.commits.length === 1 ? "" : "s"}`),
       );
       for (const commit of data.commits) {
-        const line = node("div", undefined, "ws-commit");
-        line.append(node("code", commit.sha.slice(0, 9)), " ", linked("span", commit.subject));
-        line.append(node("small", `${commit.author} · ${date(commit.time)}`, "pr-meta"));
+        const line = node(commit.body ? "details" : "div", undefined, "ws-commit");
+        const heading = commit.body ? node("summary") : line;
+        heading.append(node("code", commit.sha.slice(0, 9)), " ", linked("span", commit.subject));
+        heading.append(node("small", `${commit.author} · ${date(commit.time)}`, "pr-meta"));
+        if (commit.body) {
+          line.append(heading, linked("div", commit.body, "ws-commit-body"));
+        }
         commits.append(line);
       }
       content.append(commits);

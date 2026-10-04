@@ -151,6 +151,13 @@
 .ws-commit small {
   display: block;
 }
+.ws-commit > summary {
+  cursor: pointer;
+}
+.ws-commit-body {
+  margin-top: 8px;
+  white-space: pre-wrap;
+}
 .ws-untracked {
   margin: 0;
   padding: 8px 12px 8px 32px;

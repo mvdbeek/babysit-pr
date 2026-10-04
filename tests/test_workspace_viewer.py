@@ -72,6 +72,23 @@ def test_an_older_base_can_be_chosen_but_not_an_arbitrary_ref(repo):
             wv.diff(path, base=base)
 
 
+def test_commit_bodies_preserve_paragraphs_and_do_not_split_commit_records(repo):
+    path, git = repo
+    body = "Explain the change.\n\n- First detail\n- Second detail\n\nRefs: https://example.com/1"
+    git("commit", "--allow-empty", "-m", "With details", "-m", body)
+    git("commit", "--allow-empty", "-m", "Latest", "-m", "Another body.")
+    commits = wv.diff(path)["commits"]
+    assert [c["subject"] for c in commits] == [
+        "Latest",
+        "With details",
+        "Second commit",
+        "Rename and add a binary",
+    ]
+    assert [c["body"] for c in commits] == ["Another body.", body, "", ""]
+    assert commits[0]["sha"] == git("rev-parse", "HEAD")[:12]
+    assert all(c["author"] == "Fixture" and c["time"] > 0 for c in commits)
+
+
 def test_uncommitted_diff_compares_with_head_only(repo):
     path, _ = repo
     value = wv.diff(path, "uncommitted")
