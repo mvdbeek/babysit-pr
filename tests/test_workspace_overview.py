@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from unittest.mock import ANY
 from urllib.parse import quote
 
 import dashboard
@@ -966,3 +967,252 @@ def test_a_failing_herdr_stays_inside_the_view_boundary(server, monkeypatch):
     )
     status, value = request(port, "/api/workspace-diff?workspace=w1")
     assert status == 200 and value["error"].startswith("Workspace view unavailable")
+
+
+def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
+    state = site[4]
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            status, value = request(port, "/api/workspace-agents?workspace=w1")
+            assert status == 200 and value["agents"] == [
+                {"pane": "w1:p1", "agent": "codex", "status": "idle", "title": None}
+            ]
+            assert value["path"].endswith("merged-work") and value["sessions"] == []
+            body = {"workspace": "w1", "text": "Please add a test.\r\nThen push.\x1b[201~\x15"}
+            status, value = request(
+                port, "/api/workspace-message", body, action="workspace-message"
+            )
+            assert status == 200 and value == {"sent": True, "pane": "w1:p1", "warning": None}
+            # Control characters never reach the terminal; the rest is plain text.
+            assert read(state)["prompts"] == [["w1:p1", "Please add a test.\nThen push.[201~"]]
+            for body, error in [
+                ({"workspace": "w1", "text": " "}, "Write a message"),
+                ({"workspace": "w1", "text": "x", "pane": "w9:p1"}, "no longer running"),
+                ({"workspace": "w1", "text": "x", "extra": 1}, "Invalid message"),
+                ({"workspace": "w9", "text": "x"}, "not open"),
+                ({"workspace": "w2", "text": "x"}, "no checkout"),
+            ]:
+                status, value = request(
+                    port, "/api/workspace-message", body, action="workspace-message"
+                )
+                assert status == 400 and error in value["error"], body
+            assert len(read(state)["prompts"]) == 1
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_messages_need_a_single_unblocked_agent(site):
+    import agent_messages
+
+    state = site[4]
+    data = read(state)
+    data["agents"].append({**data["agents"][0], "pane_id": "w1:p2", "agent": "claude"})
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="choose one"):
+        agent_messages.send({"workspace": "w1", "text": "go"})
+    assert (
+        agent_messages.send({"workspace": "w1", "pane": "w1:p2", "text": "go"})["pane"] == "w1:p2"
+    )
+    data = read(state)
+    data["agents"] = [{**data["agents"][0], "agent_status": "blocked"}]
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="answer it in Collie"):
+        agent_messages.send({"workspace": "w1", "text": "go"})
+    data["agents"] = []
+    state.write_text(json.dumps({**read(state), "agents": []}))
+    with pytest.raises(ValueError, match="No agent is running"):
+        agent_messages.send({"workspace": "w1", "text": "go"})
+
+
+@pytest.mark.parametrize(
+    ("code", "outcome"),
+    [
+        ("agent_blocked", "answer it in Collie"),
+        ("agent_prompt_stalled", None),
+        ("other", "could not deliver"),
+    ],
+)
+def test_herdr_refusals_are_explained(site, monkeypatch, code, outcome):
+    import agent_messages
+
+    monkeypatch.setenv("FAKE_HERDR_PROMPT_ERROR", code)
+    if outcome is None:
+        value = agent_messages.send({"workspace": "w1", "text": "go"})
+        assert value["sent"] and "no reaction" in value["warning"]
+    else:
+        with pytest.raises(ValueError, match=outcome):
+            agent_messages.send({"workspace": "w1", "text": "go"})
+
+
+def test_dash_leading_messages_are_text(site):
+    import agent_messages
+
+    agent_messages.send({"workspace": "w1", "text": "- rename foo\n- add a test"})
+    assert read(site[4])["prompts"][-1] == ["w1:p1", "- rename foo\n- add a test"]
+    prompt = calls(site[4], ["agent", "prompt"])[-1]
+    assert prompt[-7:] == [
+        "--wait",
+        "--until",
+        "working",
+        "--until",
+        "blocked",
+        "--timeout",
+        "8000",
+    ]
+
+
+@pytest.fixture
+def exited(site, tmp_path, monkeypatch):
+    """The workspace's agent has exited; its Claude session is recorded in the checkout."""
+    plugin, _, _, worktrees, state, _ = site
+    checkout = worktrees / "merged-work"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    folder = (
+        tmp_path / "claude" / "projects" / "".join(c if c.isalnum() else "-" for c in str(checkout))
+    )
+    folder.mkdir(parents=True)
+    sid = "8f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10"
+    (folder / f"{sid}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "cwd": str(checkout),
+                "sessionId": sid,
+                "message": {"content": "Fix it"},
+            }
+        )
+        + "\n"
+    )
+    data = read(state)
+    data["agents"] = []
+    data["panes"] = [
+        {"pane_id": "w1:p1", "workspace_id": "w1"},
+        {"pane_id": "w1:p2", "workspace_id": "w1"},
+    ]
+    data["process_info"] = {
+        # p1 runs a server in the foreground; p2 is the shell at its prompt.
+        "w1:p1": {"shell_pid": 10, "foreground_processes": [{"pid": 11, "cwd": str(checkout)}]},
+        "w1:p2": {"shell_pid": 20, "foreground_processes": [{"pid": 20, "cwd": str(checkout)}]},
+    }
+    state.write_text(json.dumps(data))
+    return state, sid, checkout, plugin.home
+
+
+def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
+    import agent_messages
+
+    state, sid, checkout, home = exited
+    assert agent_messages.sessions("w1", home) == [
+        {"id": sid, "agent": "claude", "title": "Fix it", "updated": ANY, "watched": False}
+    ]
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "Now add docs"}, home)
+    data = read(state)
+    # Never the idle-looking shell in p2: a fresh split in the session's directory.
+    assert data["splits"] == [
+        ["w1:p1", "--direction", "right", "--cwd", str(checkout.resolve()), "--no-focus"]
+    ]
+    pane = data["panes"][-1]["pane_id"]
+    assert value == {"sent": True, "pane": pane, "resumed": sid, "warning": None}
+    assert [run[0] for run in data["runs"]] == [pane]
+    assert data["runs"][0][1].startswith(f'claude --resume {sid} -- "$(cat ')
+    agent = data["agents"][0]
+    assert agent["argv"] == ["--resume", sid, "--", "Now add docs"]
+    assert Path(agent["cwd"]).resolve() == checkout.resolve()
+    # The staged prompt is removed once the agent has read it.
+    assert not list((home / "message-prompts").iterdir())
+    assert agent_messages._recent == {}
+    # The agent now runs: a second resume is refused, a message goes to it instead.
+    with pytest.raises(ValueError, match="already running"):
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "again"}, home)
+
+
+def test_a_session_open_elsewhere_or_just_resumed_is_not_resumed_again(exited, monkeypatch):
+    import agent_messages
+
+    state, sid, _, home = exited
+    data = read(state)
+    data["panes"].append(
+        {"pane_id": "w7:p1", "workspace_id": "w7", "agent_session": {"value": sid}}
+    )
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="already open in pane w7:p1"):
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    data["panes"].pop()
+    state.write_text(json.dumps(data))
+    monkeypatch.setattr(agent_messages, "RESUME_WAIT", 0)
+    first = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert "no agent appeared yet" in first["warning"]
+    data = read(state)
+    data["agents"] = []  # Not recognized yet: only the recent-resume record stops a repeat.
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="just resumed"):
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert len(read(state)["runs"]) == 1
+
+
+def test_a_watched_session_is_left_to_the_watcher(exited):
+    import fcntl
+
+    import agent_messages
+    import claude_runner
+    import pr_supervisor as supervisor
+
+    state, sid, _, home = exited
+    db = supervisor.open_db(home)
+    with db:
+        supervisor.save_job(db, {"id": "w-1", "status": "watching", "session_id": sid})
+    db.close()
+    assert agent_messages.sessions("w1", home)[0]["watched"] is True
+    with pytest.raises(ValueError, match="babysit watch w-1 \\(watching\\)"):
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    db = supervisor.open_db(home)
+    with db:
+        supervisor.save_job(db, {"id": "w-1", "status": "stopped", "session_id": sid})
+    db.close()
+    # A repair holding the session lock right now, from any supervisor home.
+    lock = claude_runner.config_home() / "babysit-pr-locks" / f"{sid}.lock"
+    lock.parent.mkdir(parents=True)
+    with lock.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        with pytest.raises(ValueError, match="repair is running"):
+            agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert not read(state).get("runs")
+
+
+def test_resume_refuses_unknown_sessions_and_mixed_targets(exited):
+    import agent_messages
+
+    _, sid, _, home = exited
+    for request, error in [
+        (
+            {"workspace": "w1", "resume": "1f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10", "text": "x"},
+            "not recorded",
+        ),
+        ({"workspace": "w1", "resume": "../x", "text": "x"}, "Choose a recorded session"),
+        ({"workspace": "w1", "resume": sid, "pane": "w1:p2", "text": "x"}, "not both"),
+    ]:
+        with pytest.raises(ValueError, match=error):
+            agent_messages.send(request, home)
+
+
+def test_old_resume_prompts_and_records_are_pruned(tmp_path, monkeypatch):
+    import os
+    import time
+
+    import agent_messages
+
+    old = tmp_path / "resume-old"
+    new = tmp_path / "resume-new"
+    for staged in (old, new):
+        staged.write_text("x")
+    os.utime(old, (time.time() - 90000, time.time() - 90000))
+    recent = {"a": ("w1:p1", time.monotonic() - 999), "b": ("w1:p2", time.monotonic())}
+    monkeypatch.setattr(agent_messages, "_recent", recent)
+    agent_messages.prune(tmp_path)
+    assert [p.name for p in tmp_path.iterdir()] == ["resume-new"]
+    assert list(agent_messages._recent) == ["b"]

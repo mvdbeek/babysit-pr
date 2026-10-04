@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import agent_messages
 import workspace_viewer
 from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
@@ -265,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                 "schedule-cancel",
                 "workspace-cleanup",
                 "workspace-open",
+                "workspace-message",
                 "workspace-prompt-forget",
                 "sentry-action",
                 "push-subscribe",
@@ -295,6 +297,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-batch",
                         "workspace-cleanup",
                         "workspace-open",
+                        "workspace-message",
                         "workspace-prompt-forget",
                         "sentry-action",
                     }
@@ -346,6 +349,12 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     value = {"error": "Workspace experiment unavailable"}
                 self.send_json(200, value)
+                return
+            if action == "workspace-message":
+                try:
+                    self.send_json(200, agent_messages.send(request, self.server.home))
+                except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
+                    self.send_json(503, {"error": f"Nothing was typed: {exc}"})
                 return
             if action == "workspace-prompt-forget":
                 if not self.server.workspaces:
@@ -456,6 +465,21 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(
                         200, {"enabled": True, "error": "Workspace experiment unavailable"}
                     )
+            elif route.path == "/api/workspace-agents":
+                query = parse_qs(route.query)
+                if set(query) != {"workspace"} or len(query["workspace"]) != 1:
+                    raise ValueError("Supply a workspace")
+                workspace_id = query["workspace"][0]
+                self.send_json(
+                    200,
+                    {
+                        "agents": agent_messages.agents(workspace_id),
+                        "sessions": agent_messages.sessions(workspace_id, self.server.home),
+                        # A draft names its checkout, so a reused workspace ID cannot
+                        # deliver another checkout's comments.
+                        "path": workspace_viewer.workspace_checkout(workspace_id),
+                    },
+                )
             elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:
                 query = parse_qs(route.query)
                 if any(len(values) != 1 for values in query.values()):

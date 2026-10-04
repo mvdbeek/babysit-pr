@@ -51,13 +51,28 @@ elif a[:2] == ['workspace','close']:
  data['agents']=[g for g in data['agents'] if g.get('workspace_id')!=a[2]]
  if os.environ.get('FAKE_HERDR_CLOSE_ERROR'):
   p.write_text(json.dumps(data)); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_CLOSE_ERROR']}})); sys.exit(1)
+elif a[:2] == ['agent','prompt']:
+ if os.environ.get('FAKE_HERDR_PROMPT_ERROR'):
+  p.write_text(json.dumps(data)); print(json.dumps({'error':{'code':os.environ['FAKE_HERDR_PROMPT_ERROR'],'message':'refused'}})); sys.exit(1)
+ data.setdefault('prompts',[]).append(a[2:4])
 elif a[:2] == ['agent','send-keys']:
  if not os.environ.get('FAKE_HERDR_KEEP_AGENT'):
   data['agents']=[g for g in data['agents'] if g.get('pane_id')!=a[2]]
+elif a[:2] == ['pane','list']:
+ wid=a[a.index('--workspace')+1] if '--workspace' in a else None
+ result={'panes':[x for x in data.get('panes',[]) if wid is None or x['workspace_id']==wid]}
+elif a[:2] == ['pane','process-info']:
+ result={'process_info':data.get('process_info',{}).get(a[a.index('--pane')+1],{'shell_pid':1,'foreground_processes':[]})}
+elif a[:2] == ['pane','split']:
+ wid=a[2].split(':')[0]; pid=f"{wid}:p{len(data.setdefault('panes',[]))+10}"
+ data['panes'].append({'pane_id':pid,'workspace_id':wid,'cwd':a[a.index('--cwd')+1]})
+ data.setdefault('splits',[]).append(a[2:])
+ result={'pane':{'pane_id':pid}}
 elif a[:2] == ['pane','run']:
  w=next(w for w in data['workspaces'] if a[2].startswith(w['workspace_id']+':'))
+ data.setdefault('runs',[]).append(a[2:])
  p.write_text(json.dumps(data))
- env={**os.environ,'FAKE_WORKSPACE':w['workspace_id']}
+ env={**os.environ,'FAKE_WORKSPACE':w['workspace_id'],'FAKE_PANE':a[2]}
  subprocess.check_call(['/bin/zsh','-fc',a[3]],cwd=w['worktree']['checkout_path'],env=env)
  sys.exit(0)
 p.write_text(json.dumps(data)); print(json.dumps({'result':result}))
@@ -68,7 +83,9 @@ from pathlib import Path
 if sys.argv[1:] == ['--version']:
     print(os.environ.get('FAKE_AGENT_VERSION', 'fixture-cli 0.0.1')); sys.exit()
 p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
-data['agents'].append({'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]})
+agent={'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]}
+if os.environ.get('FAKE_PANE'): agent.update(pane_id=os.environ['FAKE_PANE'],agent_status='working')
+data['agents'].append(agent)
 p.write_text(json.dumps(data))
 """
 
@@ -134,3 +151,6 @@ def fresh_viewer_caches(monkeypatch):
 
     for name in ("_checkouts", "_details", "_parsers"):
         monkeypatch.setattr(workspace_viewer, name, {})
+    import agent_messages
+
+    monkeypatch.setattr(agent_messages, "_recent", {})
