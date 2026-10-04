@@ -64,6 +64,9 @@ BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NEW_PREFIX = "new:"
 NEW_LISTED = 86400
 NEW_LIMIT = 20
+# A new task lists clones whose HEAD moved this recently, unless asked for all of them.
+RECENT_CLONE_SECONDS = 90 * 86400
+REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=()):
@@ -121,6 +124,46 @@ def remote_slugs(config):
         for key, value in config.items()
         if key.startswith("remote.") and key.endswith(".url") and (slug := remote_slug(value))
     }
+
+
+def file_remotes(git_dir):
+    """Remote slugs read from ``.git/config`` itself, without starting a git process.
+
+    Listing hundreds of clones for a new task must be quick; includes and URL rewrites
+    are ignored, which `git config --get-regexp` does not apply to these values either.
+    """
+    try:
+        text = (git_dir / "config").read_text(errors="replace")
+    except OSError:
+        return {}
+    config: dict[str, str] = {}
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            header = REMOTE_SECTION.fullmatch(line)
+            section = header[1] if header else None
+            continue
+        key, separator, value = line.partition("=")
+        if section is not None and separator and key.strip().lower() == "url":
+            config.setdefault(f"remote.{section}.url", value.strip().strip('"'))
+    return remote_slugs(config)
+
+
+def last_activity(git_dir):
+    """When HEAD last moved in a clone or any of its worktrees, from their reflogs.
+
+    Index and FETCH_HEAD times change whenever a tool inspects or fetches a clone, so
+    they say nothing about whether anyone works in it.
+    """
+    times = []
+    for log in [git_dir / "logs" / "HEAD", *git_dir.glob("worktrees/*/logs/HEAD")]:
+        with contextlib.suppress(OSError):
+            times.append(log.stat().st_mtime)
+    if not times:
+        with contextlib.suppress(OSError):
+            times.append((git_dir / "HEAD").stat().st_mtime)
+    return max(times, default=0.0)
 
 
 def provenance(path, common, branch, sha, config, remotes):
@@ -976,24 +1019,48 @@ class Workspaces:
 
     # -- tasks started from scratch --
 
-    def local_repositories(self):
-        """Every clone under the source directory with the GitHub repositories it tracks.
+    def local_repositories(self, everything=False):
+        """Clones under the source directory with the GitHub repositories they track.
 
         The inventory only scans clones of repositories with tracked PRs or issues; a new
-        task may start in any clone. The upstream remote is listed before origin, since
-        an issue usually belongs in the repository a fork tracks.
+        task may start in any clone. Unless ``everything`` is asked for, only clones
+        whose HEAD moved recently are listed, plus those an open workspace or an earlier
+        launch uses. Most recently active clones come first. A clone offers its upstream
+        and origin repositories, upstream first since an issue usually belongs in the
+        repository a fork tracks; remotes added to fetch other people's forks are left
+        out, unless a clone has neither.
         """
         found: list[dict] = []
         if not self.src.is_dir():
-            return {"repos": found}
-        roots = sorted(p.resolve() for p in self.src.iterdir() if (p / ".git").is_dir())
-        for root in roots:
-            remotes = remote_slugs(repo_config(root))
+            return {"repos": found, "idle": 0}
+        with self.db() as db:
+            used = {path for (path,) in db.execute("SELECT path FROM clones")}
+        used.update(
+            str(Path(w["worktree"]["repo_root"]).resolve())
+            for w in self.inventory["workspaces"]
+            if w.get("worktree")
+        )
+        recent = time.time() - RECENT_CLONE_SECONDS
+        clones = []
+        idle = 0
+        for root in self.src.iterdir():
+            git_dir = root / ".git"
+            if not git_dir.is_dir():
+                continue
+            root = root.resolve()
+            active = last_activity(git_dir)
+            if not everything and active < recent and str(root) not in used:
+                idle += 1
+                continue
+            clones.append((active, root, file_remotes(git_dir)))
+        clones.sort(key=lambda clone: (-clone[0], str(clone[1])))
+        for active, root, remotes in clones:
+            main = {name: slug for name, slug in remotes.items() if name in {"upstream", "origin"}}
             for name, slug in sorted(
-                remotes.items(), key=lambda kv: (kv[0] != "upstream", kv[0] != "origin", kv[0])
+                (main or remotes).items(), key=lambda kv: (kv[0] != "upstream", kv[0])
             ):
-                found.append({"repo": slug, "clone": str(root), "remote": name})
-        return {"repos": found}
+                found.append({"repo": slug, "clone": str(root), "remote": name, "active": active})
+        return {"repos": found, "idle": idle}
 
     def new_task(self, request):
         """Start an agent on a task with no PR or issue behind it, in a new workspace.
@@ -1020,7 +1087,8 @@ class Workspaces:
             raise ValueError("Choose a repository")
         clone = request.get("clone", "")
         if not any(
-            r["repo"] == repo and r["clone"] == clone for r in self.local_repositories()["repos"]
+            r["repo"] == repo and r["clone"] == clone
+            for r in self.local_repositories(everything=True)["repos"]
         ):
             raise ValueError(f"Choose a local clone of {repo}")
         agent = request.get("agent", "codex")

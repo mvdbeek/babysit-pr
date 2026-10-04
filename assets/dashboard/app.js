@@ -2403,13 +2403,17 @@ async function newTaskDialog() {
   $("workspace-log").textContent = "";
   if (!$("workspace-dialog").open) $("workspace-dialog").showModal();
   try {
-    const [{ repos }] = await Promise.all([
+    // Recently active clones by default; idle ones are fetched only when asked for.
+    const [recent] = await Promise.all([
       get("/api/workspace-repos"),
       // Agent model choices come with the workspace snapshot.
       workspaceData.agent_choices ? null : loadWorkspaces(),
     ]);
     if (workspaceDialogItem !== owner) return;
-    if (!repos.length) throw Error("No local clones were found to start a task in.");
+    if (!recent.repos.length && !recent.idle)
+      throw Error("No local clones were found to start a task in.");
+    let repos = recent.repos;
+    let everything = null;
     const form = el("form");
     function field(text, input, parent = form) {
       const label = el("label", text);
@@ -2418,12 +2422,56 @@ async function newTaskDialog() {
     }
     const repo = el("select");
     repo.id = "new-task-repo";
-    for (const [index, choice] of repos.entries()) {
-      const option = el("option", `${choice.repo} · ${choice.clone}`);
-      option.value = String(index);
-      repo.append(option);
+    repo.required = true;
+    function activity(seconds) {
+      const days = Math.floor((Date.now() / 1000 - seconds) / 86400);
+      return days < 1 ? "active today" : `active ${days}d ago`;
     }
+    function fillRepos(list) {
+      const previous = repos[Number(repo.value)];
+      repos = list;
+      repo.replaceChildren(
+        ...list.map((choice, index) => {
+          const option = el(
+            "option",
+            `${choice.repo} · ${choice.clone} · ${activity(choice.active)}`,
+          );
+          option.value = String(index);
+          return option;
+        }),
+      );
+      const kept = list.findIndex(
+        (choice) => choice.repo === previous?.repo && choice.clone === previous?.clone,
+      );
+      if (kept >= 0) repo.value = String(kept);
+      syncSelect(repo);
+    }
+    fillRepos(repos);
     field("Repository and local clone", repo);
+    if (recent.idle) {
+      const idle = el("input");
+      idle.id = "new-task-idle";
+      idle.type = "checkbox";
+      const idleLabel = el("label", undefined, "workspace-later");
+      idleLabel.append(
+        idle,
+        ` Include ${recent.idle} idle ${recent.idle === 1 ? "clone" : "clones"} (no commit or checkout in 90 days)`,
+      );
+      idle.onchange = async () => {
+        if (!idle.checked) return fillRepos(recent.repos);
+        idle.disabled = true;
+        try {
+          everything ??= (await get("/api/workspace-repos?all=1")).repos;
+          if (idle.checked) fillRepos(everything);
+        } catch (error) {
+          idle.checked = false;
+          workspaceError(error);
+        } finally {
+          idle.disabled = false;
+        }
+      };
+      form.append(idleLabel);
+    }
     const fileIssue = el("input");
     fileIssue.id = "new-task-file-issue";
     fileIssue.type = "checkbox";

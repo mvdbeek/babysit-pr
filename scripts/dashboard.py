@@ -591,11 +591,12 @@ class Handler(BaseHTTPRequestHandler):
                     else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
                 )
             elif route.path == "/api/workspace-repos":
+                everything = parse_qs(route.query).get("all", [""])[0] == "1"
                 self.send_json(
                     200,
-                    self.server.workspaces.local_repositories()
+                    self.server.workspaces.local_repositories(everything)
                     if self.server.workspaces
-                    else {"repos": []},
+                    else {"repos": [], "idle": 0},
                 )
             elif route.path == "/api/workspace-prompts":
                 self.send_json(
