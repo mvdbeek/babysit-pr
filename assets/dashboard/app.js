@@ -1837,7 +1837,10 @@ function workspaceInfo(item) {
     workspaceData.prs?.[item.id] ??
     workspaceData.issues?.[item.id] ??
     workspaceData.watches?.[item.id] ??
-    workspaceData.sentry?.[item.id]
+    workspaceData.sentry?.[item.id] ??
+    workspaceData.new?.[item.id] ??
+    // A new task just started may be missing from a snapshot requested before it.
+    (item.newTask && item.operation ? { operation: item.operation } : undefined)
   );
 }
 function setWorkspaceOperation(item, operation) {
@@ -2386,6 +2389,141 @@ async function workspaceDialog(item, handling = "") {
     workspaceError(error);
   }
 }
+// A task with no PR or issue behind it, like `wtl`'s branch target: a new branch from a
+// base in any local clone, or, with a title, a GitHub issue filed first and then handled.
+async function newTaskDialog() {
+  // Stands in for the dialog's item; its id becomes the operation's once one starts.
+  const owner = { id: null, newTask: true };
+  workspaceDialogItem = owner;
+  $("workspace-title").textContent = "New task";
+  $("workspace-error").textContent = "";
+  $("workspace-content").replaceChildren(el("p", "Finding local clones…"));
+  $("workspace-result").replaceChildren();
+  $("workspace-progress").textContent = "";
+  $("workspace-log").textContent = "";
+  if (!$("workspace-dialog").open) $("workspace-dialog").showModal();
+  try {
+    const [{ repos }] = await Promise.all([
+      get("/api/workspace-repos"),
+      // Agent model choices come with the workspace snapshot.
+      workspaceData.agent_choices ? null : loadWorkspaces(),
+    ]);
+    if (workspaceDialogItem !== owner) return;
+    if (!repos.length) throw Error("No local clones were found to start a task in.");
+    const form = el("form");
+    function field(text, input, parent = form) {
+      const label = el("label", text);
+      label.htmlFor = input.id;
+      parent.append(label, input);
+    }
+    const repo = el("select");
+    repo.id = "new-task-repo";
+    for (const [index, choice] of repos.entries()) {
+      const option = el("option", `${choice.repo} · ${choice.clone}`);
+      option.value = String(index);
+      repo.append(option);
+    }
+    field("Repository and local clone", repo);
+    const fileIssue = el("input");
+    fileIssue.id = "new-task-file-issue";
+    fileIssue.type = "checkbox";
+    const fileLabel = el("label", undefined, "workspace-later");
+    fileLabel.append(fileIssue, " File it as a GitHub issue first");
+    form.append(fileLabel);
+    const issueFields = el("div", undefined, "new-task-fields");
+    const title = el("input");
+    title.id = "new-task-title";
+    title.maxLength = 256;
+    field("Issue title", title, issueFields);
+    issueFields.append(
+      el("small", "The task becomes the issue’s description; the branch is named after the issue."),
+    );
+    issueFields.hidden = true;
+    const branchFields = el("div", undefined, "new-task-fields");
+    const name = el("input");
+    name.id = "new-task-name";
+    name.required = true;
+    name.maxLength = 100;
+    name.pattern = "[A-Za-z0-9][A-Za-z0-9._\\-]*";
+    name.placeholder = "fix-parser";
+    name.autocapitalize = "off";
+    name.spellcheck = false;
+    field("New branch", name, branchFields);
+    const base = el("input");
+    base.id = "new-task-base";
+    base.placeholder = "The clone’s default branch";
+    base.autocapitalize = "off";
+    base.spellcheck = false;
+    field("Base branch (optional)", base, branchFields);
+    branchFields.append(el("small", "Fetched from the clone’s origin remote."));
+    form.append(issueFields, branchFields);
+    fileIssue.onchange = () => {
+      issueFields.hidden = !fileIssue.checked;
+      branchFields.hidden = fileIssue.checked;
+      title.required = fileIssue.checked;
+      name.required = !fileIssue.checked;
+    };
+    const { agent, model, effort, settingsNote } = agentFields();
+    field("Agent", agent);
+    field("Model (optional)", model);
+    field("Reasoning effort (optional)", effort);
+    form.append(settingsNote);
+    const task = el("textarea");
+    task.id = "workspace-task";
+    task.required = true;
+    task.maxLength = 32000;
+    task.rows = 6;
+    task.oninput = () => task.setCustomValidity("");
+    field("Task", task);
+    form.append(promptHistory(task));
+    const submit = el("button", "Start task");
+    submit.type = "submit";
+    form.append(submit);
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      if (!task.value.trim()) {
+        task.setCustomValidity("Enter a task");
+        task.reportValidity();
+        return;
+      }
+      const choice = repos[Number(repo.value)];
+      submit.disabled = true;
+      $("workspace-error").textContent = "";
+      try {
+        const response = await fetch("/api/workspace-new", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-new" },
+          body: JSON.stringify({
+            repo: choice.repo,
+            clone: choice.clone,
+            ...(fileIssue.checked
+              ? { issue_title: title.value }
+              : { name: name.value, ...(base.value.trim() ? { base: base.value.trim() } : {}) }),
+            agent: agent.value,
+            ...(model.value ? { model: model.value } : {}),
+            ...(effort.value ? { effort: effort.value } : {}),
+            task: task.value,
+          }),
+        });
+        const value = await response.json();
+        if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+        owner.id = value.operation.pr;
+        owner.operation = value.operation;
+        updateWorkspaceOperation();
+      } catch (error) {
+        workspaceError(error);
+        submit.disabled = false;
+      }
+    };
+    $("workspace-content").replaceChildren(form);
+    searchableSelect(repo);
+    searchableSelect(model);
+    searchableSelect(effort);
+  } catch (error) {
+    workspaceError(error);
+  }
+}
+$("new-task").onclick = () => void newTaskDialog();
 // Replaced by each issue's link when a batch is scheduled.
 const BATCH_URL = "{url}";
 // The scheduler's limit on waiting tasks.
@@ -2604,7 +2742,8 @@ function updateWorkspaceOperation() {
   if (op.result?.url)
     $("workspace-result").replaceChildren(
       link("Open in Collie", op.result.url),
-      ...viewerButtons(op.result, workspaceDialogItem),
+      // A new task's issue is filed during the operation, so the operation names it.
+      ...viewerButtons(op.result, op.subject?.url ? op.subject : workspaceDialogItem),
     );
   const submit = $("workspace-content").querySelector("button[type=submit]");
   if (submit)
@@ -2612,7 +2751,8 @@ function updateWorkspaceOperation() {
       submit.dataset.scheduled === "true" ||
       // A launch in progress does not block scheduling another for later.
       (!(submit.dataset.later === "true" && ["queued", "running"].includes(op.status)) &&
-        op.status !== "failed" &&
+        // A failed new task whose issue was filed must not file it again.
+        (op.status !== "failed" || Boolean(op.subject?.url)) &&
         !(submit.dataset.handling === "true" && op.status === "complete"));
   syncWorkspacePolling();
 }

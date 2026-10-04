@@ -59,6 +59,11 @@ SCHEDULE_POLL_SECONDS = 30
 # Batch Handle: the most a batch's starts may be spread apart, and its task's item link.
 BATCH_INTERVAL_LIMIT = 86400
 BATCH_URL = "{url}"
+# New tasks: a git branch name wt accepts, an issue title, and how long they stay listed.
+BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+NEW_PREFIX = "new:"
+NEW_LISTED = 86400
+NEW_LIMIT = 20
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=()):
@@ -210,6 +215,11 @@ def is_issue(target):
 
 def is_sentry(target):
     return target.get("kind") == "sentry"
+
+
+def is_scratch(target):
+    """A task started from scratch on a new branch, with no issue or PR behind it."""
+    return target.get("kind") == "scratch"
 
 
 def sentry_branch(target):
@@ -573,6 +583,7 @@ class Workspaces:
         issue = is_issue(pr)
         watch = pr.get("kind") == "watch"
         sentry = is_sentry(pr)
+        scratch = is_scratch(pr)
         repos = repositories(pr)  # Hoisted: snapshots compare every target with every checkout.
         linked_prs = (pr.get("linked_prs") or []) if issue else []
         cwd = str(Path(pr["cwd"]).resolve()) if watch else None
@@ -593,13 +604,16 @@ class Workspaces:
                 and prior.get("head_branch") == pr.get("head_branch")
             )
             bound = False
-            if same and not watch and not sentry:
+            if same and not watch and not sentry and not scratch:
                 url = url or canonical(pr)
                 bound = (url, item["path"], item["branch"]) in state["bound"]
             linked = None
             if watch:
                 verified = same
                 suggested = False
+            elif scratch:
+                # Only the operation that created the branch vouches for it.
+                verified = suggested = False
             elif sentry:
                 verified = same and verified_sentry(pr, item)
                 suggested = False
@@ -734,6 +748,7 @@ class Workspaces:
             described[key][target["id"]] = self.describe(target, inventory, state)
         return {
             **described,
+            "new": self.new_operations(state),
             "agent_choices": workspace_agents.catalog(self.home),
             "error": inventory["error"],
             "refreshing": self.refreshing,
@@ -958,6 +973,199 @@ class Workspaces:
             worker.start()
             # `started` tells the scheduler this call created the operation it returns.
             return {"operation": copy.deepcopy(op), "started": True}
+
+    # -- tasks started from scratch --
+
+    def local_repositories(self):
+        """Every clone under the source directory with the GitHub repositories it tracks.
+
+        The inventory only scans clones of repositories with tracked PRs or issues; a new
+        task may start in any clone. The upstream remote is listed before origin, since
+        an issue usually belongs in the repository a fork tracks.
+        """
+        found: list[dict] = []
+        if not self.src.is_dir():
+            return {"repos": found}
+        roots = sorted(p.resolve() for p in self.src.iterdir() if (p / ".git").is_dir())
+        for root in roots:
+            remotes = remote_slugs(repo_config(root))
+            for name, slug in sorted(
+                remotes.items(), key=lambda kv: (kv[0] != "upstream", kv[0] != "origin", kv[0])
+            ):
+                found.append({"repo": slug, "clone": str(root), "remote": name})
+        return {"repos": found}
+
+    def new_task(self, request):
+        """Start an agent on a task with no PR or issue behind it, in a new workspace.
+
+        With ``issue_title`` the task is first filed as a GitHub issue in ``repo`` and
+        the workspace is made for that issue, as `wti` would; otherwise ``name`` is a new
+        branch from ``base`` (the clone's default branch when empty), as `wt` would.
+        """
+        allowed = {
+            "repo",
+            "clone",
+            "base",
+            "name",
+            "issue_title",
+            "agent",
+            "model",
+            "effort",
+            "task",
+        }
+        if set(request) - allowed or any(not isinstance(v, str) for v in request.values()):
+            raise ValueError("Invalid new task parameters")
+        repo = request.get("repo", "")
+        if not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
+            raise ValueError("Choose a repository")
+        clone = request.get("clone", "")
+        if not any(
+            r["repo"] == repo and r["clone"] == clone for r in self.local_repositories()["repos"]
+        ):
+            raise ValueError(f"Choose a local clone of {repo}")
+        agent = request.get("agent", "codex")
+        if agent not in {"codex", "claude"}:
+            raise ValueError("Select Codex or Claude")
+        workspace_agents.validate(
+            agent, request.get("model", ""), request.get("effort", ""), self.home
+        )
+        task = request.get("task", "")
+        if not task.strip() or len(task) > 32000 or "\0" in task:
+            raise ValueError("Supply a task of 1–32,000 characters")
+        title = request.get("issue_title", "").strip()
+        if title:
+            if len(title) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in title):
+                raise ValueError("Supply an issue title of at most 256 characters")
+            target = {"kind": "issue", "repo": repo, "title": title}
+        else:
+            name = request.get("name", "").strip()
+            base = request.get("base", "").strip()
+            if not BRANCH_NAME.fullmatch(name) or not self.valid_branch(clone, name):
+                raise ValueError("Name the new branch: letters, digits, '.', '_' and '-'")
+            # wt fetches the base from origin, so it must name a branch, not a revision.
+            if base and (base.startswith("-") or "@" in base or not self.valid_branch(clone, base)):
+                raise ValueError("The base branch is not a valid branch name")
+            target = {"kind": "scratch", "repo": repo, "branch": name, "base": base or None}
+        key = f"{NEW_PREFIX}{uuid.uuid4()}"
+        target["id"] = key
+        op = {
+            "id": str(uuid.uuid4()),
+            "pr": key,
+            "action": "new",
+            "status": "queued",
+            "clone": clone,
+            "path": None,
+            "agent": agent,
+            "model": request.get("model") or None,
+            "effort": request.get("effort") or None,
+            "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
+            "message": "Queued",
+            "log": "",
+            "created_at": time.time(),
+        }
+        with self.lock:
+            with self.db() as db:
+                db.execute("INSERT INTO operations VALUES (?,?)", (key, json.dumps(op)))
+                self.remember_prompt(db, task, op["created_at"])
+                worker = threading.Thread(
+                    target=self.perform_new, args=(target, op, task), daemon=True
+                )
+                self.workers[key] = worker
+            worker.start()
+        return {"operation": copy.deepcopy(op)}
+
+    @staticmethod
+    def valid_branch(clone, name):
+        try:
+            git(clone, "check-ref-format", "--branch", name)
+            return True
+        except ValueError:
+            return False
+
+    def perform_new(self, target, op, task):
+        try:
+            if is_issue(target):
+                try:
+                    self.save_operation(
+                        op, status="running", message=f"Filing the issue in {target['repo']}"
+                    )
+                    self.run_logged(
+                        op,
+                        "gh",
+                        "issue",
+                        "create",
+                        "--repo",
+                        target["repo"],
+                        "--title",
+                        target["title"],
+                        "--body",
+                        task,
+                        timeout=120,
+                    )
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    # A timeout may still have filed the issue; never file it twice.
+                    timeout = isinstance(exc, subprocess.TimeoutExpired)
+                    self.save_operation(
+                        op,
+                        status="uncertain" if timeout else "failed",
+                        message=str(exc),
+                        log=(op["log"] + "\n" + str(exc))[-16000:],
+                    )
+                    return
+                filed = re.findall(
+                    rf"https://github\.com/{re.escape(target['repo'])}/issues/(\d+)",
+                    op["log"],
+                    re.IGNORECASE,
+                )
+                if not filed:
+                    # gh succeeded, so the issue exists somewhere: starting again would
+                    # file a second one.
+                    self.save_operation(
+                        op,
+                        status="uncertain",
+                        message=f"The issue was filed, but GitHub did not report its link in {target['repo']}. Find it there and use Handle on it.",
+                    )
+                    return
+                target["number"] = int(filed[-1])
+                target["url"] = canonical(target)
+                self.save_operation(
+                    op, subject={**op["subject"], "number": target["number"], "url": target["url"]}
+                )
+            self.perform(target, op, task)
+            if op["status"] == "failed" and op["subject"].get("url"):
+                self.save_operation(
+                    op,
+                    message=f"{op['message']} The issue {op['subject']['url']} was filed; use Handle on it from the Issues tab.",
+                )
+        finally:
+            with self.lock:
+                self.workers.pop(target["id"], None)
+
+    def new_operations(self, state):
+        """Recent new-task operations, newest first; interrupted ones become uncertain."""
+        now = time.time()
+        found = []
+        for key, op in state["operations"].items():
+            if not key.startswith(NEW_PREFIX) or now - op.get("created_at", 0) > NEW_LISTED:
+                continue
+            if op["status"] in {"queued", "running"} and key not in self.workers:
+                # The state was read before this call; the worker may have finished since.
+                with self.lock:
+                    op = self.operation(key) or op
+                    if op["status"] in {"queued", "running"} and key not in self.workers:
+                        self.save_operation(
+                            op,
+                            status="uncertain",
+                            message="The dashboard stopped while starting this task. Check for its issue and workspace before starting it again.",
+                        )
+            found.append(op)
+        with self.db() as db:
+            db.execute(
+                "DELETE FROM operations WHERE pr LIKE ? AND json_extract(data,'$.created_at') < ?",
+                (f"{NEW_PREFIX}%", now - NEW_LISTED),
+            )
+        found.sort(key=lambda op: op["created_at"], reverse=True)
+        return {op["pr"]: {"operation": op} for op in found[:NEW_LIMIT]}
 
     # -- scheduled launches --
 
@@ -1420,7 +1628,10 @@ class Workspaces:
                     )
                 else:
                     owner, repo = pr["repo"].split("/")
-                    if is_sentry(pr):
+                    if is_scratch(pr):
+                        helper, subject = "wt", None
+                        prefix = pr["branch"]
+                    elif is_sentry(pr):
                         helper, subject = "wt", "Sentry issue"
                         prefix = sentry_branch(pr)
                     elif is_issue(pr):
@@ -1437,7 +1648,11 @@ class Workspaces:
                         name = f"{prefix}-{n}"
                     # herdr shows the label; the branch keeps `pr-<owner>-<number>`,
                     # which the Workspaces tab uses to link the checkout back to its PR.
-                    head = None if is_issue(pr) or is_sentry(pr) else pr.get("head_branch")
+                    head = (
+                        None
+                        if is_issue(pr) or is_sentry(pr) or is_scratch(pr)
+                        else pr.get("head_branch")
+                    )
                     label = ["--label", f"pr-{repo}-{head}{name[len(prefix) :]}"] if head else []
                     if is_sentry(pr):
                         label = ["--label", f"sentry-{repo}-{pr['short_id']}{name[len(prefix) :]}"]
@@ -1446,7 +1661,9 @@ class Workspaces:
                         common=main["common"],
                         path=str(base / name),
                         branch=name,
-                        message=f"Fetching {subject.lower()} and starting the selected agent",
+                        message=f"Fetching {subject.lower()} and starting the selected agent"
+                        if subject
+                        else f"Branching {name} and starting the selected agent",
                     )
                     overrides = []
                     for key in ("model", "effort"):
@@ -1460,6 +1677,8 @@ class Workspaces:
                     if is_sentry(pr):
                         context, extra = self.sentry_context(pr, op["agent"])
                         brief = f"{task}\n\n{context}"
+                    elif is_scratch(pr):
+                        brief = f"{task}\n"
                     else:
                         brief = f"{task}\n\n{subject}: {canonical(pr)}\n"
                     if op.get("exit_marker"):
@@ -1480,7 +1699,13 @@ class Workspaces:
                         "--prompt-file",
                         str(prompt),
                         *extra,
-                        *([] if is_sentry(pr) else [canonical(pr)]),
+                        *(
+                            ([pr["base"]] if pr.get("base") else [])
+                            if is_scratch(pr)
+                            else []
+                            if is_sentry(pr)
+                            else [canonical(pr)]
+                        ),
                     ]
                     # The helper is a plain Python program run directly: no login shell
                     # wraps it. The user's interactive agent wrappers (for example the
@@ -1509,6 +1734,7 @@ class Workspaces:
                     if (
                         not is_issue(pr)
                         and not is_sentry(pr)
+                        and not is_scratch(pr)
                         and item["upstream"] != self.expected_upstream(pr)
                     ):
                         raise ValueError("Resulting checkout has unexpected PR head provenance")

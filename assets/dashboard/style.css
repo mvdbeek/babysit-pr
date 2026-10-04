@@ -114,6 +114,19 @@ header p {
   border-radius: 50%;
   background: transparent;
 }
+#new-task {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 14px;
+  flex-shrink: 0;
+  border-radius: 20px;
+}
+#new-task > span[aria-hidden] {
+  font-size: 20px;
+  line-height: 1;
+}
 #notifications-count {
   position: absolute;
   top: -5px;
@@ -212,6 +225,32 @@ header p {
     right: 16px;
     top: 64px;
   }
+  /* The header has no room on a phone: New task floats within thumb reach instead. */
+  #new-task {
+    position: fixed;
+    right: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom));
+    z-index: 5;
+    justify-content: center;
+    width: 52px;
+    height: 52px;
+    padding: 0;
+    border-radius: 50%;
+    border-color: var(--green);
+    color: #fff;
+    background: var(--green);
+    box-shadow: 0 4px 14px #0003;
+  }
+  #new-task > span[aria-hidden] {
+    font-size: 28px;
+  }
+  .new-task-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
 }
 @media (max-width: 380px) {
   .brand {
@@ -239,6 +278,12 @@ small {
 }
 main {
   padding: 30px max(5%, calc((100% - var(--page-width)) / 2));
+}
+@media (max-width: 540px) {
+  /* Room to scroll the last content above the floating New task button. */
+  main {
+    padding-bottom: 92px;
+  }
 }
 .metrics {
   display: grid;
@@ -1128,6 +1173,26 @@ button:disabled {
 }
 #workspace-error {
   color: var(--red);
+}
+.new-task-fields {
+  display: grid;
+  gap: 10px;
+}
+.new-task-fields[hidden] {
+  display: none;
+}
+.new-task-fields input {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+}
+@media (max-width: 540px) {
+  /* Below 16px, iOS zooms into a focused field and leaves the page zoomed. */
+  #workspace-dialog input,
+  #workspace-dialog select,
+  #workspace-dialog textarea {
+    font-size: 16px;
+  }
 }
 #workspace-dialog input[type="datetime-local"] {
   width: 100%;

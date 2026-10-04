@@ -21,6 +21,8 @@ if os.environ.get('FAKE_GH_FAIL'):
 if a[:2] == ['repo','clone']:
  subprocess.check_call(['git','clone',os.environ['FAKE_HEAD'],a[3]])
  subprocess.check_call(['git','-C',a[3],'remote','set-url','origin','https://github.com/base/repo.git'])
+elif a[:2] == ['issue','create']:
+ print(os.environ.get('FAKE_GH_CREATED','https://github.com/base/repo/issues/12'))
 elif 'issue' in a:
  print(os.environ.get('FAKE_GH_ISSUE','{"number": 12, "title": "Crash on start!"}'))
 else:
