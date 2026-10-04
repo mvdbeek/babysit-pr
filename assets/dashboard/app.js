@@ -1900,6 +1900,12 @@ function handleTaskButton(item, kind) {
     void workspaceDialog(item, task(item.url));
   });
 }
+// Diff and Transcript for a checkout that has a herdr workspace, beside Open in Collie.
+function viewerButtons(target, name) {
+  return target?.workspace_id && window.workspaceViewer
+    ? window.workspaceViewer.buttons({ workspace: target.workspace_id, name: name || target.name })
+    : [];
+}
 function workspaceControls(item) {
   const cell = el("div", undefined, "workspace-actions");
   const info = workspaceInfo(item);
@@ -1927,6 +1933,7 @@ function workspaceControls(item) {
   button.disabled = item.kind === "watch" && !!info && !matches.length;
   if (button.disabled) button.title = "The watch’s registered checkout is no longer available.";
   if (matches.length === 1) {
+    cell.append(...viewerButtons(matches[0]));
     const menu = el("details");
     menu.append(el("summary", "More actions"));
     if (matches[0].workspace_id)
@@ -2218,6 +2225,7 @@ async function workspaceDialog(item, handling = "") {
           workspaceButton(target.workspace_id ? "Open workspace" : "Reopen workspace", () =>
             chooseWorkspace(item, target, target.workspace_id ? "open" : "reopen"),
           ),
+          ...viewerButtons(target),
         );
         const menu = el("details");
         menu.append(el("summary", "More actions"));
@@ -2566,7 +2574,11 @@ function updateWorkspaceOperation() {
   if (!op) return;
   $("workspace-progress").textContent = `${op.status}: ${op.message}`;
   $("workspace-log").textContent = op.log || "";
-  if (op.result?.url) $("workspace-result").replaceChildren(link("Open in Collie", op.result.url));
+  if (op.result?.url)
+    $("workspace-result").replaceChildren(
+      link("Open in Collie", op.result.url),
+      ...viewerButtons(op.result),
+    );
   const submit = $("workspace-content").querySelector("button[type=submit]");
   if (submit)
     submit.disabled =
@@ -2677,7 +2689,14 @@ function scheduledCard(task) {
     if (task.operation) outcome.append(` · ${task.operation.status}: ${task.operation.message}`);
     card.append(outcome);
     if (task.exit) card.append(el("small", `Agent: ${task.exit.message}`, "scheduled-exit"));
-    if (task.operation?.url) card.append(link("Open in Collie", task.operation.url));
+    if (task.operation?.url) {
+      const open = el("div", undefined, "scheduled-open");
+      open.append(
+        link("Open in Collie", task.operation.url),
+        ...viewerButtons(task.operation, task.subject?.title),
+      );
+      card.append(open);
+    }
   } else {
     const cancel = el("button", scheduledCancelling.has(task.id) ? "Cancelling…" : "Cancel");
     cancel.type = "button";

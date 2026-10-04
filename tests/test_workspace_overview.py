@@ -7,10 +7,12 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import dashboard
 import pytest
 import workspace_overview as wso
+import workspace_viewer as wso_viewer
 from conftest import install_fakes
 
 BASE = "base/repo"
@@ -850,3 +852,117 @@ def test_open_workspace_rejects_unknown_removed_and_disabled(site):
     plugin.enabled = False
     with pytest.raises(ValueError, match="disabled"):
         plugin.open_workspace({"key": str(worktrees / "merged-work")})
+
+
+def test_diff_and_transcript_views_read_only_listed_checkouts(server, site, monkeypatch):
+    port, plugin = server
+    worktrees = site[3]
+    monkeypatch.setenv("CODEX_HOME", str(plugin.home / "codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(plugin.home / "claude"))
+    plugin.value = plugin.collect()
+    key = quote(str(worktrees / "dirty-work"), safe="")
+    status, value = request(port, f"/api/workspace-diff?key={key}")
+    assert status == 200 and value["base"] == "origin/main"
+    assert value["untracked"] == ["scratch.txt"] and value["files"] == []
+    status, value = request(port, f"/api/workspace-diff?key={key}&scope=uncommitted")
+    assert status == 200 and value["scope"] == "uncommitted"
+    status, value = request(port, f"/api/workspace-transcript?key={key}")
+    assert status == 200 and value["sessions"] == [] and value["session"] is None
+    for path, error in [
+        ("/api/workspace-diff?key=%2Fetc", "Unknown workspace"),
+        ("/api/workspace-diff?key=workspace%3Aw2", "Unknown workspace"),
+        ("/api/workspace-diff", "Supply a workspace or a workspace key"),
+        (f"/api/workspace-diff?key={key}&workspace=w1", "Supply a workspace or"),
+        (f"/api/workspace-diff?key={key}&key={key}", "once"),
+        (f"/api/workspace-diff?key={key}&path=%2Fetc", "Unknown diff parameter"),
+        (f"/api/workspace-diff?key={key}&base=HEAD", "listed base"),
+        (f"/api/workspace-transcript?key={key}&before=-1", "numeric"),
+        (f"/api/workspace-transcript?key={key}&session=..%2Fx", "listed session"),
+        (f"/api/workspace-transcript?key={key}&file=x", "Unknown transcript parameter"),
+    ]:
+        status, value = request(port, path)
+        assert status == 400 and error in value["error"], path
+
+
+def test_a_failing_view_stays_inside_the_experiment(server, site, monkeypatch):
+    port, plugin = server
+    plugin.value = plugin.collect()
+    monkeypatch.setattr(
+        wso_viewer, "diff", lambda *a: (_ for _ in ()).throw(RuntimeError("git exploded"))
+    )
+    key = quote(str(site[3] / "merged-work"), safe="")
+    assert request(port, f"/api/workspace-diff?key={key}") == (
+        200,
+        {"error": "Workspace view unavailable: git exploded"},
+    )
+    plugin.enabled = False
+    status, value = request(port, f"/api/workspace-diff?key={key}")
+    assert status == 400 and "disabled" in value["error"]
+
+
+def test_views_need_the_experiment(tmp_path):
+    with dashboard.DashboardServer(tmp_path, 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, value = request(httpd.server_port, "/api/workspace-transcript?key=%2Fw")
+            assert status == 400 and "disabled" in value["error"]
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_views_of_a_herdr_workspace_need_no_experiment(site, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            status, value = request(port, "/api/workspace-diff?workspace=w1")
+            assert status == 200 and value["base"] == "origin/main"
+            status, value = request(port, "/api/workspace-transcript?workspace=w1")
+            assert status == 200 and value["session"] is None
+            for path, error in [
+                ("/api/workspace-diff?workspace=w2", "no checkout"),
+                ("/api/workspace-diff?workspace=w9", "not open"),
+                ("/api/workspace-diff?workspace=..%2Fw1", "Supply a herdr workspace"),
+                ("/api/workspace-diff?key=%2Fw", "disabled"),
+            ]:
+                status, value = request(port, path)
+                assert status == 400 and error in value["error"], path
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_a_herdr_workspace_inside_a_checkout_is_refused(site, tmp_path, monkeypatch):
+    plugin, _, clone, worktrees, state, _ = site
+    data = read(state)
+    nested = worktrees / "merged-work" / "sub"
+    nested.mkdir()
+    data["workspaces"][0]["worktree"]["checkout_path"] = str(nested)
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="top of a Git checkout"):
+        wso_viewer.workspace_checkout("w1")
+
+
+def test_a_workspace_resolution_is_remembered_briefly(site, monkeypatch):
+    state = site[4]
+    first = wso_viewer.workspace_checkout("w1")
+    lookups = len(calls(state, ["workspace", "list"]))
+    assert wso_viewer.workspace_checkout("w1") == first
+    assert len(calls(state, ["workspace", "list"])) == lookups
+    monkeypatch.setattr(wso_viewer, "CHECKOUT_TTL", 0)
+    wso_viewer.workspace_checkout("w1")
+    assert len(calls(state, ["workspace", "list"])) == lookups + 1
+
+
+def test_a_failing_herdr_stays_inside_the_view_boundary(server, monkeypatch):
+    port, _ = server
+    monkeypatch.setattr(
+        wso_viewer, "herdr", lambda *a: (_ for _ in ()).throw(KeyError("workspaces"))
+    )
+    status, value = request(port, "/api/workspace-diff?workspace=w1")
+    assert status == 200 and value["error"].startswith("Workspace view unavailable")

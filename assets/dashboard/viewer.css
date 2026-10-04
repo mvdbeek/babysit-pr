@@ -1,0 +1,196 @@
+/* Diff and transcript viewer. */
+#ws-viewer {
+  width: min(1100px, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+  padding: 20px 24px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  background: var(--paper);
+}
+#ws-viewer::backdrop {
+  background: #0008;
+}
+#ws-viewer-close {
+  float: right;
+}
+#ws-viewer-title {
+  margin: 0 80px 12px 0;
+  overflow-wrap: anywhere;
+}
+#ws-viewer-meta {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+#ws-viewer-error {
+  color: var(--red);
+}
+#ws-viewer-meta:empty,
+#ws-viewer-error:empty {
+  display: none;
+}
+.ws-viewer-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.ws-viewer-tabs button {
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.ws-viewer-tabs button[aria-selected="true"] {
+  border-color: var(--green);
+  color: var(--green);
+  font-weight: 600;
+}
+.ws-viewer-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px 14px;
+}
+.ws-viewer-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 12px;
+  color: var(--muted);
+}
+.ws-viewer-choice select {
+  max-width: min(640px, 80vw);
+}
+.ws-file,
+.ws-commits {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.ws-file > summary,
+.ws-commits > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--bg);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.ws-added {
+  color: var(--green);
+  margin-left: auto;
+}
+.ws-removed {
+  color: var(--red);
+}
+/* Diffs keep the dashboard's dark code blocks, with line colors tuned for them. */
+.ws-diff {
+  margin: 0;
+  padding: 8px 0;
+  border-radius: 0;
+  overflow-x: auto;
+  overflow-wrap: normal;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.ws-diff span {
+  display: block;
+  padding: 0 12px;
+  min-width: max-content;
+  white-space: pre;
+}
+.ws-diff .ws-add {
+  color: #d3f2dc;
+  background: #1f3d2c;
+}
+.ws-diff .ws-del {
+  color: #f6d5d1;
+  background: #47241f;
+}
+.ws-diff .ws-hunk {
+  color: #9cc3e6;
+  background: #26333d;
+}
+.ws-commit {
+  padding: 6px 12px;
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.ws-commit small {
+  display: block;
+}
+.ws-untracked {
+  margin: 0;
+  padding: 8px 12px 8px 32px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.ws-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.ws-msg {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+.ws-user {
+  background: #eef3f8;
+}
+.ws-msg-who {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.ws-msg-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ws-tool {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+  overflow: hidden;
+}
+.ws-tool > summary {
+  padding: 6px 12px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-tool pre {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 0;
+  max-height: 320px;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ws-tool pre + pre {
+  border-top: 1px solid #3a4a41;
+}
+.ws-tool .ws-tool-error {
+  color: #f6d5d1;
+  background: #47241f;
+}
+.ws-earlier {
+  margin-top: 12px;
+}
+.ws-view-buttons {
+  display: inline-flex;
+  gap: 6px;
+  white-space: nowrap;
+}
