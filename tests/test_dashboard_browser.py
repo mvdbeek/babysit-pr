@@ -3335,7 +3335,8 @@ def test_commit_messages_expand_with_keyboard_and_preserve_body_text(
     expect(viewer.locator(".ws-commit").last.locator("summary")).to_have_count(0)
     page.keyboard.press("Space")
     expect(message).to_be_hidden()
-    commit.locator("summary").click()
+    # The summary's center can land on its URL at phone width.
+    commit.locator("summary code").click()
     expect(message).to_be_visible()
 
 
