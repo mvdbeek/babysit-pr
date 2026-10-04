@@ -3339,6 +3339,12 @@ def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, v
         size = page.locator(field).first.evaluate("el => getComputedStyle(el).fontSize")
         assert size == "16px", field
     page.screenshot(path="reports/viewer-mobile.png")
+    # iOS must not enlarge the text of long diff lines.
+    viewer.get_by_role("tab", name="Diff").click()
+    expect(viewer.locator(".ws-add")).to_be_visible()
+    adjust = page.evaluate("getComputedStyle(document.documentElement).textSizeAdjust")
+    assert adjust == "100%"
+    page.screenshot(path="reports/viewer-diff-mobile.png")
 
 
 def test_an_exited_agent_is_resumed_with_the_message(page, dashboard_site, viewer_routes):
