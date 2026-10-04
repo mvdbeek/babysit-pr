@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import workspace_viewer
 from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
 from pr_ci_logs import BackgroundLogs
@@ -455,6 +456,45 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(
                         200, {"enabled": True, "error": "Workspace experiment unavailable"}
                     )
+            elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:
+                query = parse_qs(route.query)
+                if any(len(values) != 1 for values in query.values()):
+                    raise ValueError("Supply each parameter once")
+                single = {name: values[0] for name, values in query.items()}
+                # A herdr workspace (what Collie opens) or a row of the Workspaces tab.
+                if ("workspace" in single) == ("key" in single):
+                    raise ValueError("Supply a workspace or a workspace key")
+                if "key" in single:
+                    if not self.server.workspace_overview:
+                        raise ValueError("The workspace experiment is disabled")
+                    path = self.server.workspace_overview.checkout(single.pop("key"))
+                # Read-only views own their failure boundary, like the inventory.
+                try:
+                    if "workspace" in single:
+                        path = workspace_viewer.workspace_checkout(single.pop("workspace"))
+                    if route.path == "/api/workspace-diff":
+                        if set(single) - {"scope", "base"}:
+                            raise ValueError("Unknown diff parameter")
+                        value = workspace_viewer.diff(
+                            path, single.get("scope", "branch"), single.get("base")
+                        )
+                    else:
+                        if set(single) - {"session", "before", "after"}:
+                            raise ValueError("Unknown transcript parameter")
+                        positions = {}
+                        for name in ("before", "after"):
+                            if name in single:
+                                if not single[name].isdigit():
+                                    raise ValueError("Expected a numeric page position")
+                                positions[name] = int(single[name])
+                        value = workspace_viewer.transcript(
+                            path, single.get("session"), **positions
+                        )
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    value = {"error": f"Workspace view unavailable: {exc}"}
+                self.send_json(200, value)
             elif route.path == "/api/prs":
                 self.send_json(
                     200,
@@ -559,6 +599,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/upstream-tests.css": ("upstream-tests.css", "text/css"),
                     "/workspaces.js": ("workspaces.js", "text/javascript"),
                     "/workspaces.css": ("workspaces.css", "text/css"),
+                    "/viewer.js": ("viewer.js", "text/javascript"),
+                    "/viewer.css": ("viewer.css", "text/css"),
                     "/sentry.js": ("sentry.js", "text/javascript"),
                     "/sentry.css": ("sentry.css", "text/css"),
                     "/style.css": ("style.css", "text/css"),

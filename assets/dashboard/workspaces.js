@@ -151,6 +151,10 @@
     button.disabled = opening.has(entry.key) || (!entry.workspace_ids.length && entry.missing);
     button.onclick = () => openWorkspace(entry);
     actions.append(button);
+    // Only scanned checkouts have a diff or transcripts to read.
+    if (entry.key === entry.path && !entry.missing) {
+      actions.append(...window.workspaceViewer.buttons({ key: entry.key, name: entry.name }));
+    }
     const result = openResults.get(entry.key);
     if (result?.url) actions.append(anchor("Open in Collie", result.url));
     if (result?.error) {

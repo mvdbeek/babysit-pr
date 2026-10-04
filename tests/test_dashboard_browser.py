@@ -2923,6 +2923,7 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
                 "status": "complete",
                 "message": "Workspace ready",
                 "url": "https://collie.example.ts.net/space/w5",
+                "workspace_id": "w5",
             },
         },
         {
@@ -2967,8 +2968,11 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
     expect(history.first.get_by_role("link", name="Open in Collie")).to_have_attribute(
         "href", "https://collie.example.ts.net/space/w5"
     )
+    expect(history.first.get_by_role("button", name="Diff", exact=True)).to_be_visible()
+    expect(history.first.get_by_role("button", name="Transcript", exact=True)).to_be_visible()
     expect(history.last).to_contain_text("test/gamma · GAMMA-1")
     expect(history.last).to_contain_text("no longer listed")
+    expect(history.last.get_by_role("button", name="Diff")).to_have_count(0)
     expect(history.get_by_role("button", name="Cancel")).to_have_count(0)
     assert page.locator("#scheduled-panel img").count() == 0
     assert not page.evaluate("window.injected")
@@ -3108,3 +3112,56 @@ def test_batch_needs_a_clone_choice_and_skips_issues_it_cannot_start(
     expect(page.locator("#workspace-progress")).to_contain_text("Scheduled 1 of 1")
     assert batches[0]["items"] == [{"id": "issue-one", "clone": "/fixture/b"}]
     assert "start_at" not in batches[0] and batches[0]["interval"] == 1800
+
+
+def test_any_collie_workspace_offers_its_diff_and_transcript(
+    page, dashboard_site, workspace_routes
+):
+    url, _ = dashboard_site
+    seen = []
+    diff = {
+        "scope": "branch",
+        "note": None,
+        "base": "origin/main",
+        "bases": [{"ref": "origin/main", "ahead": 0}],
+        "commits": [],
+        "files": [],
+        "untracked": [],
+        "untracked_more": 0,
+        "added": 0,
+        "removed": 0,
+        "truncated": False,
+    }
+
+    def view(route):
+        seen.append(route.request.url)
+        if "workspace-diff" in route.request.url:
+            route.fulfill(json=diff)
+        else:
+            route.fulfill(
+                json={"sessions": [], "session": None, "entries": [], "start": 0, "total": 0}
+            )
+
+    page.route("**/api/workspace-diff?*", view)
+    page.route("**/api/workspace-transcript?*", view)
+    page.goto(url + "/#prs")
+    row = page.locator("#pr-list tr").first
+    row.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.locator("#ws-viewer-title")).to_have_text("Renamed workspace")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("0 files changed")
+    assert "workspace=w1" in seen[-1] and "key=" not in seen[-1]
+    viewer.get_by_role("tab", name="Transcript").click()
+    expect(viewer.get_by_text("No Claude or Codex session")).to_be_visible()
+    assert "workspace-transcript?workspace=w1" in seen[-1]
+    page.keyboard.press("Escape")
+    expect(viewer).to_be_hidden()
+    expect(row.get_by_role("button", name="Diff", exact=True)).to_be_focused()
+    # The watcher's detail offers the same once its checkout has a workspace.
+    page.goto(url)
+    _, snapshot, _ = workspace_routes
+    snapshot["watches"] = {"watch:feedback": snapshot["prs"]["pr-one"]}
+    page.reload()
+    page.locator("#list .watch").filter(has_text="test/repo").click()
+    page.locator("#detail").get_by_role("button", name="Transcript", exact=True).click()
+    expect(viewer).to_be_visible()

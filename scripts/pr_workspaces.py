@@ -1138,6 +1138,7 @@ class Workspaces:
                     "status": op.get("status"),
                     "message": op.get("message"),
                     "url": result.get("url"),
+                    "workspace_id": result.get("workspace_id"),
                 }
             if task.get("exit"):
                 # The pane identity and transcript paths are internal.
@@ -1595,6 +1596,7 @@ class Workspaces:
                 "updated_at": op.get("updated_at") or op.get("created_at"),
                 "path": path,
                 "workspace_url": result.get("url") if path and open_space else None,
+                "workspace_id": result.get("workspace_id") if path and open_space else None,
             }
         return state
 

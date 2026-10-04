@@ -1250,6 +1250,12 @@ button:disabled {
   font-size: 13px;
   margin: 0;
 }
+.scheduled-open {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
 .scheduled-text pre {
   white-space: pre-wrap;
   font-size: 12px;

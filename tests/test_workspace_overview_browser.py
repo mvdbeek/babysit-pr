@@ -311,3 +311,209 @@ def test_a_batch_refused_because_another_is_running_keeps_the_selection(page, si
     expect(page.locator("#ws-dialog-error")).to_contain_text("another cleanup is still running")
     page.get_by_role("button", name="Cancel").click()
     expect(page.locator("#ws-selected")).to_have_text("1 selected")
+
+
+DIFF = {
+    "scope": "branch",
+    "base": "origin/main",
+    "bases": [{"ref": "origin/main", "ahead": 1}, {"ref": "upstream/release_1.0", "ahead": 4}],
+    "commits": [{"sha": "abc123def456", "author": "Fixture", "time": 1, "subject": "Fix it"}],
+    "files": [
+        {
+            "path": "app.py",
+            "old_path": None,
+            "status": "modified",
+            "binary": False,
+            "added": 1,
+            "removed": 1,
+            "lines": ["@@ -1 +1 @@", "-old line", "+new line " + "x" * 300],
+            "truncated": False,
+        },
+        {
+            "path": "logo.png",
+            "old_path": None,
+            "status": "added",
+            "binary": True,
+            "added": 0,
+            "removed": 0,
+            "lines": [],
+            "truncated": False,
+        },
+    ],
+    "untracked": ["notes.txt"],
+    "untracked_more": 0,
+    "added": 1,
+    "removed": 1,
+    "truncated": False,
+}
+
+
+def transcript(start=0, end=3):
+    entries = [
+        {"role": "user", "text": "Fix the crash", "time": None},
+        {
+            "role": "tool",
+            "name": "Bash",
+            "input": '{"command": "pytest"}',
+            "output": "1 failed",
+            "error": True,
+            "time": None,
+        },
+        {"role": "assistant", "text": "Fixed and tested.", "time": None},
+    ]
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Fix the crash"}
+    return {
+        "sessions": [session, {**session, "id": "s0", "agent": "codex", "title": "Older"}],
+        "session": session,
+        "entries": entries[start:end],
+        "start": start,
+        "total": 3,
+    }
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_diff_and_transcript_viewer(page, site, width):
+    url, _, _ = site
+    seen = []
+
+    def diff(route):
+        seen.append(route.request.url)
+        older = "base=upstream" in route.request.url
+        route.fulfill(json={**DIFF, "base": "upstream/release_1.0"} if older else DIFF)
+
+    def conversation(route):
+        seen.append(route.request.url)
+        earlier = "before=1" in route.request.url
+        route.fulfill(json=transcript(0, 1) if earlier else transcript(1))
+
+    page.route("**/api/workspace-diff?*", diff)
+    page.route("**/api/workspace-transcript?*", conversation)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Diff", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    expect(dialog).to_be_visible()
+    expect(page.locator("#ws-viewer-meta")).to_have_text("2 files changed, +1 −1 since origin/main")
+    expect(dialog.locator(".ws-add")).to_contain_text("+new line")
+    expect(dialog.locator(".ws-del")).to_have_text("-old line\n")
+    expect(dialog.get_by_text("Binary", exact=True)).to_be_visible()
+    expect(dialog.get_by_text("notes.txt")).to_be_visible()
+    assert "key=%2Fsrc%2Fworktrees%2Frepo%2Fopen-work" in seen[0] and "scope=branch" in seen[0]
+    dialog.get_by_label("Base").select_option("upstream/release_1.0")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("since upstream/release_1.0")
+    assert "base=upstream%2Frelease_1.0" in seen[-1]
+    if width == 1440:
+        page.screenshot(path="reports/workspaces-diff.png")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+    dialog.get_by_role("tab", name="Transcript").click()
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("Claude session s1, 3 entries")
+    expect(dialog.get_by_role("button", name="Show earlier entries (1)")).to_be_visible()
+    tool = dialog.locator(".ws-tool")
+    expect(tool.locator("summary")).to_contain_text("Bash")
+    expect(tool.get_by_text("Error")).to_be_visible()
+    tool.locator("summary").click()
+    expect(tool.locator(".ws-tool-error")).to_have_text("1 failed")
+    dialog.get_by_role("button", name="Show earlier entries (1)").click()
+    dialog.locator(".ws-tool summary").click()
+    expect(dialog.locator(".ws-user")).to_contain_text("Fix the crash")
+    expect(dialog.locator(".ws-msg")).to_have_count(2)
+    expect(dialog.get_by_label("Session")).to_have_value("s1")
+    if width == 1440:
+        page.screenshot(path="reports/workspaces-transcript.png")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    dialog.get_by_role("button", name="Close workspace viewer").click()
+    expect(dialog).to_be_hidden()
+
+
+def test_viewer_reports_errors_and_skips_rows_without_a_checkout(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        *copy.deepcopy(WORKSPACES),
+        row("gone", key="workspace:w5", path=None, status="missing", missing=True),
+    ]
+
+    def diff(route):
+        if "scope=uncommitted" in route.request.url:
+            route.fulfill(json={**DIFF, "scope": "uncommitted", "base": None, "bases": []})
+        else:
+            route.fulfill(status=400, json={"error": "Unknown workspace; refresh"})
+
+    page.route("**/api/workspace-diff?*", diff)
+    page.goto(url + "/#workspaces")
+    gone = page.locator("#ws-list tr").filter(has=page.get_by_text("gone", exact=True))
+    expect(gone.get_by_role("button", name="Diff")).to_have_count(0)
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Diff", exact=True).click()
+    expect(page.locator("#ws-viewer-error")).to_have_text("Unknown workspace; refresh")
+    # The other choices stay reachable after a failure.
+    page.locator("#ws-viewer").get_by_label("Changes").select_option("uncommitted")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("since the last commit")
+    expect(page.locator("#ws-viewer-error")).to_have_text("")
+
+
+def test_a_slow_response_never_overrides_a_later_choice(page, site):
+    url, _, _ = site
+    held = []
+    page.route("**/api/workspace-diff?*", lambda route: held.append(route))
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Diff", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    expect(page.locator("#ws-viewer-meta")).to_have_text("Loading…")
+    dialog.get_by_role("tab", name="Transcript").click()
+    expect(dialog.locator(".ws-user")).to_contain_text("Fix the crash")
+    held[0].fulfill(json=DIFF)
+    page.wait_for_timeout(200)
+    expect(dialog.locator(".ws-file")).to_have_count(0)
+    expect(dialog.get_by_role("tab", name="Transcript")).to_have_attribute("aria-selected", "true")
+
+
+def test_a_live_transcript_updates_in_place(page, site):
+    url, _, _ = site
+    session = {"id": "s1", "agent": "codex", "updated": 1, "size": 1, "title": "Go"}
+    tool = {"role": "tool", "name": "exec", "input": "make test", "output": None, "error": False}
+    first = {
+        "sessions": [session],
+        "session": session,
+        "entries": [{"role": "user", "text": "Go"}, tool],
+        "start": 0,
+        "total": 2,
+    }
+    requests = []
+
+    def conversation(route):
+        requests.append(route.request.url)
+        if "after=0" in route.request.url:
+            done = {**tool, "output": '{"exit_code":2}', "error": True}
+            route.fulfill(
+                json={
+                    **first,
+                    "entries": [
+                        first["entries"][0],
+                        done,
+                        {"role": "assistant", "text": "Tests fail."},
+                    ],
+                    "total": 3,
+                }
+            )
+        else:
+            route.fulfill(json=first)
+
+    page.clock.install()
+    page.route("**/api/workspace-transcript?*", conversation)
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    details = dialog.locator(".ws-tool")
+    details.locator("summary").click()
+    expect(details).to_have_attribute("open", "")
+    page.clock.fast_forward(10000)
+    expect(dialog.locator(".ws-assistant")).to_have_text("CodexTests fail.")
+    expect(details.locator(".ws-tool-error")).to_have_text('{"exit_code":2}')
+    expect(details).to_have_attribute("open", "")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("3 entries")
+    assert "after=0" in requests[-1]

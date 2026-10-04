@@ -698,6 +698,23 @@ class WorkspaceOverview:
                     raise ValueError("Workspace was not found after opening; refresh the list")
             return {"url": row["workspace_url"]}
 
+    def checkout(self, key):
+        """The directory of a listed worktree row, for the read-only diff and transcript views.
+
+        Only rows this inventory found as Git worktrees qualify here; a row that is only a
+        herdr workspace is viewed through its workspace ID instead.
+        """
+        if not isinstance(key, str) or not 0 < len(key) <= 1024:
+            raise ValueError("Supply a workspace key")
+        with self.lock:
+            if not self.enabled:
+                raise ValueError("The workspace experiment is disabled")
+            listed = self.value["workspaces"] + ((self.partial or {}).get("workspaces") or [])
+            row = next((entry for entry in listed if entry["key"] == key), None)
+        if row is None or row["path"] != key or row["missing"] or not Path(key).is_dir():
+            raise ValueError("Unknown workspace; refresh the list")
+        return key
+
     # Cleanup -------------------------------------------------------------------
 
     def cleanup(self, request):

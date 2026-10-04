@@ -125,3 +125,12 @@ def fake_tools(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_HERDR", str(state))
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     return state
+
+
+@pytest.fixture(autouse=True)
+def fresh_viewer_caches(monkeypatch):
+    """Viewer caches are per process; each test starts with none."""
+    import workspace_viewer
+
+    for name in ("_checkouts", "_details", "_parsers"):
+        monkeypatch.setattr(workspace_viewer, name, {})

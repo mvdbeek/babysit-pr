@@ -152,6 +152,7 @@
         tone: "blue",
         detail: handling.path.split("/").pop(),
         url: handling.workspace_url,
+        workspace: handling.workspace_url ? handling.workspace_id : null,
       };
     return null; // A failed launch is shown as an error next to Handle, not as work.
   }
@@ -276,6 +277,10 @@
       state.append(badge(work.label, work.tone));
       if (work.detail) state.append(node("small", work.detail, "pr-meta"));
       if (work.url) state.append(anchor("Open workspace", work.url));
+      if (work.workspace && window.workspaceViewer)
+        state.append(
+          ...window.workspaceViewer.buttons({ workspace: work.workspace, name: entry.short_id }),
+        );
       cell.append(state);
     }
     const starting = ["queued", "running"].includes(entry.handling?.status);
