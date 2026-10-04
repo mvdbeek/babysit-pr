@@ -3398,11 +3398,25 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
     page.set_viewport_size({"width": 1280, "height": 900})
     snapshot = {"prs": {}, "issues": {}, "new": {}, "error": None, "synced_at": 1234}
     page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+    now = time.time()
     repos = [
-        {"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "upstream"},
-        {"repo": "fork/alpha", "clone": "/fixture/alpha", "remote": "origin"},
+        {"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "upstream", "active": now},
+        {"repo": "fork/alpha", "clone": "/fixture/alpha", "remote": "origin", "active": now},
     ]
-    page.route("**/api/workspace-repos", lambda route: route.fulfill(json={"repos": repos}))
+    idle = {
+        "repo": "old/beta",
+        "clone": "/fixture/beta",
+        "remote": "origin",
+        "active": now - 400 * 86400,
+    }
+    asked = []
+
+    def listing(route):
+        asked.append(route.request.url.partition("?")[2])
+        everything = route.request.url.endswith("?all=1")
+        route.fulfill(json={"repos": repos + [idle] if everything else repos, "idle": 1})
+
+    page.route("**/api/workspace-repos*", listing)
     sent = []
 
     def start(route):
@@ -3429,7 +3443,24 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
     page.get_by_role("button", name="New task").click()
     dialog = page.locator("#workspace-dialog")
     expect(dialog.locator("#workspace-title")).to_have_text("New task")
-    choose_option(dialog.get_by_role("combobox", name="Repository and local clone"), "1")
+    picker = dialog.get_by_role("combobox", name="Repository and local clone")
+    options = dialog.locator("#new-task-repo option")
+    expect(options).to_have_text(
+        ["up/alpha · /fixture/alpha · active today", "fork/alpha · /fixture/alpha · active today"]
+    )
+    choose_option(picker, "1")
+    # Idle clones are listed only when asked for; the chosen clone stays chosen.
+    include = dialog.get_by_label("Include 1 idle clone (no commit or checkout in 90 days)")
+    include.check()
+    expect(options).to_have_count(3)
+    expect(options.last).to_have_text("old/beta · /fixture/beta · active 400d ago")
+    expect(dialog.locator("#new-task-repo")).to_have_value("1")
+    include.uncheck()
+    include.check()
+    expect(options).to_have_count(3)
+    assert asked == ["", "all=1"]  # Fetched once.
+    include.uncheck()
+    expect(options).to_have_count(2)
     dialog.get_by_label("New branch").fill("try-parser")
     dialog.get_by_label("Base branch (optional)").fill("release_26.1")
     dialog.get_by_label("Task", exact=True).fill("Explore the parser")
@@ -3500,7 +3531,12 @@ def test_new_task_floats_on_a_phone_without_zooming(page, dashboard_site, viewer
     page.route(
         "**/api/workspace-repos",
         lambda route: route.fulfill(
-            json={"repos": [{"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "origin"}]}
+            json={
+                "repos": [
+                    {"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "origin", "active": 1}
+                ],
+                "idle": 0,
+            }
         ),
     )
     page.goto(url)

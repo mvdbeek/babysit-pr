@@ -17,14 +17,50 @@ def request(manager, **changes):
     }
 
 
-def test_local_repositories_list_every_clone_upstream_first(local):  # noqa: F811
+def test_local_repositories_list_recent_clones_first_and_upstream_first(local):  # noqa: F811
     manager, _, git, _, _ = local
-    clone = str((manager.src / "repo").resolve())
-    assert manager.local_repositories() == {
-        "repos": [{"repo": "base/repo", "clone": clone, "remote": "origin"}]
+    clone = (manager.src / "repo").resolve()
+    listed = manager.local_repositories()
+    assert listed == {
+        "repos": [
+            {
+                "repo": "base/repo",
+                "clone": str(clone),
+                "remote": "origin",
+                "active": (clone / ".git/logs/HEAD").stat().st_mtime,
+            }
+        ],
+        "idle": 0,
     }
-    git("remote", "add", "upstream", "https://github.com/up/repo.git")
+    git("remote", "add", "upstream", "git@github.com:Up/Repo.git")
+    git("config", "remote.notgithub.url", "https://example.org/x/y.git")
+    git("remote", "add", "contributor", "https://github.com/someone/repo.git")
     assert [r["repo"] for r in manager.local_repositories()["repos"]] == ["up/repo", "base/repo"]
+    # A clone nobody committed or checked out in for months is left out unless asked for,
+    # however recently a tool fetched it or read its status.
+    old = manager.src / "old"
+    git("clone", "-q", str(clone), str(old))
+    git("remote", "rename", "origin", "mine", cwd=old)
+    git("remote", "set-url", "mine", "https://github.com/old/repo.git", cwd=old)
+    git("status", cwd=old)
+    stale = pw.time.time() - pw.RECENT_CLONE_SECONDS - 86400
+    for log in [old / ".git/logs/HEAD", *(old / ".git/logs/refs").rglob("*")]:
+        pw.os.utime(log, (stale, stale))
+    listed = manager.local_repositories()
+    assert [r["repo"] for r in listed["repos"]] == ["up/repo", "base/repo"]
+    assert listed["idle"] == 1
+    everything = manager.local_repositories(everything=True)["repos"]
+    assert [r["repo"] for r in everything] == ["up/repo", "base/repo", "old/repo"]
+    # A worktree's checkout counts as activity in its clone.
+    git("worktree", "add", "-q", str(manager.src / "worktrees/fresh"), "-b", "fresh", cwd=old)
+    assert manager.local_repositories()["idle"] == 0
+    # So does an earlier launch from it, however long ago.
+    for log in (old / ".git").rglob("logs/HEAD"):
+        pw.os.utime(log, (stale, stale))
+    assert manager.local_repositories()["idle"] == 1
+    with manager.db() as db:
+        db.execute("INSERT INTO clones VALUES (?,?)", ("old/repo", str(old.resolve())))
+    assert [r["repo"] for r in manager.local_repositories()["repos"]][-1] == "old/repo"
 
 
 def test_scratch_task_branches_from_its_base_and_starts_the_agent(local):  # noqa: F811
