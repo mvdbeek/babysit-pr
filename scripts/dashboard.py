@@ -263,6 +263,7 @@ class Handler(BaseHTTPRequestHandler):
                 "feedback-addressed",
                 "workspace-action",
                 "workspace-batch",
+                "workspace-new",
                 "schedule-cancel",
                 "workspace-cleanup",
                 "workspace-open",
@@ -295,6 +296,7 @@ class Handler(BaseHTTPRequestHandler):
                     in {
                         "workspace-action",
                         "workspace-batch",
+                        "workspace-new",
                         "workspace-cleanup",
                         "workspace-open",
                         "workspace-message",
@@ -365,6 +367,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.server.workspaces:
                     raise ValueError("Workspace actions are not enabled")
                 self.send_json(200, self.server.workspaces.batch(request))
+                return
+            if action == "workspace-new":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(200, self.server.workspaces.new_task(request))
                 return
             if not isinstance(request.get("id"), str) or not request["id"]:
                 raise ValueError("Supply a watch ID")
@@ -582,6 +589,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.workspaces.snapshot()
                     if self.server.workspaces
                     else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
+                )
+            elif route.path == "/api/workspace-repos":
+                self.send_json(
+                    200,
+                    self.server.workspaces.local_repositories()
+                    if self.server.workspaces
+                    else {"repos": []},
                 )
             elif route.path == "/api/workspace-prompts":
                 self.send_json(

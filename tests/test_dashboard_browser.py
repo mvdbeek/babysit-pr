@@ -3393,6 +3393,131 @@ def test_viewer_links_its_subject_goes_full_screen_and_closes_from_the_backdrop(
     assert viewer.bounding_box()["width"] < 1280
 
 
+def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": 1280, "height": 900})
+    snapshot = {"prs": {}, "issues": {}, "new": {}, "error": None, "synced_at": 1234}
+    page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+    repos = [
+        {"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "upstream"},
+        {"repo": "fork/alpha", "clone": "/fixture/alpha", "remote": "origin"},
+    ]
+    page.route("**/api/workspace-repos", lambda route: route.fulfill(json={"repos": repos}))
+    sent = []
+
+    def start(route):
+        body = route.request.post_data_json
+        sent.append((route.request.headers.get("x-babysit-action"), body))
+        subject = (
+            {"kind": "issue", "repo": body["repo"], "title": body["issue_title"]}
+            if "issue_title" in body
+            else {"kind": "scratch", "repo": body["repo"], "branch": body["name"]}
+        )
+        op = {
+            "id": f"op{len(sent)}",
+            "pr": f"new:{len(sent)}",
+            "status": "running",
+            "message": "Filing the issue in up/alpha",
+            "log": "",
+            "subject": subject,
+        }
+        snapshot["new"] = {op["pr"]: {"operation": op}}
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    page.goto(url)
+    page.get_by_role("button", name="New task").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog.locator("#workspace-title")).to_have_text("New task")
+    choose_option(dialog.get_by_role("combobox", name="Repository and local clone"), "1")
+    dialog.get_by_label("New branch").fill("try-parser")
+    dialog.get_by_label("Base branch (optional)").fill("release_26.1")
+    dialog.get_by_label("Task", exact=True).fill("Explore the parser")
+    expect(dialog.get_by_label("Issue title")).to_be_hidden()
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-progress")).to_have_text(
+        "running: Filing the issue in up/alpha"
+    )
+    expect(dialog.get_by_role("button", name="Start task")).to_be_disabled()
+    assert sent == [
+        (
+            "workspace-new",
+            {
+                "repo": "fork/alpha",
+                "clone": "/fixture/alpha",
+                "name": "try-parser",
+                "base": "release_26.1",
+                "agent": "codex",
+                "task": "Explore the parser",
+            },
+        )
+    ]
+    # Filing an issue asks for its title instead of a branch.
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name="New task").click()
+    dialog.get_by_label("File it as a GitHub issue first").check()
+    expect(dialog.get_by_label("New branch")).to_be_hidden()
+    dialog.get_by_label("Task", exact=True).fill("It crashes on start")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(dialog.get_by_label("Issue title")).to_be_focused()  # Required and empty.
+    assert len(sent) == 1
+    dialog.get_by_label("Issue title").fill("Crash on start")
+    page.screenshot(path="reports/new-task.png")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert sent[1][1] == {
+        "repo": "up/alpha",
+        "clone": "/fixture/alpha",
+        "issue_title": "Crash on start",
+        "agent": "codex",
+        "task": "It crashes on start",
+    }
+    # The dialog follows the operation; once ready it opens the workspace and its viewer,
+    # which links the filed issue.
+    op = snapshot["new"]["new:2"]["operation"]
+    op.update(
+        status="complete",
+        message="Workspace ready — Open in Collie",
+        subject={**op["subject"], "number": 40, "url": "https://github.com/up/alpha/issues/40"},
+        result={
+            "workspace_id": "w1",
+            "name": "issue-40-crash-on-start",
+            "path": "/fixture/worktrees/alpha/issue-40-crash-on-start",
+            "url": "https://collie.example.ts.net/space/w1",
+        },
+    )
+    result = page.locator("#workspace-result")
+    expect(result.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://collie.example.ts.net/space/w1"
+    )
+    result.get_by_role("button", name="Diff", exact=True).click()
+    expect(page.locator("#ws-viewer-links a")).to_have_text(["Issue #40"])
+
+
+def test_new_task_floats_on_a_phone_without_zooming(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.route(
+        "**/api/workspace-repos",
+        lambda route: route.fulfill(
+            json={"repos": [{"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "origin"}]}
+        ),
+    )
+    page.goto(url)
+    button = page.get_by_role("button", name="New task")
+    box = button.bounding_box()
+    assert box == {"x": 390 - 16 - 52, "y": 844 - 16 - 52, "width": 52, "height": 52}
+    assert page.evaluate("document.documentElement.scrollWidth") <= 390
+    button.click()
+    dialog = page.locator("#workspace-dialog")
+    for field in ("New branch", "Task"):
+        size = dialog.get_by_label(field, exact=True).evaluate(
+            "el => getComputedStyle(el).fontSize"
+        )
+        assert size == "16px", field
+    page.screenshot(path="reports/new-task-mobile.png")
+
+
 def test_an_exited_agent_is_resumed_with_the_message(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     viewer_routes["agents"] = []
