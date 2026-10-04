@@ -1900,10 +1900,37 @@ function handleTaskButton(item, kind) {
     void workspaceDialog(item, task(item.url));
   });
 }
+// What a checkout serves, for the viewer's header: the PR, or the issue and the PRs
+// linked to it (read from the issue list, which keeps up as PRs are opened).
+function subjectLinks(item) {
+  if (!item?.url) return [];
+  const title = item.title || undefined;
+  if (item.kind === "sentry")
+    return [{ label: item.short_id || "Sentry issue", url: item.url, title }];
+  if (item.kind === "issue") {
+    const known = issueTable
+      .items()
+      .find((issue) => issue.repo === item.repo && issue.number === item.number);
+    const prs = (known || item).linked_prs || [];
+    return [
+      { label: `Issue #${item.number}`, url: item.url, title },
+      ...prs.map((pr) => ({
+        label: pr.repo === item.repo ? `PR #${pr.number}` : `PR ${pr.repo}#${pr.number}`,
+        url: pr.url,
+        title: pr.title || undefined,
+      })),
+    ];
+  }
+  return item.number ? [{ label: `PR #${item.number}`, url: item.url, title }] : [];
+}
 // Diff and Transcript for a checkout that has a herdr workspace, beside Open in Collie.
-function viewerButtons(target, name) {
+function viewerButtons(target, item, name) {
   return target?.workspace_id && window.workspaceViewer
-    ? window.workspaceViewer.buttons({ workspace: target.workspace_id, name: name || target.name })
+    ? window.workspaceViewer.buttons({
+        workspace: target.workspace_id,
+        name: name || target.name,
+        links: subjectLinks(item),
+      })
     : [];
 }
 function workspaceControls(item) {
@@ -1933,7 +1960,7 @@ function workspaceControls(item) {
   button.disabled = item.kind === "watch" && !!info && !matches.length;
   if (button.disabled) button.title = "The watch’s registered checkout is no longer available.";
   if (matches.length === 1) {
-    cell.append(...viewerButtons(matches[0]));
+    cell.append(...viewerButtons(matches[0], item));
     const menu = el("details");
     menu.append(el("summary", "More actions"));
     if (matches[0].workspace_id)
@@ -2225,7 +2252,7 @@ async function workspaceDialog(item, handling = "") {
           workspaceButton(target.workspace_id ? "Open workspace" : "Reopen workspace", () =>
             chooseWorkspace(item, target, target.workspace_id ? "open" : "reopen"),
           ),
-          ...viewerButtons(target),
+          ...viewerButtons(target, item),
         );
         const menu = el("details");
         menu.append(el("summary", "More actions"));
@@ -2577,7 +2604,7 @@ function updateWorkspaceOperation() {
   if (op.result?.url)
     $("workspace-result").replaceChildren(
       link("Open in Collie", op.result.url),
-      ...viewerButtons(op.result),
+      ...viewerButtons(op.result, workspaceDialogItem),
     );
   const submit = $("workspace-content").querySelector("button[type=submit]");
   if (submit)
@@ -2607,6 +2634,7 @@ function syncWorkspacePolling() {
 $("workspace-close").onclick = () => $("workspace-dialog").close();
 $("workspace-dialog").onclose = syncWorkspacePolling;
 closeOnBackdropClick($("workspace-dialog"));
+closeOnBackdropClick($("ws-viewer"));
 setInterval(refreshWorkspaces, 15000);
 void refreshWorkspaces();
 
@@ -2693,7 +2721,7 @@ function scheduledCard(task) {
       const open = el("div", undefined, "scheduled-open");
       open.append(
         link("Open in Collie", task.operation.url),
-        ...viewerButtons(task.operation, task.subject?.title),
+        ...viewerButtons(task.operation, task.subject, task.subject?.title),
       );
       card.append(open);
     }

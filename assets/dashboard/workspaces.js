@@ -158,6 +158,13 @@
           key: entry.key,
           workspace: entry.workspace_ids[0],
           name: entry.name,
+          links: entry.links
+            .filter((link) => link.number)
+            .map((link) => ({
+              label: `${link.kind === "issue" ? "Issue" : "PR"} #${link.number}`,
+              url: link.url,
+              title: link.title || undefined,
+            })),
         }),
       );
     }

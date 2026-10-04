@@ -21,6 +21,13 @@
   function date(value) {
     return value ? new Date(value * 1000).toLocaleString() : "never";
   }
+  function external(label, url) {
+    const anchor = node("a", label);
+    anchor.href = url;
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    return anchor;
+  }
   // Web links in agent text become anchors; everything else stays plain text.
   const LINK = /https?:\/\/[^\s<>"'`]+/g;
   function linkify(text) {
@@ -33,12 +40,7 @@
         while (url.endsWith(close) && url.split(open).length < url.split(close).length)
           url = url.slice(0, -1);
       }
-      fragment.append(String(text).slice(last, match.index));
-      const anchor = node("a", url);
-      anchor.href = url;
-      anchor.target = "_blank";
-      anchor.rel = "noopener noreferrer";
-      fragment.append(anchor);
+      fragment.append(String(text).slice(last, match.index), external(url, url));
       last = match.index + url.length;
     }
     fragment.append(String(text).slice(last));
@@ -84,9 +86,22 @@
   function where(target) {
     return target.key ? { key: target.key } : { workspace: target.workspace };
   }
+  // The issue, pull request or Sentry issue the checkout serves, as {label, url, title}.
+  function renderLinks(links) {
+    byId("ws-viewer-links").replaceChildren(
+      ...(links || [])
+        .filter((link) => /^https?:\/\//.test(link?.url || ""))
+        .map((link) => {
+          const anchor = external(link.label, link.url);
+          if (link.title) anchor.title = link.title;
+          return anchor;
+        }),
+    );
+  }
   function openViewer(entry, mode) {
     viewer = { entry, mode, scope: "branch", base: null, session: null, data: null, nodes: [] };
     byId("ws-viewer-title").textContent = entry.name || "Workspace";
+    renderLinks(entry.links);
     resetViewer("Loading…");
     openComposer(entry);
     const dialog = byId("ws-viewer");
@@ -810,6 +825,27 @@
   byId("ws-view-diff").onclick = () => setMode("diff");
   byId("ws-view-transcript").onclick = () => setMode("transcript");
   byId("ws-viewer-close").onclick = () => byId("ws-viewer").close();
+  // Full screen is a per-browser preference, kept across viewers and reloads.
+  const FULL_KEY = "ws-viewer-full";
+  function setFull(full) {
+    byId("ws-viewer").classList.toggle("ws-viewer-full", full);
+    byId("ws-viewer-full").setAttribute("aria-pressed", String(full));
+  }
+  try {
+    setFull(localStorage.getItem(FULL_KEY) === "1");
+  } catch {
+    setFull(false);
+  }
+  byId("ws-viewer-full").onclick = () => {
+    const full = !byId("ws-viewer").classList.contains("ws-viewer-full");
+    setFull(full);
+    try {
+      if (full) localStorage.setItem(FULL_KEY, "1");
+      else localStorage.removeItem(FULL_KEY);
+    } catch {
+      // Without storage the choice lasts until the page reloads.
+    }
+  };
   byId("ws-viewer").addEventListener("close", () => {
     viewer = null;
     viewerRequest += 1; // Responses still on their way are dropped.
@@ -832,7 +868,7 @@
     }
   }, 10000);
   // Diff and Transcript buttons for a target: {workspace} (a herdr workspace ID) and/or
-  // {key} (a Workspaces-tab row), plus a name for the dialog title.
+  // {key} (a Workspaces-tab row), plus a name for the dialog title and the links it shows.
   // The pair is one element, so a narrow cell wraps it together.
   function buttons(target) {
     const pair = node("span", undefined, "ws-view-buttons");
