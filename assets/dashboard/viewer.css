@@ -309,11 +309,27 @@
   scroll-padding-bottom: 220px;
 }
 @media (max-width: 600px) {
-  /* A phone screen cannot spare the room: the composer follows the content instead. */
+  /* A phone screen cannot spare the room: the viewer fills it and the composer follows the content. */
+  #ws-viewer {
+    width: 100%;
+    max-width: none;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    padding: 14px 16px;
+    border: 0;
+    border-radius: 0;
+    scroll-padding-bottom: 0;
+  }
   .ws-message {
     position: static;
+    margin: 16px -16px -14px;
+    padding: 12px 16px 16px;
   }
-  #ws-viewer {
-    scroll-padding-bottom: 0;
+  /* Below 16px, iOS zooms into a focused field and leaves the page zoomed. */
+  #ws-viewer textarea,
+  #ws-viewer select,
+  #ws-viewer input {
+    font-size: 16px;
   }
 }

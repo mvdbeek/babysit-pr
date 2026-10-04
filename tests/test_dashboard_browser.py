@@ -3325,6 +3325,22 @@ def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
     assert viewer_routes["sent"][0][1]["pane"] == "w1:p1"
 
 
+def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.get_by_label("Agent", exact=True)).to_be_visible()
+    box = viewer.bounding_box()
+    assert box == {"x": 0, "y": 0, "width": 390, "height": 844}
+    assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+    for field in ("#ws-message-text", "#ws-viewer select"):
+        size = page.locator(field).first.evaluate("el => getComputedStyle(el).fontSize")
+        assert size == "16px", field
+    page.screenshot(path="reports/viewer-mobile.png")
+
+
 def test_an_exited_agent_is_resumed_with_the_message(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     viewer_routes["agents"] = []
