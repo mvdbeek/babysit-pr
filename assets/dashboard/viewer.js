@@ -586,7 +586,11 @@
           (known.output !== entry.output || known.error !== entry.error)
         ) {
           current.entries[index] = entry;
-          updateTool(viewer.nodes[index], entry);
+          if (entry.questions) {
+            const card = transcriptEntry(entry, agentName(data));
+            viewer.nodes[index].replaceWith(card);
+            viewer.nodes[index] = card;
+          } else updateTool(viewer.nodes[index], entry);
         }
         return;
       }
@@ -599,6 +603,9 @@
     current.session = data.session;
     current.sessions = data.sessions;
     transcriptMeta(current);
+    // Whether a question can be answered here follows the agent's state; only a recent
+    // Claude dialog can still be waiting.
+    if (current.entries.slice(-5).some(answerable)) void fetchAgents(viewer.entry);
     if (follow) byId("ws-viewer").scrollTop = byId("ws-viewer").scrollHeight;
   }
   function prependTranscript(data) {
@@ -637,7 +644,233 @@
     output: "Command output",
     notification: "Notification",
   };
+  // Questions an agent asked ------------------------------------------------------
+  // Claude's dialog can be answered from here while its agent waits on it: the server
+  // types the choices into the dialog. Codex asks without waiting, so its options only
+  // offer to fill in a reply.
+  function openQuestion(entry) {
+    return entry.role === "tool" && entry.questions && entry.output == null;
+  }
+  function answerable(entry) {
+    return openQuestion(entry) && entry.name === "AskUserQuestion";
+  }
+  // Claude joins a multiple-choice answer's labels with ", ", which labels may contain.
+  function chosenLabels(question, answer) {
+    if (answer === undefined) return [];
+    const labels = question.options.map((option) => option.label);
+    if (labels.includes(answer)) return [answer];
+    if (!question.multi) return [];
+    // Read the answer left to right, trying the longest labels first.
+    const longest = [...labels].sort((a, b) => b.length - a.length);
+    const found = [];
+    let rest = answer;
+    while (rest) {
+      const label = longest.find((l) => rest === l || rest.startsWith(`${l}, `));
+      if (!label) return found;
+      found.push(label);
+      rest = rest.slice(label.length + 2);
+    }
+    return found;
+  }
+  // What decides how an open question is drawn: whether, and to whom, it can be answered.
+  function answerState() {
+    const session = viewer?.data?.session?.id;
+    const agent = agents.find((a) => a.agent === "claude" && a.session && a.session === session);
+    return `${Boolean(draft)}|${agent?.pane}|${agent?.status}`;
+  }
+  function questionCard(entry) {
+    const claude = entry.name === "AskUserQuestion";
+    const card = node("div", undefined, "ws-question");
+    card.dataset.tool = entry.id || "";
+    card.dataset.state = answerState();
+    const head = node("div", undefined, "ws-question-head");
+    head.append(node("strong", entry.questions.length === 1 ? "Question" : "Questions"));
+    const open = openQuestion(entry);
+    if (entry.answers) head.append(badge("Answered", "green"));
+    else if (entry.error) head.append(badge("Not answered", "red"));
+    else if (claude && open) head.append(badge("Waiting for an answer", "amber"));
+    card.append(head);
+    // A dialog that can be answered here shows its questions in the form instead.
+    const controls = claude && open ? answerControls(entry) : null;
+    const answering = controls?.tagName === "FORM";
+    entry.questions.forEach((question) => {
+      if (answering) return;
+      const section = node("section", undefined, "ws-question-item");
+      const title = node("p", undefined, "ws-question-text");
+      if (question.header) title.append(badge(question.header), " ");
+      title.append(linkify(question.question));
+      section.append(title);
+      const answer = entry.answers?.[question.question];
+      const chosen = chosenLabels(question, answer);
+      const list = node("ul", undefined, "ws-question-options");
+      for (const option of question.options) {
+        const item = node("li");
+        if (chosen.includes(option.label)) {
+          item.className = "ws-chosen";
+          item.append(node("span", "✓ ", "ws-chosen-mark"));
+        }
+        item.append(node("strong", option.label));
+        if (option.description) item.append(" ", node("span", option.description, "pr-meta"));
+        if (!claude && draft) item.append(" ", replyButton(question, option.label));
+        list.append(item);
+      }
+      if (question.options.length) section.append(list);
+      if (question.multi) section.append(node("small", "Any number can be chosen.", "pr-meta"));
+      if (answer !== undefined && !chosen.length) {
+        const typed = node("p", undefined, "ws-question-typed");
+        typed.append(node("strong", "Answered: "), linkify(answer));
+        section.append(typed);
+      }
+      card.append(section);
+    });
+    if (entry.error && entry.output) card.append(linked("p", entry.output, "pr-meta"));
+    if (controls) card.append(controls);
+    return card;
+  }
+  function replyButton(question, label) {
+    const button = node("button", "Reply with this", "ws-question-reply");
+    button.type = "button";
+    button.setAttribute("aria-label", `Reply ${label} to: ${question.question}`);
+    button.onclick = () => {
+      const field = byId("ws-message-text");
+      const line = `${question.question}\n→ ${label}`;
+      field.value = field.value.trim() ? `${field.value.trimEnd()}\n\n${line}` : line;
+      field.dispatchEvent(new Event("input"));
+      field.focus();
+    };
+    return button;
+  }
+  function answerControls(entry) {
+    const session = viewer?.data?.session?.id;
+    const agent = agents.find((a) => a.agent === "claude" && a.session && a.session === session);
+    if (!draft) return node("p", "Answer it in the agent's terminal.", "pr-meta");
+    if (!agent)
+      return node("p", "No running Claude agent in this workspace is on this session.", "pr-meta");
+    if (agent.status !== "blocked")
+      return node("p", "The agent is not waiting on this question right now.", "pr-meta");
+    const form = node("form", undefined, "ws-answer");
+    const fields = entry.questions.map((question, index) => {
+      const set = node("fieldset");
+      const legend = node("legend");
+      if (question.header) legend.append(badge(question.header), " ");
+      legend.append(node("strong", question.question));
+      if (question.multi) legend.append(" ", node("small", "any number", "pr-meta"));
+      set.append(legend);
+      const name = `ws-answer-${entry.id}-${index}`;
+      const inputs = question.options.map((option, choice) => {
+        const label = node("label");
+        const input = document.createElement("input");
+        input.type = question.multi ? "checkbox" : "radio";
+        input.name = name;
+        input.value = String(choice);
+        const text = node("span");
+        text.append(option.label);
+        if (option.description) text.append(" ", node("small", option.description, "pr-meta"));
+        label.append(input, text);
+        set.append(label);
+        return input;
+      });
+      let other = null;
+      let text = null;
+      if (!question.multi) {
+        const label = node("label", undefined, "ws-answer-other");
+        other = document.createElement("input");
+        other.type = "radio";
+        other.name = name;
+        text = document.createElement("input");
+        text.type = "text";
+        text.maxLength = 2000;
+        text.placeholder = "Something else";
+        text.setAttribute("aria-label", `Other answer to: ${question.question}`);
+        text.oninput = () => (other.checked = Boolean(text.value.trim()) || other.checked);
+        label.append(other, text);
+        set.append(label);
+      }
+      form.append(set);
+      return { question, inputs, other, text };
+    });
+    const status = node("p", undefined, "ws-answer-status");
+    status.setAttribute("role", "status");
+    const submit = node("button", `Answer in ${agent.pane}`);
+    submit.type = "submit";
+    form.append(submit, status);
+    form.oninput = () => (status.textContent = "");
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const answers = [];
+      for (const { question, inputs, other, text } of fields) {
+        if (other?.checked) {
+          if (!text.value.trim()) {
+            status.textContent = `Write your answer to “${question.question}”.`;
+            return;
+          }
+          answers.push({ text: text.value.trim() });
+          continue;
+        }
+        const chosen = inputs.filter((input) => input.checked).map((input) => Number(input.value));
+        if (!chosen.length) {
+          status.textContent = `Answer “${question.question}” first.`;
+          return;
+        }
+        answers.push({ options: chosen });
+      }
+      submit.disabled = true;
+      status.textContent = "Answering…";
+      const current = viewer.entry;
+      const value = await answerRequest({
+        workspace: current.workspace,
+        pane: agent.pane,
+        session,
+        tool: entry.id,
+        answers,
+      });
+      if (viewer?.entry !== current) return;
+      if (value.error) {
+        status.textContent = value.error;
+        submit.disabled = false;
+        return;
+      }
+      status.textContent = `Answered in ${value.pane}.`;
+      // The transcript records the answer once the agent continues.
+      setTimeout(() => {
+        if (viewer?.entry === current && viewer.mode === "transcript")
+          void loadViewer({ after: Math.max(viewer.data.start, viewer.data.total - 20) });
+      }, 2500);
+    };
+    return form;
+  }
+  async function answerRequest(body) {
+    try {
+      const response = await fetch("/api/workspace-answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-answer" },
+        body: JSON.stringify(body),
+      });
+      const value = await response.json();
+      return response.ok ? value : { error: value.error || `HTTP ${response.status}` };
+    } catch {
+      return { error: "The connection dropped; check the question in Collie." };
+    }
+  }
+  // Agents arrive after the transcript: open questions are drawn again with them.
+  function refreshQuestions() {
+    if (viewer?.mode !== "transcript" || !viewer.data?.entries) return;
+    viewer.data.entries.forEach((entry, index) => {
+      const shown = viewer.nodes[index];
+      if (!answerable(entry) || !shown || shown.dataset.state === answerState()) return;
+      // A form being filled in is left alone.
+      if (
+        shown.contains(document.activeElement) ||
+        shown.querySelector("form :checked, form input[type=text]:not(:placeholder-shown)")
+      )
+        return;
+      const card = questionCard(entry);
+      shown.replaceWith(card);
+      viewer.nodes[index] = card;
+    });
+  }
   function transcriptEntry(entry, agent) {
+    if (entry.role === "tool" && entry.questions) return questionCard(entry);
     if (entry.role === "tool") {
       const item = node("details", undefined, "ws-tool");
       const summary = node("summary");
@@ -735,6 +968,7 @@
       agents = value.agents;
       sessions = value.sessions;
       renderAgents();
+      refreshQuestions();
     } catch (error) {
       if (viewer?.entry === entry) renderAgents(error.message);
     }

@@ -978,7 +978,13 @@ def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
             port = httpd.server_port
             status, value = request(port, "/api/workspace-agents?workspace=w1")
             assert status == 200 and value["agents"] == [
-                {"pane": "w1:p1", "agent": "codex", "status": "idle", "title": None}
+                {
+                    "pane": "w1:p1",
+                    "agent": "codex",
+                    "status": "idle",
+                    "title": None,
+                    "session": None,
+                }
             ]
             assert value["path"].endswith("merged-work") and value["sessions"] == []
             body = {"workspace": "w1", "text": "Please add a test.\r\nThen push.\x1b[201~\x15"}
@@ -1244,3 +1250,283 @@ def test_old_resume_prompts_and_records_are_pruned(tmp_path, monkeypatch):
     agent_messages.prune(tmp_path)
     assert [p.name for p in tmp_path.iterdir()] == ["resume-new"]
     assert list(agent_messages._recent) == ["b"]
+
+
+RULE = "─" * 40
+QUESTIONS = [
+    {
+        "question": "Pick a color",
+        "header": "Color",
+        "multiSelect": False,
+        "options": [{"label": "Red", "description": "Warm"}, {"label": "Blue"}],
+    },
+    {
+        "question": "Pick toppings",
+        "header": "Toppings",
+        "multiSelect": True,
+        "options": [{"label": "Cheese"}, {"label": "Olives"}, {"label": "Basil"}],
+    },
+]
+
+
+def dialog_screen(question):
+    """Claude's question dialog as herdr reads it from the pane."""
+    options = [f"  {i}. {o['label']}" for i, o in enumerate(question["options"], 1)]
+    return "\n".join(
+        [
+            "❯ earlier prompt that mentioned Pick a color",
+            RULE,
+            "←  ☐ Color  ☐ Toppings  ✔ Submit  →",
+            question["question"],
+            *options,
+            f"  {len(options) + 1}. Type something.",
+            RULE,
+            f"  {len(options) + 2}. Chat about this",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+    )
+
+
+REVIEW = "\n".join(
+    [
+        RULE,
+        "Review your answers",
+        "Ready to submit your answers?",
+        "❯ 1. Submit answers",
+        "2. Cancel",
+    ]
+)
+
+
+@pytest.fixture
+def asking(exited, monkeypatch):
+    """A running Claude agent waits on a two-question dialog."""
+    state, sid, checkout, home = exited
+    monkeypatch.setenv("FAKE_HERDR_KEEP_AGENT", "1")
+    folder = next(p for p in (checkout.parents[3] / "claude" / "projects").iterdir())
+    transcript = folder / f"{sid}.jsonl"
+    asked = {
+        "type": "assistant",
+        "cwd": str(checkout),
+        "sessionId": sid,
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_q1",
+                    "name": "AskUserQuestion",
+                    "input": {"questions": QUESTIONS},
+                }
+            ]
+        },
+    }
+    transcript.write_text(transcript.read_text() + json.dumps(asked) + "\n")
+    data = read(state)
+    data["agents"] = [
+        {
+            "workspace_id": "w1",
+            "pane_id": "w1:p1",
+            "agent": "claude",
+            "agent_status": "blocked",
+            "agent_session": {"value": sid},
+        }
+    ]
+    data["screens"] = {
+        "w1:p1": [
+            dialog_screen(QUESTIONS[0]),
+            dialog_screen(QUESTIONS[1]),
+            dialog_screen(QUESTIONS[1]),
+            dialog_screen(QUESTIONS[1]),
+            REVIEW,
+            "done",
+        ]
+    }
+    state.write_text(json.dumps(data))
+    monkeypatch.setattr(__import__("agent_messages"), "DIALOG_WAIT", 0.3)
+    return state, sid, transcript
+
+
+def answer_request(sid, answers, **extra):
+    return {
+        "workspace": "w1",
+        "pane": "w1:p1",
+        "session": sid,
+        "tool": "toolu_q1",
+        "answers": answers,
+        **extra,
+    }
+
+
+def keys_sent(state):
+    return [
+        c[3:]
+        for c in read(state)["calls"]
+        if c[:2] in (["agent", "send-keys"], ["pane", "send-text"])
+    ]
+
+
+def test_a_waiting_claude_dialog_is_answered_one_question_at_a_time(asking):
+    import agent_messages
+
+    state, sid, _ = asking
+    assert agent_messages.agents("w1")[0]["session"] == sid
+    value = agent_messages.answer(answer_request(sid, [{"options": [1]}, {"options": [2, 0]}]))
+    assert value == {"answered": True, "pane": "w1:p1"}
+    # Blue picks and moves on; toppings toggle, Right moves on; 1 submits the review.
+    assert keys_sent(state) == [["2"], ["1"], ["3"], ["right"], ["1"]]
+
+
+def test_a_typed_answer_goes_through_the_type_something_option(asking):
+    import agent_messages
+
+    state, sid, transcript = asking
+    data = read(state)
+    lone = [QUESTIONS[0]]
+    lines = transcript.read_text().splitlines()
+    record = json.loads(lines[-1])
+    record["message"]["content"][0]["input"]["questions"] = lone
+    transcript.write_text("\n".join(lines[:-1] + [json.dumps(record)]) + "\n")
+    typing = dialog_screen(QUESTIONS[0]).replace("Esc to", "ctrl+g to edit in Vim · Esc to")
+    data["screens"]["w1:p1"] = [dialog_screen(QUESTIONS[0]), typing, "done"]
+    state.write_text(json.dumps(data))
+    text = "Teal,\n\x1b[201~ please"
+    agent_messages.answer(answer_request(sid, [{"text": text}]))
+    # One line, with no control characters; a single question needs no review step.
+    assert keys_sent(state) == [["3"], ["--", "Teal, [201~ please"], ["enter"]]
+
+
+@pytest.mark.parametrize(
+    ("change", "answers", "error"),
+    [
+        ({}, [{"options": [1]}], "Answer every question"),
+        ({}, [{"options": [0, 1]}, {"options": [0]}], "Choose one listed option"),
+        ({}, [{"options": [5]}, {"options": [0]}], "Choose one listed option"),
+        ({}, [{"options": [True]}, {"options": [0]}], "Choose one listed option"),
+        ({}, [{"options": [0]}, {"text": "x"}], "Write an answer"),
+        ({}, [{"text": "  "}, {"options": [0]}], "Write an answer"),
+        ({}, [{"options": [0], "text": "x"}, {"options": [0]}], "Choose options or write"),
+        ({"agent_status": "working"}, [{"options": [0]}, {"options": [0]}], "not waiting"),
+        ({"agent": "codex"}, [{"options": [0]}, {"options": [0]}], "no longer running"),
+        ({"agent_session": {"value": "other"}}, [{"options": [0]}, {"options": [0]}], "no longer"),
+    ],
+)
+def test_answers_are_refused_before_anything_is_typed(asking, change, answers, error):
+    import agent_messages
+
+    state, sid, _ = asking
+    data = read(state)
+    data["agents"][0].update(change)
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=error):
+        agent_messages.answer(answer_request(sid, answers))
+    assert keys_sent(state) == []
+
+
+def test_nothing_is_typed_unless_the_dialog_shows_the_question(asking):
+    import agent_messages
+
+    state, sid, transcript = asking
+    good = [{"options": [0]}, {"options": [0]}]
+    with pytest.raises(ValueError, match="Invalid answer"):
+        agent_messages.answer(answer_request(sid, good, extra=1))
+    data = read(state)
+    data["screens"]["w1:p1"] = [dialog_screen(QUESTIONS[1])]  # Moved on in the terminal.
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="not on the agent's screen"):
+        agent_messages.answer(answer_request(sid, good))
+    assert keys_sent(state) == []
+    # A dialog that stops following stops the answer, saying it is partly given.
+    data["screens"]["w1:p1"] = [dialog_screen(QUESTIONS[0]), "something else"]
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Answered in part"):
+        agent_messages.answer(answer_request(sid, good))
+    assert keys_sent(state) == [["1"]]
+    # An answered question is not answered again.
+    result = {
+        "type": "user",
+        "cwd": "/",
+        "sessionId": sid,
+        "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_q1", "content": "done"}]
+        },
+        "toolUseResult": {"answers": {"Pick a color": "Red", "Pick toppings": "Cheese"}},
+    }
+    transcript.write_text(transcript.read_text() + json.dumps(result) + "\n")
+    with pytest.raises(ValueError, match="already answered"):
+        agent_messages.answer(answer_request(sid, good))
+
+
+def test_the_dashboard_relays_answers(asking, tmp_path):
+    state, sid, _ = asking
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            body = answer_request(sid, [{"options": [0]}, {"options": [0, 1]}])
+            status, value = request(
+                httpd.server_port, "/api/workspace-answer", body, action="workspace-answer"
+            )
+            assert status == 200 and value["answered"], value
+            status, value = request(
+                httpd.server_port,
+                "/api/workspace-answer",
+                {**body, "answers": []},
+                action="workspace-answer",
+            )
+            assert status == 400 and "Answer every question" in value["error"]
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_a_similar_question_or_a_bare_screen_is_not_taken_for_the_dialog(asking):
+    import agent_messages
+
+    state, sid, transcript = asking
+    good = [{"options": [0]}, {"options": [0]}]
+    data = read(state)
+    # The next question starts with this one's words and repeats its options.
+    longer = {**QUESTIONS[0], "question": "Pick a color for the border"}
+    shell = "\n".join(["Pick a color", "  1. Red", "  2. Blue", "% "])
+    for screen in (dialog_screen(longer), shell):
+        data["screens"]["w1:p1"] = [screen]
+        state.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="not on the agent's screen"):
+            agent_messages.answer(answer_request(sid, good))
+    assert keys_sent(state) == []
+
+
+def test_questions_with_too_many_options_for_digit_keys_are_left_to_the_terminal(asking):
+    import agent_messages
+
+    state, sid, transcript = asking
+    lines = transcript.read_text().splitlines()
+    record = json.loads(lines[-1])
+    many = {**QUESTIONS[0], "options": [{"label": f"Option {i}"} for i in range(9)]}
+    record["message"]["content"][0]["input"]["questions"] = [many]
+    transcript.write_text("\n".join(lines[:-1] + [json.dumps(record)]) + "\n")
+    for answer in ({"text": "mine"}, {"options": [0]}):
+        with pytest.raises(ValueError, match="too many options"):
+            agent_messages.answer(answer_request(sid, [answer]))
+    assert keys_sent(state) == []
+
+
+def test_an_agent_that_stops_waiting_mid_answer_stops_the_typing(asking, monkeypatch):
+    import agent_messages
+
+    state, sid, _ = asking
+    real = agent_messages.herdr
+
+    def herdr(*args):
+        value = real(*args)
+        if args[:2] == ("agent", "send-keys"):
+            # The first key lands, then the agent is no longer waiting.
+            data = read(state)
+            data["agents"][0]["agent_status"] = "working"
+            state.write_text(json.dumps(data))
+        return value
+
+    monkeypatch.setattr(agent_messages, "herdr", herdr)
+    with pytest.raises(ValueError, match=r"Answered in part \(the agent stopped waiting\)"):
+        agent_messages.answer(answer_request(sid, [{"options": [1]}, {"options": [0]}]))
+    assert keys_sent(state) == [["2"]]

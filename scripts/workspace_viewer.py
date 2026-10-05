@@ -64,6 +64,10 @@ TOOL_SUBJECT = ("command", "cmd", "file_path", "path", "pattern", "query", "url"
 CODEX_CMD = re.compile(r'\bcmd:\s*("(?:[^"\\\n]|\\.)*")')
 SHELLS = {"bash", "sh", "zsh"}
 MAX_BRIEF = 200
+# Tools that ask the user to choose: Claude's dialog, and Codex's request for input.
+QUESTION_TOOLS = re.compile(r"^(AskUserQuestion|request_user_input(_async)?)$")
+MAX_QUESTIONS = 8
+MAX_OPTIONS = 12
 CHUNK = 4 * 1024 * 1024
 # An open viewer polls every few seconds: session details are kept per file version, and
 # parsed transcripts keep their read position so a growing file is read from where it
@@ -465,6 +469,50 @@ def tool_view(value):
     return about[:MAX_BRIEF] if about else None, first_line(subject or text), text
 
 
+def question_list(value):
+    """A question tool's questions as [{question, header, multi, options: [{label,
+    description}]}], from Claude's or Codex's input shape; None if it holds none."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    raw = value.get("questions") if isinstance(value, dict) else None
+    if not isinstance(raw, list):
+        return None
+    found = []
+    for item in raw[:MAX_QUESTIONS]:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("question") or item.get("title")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        options = []
+        for option in item.get("options") or []:
+            if isinstance(option, str):
+                option = {"label": option}
+            if isinstance(option, dict) and isinstance(option.get("label"), str):
+                description = option.get("description")
+                options.append(
+                    {
+                        "label": clip(option["label"], MAX_BRIEF),
+                        "description": clip(description, 1000)
+                        if isinstance(description, str)
+                        else None,
+                    }
+                )
+        header = item.get("header")
+        found.append(
+            {
+                "question": clip(text, 2000),
+                "header": header[:40] if isinstance(header, str) else None,
+                "multi": item.get("multiSelect") is True,
+                "options": options[:MAX_OPTIONS],
+            }
+        )
+    return found or None
+
+
 def claude_text(item):
     content = (item.get("message") or {}).get("content")
     if isinstance(content, list) and any(
@@ -679,6 +727,7 @@ class Transcript:
         about, brief, text = tool_view(value)
         tool = {
             "role": "tool",
+            "id": str(key or ""),
             "name": str(name or "tool"),
             "about": about,
             "brief": brief,
@@ -687,6 +736,8 @@ class Transcript:
             "error": False,
             "time": when,
         }
+        if QUESTION_TOOLS.match(tool["name"]):
+            tool["questions"] = question_list(value)
         self.tools[key or ""] = tool
         self.entries.append(tool)
 
@@ -704,6 +755,15 @@ class Transcript:
                     if tool is not None:
                         tool["output"] = clip(block_text(block.get("content")), MAX_TOOL)
                         tool["error"] = bool(block.get("is_error"))
+                        # Claude records a dialog's answers by question as well.
+                        result = item.get("toolUseResult")
+                        answers = result.get("answers") if isinstance(result, dict) else None
+                        if tool.get("questions") and isinstance(answers, dict):
+                            tool["answers"] = {
+                                str(q): clip(a, 2000)
+                                for q, a in answers.items()
+                                if isinstance(a, str)
+                            }
             view = claude_prompt(claude_text(item))
             if view:
                 kind, text = view

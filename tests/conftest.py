@@ -60,6 +60,11 @@ elif a[:2] == ['agent','prompt']:
 elif a[:2] == ['agent','send-keys']:
  if not os.environ.get('FAKE_HERDR_KEEP_AGENT'):
   data['agents']=[g for g in data['agents'] if g.get('pane_id')!=a[2]]
+elif a[:2] == ['agent','read']:
+ # A scripted dialog: each key or text sent to the pane advances to its next screen.
+ sent=[c for c in data['calls'] if c[:2] in (['agent','send-keys'],['pane','send-text']) and c[2]==a[2]]
+ screens=data.get('screens',{}).get(a[2]) or ['']
+ p.write_text(json.dumps(data)); print(screens[min(len(sent),len(screens)-1)]); sys.exit(0)
 elif a[:2] == ['pane','list']:
  wid=a[a.index('--workspace')+1] if '--workspace' in a else None
  result={'panes':[x for x in data.get('panes',[]) if wid is None or x['workspace_id']==wid]}
