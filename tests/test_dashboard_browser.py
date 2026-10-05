@@ -1,7 +1,9 @@
 """Real Chromium tests: isolated SQLite queue, real HTTP server, no watcher or agents."""
 
 import copy
+import datetime
 import json
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -3533,6 +3535,65 @@ def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
     page.screenshot(path=f"reports/transcript-{width}.png", full_page=True)
     tool.click()
     expect(viewer.locator(".ws-tool-input")).to_contain_text("timeout: 600")
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_transcript_entries_show_when_they_were_recorded(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    today = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()
+    entries = [
+        {"role": "user", "text": "Long ago", "time": "2024-03-01T10:05:00.000Z"},
+        {
+            "role": "tool",
+            "name": "Bash",
+            "about": "Run the whole suite with every environment enabled",
+            "brief": "uv run --locked tox -e lint,format,types,unit,browser,coverage",
+            "input": "uv run --locked tox",
+            "output": "1 failed",
+            "error": True,
+            "time": today,
+        },
+        {"role": "user", "kind": "notification", "text": "Background done", "time": today},
+        {"role": "assistant", "text": "Undated reply"},
+        {"role": "assistant", "text": "Garbled date", "time": "not a date"},
+    ]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    old = viewer.locator(".ws-kind-prompt time")
+    # Another day shows its date, and another year the year too.
+    expect(old).to_contain_text("2024")
+    expect(old).to_contain_text("Mar")
+    expect(old).to_have_attribute("datetime", "2024-03-01T10:05:00.000Z")
+    # Today shows only the time of day.
+    tool = viewer.locator(".ws-tool summary")
+    expect(tool.locator("time")).to_have_text(re.compile(r"^\d{1,2}:\d{2}( [AP]M)?$"))
+    expect(tool.locator(".badge")).to_have_text("Error")
+    expect(viewer.locator(".ws-note time")).to_have_text(re.compile(r"^\d{1,2}:\d{2}"))
+    # An entry without a usable time shows none.
+    expect(viewer.locator(".ws-assistant time")).to_have_count(0)
+    expect(viewer.locator("time")).to_have_count(3)
+    assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+    time_box = tool.locator("time").bounding_box()
+    summary_box = tool.bounding_box()
+    assert time_box["x"] + time_box["width"] <= summary_box["x"] + summary_box["width"] + 1
+    page.screenshot(path=f"reports/transcript-times-{width}.png", full_page=True)
 
 
 def test_transcript_markdown_edge_cases_render_promptly(page, dashboard_site, viewer_routes):
