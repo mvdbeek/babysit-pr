@@ -619,3 +619,73 @@ def test_paths_are_shown_unquoted(repo):
     git("add", ".")
     value = wv.diff(path, "uncommitted")
     assert "café menu.txt" in [f["path"] for f in value["files"]]
+
+
+def test_question_tools_carry_their_questions_and_claudes_answers(stores):
+    checkout, _, day = stores
+    folder = (
+        checkout.parent.parent
+        / "claude"
+        / "projects"
+        / "".join(c if c.isalnum() else "-" for c in str(checkout))
+    )
+    sid = "c0ffee00-0000-4000-8000-000000000002"
+    common = {"sessionId": sid, "cwd": str(checkout)}
+    questions = [
+        {
+            "question": "Ship it?",
+            "header": "Ship",
+            "multiSelect": False,
+            "options": [{"label": "Yes", "description": "Merge now"}, {"label": "No"}],
+        }
+    ]
+    write_jsonl(
+        folder / f"{sid}.jsonl",
+        {"type": "user", **common, "message": {"content": "Go"}},
+        {
+            "type": "assistant",
+            **common,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tq",
+                        "name": "AskUserQuestion",
+                        "input": {"questions": questions},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            **common,
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "tq", "content": "answered"}]
+            },
+            "toolUseResult": {"answers": {"Ship it?": "Yes", "bad": 3}},
+        },
+    )
+    tool = wv.transcript(checkout, sid)["entries"][-1]
+    assert tool["id"] == "tq" and tool["answers"] == {"Ship it?": "Yes"}
+    assert tool["questions"] == [
+        {
+            "question": "Ship it?",
+            "header": "Ship",
+            "multi": False,
+            "options": [
+                {"label": "Yes", "description": "Merge now"},
+                {"label": "No", "description": None},
+            ],
+        }
+    ]
+    # Codex's request names a question its title and lists bare option strings.
+    codex = wv.question_list('{"questions":[{"title":"Which?","options":["A","B"]}, 5]}')
+    assert codex == [
+        {
+            "question": "Which?",
+            "header": None,
+            "multi": False,
+            "options": [{"label": "A", "description": None}, {"label": "B", "description": None}],
+        }
+    ]
+    assert wv.question_list({"questions": "no"}) is None and wv.question_list("not json") is None

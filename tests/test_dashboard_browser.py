@@ -3572,6 +3572,168 @@ def test_transcript_markdown_edge_cases_render_promptly(page, dashboard_site, vi
     expect(replies.nth(4).locator("p")).to_have_text("after")
 
 
+QUESTION = {
+    "question": 'Merge <img src=x onerror="window.injected=true"> now?',
+    "header": "Ship",
+    "multi": False,
+    "options": [
+        {"label": "Merge and deploy", "description": "After CI passes"},
+        {"label": "Leave it open", "description": None},
+    ],
+}
+TOPPINGS = {
+    "question": "Pick toppings",
+    "header": "Toppings",
+    "multi": True,
+    "options": [{"label": "Cheese", "description": None}, {"label": "Basil", "description": None}],
+}
+
+# A label with a comma, in an answer Claude joins with commas.
+SEASONING = {
+    "question": "Season?",
+    "header": None,
+    "multi": True,
+    "options": [
+        {"label": "Salt, pepper", "description": None},
+        {"label": "Salt", "description": None},
+        {"label": "Herbs", "description": None},
+    ],
+}
+
+
+def question_entry(questions, **extra):
+    return {
+        "role": "tool",
+        "id": "toolu_q",
+        "name": "AskUserQuestion",
+        "about": None,
+        "brief": "questions: …",
+        "input": "questions: …",
+        "output": None,
+        "error": False,
+        "questions": questions,
+        **extra,
+    }
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_questions_render_as_cards_and_a_waiting_one_is_answered_here(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    entries = [
+        question_entry(
+            [QUESTION, TOPPINGS, SEASONING],
+            id="toolu_done",
+            output="answered",
+            answers={
+                QUESTION["question"]: "Merge and deploy",
+                "Pick toppings": "Cheese, Basil",
+                "Season?": "Salt, pepper, Herbs",
+            },
+        ),
+        {
+            "role": "tool",
+            "id": "call_1",
+            "name": "request_user_input_async",
+            "output": '{"accepted":true}',
+            "error": False,
+            "input": "",
+            "questions": [{**QUESTION, "header": None, "question": "Codex asks: which?"}],
+        },
+        question_entry([QUESTION, TOPPINGS]),
+    ]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    answers = []
+
+    def answer(route):
+        answers.append(
+            (route.request.headers.get("x-babysit-action"), route.request.post_data_json)
+        )
+        route.fulfill(json={"answered": True, "pane": "w1:p2"})
+
+    page.route("**/api/workspace-answer", answer)
+    viewer_routes["agents"][1].update(status="blocked", session="s1")
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    cards = page.locator("#ws-viewer .ws-question")
+    expect(cards).to_have_count(3)
+    done, codex, waiting = cards.nth(0), cards.nth(1), cards.nth(2)
+    expect(done.locator(".ws-question-head")).to_contain_text("Answered")
+    expect(done.locator(".ws-chosen strong")).to_have_text(
+        ["Merge and deploy", "Cheese", "Basil", "Salt, pepper", "Herbs"]
+    )
+    expect(done.locator(".ws-question-text").first).to_contain_text(
+        '<img src=x onerror="window.injected=true">'
+    )
+    assert page.evaluate("window.injected") is None
+    assert done.locator("form").count() == 0
+    # Codex asks without waiting: an option fills in a reply instead.
+    codex.get_by_role("button", name="Reply Leave it open to: Codex asks: which?").click()
+    expect(page.locator("#ws-message-text")).to_have_value("Codex asks: which?\n→ Leave it open")
+    expect(waiting.locator(".ws-question-head")).to_contain_text("Waiting for an answer")
+    submit = waiting.get_by_role("button", name="Answer in w1:p2")
+    submit.click()
+    expect(waiting.locator(".ws-answer-status")).to_contain_text("Answer “Merge")
+    assert not answers
+    waiting.get_by_label("Other answer to: Merge").fill("After the release")
+    waiting.get_by_label("Basil").check()
+    page.screenshot(path=f"reports/transcript-questions-{width}.png", full_page=True)
+    submit.click()
+    expect(waiting.locator(".ws-answer-status")).to_have_text("Answered in w1:p2.")
+    assert answers == [
+        (
+            "workspace-answer",
+            {
+                "workspace": "w1",
+                "pane": "w1:p2",
+                "session": "s1",
+                "tool": "toolu_q",
+                "answers": [{"text": "After the release"}, {"options": [1]}],
+            },
+        )
+    ]
+
+
+def test_a_question_without_its_waiting_agent_is_answered_in_the_terminal(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    entries = [question_entry([QUESTION])]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": 1,
+            }
+        ),
+    )
+    viewer_routes["agents"][1].update(status="working", session="s1")
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    card = page.locator("#ws-viewer .ws-question")
+    expect(card).to_contain_text("The agent is not waiting on this question right now.")
+    assert card.locator("form").count() == 0
+
+
 def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})

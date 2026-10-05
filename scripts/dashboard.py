@@ -268,6 +268,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-cleanup",
                 "workspace-open",
                 "workspace-message",
+                "workspace-answer",
                 "workspace-prompt-forget",
                 "sentry-action",
                 "push-subscribe",
@@ -300,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-cleanup",
                         "workspace-open",
                         "workspace-message",
+                        "workspace-answer",
                         "workspace-prompt-forget",
                         "sentry-action",
                     }
@@ -357,6 +359,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.send(request, self.server.home))
                 except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     self.send_json(503, {"error": f"Nothing was typed: {exc}"})
+                return
+            if action == "workspace-answer":
+                try:
+                    self.send_json(200, agent_messages.answer(request))
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the question in Collie: {exc}"})
                 return
             if action == "workspace-prompt-forget":
                 if not self.server.workspaces:
