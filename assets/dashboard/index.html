@@ -244,6 +244,16 @@
               <option value="agents">Has an agent</option>
             </select>
           </label>
+          <label for="ws-sort"
+            >Sort by
+            <select id="ws-sort" aria-label="Sort workspaces by">
+              <option value="updated_at">Last updated</option>
+              <option value="created_at">Created</option>
+            </select>
+          </label>
+          <button id="ws-sort-direction" type="button" aria-label="Newest first">
+            Newest first
+          </button>
         </div>
         <p id="ws-status-line" class="pr-sync" role="status">Loading your workspaces…</p>
         <div id="ws-notices" role="status"></div>

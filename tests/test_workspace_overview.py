@@ -217,6 +217,94 @@ def test_lists_worktrees_with_links_agents_and_local_state(site):
     assert f"repos/{BASE}/pulls/9" not in fake.calls
 
 
+def test_checkout_times_follow_edits_and_head_without_advancing_on_inspection(site):
+    _, _, _, worktrees, _, git = site
+    path = worktrees / "merged-work"
+    tracked = path / 'tracked "file\n.txt'
+    tracked.write_text("original")
+    git("add", ".", cwd=path)
+    git("commit", "-m", "tracked file", cwd=path)
+    tracked.write_text("edited in place")
+    untracked = path / "untracked file.txt"
+    untracked.write_text("new")
+    log = Path(git("rev-parse", "--absolute-git-dir", cwd=path)) / "logs" / "HEAD"
+    created = float(log.read_text().splitlines()[0].split("\t", 1)[0].split()[-2])
+    baseline = created + 10
+    for file in (path, tracked, untracked, log):
+        os.utime(file, (baseline, baseline))
+    os.utime(tracked, (baseline + 20, baseline + 20))
+    first = wso.local_state(str(path), "merged-work")
+    assert first["created_at"] == created
+    assert first["updated_at"] == baseline + 20
+    assert wso.local_state(str(path), "merged-work") == first
+    git("add", ".", cwd=path)
+    assert wso.local_state(str(path), "merged-work") == first
+    os.utime(untracked, (baseline + 30, baseline + 30))
+    assert wso.local_state(str(path), "merged-work")["updated_at"] == baseline + 30
+    os.utime(log, (baseline + 40, baseline + 40))
+    assert wso.checkout_times(path) == {"created_at": created, "updated_at": baseline + 40}
+
+
+def test_checkout_times_tolerate_missing_reflogs_and_checkouts(tmp_path):
+    path = tmp_path / "checkout"
+    (path / ".git").mkdir(parents=True)
+    (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    value = wso.checkout_times(path)
+    assert value["created_at"] == getattr(path.stat(), "st_birthtime", None)
+    assert value["updated_at"] >= path.stat().st_mtime
+    assert wso.checkout_times(tmp_path / "gone") == {"created_at": None, "updated_at": None}
+
+
+def test_inventory_uses_transcript_activity_and_sorts_newest_first(site, tmp_path, monkeypatch):
+    plugin, _, _, worktrees, _, _ = site
+    day = tmp_path / "codex" / "sessions" / "2026" / "10" / "05"
+    day.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    latest = time.time() + 100
+    file = day / "rollout-recent.jsonl"
+    file.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "01234567-1234", "cwd": str(worktrees / "merged-work/lib")},
+            }
+        )
+        + "\n"
+    )
+    os.utime(file, (latest, latest))
+    unrelated = day / "rollout-unrelated.jsonl"
+    unrelated.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "01234567-9999", "cwd": "/else"}})
+        + "\n"
+    )
+    os.utime(unrelated, (latest + 100, latest + 100))
+    value = plugin.collect()["workspaces"]
+    assert value[0]["name"] == "merged-work" and value[0]["updated_at"] == latest
+    assert value[0]["created_at"] is not None
+    assert value[-1]["name"] == "gone" and value[-1]["updated_at"] is None
+
+
+@pytest.mark.parametrize("outside", [False, True])
+def test_claude_activity_matches_the_nearest_checkout(tmp_path, monkeypatch, outside):
+    src = tmp_path / "src"
+    root = tmp_path / "external" if outside else src / "checkout"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    config = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    cwd = nested / "lib"
+    folder = config / "projects" / "".join(c if c.isalnum() else "-" for c in str(cwd))
+    folder.mkdir(parents=True)
+    file = folder / "session.jsonl"
+    file.write_text(
+        json.dumps({"type": "user", "cwd": str(cwd), "sessionId": "01234567-1234"}) + "\n"
+    )
+    os.utime(file, (1000, 1000))
+    assert wso.transcript_updates({str(root), str(nested)}, src) == {str(nested): 1000}
+
+
 def test_base_tracking_and_foreign_names_never_become_links():
     item = {"path": "/w/topic", "branch": "topic", "upstream": ["fork/repo", "dev"]}
     assert wso.candidates(item, BASE, "fork") == [("head", "fork:topic")]

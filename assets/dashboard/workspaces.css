@@ -5,6 +5,14 @@
 #ws-notices {
   overflow-wrap: anywhere;
 }
+#ws-sort-direction {
+  align-self: end;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+}
 /* The dashboard sizes text inputs globally; checkboxes must stay checkbox-sized. */
 #workspaces-panel input[type="checkbox"],
 #ws-dialog input[type="checkbox"] {
