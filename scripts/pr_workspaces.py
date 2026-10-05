@@ -25,6 +25,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+import attachments
 import github_cli
 import owned_process
 import workspace_agents
@@ -452,7 +453,9 @@ class Workspaces:
     @staticmethod
     def remember_prompt(db, task, used_at):
         # Unedited Handle prefills are regenerated per item; only typed tasks recur.
-        task = task.strip()
+        # Attached files are not part of the prompt: reused, their paths could reach
+        # a filed issue's body.
+        task = attachments.without_note(task).strip()
         if not task or HANDLE_PREFILLS.fullmatch(task):
             return
         db.execute(
@@ -1079,6 +1082,8 @@ class Workspaces:
             "model",
             "effort",
             "task",
+            # Attached files, for the agent only: an issue's body is the task alone.
+            "task_files",
         }
         if set(request) - allowed or any(not isinstance(v, str) for v in request.values()):
             raise ValueError("Invalid new task parameters")
@@ -1136,7 +1141,9 @@ class Workspaces:
                 db.execute("INSERT INTO operations VALUES (?,?)", (key, json.dumps(op)))
                 self.remember_prompt(db, task, op["created_at"])
                 worker = threading.Thread(
-                    target=self.perform_new, args=(target, op, task), daemon=True
+                    target=self.perform_new,
+                    args=(target, op, task, request.get("task_files", "")),
+                    daemon=True,
                 )
                 self.workers[key] = worker
             worker.start()
@@ -1150,7 +1157,7 @@ class Workspaces:
         except ValueError:
             return False
 
-    def perform_new(self, target, op, task):
+    def perform_new(self, target, op, task, files=""):
         try:
             if is_issue(target):
                 try:
@@ -1199,7 +1206,7 @@ class Workspaces:
                 self.save_operation(
                     op, subject={**op["subject"], "number": target["number"], "url": target["url"]}
                 )
-            self.perform(target, op, task)
+            self.perform(target, op, f"{task}\n\n{files}" if files else task)
             if op["status"] == "failed" and op["subject"].get("url"):
                 self.save_operation(
                     op,

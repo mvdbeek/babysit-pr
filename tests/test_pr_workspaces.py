@@ -999,6 +999,16 @@ def test_prompt_history_dedupes_skips_prefills_and_forgets(local):
     assert manager.forget_prompt({"text": "Review this PR"}) == {"prompts": []}
 
 
+def test_prompt_history_leaves_out_attached_file_paths(local):
+    manager, pr, _, state, _ = local
+    task = "Reproduce it\n\nAttached files (read them from these paths):\n- /inbox/a.png"
+    manager.action({"id": pr["id"], "action": "create", "task": task})
+    assert finish(manager, pr["id"])["status"] == "complete"
+    # The agent gets the paths; the remembered prompt is the task as typed.
+    assert json.loads(state.read_text())["agents"][0]["task"].startswith(task)
+    assert [p["text"] for p in manager.prompts()["prompts"]] == ["Reproduce it"]
+
+
 def test_prompt_history_is_seeded_once_from_earlier_briefs(local, tmp_path):
     manager, pr, _, _, _ = local
     home = tmp_path / "seeded"

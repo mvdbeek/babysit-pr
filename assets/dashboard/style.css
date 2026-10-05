@@ -1842,3 +1842,57 @@ button:disabled {
     padding-right: 132px;
   }
 }
+.attachments {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.attachment-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.attachment-row .attach-button {
+  padding: 5px 10px;
+}
+.attachment-status {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.attachment-list:empty {
+  display: none;
+}
+.attachment-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 4px 2px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+}
+.attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-list small {
+  flex: none;
+  color: var(--muted);
+}
+.attachment-list button {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 12px;
+}

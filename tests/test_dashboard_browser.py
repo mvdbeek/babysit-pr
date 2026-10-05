@@ -3734,6 +3734,80 @@ def test_a_question_without_its_waiting_agent_is_answered_in_the_terminal(
     assert card.locator("form").count() == 0
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_files_attach_to_a_follow_up_message_and_stay_with_its_draft(
+    page, dashboard_site, viewer_routes, width
+):
+    url, home = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    row = page.locator("#pr-list tr").first
+    row.get_by_role("button", name="Transcript", exact=True).click()
+    composer = page.locator("#ws-message")
+    composer.locator("input[type=file]").set_input_files(
+        [
+            {"name": "ci <b>log</b>.txt", "mimeType": "text/plain", "buffer": b"failure"},
+            {"name": "empty.txt", "mimeType": "text/plain", "buffer": b""},
+        ]
+    )
+    chips = composer.locator(".attachment-list li")
+    expect(chips).to_have_count(1)
+    expect(chips.first).to_contain_text("ci <b>log</b>.txt")
+    expect(composer.locator(".attachment-status")).to_contain_text("empty.txt is empty")
+    # A pasted screenshot attaches too, once, however often the viewer was reopened.
+    page.keyboard.press("Escape")
+    row.get_by_role("button", name="Transcript", exact=True).click()
+    expect(chips).to_have_count(1)
+    page.locator("#ws-message-text").evaluate(
+        """field => {
+          const data = new DataTransfer();
+          data.items.add(new File([new Uint8Array([137, 80, 78, 71])], "shot.png", {type: "image/png"}));
+          field.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true}));
+        }"""
+    )
+    expect(chips).to_have_count(2)
+    # No picker left over from an earlier opening uploaded the paste again.
+    page.wait_for_timeout(300)
+    assert len(list((home / "attachments").iterdir())) == 2
+    page.screenshot(path=f"reports/attachments-composer-{width}.png")
+    # The draft keeps them across closing the viewer.
+    page.keyboard.press("Escape")
+    row.get_by_role("button", name="Transcript", exact=True).click()
+    expect(chips).to_have_count(2)
+    chips.first.get_by_role("button", name="Remove attachment ci <b>log</b>.txt").click()
+    expect(chips).to_have_count(1)
+    composer.get_by_role("button", name="Send to agent").click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
+    ((_, body),) = viewer_routes["sent"]
+    assert body["text"] == "" and len(body["attachments"]) == 1
+    stored = home / "attachments" / body["attachments"][0]
+    assert stored.name.endswith("-shot.png") and stored.read_bytes() == b"\x89PNG"
+    expect(chips).to_have_count(0)
+
+
+def test_a_launch_dialog_sends_its_attachments_with_the_task(
+    page, dashboard_site, issue_workspace_routes
+):
+    url, home = dashboard_site
+    _, _, requests = issue_workspace_routes
+    page.goto(url + "/#issues")
+    page.locator("#issue-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog = page.locator("#workspace-dialog")
+    dialog.get_by_label("Task", exact=True).fill("Reproduce from the screenshot")
+    dialog.locator("input[type=file]").set_input_files(
+        {"name": "crash.png", "mimeType": "image/png", "buffer": b"png"}
+    )
+    expect(dialog.locator(".attachment-list li")).to_contain_text("crash.png")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    page.wait_for_function("() => document.querySelector('#workspace-progress').textContent")
+    (body,) = [r for r in requests if r["action"] == "create"]
+    assert body["task"] == "Reproduce from the screenshot"
+    (stored,) = body["attachments"]
+    assert (home / "attachments" / stored).read_bytes() == b"png"
+
+
 def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})

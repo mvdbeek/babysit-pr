@@ -1991,6 +1991,19 @@ function workspaceControls(item) {
     cell.append(el("small", `Scheduled for ${scheduleTime(info.scheduled[0].start_at)}`));
   return cell;
 }
+// Files for the agent, chosen beside a task or pasted into it.
+function attachmentField(form, task) {
+  const files = window.dashboardAttachments.picker({ pasteTarget: task });
+  form.append(files.element);
+  return files;
+}
+function attached(files) {
+  return files.ids().length ? { attachments: files.ids() } : {};
+}
+function uploading(files) {
+  if (files.busy()) $("workspace-error").textContent = "Wait for the attachments to upload.";
+  return files.busy();
+}
 async function workspaceRequest(item, action, params = {}) {
   const response = await fetch("/api/workspace-action", {
     method: "POST",
@@ -2328,6 +2341,7 @@ async function workspaceDialog(item, handling = "") {
       form.append(settingsNote);
       field("Task", task);
       form.append(promptHistory(task));
+      const files = attachmentField(form, task);
       const { later, laterLabel, startFields, startTime } = startLaterFields();
       form.append(laterLabel, startFields);
       for (const pending of info.scheduled ?? [])
@@ -2355,7 +2369,7 @@ async function workspaceDialog(item, handling = "") {
           return;
         }
         const start = startTime();
-        if (start === undefined) return;
+        if (start === undefined || uploading(files)) return;
         submit.disabled = true;
         $("workspace-error").textContent = "";
         try {
@@ -2370,6 +2384,7 @@ async function workspaceDialog(item, handling = "") {
               ...(handling && task.value === handling ? { prefilled: true } : {}),
               ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
               ...(start ? { start_at: start } : {}),
+              ...attached(files),
               retry: workspaceInfo(item)?.operation?.status === "failed",
             },
           );
@@ -2536,6 +2551,7 @@ async function newTaskDialog() {
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
     form.append(promptHistory(task));
+    const files = attachmentField(form, task);
     const submit = el("button", "Start task");
     submit.type = "submit";
     form.append(submit);
@@ -2547,6 +2563,7 @@ async function newTaskDialog() {
         return;
       }
       const choice = repos[Number(repo.value)];
+      if (uploading(files)) return;
       submit.disabled = true;
       $("workspace-error").textContent = "";
       try {
@@ -2563,6 +2580,7 @@ async function newTaskDialog() {
             ...(model.value ? { model: model.value } : {}),
             ...(effort.value ? { effort: effort.value } : {}),
             task: task.value,
+            ...attached(files),
           }),
         });
         const value = await response.json();
@@ -2664,6 +2682,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
     form.append(el("small", `${BATCH_URL} becomes each ${one}’s link.`), promptHistory(task));
+    const files = attachmentField(form, task);
     const { later, laterLabel, startAt, startFields, startTime } = startLaterFields();
     form.append(laterLabel, startFields);
     const gap = el("input");
@@ -2767,7 +2786,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
       }
       if (!gap.reportValidity()) return;
       const start = startTime();
-      if (start === undefined) return;
+      if (start === undefined || uploading(files)) return;
       submit.disabled = true;
       $("workspace-error").textContent = "";
       try {
@@ -2784,6 +2803,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
             task: task.value,
             ...(task.value === template ? { prefilled: true } : {}),
             ...(start ? { start_at: start } : {}),
+            ...attached(files),
             interval: Number(gap.value) * 60,
           }),
         });

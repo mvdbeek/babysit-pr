@@ -159,6 +159,18 @@ def test_a_failed_issue_starts_nothing(local, monkeypatch):  # noqa: F811
     assert calls == [] and op["path"] is None
 
 
+def test_attached_files_reach_the_agent_but_not_the_filed_issue(local):  # noqa: F811
+    manager, _, _, state, _ = local
+    files = "Attached files (read them from these paths):\n- /inbox/2026-10-05-0123abcd-a.png"
+    value = manager.new_task(
+        request(manager, issue_title="Crash", task="It crashes", task_files=files)
+    )
+    assert finish(manager, value["operation"]["pr"])["status"] == "complete"
+    data = json.loads(state.read_text())
+    assert data["gh"][0][-2:] == ["--body", "It crashes"]
+    assert data["agents"][0]["task"].startswith(f"It crashes\n\n{files}\n\nIssue: ")
+
+
 @pytest.mark.parametrize(
     ("changes", "error"),
     [
