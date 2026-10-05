@@ -1131,7 +1131,7 @@ def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "again"}, home)
 
 
-def test_a_session_open_elsewhere_or_just_resumed_is_not_resumed_again(exited, monkeypatch):
+def test_a_session_open_elsewhere_gets_the_message_there(exited):
     import agent_messages
 
     state, sid, _, home = exited
@@ -1139,11 +1139,39 @@ def test_a_session_open_elsewhere_or_just_resumed_is_not_resumed_again(exited, m
     data["panes"].append(
         {"pane_id": "w7:p1", "workspace_id": "w7", "agent_session": {"value": sid}}
     )
+    data["agents"] = [{"pane_id": "w7:p1", "workspace_id": "w7", "agent_status": "idle"}]
     state.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match="already open in pane w7:p1"):
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert value == {"sent": True, "pane": "w7:p1", "warning": None}
+    data = read(state)
+    assert data["prompts"] == [["w7:p1", "go"]]
+    assert "splits" not in data and "runs" not in data
+    data["agents"][0]["agent_status"] = "blocked"
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="waiting on a question"):
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
-    data["panes"].pop()
+
+
+def test_a_session_left_on_an_exited_pane_is_resumed(exited, monkeypatch):
+    import agent_messages
+
+    state, sid, _, home = exited
+    data = read(state)
+    # herdr keeps the session on a pane whose agent has exited back to the shell.
+    data["panes"].append(
+        {"pane_id": "w1:p3", "workspace_id": "w1", "agent_session": {"value": sid}}
+    )
     state.write_text(json.dumps(data))
+    monkeypatch.setattr(agent_messages, "RESUME_WAIT", 0)
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert value["resumed"] == sid
+    assert len(read(state)["runs"]) == 1
+
+
+def test_a_just_resumed_session_is_not_resumed_again(exited, monkeypatch):
+    import agent_messages
+
+    state, sid, _, home = exited
     monkeypatch.setattr(agent_messages, "RESUME_WAIT", 0)
     first = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
     assert "no agent appeared yet" in first["warning"]
