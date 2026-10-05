@@ -21,6 +21,24 @@
   function date(value) {
     return value ? new Date(value * 1000).toLocaleString() : "never";
   }
+  // When a transcript entry was recorded: the time of day, with the date unless it is
+  // today; the full date and time on hover.
+  function stamp(value) {
+    const when = value ? new Date(value) : null;
+    if (!when || Number.isNaN(when.getTime())) return null;
+    const time = when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const now = new Date();
+    let text = time;
+    if (when.toDateString() !== now.toDateString()) {
+      const day = { month: "short", day: "numeric" };
+      if (when.getFullYear() !== now.getFullYear()) day.year = "numeric";
+      text = `${when.toLocaleDateString([], day)}, ${time}`;
+    }
+    const element = node("time", text, "ws-time");
+    element.dateTime = when.toISOString();
+    element.title = when.toLocaleString();
+    return element;
+  }
   function external(label, url) {
     const anchor = node("a", label);
     anchor.href = url;
@@ -633,7 +651,7 @@
   function updateTool(item, entry) {
     const summary = item.querySelector("summary");
     summary.querySelector(".badge")?.remove();
-    if (entry.error) summary.append(badge("Error", "red"));
+    if (entry.error) summary.insertBefore(badge("Error", "red"), summary.querySelector(".ws-time"));
     toolOutput(item, entry);
   }
   // What each kind of user turn is called; Claude records commands, their output and
@@ -689,6 +707,8 @@
     if (entry.answers) head.append(badge("Answered", "green"));
     else if (entry.error) head.append(badge("Not answered", "red"));
     else if (claude && open) head.append(badge("Waiting for an answer", "amber"));
+    const when = stamp(entry.time);
+    if (when) head.append(when);
     card.append(head);
     // A dialog that can be answered here shows its questions in the form instead.
     const controls = claude && open ? answerControls(entry) : null;
@@ -878,6 +898,8 @@
       if (entry.about) summary.append(node("span", entry.about, "ws-tool-about"));
       if (entry.brief) summary.append(node("code", entry.brief, "ws-tool-brief"));
       if (entry.error) summary.append(badge("Error", "red"));
+      const when = stamp(entry.time);
+      if (when) summary.append(when);
       item.append(summary);
       if (entry.input) item.append(linked("pre", entry.input, "ws-tool-input"));
       toolOutput(item, entry);
@@ -886,11 +908,17 @@
     const kind = entry.role === "user" ? entry.kind || "prompt" : null;
     if (kind === "notification") {
       const item = node("div", undefined, "ws-note");
+      const when = stamp(entry.time);
+      if (when) item.append(when);
       item.append(node("strong", "Notification"), " ", linkify(entry.text));
       return item;
     }
     const item = node("div", undefined, `ws-msg ws-${entry.role} ws-kind-${kind || "reply"}`);
-    item.append(node("strong", kind ? USER_KINDS[kind] || "Prompt" : agent, "ws-msg-who"));
+    const head = node("div", undefined, "ws-msg-head");
+    head.append(node("strong", kind ? USER_KINDS[kind] || "Prompt" : agent, "ws-msg-who"));
+    const when = stamp(entry.time);
+    if (when) head.append(when);
+    item.append(head);
     if (kind === "command" || kind === "output")
       item.append(linked("pre", entry.text, "ws-msg-code"));
     else if (kind) item.append(linked("div", entry.text, "ws-msg-text"));
