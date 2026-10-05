@@ -24,7 +24,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 import github_cli
-from pr_workspaces import COLLIE_URL, SLUG, clone_worktrees, herdr, remote_slugs, repo_config, run
+import owned_process
+import workspace_viewer
+from pr_workspaces import COLLIE_URL, SLUG, clone_worktrees, herdr, remote_slugs, repo_config
 
 INTERVAL = 300  # Local rescan cadence; GitHub state has its own freshness window.
 MIN_REFRESH = 60  # Floor between requested rescans, however often the tab asks.
@@ -53,9 +55,17 @@ BRANCH_NAME = re.compile(r"^[^\s:^~?*\\[]{1,255}$")
 BASE_BRANCH = re.compile(r"^(main|master|dev|develop|trunk|next|release[_-].+|\d+\.\d+)$")
 
 
-def git(path, *args, timeout=60):
+def git(path, *args, timeout=60, strip=True):
     """Git in one checkout. Large repositories need more room than a quick query."""
-    return run("git", "-C", path, *args, timeout=timeout)
+    result = owned_process.run(
+        ["git", "-C", str(path), *args],
+        env=github_cli.environment(),
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout or "Git failed")[-4000:].strip())
+    return result.stdout.strip() if strip else result.stdout
 
 
 def gh_json(endpoint, timeout=20):
@@ -91,11 +101,75 @@ def counted(value, limit):
     return min(len(value), limit)
 
 
+def checkout_times(path, changed=()):
+    """Worktree creation and activity; inspection must never advance these times."""
+    root = Path(path)
+    created = None
+    updated = []
+    try:
+        stat = root.stat()
+        created = getattr(stat, "st_birthtime", None)
+        updated.append(stat.st_mtime)
+        git_dir = root / ".git"
+        if git_dir.is_file():
+            pointer = git_dir.read_text().strip().removeprefix("gitdir: ")
+            git_dir = (root / pointer).resolve()
+        log = git_dir / "logs" / "HEAD"
+        try:
+            # The first reflog entry records worktree creation, even on filesystems
+            # without birth times. Its mtime follows commits, resets and checkouts.
+            with log.open() as stream:
+                created = float(stream.readline().split("\t", 1)[0].split()[-2])
+            updated.append(log.stat().st_mtime)
+        except (OSError, ValueError, IndexError):
+            updated.append((git_dir / "HEAD").stat().st_mtime)
+        for name in changed[:MAX_CHANGES]:
+            if name:
+                try:
+                    updated.append((root / name).lstat().st_mtime)
+                except OSError:
+                    pass  # A deleted file has no remaining timestamp.
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {"created_at": created, "updated_at": max(updated, default=created)}
+
+
+def transcript_updates(paths, src):
+    """Scan session stores once per inventory, matching the most specific checkout."""
+    roots = [src, *(Path(path) for path in paths if not Path(path).is_relative_to(src))]
+    seen = set()
+    updates: dict[str, float] = {}
+    for root in roots:
+        for agent, file in workspace_viewer.session_files(root):
+            if file in seen:
+                continue
+            seen.add(file)
+            session = workspace_viewer.details(file, agent)
+            if not session:
+                continue
+            cwd = Path(session["cwd"]).resolve()
+            checkout = next((str(p) for p in (cwd, *cwd.parents) if str(p) in paths), None)
+            if checkout:
+                try:
+                    updates[checkout] = max(updates.get(checkout, 0), file.stat().st_mtime)
+                except OSError:
+                    pass
+    return updates
+
+
 def local_state(path, branch=None):
     """Uncommitted changes and commits only this branch has, without touching either."""
     try:
-        status = git(path, "--no-optional-locks", "status", "--porcelain")
-        changes = [line for line in status.splitlines() if line.strip()]
+        status = git(path, "--no-optional-locks", "status", "--porcelain", "-z", strip=False)
+        changes = []
+        records = iter(status.split("\0"))
+        for record in records:
+            if not record:
+                continue
+            # NUL-delimited porcelain leaves paths unquoted, including newlines.
+            changes.append(record[3:])
+            if "R" in record[:2] or "C" in record[:2]:
+                next(records, None)  # Renames/copies carry the old path separately.
         # Only a commit that no remote ref and no other local branch carries would be
         # lost with this worktree, so those are the ones worth blocking on.
         # `--exclude` matches `--branches` with the refs/heads/ prefix already stripped.
@@ -114,6 +188,7 @@ def local_state(path, branch=None):
             "--tags",
         )
         return {
+            **checkout_times(path, changes),
             "changes": counted(changes, MAX_CHANGES),
             "unpushed": int(unpushed or 0),
             "error": None,
@@ -329,7 +404,15 @@ class WorkspaceOverview:
 
     @staticmethod
     def sorted_rows(rows):
-        return sorted(rows, key=lambda row: (row["repo"] or "~", row["name"].lower(), row["key"]))
+        return sorted(
+            rows,
+            key=lambda row: (
+                -(row.get("updated_at") or 0),
+                row["repo"] or "~",
+                row["name"].lower(),
+                row["key"],
+            ),
+        )
 
     def save(self):
         with self.lock:
@@ -492,6 +575,7 @@ class WorkspaceOverview:
             warnings.append(f"{len(selected)} checkouts found; showing the first {MAX_WORKTREES}.")
             selected = selected[:MAX_WORKTREES]
         budget = Budget(self.fetch)
+        updates = transcript_updates(set(selected), self.src.resolve())
         rows = self.orphan_rows(spaces, agents, checkouts)
         for row in rows:
             if publish:
@@ -522,6 +606,8 @@ class WorkspaceOverview:
                 row = self.row(
                     item, future.result(), links, stale, spaces, agents, watched, base, main
                 )
+                if path in updates:
+                    row["updated_at"] = max(row.get("updated_at") or 0, updates[path])
                 rows.append(row)
                 if publish:
                     publish(row)
@@ -566,6 +652,8 @@ class WorkspaceOverview:
         if working:
             blockers.append(blocker("agent", f"{len(working)} agent(s) still working"))
         row = {
+            "created_at": state.get("created_at"),
+            "updated_at": state.get("updated_at"),
             "key": item["path"],
             "path": item["path"],
             "name": Path(item["path"]).name,
@@ -629,6 +717,8 @@ class WorkspaceOverview:
                 blockers.append(blocker("agent", f"{len(working)} agent(s) still working"))
             rows.append(
                 {
+                    "created_at": None,
+                    "updated_at": None,
                     "key": f"workspace:{space['workspace_id']}",
                     "path": resolved,
                     "name": space.get("label") or space["workspace_id"],

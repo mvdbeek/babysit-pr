@@ -18,6 +18,8 @@ Optional keys: `src` (the directory scanned for clones, `~/src` by default) and 
 
 Every **linked worktree** of a scanned clone is a workspace, joined with any herdr workspace whose checkout is that path and the agents running in it. A clone's own checkout is listed only while herdr holds it open, and can never be removed here — cleaning it up closes its herdr workspace and nothing else. A herdr workspace with no Git checkout, or one whose checkout no longer exists, is listed as well so it can be closed. Discovery is Git-first: paths, branches, heads, remotes, and branch upstreams come from `git worktree list` and the clone's shared config, never from a workspace label or a directory name.
 
+Workspaces default to **Last updated**, newest first. **Sort by** also offers **Created**, and the direction button switches between newest and oldest first. Both dates appear below the workspace name. Creation comes from the first worktree HEAD reflog entry, falling back to the checkout's filesystem birth time when available. Updates follow HEAD reflog activity, checkout directory changes, modified or untracked file times (up to 1,000 paths), and the latest agent transcript in the checkout or its subdirectories. Git index and fetch times are excluded so routine inspection does not move a workspace to the top. Missing timestamps, including workspaces without a known checkout, sort last in either direction. The selected sort survives filtering and automatic refreshes while the page remains open.
+
 The base repository is the `upstream` remote when one exists, otherwise `origin` or, when `origin` is a fork, its parent. That answer is cached for a day; a failed or budget-exhausted lookup is never cached as an answer.
 
 ## Opening a workspace

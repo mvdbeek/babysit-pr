@@ -166,6 +166,44 @@ def site(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("width", [1440, 390])
+def test_workspace_sorting_dates_filters_selection_and_refresh(page, site, width):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row("older", updated_at=100, created_at=300),
+        row("newer", updated_at=300, created_at=100),
+        row("middle", updated_at=200, created_at=200),
+        row("unknown", updated_at=None, created_at=None),
+        row("legacy"),
+    ]
+    page.set_viewport_size({"width": width, "height": 1000})
+    page.clock.install()
+    page.goto(url + "/#workspaces")
+    names = page.locator("#ws-list tr td:nth-child(2) > span")
+    sort = page.get_by_role("combobox", name="Sort workspaces by")
+    expect(sort).to_have_value("Last updated")
+    expect(names).to_have_text(["newer", "middle", "older", "legacy", "unknown"])
+    expect(page.locator("#ws-list")).to_contain_text("Updated")
+    expect(page.locator("#ws-list")).to_contain_text("Created unknown")
+    page.get_by_role("checkbox", name="Select newer").check()
+    choose_option(sort, "created_at")
+    expect(names).to_have_text(["older", "middle", "newer", "legacy", "unknown"])
+    page.get_by_role("button", name="Newest first", exact=True).click()
+    expect(names).to_have_text(["newer", "middle", "older", "legacy", "unknown"])
+    page.get_by_role("searchbox", name="Search workspaces").fill("newer")
+    expect(names).to_have_text(["newer"])
+    page.get_by_role("searchbox", name="Search workspaces").fill("")
+    plugin.value["workspaces"][0]["created_at"] = 50
+    page.clock.fast_forward(5000)
+    expect(names).to_have_text(["older", "newer", "middle", "legacy", "unknown"])
+    expect(page.get_by_role("checkbox", name="Select newer")).to_be_checked()
+    expect(sort).to_have_value("Created")
+    expect(page.get_by_role("button", name="Oldest first", exact=True)).to_be_visible()
+    choose_option(sort, "updated_at")
+    expect(names).to_have_text(["newer", "middle", "older", "legacy", "unknown"])
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+@pytest.mark.parametrize("width", [1440, 390])
 def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, width):
     url, plugin, _ = site
     page.set_viewport_size({"width": width, "height": 1000})

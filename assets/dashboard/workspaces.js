@@ -18,6 +18,7 @@
   let snapshot = null;
   let busy = false;
   let pending = null;
+  let ascending = false;
   const selected = new Set();
   const names = new Map();
   const opening = new Set();
@@ -60,7 +61,21 @@
       .some((value) => String(value).toLowerCase().includes(term));
   }
   function visible() {
-    return rows().filter(matches);
+    const field = byId("ws-sort").value;
+    return rows()
+      .filter(matches)
+      .sort((left, right) => {
+        const a = left[field],
+          b = right[field];
+        if (a == null && b != null) return 1;
+        if (b == null && a != null) return -1;
+        return (
+          (a != null && b != null ? (ascending ? a - b : b - a) : 0) ||
+          (left.repo || "~").localeCompare(right.repo || "~") ||
+          left.name.toLowerCase().localeCompare(right.name.toLowerCase()) ||
+          left.key.localeCompare(right.key)
+        );
+      });
   }
   function selectable() {
     return visible().filter((row) => row.removable);
@@ -120,6 +135,10 @@
       entry.workspace_url ? anchor(entry.name, entry.workspace_url) : node("span", entry.name),
     );
     if (entry.path) name.append(node("small", entry.path, "pr-meta"));
+    name.append(
+      node("small", `Updated ${entry.updated_at ? date(entry.updated_at) : "unknown"}`, "pr-meta"),
+      node("small", `Created ${entry.created_at ? date(entry.created_at) : "unknown"}`, "pr-meta"),
+    );
     line.append(name);
     const where = node("td");
     where.append(node("span", entry.repo || "Unknown repository"));
@@ -394,6 +413,21 @@
   byId("ws-search").oninput = render;
   byId("ws-repo").onchange = render;
   byId("ws-status").onchange = render;
+  byId("ws-sort").onchange = () => {
+    ascending = false;
+    updateSortDirection();
+  };
+  function updateSortDirection() {
+    const button = byId("ws-sort-direction");
+    button.textContent = ascending ? "Oldest first" : "Newest first";
+    button.setAttribute("aria-label", button.textContent);
+    button.title = "Reverse sort order";
+    render();
+  }
+  byId("ws-sort-direction").onclick = () => {
+    ascending = !ascending;
+    updateSortDirection();
+  };
   byId("ws-refresh").onclick = () => refresh(true);
   byId("ws-all").onchange = (event) => {
     for (const entry of selectable()) {
