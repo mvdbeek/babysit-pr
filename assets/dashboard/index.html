@@ -615,12 +615,19 @@
         <p id="pr-pins-status" class="pr-sync" role="status" hidden></p>
         <p id="pr-changes" class="pr-sync" role="status" hidden></p>
         <div id="pr-alert" class="alert" role="status" hidden></div>
+        <div id="pr-batch" class="batch-bar" hidden>
+          <span id="pr-batch-count" role="status"></span>
+          <small id="pr-batch-hidden"></small>
+          <button id="pr-batch-handle" type="button">Handle selected…</button>
+          <button id="pr-batch-all" type="button">Select all shown</button>
+          <button id="pr-batch-clear" type="button">Clear</button>
+        </div>
 
         <div class="pr-table-wrap">
           <table class="pr-table">
             <thead>
               <tr>
-                <th class="item-pin-cell" scope="col" aria-label="Pinned"></th>
+                <th class="item-pin-cell" scope="col" aria-label="Pinned and selected"></th>
                 <th id="pr-heading-repo" scope="col" aria-label="Repository" aria-sort="none">
                   <button id="pr-sort-repo" type="button" aria-label="Sort by Repository">
                     Repository

@@ -1584,6 +1584,21 @@ def test_batch_handles_each_issue_in_its_own_workspace_at_staggered_times(synced
     assert [p["text"] for p in manager.prompts()["prompts"]] == ["Resolve {url} carefully"]
 
 
+def test_batch_handles_pull_requests_too(synced):
+    manager, pr, _, state, _ = synced
+    value = manager.batch(
+        {"items": [{"id": pr["id"]}, {"id": "I_one"}], "task": "Review {url}", "interval": 600}
+    )
+    tasks = [r["scheduled"] for r in value["results"]]
+    assert [t["subject"]["kind"] for t in tasks] == ["pr", "issue"]
+    assert tasks[0]["request"]["task"] == f"Review {pr['url']}"
+    assert tasks[0]["request"]["clone"] == str(manager.src / "repo")
+    manager.run_due(now=tasks[0]["start_at"])
+    assert finish(manager, pr["id"])["status"] == "complete"
+    agents = json.loads(state.read_text())["agents"]
+    assert len(agents) == 1 and agents[0]["task"].startswith(f"Review {pr['url']}")
+
+
 def test_batch_starts_now_by_default_and_reports_items_it_cannot_schedule(synced):
     manager, pr, _, _, _ = synced
     second_issue(manager)

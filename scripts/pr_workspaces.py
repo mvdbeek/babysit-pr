@@ -1353,7 +1353,7 @@ class Workspaces:
                 if "destination" in item and claimed.setdefault(item["destination"], repo) != repo:
                     raise ValueError(
                         f"{claimed[item['destination']]} also clones into {item['destination']}; "
-                        "handle this issue once that clone exists"
+                        "handle this item once that clone exists"
                     )
                 value = self.action(
                     {
