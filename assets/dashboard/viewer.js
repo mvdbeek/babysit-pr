@@ -46,6 +46,185 @@
     fragment.append(String(text).slice(last));
     return fragment;
   }
+  // Agents answer in Markdown. It is rendered as DOM nodes, never as HTML, and links
+  // only to web addresses; anything it does not recognize stays plain text.
+  // Each span ends on its own line, which keeps matching linear in the line's length.
+  // No lookbehind: older iOS Safari would reject the whole script.
+  const INLINE =
+    /(`+)([^`\n]|[^`\n][^\n]*?[^`\n])\1(?!`)|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|\*\*(?!\s)((?:[^*\n]|\*(?!\*))+?)\*\*|__(?!\s)([^_\n]+?)__|(^|[^\w*])\*(?![\s*])([^*\n]+?)\*(?![\w*])|(^|[^\w_])_(?![\s_])([^_\n]+?)_(?![\w_])/g;
+  function inline(text) {
+    const fragment = document.createDocumentFragment();
+    let last = 0;
+    for (const match of text.matchAll(INLINE)) {
+      fragment.append(linkify(text.slice(last, match.index)));
+      const [, ticks, code, label, url, bold, bolder, before, italic, beside, slanted] = match;
+      // An italic span's match starts with the character before it.
+      fragment.append(before ?? beside ?? "");
+      if (ticks) fragment.append(node("code", code.replace(/^ ([\s\S]*\S[\s\S]*) $/, "$1")));
+      else if (label) fragment.append(external(label, url));
+      else {
+        const styled = node(bold || bolder ? "strong" : "em");
+        styled.append(inline(bold || bolder || italic || slanted));
+        fragment.append(styled);
+      }
+      last = match.index + match[0].length;
+    }
+    fragment.append(linkify(text.slice(last)));
+    return fragment;
+  }
+  // Single line breaks are kept, as agents write them to be read.
+  function inlineLines(lines, tag) {
+    const element = node(tag);
+    lines.forEach((line, index) => {
+      if (index) element.append(node("br"));
+      element.append(inline(line));
+    });
+    return element;
+  }
+  // A backtick fence's info string has no backticks, so ```x``` is inline code.
+  const FENCE = /^\s*(`{3,}(?=[^`]*$)|~{3,})/;
+  const HEADING = /^\s{0,3}(#{1,6})(?:\s+(.*))?$/;
+  const RULE = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/;
+  const QUOTE = /^\s{0,3}>\s?/;
+  const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+  const TABLE_RULE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+  function startsBlock(lines, index) {
+    const line = lines[index];
+    return (
+      FENCE.test(line) ||
+      HEADING.test(line) ||
+      RULE.test(line) ||
+      QUOTE.test(line) ||
+      ITEM.test(line) ||
+      tableStart(lines, index)
+    );
+  }
+  function tableStart(lines, index) {
+    const rule = lines[index + 1] ?? "";
+    return lines[index].includes("|") && rule.includes("|") && TABLE_RULE.test(rule);
+  }
+  function cells(line) {
+    // Split on pipes, except escaped ones, dropping the optional outer pipes.
+    const found = [""];
+    const text = line.trim().replace(/^\|/, "");
+    for (let index = 0; index < text.length; index++) {
+      if (text[index] === "\\" && text[index + 1] === "|") {
+        found[found.length - 1] += "|";
+        index++;
+      } else if (text[index] === "|") found.push("");
+      else found[found.length - 1] += text[index];
+    }
+    if (found.length > 1 && !found[found.length - 1].trim()) found.pop();
+    return found.map((cell) => cell.trim());
+  }
+  function list(lines, start) {
+    const first = ITEM.exec(lines[start]);
+    const indent = first[1].length;
+    const ordered = /\d/.test(first[2]);
+    const element = node(ordered ? "ol" : "ul");
+    if (ordered && parseInt(first[2], 10) !== 1) element.start = parseInt(first[2], 10);
+    let index = start;
+    while (index < lines.length) {
+      const match = ITEM.exec(lines[index]);
+      if (!match) {
+        // A blank line between items keeps the list going.
+        const next = lines.slice(index).findIndex((line) => line.trim());
+        const after = next < 0 ? null : ITEM.exec(lines[index + next]);
+        if (!lines[index].trim() && after && after[1].length >= indent) {
+          index += next;
+          continue;
+        }
+        break;
+      }
+      const depth = match[1].length;
+      if (depth > indent) {
+        const [nested, end] = list(lines, index);
+        element.lastElementChild.append(nested);
+        index = end;
+        continue;
+      }
+      // A shallower item, or one of the other list type, ends this list.
+      if (depth < indent || /\d/.test(match[2]) !== ordered) break;
+      const text = [match[3]];
+      index++;
+      while (index < lines.length && lines[index].trim() && !startsBlock(lines, index))
+        text.push(lines[index++].trim());
+      element.append(inlineLines(text, "li"));
+    }
+    return [element, index];
+  }
+  function markdown(text, className) {
+    const root = node("div", undefined, className);
+    const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+    let index = 0;
+    while (index < lines.length) {
+      const line = lines[index];
+      const fence = FENCE.exec(line);
+      if (fence) {
+        const body = [];
+        index++;
+        // Only a bare run of at least as many of the same character closes it.
+        const closes = (text) =>
+          text.length >= fence[1].length && [...text].every((c) => c === fence[1][0]);
+        while (index < lines.length && !closes(lines[index].trim())) body.push(lines[index++]);
+        index++;
+        const pre = node("pre");
+        pre.append(node("code", body.join("\n")));
+        root.append(pre);
+        continue;
+      }
+      if (!line.trim()) {
+        index++;
+        continue;
+      }
+      const heading = HEADING.exec(line);
+      if (heading) {
+        const level = Math.min(6, heading[1].length + 2);
+        const element = node(`h${level}`);
+        element.append(inline((heading[2] || "").replace(/\s+#+\s*$/, "").trim()));
+        root.append(element);
+        index++;
+      } else if (RULE.test(line)) {
+        root.append(node("hr"));
+        index++;
+      } else if (tableStart(lines, index)) {
+        const wrap = node("div", undefined, "md-table");
+        const table = node("table");
+        const head = node("tr");
+        for (const cell of cells(line)) head.append(inlineLines([cell], "th"));
+        const body = node("tbody");
+        index += 2;
+        while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+          const row = node("tr");
+          for (const cell of cells(lines[index++])) row.append(inlineLines([cell], "td"));
+          body.append(row);
+        }
+        const thead = node("thead");
+        thead.append(head);
+        table.append(thead, body);
+        wrap.append(table);
+        root.append(wrap);
+      } else if (QUOTE.test(line)) {
+        const quoted = [];
+        while (index < lines.length && QUOTE.test(lines[index]))
+          quoted.push(lines[index++].replace(QUOTE, ""));
+        const quote = node("blockquote");
+        quote.append(...markdown(quoted.join("\n")).childNodes);
+        root.append(quote);
+      } else if (ITEM.test(line)) {
+        const [element, end] = list(lines, index);
+        root.append(element);
+        index = end;
+      } else {
+        const paragraph = [line.trim()];
+        index++;
+        while (index < lines.length && lines[index].trim() && !startsBlock(lines, index))
+          paragraph.push(lines[index++].trim());
+        root.append(inlineLines(paragraph, "p"));
+      }
+    }
+    return root;
+  }
   function linked(tag, text, className) {
     const element = node(tag, undefined, className);
     element.append(linkify(text));
@@ -450,22 +629,39 @@
     if (entry.error) summary.append(badge("Error", "red"));
     toolOutput(item, entry);
   }
+  // What each kind of user turn is called; Claude records commands, their output and
+  // background-task reports as user turns too.
+  const USER_KINDS = {
+    prompt: "Prompt",
+    command: "Command",
+    output: "Command output",
+    notification: "Notification",
+  };
   function transcriptEntry(entry, agent) {
     if (entry.role === "tool") {
       const item = node("details", undefined, "ws-tool");
-      const firstLine = String(entry.input || "")
-        .split("\n")[0]
-        .slice(0, 120);
       const summary = node("summary");
-      summary.append(node("strong", entry.name), " ", node("code", firstLine));
+      summary.append(node("strong", entry.name));
+      if (entry.about) summary.append(node("span", entry.about, "ws-tool-about"));
+      if (entry.brief) summary.append(node("code", entry.brief, "ws-tool-brief"));
       if (entry.error) summary.append(badge("Error", "red"));
-      item.append(summary, linked("pre", entry.input || ""));
+      item.append(summary);
+      if (entry.input) item.append(linked("pre", entry.input, "ws-tool-input"));
       toolOutput(item, entry);
       return item;
     }
-    const item = node("div", undefined, `ws-msg ws-${entry.role}`);
-    item.append(node("strong", entry.role === "user" ? "Prompt" : agent, "ws-msg-who"));
-    item.append(linked("div", entry.text, "ws-msg-text"));
+    const kind = entry.role === "user" ? entry.kind || "prompt" : null;
+    if (kind === "notification") {
+      const item = node("div", undefined, "ws-note");
+      item.append(node("strong", "Notification"), " ", linkify(entry.text));
+      return item;
+    }
+    const item = node("div", undefined, `ws-msg ws-${entry.role} ws-kind-${kind || "reply"}`);
+    item.append(node("strong", kind ? USER_KINDS[kind] || "Prompt" : agent, "ws-msg-who"));
+    if (kind === "command" || kind === "output")
+      item.append(linked("pre", entry.text, "ws-msg-code"));
+    else if (kind) item.append(linked("div", entry.text, "ws-msg-text"));
+    else item.append(markdown(entry.text, "ws-msg-text ws-md"));
     return item;
   }
 

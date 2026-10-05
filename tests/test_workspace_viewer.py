@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import time
 
 import pytest
 import workspace_viewer as wv
@@ -302,8 +303,125 @@ def test_claude_transcript_pairs_tools_with_results(stores):
         ("assistant", "Done."),
     ]
     tool = value["entries"][2]
-    assert json.loads(tool["input"]) == {"command": "ls"}
+    assert (tool["brief"], tool["input"], tool["about"]) == ("ls", "ls", None)
     assert tool["output"] == "a.py" and tool["error"] is True
+
+
+@pytest.mark.parametrize(
+    "text,view",
+    [
+        ("Fix it<system-reminder>be careful</system-reminder>", ("prompt", "Fix it")),
+        ("<system-reminder>only context</system-reminder>", None),
+        (
+            "<command-message>merge-forward</command-message>\n"
+            "<command-name>/merge-forward</command-name>\n"
+            "<command-args>release_25.1 into dev</command-args>",
+            ("command", "/merge-forward release_25.1 into dev"),
+        ),
+        ("<command-name>/exit</command-name><command-args></command-args>", ("command", "/exit")),
+        ("<bash-input> gh pr merge 6</bash-input>", ("command", "! gh pr merge 6")),
+        (
+            "<bash-stdout>merged</bash-stdout><bash-stderr>warning</bash-stderr>",
+            ("output", "merged\nwarning"),
+        ),
+        ("<local-command-stdout></local-command-stdout>", None),
+        ("<local-command-caveat>Caveat: not a request</local-command-caveat>", None),
+        (
+            "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n"
+            '<summary>Background command "tox" completed (exit code 0)</summary>\n'
+            "</task-notification>\n<system-reminder>not user input</system-reminder>",
+            ("notification", 'Background command "tox" completed (exit code 0)'),
+        ),
+        (
+            "<task-notification><status>killed</status></task-notification>",
+            ("notification", "Background task killed"),
+        ),
+        ("<img src=x> is broken", ("prompt", "<img src=x> is broken")),
+    ],
+)
+def test_claude_user_turns_read_as_prompts_commands_output_or_notifications(text, view):
+    assert wv.claude_prompt(text) == view
+
+
+@pytest.mark.parametrize(
+    "value,view",
+    [
+        (
+            {"command": "git status\ngit log", "description": "Show state"},
+            ("Show state", "git status", "git status\ngit log"),
+        ),
+        (
+            {"file_path": "/a.py", "old_string": "x = 1\ny = 2", "new_string": "x = 3"},
+            (None, "/a.py", "/a.py\n\nnew_string: x = 3\n\nold_string:\nx = 1\ny = 2"),
+        ),
+        ({"task_id": "b1", "limit": 3}, (None, "task_id: b1", "task_id: b1\nlimit: 3")),
+        ({}, (None, None, "")),
+        # Codex: JSON arguments, an argv command, and the exec tool's script.
+        (
+            '{"command": ["bash", "-lc", "rg foo"], "workdir": "/w"}',
+            (None, "rg foo", "rg foo\n\nworkdir: /w"),
+        ),
+        (
+            {"command": ["git", "commit", "-m", "a b"]},
+            (None, "git commit -m 'a b'", "git commit -m 'a b'"),
+        ),
+        (
+            'text(await tools.exec_command({cmd:"pwd; ls \\"x\\"",max_output_tokens:10}));',
+            (
+                None,
+                'pwd; ls "x"',
+                'text(await tools.exec_command({cmd:"pwd; ls \\"x\\"",max_output_tokens:10}));',
+            ),
+        ),
+        (
+            "*** Begin Patch\n*** Update File: a.py",
+            (None, "*** Begin Patch", "*** Begin Patch\n*** Update File: a.py"),
+        ),
+    ],
+)
+def test_tool_input_is_written_out_with_its_description_and_main_argument(value, view):
+    assert wv.tool_view(value) == view
+
+
+def test_a_long_prompt_full_of_unclosed_tags_is_classified_quickly():
+    text = "<x>" + "<br> text " * 10000
+    start = time.monotonic()
+    assert wv.claude_prompt(text) == ("prompt", text.strip())
+    assert time.monotonic() - start < 0.5
+    # Non-string argv elements read as JSON, not Python reprs.
+    assert wv.tool_view({"command": ["run", {"a": 1}]})[1] == "run '{\"a\": 1}'"
+
+
+def test_a_session_named_only_by_commands_takes_its_first_command(stores):
+    checkout, _, _ = stores
+    folder = (
+        checkout.parent.parent
+        / "claude"
+        / "projects"
+        / "".join(c if c.isalnum() else "-" for c in str(checkout))
+    )
+    sid = "c0ffee00-0000-4000-8000-000000000001"
+    write_jsonl(
+        folder / f"{sid}.jsonl",
+        {
+            "type": "user",
+            "sessionId": sid,
+            "cwd": str(checkout),
+            "message": {
+                "content": "<task-notification><summary>done</summary></task-notification>"
+            },
+        },
+        {
+            "type": "user",
+            "sessionId": sid,
+            "cwd": str(checkout),
+            "message": {
+                "content": "<command-name>/babysit-pr</command-name><command-args>9</command-args>"
+            },
+        },
+    )
+    titles = {s["id"]: s["title"] for s in wv.sessions(checkout)}
+    assert titles[sid] == "/babysit-pr 9"
 
 
 def test_codex_transcript_skips_injected_context_and_reasoning(stores):
