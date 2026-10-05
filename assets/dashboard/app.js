@@ -1817,6 +1817,7 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     refresh();
     void refreshWorkspaces();
+    void refreshScheduled();
   }
 });
 setInterval(() => {
@@ -2941,8 +2942,11 @@ function renderScheduled() {
 async function refreshScheduled() {
   if (scheduledBusy || document.hidden) return;
   scheduledBusy = true;
+  // A stalled request would hold scheduledBusy and keep the tab hidden until a reload.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
   try {
-    scheduledData = await get("/api/scheduled-tasks");
+    scheduledData = await get("/api/scheduled-tasks", controller.signal);
     $("scheduled-error").textContent = "";
     // The tab only exists while workspace actions do; leave it if it disappears.
     if (!scheduledData.enabled && !$("scheduled-panel").hidden) showPage("watcher");
@@ -2950,6 +2954,7 @@ async function refreshScheduled() {
   } catch (error) {
     $("scheduled-error").textContent = `Cannot load scheduled tasks: ${error.message}`;
   } finally {
+    clearTimeout(timer);
     scheduledBusy = false;
   }
 }
