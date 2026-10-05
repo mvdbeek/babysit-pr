@@ -3100,6 +3100,66 @@ def test_batch_handle_selects_issues_and_staggers_their_starts(
     expect(bar).to_be_hidden()
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_batch_handle_offers_review_templates_for_pull_requests(
+    page, dashboard_site, issue_workspace_routes, width
+):
+    url, _ = dashboard_site
+    batches = []
+
+    def batch(route):
+        batches.append(route.request.post_data_json)
+        route.fulfill(json={"results": [{"id": "pr-one", "scheduled": {"start_at": 2e9}}]})
+
+    page.route("**/api/workspace-batch", batch)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    bar = page.locator("#pr-batch")
+    expect(bar).to_be_hidden()
+    page.get_by_label("Select PR test/alpha #8").check()
+    page.get_by_label("Select PR test/beta #9").check()
+    expect(bar).to_contain_text("2 selected")
+    page.screenshot(path=f"reports/pr-batch-bar-{width}.png")
+    bar.get_by_role("button", name="Handle selected…").click()
+
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog.locator("#workspace-title")).to_have_text("Handle 2 pull requests")
+    items = dialog.locator(".batch-items li")
+    expect(items.first).to_contain_text("In /fixture/alpha")
+    expect(items.last).to_contain_text(
+        "Skipped: Workspace discovery has not listed this pull request yet."
+    )
+    picker = dialog.get_by_label("Task template")
+    expect(picker).to_have_value("prReview")
+    task = dialog.get_by_role("textbox", name="Task", exact=True)
+    assert task.input_value().startswith("Review {url}.")
+    assert "Do not push, comment, or submit a review on GitHub." in task.input_value()
+    page.screenshot(path=f"reports/pr-batch-dialog-{width}.png")
+    picker.select_option("review")
+    assert task.input_value().startswith("Address the review feedback on {url}.")
+    # An edited task is kept unless replacing it is confirmed.
+    task.fill("Look at {url} closely")
+    page.once("dialog", lambda prompt: prompt.dismiss())
+    picker.select_option("ci")
+    expect(picker).to_have_value("review")
+    expect(task).to_have_value("Look at {url} closely")
+    page.once("dialog", lambda prompt: prompt.accept())
+    picker.select_option("ci")
+    assert task.input_value().startswith("Investigate and fix the failing tests and CI checks")
+    # A template edited after it was chosen is the user's own task, kept in prompt history.
+    task.fill(task.input_value() + " Skip flaky tests.")
+    dialog.get_by_role("button", name="Schedule 1 task").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Scheduled 1 of 1")
+    (body,) = batches
+    assert body["items"] == [{"id": "pr-one", "clone": "/fixture/alpha"}]
+    assert "prefilled" not in body
+    assert body["task"].startswith("Investigate and fix the failing tests and CI checks for {url}.")
+    assert body["task"].endswith(" Skip flaky tests.")
+    page.locator("#workspace-close").click()
+    expect(bar).to_contain_text("1 selected")
+    expect(page.get_by_label("Select PR test/beta #9")).to_be_checked()
+
+
 def test_batch_needs_a_clone_choice_and_skips_issues_it_cannot_start(
     page, dashboard_site, issue_workspace_routes
 ):

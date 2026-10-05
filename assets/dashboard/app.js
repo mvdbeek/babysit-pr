@@ -1435,6 +1435,11 @@ const prTable = itemTable({
   dates: ["opened_at", "updated_at"],
   defaultSort: "updated_at",
   filters: ["role", "ci", "repo", "review"],
+  batch: (prs, done) =>
+    void batchDialog(prs, done, {
+      nouns: ["pull request", "pull requests"],
+      tasks: ["prReview", "review", "ci"],
+    }),
   text: {
     short: "PR",
     open: "Open PRs",
@@ -1555,7 +1560,8 @@ const issueTable = itemTable({
   dates: ["opened_at", "updated_at"],
   defaultSort: "updated_at",
   filters: ["role", "repo", "label", "linked"],
-  batch: (issues, done) => void batchDialog(issues, done),
+  batch: (issues, done) =>
+    void batchDialog(issues, done, { nouns: ["issue", "issues"], tasks: ["issue"] }),
   text: {
     short: "issue",
     open: "Open issues",
@@ -1881,6 +1887,11 @@ function workspaceCell(item) {
   return cell;
 }
 const handleTasks = {
+  prReview: [
+    "Review pull request",
+    (url) =>
+      `Review ${url}. Read its description, linked issues, and the full diff against its base branch, then check out the branch and run the relevant tests where they would confirm or rule out a problem. Look for correctness bugs, regressions, missing tests, and unclear or unnecessarily complex code. Do not push, comment, or submit a review on GitHub. Report each finding ranked by severity with file and line references, and say what you verified.`,
+  ],
   issue: [
     "Handle issue",
     (url) =>
@@ -2573,18 +2584,19 @@ async function newTaskDialog() {
   }
 }
 $("new-task").onclick = () => void newTaskDialog();
-// Replaced by each issue's link when a batch is scheduled.
+// Replaced by each item's link when a batch is scheduled.
 const BATCH_URL = "{url}";
 // The scheduler's limit on waiting tasks.
 const BATCH_LIMIT = 100;
-// Handle several issues at once. Each gets its own worktree and agent through the
+// Handle several issues or PRs at once. Each gets its own worktree and agent through the
 // scheduler, `Minutes between starts` apart; `done` receives the ids that were scheduled.
-async function batchDialog(items, done) {
+// `nouns` names one and several items; `tasks` lists the handleTasks keys offered, the
+// first being the default.
+async function batchDialog(items, done, { nouns: [one, many], tasks }) {
   // Stands in for the dialog's item, so a dialog opened meanwhile wins the await below.
   const owner = { batch: true };
   workspaceDialogItem = owner;
-  $("workspace-title").textContent =
-    `Handle ${items.length} ${items.length === 1 ? "issue" : "issues"}`;
+  $("workspace-title").textContent = `Handle ${items.length} ${items.length === 1 ? one : many}`;
   $("workspace-error").textContent = "";
   $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
   $("workspace-result").replaceChildren();
@@ -2607,7 +2619,7 @@ async function batchDialog(items, done) {
     form.append(
       el(
         "p",
-        "Each issue gets its own worktree and agent. They start as scheduled tasks; follow them in the Scheduled tab.",
+        `Each ${one} gets its own worktree and agent. They start as scheduled tasks; follow them in the Scheduled tab.`,
       ),
     );
     function field(text, input) {
@@ -2620,7 +2632,29 @@ async function batchDialog(items, done) {
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     form.append(settingsNote);
-    const template = handleTasks.issue[1](BATCH_URL);
+    let template = handleTasks[tasks[0]][1](BATCH_URL);
+    if (tasks.length > 1) {
+      const picker = el("select");
+      picker.id = "workspace-template";
+      for (const key of tasks) {
+        const option = el("option", handleTasks[key][0]);
+        option.value = key;
+        picker.append(option);
+      }
+      let chosen = tasks[0];
+      picker.onchange = () => {
+        // A task typed over the template is only replaced on confirmation.
+        if (task.value !== template && !confirm("Replace the edited task with this template?")) {
+          picker.value = chosen;
+          return;
+        }
+        chosen = picker.value;
+        template = handleTasks[chosen][1](BATCH_URL);
+        task.value = template;
+        task.setCustomValidity("");
+      };
+      field("Task template", picker);
+    }
     const task = el("textarea");
     task.id = "workspace-task";
     task.required = true;
@@ -2629,7 +2663,7 @@ async function batchDialog(items, done) {
     task.value = template;
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
-    form.append(el("small", `${BATCH_URL} becomes each issue’s link.`), promptHistory(task));
+    form.append(el("small", `${BATCH_URL} becomes each ${one}’s link.`), promptHistory(task));
     const { later, laterLabel, startAt, startFields, startTime } = startLaterFields();
     form.append(laterLabel, startFields);
     const gap = el("input");
@@ -2651,7 +2685,7 @@ async function batchDialog(items, done) {
       row.append(name, when);
       const entry = { item, row, when, request: { id: item.id } };
       if (!info) {
-        entry.skip = "Workspace discovery has not listed this issue yet.";
+        entry.skip = `Workspace discovery has not listed this ${one} yet.`;
       } else if (info.clones.length) {
         const clone =
           info.preferred_clone || (info.clones.length === 1 ? info.clones[0] : undefined);
@@ -2696,7 +2730,7 @@ async function batchDialog(items, done) {
       form.append(
         el(
           "p",
-          `At most ${BATCH_LIMIT} tasks can wait to start. Select fewer issues.`,
+          `At most ${BATCH_LIMIT} tasks can wait to start. Select fewer ${many}.`,
           "batch-limit",
         ),
       );
@@ -2763,7 +2797,7 @@ async function batchDialog(items, done) {
             : `Not scheduled: ${result.error}`;
           entry.row.classList.add(result.scheduled ? "batch-scheduled" : "batch-failed");
         }
-        // One click schedules the batch; issues that failed stay selected to retry.
+        // One click schedules the batch; items that failed stay selected to retry.
         $("workspace-progress").textContent =
           `Scheduled ${scheduled.length} of ${launching.length}. Find them in the Scheduled tab.`;
         done(scheduled.map((result) => result.id));

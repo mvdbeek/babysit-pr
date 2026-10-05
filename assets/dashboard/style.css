@@ -1238,7 +1238,8 @@ button:disabled {
 .batch-bar small {
   color: var(--muted);
 }
-#issue-batch-handle {
+#issue-batch-handle,
+#pr-batch-handle {
   margin-left: auto;
 }
 #workspace-dialog input[type="number"] {
@@ -1832,7 +1833,12 @@ button:disabled {
   .pr-table .item-pin-cell .item-pin {
     flex: none;
   }
-  #issue-batch-handle {
+  #issue-batch-handle,
+  #pr-batch-handle {
     margin-left: 0;
+  }
+  /* PR rows carry a third control, the notification toggle, beside the repository. */
+  #pr-list .pr-repo {
+    padding-right: 132px;
   }
 }
