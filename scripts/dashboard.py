@@ -10,9 +10,10 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import agent_messages
+import attachments
 import workspace_viewer
 from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
@@ -206,8 +207,10 @@ class DashboardServer(ThreadingHTTPServer):
         workspace_overview=None,
         push=None,
         sentry=None,
+        attachments: Path | None = None,
     ) -> None:
         self.home = home
+        self.attachments = attachments or home / "attachments"
         self.overview = overview
         self.issues = issues
         self.upstream_tests = upstream_tests
@@ -270,6 +273,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-message",
                 "workspace-answer",
                 "workspace-prompt-forget",
+                "attachment-upload",
                 "sentry-action",
                 "push-subscribe",
                 "push-unsubscribe",
@@ -287,6 +291,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if action == "attachment-upload":
+                self.upload(length)
+                return
             if (
                 not 0
                 < length
@@ -314,6 +321,8 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
+            # Attached files become paths in the text the agent receives.
+            attachments.attach(self.server.attachments, action, request)
             if action == "notification-silence":
                 if not self.server.push:
                     raise ValueError("Notification preferences are unavailable")
@@ -410,6 +419,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": str(exc)})
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.send_json(503, {"error": f"Cannot update watch: {exc}"})
+
+    def upload(self, length):
+        """Store a file sent as the raw request body, named by its X-Filename header."""
+        if (
+            not 0 < length <= attachments.MAX_FILE
+            or self.headers.get("Content-Type") != "application/octet-stream"
+        ):
+            raise ValueError(f"Attach a file of at most {attachments.MAX_FILE // (1024 * 1024)} MB")
+        name = unquote(self.headers.get("X-Filename") or "file")
+        # A phone over the tailnet can be slow; each read still has a limit.
+        self.connection.settimeout(30)
+        try:
+            data = self.rfile.read(length)
+        except OSError:
+            data = b""
+        if len(data) != length:
+            raise ValueError("The upload was cut short; attach the file again")
+        self.send_json(200, attachments.save(self.server.attachments, name, data))
 
     def do_GET(self):
         port = self.server.server_port
@@ -647,6 +674,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/workspaces.js": ("workspaces.js", "text/javascript"),
                     "/workspaces.css": ("workspaces.css", "text/css"),
                     "/viewer.js": ("viewer.js", "text/javascript"),
+                    "/attachments.js": ("attachments.js", "text/javascript"),
                     "/viewer.css": ("viewer.css", "text/css"),
                     "/sentry.js": ("sentry.js", "text/javascript"),
                     "/sentry.css": ("sentry.css", "text/css"),
@@ -664,7 +692,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(503, {"error": f"Cannot read watcher data: {exc}"})
 
 
-def serve(home, port=8765, open_browser=False, allowed_hosts=()):
+def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir=None):
     from dashboard_push import PushInbox
     from sentry_issues import SentryIssues
     from upstream_tests import UpstreamTests
@@ -701,6 +729,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=()):
         workspace_overview=workspace_overview,
         push=push,
         sentry=sentry,
+        attachments=attachments_dir,
     ) as server:
         ci_logs.start()
         push.start()

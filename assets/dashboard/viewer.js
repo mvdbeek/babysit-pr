@@ -907,21 +907,23 @@
   let agents = [];
   let sessions = [];
   let sending = false; // A send in flight keeps the button disabled through refreshes.
+  let files = null; // The composer's attachments, kept with the draft.
   function draftKey(entry) {
     return `ws-viewer-draft:${entry.workspace}`;
   }
   function loadDraft(entry) {
     try {
       const saved = JSON.parse(localStorage.getItem(draftKey(entry)) || "null");
-      if (saved && Array.isArray(saved.comments) && typeof saved.message === "string") return saved;
+      if (saved && Array.isArray(saved.comments) && typeof saved.message === "string")
+        return { ...saved, files: Array.isArray(saved.files) ? saved.files : [] };
     } catch {
       // Storage may be unavailable or hold something else; start empty.
     }
-    return { comments: [], message: "", path: null };
+    return { comments: [], message: "", path: null, files: [] };
   }
   function storeDraft(entry, value) {
     try {
-      if (value.comments.length || value.message) {
+      if (value.comments.length || value.message || value.files?.length) {
         localStorage.setItem(draftKey(entry), JSON.stringify(value));
       } else localStorage.removeItem(draftKey(entry));
     } catch {
@@ -939,12 +941,25 @@
     if (!entry.workspace) {
       // A checkout without a herdr workspace has no agent to talk to.
       draft = null;
+      files?.destroy();
+      files = null;
       form.hidden = true;
       return;
     }
     form.hidden = false;
     draft = loadDraft(entry);
     byId("ws-message-text").value = draft.message;
+    files?.destroy();
+    files = window.dashboardAttachments.picker({
+      files: draft.files,
+      pasteTarget: byId("ws-message-text"),
+      onchange: (list) => {
+        if (!draft || viewer?.entry !== entry) return;
+        draft.files = list;
+        saveDraft();
+      },
+    });
+    byId("ws-message-files").replaceChildren(files.element);
     renderComments();
     renderAgents("Looking for agents…");
     void fetchAgents(entry);
@@ -955,7 +970,8 @@
       if (viewer?.entry !== entry) return;
       if (draft.path && draft.path !== value.path) {
         // The workspace ID now names another checkout: its old draft does not apply.
-        draft = { comments: [], message: "", path: value.path };
+        draft = { comments: [], message: "", path: value.path, files: [] };
+        files?.clear();
         storeDraft(entry, draft);
         byId("ws-message-text").value = "";
         byId("ws-viewer-content")
@@ -1163,8 +1179,13 @@
     const message = byId("ws-message-text").value;
     const text = compose(comments, message);
     const status = byId("ws-message-status");
-    if (!text) {
-      status.textContent = "Write a message or add a comment first.";
+    const attachments = files?.ids() || [];
+    if (files?.busy()) {
+      status.textContent = "Wait for the attachments to upload.";
+      return;
+    }
+    if (!text && !attachments.length) {
+      status.textContent = "Write a message, add a comment or attach a file first.";
       return;
     }
     if (text.length > MAX_MESSAGE) {
@@ -1172,9 +1193,14 @@
       return;
     }
     const picked = byId("ws-message-agent").querySelector("select")?.value;
-    const body = agents.length
-      ? { workspace: entry.workspace, pane: picked || agents[0].pane, text }
-      : { workspace: entry.workspace, resume: picked || sessions[0]?.id, text };
+    const body = {
+      workspace: entry.workspace,
+      ...(agents.length
+        ? { pane: picked || agents[0].pane }
+        : { resume: picked || sessions[0]?.id }),
+      text,
+      ...(attachments.length ? { attachments } : {}),
+    };
     sending = true;
     byId("ws-message-send").disabled = true;
     status.textContent = body.resume ? "Resuming the session…" : "Sending…";
@@ -1184,7 +1210,7 @@
         if (viewer?.entry === entry) status.textContent = value.error;
         return;
       }
-      clearSent(entry, comments, message);
+      clearSent(entry, comments, message, attachments);
       if (viewer?.entry !== entry) return;
       status.textContent =
         value.warning ||
@@ -1228,17 +1254,20 @@
   }
   // Clear exactly what was sent, from storage and from whichever draft is now open (the
   // dialog may have been reopened meanwhile); later edits stay.
-  function clearSent(entry, comments, message) {
+  function clearSent(entry, comments, message, attachments = []) {
     const sent = new Set(comments.map((comment) => comment.id));
+    const attachedSent = new Set(attachments);
     const prune = (value) => {
       value.comments = value.comments.filter((comment) => !sent.has(comment.id));
       if (value.message === message) value.message = "";
+      value.files = (value.files || []).filter((file) => !attachedSent.has(file.id));
       return value;
     };
     storeDraft(entry, prune(loadDraft(entry)));
     if (!draft || viewer?.entry.workspace !== entry.workspace) return;
     prune(draft);
     saveDraft();
+    if (attachments.length) files?.remove(attachments);
     if (byId("ws-message-text").value === message) byId("ws-message-text").value = "";
     byId("ws-viewer-content")
       .querySelectorAll(".ws-comment-note")

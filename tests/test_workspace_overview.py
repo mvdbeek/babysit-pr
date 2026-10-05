@@ -1530,3 +1530,45 @@ def test_an_agent_that_stops_waiting_mid_answer_stops_the_typing(asking, monkeyp
     with pytest.raises(ValueError, match=r"Answered in part \(the agent stopped waiting\)"):
         agent_messages.answer(answer_request(sid, [{"options": [1]}, {"options": [0]}]))
     assert keys_sent(state) == [["2"]]
+
+
+def test_a_message_with_an_attached_file_gives_the_agent_its_path(site, tmp_path):
+    state = site[4]
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            connection.request(
+                "POST",
+                "/api/attachment-upload",
+                b"log line",
+                {
+                    "Host": f"127.0.0.1:{port}",
+                    "Content-Type": "application/octet-stream",
+                    "X-Babysit-Action": "attachment-upload",
+                    "X-Filename": "ci.log",
+                },
+            )
+            uploaded = json.loads(connection.getresponse().read())
+            connection.close()
+            body = {"workspace": "w1", "text": "See the log", "attachments": [uploaded["id"]]}
+            status, value = request(
+                port, "/api/workspace-message", body, action="workspace-message"
+            )
+            assert status == 200 and value["sent"]
+            path = tmp_path / "plain" / "attachments" / uploaded["id"]
+            assert read(state)["prompts"] == [
+                ["w1:p1", f"See the log\n\nAttached files (read them from these paths):\n- {path}"]
+            ]
+            status, value = request(
+                port,
+                "/api/workspace-message",
+                {**body, "attachments": ["2026-01-01-00000000-gone.txt"]},
+                action="workspace-message",
+            )
+            assert status == 400 and "missing" in value["error"]
+        finally:
+            httpd.shutdown()
+            thread.join(5)

@@ -1123,6 +1123,11 @@ def main():
     dashboard_parser.add_argument(
         "--open", action="store_true", help="Open the dashboard in your browser"
     )
+    dashboard_parser.add_argument(
+        "--attachments",
+        type=Path,
+        help="Directory for files attached to agent messages (default: HOME/attachments)",
+    )
     start = sub.add_parser("start", help="Restart the shared watcher after logout/reboot")
     start.add_argument("--max-workers", type=int, default=2)
     server = sub.add_parser("serve", help="Run shared watcher in foreground")
@@ -1144,7 +1149,13 @@ def main():
         import dashboard
 
         try:
-            dashboard.serve(home, args.port, args.open, args.allow_host)
+            dashboard.serve(
+                home,
+                args.port,
+                args.open,
+                args.allow_host,
+                args.attachments.expanduser().resolve() if args.attachments else None,
+            )
         except OSError as exc:
             emit({"error": str(exc)})
             return 1
