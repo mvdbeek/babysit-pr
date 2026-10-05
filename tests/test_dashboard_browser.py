@@ -2993,6 +2993,25 @@ def test_scheduled_tab_is_hidden_without_workspace_actions(page, dashboard_site)
     expect(page.get_by_role("tab", name="Scheduled")).to_be_hidden()
 
 
+def test_scheduled_tab_appears_after_a_stalled_request(page, dashboard_site):
+    url, _ = dashboard_site
+    stalled = []
+
+    def scheduled(route):
+        if not stalled:
+            stalled.append(route)  # Never answered, like a request lost while backgrounded.
+            return
+        route.fulfill(json={"enabled": True, "time": time.time(), "tasks": []})
+
+    page.route("**/api/scheduled-tasks", scheduled)
+    page.clock.install()
+    with page.expect_request("**/api/scheduled-tasks"):
+        page.goto(url)
+    expect(page.get_by_role("tab", name="Scheduled")).to_be_hidden()
+    page.clock.run_for(16000)
+    expect(page.get_by_role("tab", name="Scheduled")).to_be_visible()
+
+
 @pytest.mark.parametrize("width", [1280, 390])
 def test_batch_handle_selects_issues_and_staggers_their_starts(
     page, dashboard_site, issue_workspace_routes, width

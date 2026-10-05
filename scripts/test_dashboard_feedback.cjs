@@ -70,6 +70,9 @@ const context = vm.createContext({
     addEventListener() {},
   },
   setInterval() {},
+  setTimeout() {},
+  clearTimeout() {},
+  AbortController,
   fetch: async (url, options) => {
     requests.push({ url, options });
     return {
