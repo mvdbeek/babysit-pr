@@ -3443,6 +3443,135 @@ def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
     assert viewer_routes["sent"][0][1]["pane"] == "w1:p1"
 
 
+TRANSCRIPT_MARKDOWN = """Both PRs are forwarded; **one** test is <img src=x onerror="window.injected=true"> open.
+
+**New PRs, pushed to upstream:**
+- `release_26.0` (`47f5e8..1188df`): brings in #23905.
+- **Playwright `test_step`:** not resolved.
+  - In CI it failed on both attempts.
+  - See [the run](https://github.com/o/r/actions/runs/1) and *retry*.
+3. Third, numbered
+
+| Check | Result |
+| --- | --- |
+| Lint | `ok` |
+
+```
+tox -e unit
+```"""
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    entries = [
+        {"role": "user", "kind": "command", "text": "/babysit-pr 23905"},
+        {
+            "role": "tool",
+            "name": "Bash",
+            "about": "Fetch both remotes",
+            "brief": "git fetch -q upstream && git fetch -q origin",
+            "input": "git fetch -q upstream && git fetch -q origin\n\ntimeout: 600",
+            "output": "",
+            "error": False,
+        },
+        {"role": "assistant", "text": TRANSCRIPT_MARKDOWN},
+        {"role": "user", "kind": "notification", "text": 'Background command "tox" completed'},
+        {"role": "user", "kind": "output", "text": "Catch you later!"},
+        {"role": "user", "text": "Plain *prompt* stays as typed"},
+    ]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    reply = viewer.locator(".ws-md")
+    expect(reply.locator("p").first.locator("strong")).to_have_text("one")
+    expect(reply.locator("p").first).to_contain_text('<img src=x onerror="window.injected=true">')
+    assert reply.locator("img").count() == 0 and page.evaluate("window.injected") is None
+    bullets = reply.locator("ul").first.locator(":scope > li")
+    expect(bullets).to_have_count(2)
+    expect(bullets.first.locator("code")).to_have_text(["release_26.0", "47f5e8..1188df"])
+    nested = bullets.last.locator("ul > li")
+    expect(nested).to_have_count(2)
+    expect(nested.last.locator("a")).to_have_attribute(
+        "href", "https://github.com/o/r/actions/runs/1"
+    )
+    expect(nested.last.locator("em")).to_have_text("retry")
+    expect(reply.locator("ol")).to_have_attribute("start", "3")
+    expect(reply.locator("table th")).to_have_text(["Check", "Result"])
+    expect(reply.locator("table td code")).to_have_text("ok")
+    expect(reply.locator("pre code")).to_have_text("tox -e unit")
+    expect(viewer.locator(".ws-kind-command .ws-msg-who")).to_have_text("Command")
+    expect(viewer.locator(".ws-kind-command pre")).to_have_text("/babysit-pr 23905")
+    expect(viewer.locator(".ws-note")).to_have_text(
+        'Notification Background command "tox" completed'
+    )
+    expect(viewer.locator(".ws-kind-output .ws-msg-who")).to_have_text("Command output")
+    prompt = viewer.locator(".ws-kind-prompt .ws-msg-text")
+    expect(prompt).to_have_text("Plain *prompt* stays as typed")
+    tool = viewer.locator(".ws-tool summary")
+    expect(tool.locator(".ws-tool-about")).to_have_text("Fetch both remotes")
+    expect(tool.locator(".ws-tool-brief")).to_have_text(
+        "git fetch -q upstream && git fetch -q origin"
+    )
+    assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+    page.screenshot(path=f"reports/transcript-{width}.png", full_page=True)
+    tool.click()
+    expect(viewer.locator(".ws-tool-input")).to_contain_text("timeout: 600")
+
+
+def test_transcript_markdown_edge_cases_render_promptly(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    texts = [
+        # Inputs that once backtracked for seconds.
+        "# a" + " " * 5000 + "b",
+        "`" * 3001 + "x " * 2000,
+        "**" + "a *" * 3000,
+        "Use ```x``` inline\n\n**bold *it* x**\n\na | b\n---",
+        "```\nfirst\n```python\nsecond\n```\nafter",
+    ]
+    entries = [{"role": "assistant", "text": text} for text in texts]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    replies = page.locator("#ws-viewer .ws-md")
+    expect(replies).to_have_count(len(texts), timeout=3000)
+    expect(replies.nth(0).locator("h3")).to_have_text("a" + " " * 5000 + "b")
+    edge = replies.nth(3)
+    expect(edge.locator("code")).to_have_text("x")
+    expect(edge.locator("strong em")).to_have_text("it")
+    assert edge.locator("table").count() == 0
+    expect(replies.nth(4).locator("pre code")).to_have_text("first\n```python\nsecond")
+    expect(replies.nth(4).locator("p")).to_have_text("after")
+
+
 def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})

@@ -189,6 +189,10 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.ws-msg-text.ws-md {
+  white-space: normal;
+  line-height: 1.5;
+}
 .ws-tool {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -196,11 +200,138 @@
   overflow: hidden;
 }
 .ws-tool > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   padding: 6px 12px;
   cursor: pointer;
+  white-space: nowrap;
+}
+.ws-tool > summary::before {
+  content: "▸";
+  color: var(--muted);
+}
+.ws-tool[open] > summary::before {
+  content: "▾";
+}
+.ws-tool > summary::-webkit-details-marker {
+  display: none;
+}
+.ws-tool-about {
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+.ws-tool-brief {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 12px;
+}
+.ws-tool > summary .badge {
+  flex: none;
+}
+.ws-note {
+  padding: 2px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.ws-note strong {
+  font-weight: 600;
+}
+.ws-msg-code {
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  max-height: 320px;
+  overflow: auto;
+}
+.ws-md > :first-child {
+  margin-top: 0;
+}
+.ws-md > :last-child {
+  margin-bottom: 0;
+}
+.ws-md p,
+.ws-md ul,
+.ws-md ol,
+.ws-md pre,
+.ws-md blockquote,
+.ws-md .md-table {
+  margin: 0 0 10px;
+}
+.ws-md ul,
+.ws-md ol {
+  padding-left: 22px;
+}
+.ws-md li > ul,
+.ws-md li > ol {
+  margin: 2px 0 0;
+}
+.ws-md li + li {
+  margin-top: 2px;
+}
+.ws-md h3,
+.ws-md h4,
+.ws-md h5,
+.ws-md h6 {
+  margin: 14px 0 6px;
+  font-size: 14px;
+}
+.ws-md h3 {
+  font-size: 16px;
+}
+.ws-md hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 12px 0;
+}
+.ws-md blockquote {
+  padding-left: 10px;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+.ws-md code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: #eef1ec;
+  font:
+    12px ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+.ws-md pre {
+  padding: 10px 12px;
+  max-height: 420px;
+  overflow: auto;
+  font-size: 12px;
+}
+.ws-md pre code {
+  padding: 0;
+  background: none;
+  color: inherit;
+}
+.ws-md .md-table {
+  overflow-x: auto;
+}
+.ws-md table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.ws-md th,
+.ws-md td {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+.ws-md th {
+  background: #f6f8f4;
 }
 .ws-tool pre {
   margin: 0;
@@ -369,4 +500,10 @@
   #ws-viewer input {
     font-size: 16px;
   }
+}
+.ws-kind-command .ws-msg-code {
+  padding: 0;
+  background: none;
+  color: var(--ink);
+  font-size: 13px;
 }

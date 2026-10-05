@@ -11,6 +11,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import subprocess
 import threading
 import time
@@ -52,8 +53,17 @@ CODEX_CONTEXT = re.compile(r"^\s*(# AGENTS\.md instructions|<[a-z_]+>)")
 # formats without one, a non-zero exit code.
 CODEX_VERDICT = re.compile(r"^Script (completed|failed|error)")
 CODEX_EXIT = re.compile(r'"exit_code"\s*:\s*[1-9]|exited with code [1-9]')
-# Claude wraps slash commands and their output as user records; they are not prompts.
-CLAUDE_WRAPPER = re.compile(r"^\s*<(command-[a-z]+|local-command-[a-z]+)>")
+# Claude records slash commands, `!` shell runs, their output and background-task
+# notifications as user turns wrapped in tags; reminders it injects ride along inside them.
+CLAUDE_WRAPPED = re.compile(r"<(command-|bash-|local-command-|task-notification>)")
+CLAUDE_TAG = re.compile(r"<([a-z][a-z-]*)>(.*?)</\1>", re.S)
+SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+# The argument a tool call is about, searched in this order.
+TOOL_SUBJECT = ("command", "cmd", "file_path", "path", "pattern", "query", "url", "skill", "prompt")
+# Codex's exec tool runs a script; the shell command it wraps is its first `cmd:` string.
+CODEX_CMD = re.compile(r'\bcmd:\s*("(?:[^"\\\n]|\\.)*")')
+SHELLS = {"bash", "sh", "zsh"}
+MAX_BRIEF = 200
 CHUNK = 4 * 1024 * 1024
 # An open viewer polls every few seconds: session details are kept per file version, and
 # parsed transcripts keep their read position so a growing file is read from where it
@@ -373,6 +383,88 @@ def block_text(content):
     return ""
 
 
+def claude_prompt(text):
+    """How a Claude user turn reads, as (kind, text), or None when it shows nothing.
+
+    Kinds: "prompt" as typed, "command" for a slash command or `!` shell run, "output"
+    for what one printed, and "notification" for a background task's report.
+    """
+    text = SYSTEM_REMINDER.sub("", text).strip()
+    # Tags are parsed only in Claude's own wrappers: in a long typed prompt, unclosed
+    # tags would each be searched for to its end.
+    if not CLAUDE_WRAPPED.match(text):
+        return ("prompt", text) if text else None
+    tags = {m.group(1): m.group(2).strip() for m in CLAUDE_TAG.finditer(text)}
+    if "command-name" in tags:
+        return "command", " ".join(filter(None, (tags["command-name"], tags.get("command-args"))))
+    if "bash-input" in tags:
+        return "command", f"! {tags['bash-input']}"
+    printed = [tags.get(k) for k in ("local-command-stdout", "bash-stdout", "bash-stderr")]
+    if any(k in tags for k in ("local-command-stdout", "bash-stdout", "bash-stderr")):
+        return ("output", "\n".join(filter(None, printed))) if any(printed) else None
+    if "local-command-caveat" in tags:
+        return None
+    if "task-notification" in tags:
+        inner = {
+            m.group(1): m.group(2).strip() for m in CLAUDE_TAG.finditer(tags["task-notification"])
+        }
+        return "notification", inner.get(
+            "summary"
+        ) or f"Background task {inner.get('status', 'ended')}"
+    return "prompt", text
+
+
+def first_line(text):
+    return text.strip().split("\n")[0][:MAX_BRIEF] if text else None
+
+
+def tool_view(value):
+    """A tool call's input as (about, brief, text) for reading.
+
+    ``about`` is the call's own description, ``brief`` the gist of its main argument on
+    one line, and ``text`` the whole input written out rather than as escaped JSON.
+    """
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)  # Codex passes function arguments as JSON text.
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed
+    if not isinstance(value, dict):
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        brief = text
+        if found := CODEX_CMD.search(text):
+            try:
+                brief = json.loads(found.group(1))
+            except ValueError:
+                pass
+        return None, first_line(brief), text
+    fields = dict(value)
+    about = fields.pop("description") if isinstance(fields.get("description"), str) else None
+    key = next(
+        (k for k in TOOL_SUBJECT if fields.get(k) and isinstance(fields[k], (str, list))), None
+    )
+    subject = fields.pop(key) if key else None
+    if isinstance(subject, list):
+        words = [w if isinstance(w, str) else json.dumps(w) for w in subject]
+        # ["bash", "-lc", script] is the script itself.
+        shell = len(words) == 3 and Path(words[0]).name in SHELLS and words[1] in {"-c", "-lc"}
+        subject = words[2] if shell else shlex.join(words)
+    short, long = [], []
+    for name, item in fields.items():
+        shown = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+        if "\n" in shown:
+            long.append(f"{name}:\n{shown}")
+        else:
+            short.append(f"{name}: {shown}")
+    parts = [subject] if subject else []
+    if short:
+        parts.append("\n".join(short))
+    text = "\n\n".join(parts + long)
+    return about[:MAX_BRIEF] if about else None, first_line(subject or text), text
+
+
 def claude_text(item):
     content = (item.get("message") or {}).get("content")
     if isinstance(content, list) and any(
@@ -392,20 +484,29 @@ def records(stream):
 
 def claude_details(path):
     """Session ID, working directory and first prompt of a Claude transcript."""
-    cwd = title = None
+    cwd = title = command = None
     with path.open(encoding="utf-8", errors="replace") as stream:
         for item in records(stream):
             if item.get("type") not in {"user", "assistant"} or item.get("isSidechain"):
                 continue
             cwd = cwd or item.get("cwd")
             if item.get("type") == "user" and not item.get("isMeta"):
-                text = claude_text(item)
-                if text and not CLAUDE_WRAPPER.match(text) and not item.get("isCompactSummary"):
-                    title = text
-                    break
+                view = claude_prompt(claude_text(item))
+                if view and not item.get("isCompactSummary"):
+                    # A typed prompt names the session; failing one, its first command.
+                    if view[0] == "prompt":
+                        title = view[1]
+                        break
+                    if view[0] == "command":
+                        command = command or view[1]
     if not cwd:
         return None
-    return {"agent": "claude", "id": path.stem, "cwd": str(Path(cwd).resolve()), "title": title}
+    return {
+        "agent": "claude",
+        "id": path.stem,
+        "cwd": str(Path(cwd).resolve()),
+        "title": title or command,
+    }
 
 
 def codex_details(path):
@@ -575,10 +676,13 @@ class Transcript:
             self.codex(item)
 
     def tool(self, key, name, value, when):
+        about, brief, text = tool_view(value)
         tool = {
             "role": "tool",
             "name": str(name or "tool"),
-            "input": clip(value, MAX_TOOL),
+            "about": about,
+            "brief": brief,
+            "input": clip(text, MAX_TOOL),
             "output": None,
             "error": False,
             "time": when,
@@ -600,9 +704,12 @@ class Transcript:
                     if tool is not None:
                         tool["output"] = clip(block_text(block.get("content")), MAX_TOOL)
                         tool["error"] = bool(block.get("is_error"))
-            text = claude_text(item)
-            if text:
-                self.entries.append({"role": "user", "text": clip(text, MAX_TEXT), "time": when})
+            view = claude_prompt(claude_text(item))
+            if view:
+                kind, text = view
+                self.entries.append(
+                    {"role": "user", "kind": kind, "text": clip(text, MAX_TEXT), "time": when}
+                )
         elif kind == "assistant":
             for block in blocks:
                 if not isinstance(block, dict):
@@ -655,7 +762,9 @@ class Transcript:
             other.discard(text)
             return
         self.prompts[source].add(text)
-        self.entries.append({"role": "user", "text": clip(text, MAX_TEXT), "time": when})
+        self.entries.append(
+            {"role": "user", "kind": "prompt", "text": clip(text, MAX_TEXT), "time": when}
+        )
 
 
 def transcript(path, session=None, before=None, after=None):
