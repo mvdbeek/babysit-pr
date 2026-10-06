@@ -68,8 +68,15 @@ elif a[:2] == ['agent','read']:
 elif a[:2] == ['pane','list']:
  wid=a[a.index('--workspace')+1] if '--workspace' in a else None
  result={'panes':[x for x in data.get('panes',[]) if wid is None or x['workspace_id']==wid]}
+elif a[:2] == ['pane','get']:
+ agent=next((g for g in data['agents'] if g.get('pane_id')==a[2]),{})
+ result={'pane':dict(agent,terminal_id='terminal',scroll={'offset_from_bottom':0})}
+elif a[:2] == ['agent','get']:
+ result={'agent':{'state_change_seq':1}}
 elif a[:2] == ['pane','process-info']:
- result={'process_info':data.get('process_info',{}).get(a[a.index('--pane')+1],{'shell_pid':1,'foreground_processes':[]})}
+ agent=next((g for g in data['agents'] if g.get('pane_id')==a[a.index('--pane')+1]),{})
+ default={'shell_pid':1,'foreground_processes':[{'pid':200,'argv0':agent.get('agent','codex')}] if agent else []}
+ result={'process_info':data.get('process_info',{}).get(a[a.index('--pane')+1],default)}
 elif a[:2] == ['pane','split']:
  wid=a[2].split(':')[0]; pid=f"{wid}:p{len(data.setdefault('panes',[]))+10}"
  data['panes'].append({'pane_id':pid,'workspace_id':wid,'cwd':a[a.index('--cwd')+1]})
@@ -93,6 +100,8 @@ p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
 agent={'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]}
 if os.environ.get('FAKE_PANE'): agent.update(pane_id=os.environ['FAKE_PANE'],agent_status='working')
 if os.environ.get('SAFE_ENABLE'): agent['safe_enable']=os.environ['SAFE_ENABLE']
+for flag in ('resume','--resume'):
+ if flag in sys.argv[1:]: agent['agent_session']={'value':sys.argv[sys.argv.index(flag)+1]}
 data['agents'].append(agent)
 p.write_text(json.dumps(data))
 """
@@ -159,6 +168,9 @@ def fresh_viewer_caches(monkeypatch):
 
     for name in ("_checkouts", "_details", "_parsers"):
         monkeypatch.setattr(workspace_viewer, name, {})
+    import agent_docker
     import agent_messages
 
+    # Never query the host's Seatbelt policies for the fake agent PIDs.
+    monkeypatch.setattr(agent_docker, "has_access", lambda pid: True)
     monkeypatch.setattr(agent_messages, "_recent", {})

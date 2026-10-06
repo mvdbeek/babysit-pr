@@ -1648,7 +1648,7 @@ def test_scheduled_and_batched_launches_keep_the_docker_opt_in(synced):
     plain = manager.batch({"items": [{"id": "I_two"}], "task": "Fix {url}", "start_at": start})
     assert "docker" not in plain["results"][0]["scheduled"]["request"]
     manager.run_due(now=start)
-    for key in (pr["id"], "I_one"):
+    for key in (pr["id"], "I_one", "I_two"):
         op = finish(manager, key)
         assert op["status"] == "complete", op["log"]
         assert op["docker"] is True

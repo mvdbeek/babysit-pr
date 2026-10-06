@@ -1213,9 +1213,10 @@ def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
     pane = data["panes"][-1]["pane_id"]
     assert value == {"sent": True, "pane": pane, "resumed": sid, "warning": None}
     assert [run[0] for run in data["runs"]] == [pane]
-    assert data["runs"][0][1].startswith(f'claude --resume {sid} -- "$(cat ')
+    assert data["runs"][0][1].startswith(f'SAFE_ENABLE=docker claude --resume {sid} -- "$(cat ')
     agent = data["agents"][0]
     assert agent["argv"] == ["--resume", sid, "--", "Now add docs"]
+    assert agent["safe_enable"] == "docker"
     assert Path(agent["cwd"]).resolve() == checkout.resolve()
     # The staged prompt is removed once the agent has read it.
     assert not list((home / "message-prompts").iterdir())
@@ -1233,7 +1234,9 @@ def test_a_session_open_elsewhere_gets_the_message_there(exited):
     data["panes"].append(
         {"pane_id": "w7:p1", "workspace_id": "w7", "agent_session": {"value": sid}}
     )
-    data["agents"] = [{"pane_id": "w7:p1", "workspace_id": "w7", "agent_status": "idle"}]
+    data["agents"] = [
+        {"pane_id": "w7:p1", "workspace_id": "w7", "agent": "claude", "agent_status": "idle"}
+    ]
     state.write_text(json.dumps(data))
     value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
     assert value == {"sent": True, "pane": "w7:p1", "warning": None}
@@ -1268,7 +1271,7 @@ def test_a_just_resumed_session_is_not_resumed_again(exited, monkeypatch):
     state, sid, _, home = exited
     monkeypatch.setattr(agent_messages, "RESUME_WAIT", 0)
     first = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
-    assert "no agent appeared yet" in first["warning"]
+    assert "session is not confirmed yet" in first["warning"]
     data = read(state)
     data["agents"] = []  # Not recognized yet: only the recent-resume record stops a repeat.
     state.write_text(json.dumps(data))
