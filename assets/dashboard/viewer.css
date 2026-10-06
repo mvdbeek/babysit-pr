@@ -25,6 +25,16 @@
   border-color: var(--green);
   color: var(--green);
 }
+.ws-viewer-header {
+  position: sticky;
+  top: -20px;
+  z-index: 1;
+  display: flow-root;
+  margin: -20px -24px 12px;
+  padding: 20px 24px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+}
 .ws-viewer-actions {
   float: right;
   display: flex;
@@ -59,7 +69,7 @@
 .ws-viewer-tabs {
   display: flex;
   gap: 6px;
-  margin-bottom: 12px;
+  margin-bottom: 0;
 }
 .ws-viewer-tabs button {
   padding: 6px 14px;
@@ -501,6 +511,11 @@
     border: 0;
     border-radius: 0;
     scroll-padding-bottom: 0;
+  }
+  .ws-viewer-header {
+    top: -14px;
+    margin: -14px -16px 12px;
+    padding: 14px 16px 12px;
   }
   /* The viewer already fills a phone. */
   #ws-viewer-full {

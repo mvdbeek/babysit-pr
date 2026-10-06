@@ -67,15 +67,17 @@
       </div>
     </header>
     <dialog id="notifications-dialog" aria-labelledby="notifications-title">
-      <div class="notifications-heading">
-        <h2 id="notifications-title">Recent updates</h2>
-        <button id="notifications-close" type="button" aria-label="Close notifications">×</button>
+      <div class="dialog-header">
+        <div class="notifications-heading">
+          <h2 id="notifications-title">Recent updates</h2>
+          <button id="notifications-close" type="button" aria-label="Close notifications">×</button>
+        </div>
+        <button id="notifications-seen" type="button">Mark all seen</button>
       </div>
       <p class="notifications-caption">
         The 10 most recently updated items, grouped by PR or issue.
       </p>
       <p id="notifications-status" class="notifications-caption"></p>
-      <button id="notifications-seen" type="button">Mark all seen</button>
       <ol id="notifications-list"></ol>
       <p id="notifications-empty">Updates will appear here as the dashboard syncs.</p>
       <div class="notifications-push">
@@ -895,11 +897,15 @@
       </footer>
     </main>
     <dialog id="ci-dialog" aria-labelledby="ci-title">
-      <button id="ci-close" type="button" aria-label="Close CI details">Close</button>
-      <h2 id="ci-title">CI details</h2>
+      <div class="dialog-header">
+        <div class="dialog-heading">
+          <h2 id="ci-title">CI details</h2>
+          <button id="ci-close" type="button" aria-label="Close CI details">Close</button>
+        </div>
+        <div id="ci-links"></div>
+      </div>
       <p id="ci-meta" role="status"></p>
       <p id="ci-error" role="alert"></p>
-      <div id="ci-links"></div>
       <div id="ci-content"></div>
     </dialog>
     <dialog id="ws-dialog" aria-labelledby="ws-dialog-title">
@@ -913,17 +919,19 @@
       </div>
     </dialog>
     <dialog id="ws-viewer" aria-labelledby="ws-viewer-title">
-      <div class="ws-viewer-actions">
-        <button id="ws-viewer-full" type="button" aria-pressed="false">Full screen</button>
-        <button id="ws-viewer-close" type="button" aria-label="Close workspace viewer">
-          Close
-        </button>
-      </div>
-      <h2 id="ws-viewer-title">Workspace</h2>
-      <p id="ws-viewer-links"></p>
-      <div class="ws-viewer-tabs" role="tablist" aria-label="Workspace view">
-        <button id="ws-view-diff" type="button" role="tab">Diff</button>
-        <button id="ws-view-transcript" type="button" role="tab">Transcript</button>
+      <div class="ws-viewer-header">
+        <div class="ws-viewer-actions">
+          <button id="ws-viewer-full" type="button" aria-pressed="false">Full screen</button>
+          <button id="ws-viewer-close" type="button" aria-label="Close workspace viewer">
+            Close
+          </button>
+        </div>
+        <h2 id="ws-viewer-title">Workspace</h2>
+        <p id="ws-viewer-links"></p>
+        <div class="ws-viewer-tabs" role="tablist" aria-label="Workspace view">
+          <button id="ws-view-diff" type="button" role="tab">Diff</button>
+          <button id="ws-view-transcript" type="button" role="tab">Transcript</button>
+        </div>
       </div>
       <div id="ws-viewer-controls" class="ws-viewer-controls"></div>
       <p id="ws-viewer-meta" role="status"></p>
@@ -946,10 +954,14 @@
       </form>
     </dialog>
     <dialog id="sentry-publish-dialog" aria-labelledby="sentry-publish-heading">
-      <button id="sentry-publish-close" type="button" aria-label="Close GitHub issue draft">
-        Close
-      </button>
-      <h2 id="sentry-publish-heading">Publish to GitHub</h2>
+      <div class="dialog-header">
+        <div class="dialog-heading">
+          <h2 id="sentry-publish-heading">Publish to GitHub</h2>
+          <button id="sentry-publish-close" type="button" aria-label="Close GitHub issue draft">
+            Close
+          </button>
+        </div>
+      </div>
       <p id="sentry-publish-meta"></p>
       <p id="sentry-publish-status" role="status"></p>
       <p id="sentry-publish-public" class="alert" hidden>
@@ -981,8 +993,14 @@
       </div>
     </dialog>
     <dialog id="workspace-dialog" aria-labelledby="workspace-title">
-      <button id="workspace-close" type="button" aria-label="Close workspace actions">Close</button>
-      <h2 id="workspace-title">Workspace actions</h2>
+      <div class="dialog-header">
+        <div class="dialog-heading">
+          <h2 id="workspace-title">Workspace actions</h2>
+          <button id="workspace-close" type="button" aria-label="Close workspace actions">
+            Close
+          </button>
+        </div>
+      </div>
       <div id="workspace-content"></div>
       <p id="workspace-error" role="alert"></p>
       <p id="workspace-progress" role="status"></p>

@@ -114,12 +114,6 @@
 #sentry-publish-dialog::backdrop {
   background: #0008;
 }
-#sentry-publish-close {
-  float: right;
-}
-#sentry-publish-dialog h2 {
-  margin-bottom: 8px;
-}
 #sentry-publish-dialog h3 {
   margin: 12px 0 4px;
   font-size: 13px;
