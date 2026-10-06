@@ -535,7 +535,8 @@
   }
   function sessionLabel(session) {
     const agent = session.agent === "claude" ? "Claude" : "Codex";
-    return `${date(session.updated)} · ${agent} · ${session.title || session.id}`;
+    const account = session.claude_account ? ` (${session.claude_account})` : "";
+    return `${date(session.updated)} · ${agent}${account} · ${session.title || session.id}`;
   }
   function agentName(data) {
     return data.session.agent === "claude" ? "Claude" : "Codex";

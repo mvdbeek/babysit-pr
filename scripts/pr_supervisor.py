@@ -598,9 +598,13 @@ def run_repair(home, job_id, attempt):
             print(f"\nBabysitter: resuming {job['session_id']} for {job['summary']}\n", flush=True)
         # Per-session locks are shared by every supervisor home on this machine.
         if job.get("agent") == "claude":
+            import claude_accounts
             import claude_runner
 
-            lock_home = claude_runner.config_home() / "babysit-pr-locks"
+            lock_home = (
+                Path(job.get("claude_config_dir") or claude_runner.config_home())
+                / "babysit-pr-locks"
+            )
         else:
             lock_home = (
                 Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "babysit-pr-locks"
@@ -631,6 +635,13 @@ def run_repair(home, job_id, attempt):
             prompt_path = folder / "prompt.txt"
             prompt_path.write_text(repair_prompt(job))
             env = os.environ.copy()
+            if job.get("agent") == "claude" and job.get("claude_config_dir"):
+                env = claude_accounts.environment(
+                    job["claude_config_dir"],
+                    subscription=job.get("claude_subscription", False),
+                    base=env,
+                    config_env=job.get("claude_config_env", False),
+                )
             env.pop("CODEX_THREAD_ID", None)
             for key in ("CLAUDECODE", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
                 env.pop(key, None)
@@ -961,10 +972,14 @@ def register(db, args):
     if not sid:
         raise ValueError("Supply the exact --session UUID")
     if agent_kind == "claude":
+        import claude_accounts
         import claude_runner
 
-        info = claude_runner.session_info(sid, cwd, args.rollout)
+        selected = claude_accounts.validate(agent_kind, getattr(args, "claude_account", None))
+        info = claude_runner.session_info(sid, cwd, args.rollout, selected)
     else:
+        if getattr(args, "claude_account", None):
+            raise ValueError("A Claude account can only be selected for Claude")
         info = session_info(sid, cwd, args.rollout)
     pane = None
     if getattr(args, "pane", None):
@@ -1070,6 +1085,7 @@ def main():
     reg.add_argument("--cwd", default=os.getcwd())
     reg.add_argument("--session")
     reg.add_argument("--agent", choices=["codex", "claude"], default="codex")
+    reg.add_argument("--claude-account", help="Named Claude configuration directory (or default)")
     execution = reg.add_mutually_exclusive_group(required=True)
     execution.add_argument("--pane", help="Original herdr pane for every repair and continuation")
     execution.add_argument(

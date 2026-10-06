@@ -59,6 +59,14 @@ that agent kind. Claude uses `claude --print --resume SESSION_UUID`, streams
 readable text/tool output into the original pane, and saves its raw JSON stream
 in `agent.log`. A final structured result must match the original session UUID.
 Permission denials, CLI errors, or missing/invalid results block the watch.
+For another subscription login, add `--claude-account NAME` at registration.
+Names refer to `~/.claude/accounts/NAME` (`default` selects `~/.claude`). The
+recorded transcript store and literal `CLAUDE_CONFIG_DIR` value are retained on
+the watch and restored for every repair, before acquiring the session lock.
+Without a name, registration searches the known stores and infers the directory
+from the transcript; `--rollout` resolves an ambiguous session. Create a named
+login with `scripts/claude-account login NAME`. Existing watches without a saved
+directory continue to use their original environment behavior.
 The shared watcher handles CI waiting without LLM calls. Repairs keep the saved
 conversation and existing worktree.
 

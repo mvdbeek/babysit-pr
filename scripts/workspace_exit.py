@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-import claude_runner
+import claude_accounts
 import herdr_handoff as handoff
 
 BRIEF = (
@@ -82,6 +82,7 @@ def capture(op):
         raise Leave("The agent is the pane's root process; exiting it could close the pane")
     return {
         "agent": op["agent"],
+        "claude_account": op.get("claude_account"),
         "cwd": str(path),
         "pane_id": panes[0],
         "terminal_id": info["terminal_id"],
@@ -141,10 +142,14 @@ def locate(target, since):
     found = []
     if target["agent"] == "claude":
         # Claude names a project folder after its cwd, every other character a dash.
-        folder = claude_runner.config_home() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
         found = [
             (path, path.stem)
-            for path in folder.glob("*.jsonl")
+            for home in (
+                [claude_accounts.account_home(target["claude_account"])]
+                if target.get("claude_account")
+                else claude_accounts.homes()
+            )
+            for path in (home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))).glob("*.jsonl")
             if is_uuid(path.stem) and written_since(path, since) and claude_cwd(path) == cwd
         ]
     else:

@@ -2523,6 +2523,7 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
             "efforts": ["low", "ultra"],
         },
         "claude": {
+            "accounts": [{"id": "default", "label": "Default"}, {"id": "work", "label": "Work"}],
             "models": [{"id": "opus", "efforts": ["low", "high"]}, {"id": "haiku", "efforts": []}],
             "efforts": ["low", "high"],
         },
@@ -2562,6 +2563,7 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
     expect(docker).not_to_be_checked()
     if settings == "claude":
         docker.check()
+        dialog.get_by_label("Claude account", exact=True).select_option("work")
     dialog.get_by_label("Task", exact=True).fill("Fix this")
     if kind == "pr" and not clone and settings == "codex":
         page.screenshot(path="reports/workspace-model-effort-desktop.png")
@@ -2575,6 +2577,7 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
     body = requests[-1]
     assert body["action"] == ("clone-and-create" if clone else "create")
     assert body.get("docker") is (True if settings == "claude" else None)
+    assert body.get("claude_account") == ("work" if settings == "claude" else None)
     if settings == "default":
         assert "model" not in body and "effort" not in body
     else:

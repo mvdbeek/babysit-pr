@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-import claude_runner
+import claude_accounts
 import github_cli
 import owned_process
 from pr_workspaces import herdr
@@ -624,20 +624,20 @@ def details(path, agent):
 def session_files(root):
     """Candidate transcript files: Claude folders for the checkout and its subdirectories,
     and every Codex rollout (each is matched on its recorded cwd)."""
-    projects = claude_runner.config_home() / "projects"
     # Claude names a project folder after its cwd, every other character a dash.
     folder = re.sub(r"[^A-Za-z0-9]", "-", str(root))
-    try:
-        folders = [
-            entry
-            for entry in projects.iterdir()
-            if entry.name == folder or entry.name.startswith(folder + "-")
-        ]
-    except OSError:
-        folders = []
-    for entry in folders:
-        for path in entry.glob("*.jsonl"):
-            yield "claude", path
+    for home in claude_accounts.homes():
+        try:
+            folders = [
+                entry
+                for entry in (home / "projects").iterdir()
+                if entry.name == folder or entry.name.startswith(folder + "-")
+            ]
+        except OSError:
+            folders = []
+        for entry in folders:
+            for path in entry.glob("*.jsonl"):
+                yield "claude", path
     codex = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
     for path in codex.glob("*/*/*/rollout-*.jsonl"):
         yield "codex", path
@@ -670,6 +670,15 @@ def sessions(path):
                 "_file": file,
             }
         )
+        if agent == "claude":
+            home = claude_accounts.transcript_home(file)
+            account = claude_accounts.account_name(home) if home else None
+            if home and (account is not None or home != claude_accounts.current_home()):
+                listed[-1].update(
+                    claude_config_dir=str(home),
+                    claude_config_env=claude_accounts.config_environment(home),
+                    claude_account=account,
+                )
     listed.sort(key=lambda s: s["updated"], reverse=True)
     return listed[:MAX_SESSIONS]
 

@@ -1,13 +1,14 @@
 """Claude session validation, bounded CLI invocation, and streamed results."""
 
 import json
-import os
 import uuid
 from pathlib import Path
 
+import claude_accounts
+
 
 def config_home():
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    return claude_accounts.current_home()
 
 
 def _within(path, root):
@@ -15,15 +16,22 @@ def _within(path, root):
     return path == root or root in path.parents
 
 
-def session_info(session_id, cwd, transcript=None):
+def session_info(session_id, cwd, transcript=None, config_dir=None):
     session_id = str(uuid.UUID(session_id))
     files = (
         [Path(transcript)]
         if transcript
-        else list((config_home() / "projects").glob(f"*/{session_id}.jsonl"))
+        else [
+            path
+            for home in ([Path(config_dir)] if config_dir else claude_accounts.homes())
+            for path in (home / "projects").glob(f"*/{session_id}.jsonl")
+        ]
     )
     if len(files) != 1:
         raise ValueError("Supply --rollout: could not identify one saved Claude transcript")
+    home = claude_accounts.transcript_home(files[0]) or Path(config_dir or config_home())
+    if config_dir and home.resolve() != Path(config_dir).resolve():
+        raise ValueError("Claude transcript belongs to a different account")
     seen = False
     model = None
     permission_mode = None
@@ -49,11 +57,22 @@ def session_info(session_id, cwd, transcript=None):
                 permission_mode = item["permissionMode"]
     if not seen or not model:
         raise ValueError("Cannot validate the Claude conversation and its model")
+    account = claude_accounts.account_name(home)
     return {
         "session_id": session_id,
         "rollout": str(files[0].resolve()),
         "model": model,
         "claude_permission_mode": "plan" if permission_mode == "plan" else "dontAsk",
+        "claude_config_dir": str(home.resolve()),
+        "claude_config_env": (
+            None
+            if Path(config_dir or home).resolve() == claude_accounts.default_home()
+            else str(home.resolve())
+        )
+        if config_dir
+        else claude_accounts.config_environment(home),
+        "claude_account": account,
+        "claude_subscription": bool(config_dir) or account not in (None, "default"),
     }
 
 

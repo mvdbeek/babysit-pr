@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 
+import claude_accounts
+
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}")
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
@@ -148,6 +150,7 @@ def catalog(home=None):
             **({"note": note} if note else {}),
         },
         "claude": {
+            "accounts": [{"id": a["id"], "label": a["label"]} for a in claude_accounts.catalog()],
             "models": [
                 {"id": name, "efforts": CLAUDE_EFFORTS if name != "haiku" else []}
                 for name in ("fable", "opus", "sonnet", "haiku")

@@ -22,6 +22,8 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol, TextIO
 
+import claude_accounts
+
 COMMANDS = ("wt", "wti", "wtpr")
 ALIASES = {"wri": "wti", "wtissue": "wti"}
 DEFAULT_REPO = "galaxy"
@@ -48,6 +50,7 @@ VALUE_OPTIONS = {
     "--prompt-file": "prompt_file",
     "--model": "model",
     "--effort": "effort",
+    "--claude-account": "claude_account",
     "--name": "name",
     "--label": "label",
     "--repo-path": "repo_path",
@@ -61,6 +64,7 @@ WT_OPTIONS = frozenset(
         "--docker",
         "--model",
         "--effort",
+        "--claude-account",
         "-r",
         "-p",
         "--prompt",
@@ -97,6 +101,7 @@ to it: wt() { local d; d="$(WT_MULTIPLEXER=none command wt "$@")" && cd "$d"; }
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --claude-account <name>  use a named Claude login (or default)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
@@ -133,6 +138,7 @@ the branch is generated from the issue number and title (issue-<number>-<slug>).
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --claude-account <name>  use a named Claude login (or default)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
@@ -158,6 +164,7 @@ handled by fetching the PR branch from the contributor repository.
 options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
+  --claude-account <name>  use a named Claude login (or default)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
@@ -204,6 +211,7 @@ class Options:
         "prompt",
         "model",
         "effort",
+        "claude_account",
         "name",
         "label",
         "repo_path",
@@ -221,6 +229,7 @@ class Options:
         self.prompt = ""
         self.model = ""
         self.effort = ""
+        self.claude_account = ""
         self.name = ""
         self.label = ""
         self.repo_path = ""
@@ -399,6 +408,8 @@ def agent_command(
     stage: Callable[[str], str] = stage_prompt,
     extra: Sequence[str] = (),
     docker: bool = False,
+    claude_config_dir: str | None = None,
+    claude_subscription: bool = False,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -419,12 +430,15 @@ def agent_command(
     command = " ".join(shlex.quote(word) for word in agent_words(agent, model, effort, extra))
     if docker:
         command = f"SAFE_ENABLE=docker {command}"
-    if not prompt:
-        return command
-    # Extra words may end in a variadic option (Claude's --mcp-config <configs...>) that
-    # would swallow the prompt; `--` ends option parsing before it.
-    separator = " --" if extra else ""
-    return f'{command}{separator} "$(cat {shlex.quote(stage(prompt))})"'
+    if prompt:
+        # `--` stops variadic options from swallowing the prompt.
+        separator = " --" if extra else ""
+        command = f'{command}{separator} "$(cat {shlex.quote(stage(prompt))})"'
+    if claude_config_dir:
+        command = claude_accounts.shell_command(
+            command, claude_config_dir, subscription=claude_subscription
+        )
+    return command
 
 
 def read_config(path: str) -> dict[str, str]:
@@ -749,6 +763,10 @@ class Tool:
         return select_multiplexer(self.env, self.runner.which, self.herdr_running)
 
     def command_for(self, options: Options) -> str:
+        try:
+            home = claude_accounts.validate(options.agent, options.claude_account)
+        except ValueError as exc:
+            raise WtError(f"wt: {exc}") from exc
         return agent_command(
             options.agent,
             options.prompt,
@@ -757,6 +775,8 @@ class Tool:
             self.stage,
             options.agent_args,
             options.docker,
+            str(home) if home else None,
+            bool(options.claude_account),
         )
 
     def open_session(self, options: Options, directory: str, name: str, repo_path: str) -> None:
@@ -898,6 +918,10 @@ class Tool:
 
     def run_wt(self, options: Options) -> None:
         validate_agent_options(options.agent, options.model, options.effort)
+        try:
+            claude_accounts.validate(options.agent, options.claude_account)
+        except ValueError as exc:
+            raise WtError(f"wt: {exc}") from exc
         args = options.positional
         if options.name:
             self.reserve_wt(options)
@@ -956,6 +980,10 @@ class Tool:
 
     def run_wti(self, options: Options) -> None:
         validate_agent_options(options.agent, options.model, options.effort)
+        try:
+            claude_accounts.validate(options.agent, options.claude_account)
+        except ValueError as exc:
+            raise WtError(f"wt: {exc}") from exc
         args = options.positional
         if not args:
             raise UsageError("wti", "wti: expected an issue number or GitHub issue URL")
@@ -1000,6 +1028,10 @@ class Tool:
 
     def run_wtpr(self, options: Options) -> None:
         validate_agent_options(options.agent, options.model, options.effort)
+        try:
+            claude_accounts.validate(options.agent, options.claude_account)
+        except ValueError as exc:
+            raise WtError(f"wt: {exc}") from exc
         args = options.positional
         if not args:
             raise UsageError("wtpr", "wtpr: expected a PR number or GitHub PR URL")

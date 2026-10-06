@@ -1148,9 +1148,14 @@ def synced(local):
 
 
 def test_scheduled_task_starts_at_its_time_with_the_chosen_settings(synced):
+    import claude_accounts
+
     manager, pr, _, state, _ = synced
+    account = claude_accounts.account_home("work", create=True)
     start = time.time() + 3600
-    task = scheduled(manager, pr, start, agent="claude", model="opus", effort="high")
+    task = scheduled(
+        manager, pr, start, agent="claude", model="opus", effort="high", claude_account="work"
+    )
     assert task["status"] == "scheduled" and task["subject"]["url"] == pr["url"]
     assert task["request"]["clone"] == str(manager.src / "repo")
     assert not json.loads(state.read_text())["agents"]
@@ -1169,8 +1174,10 @@ def test_scheduled_task_starts_at_its_time_with_the_chosen_settings(synced):
     assert op["status"] == "complete", op["log"]
     assert started["operation_id"] == op["id"]
     assert (op["agent"], op["model"], op["effort"]) == ("claude", "opus", "high")
+    assert op["claude_account"] == "work"
     agents = json.loads(state.read_text())["agents"]
     assert len(agents) == 1 and agents[0]["task"].startswith("Later task")
+    assert agents[0]["claude_config_dir"] == str(account)
     listed = scheduled_task(manager, task["id"])
     assert listed["operation"]["status"] == "complete"
     assert listed["operation"]["url"].endswith(op["result"]["workspace_id"])

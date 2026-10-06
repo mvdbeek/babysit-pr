@@ -1250,6 +1250,39 @@ def test_a_session_open_elsewhere_gets_the_message_there(exited):
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
 
 
+@pytest.mark.parametrize("name", ["default", "work"])
+def test_named_account_resume_checks_its_lock_and_restores_its_store(
+    exited, tmp_path, monkeypatch, name
+):
+    import fcntl
+    import shutil
+
+    import agent_messages
+    import claude_accounts
+
+    state, sid, _, home = exited
+    original = Path(os.environ["CLAUDE_CONFIG_DIR"])
+    monkeypatch.setenv("HOME", str(tmp_path / "account-home"))
+    account = claude_accounts.account_home(name, create=True)
+    shutil.move(original / "projects", account / "projects")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert agent_messages.sessions("w1", home)[0]["claude_account"] == name
+    lock = account / "babysit-pr-locks" / f"{sid}.lock"
+    lock.parent.mkdir()
+    with lock.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        with pytest.raises(ValueError, match="repair is running"):
+            agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert not read(state).get("runs")
+    result = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert result["sent"] and result["warning"] is None
+    if name == "work":
+        assert read(state)["agents"][0]["claude_config_dir"] == str(account)
+    else:
+        assert "claude_config_dir" not in read(state)["agents"][0]
+        assert "unset CLAUDE_CONFIG_DIR" in read(state)["runs"][0][1]
+
+
 def test_a_session_left_on_an_exited_pane_is_resumed(exited, monkeypatch):
     import agent_messages
 
