@@ -488,6 +488,8 @@ function renderDetail() {
   head.append(top, title);
   if (job.title) head.append(el("div", `${watchSubject(job)} · ${job.branch}`, "branch"));
   head.append(el("p", job.summary));
+  if (job.agent === "claude")
+    head.append(el("p", `Claude account: ${job.claude_account || "Default"}`, "branch"));
   head.append(workspaceControls({ ...job, id: `watch:${job.id}`, kind: "watch" }));
   if (job.stop_after_run || job.pause_after_run)
     head.append(
@@ -2153,6 +2155,8 @@ function agentFields() {
   model.id = "workspace-model";
   const effort = el("select");
   effort.id = "workspace-effort";
+  const account = el("select");
+  account.id = "workspace-claude-account";
   const settingsNote = el("small", "Default keeps the agent’s configured setting.");
   function options(select, values) {
     select.replaceChildren();
@@ -2176,6 +2180,16 @@ function agentFields() {
   }
   function updateModels() {
     const choices = workspaceData.agent_choices?.[agent.value];
+    account.replaceChildren(el("option", "Default"));
+    account.firstChild.value = "";
+    for (const choice of choices?.accounts ?? []) {
+      if (choice.id === "default") continue;
+      const option = el("option", choice.label);
+      option.value = choice.id;
+      account.append(option);
+    }
+    account.disabled = agent.value !== "claude";
+    syncSelect(account);
     options(model, choices?.models.map((choice) => choice.id) ?? []);
     effort.value = "";
     updateEfforts();
@@ -2194,7 +2208,7 @@ function agentFields() {
   docker.type = "checkbox";
   const dockerLabel = el("label", undefined, "workspace-later");
   dockerLabel.append(docker, " Allow Docker in the agent’s sandbox");
-  return { agent, model, effort, settingsNote, docker, dockerLabel };
+  return { agent, model, effort, account, settingsNote, docker, dockerLabel };
 }
 // A Start later checkbox and the time it reveals. `startTime()` is null to start now,
 // the chosen time in seconds, or undefined after reporting an invalid time.
@@ -2317,7 +2331,7 @@ async function workspaceDialog(item, handling = "") {
         clone.value = "";
       }
       clone.required = true;
-      const { agent, model, effort, settingsNote, docker, dockerLabel } = agentFields();
+      const { agent, model, effort, account, settingsNote, docker, dockerLabel } = agentFields();
       const task = el("textarea");
       task.id = "workspace-task";
       task.required = true;
@@ -2344,6 +2358,7 @@ async function workspaceDialog(item, handling = "") {
       field("Agent", agent);
       field("Model (optional)", model);
       field("Reasoning effort (optional)", effort);
+      field("Claude account", account);
       form.append(settingsNote, dockerLabel);
       field("Task", task);
       form.append(promptHistory(task));
@@ -2386,6 +2401,9 @@ async function workspaceDialog(item, handling = "") {
               agent: agent.value,
               ...(model.value ? { model: model.value } : {}),
               ...(effort.value ? { effort: effort.value } : {}),
+              ...(agent.value === "claude" && account.value
+                ? { claude_account: account.value }
+                : {}),
               ...(docker.checked ? { docker: true } : {}),
               task: task.value.replaceAll(BATCH_URL, item.url || BATCH_URL),
               ...(handling && task.value === handling ? { prefilled: true } : {}),
@@ -2545,10 +2563,11 @@ async function newTaskDialog() {
       title.required = fileIssue.checked;
       name.required = !fileIssue.checked;
     };
-    const { agent, model, effort, settingsNote, docker, dockerLabel } = agentFields();
+    const { agent, model, effort, account, settingsNote, docker, dockerLabel } = agentFields();
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
+    field("Claude account", account);
     form.append(settingsNote, dockerLabel);
     const task = el("textarea");
     task.id = "workspace-task";
@@ -2586,6 +2605,7 @@ async function newTaskDialog() {
             agent: agent.value,
             ...(model.value ? { model: model.value } : {}),
             ...(effort.value ? { effort: effort.value } : {}),
+            ...(agent.value === "claude" && account.value ? { claude_account: account.value } : {}),
             ...(docker.checked ? { docker: true } : {}),
             task: task.value,
             ...attached(files),
@@ -2653,10 +2673,11 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
       label.htmlFor = input.id;
       form.append(label, input);
     }
-    const { agent, model, effort, settingsNote, docker, dockerLabel } = agentFields();
+    const { agent, model, effort, account, settingsNote, docker, dockerLabel } = agentFields();
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
+    field("Claude account", account);
     form.append(settingsNote, dockerLabel);
     let template = handleTasks[tasks[0]][1](BATCH_URL);
     if (tasks.length > 1) {
@@ -2808,6 +2829,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
             agent: agent.value,
             ...(model.value ? { model: model.value } : {}),
             ...(effort.value ? { effort: effort.value } : {}),
+            ...(agent.value === "claude" && account.value ? { claude_account: account.value } : {}),
             ...(docker.checked ? { docker: true } : {}),
             task: task.value,
             ...(task.value === template ? { prefilled: true } : {}),
@@ -2959,6 +2981,7 @@ function scheduledCard(task) {
         agent,
         request.model,
         request.effort && `${request.effort} effort`,
+        request.claude_account && `Claude account: ${request.claude_account}`,
         request.docker && "Docker",
       ]
         .filter(Boolean)

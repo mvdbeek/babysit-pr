@@ -26,6 +26,7 @@ import uuid
 from pathlib import Path
 
 import agent_docker
+import claude_accounts
 import claude_runner
 import workspace_viewer
 import wt
@@ -88,7 +89,11 @@ def sessions(workspace_id, home=None):
     }
     return [
         {
-            **{k: v for k, v in session.items() if k in {"id", "agent", "title", "updated"}},
+            **{
+                k: v
+                for k, v in session.items()
+                if k in {"id", "agent", "title", "updated", "claude_account"}
+            },
             "watched": session["id"] in watched,
         }
         for session in workspace_viewer.sessions(root)
@@ -171,9 +176,6 @@ def change_docker(target, enabled, home):
             raise ValueError(
                 "Could not verify the current conversation; refresh before changing Docker access"
             )
-        owner = watch_owner(session_id, record["agent"], home)
-        if owner:
-            raise ValueError(f"Not restarted: {owner}")
         recent = _recent.get(session_id)
         if recent and time.monotonic() - recent[1] < RECENT_RESUME:
             raise ValueError(f"This session was just resumed; {UNCERTAIN}")
@@ -190,6 +192,9 @@ def change_docker(target, enabled, home):
             raise ValueError(
                 "The current session is not recorded yet; wait before changing Docker access"
             )
+        owner = watch_owner(session_id, record["agent"], home, chosen.get("claude_config_dir"))
+        if owner:
+            raise ValueError(f"Not restarted: {owner}")
         agent_docker.quit_agent(record)
         result = launch(
             info["workspace_id"],
@@ -408,14 +413,14 @@ def answer(request):
     return {"answered": True, "pane": pane}
 
 
-def watch_owner(session_id, agent, home):
+def watch_owner(session_id, agent, home, config_dir=None):
     """Why the babysit watcher owns this session, if it does.
 
     A watch resumes its registered session headless for repairs, under a per-session
     lock; an interactive copy alongside would make two writers on one conversation.
     """
     lock_home = (
-        claude_runner.config_home()
+        Path(config_dir or claude_runner.config_home())
         if agent == "claude"
         else Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     ) / "babysit-pr-locks"
@@ -507,7 +512,7 @@ def resume(workspace_id, session_id, text, home):
         if elsewhere:
             # Already running in another workspace: talk to that agent, never a second one.
             return prompt(elsewhere, text)
-        owner = watch_owner(session_id, chosen["agent"], home)
+        owner = watch_owner(session_id, chosen["agent"], home, chosen.get("claude_config_dir"))
         if owner:
             raise ValueError(f"Not resumed: {owner}")
         # A session resumes from the directory it was recorded in (Claude looks its ID up
@@ -552,6 +557,13 @@ def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, laun
         # Direct Safehouse invocation already contains the executable. Its original
         # permission flags are in options; shell wrappers must not add them again.
         command = shlex.join(launcher) + command[len(chosen["agent"]) :]
+    if chosen["agent"] == "claude" and chosen.get("claude_config_dir"):
+        command = claude_accounts.shell_command(
+            command,
+            chosen["claude_config_dir"],
+            subscription=chosen.get("claude_account") not in (None, "default"),
+            config_env=chosen.get("claude_config_env", False),
+        )
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
     _recent[session_id] = (pane, time.monotonic())

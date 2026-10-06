@@ -75,6 +75,8 @@ def present_job(job):
         "sha": pr.get("head_sha"),
         "status": job.get("status", "unknown"),
         "summary": job.get("summary", ""),
+        "agent": job.get("agent", "codex"),
+        "claude_account": job.get("claude_account"),
         "attempts": job.get("attempts", 0),
         "max_repairs": job.get("max_repairs", 0),
         "pending_reviews": len(job.get("pending_reviews") or []),

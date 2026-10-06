@@ -6,6 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 
+import claude_accounts
 import claude_runner
 import pane_runner
 import pr_supervisor as supervisor
@@ -131,10 +132,11 @@ import json, os, sys
 from pathlib import Path
 args=sys.argv[1:]
 assert 'CLAUDECODE' not in os.environ
+assert 'ANTHROPIC_API_KEY' not in os.environ
 assert args[args.index('--permission-mode') + 1] == 'dontAsk'
 prompt=sys.stdin.read()
 with Path(os.environ['FAKE_AGENT_CALLS']).open('a') as out:
- out.write(json.dumps({'argv': args, 'pid': os.getpid(), 'prompt': prompt})+'\\n')
+ out.write(json.dumps({'argv': args, 'pid': os.getpid(), 'prompt': prompt, 'config_dir': os.environ.get('CLAUDE_CONFIG_DIR')})+'\\n')
 print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'Resumed Claude work'}]}}),flush=True)
 print(json.dumps({'type':'result','subtype':'success','session_id':args[args.index('--resume')+1],
  'is_error':False, 'permission_denials':[{'tool_name':'Bash'}] if os.environ.get('FAKE_DENIED') else [],
@@ -146,12 +148,18 @@ print(json.dumps({'type':'result','subtype':'success','session_id':args[args.ind
     args.rollout = str(path)
     args.codex_command = None
     args.claude_command = json.dumps([sys.executable, str(command)])
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(h["home"].parent / "claude-home"))
+    monkeypatch.setenv("HOME", str(h["home"].parent / "account-home"))
+    account = claude_accounts.account_home("work", create=True)
+    args.claude_account = "work"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(account))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-fixture-account")
     monkeypatch.setenv("CLAUDECODE", "1")
     if denied:
         monkeypatch.setenv("FAKE_DENIED", "1")
     job = supervisor.register(h["db"], args)
     assert job["agent"] == "claude" and "codex_command" not in job
+    saved_home = job["claude_config_dir"]
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(h["home"].parent / "other-account"))
     attempt = str(uuid.uuid4())
     folder = h["home"] / "runs" / attempt
     folder.mkdir(parents=True)
@@ -177,6 +185,8 @@ print(json.dumps({'type':'result','subtype':'success','session_id':args[args.ind
     assert outcome["status"] == ("blocked" if denied else "waiting")
     call = json.loads(h["calls"].read_text())
     assert call["argv"][call["argv"].index("--resume") + 1] == sid
+    assert call["config_dir"] == saved_home
+    assert (Path(saved_home) / "babysit-pr-locks" / f"{sid}.lock").exists()
     with pytest.raises(ProcessLookupError):
         os.kill(call["pid"], 0)
 

@@ -100,6 +100,7 @@ p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
 agent={'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]}
 if os.environ.get('FAKE_PANE'): agent.update(pane_id=os.environ['FAKE_PANE'],agent_status='working')
 if os.environ.get('SAFE_ENABLE'): agent['safe_enable']=os.environ['SAFE_ENABLE']
+if os.environ.get('CLAUDE_CONFIG_DIR'): agent['claude_config_dir']=os.environ['CLAUDE_CONFIG_DIR']
 for flag in ('resume','--resume'):
  if flag in sys.argv[1:]: agent['agent_session']={'value':sys.argv[sys.argv.index(flag)+1]}
 data['agents'].append(agent)

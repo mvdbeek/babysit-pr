@@ -10,6 +10,7 @@ tools only, the sanitizer gets no tools, and every result is schema-validated.
 """
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -447,9 +449,16 @@ def claude_config_home():
 def claude_login(run=owned_process.run, now=time.time):
     """Claude Code's current access token (Keychain first, then its file), never refreshed."""
     candidates = []
+    service = "Claude Code-credentials"
+    directory = os.environ.get("CLAUDE_CONFIG_DIR")
+    if directory:
+        # Claude's Keychain service is keyed by the literal NFC config path, not realpath.
+        service += (
+            "-" + hashlib.sha256(unicodedata.normalize("NFC", directory).encode()).hexdigest()[:8]
+        )
     try:
         found = run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            ["security", "find-generic-password", "-s", service, "-w"],
             timeout=10,
             text=True,
         )

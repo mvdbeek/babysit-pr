@@ -401,7 +401,7 @@ only when starting a new session. Codex receives `--model` and
 `-c 'model_reasoning_effort="…"'`; Claude receives `--model` and `--effort`.
 CLI configuration precedence and organization policies still apply, including
 Codex managed new-thread defaults that can change when either override is supplied.
-Keep `wt.py` alongside `pr_workspaces.py` when distributing the scripts; there is
+Keep `wt.py` and `claude_accounts.py` alongside `pr_workspaces.py` when distributing the scripts; there is
 no separate installed helper to update.
 
 References (verified against installed CLI help and official documentation):
@@ -415,6 +415,55 @@ References (verified against installed CLI help and official documentation):
   aliases, model-specific efforts, and fallback/organization restrictions.
 - [Claude CLI reference](https://code.claude.com/docs/en/cli-usage) documents session
   `--model` and `--effort` flags.
+
+## Multiple Claude accounts
+
+Keep your existing login as the default, and create each additional subscription
+login in `~/.claude/accounts/<name>`. Put `scripts/` on `PATH` to use the
+`claude-account` launcher, or invoke it directly from this checkout:
+
+```sh
+./scripts/claude-account login work
+./scripts/claude-account status work
+./scripts/claude-account run work
+./scripts/claude-account run work -- --resume SESSION_UUID
+./scripts/claude-account list
+```
+
+`login` creates the directory and opens Claude's normal browser login. `default`
+selects the existing `~/.claude` login without setting `CLAUDE_CONFIG_DIR`, which
+preserves its macOS Keychain entry. The launcher uses the existing Safehouse setup.
+Settings, plugins, MCP configuration and session history are separate for each
+account; this helper does not copy credentials or settings between them. An
+explicit account selection removes inherited API keys, OAuth tokens and provider
+selection variables so they cannot choose another account instead. Account names
+use letters, digits, underscores and hyphens. To register an existing custom
+directory, symlink it into `~/.claude/accounts/<name>`.
+
+Select an account for worktree launches with `wt --claude --claude-account work …`
+(also accepted by `wti` and `wtpr`), or with the dashboard's **Claude account**
+picker. Default leaves the normal shell configuration in charge. Account selection
+applies to newly started agents; reattaching a running workspace keeps its agent.
+The shell launch preserves the user's `claude` function and forwards the selected
+directory through Safehouse. The executable launcher grants that directory only.
+
+For babysitter registration, use `--agent claude --claude-account work`. Without
+that option, registration finds the session among the default, named and current
+`CLAUDE_CONFIG_DIR` stores and records the directory belonging to its transcript.
+Every new watch retains that directory for repairs and session locks, including
+after a daemon restart or a launch into an original pane with a different shell
+environment. An ambiguous session requires `--rollout`; a transcript from another
+account is refused when an account was explicitly chosen. Existing watches keep
+their original environment behavior until deliberately registered again.
+
+Dashboard session discovery includes all named accounts, labels their sessions,
+and resumes them using their original store. The Sentry usage reader selects the
+Keychain entry for its configured `CLAUDE_CONFIG_DIR` and never falls back to
+another account's Keychain entry. Account selection does not automatically rotate
+to a different subscription when a usage limit is reached.
+
+Claude's supported multi-account mechanism is documented in its
+[authentication reference](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts).
 
 ## Worktree helper
 
