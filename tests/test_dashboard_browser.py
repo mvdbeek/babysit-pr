@@ -3869,6 +3869,64 @@ def test_a_launch_dialog_sends_its_attachments_with_the_task(
     assert (home / "attachments" / stored).read_bytes() == b"png"
 
 
+@pytest.mark.parametrize("width", [320, 390, 1280])
+def test_viewer_controls_stay_reachable_in_a_long_transcript(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 844})
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": [{"role": "assistant", "text": f"Entry {i}\n" * 10} for i in range(70)],
+                "start": 0,
+                "total": 70,
+            }
+        ),
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.locator(".ws-assistant")).to_have_count(70)
+
+    def check_controls():
+        assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+        for selector in ("#ws-viewer-close", "#ws-view-diff", "#ws-view-transcript") + (
+            ("#ws-viewer-full",) if width > 600 else ()
+        ):
+            control = viewer.locator(selector)
+            expect(control).to_be_in_viewport(ratio=1)
+            # Visibility alone does not detect content painting over the sticky header.
+            assert control.evaluate("""el => {
+                const r = el.getBoundingClientRect();
+                return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+            }""")
+
+    for fraction in (0.5, 1):
+        viewer.evaluate(
+            "(el, fraction) => { el.scrollTop = el.scrollHeight * fraction; }", fraction
+        )
+        assert viewer.evaluate("el => el.scrollTop > 1000")
+        check_controls()
+    if width > 600:
+        viewer.locator("#ws-viewer-full").click()
+        expect(viewer.locator("#ws-viewer-full")).to_have_attribute("aria-pressed", "true")
+        check_controls()
+    page.screenshot(path=f"reports/viewer-sticky-controls-{width}.png")
+    viewer.get_by_role("tab", name="Diff", exact=True).click()
+    expect(viewer.locator(".ws-add")).to_be_visible()
+    viewer.get_by_role("tab", name="Transcript", exact=True).click()
+    expect(viewer.locator(".ws-assistant")).to_have_count(70)
+    viewer.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    check_controls()
+    viewer.get_by_role("button", name="Close workspace viewer").click()
+    expect(viewer).to_be_hidden()
+
+
 def test_viewer_fills_a_phone_without_zooming_its_fields(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})

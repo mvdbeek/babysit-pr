@@ -141,6 +141,7 @@ header p {
   border: 2px solid #fcfdf9;
 }
 #notifications-dialog {
+  --dialog-padding: 20px;
   position: fixed;
   inset: 72px max(16px, 5%) auto auto;
   margin: 0;
@@ -167,6 +168,9 @@ header p {
 .notifications-heading h2 {
   margin: 0;
   font-size: 19px;
+}
+#notifications-seen {
+  margin-top: 12px;
 }
 #notifications-close {
   font-size: 23px;
@@ -1154,9 +1158,6 @@ button:disabled {
 #workspace-dialog::backdrop {
   background: #0008;
 }
-#workspace-close {
-  float: right;
-}
 #workspace-dialog form {
   display: grid;
   gap: 10px;
@@ -1408,12 +1409,31 @@ button:disabled {
 #ci-dialog::backdrop {
   background: #0008;
 }
-#ci-close {
-  float: right;
+.dialog-header {
+  position: sticky;
+  top: calc(-1 * var(--dialog-padding, 24px));
+  z-index: 2;
+  margin: calc(-1 * var(--dialog-padding, 24px)) calc(-1 * var(--dialog-padding, 24px)) 16px;
+  padding: var(--dialog-padding, 24px);
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
 }
-#ci-title {
+.dialog-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.dialog-heading h2 {
+  min-width: 0;
+  margin: 0;
   overflow-wrap: anywhere;
-  margin-right: 70px;
+}
+.dialog-heading button {
+  flex: none;
+}
+#ci-links:not(:empty) {
+  margin-top: 12px;
 }
 #ci-meta,
 .ci-item small {
@@ -1746,6 +1766,15 @@ button:disabled {
   .pr-table-wrap {
     max-height: none;
     overflow: visible;
+  }
+  .batch-bar {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    margin-inline: -12px;
+    padding: 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg);
   }
   .pr-table:not(.ws-table) tr {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
