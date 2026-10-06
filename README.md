@@ -364,6 +364,15 @@ that to Safehouse's `--enable` list, which opens the Docker daemon socket to tha
 agent. Agents started without it keep Safehouse's default deny on container sockets.
 The operation records `docker` (false for reopen).
 
+Follow-up messages always enable Docker. An exited session resumes with Docker enabled.
+For a running agent, the dashboard checks its Safehouse Docker socket grants. If absent,
+it quits and resumes the exact conversation in the same pane and directory, preserving
+supported launch options, then supplies the message once. Agents with Docker access
+receive messages directly. A busy agent, blocked dialog, unsent composer draft, unknown
+launch option, changed session, or watcher-owned session prevents the restart and keeps
+the dashboard draft. Docker permission inspection requires macOS Seatbelt; inspection
+failure leaves the agent untouched. This grants socket access; it does not start Docker.
+
 Codex choices come from picker-visible entries and supported reasoning levels in
 `$CODEX_HOME/models_cache.json` (normally `~/.codex/models_cache.json`). This is a
 read-only, local cache: the dashboard never starts a Codex session to discover
