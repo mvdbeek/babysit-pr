@@ -946,7 +946,10 @@
           placeholder="Follow-up instructions; diff comments are sent with them"
         ></textarea>
         <div id="ws-message-files"></div>
-        <small>Docker access is enabled when sending. An idle agent may restart to apply it.</small>
+        <div id="ws-docker" hidden>
+          <label><input id="ws-docker-enabled" type="checkbox" /> Docker access</label>
+          <small id="ws-docker-status" role="status"></small>
+        </div>
         <div class="ws-message-actions">
           <div id="ws-message-agent"></div>
           <button id="ws-message-send" type="submit">Send to agent</button>

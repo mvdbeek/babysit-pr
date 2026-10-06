@@ -4247,3 +4247,65 @@ def test_a_draft_for_another_checkout_is_discarded(page, dashboard_site, viewer_
     )
     expect(page.locator("#ws-message-comments")).to_be_empty()
     expect(page.locator("#ws-message-text")).to_have_value("")
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_docker_checkbox_reads_and_changes_selected_agent_without_sending(
+    page, dashboard_site, viewer_routes, width
+):
+    for index, agent in enumerate(viewer_routes["agents"]):
+        agent.update(session=f"session-{index}", docker=bool(index))
+    changes = []
+
+    def toggle(route):
+        body = route.request.post_data_json
+        assert route.request.headers["x-babysit-action"] == "workspace-docker"
+        changes.append(body)
+        agent = next(a for a in viewer_routes["agents"] if a["pane"] == body["pane"])
+        agent["docker"] = body["enabled"]
+        route.fulfill(json={"pane": body["pane"], "docker": body["enabled"], "warning": None})
+
+    page.route("**/api/workspace-docker", toggle)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(dashboard_site[0] + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    checkbox = viewer.get_by_role("checkbox", name="Docker access", exact=True)
+    expect(checkbox).to_be_enabled()
+    expect(checkbox).not_to_be_checked()
+    viewer.get_by_label("Message the agent").fill("Keep this draft")
+    checkbox.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Docker access enabled.")
+    expect(checkbox).to_be_checked()
+    viewer.get_by_label("Agent", exact=True).select_option("w1:p2")
+    expect(checkbox).to_be_checked()
+    checkbox.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Docker access disabled.")
+    expect(checkbox).not_to_be_checked()
+    expect(viewer.get_by_label("Message the agent")).to_have_value("Keep this draft")
+    assert not viewer_routes["sent"]
+    assert changes == [
+        {"workspace": "w1", "pane": "w1:p1", "session": "session-0", "enabled": True},
+        {"workspace": "w1", "pane": "w1:p2", "session": "session-1", "enabled": False},
+    ]
+    # A refused change re-reads the actual state without clearing the draft.
+    page.route(
+        "**/api/workspace-docker",
+        lambda route: route.fulfill(status=400, json={"error": "Wait until the agent is idle"}),
+    )
+    checkbox.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Wait until the agent is idle")
+    expect(checkbox).not_to_be_checked()
+    expect(viewer.get_by_label("Message the agent")).to_have_value("Keep this draft")
+    page.screenshot(path=f"reports/docker-checkbox-{width}.png")
+
+
+def test_unknown_docker_access_is_indeterminate_and_disabled(page, dashboard_site, viewer_routes):
+    viewer_routes["agents"][0].update(session="s1", docker=None, docker_error="Policy unavailable")
+    page.goto(dashboard_site[0] + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    checkbox = page.get_by_role("checkbox", name="Docker access", exact=True)
+    expect(checkbox).to_be_disabled()
+    expect(checkbox).to_have_js_property("indeterminate", True)
+    expect(page.locator("#ws-docker-status")).to_have_text("Policy unavailable")
+    expect(page.get_by_role("button", name="Send to agent")).to_be_enabled()

@@ -1072,6 +1072,7 @@ def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
                     "status": "idle",
                     "title": None,
                     "session": None,
+                    "docker": True,
                 }
             ]
             assert value["path"].endswith("merged-work") and value["sessions"] == []
@@ -1213,10 +1214,10 @@ def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
     pane = data["panes"][-1]["pane_id"]
     assert value == {"sent": True, "pane": pane, "resumed": sid, "warning": None}
     assert [run[0] for run in data["runs"]] == [pane]
-    assert data["runs"][0][1].startswith(f'SAFE_ENABLE=docker claude --resume {sid} -- "$(cat ')
+    assert data["runs"][0][1].startswith(f'claude --resume {sid} -- "$(cat ')
     agent = data["agents"][0]
     assert agent["argv"] == ["--resume", sid, "--", "Now add docs"]
-    assert agent["safe_enable"] == "docker"
+    assert not agent.get("safe_enable")
     assert Path(agent["cwd"]).resolve() == checkout.resolve()
     # The staged prompt is removed once the agent has read it.
     assert not list((home / "message-prompts").iterdir())
@@ -1663,3 +1664,22 @@ def test_a_message_with_an_attached_file_gives_the_agent_its_path(site, tmp_path
         finally:
             httpd.shutdown()
             thread.join(5)
+
+
+def test_docker_action_uses_dashboard_post_protections(server, monkeypatch):
+    import agent_messages
+
+    port, _ = server
+    calls = []
+
+    def change(body, home):
+        calls.append(body)
+        return {"pane": body["pane"], "docker": body["enabled"], "warning": None}
+
+    monkeypatch.setattr(agent_messages, "set_docker", change)
+    body = {"workspace": "w1", "pane": "w1:p1", "session": "s1", "enabled": False}
+    status, _ = request(port, "/api/workspace-docker", body, action="")
+    assert status == 403 and not calls
+    status, value = request(port, "/api/workspace-docker", body, action="workspace-docker")
+    assert status == 200 and value["docker"] is False
+    assert calls == [body]

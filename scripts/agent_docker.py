@@ -30,9 +30,9 @@ def has_access(pid):
             for operation in (b"file-read-data", b"file-write-data")
         ]
     except (OSError, AttributeError, ValueError) as exc:
-        raise ValueError("Could not inspect the agent's Docker access; nothing was sent") from exc
+        raise ValueError("Could not inspect the agent's Docker access") from exc
     if any(result < 0 for result in results):
-        raise ValueError("Could not inspect the agent's Docker access; nothing was sent")
+        raise ValueError("Could not inspect the agent's Docker access")
     return all(result == 0 for result in results)
 
 
@@ -105,7 +105,7 @@ def resume_options(argv, kind, session):
     return kept
 
 
-def launcher(procs, proc):
+def launcher(procs, proc, enabled=True):
     """Reuse the original Safehouse invocation, avoiding shell-wrapper flag duplication."""
     for parent in procs["foreground_processes"]:
         argv = parent.get("argv", [])
@@ -130,7 +130,25 @@ def launcher(procs, proc):
         prefix = argv[start:command]
         if prefix[-1] == "--":
             prefix = prefix[:-1]
-        return [*prefix, "--enable=docker", "--", proc["argv"][0]]
+        # Remove Docker from repeated --enable lists, preserving other grants.
+        updated = []
+        removed = False
+        words = iter(prefix)
+        for word in words:
+            if word == "--enable" or word.startswith("--enable="):
+                value = next(words) if word == "--enable" else word.split("=", 1)[1]
+                features = value.split(",")
+                kept = [feature for feature in features if feature.strip().lower() != "docker"]
+                removed |= len(kept) != len(features)
+                if kept:
+                    updated.append("--enable=" + ",".join(kept))
+            else:
+                updated.append(word)
+        if not enabled and not removed:
+            raise ValueError("Docker access comes from another policy; change it in Collie")
+        if enabled:
+            updated.append("--enable=docker")
+        return [*updated, "--", proc["argv"][0]]
     raise ValueError("Could not preserve the agent's Safehouse launch; restart it in Collie")
 
 
@@ -143,14 +161,14 @@ def inspect(target):
     return info, procs, state, proc
 
 
-def prepare(target, info, procs, state, proc):
+def prepare(target, info, procs, state, proc, enabled=True):
     session = (info.get("agent_session") or {}).get("value")
     if not session or session != target.get("session"):
         raise ValueError("Could not verify the current conversation; refresh before sending")
     if proc["pid"] == procs["shell_pid"]:
         raise ValueError("The agent is the pane's root process; restart it in Collie")
     if info.get("agent_status") not in {"idle", "done"}:
-        raise ValueError("The agent needs Docker access; wait until it is idle before sending")
+        raise ValueError("Wait until the agent is idle before changing Docker access")
     if state.get("state_change_seq") is None:
         raise ValueError("Could not verify the agent's state; refresh before sending")
     record = {
@@ -167,7 +185,7 @@ def prepare(target, info, procs, state, proc):
     }
     if not Path(record["cwd"]).is_dir():
         raise ValueError("The agent's directory no longer exists")
-    record["launcher"] = launcher(procs, proc)
+    record["launcher"] = launcher(procs, proc, enabled)
     record["options"] = resume_options(proc["argv"], info["agent"], session)
     handoff.verify_screen(record, info, handoff.read_screen(target["pane"]))
     return record

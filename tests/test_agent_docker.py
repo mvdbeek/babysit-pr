@@ -64,6 +64,7 @@ def rig(request, tmp_path, monkeypatch):
         calls=calls,
         stuck=False,
         kind=kind,
+        access=False,
     )
     monkeypatch.setattr(docker, "_exiting", set())
     monkeypatch.setattr(
@@ -72,11 +73,14 @@ def rig(request, tmp_path, monkeypatch):
         lambda pane: (copy.deepcopy(info), copy.deepcopy(procs), copy.deepcopy(state)),
     )
     monkeypatch.setattr(docker.handoff, "read_screen", lambda pane: rig.screen)
-    monkeypatch.setattr(docker, "has_access", lambda pid: False)
+    monkeypatch.setattr(docker, "has_access", lambda pid: rig.access)
     monkeypatch.setattr(docker, "EXIT_WAIT", 0)
 
     def send(*args):
         calls.append(args)
+        if args[:3] == ("herdr", "pane", "run"):
+            procs["foreground_processes"] = [safehouse, proc]
+            rig.access = "--enable=docker" in args[-1]
         if args[:2] == ("agent", "send-keys") and not rig.stuck:
             procs["foreground_processes"] = [{"pid": 100}]
 
@@ -107,8 +111,8 @@ def rig(request, tmp_path, monkeypatch):
 
 
 def test_restart_preserves_session_pane_cwd_options_and_enables_docker(rig, tmp_path):
-    value = messages.deliver(rig.target, "New task; $(do not execute)\nnext", tmp_path)
-    assert value == {"sent": True, "pane": "w1:p1", "resumed": SID, "warning": None}
+    value = messages.change_docker(rig.target, True, tmp_path)
+    assert value == {"docker": True, "pane": "w1:p1", "warning": None}
     if rig.kind == "codex":
         assert rig.calls[0] == ("agent", "send-keys", "w1:p1", "ctrl+d")
     else:
@@ -122,24 +126,27 @@ def test_restart_preserves_session_pane_cwd_options_and_enables_docker(rig, tmp_
     assert f"--append-profile /fixture/extra.sb --enable=docker -- {rig.kind} " in command
     assert command.count(rig.proc["argv"][1]) == 1
     assert rig.proc["argv"][1] in command and "--model fixture" in command
-    assert SID in command and "old prompt" not in command and "do not execute" not in command
+    assert SID in command and "old prompt" not in command and "$(cat" not in command
     assert not list((tmp_path / "message-prompts").iterdir())
 
 
-def test_existing_access_sends_directly_even_while_working(rig, tmp_path, monkeypatch):
+def test_matching_access_does_not_restart_even_while_working(rig, tmp_path, monkeypatch):
     rig.info["agent_status"] = "working"
     monkeypatch.setattr(docker, "has_access", lambda pid: True)
-    monkeypatch.setattr(messages, "prompt", lambda target, text: {"sent": True})
-    assert messages.deliver(rig.target, "go", tmp_path) == {"sent": True}
+    assert messages.change_docker(rig.target, True, tmp_path) == {
+        "pane": "w1:p1",
+        "docker": True,
+        "warning": None,
+    }
     assert not rig.calls
 
 
 @pytest.mark.parametrize(
-    "problem", ["working", "draft", "session", "root", "watch", "unrecorded", "option"]
+    "problem", ["working", "blocked", "draft", "session", "root", "watch", "unrecorded", "option"]
 )
 def test_unsafe_restart_keeps_the_agent_and_message_untouched(rig, tmp_path, monkeypatch, problem):
-    if problem == "working":
-        rig.info["agent_status"] = "working"
+    if problem in {"working", "blocked"}:
+        rig.info["agent_status"] = problem
     elif problem == "draft":
         rig.screen = "› my unfinished message"
     elif problem == "session":
@@ -153,17 +160,17 @@ def test_unsafe_restart_keeps_the_agent_and_message_untouched(rig, tmp_path, mon
     else:
         rig.proc["argv"].insert(1, "--unknown")
     with pytest.raises(ValueError):
-        messages.deliver(rig.target, "go", tmp_path)
+        messages.change_docker(rig.target, True, tmp_path)
     assert not rig.calls
 
 
 def test_failed_exit_is_never_repeated_and_never_resumes(rig, tmp_path):
     rig.stuck = True
     with pytest.raises(ValueError, match="Exit unconfirmed"):
-        messages.deliver(rig.target, "go", tmp_path)
+        messages.change_docker(rig.target, True, tmp_path)
     calls = list(rig.calls)
     with pytest.raises(ValueError, match="already attempted"):
-        messages.deliver(rig.target, "go", tmp_path)
+        messages.change_docker(rig.target, True, tmp_path)
     assert rig.calls == calls
     assert not any(c[:3] == ("herdr", "pane", "run") for c in rig.calls)
 
@@ -237,10 +244,10 @@ def test_an_unverified_replacement_is_uncertain_and_cannot_be_relaunched(
         messages, "agents", lambda wid: [{"pane": "w1:p1", "session": "wrong", "agent": rig.kind}]
     )
     monkeypatch.setattr(messages, "RESUME_WAIT", 0.01)
-    value = messages.deliver(rig.target, "go", tmp_path)
-    assert value["sent"] and "not confirmed" in value["warning"]
+    value = messages.change_docker(rig.target, True, tmp_path)
+    assert value["docker"] is None and "not confirmed" in value["warning"]
     assert SID in messages._recent
-    assert len(list((tmp_path / "message-prompts").iterdir())) == 1
+    assert not list((tmp_path / "message-prompts").iterdir())
 
 
 def test_original_safehouse_profile_options_survive_the_restart(rig):
@@ -255,3 +262,76 @@ def test_original_safehouse_profile_options_survive_the_restart(rig):
     rig.procs["foreground_processes"] = [rig.proc]
     with pytest.raises(ValueError, match="preserve.*Safehouse"):
         docker.launcher(rig.procs, rig.proc)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--enable=docker"],
+        ["--enable", "docker,ssh", "--enable=docker,playwright-chrome"],
+    ],
+)
+def test_disabling_removes_docker_and_preserves_other_grants(rig, tmp_path, flags):
+    rig.access = True
+    rig.procs["foreground_processes"][0]["argv"][2:2] = flags
+    result = messages.change_docker(rig.target, False, tmp_path)
+    assert result == {"pane": "w1:p1", "docker": False, "warning": None}
+    command = rig.calls[-1][-1]
+    assert "docker" not in command.split(" && ", 1)[1]
+    assert "--enable=playwright-chrome" in command
+    assert "--append-profile /fixture/extra.sb" in command
+    assert "$(cat" not in command
+    if "ssh" in ",".join(flags):
+        assert "--enable=ssh" in command
+
+
+def test_uncontrolled_docker_grant_is_not_claimed_to_be_disabled(rig, tmp_path):
+    rig.access = True
+    with pytest.raises(ValueError, match="another policy"):
+        messages.change_docker(rig.target, False, tmp_path)
+    assert not rig.calls
+
+
+def test_send_does_not_inspect_or_change_docker(rig, tmp_path, monkeypatch):
+    rig.target["status"] = "working"
+    monkeypatch.setattr(messages, "agents", lambda wid: [rig.target])
+    monkeypatch.setattr(messages, "herdr", lambda *args: rig.calls.append(args))
+    result = messages.send({"workspace": "w1", "pane": "w1:p1", "text": "go"}, tmp_path)
+    assert result["sent"]
+    assert len(rig.calls) == 1 and rig.calls[0][:2] == ("agent", "prompt")
+    assert not rig.access
+
+
+@pytest.mark.parametrize("enabled", [False, True, None])
+def test_status_reports_current_access_or_unknown(rig, monkeypatch, enabled):
+    def access(pid):
+        if enabled is None:
+            raise ValueError("Policy unavailable")
+        return enabled
+
+    monkeypatch.setattr(docker, "has_access", access)
+    result = messages.docker_status("w1")[0]
+    assert result["docker"] is enabled
+    if enabled is None:
+        assert result["docker_error"] == "Policy unavailable"
+    assert not rig.calls
+
+
+@pytest.mark.parametrize(
+    "field,value", [("enabled", "false"), ("session", "other"), ("pane", "other")]
+)
+def test_toggle_rejects_invalid_or_stale_requests(rig, tmp_path, field, value):
+    request = {"workspace": "w1", "pane": "w1:p1", "session": SID, "enabled": True}
+    request[field] = value
+    with pytest.raises(ValueError):
+        messages.set_docker(request, tmp_path)
+    assert not rig.calls
+
+
+def test_toggle_checks_access_after_restart(rig, tmp_path, monkeypatch):
+    monkeypatch.setattr(docker, "has_access", lambda pid: False)
+    result = messages.set_docker(
+        {"workspace": "w1", "pane": "w1:p1", "session": SID, "enabled": True}, tmp_path
+    )
+    assert result["docker"] is False
+    assert "did not match" in result["warning"]

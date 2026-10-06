@@ -272,6 +272,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-open",
                 "workspace-message",
                 "workspace-answer",
+                "workspace-docker",
                 "workspace-prompt-forget",
                 "attachment-upload",
                 "sentry-action",
@@ -368,6 +369,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.send(request, self.server.home))
                 except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     self.send_json(503, {"error": f"Nothing was typed: {exc}"})
+                return
+            if action == "workspace-docker":
+                try:
+                    self.send_json(200, agent_messages.set_docker(request, self.server.home))
+                except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
+                    self.send_json(503, {"error": f"Check Docker access in Collie: {exc}"})
                 return
             if action == "workspace-answer":
                 try:
@@ -515,7 +522,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(
                     200,
                     {
-                        "agents": agent_messages.agents(workspace_id),
+                        "agents": agent_messages.docker_status(workspace_id),
                         "sessions": agent_messages.sessions(workspace_id, self.server.home),
                         # A draft names its checkout, so a reused workspace ID cannot
                         # deliver another checkout's comments.
