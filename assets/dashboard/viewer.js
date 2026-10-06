@@ -934,6 +934,7 @@
   let draft = null;
   let agents = [];
   let sessions = [];
+  let changingDocker = false;
   let sending = false; // A send in flight keeps the button disabled through refreshes.
   let files = null; // The composer's attachments, kept with the draft.
   function draftKey(entry) {
@@ -1032,12 +1033,13 @@
     const send = byId("ws-message-send");
     send.textContent = "Send to agent";
     send.disabled = true;
+    byId("ws-docker").hidden = true;
     if (message) {
       holder.append(node("small", message, "pr-meta"));
       return;
     }
     if (agents.length) {
-      send.disabled = sending;
+      send.disabled = sending || changingDocker;
       holder.append(
         agents.length === 1
           ? node("small", `To ${agentLabel(agents[0])}`, "pr-meta")
@@ -1045,9 +1047,10 @@
               "Agent",
               agents.map((agent) => [agent.pane, agentLabel(agent)]),
               keep(agents.map((agent) => agent.pane)),
-              () => {},
+              renderDocker,
             ),
       );
+      renderDocker();
       return;
     }
     if (!sessions.length) {
@@ -1056,7 +1059,7 @@
       );
       return;
     }
-    send.disabled = sending;
+    send.disabled = sending || changingDocker;
     send.textContent = "Resume and send";
     holder.append(
       node("small", "No agent is running; the message resumes this session:", "pr-meta"),
@@ -1072,6 +1075,64 @@
       ),
     );
   }
+  function selectedAgent() {
+    const picked = byId("ws-message-agent").querySelector("select")?.value;
+    return agents.find((agent) => agent.pane === picked) || agents[0];
+  }
+  function renderDocker() {
+    const agent = selectedAgent();
+    byId("ws-docker").hidden = !agent;
+    if (!agent) return;
+    const checkbox = byId("ws-docker-enabled");
+    const known = typeof agent.docker === "boolean";
+    checkbox.checked =
+      changingDocker && changingDocker.pane === agent.pane
+        ? changingDocker.enabled
+        : agent.docker === true;
+    checkbox.indeterminate = !known;
+    checkbox.disabled = changingDocker || sending || !known || !agent.session;
+    byId("ws-docker-status").textContent = changingDocker
+      ? "Applying Docker access…"
+      : !known
+        ? agent.docker_error || "Docker access is unknown."
+        : "Changes require an idle agent and restart its session.";
+  }
+  byId("ws-docker-enabled").onchange = async (event) => {
+    const agent = selectedAgent();
+    if (!viewer || !agent || changingDocker || sending) return;
+    const entry = viewer.entry;
+    const enabled = event.target.checked;
+    changingDocker = { pane: agent.pane, enabled };
+    renderAgents();
+    const status = byId("ws-message-status");
+    try {
+      const response = await fetch("/api/workspace-docker", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-docker" },
+        body: JSON.stringify({
+          workspace: entry.workspace,
+          pane: agent.pane,
+          session: agent.session,
+          enabled,
+        }),
+      });
+      const value = await response.json();
+      if (viewer?.entry !== entry) return;
+      if (value.error) status.textContent = value.error;
+      else {
+        agent.docker = value.docker;
+        status.textContent =
+          value.warning || `Docker access ${value.docker ? "enabled" : "disabled"}.`;
+      }
+    } catch {
+      if (viewer?.entry === entry)
+        status.textContent =
+          "Docker access change could not be confirmed; refresh or check Collie.";
+    } finally {
+      changingDocker = false;
+      if (viewer?.entry.workspace) await fetchAgents(viewer.entry);
+    }
+  };
   function removeComment(id) {
     draft.comments = draft.comments.filter((comment) => comment.id !== id);
     saveDraft();
@@ -1201,7 +1262,7 @@
   }
   async function sendMessage(event) {
     event.preventDefault();
-    if (!viewer || !draft || sending) return;
+    if (!viewer || !draft || sending || changingDocker) return;
     const entry = viewer.entry;
     const comments = [...draft.comments];
     const message = byId("ws-message-text").value;
@@ -1231,6 +1292,7 @@
     };
     sending = true;
     byId("ws-message-send").disabled = true;
+    renderDocker();
     status.textContent = body.resume ? "Resuming the session…" : "Sending…";
     try {
       const value = await deliver(body);

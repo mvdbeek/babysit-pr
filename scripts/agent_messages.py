@@ -2,8 +2,8 @@
 
 A message goes to one agent pane of the named workspace through `herdr agent prompt`,
 which types it and presses Enter only while the pane hosts a recognized agent, so text
-never reaches a plain shell. Nothing is sent to an agent waiting on a dialog, and a
-running agent without Docker access is gracefully restarted once idle.
+never reaches a plain shell. Nothing is sent to an agent waiting on a dialog, and
+sending does not change the agent's Docker access.
 
 When no agent runs there (usually it exited after finishing), the message can instead
 resume one of the sessions recorded in that checkout: the agent's own resume command,
@@ -121,21 +121,56 @@ def send(request, home=None):
     if target is None:
         raise ValueError("That agent is no longer running; refresh")
     with _resume_lock:
-        return deliver(target, text, home)
+        return prompt(target, text)
 
 
-def deliver(target, text, home):
-    """Ensure Docker access before delivering a follow-up to an existing session."""
-    if target["status"] == "blocked":
-        raise ValueError("The agent is waiting on a question or approval; answer it in Collie")
+def docker_status(workspace_id):
+    """Report observed access; a failed probe must never look like disabled access."""
+    result = agents(workspace_id)
+    for target in result:
+        target["docker"] = None
+        try:
+            info, _, _, proc = agent_docker.inspect(target)
+            if (info.get("agent_session") or {}).get("value") != target["session"]:
+                raise ValueError("The agent changed; refresh")
+            target["docker"] = agent_docker.has_access(proc["pid"])
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            target["docker_error"] = str(exc)
+    return result
+
+
+def set_docker(request, home=None):
+    """Change access independently of sending, for exactly the selected session."""
+    if set(request) != {"workspace", "pane", "session", "enabled"} or not (
+        isinstance(request["enabled"], bool)
+        and all(
+            isinstance(request[k], str) and request[k] for k in ("workspace", "pane", "session")
+        )
+    ):
+        raise ValueError("Invalid Docker access parameters")
+    with _resume_lock:
+        target = next(
+            (a for a in agents(request["workspace"]) if a["pane"] == request["pane"]), None
+        )
+        if target is None or target.get("session") != request["session"]:
+            raise ValueError("That session is no longer running in this pane; refresh")
+        return change_docker(target, request["enabled"], home)
+
+
+def change_docker(target, enabled, home):
+    """Restart an idle agent with the requested access, without submitting a prompt."""
     try:
         info, procs, state, proc = agent_docker.inspect(target)
-        if agent_docker.has_access(proc["pid"]):
-            return prompt(target, text)
-        record = agent_docker.prepare(target, info, procs, state, proc)
+        if (info.get("agent_session") or {}).get("value") != target.get("session"):
+            raise ValueError("The agent changed; refresh")
+        if agent_docker.has_access(proc["pid"]) == enabled:
+            return {"pane": target["pane"], "docker": enabled, "warning": None}
+        record = agent_docker.prepare(target, info, procs, state, proc, enabled)
         session_id = record["session_id"]
         if not workspace_viewer.SESSION.fullmatch(session_id):
-            raise ValueError("Could not verify the current conversation; refresh before sending")
+            raise ValueError(
+                "Could not verify the current conversation; refresh before changing Docker access"
+            )
         owner = watch_owner(session_id, record["agent"], home)
         if owner:
             raise ValueError(f"Not restarted: {owner}")
@@ -152,18 +187,33 @@ def deliver(target, text, home):
             None,
         )
         if chosen is None:
-            raise ValueError("The current session is not recorded yet; wait before sending")
+            raise ValueError(
+                "The current session is not recorded yet; wait before changing Docker access"
+            )
         agent_docker.quit_agent(record)
-        return launch(
+        result = launch(
             info["workspace_id"],
             chosen,
             target["pane"],
-            text,
+            "",
             home,
             options=record["options"],
             cwd=record["cwd"],
             launcher=record["launcher"],
         )
+        observed = None
+        if not result["warning"]:
+            try:
+                current, _, _, proc = agent_docker.inspect(target)
+                if (current.get("agent_session") or {}).get("value") == target["session"]:
+                    observed = agent_docker.has_access(proc["pid"])
+            except (ValueError, RuntimeError, OSError, subprocess.SubprocessError):
+                pass  # The restart happened; report uncertainty, never imply no action.
+            if observed != enabled:
+                result["warning"] = (
+                    "Docker access did not match the requested setting; check Collie."
+                )
+        return {"pane": target["pane"], "docker": observed, "warning": result["warning"]}
     except RuntimeError as exc:
         raise ValueError(str(exc)) from exc
 
@@ -456,7 +506,7 @@ def resume(workspace_id, session_id, text, home):
         elsewhere = open_elsewhere(session_id)
         if elsewhere:
             # Already running in another workspace: talk to that agent, never a second one.
-            return deliver(elsewhere, text, home)
+            return prompt(elsewhere, text)
         owner = watch_owner(session_id, chosen["agent"], home)
         if owner:
             raise ValueError(f"Not resumed: {owner}")
@@ -480,7 +530,7 @@ def resume(workspace_id, session_id, text, home):
 
 
 def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None):
-    """Resume once with Docker enabled, into a fresh or verified empty shell pane."""
+    """Resume once into a fresh or verified empty shell pane, optionally with a prompt."""
     session_id = chosen["id"]
     # The prompt is read back from a private file, as launches do: a typed line has
     # a length ceiling, and command-substitution output needs no escaping.
@@ -488,14 +538,14 @@ def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, laun
     prompts.mkdir(mode=0o700, parents=True, exist_ok=True)
     prune(prompts)
     staged = prompts / f"resume-{uuid.uuid4()}"
-    descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(text + "\n")
+    if text:
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text + "\n")
     command = wt.agent_command(
         chosen["agent"],
         text,
         extra=[*options, *RESUME[chosen["agent"]], chosen["id"]],
-        docker=launcher is None,
         stage=lambda _: str(staged),
     )
     if launcher:
