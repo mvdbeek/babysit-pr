@@ -3769,6 +3769,87 @@ def test_questions_render_as_cards_and_a_waiting_one_is_answered_here(
     ]
 
 
+@pytest.mark.parametrize("width", [390, 1280])
+def test_missing_question_is_answerable_without_the_transcript(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        session="live-session",
+        interaction={
+            "screen": "A live terminal question",
+            "question": question_entry([QUESTION], id="screen:question"),
+        },
+    )
+    viewer_routes["agents"] = [agent]
+    answers = []
+
+    def answer(route):
+        answers.append(route.request.post_data_json)
+        agent.update(status="working", interaction=None)
+        route.fulfill(json={"answered": True, "pane": "w1:p2"})
+
+    page.route("**/api/workspace-answer", answer)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    # The visible transcript belongs to s1 and has no pending question at all.
+    interaction = page.locator("#ws-agent-interaction")
+    expect(interaction).to_contain_text("Live question from the agent")
+    send = page.get_by_role("button", name="Send to agent")
+    expect(send).to_be_disabled()
+    page.get_by_label("Message the agent").fill("Restart, then open the PR")
+    interaction.get_by_label("Other answer to: Merge").fill("Restart only")
+    page.locator("#ws-viewer").get_by_role("button", name="Refresh", exact=True).click()
+    expect(interaction.get_by_label("Other answer to: Merge")).to_have_value("Restart only")
+    assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
+    interaction.screenshot(path=f"reports/live-question-{width}.png")
+    interaction.get_by_role("button", name="Answer in w1:p2").click()
+    expect(interaction.locator(".ws-answer-status")).to_have_text("Answered in w1:p2.")
+    assert answers == [
+        {
+            "workspace": "w1",
+            "pane": "w1:p2",
+            "session": "live-session",
+            "tool": "screen:question",
+            "answers": [{"text": "Restart only"}],
+        }
+    ]
+    expect(send).to_be_enabled()
+    expect(interaction).to_be_empty()
+    expect(page.get_by_label("Message the agent")).to_have_value("Restart, then open the PR")
+    send.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p2.")
+
+
+def test_blocked_agent_selection_shows_unsupported_dialog(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    viewer_routes["agents"][1].update(
+        status="blocked",
+        interaction={
+            "screen": "Allow this command? <img src=x onerror=alert(1)>" + "x" * 200,
+            "question": None,
+        },
+    )
+    page.set_viewport_size({"width": 390, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    send = page.get_by_role("button", name="Send to agent")
+    expect(send).to_be_enabled()
+    page.get_by_label("Agent", exact=True).select_option("w1:p2")
+    expect(send).to_be_disabled()
+    interaction = page.locator("#ws-agent-interaction")
+    expect(interaction).to_contain_text("Allow this command? <img")
+    expect(interaction.locator("img")).to_have_count(0)
+    expect(interaction).to_contain_text("Answer this dialog in Collie")
+    assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
+    page.get_by_label("Agent", exact=True).select_option("w1:p1")
+    expect(send).to_be_enabled()
+    expect(interaction).to_be_empty()
+
+
 def test_a_question_without_its_waiting_agent_is_answered_in_the_terminal(
     page, dashboard_site, viewer_routes
 ):

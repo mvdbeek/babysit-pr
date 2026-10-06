@@ -515,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(
                     200,
                     {
-                        "agents": agent_messages.agents(workspace_id),
+                        "agents": agent_messages.agents(workspace_id, interactions=True),
                         "sessions": agent_messages.sessions(workspace_id, self.server.home),
                         # A draft names its checkout, so a reused workspace ID cannot
                         # deliver another checkout's comments.

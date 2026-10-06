@@ -14,6 +14,7 @@ never resumed again.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -58,13 +59,13 @@ def clean(text):
     return CONTROL.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def agents(workspace_id):
+def agents(workspace_id, interactions=False):
     """The agents running in a herdr workspace, for choosing whom to message.
 
     Only a workspace on a Git checkout qualifies, the same ones the viewer shows.
     """
     workspace_viewer.workspace_checkout(workspace_id)  # Validates the workspace exists.
-    return [
+    found = [
         {
             "pane": agent["pane_id"],
             "agent": agent.get("agent"),
@@ -76,6 +77,14 @@ def agents(workspace_id):
         for agent in herdr("agent", "list")["agents"]
         if agent.get("workspace_id") == workspace_id and agent.get("pane_id")
     ]
+    if interactions:
+        for agent in found:
+            if agent["status"] == "blocked":
+                try:
+                    agent["interaction"] = live_interaction(agent)
+                except (ValueError, subprocess.SubprocessError):
+                    agent["interaction"] = None
+    return found
 
 
 def sessions(workspace_id, home=None):
@@ -169,6 +178,65 @@ def squash(text):
     return " ".join(text.split())
 
 
+def live_interaction(target):
+    """Expose a blocked pane even when its pending tool is absent from the transcript.
+
+    Only a complete, single-choice, single-question Claude dialog can be answered
+    from the screen. Other dialogs remain visible without guessing their controls.
+    """
+    screen = run("herdr", "agent", "read", target["pane"], "--source", "visible")
+    result = {"screen": screen, "question": None}
+    if target["agent"] != "claude" or not target.get("session"):
+        return result
+    lines = screen.splitlines()
+    rules = [i for i, line in enumerate(lines) if RULE.match(line)]
+    if len(rules) < 2 or "Esc to cancel" not in screen or "ctrl+g to edit" in screen:
+        return result
+    start, end = rules[-2:]
+    body = lines[start + 1 : end]
+    if not body or "Chat about this" not in "\n".join(lines[end + 1 :]):
+        return result
+    body = [line for line in body if line.strip()]
+    if not body or not re.fullmatch(r"\s*☐\s+[^☐✔←→]+", body[0]):
+        return result
+    numbered = []
+    for index, line in enumerate(body[1:], 1):
+        match = re.fullmatch(r"\s*(?:❯\s*)?(\d)\.\s+(.+?)\s*", line)
+        if match:
+            numbered.append((index, int(match[1]), match[2]))
+    if (
+        len(numbered) < 2
+        or numbered[-1][2] != "Type something."
+        or [n for _, n, _ in numbered] != list(range(1, len(numbered) + 1))
+        or len(numbered) > 9
+        or any(label.startswith("[") for _, _, label in numbered)
+    ):
+        return result
+    question = {
+        "header": body[0].strip().removeprefix("☐").strip(),
+        "question": squash(" ".join(body[1 : numbered[0][0]])),
+        "multi": False,
+        "options": [
+            {
+                "label": label,
+                "description": squash(" ".join(body[index + 1 : numbered[i + 1][0]])),
+            }
+            for i, (index, _, label) in enumerate(numbered[:-1])
+        ],
+    }
+    if not question["question"]:
+        return result
+    signature = hashlib.sha256(json.dumps(question, sort_keys=True).encode()).hexdigest()
+    result["question"] = {
+        "id": f"screen:{signature}",
+        "name": "AskUserQuestion",
+        "role": "tool",
+        "questions": [question],
+        "output": None,
+    }
+    return result
+
+
 def dialog(pane):
     """The question dialog on the pane's screen, whitespace collapsed.
 
@@ -257,12 +325,21 @@ def answer(request):
         raise ValueError("That Claude session is no longer running in this pane; refresh")
     if target["status"] != "blocked":
         raise ValueError("The agent is not waiting on a question; refresh")
-    root = workspace_viewer.workspace_checkout(request["workspace"])
-    entries = workspace_viewer.transcript(root, request["session"])["entries"]
-    asked = next(
-        (e for e in reversed(entries) if e["role"] == "tool" and e.get("id") == request["tool"]),
-        None,
-    )
+    if request["tool"].startswith("screen:"):
+        asked = live_interaction(target)["question"]
+        if not asked or asked["id"] != request["tool"]:
+            raise ValueError("The question on the agent's screen changed; refresh")
+    else:
+        root = workspace_viewer.workspace_checkout(request["workspace"])
+        entries = workspace_viewer.transcript(root, request["session"])["entries"]
+        asked = next(
+            (
+                e
+                for e in reversed(entries)
+                if e["role"] == "tool" and e.get("id") == request["tool"]
+            ),
+            None,
+        )
     if not asked or asked["output"] is not None or not asked.get("questions"):
         raise ValueError("That question was already answered; refresh")
     questions = asked["questions"]
@@ -272,15 +349,19 @@ def answer(request):
         try:
             for question, keys in zip(questions, steps, strict=True):
                 # The agent may have moved on, or exited and left its dialog on screen.
-                if typed:
-                    current: dict = next(
-                        (a for a in agents(request["workspace"]) if a["pane"] == pane), {}
-                    )
-                    if (current.get("session"), current.get("status")) != (
-                        request["session"],
-                        "blocked",
-                    ):
-                        raise ValueError("the agent stopped waiting")
+                current: dict = next(
+                    (a for a in agents(request["workspace"]) if a["pane"] == pane), {}
+                )
+                if (current.get("agent"), current.get("session"), current.get("status")) != (
+                    "claude",
+                    request["session"],
+                    "blocked",
+                ):
+                    raise ValueError("the agent stopped waiting")
+                if request["tool"].startswith("screen:"):
+                    live = live_interaction(current)["question"]
+                    if not live or live["id"] != request["tool"]:
+                        raise ValueError("the dialog changed")
                 if not wait_for(pane, shows_question(question)):
                     raise ValueError("the dialog did not show the next question")
                 for kind, value in keys:

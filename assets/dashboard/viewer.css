@@ -360,7 +360,8 @@
 .ws-md th {
   background: #f6f8f4;
 }
-.ws-tool pre {
+.ws-tool pre,
+.ws-agent-screen {
   margin: 0;
   padding: 8px 12px;
   border-radius: 0;
