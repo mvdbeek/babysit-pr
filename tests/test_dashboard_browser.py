@@ -2558,6 +2558,10 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
         dialog.get_by_label("Agent", exact=True).select_option(settings)
         choose_option(model, "fixture-codex" if settings == "codex" else "opus")
         choose_option(effort, "ultra" if settings == "codex" else "high")
+    docker = dialog.get_by_label("Allow Docker in the agent’s sandbox")
+    expect(docker).not_to_be_checked()
+    if settings == "claude":
+        docker.check()
     dialog.get_by_label("Task", exact=True).fill("Fix this")
     if kind == "pr" and not clone and settings == "codex":
         page.screenshot(path="reports/workspace-model-effort-desktop.png")
@@ -2570,6 +2574,7 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
     expect(page.locator("#workspace-progress")).to_contain_text("running")
     body = requests[-1]
     assert body["action"] == ("clone-and-create" if clone else "create")
+    assert body.get("docker") is (True if settings == "claude" else None)
     if settings == "default":
         assert "model" not in body and "effort" not in body
     else:
@@ -2893,6 +2898,7 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
         "agent": "claude",
         "model": "opus",
         "effort": "high",
+        "docker": True,
         "task": '<img src=x onerror="window.injected=true"> Fix CI overnight',
     }
     subject = {
@@ -2959,7 +2965,7 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
     pending = page.locator("#scheduled-pending li")
     expect(pending).to_have_count(1)
     expect(pending).to_contain_text("in 2 h")
-    expect(pending).to_contain_text("Handle · Claude · opus · high effort")
+    expect(pending).to_contain_text("Handle · Claude · opus · high effort · Docker")
     expect(pending.get_by_role("link", name="test/alpha #8")).to_have_attribute(
         "href", "https://github.com/test/alpha/pull/8"
     )
@@ -3077,6 +3083,7 @@ def test_batch_handle_selects_issues_and_staggers_their_starts(
     dialog.get_by_label("Minutes between starts").fill("45")
     dialog.get_by_label("Start later").check()
     expect(items.first).not_to_contain_text("Starts now")
+    dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
     page.screenshot(path=f"reports/batch-dialog-{width}.png")
     dialog.get_by_role("button", name="Schedule 2 tasks").click()
     expect(page.locator("#workspace-progress")).to_have_text(
@@ -3090,7 +3097,7 @@ def test_batch_handle_selects_issues_and_staggers_their_starts(
         {"id": "issue-one", "clone": "/fixture/alpha"},
         {"id": "issue-two", "destination": "/fixture/src/beta"},
     ]
-    assert body["interval"] == 2700 and body["agent"] == "codex"
+    assert body["interval"] == 2700 and body["agent"] == "codex" and body["docker"] is True
     assert body["prefilled"] is True and body["task"].startswith("Investigate and resolve {url}.")
     assert body["start_at"] > time.time() + 3000
     # Scheduled issues leave the selection; the one that failed stays to retry.
@@ -4095,6 +4102,7 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
     expect(dialog.get_by_label("Issue title")).to_be_focused()  # Required and empty.
     assert len(sent) == 1
     dialog.get_by_label("Issue title").fill("Crash on start")
+    dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
     page.screenshot(path="reports/new-task.png")
     dialog.get_by_role("button", name="Start task").click()
     expect(page.locator("#workspace-progress")).to_contain_text("running")
@@ -4103,6 +4111,7 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
         "clone": "/fixture/alpha",
         "issue_title": "Crash on start",
         "agent": "codex",
+        "docker": True,
         "task": "It crashes on start",
     }
     # The dialog follows the operation; once ready it opens the workspace and its viewer,

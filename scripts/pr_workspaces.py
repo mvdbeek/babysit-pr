@@ -831,6 +831,7 @@ class Workspaces:
             "task",
             "retry",
             "prefilled",
+            "docker",
             "start_at",
         }
         if (
@@ -848,10 +849,10 @@ class Workspaces:
             }
         ):
             raise ValueError("Invalid workspace action parameters")
-        for field in allowed - {"retry", "prefilled", "start_at"}:
+        for field in allowed - {"retry", "prefilled", "docker", "start_at"}:
             if field in request and not isinstance(request[field], str):
                 raise ValueError(f"Expected text for {field}")
-        for field in ("retry", "prefilled"):
+        for field in ("retry", "prefilled", "docker"):
             if field in request and not isinstance(request[field], bool):
                 raise ValueError(f"Expected a {field} flag")
         scheduling = "start_at" in request
@@ -986,6 +987,8 @@ class Workspaces:
                 "agent": None if action == "reopen" else request.get("agent", "codex"),
                 "model": None if action == "reopen" else request.get("model") or None,
                 "effort": None if action == "reopen" else request.get("effort") or None,
+                # Opens the Docker socket in the agent's Safehouse sandbox (`wt --docker`).
+                "docker": action != "reopen" and request.get("docker", False),
                 "message": "Queued",
                 "log": "",
                 "created_at": time.time(),
@@ -1084,8 +1087,13 @@ class Workspaces:
             "task",
             # Attached files, for the agent only: an issue's body is the task alone.
             "task_files",
+            "docker",
         }
-        if set(request) - allowed or any(not isinstance(v, str) for v in request.values()):
+        if (
+            set(request) - allowed
+            or any(not isinstance(v, str) for k, v in request.items() if k != "docker")
+            or not isinstance(request.get("docker", False), bool)
+        ):
             raise ValueError("Invalid new task parameters")
         repo = request.get("repo", "")
         if not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
@@ -1131,6 +1139,7 @@ class Workspaces:
             "agent": agent,
             "model": request.get("model") or None,
             "effort": request.get("effort") or None,
+            "docker": request.get("docker", False),
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
             "message": "Queued",
             "log": "",
@@ -1254,7 +1263,16 @@ class Workspaces:
         saved = {
             key: request[key]
             # `prefilled` keeps an unedited Handle prefill out of prompt history at launch.
-            for key in ("id", "agent", "model", "effort", "task", "destination", "prefilled")
+            for key in (
+                "id",
+                "agent",
+                "model",
+                "effort",
+                "task",
+                "destination",
+                "prefilled",
+                "docker",
+            )
             if request.get(key)
         }
         saved["action"] = action
@@ -1296,7 +1314,7 @@ class Workspaces:
         item is validated like a single scheduled Handle; one that fails is reported and
         the others are still scheduled.
         """
-        shared = {"agent", "model", "effort", "task", "prefilled"}
+        shared = {"agent", "model", "effort", "task", "prefilled", "docker"}
         items = request.get("items")
         interval = request.get("interval", 0)
         if (
@@ -1311,8 +1329,10 @@ class Workspaces:
                 for item in items
             )
             or len({item["id"] for item in items}) != len(items)
-            or any(not isinstance(request.get(k, ""), str) for k in shared - {"prefilled"})
-            or not isinstance(request.get("prefilled", False), bool)
+            or any(
+                not isinstance(request.get(k, ""), str) for k in shared - {"prefilled", "docker"}
+            )
+            or any(not isinstance(request.get(k, False), bool) for k in ("prefilled", "docker"))
         ):
             raise ValueError("Invalid batch parameters")
         if len(items) > SCHEDULE_PENDING_LIMIT:
@@ -1763,6 +1783,7 @@ class Workspaces:
                     args = [
                         f"--{op['agent']}",
                         *overrides,
+                        *(["--docker"] if op.get("docker") else []),
                         "--no-focus",
                         "--name",
                         name,

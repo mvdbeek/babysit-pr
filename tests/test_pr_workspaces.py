@@ -945,6 +945,46 @@ def test_reopen_ignores_creation_overrides(local, key):
     assert not json.loads(state.read_text())["agents"]
 
 
+@pytest.mark.parametrize("key", ["PR_one", "I_one"])
+def test_docker_opt_in_reaches_the_agent_sandbox_through_wt(local, key):
+    manager, _, git, state, _ = local
+    calls = helper_calls(manager)
+    manager.action(
+        {"id": key, "action": "create", "task": "Run the container tests", "docker": True}
+    )
+    op = finish(manager, key)
+    assert op["status"] == "complete", op["log"]
+    assert op["docker"] is True
+    assert "--docker" in calls[0]
+    # wt types `SAFE_ENABLE=docker codex …`; the user's `safe` wrapper turns it into
+    # safehouse --enable=docker, so the agent itself must see the variable.
+    agent = json.loads(state.read_text())["agents"][0]
+    assert agent["safe_enable"] == "docker"
+    assert agent["argv"] == [agent["task"]]
+
+
+def test_docker_is_off_unless_asked_for_and_reopen_ignores_it(local):
+    manager, _, git, state, _ = local
+    calls = helper_calls(manager)
+    manager.action({"id": "PR_one", "action": "create", "task": "Fix", "docker": False})
+    op = finish(manager, "PR_one")
+    assert op["status"] == "complete", op["log"]
+    assert op["docker"] is False and "--docker" not in calls[0]
+    assert "safe_enable" not in json.loads(state.read_text())["agents"][0]
+    git("branch", "issue-12")
+    path = make_checkout(local, branch="issue-12", name="issue")
+    manager.action({"id": "I_one", "action": "reopen", "path": str(path), "docker": True})
+    assert finish(manager, "I_one")["docker"] is False
+
+
+@pytest.mark.parametrize("docker", ["true", 1, None])
+def test_docker_must_be_a_flag(local, docker):
+    manager, _, _, _, _ = local
+    with pytest.raises(ValueError, match="docker flag"):
+        manager.action({"id": "PR_one", "action": "create", "task": "Fix", "docker": docker})
+    assert manager.operation("PR_one") is None
+
+
 def test_handle_starts_separate_workspace_with_selected_settings(local):
     manager, pr, _, state, _ = local
     manager.action({"id": pr["id"], "action": "create", "task": "Original task"})
@@ -1594,6 +1634,28 @@ def test_batch_handles_each_issue_in_its_own_workspace_at_staggered_times(synced
     assert [p["text"] for p in manager.prompts()["prompts"]] == ["Resolve {url} carefully"]
 
 
+def test_scheduled_and_batched_launches_keep_the_docker_opt_in(synced):
+    manager, pr, _, state, _ = synced
+    second_issue(manager)
+    start = time.time() + 60
+    task = scheduled(manager, pr, start, docker=True)
+    assert task["request"]["docker"] is True
+    value = manager.batch(
+        {"items": [{"id": "I_one"}, {"id": "I_two"}], "task": "Fix {url}", "docker": True}
+    )
+    batched = [r["scheduled"] for r in value["results"]]
+    assert [t["request"]["docker"] for t in batched] == [True, True]
+    plain = manager.batch({"items": [{"id": "I_two"}], "task": "Fix {url}", "start_at": start})
+    assert "docker" not in plain["results"][0]["scheduled"]["request"]
+    manager.run_due(now=start)
+    for key in (pr["id"], "I_one"):
+        op = finish(manager, key)
+        assert op["status"] == "complete", op["log"]
+        assert op["docker"] is True
+    agents = json.loads(state.read_text())["agents"]
+    assert {a.get("safe_enable") for a in agents} == {"docker"}
+
+
 def test_batch_handles_pull_requests_too(synced):
     manager, pr, _, state, _ = synced
     value = manager.batch(
@@ -1645,6 +1707,7 @@ def test_batch_starts_now_by_default_and_reports_items_it_cannot_schedule(synced
         ({"items": [{"id": "I_one"}], "interval": float("inf")}, "at most a day"),
         ({"items": [{"id": "I_one"}], "task": 5}, "Invalid batch"),
         ({"items": [{"id": "I_one"}], "prefilled": "false"}, "Invalid batch"),
+        ({"items": [{"id": "I_one"}], "docker": "true"}, "Invalid batch"),
         ({"items": [{"id": f"I_{n}"} for n in range(101)]}, "At most 100 tasks"),
         ({"items": [{"id": "I_one"}], "start_at": 0}, "within the next 30 days"),
         ({"items": [{"id": "I_one"}], "task": "  "}, "Supply a task"),
