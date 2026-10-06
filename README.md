@@ -356,6 +356,14 @@ policies can determine the effective model. The operation records the requested
 configuration. Agent startup/provenance verification and duplicate-launch protection
 remain in place. Open/reopen actions do not apply these settings to existing sessions.
 
+**Allow Docker in the agent’s sandbox**, off by default, passes `--docker` to the
+helper (the request field is `docker: true`; New task, Handle, Create workspace and
+batch Handle all offer it, and scheduled launches keep it). The helper types
+`SAFE_ENABLE=docker <agent> …` into the pane, and the user's `safe` shell wrapper adds
+that to Safehouse's `--enable` list, which opens the Docker daemon socket to that one
+agent. Agents started without it keep Safehouse's default deny on container sockets.
+The operation records `docker` (false for reopen).
+
 Codex choices come from picker-visible entries and supported reasoning levels in
 `$CODEX_HOME/models_cache.json` (normally `~/.codex/models_cache.json`). This is a
 read-only, local cache: the dashboard never starts a Codex session to discover
@@ -409,7 +417,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude] [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude] [--docker] [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]

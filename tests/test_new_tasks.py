@@ -247,3 +247,23 @@ def test_a_finished_task_is_not_reported_uncertain_from_a_stale_read(local):  # 
     assert manager.new_operations(stale)["new:done"]["operation"]["status"] == "complete"
     assert manager.operation("new:done")["status"] == "complete"
     assert manager.operation("new:old") is None
+
+
+def test_new_task_can_let_the_agent_use_docker(local):  # noqa: F811
+    manager, _, _, state, _ = local
+    calls = helper_calls(manager)
+    value = manager.new_task(request(manager, name="containers", docker=True))
+    op = finish(manager, value["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert op["docker"] is True
+    assert calls[0][:3] == ["wt", "--codex", "--docker"]
+    assert json.loads(state.read_text())["agents"][0]["safe_enable"] == "docker"
+    off = finish(manager, manager.new_task(request(manager, name="plain"))["operation"]["pr"])
+    assert off["docker"] is False and "--docker" not in calls[1]
+
+
+@pytest.mark.parametrize("docker", ["true", 1, None])
+def test_new_task_docker_must_be_a_flag(local, docker):  # noqa: F811
+    manager, _, _, _, _ = local
+    with pytest.raises(ValueError, match="Invalid new task"):
+        manager.new_task(request(manager, name="containers", docker=docker))
