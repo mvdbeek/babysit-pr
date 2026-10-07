@@ -1,8 +1,10 @@
-/* Cron jobs: recurring shell commands, their schedules and run history. */
+/* Cron jobs: recurring agent tasks and shell commands, their schedules and run history. */
 (() => {
   const byId = (id) => document.getElementById(`cron-${id}`);
   const STATUS = {
+    starting: ["Starting", "blue"],
     running: ["Running", "blue"],
+    attention: ["Needs attention", "amber"],
     succeeded: ["Succeeded", "green"],
     failed: ["Failed", "red"],
     timed_out: ["Timed out", "red"],
@@ -12,7 +14,8 @@
     missed: ["Missed", "amber"],
     skipped: ["Skipped", ""],
   };
-  const FAILING = new Set(["failed", "timed_out", "error"]);
+  const FAILING = new Set(["failed", "timed_out", "error", "attention"]);
+  const AGENTS = { codex: "Codex", claude: "Claude" };
   const TRIGGERS = { schedule: "Scheduled", manual: "Run now" };
   let snapshot = null;
   let busy = false;
@@ -98,6 +101,26 @@
     const [count, unit] = unitOf(schedule.every);
     const name = { 60: "minute", 3600: "hour", 86400: "day" }[unit];
     return count === 1 ? `Every ${name}` : `Every ${count} ${name}s`;
+  }
+  function agentSummary(job) {
+    return [
+      AGENTS[job.agent] || job.agent,
+      job.model,
+      job.effort && `${job.effort} effort`,
+      job.claude_account && `Claude account: ${job.claude_account}`,
+      job.docker && "Docker",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
+  function link(text, url) {
+    const element = node("a", text);
+    if (typeof url === "string" && /^https?:\/\//.test(url)) {
+      element.href = url;
+      element.target = "_blank";
+      element.rel = "noopener noreferrer";
+    }
+    return element;
   }
   function jobs() {
     return snapshot?.jobs ?? [];
@@ -188,7 +211,8 @@
     started.append(open);
     const result = node("td");
     result.append(badge(run.status));
-    if (run.message && run.status !== "running") result.append(node("small", run.message));
+    if (run.message && (run.status !== "running" || run.kind === "agent"))
+      result.append(node("small", run.message));
     row.append(
       started,
       node("td", TRIGGERS[run.trigger] || run.trigger),
@@ -227,6 +251,7 @@
     view.output.hidden = !run;
     if (!run) return;
     const quiet = ["skipped", "missed"].includes(run.status);
+    const agent = run.kind === "agent";
     const head = node("div", undefined, "cron-output-head");
     head.append(node("h4", `Output of the run started ${when(run.started_at)}`), badge(run.status));
     const facts = quiet
@@ -238,16 +263,36 @@
           run.exit_code !== null && run.exit_code !== undefined
             ? `Exit status ${run.exit_code}`
             : null,
-          run.status === "running" ? `Running for ${duration(run)}` : `Took ${duration(run)}`,
+          ["running", "starting"].includes(run.status)
+            ? `Running for ${duration(run)}`
+            : `Took ${duration(run)}`,
           run.cwd ? `In ${run.cwd}` : null,
+          agent && run.status !== "starting" ? run.message : null,
         ].filter(Boolean);
     const parts = [head, node("p", facts.join(" · "), "pr-sync")];
-    if (!quiet && run.command !== undefined && run.command !== job.command) {
+    if (agent && run.agent_run) {
+      // The session lives on in its workspace: open it there, or read it here.
+      const open = node("div", undefined, "cron-open");
+      open.append(link("Open in Collie", run.agent_run.url));
+      if (window.workspaceViewer)
+        open.append(
+          ...window.workspaceViewer.buttons({
+            workspace: run.agent_run.workspace_id,
+            name: job.name,
+          }),
+        );
+      parts.push(open);
+    }
+    const then = agent ? run.prompt : run.command;
+    if (!quiet && then !== undefined && then !== (agent ? job.prompt : job.command)) {
       const previous = view.outputHead.querySelector(".cron-command-then");
       const details = node("details", undefined, "cron-command-then");
       details.dataset.run = run.id;
       details.open = Boolean(previous?.open && previous.dataset.run === run.id);
-      details.append(node("summary", "This run used an earlier command"), node("pre", run.command));
+      details.append(
+        node("summary", `This run used an earlier ${agent ? "prompt" : "command"}`),
+        node("pre", then),
+      );
       parts.push(details);
     }
     rebuild(view.outputHead, ...parts);
@@ -274,15 +319,21 @@
     const title = node("div", undefined, "cron-title");
     title.append(node("h3", job.name));
     if (!job.enabled) title.append(node("span", "Paused", "badge amber"));
+    const agent = job.kind === "agent";
     const meta = [
       frequency(job.schedule),
-      job.cwd ? `In ${job.cwd}` : "In your home directory",
+      agent
+        ? `${job.repo} · branch ${job.branch}`
+        : job.cwd
+          ? `In ${job.cwd}`
+          : "In your home directory",
+      agent ? agentSummary(job) : null,
       `Time limit ${Math.round(job.timeout / 60)} min`,
-    ];
+    ].filter(Boolean);
     const actions = node("div", undefined, "cron-actions");
     const pending = acting.has(job.id);
     actions.append(
-      job.running
+      job.running && !agent
         ? button("Stop", () => act(job, { action: "stop" }), { pending, key: "primary" })
         : button(
             "Run now",
@@ -290,7 +341,8 @@
               act(job, { action: "run" }, (value) => {
                 selectedRun = value.run.id;
               }),
-            { pending, key: "primary" },
+            // An agent run finishes in Collie; the job is free again once it does.
+            { pending, key: "primary", disabled: job.running },
           ),
       button(
         job.enabled ? "Pause" : "Resume",
@@ -311,7 +363,7 @@
       ),
     );
     const head = [title, node("p", meta.join(" · "), "pr-sync")];
-    head.push(node("pre", job.command, "cron-command"), actions);
+    head.push(node("pre", agent ? job.prompt : job.command, "cron-command"), actions);
     if (jobErrors.has(job.id)) head.push(node("p", jobErrors.get(job.id), "cron-job-error"));
     if (job.enabled && job.upcoming?.length) {
       head.push(
@@ -370,7 +422,9 @@
     byId("tab-count").title = `${failing} job${failing === 1 ? "" : "s"} failed on the last run`;
     byId("count").textContent = all.length;
     byId("status").textContent = snapshot.active
-      ? `Commands run with ${snapshot.shell} on the dashboard host while the dashboard is running. ` +
+      ? `Jobs run on the dashboard host while the dashboard is running: ${
+          snapshot.agents ? "agent tasks in their own workspace in Collie, " : ""
+        }commands with ${snapshot.shell}. ` +
         "A run due while it was stopped starts once when it returns, up to a day late."
       : "Another dashboard process over this state directory runs these jobs; this one only shows them.";
     rebuild(byId("list"), ...all.map(card));
@@ -434,10 +488,141 @@
     byId("every-fields").hidden = cron;
     byId("expression-fields").hidden = !cron;
   }
+  // The agent settings of the open editor, rebuilt each time it opens.
+  let agentForm = null;
+  let editorSequence = 0;
+  function jobKind() {
+    return byId("kinds").querySelector("input:checked")?.value ?? "shell";
+  }
+  function syncJobKind() {
+    const agent = jobKind() === "agent";
+    byId("agent-fields").hidden = !agent;
+    byId("shell-fields").hidden = agent;
+  }
+  async function buildAgentFields(job, sequence) {
+    const tools = window.dashboardAgents;
+    const container = byId("agent-fields");
+    agentForm = null;
+    if (!snapshot?.agents || !tools) {
+      container.replaceChildren(
+        node("p", "Agent tasks need the dashboard’s workspace actions.", "pr-sync"),
+      );
+      return;
+    }
+    container.replaceChildren(node("p", "Loading agents and local clones…", "pr-sync"));
+    let fields, listed;
+    try {
+      [fields, listed] = await Promise.all([tools.fields(), tools.repositories()]);
+    } catch (error) {
+      if (sequence === editorSequence)
+        container.replaceChildren(
+          node("p", `Cannot load agents: ${error.message}`, "cron-job-error"),
+        );
+      return;
+    }
+    if (sequence !== editorSequence) return;
+    const repos = [...listed.repos];
+    const repo = node("select");
+    repo.id = "cron-repo";
+    if (job?.repo && !repos.some((r) => r.repo === job.repo && r.clone === job.clone))
+      repos.push({ repo: job.repo, clone: job.clone, missing: true });
+    repos.forEach((choice, index) => {
+      const option = node(
+        "option",
+        `${choice.repo} · ${choice.clone}${choice.missing ? " (not found)" : ""}`,
+      );
+      option.value = String(index);
+      repo.append(option);
+    });
+    if (job?.repo)
+      repo.value = String(repos.findIndex((r) => r.repo === job.repo && r.clone === job.clone));
+    const text = (id, value, placeholder) => {
+      const input = node("input");
+      input.id = id;
+      input.type = "text";
+      input.value = value ?? "";
+      input.placeholder = placeholder;
+      input.autocapitalize = "off";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      return input;
+    };
+    const branch = text("cron-branch", job?.branch, "nightly-triage");
+    branch.maxLength = 100;
+    const base = text("cron-base", job?.base, "The clone’s current commit");
+    const { agent, model, effort, account, settingsNote, docker, dockerLabel } = fields;
+    // agentFields names its controls for the New task dialog; this one has its own.
+    agent.id = "cron-agent";
+    model.id = "cron-model";
+    effort.id = "cron-effort";
+    account.id = "cron-claude-account";
+    docker.id = "cron-docker";
+    // A saved setting the current choices lack (an uncached model, a removed account)
+    // stays selected, so editing something else does not quietly drop it.
+    const keep = (select, value) => {
+      if (value && ![...select.options].some((option) => option.value === value)) {
+        const option = node("option", `${value} (not listed)`);
+        option.value = value;
+        select.append(option);
+      }
+      select.value = value || "";
+    };
+    if (job?.agent) {
+      agent.value = job.agent;
+      agent.onchange();
+      keep(model, job.model);
+      model.onchange();
+      keep(effort, job.effort);
+      keep(account, job.claude_account);
+      docker.checked = Boolean(job.docker);
+    }
+    const prompt = node("textarea");
+    prompt.id = "cron-prompt";
+    prompt.rows = 6;
+    prompt.maxLength = 32000;
+    prompt.value = job?.prompt ?? "";
+    const parts = [];
+    const field = (label, input) => {
+      const element = node("label", label);
+      element.htmlFor = input.id;
+      parts.push(element, input);
+    };
+    field("Repository and local clone", repo);
+    field("Branch", branch);
+    field("Base branch (optional)", base);
+    parts.push(
+      node(
+        "small",
+        "Every run works in this branch’s worktree, made from the base on the first run. Changes carry over between runs.",
+      ),
+    );
+    field("Agent", agent);
+    field("Model (optional)", model);
+    field("Reasoning effort (optional)", effort);
+    field("Claude account", account);
+    parts.push(settingsNote, dockerLabel);
+    field("Prompt", prompt);
+    parts.push(
+      node(
+        "small",
+        "Each run starts a fresh session in its own pane. The agent is exited once it confirms the task is done; one that asks a question stays open in Collie.",
+      ),
+    );
+    container.replaceChildren(...parts);
+    for (const select of [repo, model, effort]) tools.searchable(select);
+    agentForm = { repos, repo, branch, base, agent, model, effort, account, docker, prompt };
+  }
   function openEditor(job) {
+    const sequence = ++editorSequence;
     editing = job ? job.id : null;
     byId("dialog-title").textContent = job ? `Edit ${job.name}` : "New job";
     byId("name").value = job?.name ?? "";
+    const kind = job ? job.kind || "shell" : snapshot?.agents ? "agent" : "shell";
+    for (const input of byId("kinds").querySelectorAll("input")) {
+      input.checked = input.value === kind;
+      input.disabled = input.value === "agent" && !snapshot?.agents && kind !== "agent";
+    }
+    syncJobKind();
     byId("command").value = job?.command ?? "";
     byId("cwd").value = job?.cwd ?? "";
     byId("shell").textContent = snapshot
@@ -458,6 +643,27 @@
     byId("save").disabled = false;
     byId("dialog").showModal();
     byId("name").focus();
+    void buildAgentFields(job?.kind === "agent" ? job : null, sequence);
+  }
+  function task() {
+    if (jobKind() === "shell")
+      return { kind: "shell", command: byId("command").value, cwd: byId("cwd").value };
+    if (!agentForm) throw new Error("The agent settings are still loading");
+    const form = agentForm;
+    const choice = form.repos[Number(form.repo.value)] ?? {};
+    return {
+      kind: "agent",
+      repo: choice.repo,
+      clone: choice.clone,
+      branch: form.branch.value.trim(),
+      base: form.base.value.trim(),
+      agent: form.agent.value,
+      model: form.model.value,
+      effort: form.effort.value,
+      claude_account: form.agent.value === "claude" ? form.account.value : "",
+      docker: form.docker.checked,
+      prompt: form.prompt.value,
+    };
   }
   async function save(event) {
     event.preventDefault();
@@ -465,20 +671,18 @@
       byId("kind").value === "cron"
         ? { cron: byId("expression").value }
         : { every: Number(byId("every").value) * Number(byId("unit").value) };
-    const body = {
-      action: "save",
-      id: editing,
-      name: byId("name").value,
-      command: byId("command").value,
-      cwd: byId("cwd").value,
-      schedule,
-      timeout: Number(byId("timeout").value) * 60,
-      enabled: byId("enabled-input").checked,
-    };
     byId("save").disabled = true;
     byId("form-error").textContent = "";
     try {
-      const value = await post(body);
+      const value = await post({
+        action: "save",
+        id: editing,
+        name: byId("name").value,
+        ...task(),
+        schedule,
+        timeout: Number(byId("timeout").value) * 60,
+        enabled: byId("enabled-input").checked,
+      });
       selectedJob = value.job.id;
       byId("dialog").close();
       await refresh(true);
@@ -491,6 +695,7 @@
 
   byId("new").onclick = () => openEditor(null);
   byId("kind").onchange = syncKind;
+  for (const input of byId("kinds").querySelectorAll("input")) input.onchange = syncJobKind;
   byId("form").onsubmit = save;
   byId("dialog-close").onclick = () => byId("dialog").close();
   window.addEventListener("cron-visible", () => refresh());

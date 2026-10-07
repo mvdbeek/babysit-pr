@@ -743,7 +743,6 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
     overview = Overview(home)
     issues = IssueOverview(home)
     sentry = SentryIssues(home)
-    cron = CronJobs(home)
     workspaces = Workspaces(
         home,
         overview,
@@ -751,6 +750,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         issues=issues,
         sentry=sentry if sentry.enabled else None,
     )
+    cron = CronJobs(home, workspaces=workspaces)
     ci = CiDetails(home, overview)
     ci_logs = BackgroundLogs(home, overview, ci)
     push = PushInbox(

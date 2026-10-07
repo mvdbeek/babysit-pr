@@ -2631,6 +2631,16 @@ async function newTaskDialog() {
   }
 }
 $("new-task").onclick = () => void newTaskDialog();
+// Agent settings for other views (cron jobs), with the same choices as New task.
+window.dashboardAgents = {
+  async fields() {
+    if (!workspaceData.agent_choices) await loadWorkspaces();
+    return agentFields();
+  },
+  repositories: () => get("/api/workspace-repos?all=1"),
+  searchable: searchableSelect,
+  sync: syncSelect,
+};
 // Replaced by each item's link when a batch is scheduled.
 const BATCH_URL = "{url}";
 // The scheduler's limit on waiting tasks.
