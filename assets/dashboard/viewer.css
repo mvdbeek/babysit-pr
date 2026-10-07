@@ -88,6 +88,63 @@
   align-items: end;
   gap: 10px 14px;
 }
+/* The agents running in the workspace, above a transcript. */
+.ws-live {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.ws-live[hidden] {
+  display: none;
+}
+#ws-live-agents {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ws-live-agent {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  overflow-wrap: anywhere;
+}
+.ws-live-agent button {
+  padding: 5px 10px;
+}
+.ws-live-agent .ws-stop {
+  margin-left: auto;
+  color: var(--red);
+  border-color: #dfbdb8;
+}
+.ws-live-agent .ws-stop:hover {
+  background: #faeeeb;
+}
+.ws-live-agent[data-status="working"] .badge:before {
+  animation: ws-live-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ws-live-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ws-live-agent[data-status="working"] .badge:before {
+    animation: none;
+  }
+}
+#ws-live-status {
+  margin: 0;
+  font-size: 13px;
+}
+#ws-live-status:empty {
+  display: none;
+}
 .ws-viewer-choice {
   display: flex;
   flex-direction: column;

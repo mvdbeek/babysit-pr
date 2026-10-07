@@ -53,6 +53,8 @@ ENDED_WATCHES = {"closed", "stopped"}
 DIALOG_WAIT = 4
 RULE = re.compile(r"^\s*─{8,}\s*$")
 MAX_ANSWER = 2000
+# How long a stop waits for the agent to leave its turn, in milliseconds.
+STOP_WAIT = 5000
 _answer_lock = threading.Lock()
 _resume_lock = threading.RLock()
 _recent: dict[str, tuple[str, float]] = {}
@@ -274,6 +276,65 @@ def prompt(target, text):
             }
         raise ValueError(f"herdr could not deliver the message: {detail[-300:]}") from exc
     return {"sent": True, "pane": pane, "warning": None}
+
+
+def interrupt(request):
+    """Stop the turn a working agent is on, as Esc does in its terminal.
+
+    Both Claude Code and Codex interrupt the running turn on Esc and keep the session
+    open, so the agent can be messaged again. Only a pane still working on the named
+    session gets the key: an idle agent's Esc would edit its prompt instead.
+    """
+    if set(request) != {"workspace", "pane", "session"} or not (
+        all(isinstance(request[k], str) and request[k] for k in ("workspace", "pane"))
+        and (request["session"] is None or isinstance(request["session"], str))
+    ):
+        raise ValueError("Invalid stop parameters")
+    pane = request["pane"]
+
+    def current():
+        return next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
+
+    # Typing an answer into a dialog holds the answer lock; Esc must not land mid-answer.
+    with _resume_lock, _answer_lock:
+        target = current()
+        if target is None or target.get("session") != request["session"]:
+            raise ValueError("That session is no longer running in this pane; refresh")
+        if target["status"] != "working":
+            raise ValueError("The agent is not working on anything right now; refresh")
+        try:
+            herdr("agent", "send-keys", pane, "esc")
+        except ValueError as exc:
+            raise ValueError(f"herdr could not send Esc: {str(exc)[-300:]}") from exc
+    # The wait holds no lock, so other workspaces' messages need not queue behind it.
+    try:
+        herdr(
+            "agent",
+            "wait",
+            pane,
+            "--until",
+            "idle",
+            "--until",
+            "done",
+            "--until",
+            "blocked",
+            "--timeout",
+            str(STOP_WAIT),
+        )
+    except (ValueError, subprocess.SubprocessError):
+        # The wait also fails when the agent exited after Esc: only a pane still
+        # working on the session means the stop did not take.
+        try:
+            after = current()
+        except (ValueError, subprocess.SubprocessError):
+            after = target
+        if after and after.get("session") == request["session"] and after["status"] == "working":
+            return {
+                "stopped": False,
+                "pane": pane,
+                "warning": "Esc was sent, but the agent still shows as working; check it in Collie.",
+            }
+    return {"stopped": True, "pane": pane, "warning": None}
 
 
 def squash(text):

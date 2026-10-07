@@ -271,6 +271,7 @@
     byId("ws-viewer-content").replaceChildren();
     byId("ws-viewer-error").textContent = "";
     byId("ws-viewer-meta").textContent = message;
+    byId("ws-live").hidden = true;
     for (const [id, mode] of [
       ["ws-view-diff", "diff"],
       ["ws-view-transcript", "transcript"],
@@ -569,6 +570,7 @@
       );
     }
     controls.append(refreshButton());
+    renderLive();
     const content = byId("ws-viewer-content");
     if (!data.session) {
       byId("ws-viewer-meta").textContent = "";
@@ -625,6 +627,7 @@
     // Whether a question can be answered here follows the agent's state; only a recent
     // Claude dialog can still be waiting.
     if (current.entries.slice(-5).some(answerable)) void fetchAgents(viewer.entry);
+    renderLive();
     if (follow) byId("ws-viewer").scrollTop = byId("ws-viewer").scrollHeight;
   }
   function prependTranscript(data) {
@@ -970,6 +973,7 @@
     byId("ws-agent-interaction").replaceChildren();
     delete byId("ws-agent-interaction").dataset.state;
     byId("ws-message-status").textContent = "";
+    byId("ws-live-status").textContent = "";
     agents = [];
     sessions = [];
     if (!entry.workspace) {
@@ -998,10 +1002,13 @@
     renderAgents("Looking for agents…");
     void fetchAgents(entry);
   }
+  // Agents are read by polls, refreshes and actions alike; only the newest answer counts.
+  let agentsRequest = 0;
   async function fetchAgents(entry) {
+    const token = ++agentsRequest;
     try {
       const value = await getJSON("/api/workspace-agents", { workspace: entry.workspace });
-      if (viewer?.entry !== entry) return;
+      if (viewer?.entry !== entry || token !== agentsRequest) return;
       if (draft.path && draft.path !== value.path) {
         // The workspace ID now names another checkout: its old draft does not apply.
         draft = { comments: [], message: "", path: value.path, files: [] };
@@ -1019,8 +1026,9 @@
       sessions = value.sessions;
       renderAgents();
       refreshQuestions();
+      renderLive();
     } catch (error) {
-      if (viewer?.entry === entry) renderAgents(error.message);
+      if (viewer?.entry === entry && token === agentsRequest) renderAgents(error.message);
     }
   }
   function agentLabel(agent) {
@@ -1031,6 +1039,11 @@
   }
   function renderAgents(message) {
     const holder = byId("ws-message-agent");
+    // Polls redraw only on a change, so an open agent choice is never swapped under
+    // the reader's finger.
+    const key = JSON.stringify([message, agents, sessions, sending, Boolean(changingDocker)]);
+    if (holder.dataset.state === key) return;
+    holder.dataset.state = key;
     // A refresh keeps the agent or session the reader picked, while it is still listed.
     const picked = holder.querySelector("select")?.value;
     const keep = (values) => (values.includes(picked) ? picked : values[0]);
@@ -1118,6 +1131,113 @@
   function selectedAgent() {
     const picked = byId("ws-message-agent").querySelector("select")?.value;
     return agents.find((agent) => agent.pane === picked) || agents[0];
+  }
+  // Running agents ------------------------------------------------------------------
+  // Above a transcript: each agent running in the workspace and what it is doing, a
+  // way to its session's transcript, and Stop, which interrupts its turn as Esc would.
+  const ACTIVITY = {
+    working: ["Working", "amber"],
+    blocked: ["Waiting for an answer", "amber"],
+    idle: ["Idle", "green"],
+    done: ["Done", "green"],
+  };
+  let stopping = null; // The pane a stop is on its way to.
+  function agentTitle(agent) {
+    return { claude: "Claude", codex: "Codex" }[agent.agent] || agent.agent || "Agent";
+  }
+  function activity(agent) {
+    return ACTIVITY[agent.status] || [agent.status || "Unknown", ""];
+  }
+  function renderLive() {
+    const holder = byId("ws-live");
+    const data = viewer?.mode === "transcript" ? viewer.data : null;
+    const shown = data?.session?.id;
+    const live = (id) => agents.find((agent) => agent.session && agent.session === id);
+    // A session with a running agent says so in the session choice.
+    const select = byId("ws-viewer-controls").querySelector('select[aria-label="Session"]');
+    for (const option of select?.options || []) {
+      const session = data?.sessions.find((s) => s.id === option.value);
+      const agent = live(option.value);
+      if (session)
+        option.textContent = (agent ? `● ${activity(agent)[0]} · ` : "") + sessionLabel(session);
+    }
+    holder.hidden = !data || !(agents.length || byId("ws-live-status").textContent);
+    if (holder.hidden) return;
+    // Polls redraw only on a change, so a focused button stays focused.
+    const list = byId("ws-live-agents");
+    const key = JSON.stringify([
+      shown,
+      stopping,
+      data.sessions.map((session) => session.id),
+      agents.map((agent) => [agent.pane, agent.agent, agent.status, agent.session]),
+    ]);
+    if (list.dataset.state === key) return;
+    list.dataset.state = key;
+    list.replaceChildren(
+      ...agents.map((agent) => {
+        const [text, tone] = activity(agent);
+        const row = node("div", undefined, "ws-live-agent");
+        row.dataset.status = agent.status || "";
+        row.append(
+          badge(text, tone),
+          node("strong", agentTitle(agent)),
+          node("span", `in ${agent.pane}`, "pr-meta"),
+        );
+        if (agent.session && agent.session === shown) {
+          row.append(node("small", "this transcript", "pr-meta"));
+        } else if (data.sessions.some((session) => session.id === agent.session)) {
+          const show = node("button", "Show its transcript");
+          show.type = "button";
+          show.onclick = () => change((state) => (state.session = agent.session));
+          row.append(show);
+        }
+        if (agent.status === "working") {
+          const stop = node("button", stopping === agent.pane ? "Stopping…" : "Stop", "ws-stop");
+          stop.type = "button";
+          stop.disabled = Boolean(stopping);
+          stop.setAttribute("aria-label", `Stop ${agentTitle(agent)} in ${agent.pane}`);
+          stop.onclick = () => void stopAgent(agent);
+          row.append(stop);
+        }
+        return row;
+      }),
+    );
+  }
+  async function stopAgent(agent) {
+    if (!viewer || stopping) return;
+    const entry = viewer.entry;
+    const status = byId("ws-live-status");
+    stopping = agent.pane;
+    status.textContent = "";
+    renderLive();
+    let message;
+    try {
+      const response = await fetch("/api/workspace-interrupt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-interrupt" },
+        body: JSON.stringify({
+          workspace: entry.workspace,
+          pane: agent.pane,
+          session: agent.session ?? null,
+        }),
+      });
+      const value = await response.json();
+      message = value.error || value.warning || `Stopped ${agentTitle(agent)} in ${value.pane}.`;
+    } catch {
+      message = "The stop could not be confirmed; refresh or check Collie.";
+    } finally {
+      stopping = null;
+    }
+    if (viewer?.entry !== entry) {
+      renderLive(); // Another viewer's Stop buttons were waiting on this one.
+      return;
+    }
+    status.textContent = message;
+    await fetchAgents(entry);
+    // The transcript records where the turn was cut off.
+    const data = viewer?.entry === entry && viewer.mode === "transcript" ? viewer.data : null;
+    if (data?.session && !viewerInflight)
+      void loadViewer({ after: Math.max(data.start, data.total - 20) });
   }
   function renderDocker() {
     const agent = selectedAgent();
@@ -1331,8 +1451,7 @@
       ...(attachments.length ? { attachments } : {}),
     };
     sending = true;
-    byId("ws-message-send").disabled = true;
-    renderDocker();
+    renderAgents();
     status.textContent = body.resume ? "Resuming the session…" : "Sending…";
     try {
       const value = await deliver(body);
@@ -1447,8 +1566,16 @@
     opener = null;
     back?.focus();
   });
-  // A live transcript keeps up while it is open and its newest entries are shown.
+  // A live transcript keeps up while it is open and its newest entries are shown, and
+  // so do its running agents.
+  let pollingAgents = false;
   setInterval(() => {
+    if (viewer?.mode === "transcript" && viewer.entry.workspace && !document.hidden) {
+      if (!pollingAgents && !stopping) {
+        pollingAgents = true;
+        void fetchAgents(viewer.entry).finally(() => (pollingAgents = false));
+      }
+    }
     const data = viewer?.data;
     if (
       viewer?.mode === "transcript" &&

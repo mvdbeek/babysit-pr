@@ -278,6 +278,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-message",
                 "workspace-answer",
                 "workspace-docker",
+                "workspace-interrupt",
                 "workspace-prompt-forget",
                 "attachment-upload",
                 "sentry-action",
@@ -387,6 +388,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.set_docker(request, self.server.home))
                 except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     self.send_json(503, {"error": f"Check Docker access in Collie: {exc}"})
+                return
+            if action == "workspace-interrupt":
+                try:
+                    self.send_json(200, agent_messages.interrupt(request))
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
                 return
             if action == "workspace-answer":
                 try:

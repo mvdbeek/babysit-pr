@@ -1143,6 +1143,142 @@ def test_herdr_refusals_are_explained(site, monkeypatch, code, outcome):
             agent_messages.send({"workspace": "w1", "text": "go"})
 
 
+@pytest.fixture
+def working(site, monkeypatch):
+    """A Claude agent in the workspace is busy with a turn of session s1."""
+    state = site[4]
+    monkeypatch.setenv("FAKE_HERDR_KEEP_AGENT", "1")
+    data = read(state)
+    data["agents"] = [
+        {**data["agents"][0], "agent": "claude", "agent_status": "working"},
+        {
+            **data["agents"][0],
+            "pane_id": "w1:p2",
+            "agent_status": "working",
+            "agent_session": {"value": "s1"},
+        },
+    ]
+    data["agents"][0]["agent_session"] = {"value": "s1-other"}
+    state.write_text(json.dumps(data))
+    return state
+
+
+def stop_request(**extra):
+    return {"workspace": "w1", "pane": "w1:p2", "session": "s1", **extra}
+
+
+def test_stop_sends_esc_to_the_working_agent_and_waits_for_it(working):
+    import agent_messages
+
+    assert agent_messages.interrupt(stop_request()) == {
+        "stopped": True,
+        "pane": "w1:p2",
+        "warning": None,
+    }
+    assert calls(working, ["agent", "send-keys"]) == [["agent", "send-keys", "w1:p2", "esc"]]
+    assert calls(working, ["agent", "wait"]) == [
+        [
+            "agent",
+            "wait",
+            "w1:p2",
+            "--until",
+            "idle",
+            "--until",
+            "done",
+            "--until",
+            "blocked",
+            "--timeout",
+            "5000",
+        ]
+    ]
+
+
+@pytest.mark.parametrize("exits", [False, True])
+def test_a_failed_wait_reports_only_an_agent_still_working(working, monkeypatch, exits):
+    import agent_messages
+
+    real = agent_messages.herdr
+
+    def herdr(*args):
+        if args[:2] == ("agent", "wait"):
+            if exits:
+                # The agent quit on Esc, so herdr has nothing left to wait on.
+                data = read(working)
+                data["agents"] = data["agents"][:1]
+                working.write_text(json.dumps(data))
+            raise ValueError('{"code":"timeout","message":"timed out waiting for agent status"}')
+        return real(*args)
+
+    monkeypatch.setattr(agent_messages, "herdr", herdr)
+    value = agent_messages.interrupt(stop_request())
+    if exits:
+        assert value == {"stopped": True, "pane": "w1:p2", "warning": None}
+    else:
+        assert not value["stopped"] and "still shows as working" in value["warning"]
+    assert calls(working, ["agent", "send-keys"]) == [["agent", "send-keys", "w1:p2", "esc"]]
+
+
+@pytest.mark.parametrize(
+    ("change", "request_", "error"),
+    [
+        (None, stop_request(session="s1-other"), "no longer running"),
+        (None, stop_request(pane="w1:p9"), "no longer running"),
+        (None, stop_request(session=None), "no longer running"),
+        ({"agent_status": "idle"}, stop_request(), "not working"),
+        ({"agent_status": "blocked"}, stop_request(), "not working"),
+        (None, {"workspace": "w1", "pane": "w1:p2"}, "Invalid stop"),
+        (None, stop_request(extra=1), "Invalid stop"),
+        (None, stop_request(session=5), "Invalid stop"),
+        (None, stop_request(workspace="w9"), "not open"),
+    ],
+)
+def test_stop_is_refused_before_any_key_is_sent(working, change, request_, error):
+    import agent_messages
+
+    if change:
+        data = read(working)
+        data["agents"][1].update(change)
+        working.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=error):
+        agent_messages.interrupt(request_)
+    assert calls(working, ["agent", "send-keys"]) == []
+
+
+def test_an_agent_without_a_session_can_be_stopped(working):
+    import agent_messages
+
+    data = read(working)
+    del data["agents"][1]["agent_session"]
+    working.write_text(json.dumps(data))
+    assert agent_messages.interrupt(stop_request(session=None))["stopped"]
+
+
+def test_the_dashboard_relays_stops(working, tmp_path):
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            status, value = request(
+                port, "/api/workspace-interrupt", stop_request(), action="workspace-interrupt"
+            )
+            assert status == 200 and value["stopped"], value
+            status, value = request(
+                port,
+                "/api/workspace-interrupt",
+                stop_request(session="s9"),
+                action="workspace-interrupt",
+            )
+            assert status == 400 and "no longer running" in value["error"]
+            # The action needs its own header, as every dashboard action does.
+            status, _ = request(port, "/api/workspace-interrupt", stop_request(), action="cancel")
+            assert status == 404
+            assert len(calls(working, ["agent", "send-keys"])) == 1
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
 def test_dash_leading_messages_are_text(site):
     import agent_messages
 
