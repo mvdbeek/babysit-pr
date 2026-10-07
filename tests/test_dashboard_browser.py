@@ -3849,9 +3849,9 @@ def test_questions_render_as_cards_and_a_waiting_one_is_answered_here(
     )
     assert page.evaluate("window.injected") is None
     assert done.locator("form").count() == 0
-    # Codex asks without waiting: an option fills in a reply instead.
-    codex.get_by_role("button", name="Reply Leave it open to: Codex asks: which?").click()
-    expect(page.locator("#ws-message-text")).to_have_value("Codex asks: which?\n→ Leave it open")
+    # A question belonging to a different agent/session cannot become a plain message.
+    expect(codex).to_contain_text("No running agent in this workspace is on this session.")
+    expect(codex.get_by_role("button")).to_have_count(0)
     expect(waiting.locator(".ws-question-head")).to_contain_text("Waiting for an answer")
     submit = waiting.get_by_role("button", name="Answer in w1:p2")
     submit.click()
@@ -4508,3 +4508,82 @@ def test_unknown_docker_access_is_indeterminate_and_disabled(page, dashboard_sit
     expect(checkbox).to_have_js_property("indeterminate", True)
     expect(page.locator("#ws-docker-status")).to_have_text("Policy unavailable")
     expect(page.get_by_role("button", name="Send to agent")).to_be_enabled()
+
+
+@pytest.mark.parametrize("width,freeform", [(1280, False), (390, True)])
+def test_codex_async_question_answers_in_the_transcript(
+    page, dashboard_site, viewer_routes, width, freeform
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "codex", "updated": 1, "size": 1, "title": "Go"}
+    question = {
+        **QUESTION,
+        "question": "Should Docker access be automatic for every message, or an Allow Docker checkbox?",
+        "header": "Docker",
+        "options": [
+            {"label": "Automatic for every message", "description": None},
+            {"label": "Optional checkbox on each message", "description": None},
+        ],
+    }
+    entry = question_entry([question], name="request_user_input_async", output='{"accepted":true}')
+    # Async agents can keep working and add entries before the question blocks them.
+    entries = [entry] + (
+        [{"role": "assistant", "text": "Still working", "time": None}] * 6 if width == 1280 else []
+    )
+    page.clock.install()
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    viewer_routes["agents"][0].update(
+        status="working" if width == 1280 else "blocked", session="s1"
+    )
+    answers = []
+
+    def answer(route):
+        answers.append(route.request.post_data_json)
+        route.fulfill(json={"answered": True, "pane": "w1:p1"})
+
+    page.route("**/api/workspace-answer", answer)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    card = page.locator("#ws-viewer .ws-question")
+    if width == 1280:
+        expect(card).to_contain_text("The agent is not waiting on this question right now.")
+        viewer_routes["agents"][0]["status"] = "blocked"
+        page.clock.fast_forward(10000)
+    expect(card).to_contain_text("Waiting for an answer")
+    if freeform:
+        card.get_by_label("Other answer to: Should Docker").fill(
+            "Allow Docker for this message only"
+        )
+    else:
+        card.get_by_label("Optional checkbox on each message", exact=True).check()
+    card.get_by_role("button", name="Answer in w1:p1").click()
+    expect(card.locator(".ws-answer-status")).to_have_text("Answered in w1:p1.")
+    assert answers == [
+        {
+            "workspace": "w1",
+            "pane": "w1:p1",
+            "session": "s1",
+            "tool": "toolu_q",
+            "answers": [
+                {"text": "Allow Docker for this message only"} if freeform else {"options": [1]}
+            ],
+        }
+    ]
+    expect(card.locator(".ws-question-head")).to_contain_text("Answered")
+    expect(card.locator(".ws-question-head")).not_to_contain_text("Waiting")
+    assert viewer_routes["sent"] == []
+    expect(page.locator("#ws-message-text")).to_have_value("")
+    expect(card.get_by_role("button", name="Answer in w1:p1")).to_be_disabled()
+    page.screenshot(path=f"reports/codex-transcript-answer-{width}.png", full_page=True)

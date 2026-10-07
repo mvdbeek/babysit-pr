@@ -624,9 +624,8 @@
     current.session = data.session;
     current.sessions = data.sessions;
     transcriptMeta(current);
-    // Whether a question can be answered here follows the agent's state; only a recent
-    // Claude dialog can still be waiting.
-    if (current.entries.slice(-5).some(answerable)) void fetchAgents(viewer.entry);
+    // Async questions can stay open while subsequent tool calls fill the transcript.
+    if (current.entries.some(answerable)) void fetchAgents(viewer.entry);
     renderLive();
     if (follow) byId("ws-viewer").scrollTop = byId("ws-viewer").scrollHeight;
   }
@@ -667,14 +666,25 @@
     notification: "Notification",
   };
   // Questions an agent asked ------------------------------------------------------
-  // Claude's dialog can be answered from here while its agent waits on it: the server
-  // types the choices into the dialog. Codex asks without waiting, so its options only
-  // offer to fill in a reply.
+  // Answers go through the matching session's question dialog, for both agents.
   function openQuestion(entry) {
-    return entry.role === "tool" && entry.questions && entry.output == null;
+    if (entry.role !== "tool" || !entry.questions || entry.error || entry.answeredHere)
+      return false;
+    if (entry.output == null) return true;
+    if (entry.name === "request_user_input_async") {
+      try {
+        const value = JSON.parse(entry.output);
+        return value.accepted === true && Object.keys(value).length === 1;
+      } catch {
+        return false;
+      }
+    }
+    return false;
   }
   function answerable(entry) {
-    return openQuestion(entry) && entry.name === "AskUserQuestion";
+    return (
+      openQuestion(entry) && /^(AskUserQuestion|request_user_input(_async)?)$/.test(entry.name)
+    );
   }
   // Claude joins a multiple-choice answer's labels with ", ", which labels may contain.
   function chosenLabels(question, answer) {
@@ -695,27 +705,31 @@
     return found;
   }
   // What decides how an open question is drawn: whether, and to whom, it can be answered.
-  function answerState() {
+  function questionAgent(entry) {
     const session = viewer?.data?.session?.id;
-    const agent = agents.find((a) => a.agent === "claude" && a.session && a.session === session);
+    const kind = entry.name === "AskUserQuestion" ? "claude" : "codex";
+    return agents.find((a) => a.agent === kind && a.session && a.session === session);
+  }
+  function answerState(entry) {
+    const agent = questionAgent(entry);
     return `${Boolean(draft)}|${agent?.pane}|${agent?.status}`;
   }
   function questionCard(entry) {
-    const claude = entry.name === "AskUserQuestion";
     const card = node("div", undefined, "ws-question");
     card.dataset.tool = entry.id || "";
-    card.dataset.state = answerState();
+    card.dataset.state = answerState(entry);
     const head = node("div", undefined, "ws-question-head");
     head.append(node("strong", entry.questions.length === 1 ? "Question" : "Questions"));
     const open = openQuestion(entry);
-    if (entry.answers) head.append(badge("Answered", "green"));
+    if (entry.answers || entry.answeredHere) head.append(badge("Answered", "green"));
     else if (entry.error) head.append(badge("Not answered", "red"));
-    else if (claude && open) head.append(badge("Waiting for an answer", "amber"));
+    else if (open && questionAgent(entry)?.status === "blocked")
+      head.append(badge("Waiting for an answer", "amber"));
     const when = stamp(entry.time);
     if (when) head.append(when);
     card.append(head);
     // A dialog that can be answered here shows its questions in the form instead.
-    const controls = claude && open ? answerControls(entry) : null;
+    const controls = answerable(entry) ? answerControls(entry) : null;
     const answering = controls?.tagName === "FORM";
     entry.questions.forEach((question) => {
       if (answering) return;
@@ -735,7 +749,6 @@
         }
         item.append(node("strong", option.label));
         if (option.description) item.append(" ", node("span", option.description, "pr-meta"));
-        if (!claude && draft) item.append(" ", replyButton(question, option.label));
         list.append(item);
       }
       if (question.options.length) section.append(list);
@@ -751,26 +764,12 @@
     if (controls) card.append(controls);
     return card;
   }
-  function replyButton(question, label) {
-    const button = node("button", "Reply with this", "ws-question-reply");
-    button.type = "button";
-    button.setAttribute("aria-label", `Reply ${label} to: ${question.question}`);
-    button.onclick = () => {
-      const field = byId("ws-message-text");
-      const line = `${question.question}\n→ ${label}`;
-      field.value = field.value.trim() ? `${field.value.trimEnd()}\n\n${line}` : line;
-      field.dispatchEvent(new Event("input"));
-      field.focus();
-    };
-    return button;
-  }
   function answerControls(entry, target = null) {
     const session = target?.session || viewer?.data?.session?.id;
-    const agent =
-      target || agents.find((a) => a.agent === "claude" && a.session && a.session === session);
+    const agent = target || questionAgent(entry);
     if (!draft) return node("p", "Answer it in the agent's terminal.", "pr-meta");
     if (!agent)
-      return node("p", "No running Claude agent in this workspace is on this session.", "pr-meta");
+      return node("p", "No running agent in this workspace is on this session.", "pr-meta");
     if (agent.status !== "blocked")
       return node("p", "The agent is not waiting on this question right now.", "pr-meta");
     const form = node("form", undefined, "ws-answer");
@@ -855,8 +854,13 @@
         submit.disabled = false;
         return;
       }
+      entry.answeredHere = true;
+      form
+        .closest(".ws-question")
+        ?.querySelector(".ws-question-head .badge")
+        ?.replaceWith(badge("Answered", "green"));
       status.textContent = `Answered in ${value.pane}.`;
-      // The transcript records the answer once the agent continues.
+      // Refresh synchronous results; async transcripts can retain just an acknowledgment.
       setTimeout(() => {
         if (viewer?.entry === current) void fetchAgents(current);
         if (viewer?.entry === current && viewer.mode === "transcript")
@@ -883,7 +887,7 @@
     if (viewer?.mode !== "transcript" || !viewer.data?.entries) return;
     viewer.data.entries.forEach((entry, index) => {
       const shown = viewer.nodes[index];
-      if (!answerable(entry) || !shown || shown.dataset.state === answerState()) return;
+      if (!answerable(entry) || !shown || shown.dataset.state === answerState(entry)) return;
       // A form being filled in is left alone.
       if (
         shown.contains(document.activeElement) ||
