@@ -208,7 +208,8 @@ def quit_agent(record):
         raise ValueError("An exit was already attempted for this process; check the pane in Collie")
     _exiting.add(key)
     if record["agent"] == "claude":
-        handoff.herdr("pane", "send-text", pane, "--", "/exit")
+        # send-text joins all arguments after the pane ID, including a literal --.
+        handoff.herdr("pane", "send-text", pane, "/exit")
         handoff.herdr("agent", "send-keys", pane, "enter")
     else:
         handoff.herdr("agent", "send-keys", pane, "ctrl+d")

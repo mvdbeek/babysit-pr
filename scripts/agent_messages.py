@@ -533,7 +533,7 @@ def answer(request):
                         # shows once it has focus.
                         if not wait_for(pane, lambda screen: "ctrl+g to edit" in screen):
                             raise ValueError("the answer field did not open")
-                        run("herdr", "pane", "send-text", pane, "--", value)
+                        run("herdr", "pane", "send-text", pane, value)
                     else:
                         if value == str(
                             len(question["options"]) + 1
