@@ -104,7 +104,9 @@ def rig(request, tmp_path, monkeypatch):
         messages.workspace_viewer, "sessions", lambda root: [{"id": SID, "agent": kind}]
     )
     monkeypatch.setattr(
-        messages, "agents", lambda wid: [{"pane": "w1:p1", "session": SID, "agent": kind}]
+        messages,
+        "agents",
+        lambda wid, interactions=False: [{"pane": "w1:p1", "session": SID, "agent": kind}],
     )
     monkeypatch.setattr(messages, "run", send)
     return rig

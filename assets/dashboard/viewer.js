@@ -761,9 +761,10 @@
     };
     return button;
   }
-  function answerControls(entry) {
-    const session = viewer?.data?.session?.id;
-    const agent = agents.find((a) => a.agent === "claude" && a.session && a.session === session);
+  function answerControls(entry, target = null) {
+    const session = target?.session || viewer?.data?.session?.id;
+    const agent =
+      target || agents.find((a) => a.agent === "claude" && a.session && a.session === session);
     if (!draft) return node("p", "Answer it in the agent's terminal.", "pr-meta");
     if (!agent)
       return node("p", "No running Claude agent in this workspace is on this session.", "pr-meta");
@@ -854,6 +855,7 @@
       status.textContent = `Answered in ${value.pane}.`;
       // The transcript records the answer once the agent continues.
       setTimeout(() => {
+        if (viewer?.entry === current) void fetchAgents(current);
         if (viewer?.entry === current && viewer.mode === "transcript")
           void loadViewer({ after: Math.max(viewer.data.start, viewer.data.total - 20) });
       }, 2500);
@@ -965,6 +967,8 @@
   }
   function openComposer(entry) {
     const form = byId("ws-message");
+    byId("ws-agent-interaction").replaceChildren();
+    delete byId("ws-agent-interaction").dataset.state;
     byId("ws-message-status").textContent = "";
     agents = [];
     sessions = [];
@@ -1032,10 +1036,13 @@
     const keep = (values) => (values.includes(picked) ? picked : values[0]);
     holder.replaceChildren();
     const send = byId("ws-message-send");
+    const interaction = byId("ws-agent-interaction");
     send.textContent = "Send to agent";
     send.disabled = true;
     byId("ws-docker").hidden = true;
     if (message) {
+      interaction.replaceChildren();
+      delete interaction.dataset.state;
       holder.append(node("small", message, "pr-meta"));
       return;
     }
@@ -1048,12 +1055,18 @@
               "Agent",
               agents.map((agent) => [agent.pane, agentLabel(agent)]),
               keep(agents.map((agent) => agent.pane)),
-              renderDocker,
+              () => {
+                renderDocker();
+                renderInteraction();
+              },
             ),
       );
       renderDocker();
+      renderInteraction();
       return;
     }
+    interaction.replaceChildren();
+    delete interaction.dataset.state;
     if (!sessions.length) {
       holder.append(
         node("small", "No agent is running and no session was recorded here.", "pr-meta"),
@@ -1075,6 +1088,32 @@
         () => {},
       ),
     );
+  }
+  function renderInteraction() {
+    const agent = selectedAgent();
+    const blocked = agent?.status === "blocked";
+    byId("ws-message-send").disabled = sending || changingDocker || blocked;
+    const holder = byId("ws-agent-interaction");
+    const state = JSON.stringify([agent?.pane, agent?.session, blocked, agent?.interaction]);
+    if (holder.dataset.state === state) return;
+    holder.dataset.state = state;
+    holder.replaceChildren();
+    if (!blocked) return;
+    holder.append(
+      node("p", "The agent is waiting for an answer. Your message is saved.", "pr-meta"),
+    );
+    const question = agent.interaction?.question;
+    if (question) {
+      const card = node("div", undefined, "ws-question");
+      card.append(node("strong", "Live question from the agent"), answerControls(question, agent));
+      holder.append(card);
+    } else {
+      if (agent.interaction?.screen)
+        holder.append(node("pre", agent.interaction.screen, "ws-agent-screen"));
+      holder.append(
+        node("p", "Answer this dialog in Collie, then refresh to send your message.", "pr-meta"),
+      );
+    }
   }
   function selectedAgent() {
     const picked = byId("ws-message-agent").querySelector("select")?.value;

@@ -1490,6 +1490,91 @@ def keys_sent(state):
     ]
 
 
+@pytest.fixture
+def missing_question(asking):
+    state, sid, transcript = asking
+    # Claude may be blocked before the tool call reaches the JSONL transcript.
+    transcript.write_text(transcript.read_text().splitlines()[0] + "\n")
+    screen = (
+        dialog_screen(QUESTIONS[0])
+        .replace("←  ☐ Color  ☐ Toppings  ✔ Submit  →", " ☐ Color")
+        .replace("Pick a color\n", "Pick a\ncolor\n")
+        .replace("  1. Red", "❯ 1. Red\n     Warm")
+    )
+    data = read(state)
+    data["screens"]["w1:p1"] = [screen, "done"]
+    state.write_text(json.dumps(data))
+    return state, sid, screen
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_missing_transcript_question_can_be_answered_from_the_screen(missing_question, typed):
+    import agent_messages
+
+    state, sid, screen = missing_question
+    target = agent_messages.docker_status("w1")[0]
+    assert "docker" in target
+    interaction = target["interaction"]
+    question = interaction["question"]
+    assert interaction["screen"] == screen
+    assert question["questions"][0] == {
+        "header": "Color",
+        "question": "Pick a color",
+        "multi": False,
+        "options": [{"label": "Red", "description": "Warm"}, {"label": "Blue", "description": ""}],
+    }
+    if typed:
+        data = read(state)
+        data["screens"]["w1:p1"] = [
+            screen,
+            screen.replace("Esc to", "ctrl+g to edit · Esc to"),
+            "done",
+        ]
+        state.write_text(json.dumps(data))
+    value = agent_messages.answer(
+        answer_request(
+            sid, [{"text": "Teal"}] if typed else [{"options": [1]}], tool=question["id"]
+        )
+    )
+    assert value["answered"]
+    assert keys_sent(state) == ([["3"], ["--", "Teal"], ["enter"]] if typed else [["2"]])
+
+
+def test_changed_live_question_is_not_answered(missing_question):
+    import agent_messages
+
+    state, sid, screen = missing_question
+    question = agent_messages.agents("w1", interactions=True)[0]["interaction"]["question"]
+    data = read(state)
+    data["screens"]["w1:p1"] = [screen.replace("Warm", "Different meaning")]
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="screen changed"):
+        agent_messages.answer(answer_request(sid, [{"options": [0]}], tool=question["id"]))
+    assert keys_sent(state) == []
+
+
+@pytest.mark.parametrize("mode", ["shell", "multiple", "editing", "truncated", "approval"])
+def test_unsupported_live_dialogs_are_visible_without_answer_controls(missing_question, mode):
+    import agent_messages
+
+    state, _, screen = missing_question
+    screen = {
+        "shell": "Pick a color\n1. Red\n2. Blue\n%",
+        "multiple": screen.replace("☐ Color", "☐ Color  ☐ Toppings  ✔ Submit"),
+        "editing": screen.replace("Esc to", "ctrl+g to edit · Esc to"),
+        "truncated": screen.replace("3. Type something.", ""),
+        "approval": screen.replace("☐ Color", "Allow this command?"),
+    }[mode]
+    data = read(state)
+    data["screens"]["w1:p1"] = [screen]
+    state.write_text(json.dumps(data))
+    assert agent_messages.agents("w1", interactions=True)[0]["interaction"] == {
+        "screen": screen,
+        "question": None,
+    }
+    assert keys_sent(state) == []
+
+
 def test_a_waiting_claude_dialog_is_answered_one_question_at_a_time(asking):
     import agent_messages
 
