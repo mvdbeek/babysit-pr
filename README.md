@@ -546,6 +546,51 @@ no slug), with a numeric suffix for collisions; the branch starts from the clone
 `Issue: <canonical URL>`. Associations, operations and logs share
 `pr-workspaces.sqlite`; the `pr` column keeps its name and stores both kinds of id.
 
+## Cron jobs
+
+The **Cron jobs** tab (`#cron`) runs your own shell commands on a schedule. Choose
+**New job** and give it a name, a command, an optional working directory (your home
+directory otherwise), a frequency and a time limit. A frequency is either an interval
+(every N minutes, hours or days, counted from when the schedule was saved) or a
+five-field cron expression such as `*/15 * * * *`, `0 9 * * mon-fri` or `@daily`.
+Cron expressions use the dashboard host's local time; when both day of month and day
+of week are restricted, either one matching is enough, as in Vixie cron. Saving shows
+the next three run times.
+
+Commands run as you, through your login shell (`$SHELL -lc`, so your usual `PATH`
+applies even under launchd), with stdin closed and `BABYSIT_CRON_JOB` and
+`BABYSIT_CRON_RUN` set. Stdout and stderr are kept together per run, up to 512 KiB;
+longer output is counted and dropped. A run that exceeds its time limit, or that you
+**Stop**, is sent SIGTERM with its whole process group; anything still running when the
+shell exits, or five seconds later, is killed. Processes a command leaves running in
+the background are stopped when its run ends; use `launchd` or similar for anything
+that should outlive the run. Commands inherit the dashboard's environment, including
+`GH_TOKEN` when the dashboard has one.
+
+Select a job to see its schedule, command and up to 20 recent runs: start time,
+whether it was scheduled or started with **Run now**, duration, and result (exit
+status or signal). Selecting a run shows its output, which follows along live while
+the job runs. The 50 most recent runs of each job are kept with their output. The tab
+counts jobs whose latest run failed.
+
+Jobs run only while the dashboard process runs. A job never overlaps itself: a run
+due while the previous one is still going is recorded as skipped. A run that came due
+while the dashboard was stopped starts once when it returns, up to a day late; later
+than that it is recorded as missed. **Pause** stops scheduled runs without deleting
+the job, and **Resume** continues from the current time instead of replaying what was
+missed. Interval schedules are exact durations, so a daily interval shifts by an hour
+across a daylight-saving change; use a cron expression for a fixed time of day. Like
+Vixie cron, a schedule that runs every hour also runs in the hour repeated when clocks
+go back, while a fixed-hour schedule runs once. Stopping the dashboard (including a
+`launchctl kickstart -k` restart) stops running jobs and records them as interrupted.
+Only one dashboard process runs the jobs of a state directory; another one started
+over the same directory shows them without running them.
+
+Jobs and run history are stored in `cron.sqlite` and output in `cron-logs/` under the
+state directory, both private to your user. Anyone who can use the dashboard can run
+commands as you through this tab, just as they can launch agents; only expose the
+dashboard through `--allow-host` to devices you trust.
+
 ## GitHub credentials and prompts
 
 Every `gh` process normally reads its token back from the system keyring, which on macOS means waiting on the login Keychain; pinentry-mac fetches the GPG signing passphrase from that same Keychain. A polling supervisor and dashboard start many `gh` processes at once, and one stalled keyring read used to leave dozens of them parked there, with your own `gh` and `git commit` queued behind them. The supervisor and dashboard therefore resolve the token once per process with `gh auth token`, hand it to each `gh` and `git` child through `GH_TOKEN` (so the keyring is never opened again), re-read it only when GitHub answers 401 or after six hours, and run at most four `gh` processes at a time per Python process. Children also get `GH_PROMPT_DISABLED`, `GH_NO_UPDATE_NOTIFIER`, `GIT_TERMINAL_PROMPT=0`, and `GCM_INTERACTIVE=never`, so an unattended command fails instead of waiting for a terminal or a dialog. When no token can be read, no `gh` process is started at all: `gh` would otherwise fall back to unauthenticated requests, still opening the keyring each time and burning the per-IP rate limit. The dashboard and watcher instead report why (`gh auth token` output) and retry after a minute. A launchd service or sandbox cannot answer Keychain prompts, so `gh auth token` fails there with "no oauth token found"; run `gh auth login --insecure-storage` (the token then lives in `~/.config/gh/hosts.yml`, mode 0600) or provide `GH_TOKEN` in that service's environment. The token stays in memory and child environments only; it is never written to state files or logs. Repair agents receive the non-interactive settings but not the token: they authenticate the same way your interactive sessions do. Set `GH_TOKEN` yourself to skip the lookup entirely.
