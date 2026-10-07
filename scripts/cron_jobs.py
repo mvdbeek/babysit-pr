@@ -549,18 +549,20 @@ class CronJobs:
     def execute(self, job, handle):
         run = handle.record
         try:
-            self.update_run(run, **self.perform(job, handle))
+            result = self.perform(job, handle)
         except Exception as exc:  # The run must always finish, whatever went wrong.
-            self.update_run(run, status="error", message=f"Could not run: {exc}")
-        finally:
-            if run.get("finished_at") is None:
-                self.update_run(run, finished_at=self.clock())
-            with self.lock:
-                self.running.pop(job["id"], None)
+            result = {"status": "error", "message": f"Could not run: {exc}"}
+        result.setdefault("finished_at", self.clock())
+        # Together under the lock, so no snapshot shows a finished run of a running job.
+        with self.lock:
             try:
-                self.prune(job["id"])
-            except (OSError, sqlite3.Error):
-                pass
+                self.update_run(run, **result)
+            finally:
+                self.running.pop(job["id"], None)
+        try:
+            self.prune(job["id"])
+        except (OSError, sqlite3.Error):
+            pass
 
     def perform(self, job, handle):
         run = handle.record
