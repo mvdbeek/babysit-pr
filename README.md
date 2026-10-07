@@ -356,6 +356,23 @@ policies can determine the effective model. The operation records the requested
 configuration. Agent startup/provenance verification and duplicate-launch protection
 remain in place. Open/reopen actions do not apply these settings to existing sessions.
 
+**Allow Docker in the agent’s sandbox**, off by default, passes `--docker` to the
+helper (the request field is `docker: true`; New task, Handle, Create workspace and
+batch Handle all offer it, and scheduled launches keep it). The helper types
+`SAFE_ENABLE=docker <agent> …` into the pane, and the user's `safe` shell wrapper adds
+that to Safehouse's `--enable` list, which opens the Docker daemon socket to that one
+agent. Agents started without it keep Safehouse's default deny on container sockets.
+The operation records `docker` (false for reopen).
+
+The follow-up composer's **Docker access** checkbox reflects the selected running
+agent's current socket grants. Toggle it to restart an idle agent with Docker enabled
+or disabled, preserving its exact conversation, pane, directory and supported launch
+options without sending a message. Sending messages does not change Docker access;
+exited sessions resume using the shell's normal defaults. A busy agent, blocked dialog,
+unsent terminal draft, unknown launch option, changed session, or watcher-owned session
+prevents the restart. Unknown access is shown as unavailable, never as disabled.
+Inspection requires macOS Seatbelt. This controls socket access; it does not start Docker.
+
 Codex choices come from picker-visible entries and supported reasoning levels in
 `$CODEX_HOME/models_cache.json` (normally `~/.codex/models_cache.json`). This is a
 read-only, local cache: the dashboard never starts a Codex session to discover
@@ -384,7 +401,7 @@ only when starting a new session. Codex receives `--model` and
 `-c 'model_reasoning_effort="…"'`; Claude receives `--model` and `--effort`.
 CLI configuration precedence and organization policies still apply, including
 Codex managed new-thread defaults that can change when either override is supplied.
-Keep `wt.py` alongside `pr_workspaces.py` when distributing the scripts; there is
+Keep `wt.py` and `claude_accounts.py` alongside `pr_workspaces.py` when distributing the scripts; there is
 no separate installed helper to update.
 
 References (verified against installed CLI help and official documentation):
@@ -399,6 +416,55 @@ References (verified against installed CLI help and official documentation):
 - [Claude CLI reference](https://code.claude.com/docs/en/cli-usage) documents session
   `--model` and `--effort` flags.
 
+## Multiple Claude accounts
+
+Keep your existing login as the default, and create each additional subscription
+login in `~/.claude/accounts/<name>`. Put `scripts/` on `PATH` to use the
+`claude-account` launcher, or invoke it directly from this checkout:
+
+```sh
+./scripts/claude-account login work
+./scripts/claude-account status work
+./scripts/claude-account run work
+./scripts/claude-account run work -- --resume SESSION_UUID
+./scripts/claude-account list
+```
+
+`login` creates the directory and opens Claude's normal browser login. `default`
+selects the existing `~/.claude` login without setting `CLAUDE_CONFIG_DIR`, which
+preserves its macOS Keychain entry. The launcher uses the existing Safehouse setup.
+Settings, plugins, MCP configuration and session history are separate for each
+account; this helper does not copy credentials or settings between them. An
+explicit account selection removes inherited API keys, OAuth tokens and provider
+selection variables so they cannot choose another account instead. Account names
+use letters, digits, underscores and hyphens. To register an existing custom
+directory, symlink it into `~/.claude/accounts/<name>`.
+
+Select an account for worktree launches with `wt --claude --claude-account work …`
+(also accepted by `wti` and `wtpr`), or with the dashboard's **Claude account**
+picker. Default leaves the normal shell configuration in charge. Account selection
+applies to newly started agents; reattaching a running workspace keeps its agent.
+The shell launch preserves the user's `claude` function and forwards the selected
+directory through Safehouse. The executable launcher grants that directory only.
+
+For babysitter registration, use `--agent claude --claude-account work`. Without
+that option, registration finds the session among the default, named and current
+`CLAUDE_CONFIG_DIR` stores and records the directory belonging to its transcript.
+Every new watch retains that directory for repairs and session locks, including
+after a daemon restart or a launch into an original pane with a different shell
+environment. An ambiguous session requires `--rollout`; a transcript from another
+account is refused when an account was explicitly chosen. Existing watches keep
+their original environment behavior until deliberately registered again.
+
+Dashboard session discovery includes all named accounts, labels their sessions,
+and resumes them using their original store. The Sentry usage reader selects the
+Keychain entry for its configured `CLAUDE_CONFIG_DIR` and never falls back to
+another account's Keychain entry. Account selection does not automatically rotate
+to a different subscription when a usage limit is reached.
+
+Claude's supported multi-account mechanism is documented in its
+[authentication reference](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts).
+
 ## Worktree helper
 
 `scripts/wt.py` is a portable, stdlib-only Python implementation of the `wt`, `wti`
@@ -409,7 +475,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude] [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude] [--docker] [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]

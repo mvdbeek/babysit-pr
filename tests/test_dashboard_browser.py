@@ -2523,6 +2523,7 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
             "efforts": ["low", "ultra"],
         },
         "claude": {
+            "accounts": [{"id": "default", "label": "Default"}, {"id": "work", "label": "Work"}],
             "models": [{"id": "opus", "efforts": ["low", "high"]}, {"id": "haiku", "efforts": []}],
             "efforts": ["low", "high"],
         },
@@ -2558,6 +2559,11 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
         dialog.get_by_label("Agent", exact=True).select_option(settings)
         choose_option(model, "fixture-codex" if settings == "codex" else "opus")
         choose_option(effort, "ultra" if settings == "codex" else "high")
+    docker = dialog.get_by_label("Allow Docker in the agent’s sandbox")
+    expect(docker).not_to_be_checked()
+    if settings == "claude":
+        docker.check()
+        dialog.get_by_label("Claude account", exact=True).select_option("work")
     dialog.get_by_label("Task", exact=True).fill("Fix this")
     if kind == "pr" and not clone and settings == "codex":
         page.screenshot(path="reports/workspace-model-effort-desktop.png")
@@ -2570,6 +2576,8 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
     expect(page.locator("#workspace-progress")).to_contain_text("running")
     body = requests[-1]
     assert body["action"] == ("clone-and-create" if clone else "create")
+    assert body.get("docker") is (True if settings == "claude" else None)
+    assert body.get("claude_account") == ("work" if settings == "claude" else None)
     if settings == "default":
         assert "model" not in body and "effort" not in body
     else:
@@ -2893,6 +2901,7 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
         "agent": "claude",
         "model": "opus",
         "effort": "high",
+        "docker": True,
         "task": '<img src=x onerror="window.injected=true"> Fix CI overnight',
     }
     subject = {
@@ -2959,7 +2968,7 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
     pending = page.locator("#scheduled-pending li")
     expect(pending).to_have_count(1)
     expect(pending).to_contain_text("in 2 h")
-    expect(pending).to_contain_text("Handle · Claude · opus · high effort")
+    expect(pending).to_contain_text("Handle · Claude · opus · high effort · Docker")
     expect(pending.get_by_role("link", name="test/alpha #8")).to_have_attribute(
         "href", "https://github.com/test/alpha/pull/8"
     )
@@ -3077,6 +3086,7 @@ def test_batch_handle_selects_issues_and_staggers_their_starts(
     dialog.get_by_label("Minutes between starts").fill("45")
     dialog.get_by_label("Start later").check()
     expect(items.first).not_to_contain_text("Starts now")
+    dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
     page.screenshot(path=f"reports/batch-dialog-{width}.png")
     dialog.get_by_role("button", name="Schedule 2 tasks").click()
     expect(page.locator("#workspace-progress")).to_have_text(
@@ -3090,7 +3100,7 @@ def test_batch_handle_selects_issues_and_staggers_their_starts(
         {"id": "issue-one", "clone": "/fixture/alpha"},
         {"id": "issue-two", "destination": "/fixture/src/beta"},
     ]
-    assert body["interval"] == 2700 and body["agent"] == "codex"
+    assert body["interval"] == 2700 and body["agent"] == "codex" and body["docker"] is True
     assert body["prefilled"] is True and body["task"].startswith("Investigate and resolve {url}.")
     assert body["start_at"] > time.time() + 3000
     # Scheduled issues leave the selection; the one that failed stays to retry.
@@ -4176,6 +4186,7 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
     expect(dialog.get_by_label("Issue title")).to_be_focused()  # Required and empty.
     assert len(sent) == 1
     dialog.get_by_label("Issue title").fill("Crash on start")
+    dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
     page.screenshot(path="reports/new-task.png")
     dialog.get_by_role("button", name="Start task").click()
     expect(page.locator("#workspace-progress")).to_contain_text("running")
@@ -4184,6 +4195,7 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
         "clone": "/fixture/alpha",
         "issue_title": "Crash on start",
         "agent": "codex",
+        "docker": True,
         "task": "It crashes on start",
     }
     # The dialog follows the operation; once ready it opens the workspace and its viewer,
@@ -4319,3 +4331,83 @@ def test_a_draft_for_another_checkout_is_discarded(page, dashboard_site, viewer_
     )
     expect(page.locator("#ws-message-comments")).to_be_empty()
     expect(page.locator("#ws-message-text")).to_have_value("")
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_docker_checkbox_reads_and_changes_selected_agent_without_sending(
+    page, dashboard_site, viewer_routes, width
+):
+    for index, agent in enumerate(viewer_routes["agents"]):
+        agent.update(session=f"session-{index}", docker=bool(index))
+    changes = []
+
+    def toggle(route):
+        body = route.request.post_data_json
+        assert route.request.headers["x-babysit-action"] == "workspace-docker"
+        changes.append(body)
+        agent = next(a for a in viewer_routes["agents"] if a["pane"] == body["pane"])
+        agent["docker"] = body["enabled"]
+        route.fulfill(json={"pane": body["pane"], "docker": body["enabled"], "warning": None})
+
+    page.route("**/api/workspace-docker", toggle)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(dashboard_site[0] + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    checkbox = viewer.get_by_role("checkbox", name="Docker access", exact=True)
+    expect(checkbox).to_be_enabled()
+    expect(checkbox).not_to_be_checked()
+    viewer.get_by_label("Message the agent").fill("Keep this draft")
+    checkbox.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Docker access enabled.")
+    expect(checkbox).to_be_checked()
+    viewer.get_by_label("Agent", exact=True).select_option("w1:p2")
+    expect(checkbox).to_be_checked()
+    checkbox.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Docker access disabled.")
+    expect(checkbox).not_to_be_checked()
+    expect(viewer.get_by_label("Message the agent")).to_have_value("Keep this draft")
+    assert not viewer_routes["sent"]
+    assert changes == [
+        {"workspace": "w1", "pane": "w1:p1", "session": "session-0", "enabled": True},
+        {"workspace": "w1", "pane": "w1:p2", "session": "session-1", "enabled": False},
+    ]
+    # A refused change re-reads the actual state without clearing the draft.
+    page.route(
+        "**/api/workspace-docker",
+        lambda route: route.fulfill(status=400, json={"error": "Wait until the agent is idle"}),
+    )
+    checkbox.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Wait until the agent is idle")
+    expect(checkbox).not_to_be_checked()
+    expect(viewer.get_by_label("Message the agent")).to_have_value("Keep this draft")
+    page.screenshot(path=f"reports/docker-checkbox-{width}.png")
+
+
+def test_sending_stays_disabled_while_docker_access_changes(page, dashboard_site, viewer_routes):
+    agent = viewer_routes["agents"][0]
+    agent.update(session="s1", docker=False)
+    pending = []
+    page.route("**/api/workspace-docker", lambda route: pending.append(route))
+    page.goto(dashboard_site[0] + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    page.get_by_role("checkbox", name="Docker access", exact=True).click()
+    expect(page.locator("#ws-docker-status")).to_have_text("Applying Docker access…")
+    send = page.get_by_role("button", name="Send to agent")
+    expect(send).to_be_disabled()
+    agent["docker"] = True
+    pending[0].fulfill(json={"pane": agent["pane"], "docker": True, "warning": None})
+    expect(send).to_be_enabled()
+    expect(page.get_by_role("checkbox", name="Docker access", exact=True)).to_be_checked()
+    assert not viewer_routes["sent"]
+
+
+def test_unknown_docker_access_is_indeterminate_and_disabled(page, dashboard_site, viewer_routes):
+    viewer_routes["agents"][0].update(session="s1", docker=None, docker_error="Policy unavailable")
+    page.goto(dashboard_site[0] + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    checkbox = page.get_by_role("checkbox", name="Docker access", exact=True)
+    expect(checkbox).to_be_disabled()
+    expect(checkbox).to_have_js_property("indeterminate", True)
+    expect(page.locator("#ws-docker-status")).to_have_text("Policy unavailable")
+    expect(page.get_by_role("button", name="Send to agent")).to_be_enabled()

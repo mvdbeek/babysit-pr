@@ -1072,6 +1072,7 @@ def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
                     "status": "idle",
                     "title": None,
                     "session": None,
+                    "docker": True,
                 }
             ]
             assert value["path"].endswith("merged-work") and value["sessions"] == []
@@ -1216,6 +1217,7 @@ def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
     assert data["runs"][0][1].startswith(f'claude --resume {sid} -- "$(cat ')
     agent = data["agents"][0]
     assert agent["argv"] == ["--resume", sid, "--", "Now add docs"]
+    assert not agent.get("safe_enable")
     assert Path(agent["cwd"]).resolve() == checkout.resolve()
     # The staged prompt is removed once the agent has read it.
     assert not list((home / "message-prompts").iterdir())
@@ -1233,7 +1235,9 @@ def test_a_session_open_elsewhere_gets_the_message_there(exited):
     data["panes"].append(
         {"pane_id": "w7:p1", "workspace_id": "w7", "agent_session": {"value": sid}}
     )
-    data["agents"] = [{"pane_id": "w7:p1", "workspace_id": "w7", "agent_status": "idle"}]
+    data["agents"] = [
+        {"pane_id": "w7:p1", "workspace_id": "w7", "agent": "claude", "agent_status": "idle"}
+    ]
     state.write_text(json.dumps(data))
     value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
     assert value == {"sent": True, "pane": "w7:p1", "warning": None}
@@ -1244,6 +1248,39 @@ def test_a_session_open_elsewhere_gets_the_message_there(exited):
     state.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="waiting on a question"):
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+
+
+@pytest.mark.parametrize("name", ["default", "work"])
+def test_named_account_resume_checks_its_lock_and_restores_its_store(
+    exited, tmp_path, monkeypatch, name
+):
+    import fcntl
+    import shutil
+
+    import agent_messages
+    import claude_accounts
+
+    state, sid, _, home = exited
+    original = Path(os.environ["CLAUDE_CONFIG_DIR"])
+    monkeypatch.setenv("HOME", str(tmp_path / "account-home"))
+    account = claude_accounts.account_home(name, create=True)
+    shutil.move(original / "projects", account / "projects")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert agent_messages.sessions("w1", home)[0]["claude_account"] == name
+    lock = account / "babysit-pr-locks" / f"{sid}.lock"
+    lock.parent.mkdir()
+    with lock.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        with pytest.raises(ValueError, match="repair is running"):
+            agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert not read(state).get("runs")
+    result = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert result["sent"] and result["warning"] is None
+    if name == "work":
+        assert read(state)["agents"][0]["claude_config_dir"] == str(account)
+    else:
+        assert "claude_config_dir" not in read(state)["agents"][0]
+        assert "unset CLAUDE_CONFIG_DIR" in read(state)["runs"][0][1]
 
 
 def test_a_session_left_on_an_exited_pane_is_resumed(exited, monkeypatch):
@@ -1268,7 +1305,7 @@ def test_a_just_resumed_session_is_not_resumed_again(exited, monkeypatch):
     state, sid, _, home = exited
     monkeypatch.setattr(agent_messages, "RESUME_WAIT", 0)
     first = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
-    assert "no agent appeared yet" in first["warning"]
+    assert "session is not confirmed yet" in first["warning"]
     data = read(state)
     data["agents"] = []  # Not recognized yet: only the recent-resume record stops a repeat.
     state.write_text(json.dumps(data))
@@ -1475,7 +1512,9 @@ def test_missing_transcript_question_can_be_answered_from_the_screen(missing_que
     import agent_messages
 
     state, sid, screen = missing_question
-    interaction = agent_messages.agents("w1", interactions=True)[0]["interaction"]
+    target = agent_messages.docker_status("w1")[0]
+    assert "docker" in target
+    interaction = target["interaction"]
     question = interaction["question"]
     assert interaction["screen"] == screen
     assert question["questions"][0] == {
@@ -1743,3 +1782,22 @@ def test_a_message_with_an_attached_file_gives_the_agent_its_path(site, tmp_path
         finally:
             httpd.shutdown()
             thread.join(5)
+
+
+def test_docker_action_uses_dashboard_post_protections(server, monkeypatch):
+    import agent_messages
+
+    port, _ = server
+    calls = []
+
+    def change(body, home):
+        calls.append(body)
+        return {"pane": body["pane"], "docker": body["enabled"], "warning": None}
+
+    monkeypatch.setattr(agent_messages, "set_docker", change)
+    body = {"workspace": "w1", "pane": "w1:p1", "session": "s1", "enabled": False}
+    status, _ = request(port, "/api/workspace-docker", body, action="")
+    assert status == 403 and not calls
+    status, value = request(port, "/api/workspace-docker", body, action="workspace-docker")
+    assert status == 200 and value["docker"] is False
+    assert calls == [body]
