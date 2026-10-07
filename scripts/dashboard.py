@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import signal
 import sqlite3
 import subprocess
 import time
@@ -209,6 +210,7 @@ class DashboardServer(ThreadingHTTPServer):
         workspace_overview=None,
         push=None,
         sentry=None,
+        cron=None,
         attachments: Path | None = None,
     ) -> None:
         self.home = home
@@ -217,6 +219,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.issues = issues
         self.upstream_tests = upstream_tests
         self.sentry = sentry
+        self.cron = cron
         self.workspace_overview = workspace_overview
         self.workspaces = workspaces
         self.ci = ci
@@ -278,6 +281,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-prompt-forget",
                 "attachment-upload",
                 "sentry-action",
+                "cron-action",
                 "push-subscribe",
                 "push-unsubscribe",
                 "push-read",
@@ -314,6 +318,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-answer",
                         "workspace-prompt-forget",
                         "sentry-action",
+                        "cron-action",
                     }
                     else 1024
                 )
@@ -349,6 +354,11 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     value = {"error": "Sentry experiment unavailable"}
                 self.send_json(200, value)
+                return
+            if action == "cron-action":
+                if not self.server.cron:
+                    raise ValueError("Cron jobs are not enabled")
+                self.send_json(200, self.server.cron.action(request))
                 return
             if action in {"workspace-cleanup", "workspace-open"}:
                 # Experimental workspace actions own their validation.
@@ -502,6 +512,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, value)
                 except Exception:
                     self.send_json(200, {"enabled": True, "error": "Sentry experiment unavailable"})
+            elif route.path == "/api/cron":
+                self.send_json(
+                    200, self.server.cron.snapshot() if self.server.cron else {"enabled": False}
+                )
+            elif route.path == "/api/cron-log":
+                if not self.server.cron:
+                    raise ValueError("Cron jobs are not enabled")
+                query = parse_qs(route.query)
+                if set(query) != {"run"} or len(query["run"]) != 1:
+                    raise ValueError("Supply a run")
+                self.send_json(200, self.server.cron.log(query["run"][0]))
             elif route.path == "/api/workspace-overview":
                 # Experimental inventory must stay outside the main dashboard boundary.
                 try:
@@ -687,6 +708,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/viewer.css": ("viewer.css", "text/css"),
                     "/sentry.js": ("sentry.js", "text/javascript"),
                     "/sentry.css": ("sentry.css", "text/css"),
+                    "/cron.js": ("cron.js", "text/javascript"),
+                    "/cron.css": ("cron.css", "text/css"),
                     "/style.css": ("style.css", "text/css"),
                 }
                 if route.path not in files:
@@ -702,6 +725,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir=None):
+    from cron_jobs import CronJobs
     from dashboard_push import PushInbox
     from sentry_issues import SentryIssues
     from upstream_tests import UpstreamTests
@@ -712,6 +736,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
     overview = Overview(home)
     issues = IssueOverview(home)
     sentry = SentryIssues(home)
+    cron = CronJobs(home)
     workspaces = Workspaces(
         home,
         overview,
@@ -738,9 +763,11 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         workspace_overview=workspace_overview,
         push=push,
         sentry=sentry,
+        cron=cron,
         attachments=attachments_dir,
     ) as server:
         ci_logs.start()
+        cron.start()
         push.start()
         workspaces.start()
         url = f"http://127.0.0.1:{server.server_port}"
@@ -750,11 +777,19 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         )
         if open_browser:
             webbrowser.open(url)
+
+        def stopped(signum, frame):
+            raise KeyboardInterrupt()
+
+        # launchd restarts with SIGTERM; cleanup below must still stop running cron jobs.
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(sig, stopped)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
         finally:
+            cron.close()
             workspaces.close()
             push.close()
             ci_logs.close()
