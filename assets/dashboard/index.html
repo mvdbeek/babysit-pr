@@ -1046,25 +1046,37 @@
       <form id="cron-form" method="dialog">
         <label for="cron-name">Name</label>
         <input id="cron-name" type="text" maxlength="80" required autocomplete="off" />
-        <label for="cron-command">Command</label>
-        <textarea
-          id="cron-command"
-          rows="5"
-          required
-          spellcheck="false"
-          autocapitalize="off"
-          autocomplete="off"
-        ></textarea>
-        <small id="cron-shell"></small>
-        <label for="cron-cwd">Working directory</label>
-        <input
-          id="cron-cwd"
-          type="text"
-          placeholder="Home directory"
-          spellcheck="false"
-          autocapitalize="off"
-          autocomplete="off"
-        />
+        <fieldset id="cron-kinds" class="cron-kinds">
+          <legend>Runs</legend>
+          <label
+            ><input type="radio" name="cron-kind-choice" value="agent" checked /> An agent
+            task</label
+          >
+          <label
+            ><input type="radio" name="cron-kind-choice" value="shell" /> A shell command</label
+          >
+        </fieldset>
+        <div id="cron-agent-fields" class="cron-section"></div>
+        <div id="cron-shell-fields" class="cron-section" hidden>
+          <label for="cron-command">Command</label>
+          <textarea
+            id="cron-command"
+            rows="5"
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+          ></textarea>
+          <small id="cron-shell"></small>
+          <label for="cron-cwd">Working directory</label>
+          <input
+            id="cron-cwd"
+            type="text"
+            placeholder="Home directory"
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+          />
+        </div>
         <fieldset class="cron-frequency">
           <legend>Frequency</legend>
           <div class="cron-repeat">
@@ -1107,7 +1119,18 @@
           </div>
         </fieldset>
         <label for="cron-timeout">Time limit (minutes)</label>
-        <input id="cron-timeout" type="number" min="1" max="1440" step="1" value="60" />
+        <input
+          id="cron-timeout"
+          type="number"
+          min="1"
+          max="1440"
+          step="1"
+          value="60"
+          aria-describedby="cron-timeout-help"
+        />
+        <small id="cron-timeout-help"
+          >A command is stopped at the limit; an agent still working is left open in Collie.</small
+        >
         <label class="cron-enabled"
           ><input id="cron-enabled-input" type="checkbox" checked /> Run on schedule</label
         >

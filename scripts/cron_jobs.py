@@ -1,7 +1,9 @@
-"""Recurring shell commands the dashboard runs on a schedule, with their run history.
+"""Recurring jobs the dashboard runs on a schedule, with their run history.
 
-A job is a shell command, a working directory and a schedule: a five-field cron
-expression in the dashboard host's local time, or a fixed interval. The scheduler
+A job is either a shell command with a working directory, or an agent task that starts
+a fresh agent session in the job's own workspace (see ``cron_agents``). Its schedule is
+a five-field cron expression in the dashboard host's local time, or a fixed interval.
+The scheduler
 runs inside the dashboard process; nothing runs while the dashboard is stopped.
 A run that was due while it was stopped starts once when it returns, up to a day
 late. Each run's output is kept in a bounded log file next to its history.
@@ -22,7 +24,9 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import cron_agents
 import owned_process
+import workspace_exit
 
 MAX_JOBS = 100
 RUN_HISTORY = 50  # Finished runs kept per job, with their logs.
@@ -35,6 +39,20 @@ MIN_INTERVAL = 60
 MAX_INTERVAL = 31 * 86400
 MISSED_AFTER = 86400  # A run due longer ago than this is recorded as missed.
 POLL_SECONDS = 30
+WATCH_SECONDS = 10  # How often an agent run's session is checked while it works.
+SHELL_KEYS = {"command", "cwd"}
+AGENT_KEYS = {
+    "repo",
+    "clone",
+    "branch",
+    "base",
+    "agent",
+    "model",
+    "effort",
+    "claude_account",
+    "docker",
+    "prompt",
+}
 STOP_GRACE = 5  # Seconds between SIGTERM and SIGKILL when a run is stopped.
 QUIET_AFTER_EXIT = 2  # Seconds to wait for output a background child still writes.
 
@@ -176,11 +194,22 @@ def default_shell():
     return [shell, "-lc"]
 
 
-def validate(request):
+def validate(request, workspaces=None, home=None):
     """A job definition from an untrusted request; raises ValueError with a readable reason."""
     name = request.get("name")
     if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
         raise ValueError("Give the job a name of at most 80 characters")
+    kind = request.get("kind", "shell")
+    if kind == "agent":
+        task = cron_agents.validate(request, workspaces, home)
+    elif kind == "shell":
+        task = shell_task(request)
+    else:
+        raise ValueError("Choose a shell command or an agent task")
+    return {"name": name.strip(), "kind": kind, **task, **when(request)}
+
+
+def shell_task(request):
     command = request.get("command")
     if not isinstance(command, str) or not command.strip() or len(command) > 20000:
         raise ValueError("Give the job a command of at most 20000 characters")
@@ -196,6 +225,10 @@ def validate(request):
             raise ValueError("Use an absolute working directory, or ~ for your home")
         if not path.is_dir():
             raise ValueError(f"The working directory does not exist: {cwd}")
+    return {"command": command, "cwd": cwd}
+
+
+def when(request):
     schedule = request.get("schedule")
     if not isinstance(schedule, dict) or len(schedule) != 1:
         raise ValueError("Choose an interval or a cron expression")
@@ -227,14 +260,7 @@ def validate(request):
     enabled = request.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError("Expected enabled to be true or false")
-    return {
-        "name": name.strip(),
-        "command": command,
-        "cwd": cwd,
-        "schedule": schedule,
-        "timeout": timeout,
-        "enabled": enabled,
-    }
+    return {"schedule": schedule, "timeout": timeout, "enabled": enabled}
 
 
 class Run:
@@ -247,8 +273,12 @@ class Run:
 
 
 class CronJobs:
-    def __init__(self, home: Path, shell: list[str] | None = None, clock=time.time):
+    def __init__(
+        self, home: Path, shell: list[str] | None = None, clock=time.time, workspaces=None
+    ):
         self.home = home
+        # Agent jobs pick clones and start agents the way workspace actions do.
+        self.workspaces = workspaces
         self.shell = shell or default_shell()
         self.clock = clock
         self.path = home / "cron.sqlite"
@@ -273,17 +303,27 @@ class CronJobs:
                 "CREATE TABLE IF NOT EXISTS runs "
                 "(id INTEGER PRIMARY KEY AUTOINCREMENT, job TEXT, data TEXT)"
             )
-            # A run the previous process left behind lost its process when it stopped.
+            # A command the previous process ran stopped with it. An agent lives on in
+            # herdr: a started one is still followed, one being started may be there.
             leftovers = db.execute(
-                "SELECT id,data FROM runs WHERE json_extract(data,'$.status')='running'"
+                "SELECT id,data FROM runs WHERE json_extract(data,'$.status') "
+                "IN ('running','starting')"
             ).fetchall()
             for key, data in leftovers if self.active else []:
                 run = json.loads(data)
-                run.update(
-                    status="interrupted",
-                    finished_at=run.get("updated_at") or run["started_at"],
-                    message="The dashboard stopped during this run",
-                )
+                if run.get("kind") == "agent" and run["status"] == "running":
+                    continue
+                if run.get("kind") == "agent":
+                    run.update(
+                        status="attention",
+                        message="The dashboard stopped while starting this agent; "
+                        "check the job's workspace in Collie",
+                    )
+                else:
+                    run.update(
+                        status="interrupted", message="The dashboard stopped during this run"
+                    )
+                run["finished_at"] = run.get("updated_at") or run["started_at"]
                 db.execute("UPDATE runs SET data=? WHERE id=?", (json.dumps(run), key))
         self.path.chmod(0o600)
 
@@ -333,7 +373,7 @@ class CronJobs:
                 job["runs"] = self.runs(db, job["id"], RUNS_SHOWN)
                 for run in job["runs"][:1]:
                     run["tail"] = self.tail(run)
-                job["running"] = job["id"] in self.running
+                job["running"] = self.busy(db, job["id"])
                 try:
                     job["upcoming"] = upcoming(job, now) if job["enabled"] else []
                 except ValueError:
@@ -347,8 +387,19 @@ class CronJobs:
             "timezone": time.strftime("%Z"),
             "limit": MAX_JOBS,
             "log_limit": LOG_LIMIT,
+            "agents": self.workspaces is not None,
             "jobs": jobs,
         }
+
+    def busy(self, db, key):
+        """Whether a run of the job is starting or going: a command, or a followed agent."""
+        return key in self.running or bool(
+            db.execute(
+                "SELECT 1 FROM runs WHERE job=? AND json_extract(data,'$.status') "
+                "IN ('running','starting') LIMIT 1",
+                (key,),
+            ).fetchone()
+        )
 
     def log_path(self, run_id):
         return self.logs / f"{int(run_id)}.log"
@@ -386,7 +437,7 @@ class CronJobs:
         raise ValueError("Unknown job action")
 
     def save(self, request):
-        definition = validate(request)
+        definition = validate(request, self.workspaces, self.home)
         now = self.clock()
         with self.lock, self.db() as db:
             if request.get("id") is None:
@@ -395,9 +446,24 @@ class CronJobs:
                 job = {"id": secrets.token_hex(6), "created_at": now}
             else:
                 job = self.job(db, request["id"])
+            if definition["kind"] == "agent":
+                for other in self.jobs(db):
+                    if (
+                        other["id"] != job["id"]
+                        and other.get("kind") == "agent"
+                        and (other["clone"], other["branch"])
+                        == (definition["clone"], definition["branch"])
+                    ):
+                        raise ValueError(
+                            f"“{other['name']}” already works on {definition['branch']}; "
+                            "give this job its own branch"
+                        )
             rescheduled = job.get("schedule") != definition["schedule"] or (
                 definition["enabled"] and not job.get("enabled")
             )
+            # A job changed to the other kind keeps none of the old kind's settings.
+            for key in SHELL_KEYS | AGENT_KEYS:
+                job.pop(key, None)
             job.update(definition, updated_at=now)
             if rescheduled or job.get("next_run") is None:
                 job["anchor"] = now
@@ -437,17 +503,23 @@ class CronJobs:
     def run_now(self, key):
         # Held through launch, so a delete or scheduled start cannot slip in between.
         with self.lock:
+            if not self.active:
+                raise ValueError("Another dashboard process runs these jobs")
             with self.db() as db:
                 job = self.job(db, key)
-            if key in self.running:
-                raise ValueError("This job is already running")
+                if self.busy(db, key):
+                    raise ValueError("This job is already running")
             return self.launch(job, "manual", self.clock())
 
     def stop(self, key):
         with self.lock:
             run = self.running.get(key)
-            if not run:
-                raise ValueError("This job is not running")
+            if not run or run.record.get("kind") == "agent":
+                raise ValueError(
+                    "Agents finish in Collie; open the job's workspace to stop one"
+                    if run
+                    else "This job is not running"
+                )
             run.stop.set()
         return {"stopping": run.record["id"]}
 
@@ -473,7 +545,7 @@ class CronJobs:
             ids = [
                 row[0]
                 for row in db.execute(
-                    "SELECT id FROM runs WHERE job=? AND json_extract(data,'$.status')!='running' "
+                    "SELECT id FROM runs WHERE job=? AND json_extract(data,'$.status') NOT IN ('running','starting') "
                     "ORDER BY id DESC LIMIT -1 OFFSET ?",
                     (key, RUN_HISTORY),
                 )
@@ -491,8 +563,10 @@ class CronJobs:
             if self.stopping.is_set():
                 raise ValueError("The dashboard is stopping")
             with self.db() as db:
-                if job["id"] in self.running:
+                if self.busy(db, job["id"]):
                     return self.skip(db, job, trigger, due_at, now)
+                if job.get("kind") == "agent":
+                    return self.launch_agent(db, job, trigger, due_at, now)
                 run = self.record(
                     db,
                     job,
@@ -516,7 +590,161 @@ class CronJobs:
             handle.thread.start()
         return run
 
-    def skip(self, db, job, trigger, due_at, now):
+    def launch_agent(self, db, job, trigger, due_at, now):
+        run = self.record(
+            db,
+            job,
+            kind="agent",
+            trigger=trigger,
+            due_at=due_at,
+            started_at=now,
+            finished_at=None,
+            status="starting",
+            message="Opening the job's workspace",
+            # What this run started with, should the job be edited later.
+            agent=job["agent"],
+            claude_account=job["claude_account"],
+            prompt=job["prompt"],
+            timeout=job["timeout"],
+        )
+        handle = Run(run)
+        self.running[job["id"]] = handle
+        handle.thread = threading.Thread(
+            target=self.start_agent, args=(job, handle), daemon=True, name=f"cron-{job['id']}"
+        )
+        handle.thread.start()
+        return run
+
+    def start_agent(self, job, handle):
+        run = handle.record
+        now = self.clock
+        try:
+            if self.workspaces is None:
+                raise ValueError("Workspace actions are not enabled")
+            launched = cron_agents.start(job, run["id"], self.home, self.workspaces.src)
+        except cron_agents.Busy as exc:
+            # Merged like other skips: an agent left open for days must not push the run
+            # that needs attention out of the history.
+            with self.lock:
+                with self.db() as db:
+                    db.execute("DELETE FROM runs WHERE id=?", (int(run["id"]),))
+                    self.skip(db, job, run["trigger"], run["due_at"], now(), str(exc))
+                self.running.pop(job["id"], None)
+            return
+        except Exception as exc:  # Nothing was typed, or what was is reported as uncertain.
+            result = {
+                "status": "error",
+                "finished_at": now(),
+                "message": f"Could not start the agent: {exc}",
+            }
+        else:
+            result = {"agent_run": launched}
+            if launched.get("uncertain"):
+                result.update(
+                    status="attention",
+                    finished_at=now(),
+                    message=f"{launched['uncertain']}; check the job's workspace in Collie",
+                )
+            else:
+                result.update(
+                    status="running",
+                    exit=workspace_exit.watching(now()),
+                    message="Waiting for the agent to finish",
+                )
+            self.append_log(
+                run,
+                f"{job['agent'].capitalize()} started in {launched['path']}\n"
+                f"Workspace: {launched['url']}\n",
+            )
+        with self.lock:
+            try:
+                self.update_run(run, **result)
+            finally:
+                self.running.pop(job["id"], None)
+        self.wake.set()  # Follow the agent at the watch interval from now on.
+        try:
+            self.prune(job["id"])
+        except (OSError, sqlite3.Error):
+            pass
+
+    def append_log(self, run, text):
+        fd = os.open(self.log_path(run["id"]), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with open(fd, "a", encoding="utf-8") as log:
+            log.write(text)
+
+    def watch(self):
+        """Follow every started agent until it exits or is left open for the user."""
+        with self.db() as db:
+            runs = [
+                json.loads(data)
+                for (data,) in db.execute(
+                    "SELECT data FROM runs WHERE json_extract(data,'$.kind')='agent' "
+                    "AND json_extract(data,'$.status')='running'"
+                )
+            ]
+        for run in runs:
+            try:
+                self.watch_one(run)
+            except Exception:
+                continue  # One watch must not stop the others; the next pass retries it.
+        return bool(runs)
+
+    def current(self, run):
+        """The run as stored, or None once it is deleted or no longer followed."""
+        with self.db() as db:
+            row = db.execute("SELECT data FROM runs WHERE id=?", (int(run["id"]),)).fetchone()
+        stored = json.loads(row[0]) if row else None
+        return stored if stored and stored["status"] == "running" else None
+
+    def watch_one(self, run):
+        now = self.clock()
+        launched = run["agent_run"]
+        op = cron_agents.operation(run, launched)
+
+        def persist(record):
+            # Saved before any key is sent: a run deleted with its job sends nothing.
+            if not self.current(run):
+                raise workspace_exit.Leave("The job was deleted; nothing was sent")
+            self.update_run(run, exit=record)
+
+        previous = run["exit"].get("state")
+        record = workspace_exit.step(json.loads(json.dumps(run["exit"])), op, persist, now)
+        if previous == "exiting":
+            # The dashboard stopped between claiming the exit and confirming it.
+            record.update(state="unconfirmed", message="Exit unconfirmed; check its pane")
+        if (
+            record["state"] == "watching"
+            and "ready" not in record  # A finished agent settling is not over its limit.
+            and now - run["started_at"] > run["timeout"]
+        ):
+            record.update(
+                state="left_open",
+                message=f"Still working at the {run['timeout'] // 60} min time limit; "
+                "left open in Collie",
+            )
+        if not self.current(run):
+            return
+        if record["state"] == "watching":
+            self.update_run(run, exit=record, message=record["message"])
+            return
+        text = cron_agents.final_response(record, run["agent"], launched["exit_marker"])
+        if text:
+            self.append_log(run, f"\nFinal response:\n{text}\n")
+        if record["state"] == "exited":
+            # Only the pane this run opened, and only if it is the one the agent left.
+            exited = (record.get("target") or {}).get("pane_id", launched["pane"])
+            closed = exited == launched["pane"] and cron_agents.close_pane(launched["pane"])
+            changes = {
+                "status": "succeeded",
+                "message": "The agent finished and exited"
+                + ("" if closed else "; its pane is still open"),
+            }
+        else:
+            changes = {"status": "attention", "message": record["message"]}
+        self.update_run(run, exit=record, finished_at=now, result=bool(text), **changes)
+        self.prune(run["job"])
+
+    def skip(self, db, job, trigger, due_at, now, reason="The previous run was still going"):
         """Count a start skipped behind a long run, adding to the latest skip if it is one.
 
         A frequent job behind a slow run would otherwise fill its history with skips
@@ -530,7 +758,7 @@ class CronJobs:
                 due_at=due_at,
                 finished_at=now,
                 updated_at=now,
-                message=f"Skipped {count} times while the previous run was still going",
+                message=f"Skipped {count} times: {reason[0].lower()}{reason[1:]}",
             )
             db.execute("UPDATE runs SET data=? WHERE id=?", (json.dumps(last), int(last["id"])))
             return last
@@ -543,7 +771,7 @@ class CronJobs:
             finished_at=now,
             status="skipped",
             count=1,
-            message="The previous run was still going",
+            message=reason,
         )
 
     def execute(self, job, handle):
@@ -711,8 +939,13 @@ class CronJobs:
             except Exception:
                 pass  # The scheduler must outlive any single failure; the next pass retries.
             try:
+                watching = self.watch()
+            except Exception:
+                watching = False
+            try:
                 due = self.next_due()
             except Exception:
                 due = None
             delay = POLL_SECONDS if due is None else due - self.clock()
-            self.wake.wait(max(0.5, min(POLL_SECONDS, delay)))
+            limit = WATCH_SECONDS if watching else POLL_SECONDS
+            self.wake.wait(max(0.5, min(limit, delay)))

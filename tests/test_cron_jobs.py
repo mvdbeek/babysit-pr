@@ -549,7 +549,7 @@ def test_skips_behind_a_long_run_are_counted_in_one_entry(tmp_path):
     assert running["status"] == "running"
     assert skipped["status"] == "skipped" and skipped["count"] == 3
     assert skipped["due_at"] == 1240.0
-    assert skipped["message"] == "Skipped 3 times while the previous run was still going"
+    assert skipped["message"] == "Skipped 3 times: the previous run was still going"
     jobs.stop(saved["id"])
     jobs.close()
 

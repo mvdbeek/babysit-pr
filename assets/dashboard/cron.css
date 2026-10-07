@@ -310,3 +310,53 @@
     display: none;
   }
 }
+.cron-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 6px 0 0;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.cron-kinds legend {
+  font-weight: 550;
+  padding: 0 4px;
+}
+#cron-form .cron-kinds label,
+#cron-form .workspace-later {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  margin: 0;
+  font-weight: 400;
+}
+#cron-form .cron-kinds input,
+#cron-form .workspace-later input {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  flex: none;
+}
+.cron-section {
+  display: grid;
+  gap: 8px;
+}
+.cron-section[hidden] {
+  display: none;
+}
+.cron-section > input,
+.cron-section > select,
+.cron-section > .searchable-select {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+.cron-open {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin-top: 8px;
+}

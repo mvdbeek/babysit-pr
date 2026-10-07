@@ -548,14 +548,32 @@ no slug), with a numeric suffix for collisions; the branch starts from the clone
 
 ## Cron jobs
 
-The **Cron jobs** tab (`#cron`) runs your own shell commands on a schedule. Choose
-**New job** and give it a name, a command, an optional working directory (your home
-directory otherwise), a frequency and a time limit. A frequency is either an interval
+The **Cron jobs** tab (`#cron`) runs agent tasks and shell commands on a schedule.
+Choose **New job**, give it a name, a frequency and a time limit, and choose what it
+runs: an agent task or a shell command. A frequency is either an interval
 (every N minutes, hours or days, counted from when the schedule was saved) or a
 five-field cron expression such as `*/15 * * * *`, `0 9 * * mon-fri` or `@daily`.
 Cron expressions use the dashboard host's local time; when both day of month and day
 of week are restricted, either one matching is enough, as in Vixie cron. Saving shows
 the next three run times.
+
+An **agent task** has a repository and local clone, a branch, an optional base branch,
+the agent (Codex or Claude) with optional model, reasoning effort and Claude account,
+the Docker sandbox switch, and a prompt, as in **New task**. The job owns one
+workspace: the worktree for its branch under `~/src/worktrees/<repo>`, made from the
+base branch (or the clone's current commit) on the first run, or wherever that branch is
+already checked out, though never the clone's own checkout. Each agent job needs its
+own branch. Every run works there, so changes and notes carry over from one
+run to the next. A run opens the checkout's herdr workspace, splits a new pane and
+starts a fresh agent session with the prompt, through your shell's agent wrappers
+(Safehouse, Claude accounts) like other launches. As with **Start later** tasks, the
+agent is asked to end with a marker once the task is finished; the dashboard then
+exits it, keeps its final response as the run's output, and closes the pane. The run
+lists **Open in Collie**, **Diff** and **Transcript** for the session. An agent that stops
+to ask a question, that is still working at the job's time limit, or that cannot be
+identified is left open in Collie and the run **Needs attention**; the job skips its
+runs until no agent is open in its workspace. Agents keep running when the dashboard
+restarts, and the restarted dashboard keeps following them.
 
 Commands run as you, through your login shell (`$SHELL -lc`, so your usual `PATH`
 applies even under launchd), with stdin closed and `BABYSIT_CRON_JOB` and

@@ -1,14 +1,18 @@
 """Cron jobs tab in real Chromium against a temporary dashboard and state directory."""
 
+import json
 import threading
 import time
 
+import cron_agents
 import cron_jobs
 import dashboard
 import pytest
+import workspace_exit
 from cron_jobs import CronJobs
 from playwright.sync_api import expect
 from test_dashboard_browser import choose_option
+from test_pr_workspaces import local  # noqa: F401 (fixture)
 
 pytestmark = pytest.mark.browser
 
@@ -51,7 +55,7 @@ def test_define_run_edit_pause_and_delete_a_job(page, site, errors, tmp_path):
     dialog = page.locator("#cron-dialog")
     expect(dialog).to_be_visible()
     dialog.get_by_label("Name").fill("Greeting")
-    dialog.get_by_label("Command").fill("echo hello from cron; echo '<b>not html</b>'")
+    dialog.get_by_label("Command", exact=True).fill("echo hello from cron; echo '<b>not html</b>'")
     dialog.get_by_label("Working directory").fill("relative")
     dialog.get_by_role("button", name="Save job").click()
     expect(page.locator("#cron-form-error")).to_contain_text("absolute working directory")
@@ -90,7 +94,7 @@ def test_define_run_edit_pause_and_delete_a_job(page, site, errors, tmp_path):
         "This cron expression never matches a date"
     )
     dialog.get_by_label("Cron expression").fill("30 4 * * mon")
-    dialog.get_by_label("Command").fill("echo broken >&2; exit 4")
+    dialog.get_by_label("Command", exact=True).fill("echo broken >&2; exit 4")
     dialog.get_by_role("button", name="Save job").click()
     expect(dialog).to_be_hidden()
     expect(card).to_contain_text("Cron: 30 4 * * mon")
@@ -186,3 +190,128 @@ def test_the_tab_stays_hidden_without_cron_jobs(page, tmp_path, errors):
         finally:
             server.shutdown()
             thread.join(3)
+
+
+@pytest.fixture
+def agent_site(local):  # noqa: F811
+    manager, _, git, state, _ = local
+    jobs = CronJobs(manager.home, shell=["/bin/sh", "-c"], workspaces=manager)
+    with dashboard.DashboardServer(
+        manager.home, 0, overview=manager.overview, workspaces=manager, cron=jobs
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield f"http://127.0.0.1:{server.server_port}", jobs, manager, state
+        server.shutdown()
+        thread.join(3)
+    jobs.close()
+
+
+@pytest.mark.parametrize("width", [1400, 390])
+def test_define_and_follow_an_agent_job(page, agent_site, errors, width, monkeypatch, tmp_path):
+    url, jobs, manager, state = agent_site
+    page.set_viewport_size({"width": width, "height": 1000})
+    page.goto(url + "/#cron")
+    page.get_by_role("button", name="New job").click()
+    dialog = page.locator("#cron-dialog")
+    expect(dialog.get_by_label("An agent task")).to_be_checked()
+    expect(dialog.get_by_label("Command", exact=True)).to_be_hidden()
+    dialog.get_by_label("Name").fill("Nightly triage")
+    clone = str((manager.src / "repo").resolve())
+    expect(dialog.locator("#cron-repo option")).to_have_text([f"base/repo · {clone}"])
+    dialog.get_by_label("Branch", exact=True).fill("nightly")
+    dialog.get_by_label("Base branch (optional)").fill("feature")
+    dialog.get_by_label("Agent", exact=True).select_option("codex")
+    choose_option(dialog.get_by_role("combobox", name="Model (optional)"), "fixture-codex")
+    choose_option(dialog.get_by_role("combobox", name="Reasoning effort (optional)"), "high")
+    dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
+    dialog.get_by_label("Prompt").fill("Triage new issues")
+    page.screenshot(path=str(tmp_path / f"agent-dialog-{width}.png"))
+    dialog.get_by_role("button", name="Save job").click()
+    expect(dialog).to_be_hidden()
+    [saved] = jobs.snapshot()["jobs"]
+    assert {k: saved[k] for k in ("kind", "repo", "clone", "branch", "base", "agent")} == {
+        "kind": "agent",
+        "repo": "base/repo",
+        "clone": clone,
+        "branch": "nightly",
+        "base": "feature",
+        "agent": "codex",
+    }
+    assert (saved["model"], saved["effort"], saved["docker"]) == ("fixture-codex", "high", True)
+
+    if width < 900:
+        page.locator(".cron-job").first.click()
+    detail = page.locator("#cron-detail")
+    expect(detail).to_contain_text("base/repo · branch nightly")
+    expect(detail).to_contain_text("Codex · fixture-codex · high effort · Docker")
+    expect(detail.locator(".cron-command")).to_have_text("Triage new issues")
+    detail.get_by_role("button", name="Run now").click()
+    expect(detail.locator(".cron-runs")).to_contain_text("Waiting for the agent to finish")
+    expect(detail.get_by_role("button", name="Run now")).to_be_disabled()
+    expect(detail.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "http://127.0.0.1:8787/space/w1"
+    )
+    expect(detail.get_by_role("button", name="Transcript")).to_be_visible()
+    expect(detail.locator(".cron-log")).to_contain_text("Codex started in ")
+    assert page.evaluate("document.documentElement.scrollWidth") <= width
+
+    # The agent confirms it is done and is exited; its answer becomes the run's output.
+    run = jobs.snapshot()["jobs"][0]["runs"][0]
+    marker = run["agent_run"]["exit_marker"]
+    monkeypatch.setattr(
+        workspace_exit,
+        "step",
+        lambda record, *a: {
+            **record,
+            "state": "exited",
+            "target": {"rollout": "r", "session_id": "s"},
+        },
+    )
+    monkeypatch.setattr(
+        cron_agents.handoff, "latest_turn", lambda *a: ("t", f"Labelled 3 issues.\n{marker}")
+    )
+    jobs.watch()
+    expect(detail.locator(".cron-runs")).to_contain_text("Succeeded", timeout=20000)
+    expect(detail.locator(".cron-log")).to_contain_text("Final response:\nLabelled 3 issues.")
+    expect(detail.get_by_role("button", name="Run now")).to_be_enabled()
+    page.screenshot(path=str(tmp_path / f"agent-detail-{width}.png"), full_page=True)
+
+    # Editing shows the saved agent settings.
+    detail.get_by_role("button", name="Edit").click()
+    expect(dialog.get_by_label("Prompt")).to_have_value("Triage new issues")
+    expect(dialog.get_by_label("Branch", exact=True)).to_have_value("nightly")
+    expect(dialog.get_by_label("Agent", exact=True)).to_have_value("codex")
+    expect(dialog.locator("#cron-effort")).to_have_value("high")
+    expect(dialog.get_by_label("Allow Docker in the agent’s sandbox")).to_be_checked()
+    dialog.get_by_role("button", name="Close").click()
+
+    # A model the agent catalog no longer lists is shown, not silently replaced by
+    # Default: saving then asks for an available one.
+    with jobs.db() as db:
+        job = jobs.job(db, saved["id"])
+        job.update(model="retired-model", effort="ultra")
+        db.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(job), job["id"]))
+    page.reload()
+    if width < 900:
+        page.locator(".cron-job").first.click()
+    detail.get_by_role("button", name="Edit").click()
+    expect(dialog.locator("#cron-model")).to_have_value("retired-model")
+    expect(dialog.locator("#cron-effort")).to_have_value("ultra")
+    expect(dialog.get_by_role("combobox", name="Model (optional)")).to_have_value(
+        "retired-model (not listed)"
+    )
+    dialog.get_by_label("Name").fill("Nightly triage, renamed")
+    dialog.get_by_role("button", name="Save job").click()
+    expect(page.locator("#cron-form-error")).to_contain_text("Select an available model")
+    assert jobs.snapshot()["jobs"][0]["model"] == "retired-model"
+    dialog.get_by_role("button", name="Close").click()
+
+    detail.get_by_role("button", name="Edit").click()
+    dialog.get_by_label("A shell command").check()
+    expect(dialog.get_by_label("Prompt")).to_be_hidden()
+    dialog.get_by_label("Command", exact=True).fill("echo switched")
+    dialog.get_by_role("button", name="Save job").click()
+    expect(dialog).to_be_hidden()
+    expect(detail.locator(".cron-command")).to_have_text("echo switched")
+    assert "prompt" not in jobs.snapshot()["jobs"][0]
