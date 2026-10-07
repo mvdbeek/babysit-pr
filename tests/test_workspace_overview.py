@@ -1537,7 +1537,9 @@ def test_missing_transcript_question_can_be_answered_from_the_screen(missing_que
         )
     )
     assert value["answered"]
-    assert keys_sent(state) == ([["3"], ["--", "Teal"], ["enter"]] if typed else [["2"]])
+    assert keys_sent(state) == ([["3"], ["Teal"], ["enter"]] if typed else [["2"]])
+    if typed:
+        assert read(state)["typed_text"] == [["w1:p1", "Teal"]]
 
 
 def test_changed_live_question_is_not_answered(missing_question):
@@ -1586,7 +1588,8 @@ def test_a_waiting_claude_dialog_is_answered_one_question_at_a_time(asking):
     assert keys_sent(state) == [["2"], ["1"], ["3"], ["right"], ["1"]]
 
 
-def test_a_typed_answer_goes_through_the_type_something_option(asking):
+@pytest.mark.parametrize("prefix", ["", "-- "])
+def test_a_typed_answer_goes_through_the_type_something_option(asking, prefix):
     import agent_messages
 
     state, sid, transcript = asking
@@ -1599,10 +1602,12 @@ def test_a_typed_answer_goes_through_the_type_something_option(asking):
     typing = dialog_screen(QUESTIONS[0]).replace("Esc to", "ctrl+g to edit in Vim · Esc to")
     data["screens"]["w1:p1"] = [dialog_screen(QUESTIONS[0]), typing, "done"]
     state.write_text(json.dumps(data))
-    text = "Teal,\n\x1b[201~ please"
+    text = prefix + "Teal,\n\x1b[201~ please"
     agent_messages.answer(answer_request(sid, [{"text": text}]))
     # One line, with no control characters; a single question needs no review step.
-    assert keys_sent(state) == [["3"], ["--", "Teal, [201~ please"], ["enter"]]
+    expected = prefix + "Teal, [201~ please"
+    assert read(state)["typed_text"] == [["w1:p1", expected]]
+    assert keys_sent(state) == [["3"], [expected], ["enter"]]
 
 
 @pytest.mark.parametrize(

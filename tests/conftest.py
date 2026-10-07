@@ -57,6 +57,8 @@ elif a[:2] == ['agent','prompt']:
  if os.environ.get('FAKE_HERDR_PROMPT_ERROR'):
   p.write_text(json.dumps(data)); print(json.dumps({'error':{'code':os.environ['FAKE_HERDR_PROMPT_ERROR'],'message':'refused'}})); sys.exit(1)
  data.setdefault('prompts',[]).append(a[2:4])
+elif a[:2] == ['pane','send-text']:
+ data.setdefault('typed_text',[]).append([a[2], ' '.join(a[3:])])
 elif a[:2] == ['agent','send-keys']:
  if not os.environ.get('FAKE_HERDR_KEEP_AGENT'):
   data['agents']=[g for g in data['agents'] if g.get('pane_id')!=a[2]]
