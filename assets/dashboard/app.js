@@ -1994,9 +1994,9 @@ function workspaceControls(item) {
     cell.append(el("small", `Scheduled for ${scheduleTime(info.scheduled[0].start_at)}`));
   return cell;
 }
-// Files for the agent, chosen beside a task or pasted into it.
+// Files for the agent, chosen beside a task, pasted into it or dropped onto its form.
 function attachmentField(form, task) {
-  const files = window.dashboardAttachments.picker({ pasteTarget: task });
+  const files = window.dashboardAttachments.picker({ pasteTarget: task, dropTarget: form });
   form.append(files.element);
   return files;
 }
