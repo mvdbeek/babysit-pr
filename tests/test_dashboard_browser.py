@@ -3455,6 +3455,103 @@ def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
     assert viewer_routes["sent"][0][1]["pane"] == "w1:p1"
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopped(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    codex, claude = viewer_routes["agents"]
+    codex.update(session="s2", status="idle")
+    claude.update(session="s1", status="working")
+    sessions = [
+        {"id": "s1", "agent": "claude", "updated": 2, "size": 1, "title": "Go"},
+        {"id": "s2", "agent": "codex", "updated": 1, "size": 1, "title": "Earlier"},
+    ]
+    asked = []
+
+    def transcript(route):
+        wanted = re.search(r"session=([^&]+)", route.request.url)
+        asked.append(wanted and wanted[1])
+        shown = next((x for x in sessions if wanted and x["id"] == wanted[1]), sessions[0])
+        entry = {"role": "assistant", "text": f"Working on {shown['title']}"}
+        route.fulfill(
+            json={
+                "sessions": sessions,
+                "session": shown,
+                "entries": [entry],
+                "start": 0,
+                "total": 1,
+            }
+        )
+
+    page.route("**/api/workspace-transcript?*", transcript)
+    stops = []
+
+    def stop(route):
+        assert route.request.headers["x-babysit-action"] == "workspace-interrupt"
+        stops.append(route.request.post_data_json)
+        claude["status"] = "idle"
+        route.fulfill(json={"stopped": True, "pane": "w1:p2", "warning": None})
+
+    page.route("**/api/workspace-interrupt", stop)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    live = viewer.get_by_role("region", name="Running agents")
+    rows = live.locator(".ws-live-agent")
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_contain_text("IdleCodexin w1:p1")
+    expect(rows.nth(1)).to_contain_text("WorkingClaudein w1:p2this transcript")
+    # The session choice marks each session an agent is running.
+    options = viewer.get_by_label("Session", exact=True).locator("option")
+    expect(options.nth(0)).to_contain_text("● Working · ")
+    expect(options.nth(1)).to_contain_text("● Idle · ")
+    expect(rows.nth(0).get_by_role("button", name="Stop")).to_have_count(0)
+    page.screenshot(path=f"reports/viewer-running-agents-{width}.png")
+    rows.nth(1).get_by_role("button", name="Stop Claude in w1:p2").click()
+    expect(page.locator("#ws-live-status")).to_have_text("Stopped Claude in w1:p2.")
+    expect(rows.nth(1)).to_contain_text("Idle")
+    expect(live.get_by_role("button", name=re.compile("^Stop"))).to_have_count(0)
+    expect(options.nth(0)).to_contain_text("● Idle · ")
+    assert stops == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
+    assert not viewer_routes["sent"]
+    # Another running session's transcript is one click away.
+    rows.nth(0).get_by_role("button", name="Show its transcript").click()
+    expect(viewer.locator(".ws-msg-text")).to_have_text("Working on Earlier")
+    expect(rows.nth(0)).to_contain_text("this transcript")
+    assert asked[-1] == "s2"
+
+
+def test_a_refused_stop_says_why_and_running_agents_follow_polls(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [viewer_routes["agents"][1]]
+    viewer_routes["agents"][0].update(session="s1", status="working")
+    page.route(
+        "**/api/workspace-interrupt",
+        lambda route: route.fulfill(
+            status=400, json={"error": "The agent is not working on anything right now; refresh"}
+        ),
+    )
+    page.clock.install()
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-live")
+    live.get_by_role("button", name="Stop Claude in w1:p2").click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "The agent is not working on anything right now; refresh"
+    )
+    # The agents are read again while the transcript is open.
+    viewer_routes["agents"] = []
+    page.clock.run_for(11000)
+    expect(live.locator(".ws-live-agent")).to_have_count(0)
+    expect(page.locator("#ws-live-status")).to_be_visible()
+    page.locator("#ws-view-diff").click()
+    expect(live).to_be_hidden()
+
+
 TRANSCRIPT_MARKDOWN = """Both PRs are forwarded; **one** test is <img src=x onerror="window.injected=true"> open.
 
 **New PRs, pushed to upstream:**
