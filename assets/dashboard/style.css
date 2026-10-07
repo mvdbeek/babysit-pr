@@ -1882,6 +1882,10 @@ button:disabled {
   align-items: center;
   gap: 6px 10px;
 }
+.attachment-drop {
+  outline: 2px dashed var(--green);
+  outline-offset: 4px;
+}
 .attachment-row .attach-button {
   padding: 5px 10px;
 }

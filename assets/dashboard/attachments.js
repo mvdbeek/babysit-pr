@@ -1,5 +1,5 @@
 /* Files attached to what the dashboard sends an agent: a follow-up message or a task.
-   Each file is uploaded as soon as it is chosen or pasted; the request then names the
+   Each file is uploaded as soon as it is chosen, pasted or dropped; the request then names the
    uploads, and the agent receives their paths after its text. */
 (() => {
   const MAX_FILE = 25 * 1024 * 1024;
@@ -15,6 +15,16 @@
     if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
+  const carriesFiles = (event) => [...(event.dataTransfer?.types || [])].includes("Files");
+  // A file dropped beside a drop target would open in the tab, leaving the dashboard.
+  window.addEventListener("dragover", (event) => {
+    if (!carriesFiles(event) || event.defaultPrevented) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "none";
+  });
+  window.addEventListener("drop", (event) => {
+    if (carriesFiles(event) && !event.defaultPrevented) event.preventDefault();
+  });
   async function upload(file) {
     let response;
     try {
@@ -34,9 +44,15 @@
     if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
     return value;
   }
-  // A picker: a button choosing files, a list of them, and paste into `pasteTarget`.
+  // A picker: a button choosing files, a list of them, paste into `pasteTarget` and
+  // drop onto `dropTarget` (the paste target unless given).
   // `files` restores earlier uploads ({id, name, size}); `onchange` gets the list.
-  function picker({ files = [], pasteTarget = null, onchange = () => {} } = {}) {
+  function picker({
+    files = [],
+    pasteTarget = null,
+    dropTarget = pasteTarget,
+    onchange = () => {},
+  } = {}) {
     const element = node("div", undefined, "attachments");
     const input = document.createElement("input");
     input.type = "file";
@@ -113,7 +129,41 @@
       event.preventDefault();
       void add(pasted);
     }
+    // Dropped files attach; dragged text still drops into the field as text.
+    // The highlight lasts while dragover keeps arriving: dragleave goes missing when
+    // the hovered child is redrawn mid-drag, and some browsers omit its relatedTarget.
+    let fade = 0;
+    function hover(on) {
+      clearTimeout(fade);
+      dropTarget.classList.toggle("attachment-drop", on);
+      if (on) fade = setTimeout(() => hover(false), 200);
+    }
+    function dragover(event) {
+      if (!carriesFiles(event)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      hover(true);
+    }
+    const dragenter = dragover;
+    function dragleave(event) {
+      if (carriesFiles(event) && event.relatedTarget && !dropTarget.contains(event.relatedTarget))
+        hover(false);
+    }
+    function drop(event) {
+      if (!carriesFiles(event)) return;
+      hover(false);
+      // An image dragged from a web page can name "Files" yet carry none; let it drop.
+      if (!event.dataTransfer.files.length) return;
+      event.preventDefault();
+      const entries = [...event.dataTransfer.items].map((item) => item.webkitGetAsEntry?.());
+      const dropped = [...event.dataTransfer.files].filter((_, i) => !entries[i]?.isDirectory);
+      if (dropped.length) void add(dropped);
+      else status.textContent = "Folders cannot be attached.";
+    }
+    const dragHandlers = { dragenter, dragover, dragleave, drop };
     pasteTarget?.addEventListener("paste", paste);
+    for (const [type, handler] of Object.entries(dragHandlers))
+      dropTarget?.addEventListener(type, handler);
     render();
     return {
       element,
@@ -131,9 +181,12 @@
         items = items.filter((file) => !gone.has(file.id));
         render();
       },
-      // A picker replaced by another stops taking pastes and reporting changes.
+      // A picker replaced by another stops taking pastes and drops and reporting changes.
       destroy() {
         pasteTarget?.removeEventListener("paste", paste);
+        for (const [type, handler] of Object.entries(dragHandlers))
+          dropTarget?.removeEventListener(type, handler);
+        if (dropTarget) hover(false);
         onchange = () => {};
       },
     };

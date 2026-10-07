@@ -995,6 +995,7 @@
     files = window.dashboardAttachments.picker({
       files: draft.files,
       pasteTarget: byId("ws-message-text"),
+      dropTarget: form,
       onchange: (list) => {
         if (!draft || viewer?.entry !== entry) return;
         draft.files = list;

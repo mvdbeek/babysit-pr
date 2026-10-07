@@ -4034,6 +4034,76 @@ def test_files_attach_to_a_follow_up_message_and_stay_with_its_draft(
     expect(chips).to_have_count(0)
 
 
+DROP_FILES = """([target, names]) => {
+  const data = new DataTransfer();
+  for (const name of names) data.items.add(new File(["dropped"], name, {type: "image/png"}));
+  const fire = (type) =>
+    target.dispatchEvent(new DragEvent(type, {dataTransfer: data, bubbles: true, cancelable: true}));
+  fire("dragenter");
+  fire("dragover");
+  const highlighted = target.closest(".attachment-drop") !== null;
+  fire("drop");
+  return highlighted;
+}"""
+
+
+def test_files_dropped_onto_a_follow_up_message_attach(page, dashboard_site, viewer_routes):
+    url, home = dashboard_site
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    composer = page.locator("#ws-message")
+    text = page.locator("#ws-message-text")
+    # Anywhere on the composer takes the drop, and shows where it will land meanwhile.
+    for target in (text, composer.get_by_text("Message the agent")):
+        highlighted = target.evaluate(
+            "(target, names) => (" + DROP_FILES + ")([target, names])", ["shot.png"]
+        )
+        assert highlighted
+    chips = composer.locator(".attachment-list li")
+    expect(chips).to_have_count(2)
+    expect(composer).not_to_have_class(re.compile("attachment-drop"))
+    # A drag that stops arriving, as when its hovered child was redrawn, unhighlights.
+    composer.evaluate(
+        """form => {
+          const data = new DataTransfer();
+          data.items.add(new File(["x"], "late.png", {type: "image/png"}));
+          form.dispatchEvent(new DragEvent("dragenter", {dataTransfer: data, bubbles: true}));
+        }"""
+    )
+    expect(composer).to_have_class(re.compile("attachment-drop"))
+    expect(composer).not_to_have_class(re.compile("attachment-drop"))
+    # Dragged text is no attachment; it drops into the field as usual.
+    prevented = text.evaluate(
+        """field => {
+          const data = new DataTransfer();
+          data.setData("text/plain", "words");
+          return ["dragenter", "dragover", "drop"].map(type => !field.dispatchEvent(
+            new DragEvent(type, {dataTransfer: data, bubbles: true, cancelable: true})
+          ));
+        }"""
+    )
+    assert prevented == [False, False, False]
+    expect(composer).not_to_have_class(re.compile("attachment-drop"))
+    # A file dropped beside the composer is kept from opening in place of the dashboard.
+    kept = page.locator("#ws-viewer-meta").evaluate(
+        """meta => {
+          const data = new DataTransfer();
+          data.items.add(new File(["x"], "missed.png", {type: "image/png"}));
+          return !meta.dispatchEvent(
+            new DragEvent("drop", {dataTransfer: data, bubbles: true, cancelable: true})
+          );
+        }"""
+    )
+    assert kept
+    expect(chips).to_have_count(2)
+    composer.get_by_role("button", name="Send to agent").click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
+    ((_, body),) = viewer_routes["sent"]
+    assert len(body["attachments"]) == 2
+    for stored in body["attachments"]:
+        assert (home / "attachments" / stored).read_bytes() == b"dropped"
+
+
 def test_a_launch_dialog_sends_its_attachments_with_the_task(
     page, dashboard_site, issue_workspace_routes
 ):
@@ -4049,12 +4119,18 @@ def test_a_launch_dialog_sends_its_attachments_with_the_task(
         {"name": "crash.png", "mimeType": "image/png", "buffer": b"png"}
     )
     expect(dialog.locator(".attachment-list li")).to_contain_text("crash.png")
+    # Files dropped onto the dialog's form attach too.
+    dialog.get_by_label("Task", exact=True).evaluate(
+        "(target, names) => (" + DROP_FILES + ")([target.form, names])", ["trace.png"]
+    )
+    expect(dialog.locator(".attachment-list li")).to_have_count(2)
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
     page.wait_for_function("() => document.querySelector('#workspace-progress').textContent")
     (body,) = [r for r in requests if r["action"] == "create"]
     assert body["task"] == "Reproduce from the screenshot"
-    (stored,) = body["attachments"]
-    assert (home / "attachments" / stored).read_bytes() == b"png"
+    first, second = body["attachments"]
+    assert (home / "attachments" / first).read_bytes() == b"png"
+    assert (home / "attachments" / second).read_bytes() == b"dropped"
 
 
 @pytest.mark.parametrize("width", [320, 390, 1280])
