@@ -1942,3 +1942,261 @@ def test_docker_action_uses_dashboard_post_protections(server, monkeypatch):
     status, value = request(port, "/api/workspace-docker", body, action="workspace-docker")
     assert status == 200 and value["docker"] is False
     assert calls == [body]
+
+
+# Layout and digit/notes behavior from openai/codex rust-v0.160.0,
+# tui/src/bottom_pane/request_user_input/{mod.rs,snapshots/}.
+def codex_screen(question, index=0, total=1, selected=1, notes=None):
+    options = question.get("options", [])
+    labels = [o if isinstance(o, str) else o["label"] for o in options]
+    if labels:
+        labels.append("None of the above")
+    lines = [f"Question {index + 1}/{total} ({total - index} unanswered)", question["title"], ""]
+    lines += [f"{'›' if i == selected else ' '} {i}. {label}" for i, label in enumerate(labels, 1)]
+    if not labels or notes is not None:
+        lines += [
+            "",
+            "› " + (notes or ("Add notes" if labels else "Type your answer (optional)")),
+            "",
+        ]
+    footer = (
+        "tab to clear notes | " if notes is not None else "tab to add notes | " if labels else ""
+    )
+    return "\n".join([*lines, footer + "enter to submit answer | esc to interrupt"])
+
+
+@pytest.fixture
+def codex_asking(exited, monkeypatch):
+    import agent_messages
+
+    state, sid, checkout, _ = exited
+    sid = "c0ffee00-0000-4000-8000-000000000003"
+    folder = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "10" / "06"
+    folder.mkdir(parents=True)
+    transcript = folder / f"rollout-{sid}.jsonl"
+    question = {
+        "title": "Should Docker access be automatic?",
+        "options": ["Automatic", "Optional checkbox"],
+    }
+    records = [
+        {"type": "session_meta", "payload": {"id": sid, "cwd": str(checkout)}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "request_user_input_async",
+                "call_id": "toolu_q1",
+                "arguments": json.dumps({"questions": [question]}),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "toolu_q1",
+                "output": '{"accepted":true}',
+            },
+        },
+    ]
+    transcript.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = read(state)
+    data["agents"] = [
+        {
+            "workspace_id": "w1",
+            "pane_id": "w1:p1",
+            "agent": "codex",
+            "agent_status": "blocked",
+            "agent_session": {"value": sid},
+        }
+    ]
+    data["screens"] = {"w1:p1": [codex_screen(question), "done"]}
+    state.write_text(json.dumps(data))
+    monkeypatch.setenv("FAKE_HERDR_KEEP_AGENT", "1")
+    monkeypatch.setattr(agent_messages, "DIALOG_WAIT", 0.01)
+    monkeypatch.setattr(agent_messages, "_codex_answered", set())
+    return state, sid, transcript, question
+
+
+def test_codex_async_question_is_answered_via_the_dashboard(codex_asking, tmp_path):
+    state, sid, _, _ = codex_asking
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            body = answer_request(sid, [{"options": [1]}])
+            status, value = request(
+                httpd.server_port, "/api/workspace-answer", body, action="workspace-answer"
+            )
+            assert status == 200 and value["answered"], value
+            assert keys_sent(state) == [["2"]]
+            # A stale async acknowledgment must never replay a completed answer.
+            status, value = request(
+                httpd.server_port, "/api/workspace-answer", body, action="workspace-answer"
+            )
+            assert status == 400 and "already attempted" in value["error"]
+            assert keys_sent(state) == [["2"]]
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+@pytest.mark.parametrize("freeform", [False, True])
+@pytest.mark.parametrize("prefix", ["", "-- "])
+def test_codex_typed_answer_uses_other_or_a_freeform_composer(codex_asking, freeform, prefix):
+    import agent_messages
+
+    state, sid, transcript, question = codex_asking
+    text = prefix + "Use a checkbox"
+    if freeform:
+        question = {"title": "Share details."}
+        records = [json.loads(line) for line in transcript.read_text().splitlines()]
+        records[1]["payload"]["arguments"] = json.dumps({"questions": [question]})
+        transcript.write_text("".join(json.dumps(r) + "\n" for r in records))
+        screens = [codex_screen(question), codex_screen(question, notes=text), "done"]
+        expected = [[text], ["enter"]]
+    else:
+        screens = [codex_screen(question, selected=i) for i in (1, 2, 3)] + [
+            codex_screen(question, selected=3, notes=""),
+            codex_screen(question, selected=3, notes=text),
+            "done",
+        ]
+        expected = [["down"], ["down"], ["tab"], [text], ["enter"]]
+    data = read(state)
+    data["screens"]["w1:p1"] = screens
+    state.write_text(json.dumps(data))
+    agent_messages.answer(answer_request(sid, [{"text": prefix + "Use a\ncheckbox"}]))
+    assert keys_sent(state) == expected
+    assert read(state)["typed_text"] == [["w1:p1", text]]
+
+
+def test_codex_synchronous_questions_advance_without_a_claude_review(codex_asking):
+    import agent_messages
+
+    state, sid, transcript, question = codex_asking
+    second = {"title": "Which environment?", "options": ["Test", "Production"]}
+    records = [json.loads(line) for line in transcript.read_text().splitlines()][:2]
+    records[1]["payload"].update(
+        name="request_user_input", arguments=json.dumps({"questions": [question, second]})
+    )
+    transcript.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = read(state)
+    data["screens"]["w1:p1"] = [
+        codex_screen(question, total=2),
+        codex_screen(second, index=1, total=2),
+        "done",
+    ]
+    state.write_text(json.dumps(data))
+    agent_messages.answer(answer_request(sid, [{"options": [1]}, {"options": [0]}]))
+    assert keys_sent(state) == [["2"], ["1"]]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "approval",
+        "similar",
+        "missing_header",
+        "notes",
+        "other_session",
+        "working",
+        "answered",
+        "remapped_submit",
+    ],
+)
+def test_codex_answers_require_the_matching_live_question(codex_asking, mode):
+    import agent_messages
+
+    state, sid, transcript, question = codex_asking
+    data = read(state)
+    screen = codex_screen(question)
+    if mode == "approval":
+        screen = (
+            "Would you like to run the following command?\n1. Yes\n2. No\nPress enter to confirm"
+        )
+    elif mode == "similar":
+        screen = codex_screen({**question, "title": question["title"] + " For all agents?"})
+    elif mode == "missing_header":
+        screen = screen.split("\n", 1)[1]
+    elif mode == "notes":
+        screen = codex_screen(question, notes="An unfinished answer")
+    elif mode == "other_session":
+        data["agents"][0]["agent_session"]["value"] = "different"
+    elif mode == "working":
+        data["agents"][0]["agent_status"] = "working"
+    elif mode == "answered":
+        transcript.write_text(
+            transcript.read_text().replace('{\\"accepted\\":true}', '{\\"answers\\":{}}')
+        )
+    elif mode == "remapped_submit":
+        screen = screen.replace("enter to", "ctrl+enter to")
+    data["screens"]["w1:p1"] = [screen]
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError):
+        agent_messages.answer(answer_request(sid, [{"options": [1]}]))
+    assert keys_sent(state) == []
+
+
+def test_codex_partial_answer_stops_and_cannot_be_retried(codex_asking):
+    import agent_messages
+
+    state, sid, _, question = codex_asking
+    data = read(state)
+    data["screens"]["w1:p1"] = [codex_screen(question), "approval or exited shell"]
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Answer attempted"):
+        agent_messages.answer(answer_request(sid, [{"text": "Something else"}]))
+    assert keys_sent(state) == [["down"]]
+    with pytest.raises(ValueError, match="already attempted"):
+        agent_messages.answer(answer_request(sid, [{"text": "Something else"}]))
+    assert keys_sent(state) == [["down"]]
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout"])
+def test_codex_delivery_stops_when_the_agent_exits_or_io_is_uncertain(
+    codex_asking, monkeypatch, failure
+):
+    import agent_messages
+
+    state, sid, _, _ = codex_asking
+    if failure == "exit":
+        real = agent_messages.agents
+        count = 0
+
+        def agents(workspace):
+            nonlocal count
+            count += 1
+            return real(workspace) if count == 1 else []
+
+        monkeypatch.setattr(agent_messages, "agents", agents)
+        error = "agent stopped waiting"
+    else:
+        real_herdr = agent_messages.herdr
+
+        def herdr(*args):
+            if args[:2] == ("agent", "send-keys"):
+                raise subprocess.TimeoutExpired("herdr", 1)
+            return real_herdr(*args)
+
+        monkeypatch.setattr(agent_messages, "herdr", herdr)
+        error = "Answer attempted"
+    with pytest.raises(ValueError, match=error):
+        agent_messages.answer(answer_request(sid, [{"options": [1]}]))
+    assert keys_sent(state) == []
+    if failure == "timeout":
+        with pytest.raises(ValueError, match="already attempted"):
+            agent_messages.answer(answer_request(sid, [{"options": [1]}]))
+
+
+def test_codex_answer_is_not_replayed_after_its_session_moves_panes(codex_asking):
+    import agent_messages
+
+    state, sid, _, question = codex_asking
+    body = answer_request(sid, [{"options": [1]}])
+    agent_messages.answer(body)
+    data = read(state)
+    data["agents"][0]["pane_id"] = "w1:p2"
+    data["screens"]["w1:p2"] = [codex_screen(question)]
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="already attempted"):
+        agent_messages.answer({**body, "pane": "w1:p2"})
+    assert keys_sent(state) == [["2"]]

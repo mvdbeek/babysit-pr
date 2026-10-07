@@ -513,6 +513,21 @@ def question_list(value):
     return found or None
 
 
+def question_pending(tool):
+    """An async acknowledgment opens a Codex dialog; it is not the user's answer."""
+    if not tool.get("questions") or tool.get("error"):
+        return False
+    output = tool.get("output")
+    if output is None:
+        return True
+    if tool.get("name") == "request_user_input_async":
+        try:
+            return json.loads(output) == {"accepted": True}
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
 def claude_text(item):
     content = (item.get("message") or {}).get("content")
     if isinstance(content, list) and any(
