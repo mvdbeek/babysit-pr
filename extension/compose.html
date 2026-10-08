@@ -13,66 +13,81 @@
       <a href="options.html" target="_blank" rel="noopener">Settings</a>
       <button id="reload" type="button">Reload choices</button>
       <form id="task-form">
-        <label for="mode">Send to</label>
-        <select id="mode">
-          <option value="new">New task</option>
-          <option value="target" disabled>GitHub PR or issue</option>
-          <option value="message">Existing agent</option>
-        </select>
-        <p id="target-note" class="note"></p>
-        <div id="launch-fields">
-          <label for="repo">Repository and local clone</label>
-          <select id="repo"></select>
-          <div id="branch-fields">
-            <label for="name">New branch</label>
-            <input
-              id="name"
-              pattern="[A-Za-z0-9][A-Za-z0-9._\-]*"
-              maxlength="100"
-              placeholder="fix-parser"
-            />
-            <label for="base">Base branch (optional)</label>
-            <input id="base" placeholder="Default branch" />
-          </div>
-          <label for="agent">Agent</label>
-          <select id="agent">
-            <option value="codex">Codex</option>
-            <option value="claude">Claude</option>
-          </select>
-          <label for="model">Model</label
-          ><select id="model"></select>
-          <label for="effort">Reasoning effort</label
-          ><select id="effort"></select>
-          <label for="account">Claude account</label
-          ><select id="account"></select>
-        </div>
-        <div id="message-fields" hidden>
-          <label for="recipient">Existing agent</label
-          ><select id="recipient"></select>
-        </div>
-        <label for="task">Task instructions</label>
-        <textarea
-          id="task"
-          required
-          maxlength="32000"
-          placeholder="What should the agent do?"
-        ></textarea>
-        <label
-          ><input id="babysit" type="checkbox" /> Babysit the PR after completing this task</label
-        >
-        <p class="note">
-          Requests monitoring through the babysit-pr skill. Review feedback still needs dashboard
-          approval.
-        </p>
-        <details id="reference">
-          <summary>Page reference (included with your task)</summary>
-          <label for="source-url">Page URL</label><input id="source-url" type="url" />
-          <label for="source-title">Page title</label><input id="source-title" maxlength="2000" />
-          <label for="selection">Selected text</label
-          ><textarea id="selection" maxlength="24000"></textarea>
-        </details>
-        <button id="send" type="submit">Send task</button>
-        <button id="handoff" type="button">Open in dashboard</button>
+        <fieldset id="composer-fields">
+          <section id="destination" aria-live="polite">
+            <strong id="destination-summary">Finding the destination…</strong>
+            <p id="target-note" class="note"></p>
+            <div id="suggested-agents"></div>
+          </section>
+          <label for="task">Task instructions</label>
+          <textarea
+            id="task"
+            required
+            maxlength="32000"
+            placeholder="What should the agent do?"
+          ></textarea>
+          <label
+            ><input id="babysit" type="checkbox" /> Babysit the PR after completing this task</label
+          >
+          <p class="note">
+            Requests monitoring through the babysit-pr skill. Review feedback still needs dashboard
+            approval.
+          </p>
+          <div id="quick-actions" aria-label="Suggested tasks"></div>
+          <button id="send" type="submit">Send task</button>
+          <details id="choices">
+            <summary>Change destination and settings</summary>
+            <label for="mode">Send to</label>
+            <select id="mode">
+              <option value="new">New task</option>
+              <option value="target" disabled>GitHub PR or issue</option>
+              <option value="message">Existing agent</option>
+            </select>
+
+            <div id="launch-fields">
+              <label for="repo">Repository and local clone</label>
+              <select id="repo"></select>
+              <div id="branch-fields">
+                <label for="name">New branch</label>
+                <input
+                  id="name"
+                  pattern="[A-Za-z0-9][A-Za-z0-9._\-]*"
+                  maxlength="100"
+                  placeholder="Generated from your task"
+                />
+                <label for="base">Base branch (optional)</label>
+                <input id="base" placeholder="Default branch" />
+              </div>
+              <label for="agent">Agent</label>
+              <select id="agent">
+                <option value="codex">Codex</option>
+                <option value="claude">Claude</option>
+              </select>
+              <label for="model">Model</label
+              ><select id="model"></select>
+              <label for="effort">Reasoning effort</label
+              ><select id="effort"></select>
+              <label for="account">Claude account</label
+              ><select id="account"></select>
+            </div>
+            <div id="message-fields" hidden>
+              <label for="recipient">Existing agent</label
+              ><select id="recipient"></select>
+            </div>
+          </details>
+          <details id="reference">
+            <summary>Page context included with your task</summary>
+            <label for="source-url">Page URL</label><input id="source-url" type="url" />
+            <label for="source-title">Page title</label><input id="source-title" maxlength="2000" />
+            <label for="selection">Selected text</label
+            ><textarea id="selection" maxlength="24000"></textarea>
+            <label for="content">Page excerpt</label
+            ><textarea id="content" maxlength="12000"></textarea>
+            <label for="links">GitHub links from this page</label
+            ><textarea id="links" maxlength="4000"></textarea>
+          </details>
+          <button id="handoff" type="button">Open in dashboard</button>
+        </fieldset>
       </form>
       <p id="status" role="status"></p>
       <a id="workspace" hidden target="_blank" rel="noopener">Open in Collie</a>

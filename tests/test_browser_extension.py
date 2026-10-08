@@ -3,6 +3,7 @@
 import copy
 import http.client
 import json
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -65,7 +66,8 @@ class FakeWorkspaces:
 
 
 @pytest.fixture
-def extension_server(tmp_path):
+def extension_server(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_extension, "herdr", lambda *args: {"agents": []})
     with dashboard.DashboardServer(tmp_path, 0, workspaces=FakeWorkspaces()) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -321,13 +323,14 @@ def test_real_extension_launch_reload_target_and_revoke(extension_browser, exten
     page = context.new_page()
     page.goto(f"chrome-extension://{client}/compose.html")
     expect(page.locator("#status")).to_have_text("Ready.")
-    page.locator("#repo").select_option(label="test/repo · /fake/repo")
-    page.locator("#name").fill("browser-task")
+    expect(page.locator("#choices")).not_to_have_attribute("open", "")
+    expect(page.locator("#destination-summary")).to_contain_text("test/repo")
     page.locator("#task").fill("Fix the selected problem")
     page.locator("#babysit").check()
     page.get_by_role("button", name="Start task", exact=True).click()
     expect(page.locator("#workspace")).to_have_attribute("href", "http://127.0.0.1:8787/space/fake")
     assert len(extension_server.workspaces.calls) == 1
+    assert extension_server.workspaces.calls[0]["name"].startswith("fix-the-selected-problem-")
     assert "dashboard approval gate" in extension_server.workspaces.calls[0]["task"]
     page.reload()
     expect(page.locator("#send")).to_be_disabled()
@@ -361,12 +364,13 @@ def test_real_extension_dashboard_handoff_without_token(extension_browser, exten
     page = context.new_page()
     page.goto(f"chrome-extension://{client}/compose.html")
     page.locator("#task").fill("Investigate the rendering")
-    page.locator("#name").fill("render-fix")
     with context.expect_page() as opened:
         page.get_by_role("button", name="Open in dashboard").click()
     dashboard_page = opened.value
     expect(dashboard_page.locator("#workspace-task")).to_have_value("Investigate the rendering")
-    expect(dashboard_page.locator("#new-task-name")).to_have_value("render-fix")
+    expect(dashboard_page.locator("#new-task-name")).to_have_value(
+        re.compile("investigate-the-rendering-[a-f0-9]{8}")
+    )
     assert dashboard_page.url == base + "/#watcher"
     assert not extension_server.workspaces.calls  # A handoff only prefills, never launches.
 
@@ -398,10 +402,200 @@ def test_real_extension_followup(extension_browser, extension_server, monkeypatc
     page = context.new_page()
     page.goto(f"chrome-extension://{client}/compose.html")
     expect(page.locator("#status")).to_have_text("Ready.")
+    page.locator("#choices summary").click()
     page.locator("#mode").select_option("message")
     expect(page.locator("#recipient option")).to_have_count(2)
-    page.locator("#recipient").select_option("0")
+    page.locator("#recipient").select_option("w1:p1:session1")
     page.locator("#task").fill("Also check the regression")
     page.get_by_role("button", name="Send follow-up").click()
     expect(page.locator("#status")).to_contain_text("Follow-up sent")
     assert messages == [("p1", "Also check the regression")]
+
+
+def test_agent_context_uses_verified_workspace_associations(extension_server, monkeypatch):
+    manager = extension_server.workspaces
+    snapshot = manager.snapshot()
+    snapshot["prs"] = {"pr-one": {"matches": [{"workspace_id": "w1"}]}}
+    monkeypatch.setattr(manager, "snapshot", lambda: snapshot)
+    monkeypatch.setattr(
+        browser_extension,
+        "herdr",
+        lambda *args: {
+            "agents": [
+                {
+                    "workspace_id": "w1",
+                    "pane_id": "p1",
+                    "agent": "codex",
+                    "agent_session": {"value": "s1"},
+                },
+                {
+                    "workspace_id": "unrelated",
+                    "pane_id": "p2",
+                    "agent": "codex",
+                    "agent_session": {"value": "s2"},
+                },
+            ]
+        },
+    )
+    value = request(
+        extension_server, "/api/extension", {"action": "context"}, pair(extension_server)
+    )[1]
+    assert value["agents"][0]["targets"] == ["https://github.com/test/repo/pull/1"]
+    assert value["agents"][0]["repos"] == ["test/repo"]
+    assert not value["agents"][1]["targets"]
+
+
+def test_agent_discovery_failure_does_not_block_new_tasks(extension_server, monkeypatch):
+    def unavailable(*args):
+        raise ValueError("herdr offline")
+
+    monkeypatch.setattr(browser_extension, "herdr", unavailable)
+    code, value, _ = request(
+        extension_server, "/api/extension", {"action": "context"}, pair(extension_server)
+    )
+    assert code == 200 and value["repos"]
+    assert value["agents"] == [] and "herdr offline" in value["agents_error"]
+
+
+def draft_page(context, worker, client, source):
+    import uuid
+
+    draft = str(uuid.uuid4())
+    worker.evaluate(
+        "args => chrome.storage.session.set({[args.id]: {source: args.source}})",
+        {"id": draft, "source": source},
+    )
+    page = context.new_page()
+    page.goto(f"chrome-extension://{client}/compose.html#{draft}")
+    expect(page.locator("#status")).to_have_text("Ready.")
+    return page
+
+
+@pytest.mark.browser
+def test_page_inference_and_remembered_settings(extension_browser, extension_server, monkeypatch):
+    context, worker, client, _ = extension_browser
+    monkeypatch.setattr(
+        extension_server.workspaces,
+        "local_repositories",
+        lambda everything=False: {
+            "repos": [
+                {"repo": "other/project", "clone": "/other"},
+                {"repo": "test/repo", "clone": "/fake/repo"},
+            ]
+        },
+    )
+    source = {
+        "url": "https://github.com/test/repo/blob/main/file.py",
+        "title": "file.py",
+        "content": "def relevant_function(): pass",
+    }
+    page = draft_page(context, worker, client, source)
+    expect(page.locator("#destination-summary")).to_contain_text("test/repo")
+    expect(page.locator("#choices")).not_to_have_attribute("open", "")
+    assert "Inspect this file" in page.locator("#task").input_value()
+    page.locator("#choices summary").click()
+    page.locator("#model").select_option("fixture")
+    page.locator("#effort").select_option("high")
+    page.get_by_role("button", name="Start task", exact=True).click()
+    expect(page.locator("#workspace")).to_be_visible()
+    payload = extension_server.workspaces.calls[-1]
+    assert payload["clone"] == "/fake/repo" and payload["effort"] == "high"
+    assert "relevant_function" in payload["task"]
+    assert payload["name"].startswith("inspect-this-file-")
+    next_page = draft_page(context, worker, client, source)
+    expect(next_page.locator("#model")).to_have_value("fixture")
+    expect(next_page.locator("#effort")).to_have_value("high")
+    next_page.get_by_role("button", name="Start task", exact=True).click()
+    expect(next_page.locator("#workspace")).to_be_visible()
+    assert extension_server.workspaces.calls[-1]["name"] != payload["name"]
+
+
+@pytest.mark.browser
+@pytest.mark.parametrize("count", [1, 2])
+def test_exact_pr_conversation_and_ambiguity(
+    extension_browser, extension_server, monkeypatch, count
+):
+    context, worker, client, _ = extension_browser
+    snapshot = extension_server.workspaces.snapshot()
+    snapshot["prs"] = {"pr-one": {"matches": [{"workspace_id": "w1"}]}}
+    monkeypatch.setattr(extension_server.workspaces, "snapshot", lambda: snapshot)
+    monkeypatch.setattr(
+        browser_extension,
+        "herdr",
+        lambda *args: {
+            "agents": [
+                {
+                    "workspace_id": "w1",
+                    "pane_id": f"p{i}",
+                    "agent": "codex",
+                    "terminal_title_stripped": f"Fix PR {i}",
+                    "agent_session": {"value": f"s{i}"},
+                }
+                for i in range(count)
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        agent_messages,
+        "agents",
+        lambda _: [{"pane": f"p{i}", "session": f"s{i}"} for i in range(count)],
+    )
+    sent = []
+    monkeypatch.setattr(
+        agent_messages,
+        "prompt",
+        lambda target, text: sent.append((target["pane"], text)) or {"sent": True},
+    )
+    page = draft_page(
+        context,
+        worker,
+        client,
+        {"url": "https://github.com/test/repo/pull/1", "selection": "Please fix this assertion"},
+    )
+    expect(page.locator("#mode")).to_have_value("message")
+    if count == 2:
+        expect(page.locator("#choices")).to_have_attribute("open", "")
+        expect(page.locator("#recipient")).to_have_value("")
+        page.get_by_role("button", name="Send follow-up").click()
+        assert not sent
+        page.locator("#recipient").select_option("w1:p1:s1")
+    else:
+        expect(page.locator("#choices")).not_to_have_attribute("open", "")
+        expect(page.locator("#destination-summary")).to_contain_text("Continue Fix PR 0")
+    page.get_by_role("button", name="Send follow-up").click()
+    expect(page.locator("#status")).to_contain_text("Follow-up sent")
+    assert len(sent) == 1 and "Please fix this assertion" in sent[0][1]
+    assert not extension_server.workspaces.calls
+
+
+@pytest.mark.browser
+def test_lost_response_retry_keeps_automatic_branch_and_request_id(
+    extension_browser, extension_server
+):
+    context, worker, client, _ = extension_browser
+    page = draft_page(
+        context,
+        worker,
+        client,
+        {"url": "https://github.com/test/repo", "selection": "Fix this error"},
+    )
+    delivered = []
+
+    def drop_response(route):
+        payload = route.request.post_data_json
+        if payload.get("action") == "submit" and not delivered:
+            delivered.append(payload)
+            route.fetch()
+            route.abort()
+        else:
+            route.continue_()
+
+    page.route("**/api/extension", drop_response)
+    page.get_by_role("button", name="Start task", exact=True).click()
+    expect(page.locator("#status")).to_contain_text("delivery is uncertain")
+    assert len(extension_server.workspaces.calls) == 1
+    page.reload()
+    expect(page.locator("#status")).to_have_text("Ready.")
+    page.get_by_role("button", name="Start task", exact=True).click()
+    expect(page.locator("#workspace")).to_be_visible()
+    assert len(extension_server.workspaces.calls) == 1

@@ -27,7 +27,7 @@ $("settings").onsubmit = async (event) => {
     if (!granted) throw Error("Dashboard access was not granted.");
     await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
     await chrome.storage.local.set({ config: { url, token: $("token").value.trim() } });
-    $("status").textContent = "Saved. Return to your task and click Reload choices.";
+    $("status").textContent = "Saved. Return to your task; its choices will refresh automatically.";
   } catch (error) {
     $("status").textContent = error.message;
   }
