@@ -2614,6 +2614,81 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
         assert body["effort"] == ("ultra" if settings == "codex" else "high")
 
 
+def test_saved_effort_defaults_name_default_and_save_from_the_picker(
+    page, dashboard_site, workspace_routes
+):
+    info, snapshot, requests = workspace_routes
+    info["matches"] = []
+    snapshot["agent_choices"] = {
+        "codex": {"models": [], "efforts": ["low", "ultra"]},
+        "claude": {
+            "accounts": [{"id": "default", "label": "Default"}],
+            "models": [{"id": "opus", "efforts": ["low", "high"]}],
+            "efforts": ["low", "high"],
+        },
+    }
+    snapshot["effort_defaults"] = {"effort": "low", "repos": {}}
+    saved = []
+
+    def save(route):
+        body = route.request.post_data_json
+        saved.append(body)
+        defaults = snapshot["effort_defaults"]
+        if "repo" in body:
+            defaults["repos"][body["repo"].lower()] = body["effort"]
+        else:
+            defaults["effort"] = body["effort"] or None
+        route.fulfill(json={"effort_defaults": defaults})
+
+    page.route("**/api/effort-default", save)
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    effort = dialog.get_by_role("combobox", name="Reasoning effort (optional)", exact=True)
+    expect(effort).to_have_value("Default (low)")
+    expect(dialog).to_contain_text(
+        "Default effort is low, saved for all projects. Support depends on the agent’s configured model."
+    )
+    dialog.get_by_text("Effort defaults", exact=True).click()
+    expect(dialog.get_by_label("Default effort for all projects")).to_have_value("low")
+    page.screenshot(path="reports/effort-defaults.png")
+    dialog.get_by_label("Default effort for test/alpha").select_option("ultra")
+    dialog.get_by_role("button", name="Save defaults", exact=True).click()
+    expect(dialog.locator(".effort-default-status")).to_have_text("Saved.")
+    assert saved == [{"repo": "test/alpha", "effort": "ultra"}]
+    expect(effort).to_have_value("Default (ultra)")
+    expect(dialog).to_contain_text("Default effort is ultra, saved for test/alpha.")
+    # Claude has no ultra, so the default for all projects applies instead.
+    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    expect(effort).to_have_value("Default (low)")
+    # The server resolves Default at launch, so nothing is sent for it.
+    dialog.get_by_label("Task", exact=True).fill("Fix this")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1]["agent"] == "claude" and "effort" not in requests[-1]
+
+
+def test_operation_messages_link_their_workspace_in_collie(page, dashboard_site, workspace_routes):
+    info, _, _ = workspace_routes
+    info["operation"] = {
+        "id": "op1",
+        "status": "complete",
+        "message": "Workspace ready — Open in Collie",
+        "log": "",
+        "result": {"workspace_id": "w1", "url": "https://collie.example.ts.net/space/w1"},
+    }
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    row = page.locator("#pr-list tr").first
+    expect(row.get_by_role("link", name="Open in Collie", exact=True)).to_have_attribute(
+        "href", "https://collie.example.ts.net/space/w1"
+    )
+    expect(row).to_contain_text("Workspace ready — Open in Collie")
+
+
 @pytest.mark.parametrize("kind", ["pr", "issue"])
 def test_existing_workspace_has_no_model_controls(page, dashboard_site, request, kind):
     info, _, requests = request.getfixturevalue(
@@ -3284,6 +3359,28 @@ def test_any_collie_workspace_offers_its_diff_and_transcript(
     page.locator("#list .watch").filter(has_text="test/repo").click()
     page.locator("#detail").get_by_role("button", name="Transcript", exact=True).click()
     expect(viewer).to_be_visible()
+
+
+def test_a_transcript_opened_before_the_first_turn_appears_once_recorded(
+    page, dashboard_site, workspace_routes
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Fix it"}
+    entry = {"role": "user", "kind": "prompt", "text": "Fix it", "time": None}
+    empty = {"sessions": [], "session": None, "entries": [], "start": 0, "total": 0}
+    recorded = {"sessions": [session], "session": session, "entries": [entry], "start": 0}
+    state = {"data": empty}
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=state["data"]))
+    page.clock.install()
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.get_by_text("No Claude or Codex session")).to_be_visible()
+    # The agent clears its startup prompts and its first turn is written.
+    state["data"] = {**recorded, "total": 1}
+    page.clock.run_for(11000)
+    expect(viewer.locator(".ws-msg-text")).to_have_text("Fix it")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("Claude session s1")
 
 
 COMMENT_DIFF = {
@@ -3968,21 +4065,174 @@ def test_blocked_agent_selection_shows_unsupported_dialog(page, dashboard_site, 
             "question": None,
         },
     )
+    collie = "https://collie.example.ts.net/space/w1"
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "agents": viewer_routes["agents"],
+                "sessions": viewer_routes["sessions"],
+                "path": viewer_routes["path"],
+                "url": collie,
+            }
+        ),
+    )
     page.set_viewport_size({"width": 390, "height": 900})
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     send = page.get_by_role("button", name="Send to agent")
     expect(send).to_be_enabled()
+    expect(
+        page.locator("#ws-viewer-links").get_by_role("link", name="Open in Collie")
+    ).to_have_attribute("href", collie)
     page.get_by_label("Agent", exact=True).select_option("w1:p2")
     expect(send).to_be_disabled()
     interaction = page.locator("#ws-agent-interaction")
     expect(interaction).to_contain_text("Allow this command? <img")
     expect(interaction.locator("img")).to_have_count(0)
     expect(interaction).to_contain_text("Answer this dialog in Collie")
+    # The instruction links the workspace in Collie.
+    expect(interaction.get_by_role("link", name="Collie", exact=True)).to_have_attribute(
+        "href", collie
+    )
     assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
     page.get_by_label("Agent", exact=True).select_option("w1:p1")
     expect(send).to_be_enabled()
     expect(interaction).to_be_empty()
+
+
+@pytest.mark.parametrize("width", [390, 1280])
+def test_a_permission_dialog_is_answered_with_its_option_buttons(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        session="live-session",
+        interaction={
+            "screen": "the whole terminal",
+            "question": None,
+            "idle": False,
+            "choices": {
+                "id": "dialog:abc",
+                "text": "Bash command\n\n  rm -rf build <b>x</b>\n\nDo you want to proceed?",
+                "options": [
+                    {"key": "1", "label": "Yes"},
+                    {"key": "2", "label": "Yes, and don't ask again for rm commands"},
+                    {"key": "3", "label": "No, and tell Claude what to do differently (esc)"},
+                ],
+            },
+        },
+    )
+    viewer_routes["agents"] = [agent]
+    chosen = []
+
+    def choose(route):
+        chosen.append(route.request.post_data_json)
+        if len(chosen) == 1:
+            route.fulfill(
+                status=400, json={"error": "The dialog on the agent's screen changed; refresh"}
+            )
+            return
+        agent.update(status="working", interaction=None)
+        route.fulfill(json={"chosen": True, "pane": "w1:p2"})
+
+    page.route("**/api/workspace-choose", choose)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    interaction = page.locator("#ws-agent-interaction")
+    expect(interaction).to_contain_text("Live dialog from the agent")
+    expect(interaction).to_contain_text("rm -rf build <b>x</b>")
+    expect(interaction).not_to_contain_text("Answer this dialog in Collie")
+    expect(page.get_by_role("button", name="Send to agent")).to_be_disabled()
+    assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
+    interaction.screenshot(path=f"reports/live-dialog-{width}.png")
+    no = interaction.get_by_role("button", name="No, and tell Claude what to do differently (esc)")
+    no.click()
+    expect(interaction.locator(".ws-answer-status")).to_have_text(
+        "The dialog on the agent's screen changed; refresh"
+    )
+    expect(no).to_be_enabled()
+    no.click()
+    expect(interaction.locator(".ws-answer-status")).to_contain_text("Chose “No, and tell")
+    assert chosen[-1] == {
+        "workspace": "w1",
+        "pane": "w1:p2",
+        "session": "live-session",
+        "dialog": "dialog:abc",
+        "option": "3",
+    }
+    expect(interaction).to_be_empty()
+
+
+def test_an_uncertain_choice_is_not_offered_again(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        session="live-session",
+        interaction={
+            "screen": "",
+            "question": None,
+            "idle": False,
+            "choices": {
+                "id": "dialog:abc",
+                "text": "Do you want to proceed?",
+                "options": [{"key": "1", "label": "Yes"}, {"key": "2", "label": "No"}],
+            },
+        },
+    )
+    viewer_routes["agents"] = [agent]
+    page.route(
+        "**/api/workspace-choose",
+        lambda route: route.fulfill(
+            status=503, json={"error": "Check the dialog in Collie: timeout"}
+        ),
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    interaction = page.locator("#ws-agent-interaction")
+    interaction.get_by_role("button", name="Yes", exact=True).click()
+    expect(interaction.locator(".ws-answer-status")).to_contain_text("may have gone through")
+    expect(interaction.get_by_role("button", name="Yes", exact=True)).to_be_disabled()
+    expect(interaction.get_by_role("button", name="No", exact=True)).to_be_disabled()
+
+
+def test_a_blocked_agent_with_an_idle_prompt_box_can_be_messaged(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        interaction={"screen": "❯", "question": None, "choices": None, "idle": True},
+    )
+    viewer_routes["agents"] = [agent]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_label("Message the agent").fill("Carry on")
+    send = page.get_by_role("button", name="Send to agent")
+    expect(send).to_be_enabled()
+    expect(page.locator("#ws-agent-interaction")).to_be_empty()
+    send.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p2.")
+
+
+def test_an_unsupported_dialog_preview_opens_at_its_bottom(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    screen = "\n".join(f"transcript line {i}" for i in range(80)) + "\nThe dialog"
+    agent.update(status="blocked", interaction={"screen": screen, "question": None})
+    viewer_routes["agents"] = [agent]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    preview = page.locator("#ws-agent-interaction .ws-agent-screen")
+    expect(preview).to_contain_text("The dialog")
+    assert preview.evaluate(
+        "el => el.scrollTop > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 1"
+    )
 
 
 def test_a_question_without_its_waiting_agent_is_answered_in_the_terminal(
