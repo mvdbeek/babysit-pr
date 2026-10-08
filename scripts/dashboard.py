@@ -279,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-open",
                 "workspace-message",
                 "workspace-answer",
+                "workspace-choose",
                 "workspace-docker",
                 "workspace-interrupt",
                 "workspace-prompt-forget",
@@ -403,6 +404,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.answer(request))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the question in Collie: {exc}"})
+                return
+            if action == "workspace-choose":
+                try:
+                    self.send_json(200, agent_messages.choose(request))
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the dialog in Collie: {exc}"})
                 return
             if action == "effort-default":
                 self.send_json(

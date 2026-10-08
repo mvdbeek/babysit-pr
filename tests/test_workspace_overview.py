@@ -1708,11 +1708,259 @@ def test_unsupported_live_dialogs_are_visible_without_answer_controls(missing_qu
     data = read(state)
     data["screens"]["w1:p1"] = [screen]
     state.write_text(json.dumps(data))
-    assert agent_messages.agents("w1", interactions=True)[0]["interaction"] == {
-        "screen": screen,
-        "question": None,
-    }
+    interaction = agent_messages.agents("w1", interactions=True)[0]["interaction"]
+    assert (interaction["screen"], interaction["question"], interaction["idle"]) == (
+        screen,
+        None,
+        False,
+    )
+    # Its numbered options can still be picked one key at a time, unless typing is open.
+    labels = [o["label"] for o in (interaction["choices"] or {}).get("options", [])]
+    assert labels == (
+        ["Red", "Blue", "Chat about this"] if mode in {"multiple", "approval"} else []
+    )
     assert keys_sent(state) == []
+
+
+PERMISSION = "\n".join(
+    [
+        "⏺ Bash(rm -rf build)",
+        RULE,
+        " Bash command",
+        "",
+        "   rm -rf build",
+        "   Remove the build directory",
+        "",
+        " Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. Yes, and don't ask again for rm commands in /work",
+        "   3. No, and tell Claude what to do differently (esc)",
+        "",
+        " Esc to cancel · Tab to amend · ctrl+e to explain",
+    ]
+)
+
+
+@pytest.fixture
+def approving(asking):
+    state, sid, transcript = asking
+    transcript.write_text(transcript.read_text().splitlines()[0] + "\n")
+    data = read(state)
+    data["screens"]["w1:p1"] = [PERMISSION, "done"]
+    state.write_text(json.dumps(data))
+    return state, sid
+
+
+def choice_request(sid, dialog, option="1", **extra):
+    return {
+        "workspace": "w1",
+        "pane": "w1:p1",
+        "session": sid,
+        "dialog": dialog,
+        "option": option,
+        **extra,
+    }
+
+
+def test_a_permission_prompt_is_answered_with_the_chosen_number(approving):
+    import agent_messages
+
+    state, sid = approving
+    interaction = agent_messages.agents("w1", interactions=True)[0]["interaction"]
+    assert interaction["question"] is None
+    choices = interaction["choices"]
+    assert (
+        choices["text"]
+        == "Bash command\n\n  rm -rf build\n  Remove the build directory\n\nDo you want to proceed?"
+    )
+    assert [(o["key"], o["label"]) for o in choices["options"]] == [
+        ("1", "Yes"),
+        ("2", "Yes, and don't ask again for rm commands in /work"),
+        ("3", "No, and tell Claude what to do differently (esc)"),
+    ]
+    # Moving the cursor in the terminal leaves it the same dialog.
+    moved = PERMISSION.replace(" ❯ 1. Yes", "   1. Yes").replace("   3. No", " ❯ 3. No")
+    data = read(state)
+    data["screens"]["w1:p1"] = [moved, "done"]
+    state.write_text(json.dumps(data))
+    assert agent_messages.choose(choice_request(sid, choices["id"], "3")) == {
+        "chosen": True,
+        "pane": "w1:p1",
+    }
+    assert keys_sent(state) == [["3"]]
+
+
+@pytest.mark.parametrize(
+    "change, request_extra, error",
+    [
+        ("dialog", {}, "dialog on the agent's screen changed"),
+        (None, {"option": "4"}, "one of the dialog's options"),
+        (None, {"session": "other"}, "no longer running"),
+        (None, {"extra": "x"}, "Invalid choice"),
+        ("idle", {}, "not waiting on a dialog"),
+    ],
+)
+def test_choices_are_refused_before_any_key(approving, change, request_extra, error):
+    import agent_messages
+
+    state, sid = approving
+    dialog = agent_messages.agents("w1", interactions=True)[0]["interaction"]["choices"]["id"]
+    data = read(state)
+    if change == "dialog":
+        data["screens"]["w1:p1"] = [PERMISSION.replace("rm -rf build", "rm -rf /"), "done"]
+    if change == "idle":
+        data["agents"][0]["agent_status"] = "idle"
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=error):
+        agent_messages.choose(choice_request(sid, dialog, **request_extra))
+    assert keys_sent(state) == []
+
+
+def test_the_dashboard_relays_choices(approving, tmp_path):
+    import agent_messages
+
+    state, sid = approving
+    dialog = agent_messages.agents("w1", interactions=True)[0]["interaction"]["choices"]["id"]
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, value = request(
+                httpd.server_port,
+                "/api/workspace-choose",
+                choice_request(sid, dialog, "2"),
+                action="workspace-choose",
+            )
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+    assert (status, value) == (200, {"chosen": True, "pane": "w1:p1"})
+    assert keys_sent(state) == [["2"]]
+
+
+TRUST = "\n".join(
+    [
+        RULE,
+        " Accessing workspace:",
+        "",
+        " /work/checkout",
+        "",
+        " These will apply without asking. Only proceed if you trust this configuration.",
+        "",
+        " ❯ No, exit",
+        "   Yes, I trust this folder",
+        "",
+        " Enter to confirm · Esc to cancel",
+    ]
+)
+
+
+@pytest.mark.parametrize("lands", [True, False])
+def test_an_unnumbered_dialog_moves_its_cursor_before_enter(approving, lands):
+    import agent_messages
+
+    state, sid = approving
+    moved = TRUST.replace(" ❯ No, exit", "   No, exit").replace("   Yes, I", " ❯ Yes, I")
+    data = read(state)
+    data["screens"]["w1:p1"] = [TRUST, moved if lands else TRUST, "done"]
+    state.write_text(json.dumps(data))
+    choices = agent_messages.agents("w1", interactions=True)[0]["interaction"]["choices"]
+    assert choices["text"].startswith("Accessing workspace:\n\n/work/checkout")
+    assert [(o["key"], o["label"]) for o in choices["options"]] == [
+        ("1", "No, exit"),
+        ("2", "Yes, I trust this folder"),
+    ]
+    if lands:
+        agent_messages.choose(choice_request(sid, choices["id"], "2"))
+        assert keys_sent(state) == [["down"], ["enter"]]
+    else:
+        with pytest.raises(ValueError, match="nothing was confirmed"):
+            agent_messages.choose(choice_request(sid, choices["id"], "2"))
+        assert keys_sent(state) == [["down"]]
+
+
+IDLE = "\n".join(["⏺ All checks passed.", "", RULE, "❯ ", RULE, "  ? for shortcuts"])
+
+
+@pytest.mark.parametrize("appears", [True, False])
+def test_a_misdetected_blocked_agent_gets_the_message_pasted(asking, appears):
+    import agent_messages
+
+    state, sid, _ = asking
+    data = read(state)
+    typed = IDLE.replace("❯ ", "❯ [Pasted text #1 +2 lines]")
+    data["screens"]["w1:p1"] = [IDLE, typed if appears else IDLE, "done"]
+    state.write_text(json.dumps(data))
+    interaction = agent_messages.agents("w1", interactions=True)[0]["interaction"]
+    assert (interaction["idle"], interaction["choices"], interaction["question"]) == (
+        True,
+        None,
+        None,
+    )
+    request = {"workspace": "w1", "pane": "w1:p1", "text": "one\ntwo"}
+    if appears:
+        assert agent_messages.send(request) == {"sent": True, "pane": "w1:p1", "warning": None}
+        assert keys_sent(state) == [["\x1b[200~one\ntwo\x1b[201~"], ["enter"]]
+    else:
+        with pytest.raises(ValueError, match="did not appear"):
+            agent_messages.send(request)
+        assert keys_sent(state) == [["\x1b[200~one\ntwo\x1b[201~"]]
+    assert "prompts" not in read(state)
+
+
+def test_a_dialog_that_opens_after_the_paste_gets_no_enter(asking, monkeypatch):
+    import agent_messages
+
+    state, _, _ = asking
+    monkeypatch.setattr(agent_messages, "DIALOG_WAIT", 0.3)
+    data = read(state)
+    data["screens"]["w1:p1"] = [IDLE, PERMISSION.replace("rm -rf build", "rm one\ntwo")]
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="did not appear"):
+        agent_messages.send({"workspace": "w1", "pane": "w1:p1", "text": "one\ntwo"})
+    assert keys_sent(state) == [["\x1b[200~one\ntwo\x1b[201~"]]
+
+
+def test_a_numbered_list_in_the_question_is_not_taken_for_its_options(missing_question):
+    import agent_messages
+
+    state, sid, screen = missing_question
+    listed = screen.replace("Pick a\ncolor\n", "Pick a color from\n1. the logo\n2. the site\n")
+    data = read(state)
+    data["screens"]["w1:p1"] = [listed, "done"]
+    state.write_text(json.dumps(data))
+    question = agent_messages.agents("w1", interactions=True)[0]["interaction"]["question"]
+    asked = question["questions"][0]
+    assert asked["question"] == "Pick a color from 1. the logo 2. the site"
+    assert [o["label"] for o in asked["options"]] == ["Red", "Blue"]
+
+
+def test_a_blocked_agent_with_a_draft_or_dialog_is_not_pasted_into(asking):
+    import agent_messages
+
+    state, _, _ = asking
+    working = IDLE.replace("? for shortcuts", "⏵⏵ bypass permissions on · esc to interrupt")
+    for screen in (IDLE.replace("❯ ", "❯ half-typed draft"), PERMISSION, working):
+        data = read(state)
+        data["screens"]["w1:p1"] = [screen]
+        state.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="waiting on a question"):
+            agent_messages.send({"workspace": "w1", "pane": "w1:p1", "text": "hi"})
+    assert keys_sent(state) == []
+
+
+def test_quote_bars_are_not_part_of_a_live_question(missing_question):
+    import agent_messages
+
+    state, sid, screen = missing_question
+    quoted = screen.replace("Pick a\ncolor\n", "│ Pick a\n│ color\n")
+    data = read(state)
+    data["screens"]["w1:p1"] = [quoted, "done"]
+    state.write_text(json.dumps(data))
+    question = agent_messages.agents("w1", interactions=True)[0]["interaction"]["question"]
+    assert question["questions"][0]["question"] == "Pick a color"
+    agent_messages.answer(answer_request(sid, [{"options": [1]}], tool=question["id"]))
+    assert keys_sent(state) == [["2"]]
 
 
 def test_a_waiting_claude_dialog_is_answered_one_question_at_a_time(asking):

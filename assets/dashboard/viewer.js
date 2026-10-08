@@ -1122,7 +1122,8 @@
   }
   function renderInteraction() {
     const agent = selectedAgent();
-    const blocked = agent?.status === "blocked";
+    // herdr can call an agent blocked while its screen shows an empty prompt box.
+    const blocked = agent?.status === "blocked" && !agent.interaction?.idle;
     byId("ws-message-send").disabled = sending || changingDocker || blocked;
     const holder = byId("ws-agent-interaction");
     const state = JSON.stringify([agent?.pane, agent?.session, blocked, agent?.interaction]);
@@ -1134,16 +1135,89 @@
       node("p", "The agent is waiting for an answer. Your message is saved.", "pr-meta"),
     );
     const question = agent.interaction?.question;
+    const choices = agent.interaction?.choices;
     if (question) {
       const card = node("div", undefined, "ws-question");
       card.append(node("strong", "Live question from the agent"), answerControls(question, agent));
       holder.append(card);
+    } else if (choices) {
+      const card = node("div", undefined, "ws-question");
+      card.append(node("strong", "Live dialog from the agent"), choiceControls(choices, agent));
+      holder.append(card);
     } else {
-      if (agent.interaction?.screen)
-        holder.append(node("pre", agent.interaction.screen, "ws-agent-screen"));
+      if (agent.interaction?.screen) {
+        const screen = node("pre", agent.interaction.screen, "ws-agent-screen");
+        holder.append(screen);
+        // A dialog sits at the bottom of the screen.
+        screen.scrollTop = screen.scrollHeight;
+      }
       const note = node("p", undefined, "pr-meta");
       tell(note, "Answer this dialog in Collie, then refresh to send your message.");
       holder.append(note);
+    }
+  }
+  // A dialog's options, each picked with its number key once the server sees the same
+  // dialog on the agent's screen.
+  function choiceControls(choices, agent) {
+    const box = node("div", undefined, "ws-answer");
+    if (choices.text) box.append(node("pre", choices.text, "ws-agent-screen"));
+    const status = node("p", undefined, "ws-answer-status");
+    status.setAttribute("role", "status");
+    const buttons = choices.options.map((option) => {
+      const button = node("button", option.label);
+      button.type = "button";
+      button.onclick = async () => {
+        buttons.forEach((b) => (b.disabled = true));
+        status.textContent = "Choosing…";
+        const current = viewer.entry;
+        const value = await choiceRequest({
+          workspace: current.workspace,
+          pane: agent.pane,
+          session: agent.session,
+          dialog: choices.id,
+          option: option.key,
+        });
+        if (viewer?.entry !== current) return;
+        if (value.error) {
+          status.textContent = value.error;
+          // The key may have gone through: a retry could answer the next, identical
+          // dialog unseen, so only a clean refusal allows one.
+          if (!value.uncertain) buttons.forEach((b) => (b.disabled = false));
+          return;
+        }
+        status.textContent = `Chose “${option.label}” in ${value.pane}.`;
+        setTimeout(() => {
+          if (viewer?.entry === current) void fetchAgents(current);
+        }, 1500);
+      };
+      return button;
+    });
+    const list = node("div", undefined, "ws-choices");
+    list.append(...buttons);
+    box.append(list, status);
+    return box;
+  }
+  async function choiceRequest(body) {
+    try {
+      const response = await fetch("/api/workspace-choose", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-choose" },
+        body: JSON.stringify(body),
+      });
+      const value = await response.json();
+      if (response.ok) return value;
+      // 400 is a refusal before any key; anything else may have pressed it.
+      const uncertain = response.status !== 400;
+      const error = value.error || `HTTP ${response.status}`;
+      return {
+        error: uncertain ? `${error}. It may have gone through; refresh.` : error,
+        uncertain,
+      };
+    } catch {
+      return {
+        error: "The connection dropped; it may have gone through. Check the dialog in Collie.",
+        uncertain: true,
+      };
     }
   }
   function selectedAgent() {
@@ -1164,6 +1238,7 @@
     return { claude: "Claude", codex: "Codex" }[agent.agent] || agent.agent || "Agent";
   }
   function activity(agent) {
+    if (agent.status === "blocked" && agent.interaction?.idle) return ACTIVITY.idle;
     return ACTIVITY[agent.status] || [agent.status || "Unknown", ""];
   }
   function renderLive() {

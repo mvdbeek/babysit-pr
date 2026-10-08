@@ -4101,6 +4101,140 @@ def test_blocked_agent_selection_shows_unsupported_dialog(page, dashboard_site, 
     expect(interaction).to_be_empty()
 
 
+@pytest.mark.parametrize("width", [390, 1280])
+def test_a_permission_dialog_is_answered_with_its_option_buttons(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        session="live-session",
+        interaction={
+            "screen": "the whole terminal",
+            "question": None,
+            "idle": False,
+            "choices": {
+                "id": "dialog:abc",
+                "text": "Bash command\n\n  rm -rf build <b>x</b>\n\nDo you want to proceed?",
+                "options": [
+                    {"key": "1", "label": "Yes"},
+                    {"key": "2", "label": "Yes, and don't ask again for rm commands"},
+                    {"key": "3", "label": "No, and tell Claude what to do differently (esc)"},
+                ],
+            },
+        },
+    )
+    viewer_routes["agents"] = [agent]
+    chosen = []
+
+    def choose(route):
+        chosen.append(route.request.post_data_json)
+        if len(chosen) == 1:
+            route.fulfill(
+                status=400, json={"error": "The dialog on the agent's screen changed; refresh"}
+            )
+            return
+        agent.update(status="working", interaction=None)
+        route.fulfill(json={"chosen": True, "pane": "w1:p2"})
+
+    page.route("**/api/workspace-choose", choose)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    interaction = page.locator("#ws-agent-interaction")
+    expect(interaction).to_contain_text("Live dialog from the agent")
+    expect(interaction).to_contain_text("rm -rf build <b>x</b>")
+    expect(interaction).not_to_contain_text("Answer this dialog in Collie")
+    expect(page.get_by_role("button", name="Send to agent")).to_be_disabled()
+    assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
+    interaction.screenshot(path=f"reports/live-dialog-{width}.png")
+    no = interaction.get_by_role("button", name="No, and tell Claude what to do differently (esc)")
+    no.click()
+    expect(interaction.locator(".ws-answer-status")).to_have_text(
+        "The dialog on the agent's screen changed; refresh"
+    )
+    expect(no).to_be_enabled()
+    no.click()
+    expect(interaction.locator(".ws-answer-status")).to_contain_text("Chose “No, and tell")
+    assert chosen[-1] == {
+        "workspace": "w1",
+        "pane": "w1:p2",
+        "session": "live-session",
+        "dialog": "dialog:abc",
+        "option": "3",
+    }
+    expect(interaction).to_be_empty()
+
+
+def test_an_uncertain_choice_is_not_offered_again(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        session="live-session",
+        interaction={
+            "screen": "",
+            "question": None,
+            "idle": False,
+            "choices": {
+                "id": "dialog:abc",
+                "text": "Do you want to proceed?",
+                "options": [{"key": "1", "label": "Yes"}, {"key": "2", "label": "No"}],
+            },
+        },
+    )
+    viewer_routes["agents"] = [agent]
+    page.route(
+        "**/api/workspace-choose",
+        lambda route: route.fulfill(
+            status=503, json={"error": "Check the dialog in Collie: timeout"}
+        ),
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    interaction = page.locator("#ws-agent-interaction")
+    interaction.get_by_role("button", name="Yes", exact=True).click()
+    expect(interaction.locator(".ws-answer-status")).to_contain_text("may have gone through")
+    expect(interaction.get_by_role("button", name="Yes", exact=True)).to_be_disabled()
+    expect(interaction.get_by_role("button", name="No", exact=True)).to_be_disabled()
+
+
+def test_a_blocked_agent_with_an_idle_prompt_box_can_be_messaged(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        interaction={"screen": "❯", "question": None, "choices": None, "idle": True},
+    )
+    viewer_routes["agents"] = [agent]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_label("Message the agent").fill("Carry on")
+    send = page.get_by_role("button", name="Send to agent")
+    expect(send).to_be_enabled()
+    expect(page.locator("#ws-agent-interaction")).to_be_empty()
+    send.click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p2.")
+
+
+def test_an_unsupported_dialog_preview_opens_at_its_bottom(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    agent = viewer_routes["agents"][1]
+    screen = "\n".join(f"transcript line {i}" for i in range(80)) + "\nThe dialog"
+    agent.update(status="blocked", interaction={"screen": screen, "question": None})
+    viewer_routes["agents"] = [agent]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    preview = page.locator("#ws-agent-interaction .ws-agent-screen")
+    expect(preview).to_contain_text("The dialog")
+    assert preview.evaluate(
+        "el => el.scrollTop > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 1"
+    )
+
+
 def test_a_question_without_its_waiting_agent_is_answered_in_the_terminal(
     page, dashboard_site, viewer_routes
 ):
