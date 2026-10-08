@@ -1652,9 +1652,14 @@ def test_scheduled_and_batched_launches_keep_the_docker_opt_in(synced):
     )
     batched = [r["scheduled"] for r in value["results"]]
     assert [t["request"]["docker"] for t in batched] == [True, True]
-    plain = manager.batch({"items": [{"id": "I_two"}], "task": "Fix {url}", "start_at": start})
+    # Due after the run below: were it due too, it would start for I_two as soon as the
+    # Docker launch's worker finished, replacing that operation (a timing-dependent race).
+    plain = manager.batch(
+        {"items": [{"id": "I_two"}], "task": "Fix {url}", "start_at": start + 3600}
+    )
     assert "docker" not in plain["results"][0]["scheduled"]["request"]
     manager.run_due(now=start)
+    assert scheduled_task(manager, plain["results"][0]["scheduled"]["id"])["status"] == "scheduled"
     for key in (pr["id"], "I_one", "I_two"):
         op = finish(manager, key)
         assert op["status"] == "complete", op["log"]

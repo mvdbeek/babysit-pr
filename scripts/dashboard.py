@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import agent_messages
 import attachments
+import llm_usage
 import workspace_viewer
 from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
@@ -482,6 +483,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route.path == "/api/status":
                 self.send_json(200, status(self.server.home))
+            elif route.path == "/api/llm-usage":
+                refresh = parse_qs(route.query).get("refresh") == ["1"]
+                llm_usage.request(self.server.home, refresh)
+                heartbeat = read_json(self.server.home / "heartbeat.json") or {}
+                reader = llm_usage.reader_state(self.server.home, heartbeat)
+                self.send_json(200, llm_usage.present(self.server.home, reader=reader))
             elif route.path == "/api/notification-preferences":
                 self.send_json(
                     200,
@@ -701,6 +708,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
                     "/app.js": ("app.js", "text/javascript"),
                     "/notifications.js": ("notifications.js", "text/javascript"),
+                    "/usage.js": ("usage.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
                     "/sw.js": ("sw.js", "text/javascript"),
                     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),

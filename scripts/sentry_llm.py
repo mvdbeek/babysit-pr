@@ -442,15 +442,20 @@ def iso(epoch):
     return datetime.fromtimestamp(epoch, UTC).isoformat().replace("+00:00", "Z")
 
 
-def claude_config_home():
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+def claude_config_home(config_env=False):
+    directory = os.environ.get("CLAUDE_CONFIG_DIR") if config_env is False else config_env
+    return Path(directory) if directory else Path.home() / ".claude"
 
 
-def claude_login(run=owned_process.run, now=time.time):
-    """Claude Code's current access token (Keychain first, then its file), never refreshed."""
+def claude_login(run=owned_process.run, now=time.time, config_env=False):
+    """Claude Code's current access token (Keychain first, then its file), never refreshed.
+
+    ``config_env`` is the literal ``CLAUDE_CONFIG_DIR`` of the login to read (None for
+    ``~/.claude``); by default the current environment's login is read.
+    """
     candidates = []
     service = "Claude Code-credentials"
-    directory = os.environ.get("CLAUDE_CONFIG_DIR")
+    directory = os.environ.get("CLAUDE_CONFIG_DIR") if config_env is False else config_env
     if directory:
         # Claude's Keychain service is keyed by the literal NFC config path, not realpath.
         service += (
@@ -466,7 +471,7 @@ def claude_login(run=owned_process.run, now=time.time):
             candidates.append(json.loads(found.stdout))
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
-    path = claude_config_home() / ".credentials.json"
+    path = claude_config_home(config_env) / ".credentials.json"
     with contextlib.suppress(OSError, ValueError):
         candidates.append(json.loads(path.read_text()))
     expired = False
@@ -535,11 +540,11 @@ def codex_windows(body):
     return windows
 
 
-def usage_reading(agent, run=owned_process.run, fetch=http_json, now=time.time):
+def usage_reading(agent, run=owned_process.run, fetch=http_json, now=time.time, config_env=False):
     """({windows}, None) or (None, why); undocumented endpoints, so any surprise is 'unknown'."""
     try:
         if agent == "claude":
-            token, why = claude_login(run, now)
+            token, why = claude_login(run, now, config_env)
             if not token:
                 return None, why
             body = fetch(

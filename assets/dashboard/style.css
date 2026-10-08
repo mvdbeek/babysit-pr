@@ -114,6 +114,83 @@ header p {
   border-radius: 50%;
   background: transparent;
 }
+#usage-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 40px;
+  padding: 0 12px;
+  flex-shrink: 0;
+  border-radius: 20px;
+  background: transparent;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+#usage-toggle[data-level="green"] {
+  color: var(--green);
+}
+#usage-toggle[data-level="amber"] {
+  color: var(--amber);
+}
+#usage-toggle[data-level="red"] {
+  color: var(--red);
+}
+#usage-refresh {
+  margin-top: 12px;
+}
+#usage-status:empty {
+  display: none;
+}
+#usage-list {
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 18px;
+}
+.usage-account {
+  display: grid;
+  gap: 8px;
+}
+.usage-account-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.usage-window {
+  display: grid;
+  gap: 4px;
+}
+.usage-window-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.usage-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+.usage-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--green);
+}
+.usage-bar.amber > span {
+  background: var(--amber);
+}
+.usage-bar.red > span {
+  background: var(--red);
+}
+.usage-error {
+  overflow-wrap: anywhere;
+}
 #new-task {
   display: inline-flex;
   align-items: center;
@@ -140,7 +217,8 @@ header p {
   font-weight: 700;
   border: 2px solid #fcfdf9;
 }
-#notifications-dialog {
+#notifications-dialog,
+#usage-dialog {
   --dialog-padding: 20px;
   position: fixed;
   inset: 72px max(16px, 5%) auto auto;
@@ -156,7 +234,8 @@ header p {
   color: var(--ink);
   box-shadow: 0 16px 50px #25342f26;
 }
-#notifications-dialog::backdrop {
+#notifications-dialog::backdrop,
+#usage-dialog::backdrop {
   background: #25342f26;
 }
 .notifications-heading {
@@ -225,9 +304,17 @@ header p {
   .header-tools .connection {
     gap: 2px;
   }
-  #notifications-dialog {
+  #notifications-dialog,
+  #usage-dialog {
     right: 16px;
     top: 64px;
+  }
+  #usage-toggle {
+    height: 36px;
+    padding: 0 8px;
+  }
+  #usage-toggle svg {
+    display: none;
   }
   /* The header has no room on a phone: New task floats within thumb reach instead. */
   #new-task {
@@ -274,6 +361,22 @@ header p {
   #notifications-toggle {
     width: 36px;
     height: 36px;
+  }
+  /* No room left in the header: usage floats opposite New task, in main's spare space. */
+  #usage-toggle {
+    position: fixed;
+    left: 16px;
+    bottom: calc(22px + env(safe-area-inset-bottom));
+    z-index: 5;
+    height: 40px;
+    padding: 0 12px;
+    background: var(--paper);
+    box-shadow: 0 4px 14px #0002;
+  }
+  #usage-dialog {
+    left: 16px;
+    right: 16px;
+    width: auto;
   }
 }
 small {

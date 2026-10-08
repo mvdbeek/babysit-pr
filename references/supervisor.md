@@ -67,6 +67,10 @@ Without a name, registration searches the known stores and infers the directory
 from the transcript; `--rollout` resolves an ambiguous session. Create a named
 login with `scripts/claude-account login NAME`. Existing watches without a saved
 directory continue to use their original environment behavior.
+While a dashboard is open, the daemon also reads subscription usage for Codex and
+each Claude login (at most every 5 minutes, off its loop thread) into
+`llm-usage.json`; the dashboard uses it to default new tasks to the login with
+the most quota left.
 The shared watcher handles CI waiting without LLM calls. Repairs keep the saved
 conversation and existing worktree.
 

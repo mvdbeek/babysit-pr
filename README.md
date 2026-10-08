@@ -468,11 +468,49 @@ their original environment behavior until deliberately registered again.
 Dashboard session discovery includes all named accounts, labels their sessions,
 and resumes them using their original store. The Sentry usage reader selects the
 Keychain entry for its configured `CLAUDE_CONFIG_DIR` and never falls back to
-another account's Keychain entry. Account selection does not automatically rotate
-to a different subscription when a usage limit is reached.
+another account's Keychain entry. New tasks default to the login with the most
+quota left (see [Subscription usage](#subscription-usage)), but a running agent or
+a repair does not rotate to a different subscription when a usage limit is reached.
 
 Claude's supported multi-account mechanism is documented in its
 [authentication reference](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts).
+
+## Subscription usage
+
+The header shows the quota left on the login with the most headroom (on the
+narrowest phones it floats at the bottom left); select it to see the 5-hour and
+weekly windows for Codex and every Claude login (default and named accounts), with
+their reset times. Claude's model-specific weekly windows are shown too.
+
+The New task, Create workspace and batch dialogs open on the agent and Claude
+account with the most quota left. A login's quota left is its tightest 5-hour or
+weekly window; model-specific windows are not ranked, and ties keep the order
+Codex, default Claude, named Claude accounts. Choosing **Claude** picks its account
+with the most left. Picker options show each choice's quota, and a note names the
+best login and, after you choose another, how much the chosen one has left. A
+reading that arrives while a dialog is open only fills in a default when none was
+known at opening, and never after you change the agent, account, model or effort.
+A scheduled task keeps the choice made when it was scheduled. Without any reading
+the previous defaults (Codex, default account) remain.
+
+The watcher daemon takes the readings, because the launchd dashboard cannot read
+the login Keychain. It reads only while a dashboard has asked in the last 15
+minutes, at most every 5 minutes; **Refresh** asks for a new reading, no sooner than
+a minute after the last. Readings use the same read-only reader as the Sentry
+experiment: the Claude and Codex usage endpoints with each CLI's stored login,
+never refreshed. These endpoints are undocumented. The default Claude login uses
+the Keychain entry for `~/.claude`; named accounts use the entry for their resolved
+`~/.claude/accounts/NAME` directory, as launches do, and macOS may ask once to allow
+`security` to read each one.
+
+A failed reading keeps the login's last windows, marked stale, and any window whose
+reset time has passed counts as unused. An idle Claude login's stored access token
+expires until Claude next uses it, so such a login stays ranked on its last reading.
+After any other failure (for example a removed login or repeated endpoint errors), a
+reading older than an hour is still shown but no longer ranked. The snapshot is the
+private `llm-usage.json` file in the state directory. When the daemon is not
+running, or was started before this feature and needs a restart, the dialog says so
+and shows the last saved reading.
 
 ## Worktree helper
 
