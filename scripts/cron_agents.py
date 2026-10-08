@@ -185,7 +185,9 @@ def start(job, run_id, home, src):
         job["agent"],
         job["prompt"],
         job["model"],
-        job["effort"],
+        # Left on Default: the repository's or global saved default, if any.
+        job["effort"]
+        or workspace_agents.default_effort(home, job["repo"], job["agent"], job["model"]),
         stage=lambda _: str(staged),
         docker=job["docker"],
         claude_config_dir=str(config) if config else None,

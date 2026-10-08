@@ -229,6 +229,9 @@ from the dashboard's environment (default `http://127.0.0.1:8787`). Multiple mat
 workspace names and agent status. **More actions** offers **Focus in herdr** and
 **Copy command**. Opening never sends a task to an existing agent. Only the explicit
 native focus action changes herdr focus; creation finishes with an **Open in Collie** link.
+Messages that send you to Collie, such as **Workspace ready — Open in Collie** beside
+a row or "check it in Collie" in the diff and transcript viewer, link the workspace
+there whenever it is known; the viewer also offers **Open in Collie** beside its links.
 
 When there is no workspace, **Reopen workspace** restores a verified checkout
 without starting an agent. **Create workspace** requires a task and selects Codex
@@ -364,6 +367,20 @@ policies can determine the effective model. The operation records the requested
 `model` and `effort` (null for Default), not a claim about the provider's effective
 configuration. Agent startup/provenance verification and duplicate-launch protection
 remain in place. Open/reopen actions do not apply these settings to existing sessions.
+
+**Effort defaults**, under the effort picker in every launch form (New task, Create
+workspace, Handle, batch Handle and agent cron jobs), saves a default reasoning effort
+for all projects and one for the launch's repository. A launch left on Default uses
+the repository's default, else the one for all projects, and the picker shows it as
+**Default (high)** with a note naming where it was saved. A default the chosen agent
+or model does not support is skipped, falling back to the next one and then to the
+agent's own configuration, so it never fails a launch. Defaults are resolved when the
+agent starts, so a scheduled task or cron job left on Default follows later changes;
+a workspace operation then records the effort it used. They are kept in `effort-defaults.json` in
+the state directory (`{"effort": "high", "repos": {"owner/name": "xhigh"}}`) and set
+through `POST /api/effort-default` with `{"effort": level}` or `{"repo": "owner/name",
+"effort": level}`; an empty effort clears one. The `wt` helpers on the command line do
+not read them.
 
 **Allow Docker in the agent’s sandbox**, off by default, passes `--docker` to the
 helper (the request field is `docker: true`; New task, Handle, Create workspace and

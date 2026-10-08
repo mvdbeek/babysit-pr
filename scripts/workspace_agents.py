@@ -19,8 +19,13 @@ VERSION = re.compile(r"\d+\.\d+\.\d+[0-9A-Za-z.+-]*")
 # found for an unchanged file is still rechecked after this many seconds.
 VERSION_RECHECK = 600
 REMEMBERED = "codex-models.json"
+# Reasoning efforts a launch left on Default uses: a global one and one per repository.
+DEFAULTS = "effort-defaults.json"
+REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 _version_lock = threading.Lock()
+# Saves read, change and rewrite the defaults file; concurrent requests take turns.
+_defaults_lock = threading.Lock()
 _version: dict = {}
 
 
@@ -168,3 +173,75 @@ def validate(agent, model, effort, home=None):
     levels = selected["efforts"] if selected else choices["efforts"]
     if effort and effort not in levels:
         raise ValueError("Select a supported reasoning effort for this agent and model")
+
+
+def effort_defaults(home):
+    """``{"effort": level or None, "repos": {"owner/name": level}}``, keys lower-case.
+
+    A missing or malformed file means no defaults; unknown levels are dropped.
+    """
+    try:
+        value = json.loads((Path(home) / DEFAULTS).read_text())
+    except (OSError, ValueError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    repos = value.get("repos")
+    if not isinstance(repos, dict):
+        repos = {}
+    return {
+        "effort": value.get("effort") if value.get("effort") in EFFORTS else None,
+        "repos": {
+            slug.lower(): level
+            for slug, level in repos.items()
+            if isinstance(slug, str) and REPO.fullmatch(slug) and level in EFFORTS
+        },
+    }
+
+
+def save_effort_default(home, request):
+    """Set one default, or clear it with an empty effort; returns all defaults.
+
+    ``{"effort": level}`` is the global default, ``{"repo": "owner/name", ...}`` the
+    repository's, which a launch there prefers.
+    """
+    if not isinstance(request, dict) or set(request) - {"repo", "effort"}:
+        raise ValueError("Unknown effort default field")
+    effort = request.get("effort") or ""
+    if effort and effort not in EFFORTS:
+        raise ValueError("Select a known reasoning effort")
+    repo = request.get("repo")
+    if repo is not None and not (isinstance(repo, str) and REPO.fullmatch(repo)):
+        raise ValueError("Name the repository as owner/name")
+    with _defaults_lock:
+        defaults = effort_defaults(home)
+        if repo is None:
+            defaults["effort"] = effort or None
+        elif effort:
+            defaults["repos"][repo.lower()] = effort
+        else:
+            defaults["repos"].pop(repo.lower(), None)
+        path = Path(home) / DEFAULTS
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+        try:
+            temporary.write_text(json.dumps(defaults, indent=2, sort_keys=True))
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return defaults
+
+
+def default_effort(home, repo, agent, model=""):
+    """The effort for a launch in ``repo`` left on Default, or "" for the agent's own.
+
+    The repository's default wins over the global one; a default the agent and model
+    do not support is skipped rather than failing the launch.
+    """
+    defaults = effort_defaults(home)
+    choices = catalog(home)[agent]
+    selected = next((m for m in choices["models"] if m["id"] == model), None)
+    levels = selected["efforts"] if selected else choices["efforts"]
+    for level in (defaults["repos"].get((repo or "").lower()), defaults["effort"]):
+        if level and level in levels:
+            return level
+    return ""

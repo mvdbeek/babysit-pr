@@ -2614,6 +2614,81 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
         assert body["effort"] == ("ultra" if settings == "codex" else "high")
 
 
+def test_saved_effort_defaults_name_default_and_save_from_the_picker(
+    page, dashboard_site, workspace_routes
+):
+    info, snapshot, requests = workspace_routes
+    info["matches"] = []
+    snapshot["agent_choices"] = {
+        "codex": {"models": [], "efforts": ["low", "ultra"]},
+        "claude": {
+            "accounts": [{"id": "default", "label": "Default"}],
+            "models": [{"id": "opus", "efforts": ["low", "high"]}],
+            "efforts": ["low", "high"],
+        },
+    }
+    snapshot["effort_defaults"] = {"effort": "low", "repos": {}}
+    saved = []
+
+    def save(route):
+        body = route.request.post_data_json
+        saved.append(body)
+        defaults = snapshot["effort_defaults"]
+        if "repo" in body:
+            defaults["repos"][body["repo"].lower()] = body["effort"]
+        else:
+            defaults["effort"] = body["effort"] or None
+        route.fulfill(json={"effort_defaults": defaults})
+
+    page.route("**/api/effort-default", save)
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role(
+        "button", name="Create workspace", exact=True
+    ).click()
+    dialog = page.get_by_role("dialog")
+    effort = dialog.get_by_role("combobox", name="Reasoning effort (optional)", exact=True)
+    expect(effort).to_have_value("Default (low)")
+    expect(dialog).to_contain_text(
+        "Default effort is low, saved for all projects. Support depends on the agent’s configured model."
+    )
+    dialog.get_by_text("Effort defaults", exact=True).click()
+    expect(dialog.get_by_label("Default effort for all projects")).to_have_value("low")
+    page.screenshot(path="reports/effort-defaults.png")
+    dialog.get_by_label("Default effort for test/alpha").select_option("ultra")
+    dialog.get_by_role("button", name="Save defaults", exact=True).click()
+    expect(dialog.locator(".effort-default-status")).to_have_text("Saved.")
+    assert saved == [{"repo": "test/alpha", "effort": "ultra"}]
+    expect(effort).to_have_value("Default (ultra)")
+    expect(dialog).to_contain_text("Default effort is ultra, saved for test/alpha.")
+    # Claude has no ultra, so the default for all projects applies instead.
+    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    expect(effort).to_have_value("Default (low)")
+    # The server resolves Default at launch, so nothing is sent for it.
+    dialog.get_by_label("Task", exact=True).fill("Fix this")
+    dialog.get_by_role("button", name="Create workspace", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1]["agent"] == "claude" and "effort" not in requests[-1]
+
+
+def test_operation_messages_link_their_workspace_in_collie(page, dashboard_site, workspace_routes):
+    info, _, _ = workspace_routes
+    info["operation"] = {
+        "id": "op1",
+        "status": "complete",
+        "message": "Workspace ready — Open in Collie",
+        "log": "",
+        "result": {"workspace_id": "w1", "url": "https://collie.example.ts.net/space/w1"},
+    }
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    row = page.locator("#pr-list tr").first
+    expect(row.get_by_role("link", name="Open in Collie", exact=True)).to_have_attribute(
+        "href", "https://collie.example.ts.net/space/w1"
+    )
+    expect(row).to_contain_text("Workspace ready — Open in Collie")
+
+
 @pytest.mark.parametrize("kind", ["pr", "issue"])
 def test_existing_workspace_has_no_model_controls(page, dashboard_site, request, kind):
     info, _, requests = request.getfixturevalue(
@@ -3968,17 +4043,36 @@ def test_blocked_agent_selection_shows_unsupported_dialog(page, dashboard_site, 
             "question": None,
         },
     )
+    collie = "https://collie.example.ts.net/space/w1"
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "agents": viewer_routes["agents"],
+                "sessions": viewer_routes["sessions"],
+                "path": viewer_routes["path"],
+                "url": collie,
+            }
+        ),
+    )
     page.set_viewport_size({"width": 390, "height": 900})
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     send = page.get_by_role("button", name="Send to agent")
     expect(send).to_be_enabled()
+    expect(
+        page.locator("#ws-viewer-links").get_by_role("link", name="Open in Collie")
+    ).to_have_attribute("href", collie)
     page.get_by_label("Agent", exact=True).select_option("w1:p2")
     expect(send).to_be_disabled()
     interaction = page.locator("#ws-agent-interaction")
     expect(interaction).to_contain_text("Allow this command? <img")
     expect(interaction.locator("img")).to_have_count(0)
     expect(interaction).to_contain_text("Answer this dialog in Collie")
+    # The instruction links the workspace in Collie.
+    expect(interaction.get_by_role("link", name="Collie", exact=True)).to_have_attribute(
+        "href", collie
+    )
     assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
     page.get_by_label("Agent", exact=True).select_option("w1:p1")
     expect(send).to_be_enabled()
