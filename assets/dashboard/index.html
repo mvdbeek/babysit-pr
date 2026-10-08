@@ -14,6 +14,7 @@
     <link rel="stylesheet" href="/style.css" />
     <script src="/push.js" defer></script>
     <script src="/notifications.js" defer></script>
+    <script src="/usage.js" defer></script>
     <script src="/attachments.js" defer></script>
     <script src="/viewer.js" defer></script>
     <script src="/app.js" defer></script>
@@ -39,6 +40,28 @@
           <span id="health" class="badge">Connecting</span
           ><small id="updated">Reading watcher state…</small>
         </div>
+        <button
+          id="usage-toggle"
+          type="button"
+          aria-label="Usage"
+          aria-haspopup="dialog"
+          aria-controls="usage-dialog"
+          title="Subscription usage"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="18"
+            height="18"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            aria-hidden="true"
+          >
+            <path d="M4 18a8 8 0 1 1 16 0M12 18l4-6" />
+          </svg>
+          <span id="usage-value" aria-hidden="true">–</span>
+        </button>
         <button id="new-task" type="button" aria-haspopup="dialog" aria-label="New task">
           <span aria-hidden="true">+</span><span class="new-task-label">New task</span>
         </button>
@@ -84,6 +107,20 @@
         <button id="notifications-push-enable" type="button" hidden>Enable notifications</button>
         <p id="notifications-push-status" class="notifications-caption" role="status"></p>
       </div>
+    </dialog>
+    <dialog id="usage-dialog" aria-labelledby="usage-title">
+      <div class="dialog-header">
+        <div class="notifications-heading">
+          <h2 id="usage-title">Subscription usage</h2>
+          <button id="usage-close" type="button" aria-label="Close usage">×</button>
+        </div>
+        <button id="usage-refresh" type="button">Refresh</button>
+      </div>
+      <p class="notifications-caption">
+        New tasks default to the login with the most quota left in its 5-hour and weekly windows.
+      </p>
+      <p id="usage-status" class="notifications-caption" role="status"></p>
+      <ol id="usage-list"></ol>
     </dialog>
     <main>
       <p id="navigation-status" role="status" hidden></p>

@@ -23,6 +23,7 @@ from typing import Any
 
 import gh_pr_watch as watch
 import github_cli
+import llm_usage
 import owned_process
 import sentry_llm
 
@@ -823,6 +824,9 @@ def serve(home, max_workers):
         # The opt-in Sentry experiment's LLM queue runs here, in the user's session.
         sentry_worker = sentry_llm.Worker(home)
         sentry_error: str | None = None
+        # Subscription usage for the dashboard, read only while a dashboard asks for it.
+        usage_worker = llm_usage.Worker(home)
+        usage_error: str | None = None
         checking: dict[str, concurrent.futures.Future] = {}
         next_check: dict[str, float] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -926,6 +930,13 @@ def serve(home, max_workers):
                     if str(exc) != sentry_error:
                         sentry_error = str(exc)
                         print(f"Sentry experiment worker failed: {exc}", flush=True)
+                try:
+                    usage_worker.tick()
+                    usage_error = None
+                except Exception as exc:  # Usage display must never stop the supervisor.
+                    if str(exc) != usage_error:
+                        usage_error = str(exc)
+                        print(f"Usage reader failed: {exc}", flush=True)
                 watch.save_state(home / "heartbeat.json", {"time": time.time(), "pid": os.getpid()})
                 time.sleep(1)
 

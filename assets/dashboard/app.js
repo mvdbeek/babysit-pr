@@ -2143,7 +2143,14 @@ function promptHistory(task) {
 }
 // Agent, model and effort choices; the model and effort lists follow the agent. `docker`
 // opens the Docker socket in the agent's Safehouse sandbox (`wt --docker`).
+// Subscription quota from usage.js, as " · 72% left" for a picker option.
+function quotaLeft(entry) {
+  return entry?.left_percent == null ? "" : ` · ${Math.round(entry.left_percent)}% left`;
+}
+const usageId = (agent, account) =>
+  agent === "codex" ? "codex" : `claude:${account || "default"}`;
 function agentFields() {
+  const usage = window.dashboardUsage;
   const agent = el("select");
   agent.id = "workspace-agent";
   for (const value of ["codex", "claude"]) {
@@ -2151,6 +2158,7 @@ function agentFields() {
     option.value = value;
     agent.append(option);
   }
+  const usageNote = el("small", "", "usage-choice");
   const model = el("select");
   model.id = "workspace-model";
   const effort = el("select");
@@ -2180,15 +2188,20 @@ function agentFields() {
   }
   function updateModels() {
     const choices = workspaceData.agent_choices?.[agent.value];
-    account.replaceChildren(el("option", "Default"));
+    const label = (id, text) => text + quotaLeft(usage?.account(usageId("claude", id)));
+    account.replaceChildren(el("option", label("", "Default")));
     account.firstChild.value = "";
     for (const choice of choices?.accounts ?? []) {
       if (choice.id === "default") continue;
-      const option = el("option", choice.label);
+      const option = el("option", label(choice.id, choice.label));
       option.value = choice.id;
       account.append(option);
     }
     account.disabled = agent.value !== "claude";
+    // Each agent starts on its login with the most quota left.
+    const best = agent.value === "claude" && usage?.best("claude");
+    if (best && [...account.options].some((option) => option.value === (best.account ?? "")))
+      account.value = best.account ?? "";
     syncSelect(account);
     options(model, choices?.models.map((choice) => choice.id) ?? []);
     effort.value = "";
@@ -2199,16 +2212,61 @@ function agentFields() {
         choices?.note ??
         "Default keeps your settings. Codex model choices need its local model cache.";
   }
-  agent.onchange = updateModels;
-  model.onchange = updateEfforts;
-  effort.onchange = updateEfforts;
-  updateModels();
+  function describeUsage() {
+    for (const option of agent.options)
+      option.textContent =
+        (option.value === "codex" ? "Codex" : "Claude") + quotaLeft(usage?.best(option.value));
+    const best = usage?.best();
+    const current = usage?.account(usageId(agent.value, account.value));
+    usageNote.textContent = !best
+      ? ""
+      : `${best.label} has the most quota left (${Math.round(best.left_percent)}%)` +
+        (current?.id === best.id || current?.left_percent == null
+          ? "."
+          : `; ${current.label} has ${Math.round(current.left_percent)}%.`);
+  }
+  // Open on the login with the most quota left. A later reading only fills in a
+  // default when none was known at opening, and never replaces a person's choice.
+  let personChose = false,
+    settled = false;
+  function applyUsage() {
+    if (!personChose && !settled) {
+      const best = usage?.best();
+      if (best) agent.value = best.agent;
+      settled = Boolean(best);
+      updateModels();
+    }
+    describeUsage();
+  }
+  function onUsage() {
+    if (!agent.isConnected) window.removeEventListener("usage-updated", onUsage);
+    else applyUsage();
+  }
+  agent.onchange = () => {
+    personChose = true;
+    updateModels();
+    describeUsage();
+  };
+  account.onchange = () => {
+    personChose = true;
+    describeUsage();
+  };
+  model.onchange = () => {
+    personChose = true;
+    updateEfforts();
+  };
+  effort.onchange = () => {
+    personChose = true;
+    updateEfforts();
+  };
+  applyUsage();
+  window.addEventListener("usage-updated", onUsage);
   const docker = el("input");
   docker.id = "workspace-docker";
   docker.type = "checkbox";
   const dockerLabel = el("label", undefined, "workspace-later");
   dockerLabel.append(docker, " Allow Docker in the agent’s sandbox");
-  return { agent, model, effort, account, settingsNote, docker, dockerLabel };
+  return { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel };
 }
 // A Start later checkbox and the time it reveals. `startTime()` is null to start now,
 // the chosen time in seconds, or undefined after reporting an invalid time.
@@ -2331,7 +2389,8 @@ async function workspaceDialog(item, handling = "") {
         clone.value = "";
       }
       clone.required = true;
-      const { agent, model, effort, account, settingsNote, docker, dockerLabel } = agentFields();
+      const { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel } =
+        agentFields();
       const task = el("textarea");
       task.id = "workspace-task";
       task.required = true;
@@ -2359,7 +2418,7 @@ async function workspaceDialog(item, handling = "") {
       field("Model (optional)", model);
       field("Reasoning effort (optional)", effort);
       field("Claude account", account);
-      form.append(settingsNote, dockerLabel);
+      form.append(usageNote, settingsNote, dockerLabel);
       field("Task", task);
       form.append(promptHistory(task));
       const files = attachmentField(form, task);
@@ -2563,12 +2622,13 @@ async function newTaskDialog() {
       title.required = fileIssue.checked;
       name.required = !fileIssue.checked;
     };
-    const { agent, model, effort, account, settingsNote, docker, dockerLabel } = agentFields();
+    const { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel } =
+      agentFields();
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    form.append(settingsNote, dockerLabel);
+    form.append(usageNote, settingsNote, dockerLabel);
     const task = el("textarea");
     task.id = "workspace-task";
     task.required = true;
@@ -2673,12 +2733,13 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
       label.htmlFor = input.id;
       form.append(label, input);
     }
-    const { agent, model, effort, account, settingsNote, docker, dockerLabel } = agentFields();
+    const { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel } =
+      agentFields();
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    form.append(settingsNote, dockerLabel);
+    form.append(usageNote, settingsNote, dockerLabel);
     let template = handleTasks[tasks[0]][1](BATCH_URL);
     if (tasks.length > 1) {
       const picker = el("select");
