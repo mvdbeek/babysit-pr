@@ -1582,15 +1582,12 @@
       }
     }
     const data = viewer?.data;
-    if (
-      viewer?.mode === "transcript" &&
-      data?.session &&
-      !viewerInflight &&
-      !document.hidden &&
-      data.start + data.entries.length >= data.total
-    ) {
+    if (viewer?.mode !== "transcript" || !data || viewerInflight || document.hidden) return;
+    // An agent waiting on a startup prompt (trusting the folder, allowing imports) has
+    // no transcript yet: look again until its first turn records one.
+    if (!data.session) void loadViewer();
+    else if (data.start + data.entries.length >= data.total)
       void loadViewer({ after: Math.max(data.start, data.total - 20) });
-    }
   }, 10000);
   // Diff and Transcript buttons for a target: {workspace} (a herdr workspace ID) and/or
   // {key} (a Workspaces-tab row), plus a name for the dialog title and the links it shows.
