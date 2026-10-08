@@ -49,13 +49,15 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
             page([pr("two", ci=None, author=None)]),
             page([pr(updated="2026-09-11T13:00:00Z", ci="FAILURE")]),
             page([pr(updated="2026-09-11T11:00:00Z"), pr("three", ci="PENDING")]),
+            page([pr(updated="2026-09-11T10:00:00Z")]),
         ]
     )
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect()
     assert len(result["prs"]) == 3
     first = result["prs"][0]
-    assert first["roles"] == ["author", "assignee", "reviewer"]
+    assert first["roles"] == ["author", "assignee", "reviewer", "mentioned"]
+    assert result["roles"] == ["author", "assignee", "reviewer", "mentioned"]
     assert first["ci"] == "FAILURE"
     assert (first["head_repo"], first["head_branch"], first["head_sha"]) == (
         "fork/repo",
@@ -67,8 +69,46 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
     assert result["prs"][1]["ci"] == "NONE"
     assert result["prs"][1]["author"] is None
     assert fetch.call_args_list[1].args[1] == "next"
-    assert "review-involves:@me" in fetch.call_args_list[-1].args[0]
+    assert "review-involves:@me" in fetch.call_args_list[-2].args[0]
+    assert fetch.call_args_list[-1].args[0] == "is:pr is:open mentions:@me sort:updated-desc"
     assert result["login"] == "alice" and not result["warnings"]
+
+
+def test_mentions_can_be_left_out(monkeypatch):
+    fetch = Mock(return_value=page([pr()]))
+    monkeypatch.setattr(overview, "github_page", fetch)
+    result = overview.collect(mentions=False)
+    assert result["roles"] == result["prs"][0]["roles"] == ["author", "assignee", "reviewer"]
+    assert not any("mentions:" in call.args[0] for call in fetch.call_args_list)
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [(None, True), ("{}", True), ('{"mentions": true}', True), ('{"mentions": false}', False)],
+)
+def test_mentions_setting_defaults_on(tmp_path, content, expected):
+    if content is not None:
+        (tmp_path / "overview-config.json").write_text(content)
+    assert overview.include_mentions(tmp_path) is expected
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"mentions": "no"}'])
+def test_invalid_mentions_setting_is_a_visible_sync_error(tmp_path, monkeypatch, content):
+    (tmp_path / "overview-config.json").write_text(content)
+    fetch = Mock()
+    monkeypatch.setattr(overview, "collect", fetch)
+    cache = overview.Overview(tmp_path)
+    cache.refresh()
+    assert "overview-config.json" in cache.value["error"]
+    assert not fetch.called
+
+
+def test_overview_passes_the_mentions_setting(tmp_path, monkeypatch):
+    (tmp_path / "overview-config.json").write_text('{"mentions": false}')
+    fetch = Mock(return_value={"prs": [], "login": "alice", "warnings": []})
+    monkeypatch.setattr(overview, "collect", fetch)
+    overview.Overview(tmp_path).refresh()
+    fetch.assert_called_once_with(mentions=False)
 
 
 def test_counts_unresolved_review_threads_including_outdated(monkeypatch):
@@ -82,17 +122,19 @@ def test_counts_unresolved_review_threads_including_outdated(monkeypatch):
     assert "reviewThreads(last: 100) { nodes { isResolved } }" in overview.PR_FRAGMENT
 
 
-def test_empty_search(monkeypatch):
+def test_empty_search_still_lists_the_searched_roles(monkeypatch):
     monkeypatch.setattr(overview, "github_page", lambda *args: page([]))
-    assert overview.collect()["prs"] == []
+    result = overview.collect()
+    assert result["prs"] == []
+    assert result["roles"] == ["author", "assignee", "reviewer", "mentioned"]
 
 
 def test_search_limit_is_visible(monkeypatch):
-    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(20)] + [page(), page()])
+    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(20)] + [page()] * 3)
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect()
     assert result["warnings"] == ["Only the most recently updated 1,000 author PRs are shown."]
-    assert fetch.call_count == 22
+    assert fetch.call_count == 23
 
 
 @pytest.mark.parametrize(
@@ -129,7 +171,7 @@ def test_cache_serves_stale_data_without_duplicate_workers_and_persists(tmp_path
     entered, finish = threading.Event(), threading.Event()
     result = {"prs": [{"id": "one"}], "login": "alice", "warnings": []}
 
-    def collect():
+    def collect(**_):
         entered.set()
         assert finish.wait(5)
         return result
@@ -179,7 +221,9 @@ def test_corrupt_cache_and_write_failure_are_recoverable(tmp_path, monkeypatch):
     (tmp_path / "pr-overview.json").write_text("not json")
     cache = overview.Overview(tmp_path)
     assert cache.value["prs"] == []
-    monkeypatch.setattr(overview, "collect", lambda: {"prs": [], "login": "alice", "warnings": []})
+    monkeypatch.setattr(
+        overview, "collect", lambda **_: {"prs": [], "login": "alice", "warnings": []}
+    )
     monkeypatch.setattr(overview.os, "open", Mock(side_effect=OSError("read only")))
     cache.refresh()
     assert "read only" in cache.value["error"]

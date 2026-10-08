@@ -87,6 +87,20 @@ def test_collects_every_role_merges_duplicates_and_maps_linked_prs(monkeypatch):
     assert result["login"] == "alice" and not result["warnings"]
 
 
+def test_issue_mentions_follow_the_shared_setting(tmp_path, monkeypatch):
+    (tmp_path / "overview-config.json").write_text('{"mentions": false}')
+    fetch = Mock(return_value=page([issue()]))
+    monkeypatch.setattr(pr_overview, "github_page", fetch)
+    issue_overview.Overview(tmp_path).refresh()
+    queries = [call.args[0] for call in fetch.call_args_list]
+    assert len(queries) == 3 and not any("mentions:" in query for query in queries)
+    assert issue_overview.Overview(tmp_path).value["roles"] == [
+        "author",
+        "assignee",
+        "participant",
+    ]
+
+
 def test_search_limit_names_issues(monkeypatch):
     fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(20)] + [page()] * 3)
     monkeypatch.setattr(pr_overview, "github_page", fetch)

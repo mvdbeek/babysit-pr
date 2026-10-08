@@ -820,6 +820,34 @@ def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboar
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
+def test_role_filter_offers_only_searched_roles(page: Page, dashboard_site) -> None:
+    url, _ = dashboard_site
+    searched = {"roles": ["author", "assignee", "reviewer", "mentioned"], "mentioned": True}
+
+    def snapshot(route):
+        data = route.fetch().json()
+        data["roles"] = searched["roles"]
+        if searched["mentioned"]:
+            data["prs"][1]["roles"].append("mentioned")
+        route.fulfill(json=data)
+
+    page.route("**/api/prs", snapshot)
+    page.goto(url + "/#prs")
+    rows = page.locator("#pr-list tr")
+    expect(rows).to_have_count(2)
+    role = page.get_by_role("combobox", name="Filter pull requests by role", exact=True)
+    choose_option(role, "mentioned")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Mentioned")
+    searched.update(roles=["author", "assignee", "reviewer"], mentioned=False)
+    page.evaluate("() => prTable.refresh()")
+    expect(rows).to_have_count(2)
+    expect(role).to_have_value("All roles")
+    role.fill("Mentioned")
+    wrapper = role.locator("xpath=../..")
+    expect(wrapper.get_by_role("status")).to_have_text("No matches")
+
+
 def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site) -> None:
     url, _ = dashboard_site
     page.route(
