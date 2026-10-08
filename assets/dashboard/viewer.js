@@ -8,12 +8,18 @@
   let viewerRequest = 0;
   let viewerInflight = 0;
   let opener = null;
+  // The open workspace in Collie, once its agents are read; text that sends the
+  // reader to Collie links there.
+  let collieUrl = null;
 
   function node(tag, text, className) {
     const element = document.createElement(tag);
     if (text !== undefined) element.textContent = text;
     if (className) element.className = className;
     return element;
+  }
+  function tell(element, text) {
+    element.replaceChildren(window.collieText(text, collieUrl));
   }
   function badge(text, tone) {
     return node("span", text, `badge ${tone || ""}`.trim());
@@ -287,7 +293,7 @@
   // The issue, pull request or Sentry issue the checkout serves, as {label, url, title}.
   function renderLinks(links) {
     byId("ws-viewer-links").replaceChildren(
-      ...(links || [])
+      ...[...(links || []), ...(collieUrl ? [{ label: "Open in Collie", url: collieUrl }] : [])]
         .filter((link) => /^https?:\/\//.test(link?.url || ""))
         .map((link) => {
           const anchor = external(link.label, link.url);
@@ -298,6 +304,7 @@
   }
   function openViewer(entry, mode) {
     viewer = { entry, mode, scope: "branch", base: null, session: null, data: null, nodes: [] };
+    collieUrl = null;
     byId("ws-viewer-title").textContent = entry.name || "Workspace";
     renderLinks(entry.links);
     resetViewer("Loading…");
@@ -850,7 +857,7 @@
       });
       if (viewer?.entry !== current) return;
       if (value.error) {
-        status.textContent = value.error;
+        tell(status, value.error);
         submit.disabled = false;
         return;
       }
@@ -1027,6 +1034,10 @@
         byId("ws-message-status").textContent = "A saved draft for another checkout was discarded.";
       }
       draft.path = value.path;
+      if (value.url !== collieUrl) {
+        collieUrl = value.url || null;
+        renderLinks(entry.links);
+      }
       agents = value.agents;
       sessions = value.sessions;
       renderAgents();
@@ -1061,7 +1072,9 @@
     if (message) {
       interaction.replaceChildren();
       delete interaction.dataset.state;
-      holder.append(node("small", message, "pr-meta"));
+      const note = node("small", undefined, "pr-meta");
+      tell(note, message);
+      holder.append(note);
       return;
     }
     if (agents.length) {
@@ -1128,9 +1141,9 @@
     } else {
       if (agent.interaction?.screen)
         holder.append(node("pre", agent.interaction.screen, "ws-agent-screen"));
-      holder.append(
-        node("p", "Answer this dialog in Collie, then refresh to send your message.", "pr-meta"),
-      );
+      const note = node("p", undefined, "pr-meta");
+      tell(note, "Answer this dialog in Collie, then refresh to send your message.");
+      holder.append(note);
     }
   }
   function selectedAgent() {
@@ -1237,7 +1250,7 @@
       renderLive(); // Another viewer's Stop buttons were waiting on this one.
       return;
     }
-    status.textContent = message;
+    tell(status, message);
     await fetchAgents(entry);
     // The transcript records where the turn was cut off.
     const data = viewer?.entry === entry && viewer.mode === "transcript" ? viewer.data : null;
@@ -1256,11 +1269,14 @@
         : agent.docker === true;
     checkbox.indeterminate = !known;
     checkbox.disabled = changingDocker || sending || !known || !agent.session;
-    byId("ws-docker-status").textContent = changingDocker
-      ? "Applying Docker access…"
-      : !known
-        ? agent.docker_error || "Docker access is unknown."
-        : "Changes require an idle agent and restart its session.";
+    tell(
+      byId("ws-docker-status"),
+      changingDocker
+        ? "Applying Docker access…"
+        : !known
+          ? agent.docker_error || "Docker access is unknown."
+          : "Changes require an idle agent and restart its session.",
+    );
   }
   byId("ws-docker-enabled").onchange = async (event) => {
     const agent = selectedAgent();
@@ -1283,16 +1299,14 @@
       });
       const value = await response.json();
       if (viewer?.entry !== entry) return;
-      if (value.error) status.textContent = value.error;
+      if (value.error) tell(status, value.error);
       else {
         agent.docker = value.docker;
-        status.textContent =
-          value.warning || `Docker access ${value.docker ? "enabled" : "disabled"}.`;
+        tell(status, value.warning || `Docker access ${value.docker ? "enabled" : "disabled"}.`);
       }
     } catch {
       if (viewer?.entry === entry)
-        status.textContent =
-          "Docker access change could not be confirmed; refresh or check Collie.";
+        tell(status, "Docker access change could not be confirmed; refresh or check Collie.");
     } finally {
       changingDocker = false;
       if (viewer?.entry.workspace) await fetchAgents(viewer.entry);
@@ -1461,16 +1475,18 @@
     try {
       const value = await deliver(body);
       if (value.error) {
-        if (viewer?.entry === entry) status.textContent = value.error;
+        if (viewer?.entry === entry) tell(status, value.error);
         return;
       }
       clearSent(entry, comments, message, attachments);
       if (viewer?.entry !== entry) return;
-      status.textContent =
+      tell(
+        status,
         value.warning ||
-        (value.resumed
-          ? `Resumed the session in ${value.pane} and sent the message.`
-          : `Sent to the agent in ${value.pane}.`);
+          (value.resumed
+            ? `Resumed the session in ${value.pane} and sent the message.`
+            : `Sent to the agent in ${value.pane}.`),
+      );
       // The transcript shows the new turn soon after.
       if (viewer.mode === "transcript")
         setTimeout(() => {

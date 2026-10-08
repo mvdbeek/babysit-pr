@@ -759,6 +759,76 @@ def test_workspace_model_effort_argv_defaults_and_idempotency(
     assert restarted.operation(key)["effort"] == op["effort"]
 
 
+def test_saved_effort_defaults_store_set_and_clear(local):
+    import workspace_agents as wa
+
+    home = local[0].home
+    assert wa.effort_defaults(home) == {"effort": None, "repos": {}}
+    wa.save_effort_default(home, {"effort": "high"})
+    saved = wa.save_effort_default(home, {"repo": "Base/Repo", "effort": "low"})
+    assert saved == {"effort": "high", "repos": {"base/repo": "low"}}
+    assert wa.effort_defaults(home) == saved
+    assert wa.save_effort_default(home, {"repo": "base/repo", "effort": ""})["repos"] == {}
+    assert wa.save_effort_default(home, {"effort": ""}) == {"effort": None, "repos": {}}
+    for bad in (
+        {"effort": "extreme"},
+        {"repo": "no-slash", "effort": "low"},
+        {"repo": 7, "effort": "low"},
+        {"effort": "low", "agent": "codex"},
+    ):
+        with pytest.raises(ValueError):
+            wa.save_effort_default(home, bad)
+    # A hand-edited file keeps only what a launch could use.
+    (home / wa.DEFAULTS).write_text(
+        json.dumps({"effort": "turbo", "repos": {"a/b": "max", "bad": "low", "c/d": "x"}})
+    )
+    assert wa.effort_defaults(home) == {"effort": None, "repos": {"a/b": "max"}}
+    (home / wa.DEFAULTS).write_text("[")
+    assert wa.effort_defaults(home) == {"effort": None, "repos": {}}
+
+
+def test_saved_effort_default_follows_project_then_global_and_support(local):
+    import workspace_agents as wa
+
+    home = local[0].home
+    wa.save_effort_default(home, {"effort": "high"})
+    wa.save_effort_default(home, {"repo": "base/repo", "effort": "low"})
+    assert wa.default_effort(home, "BASE/repo", "codex", "fixture-codex") == "low"
+    assert wa.default_effort(home, "other/repo", "codex", "fixture-codex") == "high"
+    # A project default the model lacks falls back to the global one, then to none.
+    wa.save_effort_default(home, {"repo": "base/repo", "effort": "max"})
+    assert wa.default_effort(home, "base/repo", "codex", "fixture-codex") == "high"
+    assert wa.default_effort(home, "base/repo", "claude", "") == "max"
+    assert wa.default_effort(home, "base/repo", "claude", "haiku") == ""
+    wa.save_effort_default(home, {"effort": "minimal"})
+    assert wa.default_effort(home, "other/repo", "claude", "opus") == ""
+
+
+@pytest.mark.parametrize(("requested", "expected"), [("", "low"), ("ultra", "ultra")])
+def test_a_launch_left_on_default_uses_the_saved_effort(local, requested, expected):
+    import workspace_agents as wa
+
+    manager, _, _, state, _ = local
+    wa.save_effort_default(manager.home, {"effort": "high"})
+    wa.save_effort_default(manager.home, {"repo": "base/repo", "effort": "low"})
+    assert manager.snapshot()["effort_defaults"] == wa.effort_defaults(manager.home)
+    manager.action(
+        {
+            "id": "PR_one",
+            "action": "create",
+            "agent": "codex",
+            "model": "fixture-codex",
+            "effort": requested,
+            "task": "Fix",
+        }
+    )
+    op = finish(manager, "PR_one")
+    assert op["status"] == "complete", op["log"]
+    assert op["effort"] == expected
+    argv = json.loads(state.read_text())["agents"][0]["argv"]
+    assert argv[:4] == ["--model", "fixture-codex", "-c", f'model_reasoning_effort="{expected}"']
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -1116,6 +1186,18 @@ def test_prompt_history_http_routes(local):
             # A long task fits the larger body limit workspace actions get.
             assert request("POST", "/api/workspace-prompt-forget", {"text": "x" * 5000})[0] == 200
             assert request("POST", "/api/workspace-prompt-forget", forget) == (200, {"prompts": []})
+            saved = {"effort": "high", "repos": {"base/repo": "low"}}
+            assert request("POST", "/api/effort-default", {"effort": "high"}, action="")[0] == 403
+            assert request(
+                "POST", "/api/effort-default", {"effort": "extreme"}, action="effort-default"
+            ) == (400, {"error": "Select a known reasoning effort"})
+            request("POST", "/api/effort-default", {"effort": "high"}, action="effort-default")
+            assert request(
+                "POST",
+                "/api/effort-default",
+                {"repo": "base/repo", "effort": "low"},
+                action="effort-default",
+            ) == (200, {"effort_defaults": saved})
         finally:
             server.shutdown()
             thread.join()
