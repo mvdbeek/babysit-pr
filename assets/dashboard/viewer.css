@@ -612,6 +612,12 @@
   color: var(--ink);
   font-size: 13px;
 }
+.ws-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
 .ws-question {
   padding: 10px 12px;
   border: 1px solid var(--line);
