@@ -3361,6 +3361,28 @@ def test_any_collie_workspace_offers_its_diff_and_transcript(
     expect(viewer).to_be_visible()
 
 
+def test_a_transcript_opened_before_the_first_turn_appears_once_recorded(
+    page, dashboard_site, workspace_routes
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Fix it"}
+    entry = {"role": "user", "kind": "prompt", "text": "Fix it", "time": None}
+    empty = {"sessions": [], "session": None, "entries": [], "start": 0, "total": 0}
+    recorded = {"sessions": [session], "session": session, "entries": [entry], "start": 0}
+    state = {"data": empty}
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=state["data"]))
+    page.clock.install()
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.get_by_text("No Claude or Codex session")).to_be_visible()
+    # The agent clears its startup prompts and its first turn is written.
+    state["data"] = {**recorded, "total": 1}
+    page.clock.run_for(11000)
+    expect(viewer.locator(".ws-msg-text")).to_have_text("Fix it")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("Claude session s1")
+
+
 COMMENT_DIFF = {
     "scope": "branch",
     "note": None,
