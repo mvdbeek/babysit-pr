@@ -1339,11 +1339,21 @@ function itemTable(spec) {
           ? spec.text.unavailable
           : spec.text.loading;
   }
+  function searchedRoles(roles) {
+    // A role the server no longer searches (mentions can be turned off) would match nothing.
+    if (!Array.isArray(roles)) return;
+    const select = id("role");
+    for (const option of select.options)
+      option.disabled = option.hidden = option.value !== "all" && !roles.includes(option.value);
+    if (select.selectedOptions[0]?.disabled) select.value = "all";
+    syncSelect(select);
+  }
   async function refresh() {
     if (table.busy) return;
     table.busy = true;
     try {
       table.data = await get(spec.endpoint);
+      searchedRoles(table.data.roles);
       window.dashboardNotifications?.overview(spec.key, table.data, spec.changeFields, changeValue);
       render();
       revealNotification(spec.key);

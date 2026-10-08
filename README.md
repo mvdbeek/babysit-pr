@@ -115,10 +115,18 @@ they reappear. If browser storage is unavailable, pins work for the current tab
 and a notice explains that they cannot persist. Pin controls support Enter and
 Space, retain keyboard focus when rows move, and have touch-sized targets on mobile.
 
-The dashboard also discovers open GitHub PRs you authored, are assigned to, or are
-involved in reviewing (including team requests and completed reviews). It uses the
+The dashboard also discovers open GitHub PRs you authored, are assigned to, are
+involved in reviewing (including team requests and completed reviews), or are
+@mentioned in (**Mentioned**: the description or a comment names you). It uses the
 active `gh` account on github.com. No registration is needed. These PRs are a
 read-only discovery results. Workspace actions require an explicit click and never register repair watches.
+
+Mention searches are on by default for both PRs and issues. To turn them off, write
+`{"mentions": false}` to `overview-config.json` in the watcher state directory
+(`~/.local/state/babysit-pr` by default). The file is reread on every refresh, so
+no restart is needed; the next refresh drops the **Mentioned** role and its filter
+option. A malformed file is shown as the overview's sync error, keeping the last
+snapshot.
 
 Search by repository, title, number, or author. The labeled filter row combines
 repository, CI state, review status (Draft or Ready for review), and your role.
@@ -192,7 +200,8 @@ PR is already in your PR overview, its CI badge appears next to the link and ope
 the same CI details dialog; otherwise no CI is shown and nothing extra is fetched.
 Issues have no CI columns of their own.
 
-Discovery runs four searches (`author`, `assignee`, `mentions`, `commenter`) and
+Discovery runs four searches (`author`, `assignee`, `mentions`, `commenter`; the
+`mentions` search follows the same `overview-config.json` setting as PRs) and
 merges duplicates with all matching roles, with the same 1,000-result cap notice as
 PRs. It shares the five-minute refresh cadence and the GitHub request machinery with
 the PR overview (`scripts/pr_overview.py`; the issue definition is

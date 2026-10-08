@@ -18,7 +18,13 @@ import github_cli
 from latest_activity import activity_fragment, latest_activity, notification_activity
 
 POLL_SECONDS = 300
-ROLES = {"author": "author", "assignee": "assignee", "reviewer": "review-involves"}
+ROLES = {
+    "author": "author",
+    "assignee": "assignee",
+    "reviewer": "review-involves",
+    "mentioned": "mentions",
+}
+SETTINGS = "overview-config.json"
 PR_FRAGMENT = (
     """... on PullRequest {
       id number title url createdAt updatedAt state isDraft reviewDecision
@@ -112,11 +118,29 @@ def github_page(query, cursor=None, fragment=PR_FRAGMENT):
     return response["data"]
 
 
-def collect(kind: Kind = PRS):
+def include_mentions(home: Path):
+    """Whether discovery searches @mentions: on unless the settings file turns it off."""
+    path = home / SETTINGS
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read {path}: {exc}") from exc
+    value = raw.get("mentions", True) if isinstance(raw, dict) else None
+    if not isinstance(value, bool):
+        raise ValueError(f'{path} must be a JSON object with "mentions": true or false')
+    return value
+
+
+def collect(kind: Kind = PRS, mentions=True):
     items: dict[str, dict] = {}
     warnings = []
     login = None
-    for role, qualifier in kind.roles.items():
+    searched = {
+        role: qualifier for role, qualifier in kind.roles.items() if mentions or role != "mentioned"
+    }
+    for role, qualifier in searched.items():
         cursor = None
         for _ in range(20):  # GitHub search exposes at most 1,000 results per query.
             data = github_page(
@@ -151,6 +175,7 @@ def collect(kind: Kind = PRS):
     return {
         "login": login,
         kind.key: sorted(items.values(), key=lambda item: item["updated_at"], reverse=True),
+        "roles": list(searched),
         "warnings": warnings,
     }
 
@@ -161,6 +186,7 @@ class Overview:
     kind: Kind = PRS
 
     def __init__(self, home: Path):
+        self.home = home
         self.path = home / self.kind.cache
         self.lock = threading.Lock()
         self.worker: threading.Thread | None = None
@@ -181,7 +207,7 @@ class Overview:
 
     def fetch(self):
         # The module-level collector is looked up at call time so tests can replace it.
-        return collect()
+        return collect(mentions=include_mentions(self.home))
 
     def snapshot(self):
         with self.lock:

@@ -86,8 +86,8 @@ ISSUES = pr_overview.Kind(
 )
 
 
-def collect():
-    return pr_overview.collect(ISSUES)
+def collect(mentions=True):
+    return pr_overview.collect(ISSUES, mentions)
 
 
 def branch_number(branch):
@@ -100,4 +100,4 @@ class Overview(pr_overview.Overview):
     kind = ISSUES
 
     def fetch(self):
-        return collect()
+        return collect(mentions=pr_overview.include_mentions(self.home))

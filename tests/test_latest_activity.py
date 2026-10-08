@@ -163,7 +163,7 @@ def test_missing_actor_and_empty_or_missing_timeline():
     assert latest_activity(issue(timelineItems={"nodes": []}, createdAt=None)) is None
 
 
-@pytest.mark.parametrize("module,factory,calls", [(pr_overview, pr, 3), (issue_overview, issue, 4)])
+@pytest.mark.parametrize("module,factory,calls", [(pr_overview, pr, 4), (issue_overview, issue, 4)])
 def test_collect_includes_activity_in_existing_requests(monkeypatch, module, factory, calls):
     node = factory(timelineItems={"nodes": [comment()]})
     run = Mock(return_value=Mock(returncode=0, stdout=json.dumps({"data": page([node])})))
@@ -183,7 +183,7 @@ def test_collect_includes_activity_in_existing_requests(monkeypatch, module, fac
 def test_activity_survives_cache_reload(tmp_path, monkeypatch):
     node = pr(timelineItems={"nodes": [comment()]})
     record = pr_overview.pr_record(node, ["author"])
-    monkeypatch.setattr(pr_overview, "collect", lambda: {"prs": [record], "login": "alice"})
+    monkeypatch.setattr(pr_overview, "collect", lambda **_: {"prs": [record], "login": "alice"})
     pr_overview.Overview(tmp_path).refresh()
     assert (
         pr_overview.Overview(tmp_path).value["prs"][0]["latest_activity"]
