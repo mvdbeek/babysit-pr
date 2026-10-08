@@ -139,10 +139,21 @@ FAKES = {"gh": GH, "herdr": HERDR, "tmux": TMUX, "cmux": CMUX, "codex": AGENT, "
 
 
 def install_fakes(bin_dir: Path) -> None:
+    # -S: the fakes need only the stdlib, and skipping site keeps coverage's subprocess
+    # hook from starting (and slowing) every fake call; scripts they launch still measure.
     for name, body in FAKES.items():
         path = bin_dir / name
-        path.write_text(f"#!{sys.executable}\n" + body)
+        path.write_text(f"#!{sys.executable} -S\n" + body)
         path.chmod(0o700)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def delete_output_dir():
+    """Overrides pytest-playwright's per-session wipe of the screenshot directory.
+
+    Under xdist every worker is a session, so a late-starting worker would delete
+    an earlier one's failure screenshots; tox clears the directory once instead.
+    """
 
 
 @pytest.fixture(autouse=True)
