@@ -676,8 +676,9 @@ No separate manual dependency installation is needed beyond uv, Node/npm, Git,
 and zsh. The first run requires downloads; subsequent runs reuse tool caches.
 
 The default environments are `lint`, `format`, `types`, `skill`, `frontend`,
-`unit`, `browser`, and `coverage`. The coverage report depends on both test
-environments. To run independent environments concurrently:
+`unit`, and `browser`; both test environments spread tests over all CPU cores
+with pytest-xdist (pass `-- -n 0` to run serially). To run independent
+environments concurrently:
 
 ```sh
 uv run --locked tox run-parallel
@@ -687,7 +688,7 @@ Tox runs Ruff lint/format checks, mypy across the Python runtime and development
 scripts, ESLint, Prettier, zsh syntax checking, the repository-local skill
 validator, the Node interaction test, and pytest including real Chromium tests.
 Mypy checks unannotated function bodies; this is gradual typing, not strict typing
-of every JSON payload. No automated CI workflow is configured.
+of every JSON payload. GitHub Actions runs the default environments on pushes to `main` and on pull requests.
 
 Apply formatting and safe lint fixes through the separate opt-in environment:
 
@@ -700,7 +701,7 @@ For a targeted rerun, select a tox environment, for example
 
 Browser tests use a real Chromium process and a real HTTP server backed by a temporary SQLite queue. They cover comment text rendering, explicit feedback approval, stale approval rejection, cancellation/history, cleanup indicators, and mobile layout. They never start the production watcher or a coding agent. Other integration tests use fake GitHub/agent executables and temporary worktrees, and exercise timeouts, process ownership, and restart recovery.
 
-Coverage includes Python branches and instrumented child Python processes. The `coverage` tox environment writes a terminal summary, HTML at `reports/coverage/index.html`, and XML at `reports/coverage.xml`. The combined Python line/branch coverage gate is 75%. Reports and browser failure artifacts are ignored by Git. JavaScript behavior is exercised by browser and Node tests; the coverage percentage measures Python only.
+Coverage is opt-in and not part of the default run or CI: `uv run --locked tox -e coverage` runs every test under coverage, including Python branches and instrumented child Python processes. It writes a terminal summary, HTML at `reports/coverage/index.html`, and XML at `reports/coverage.xml`. The combined Python line/branch coverage gate is 75%. Reports and browser failure artifacts are ignored by Git. JavaScript behavior is exercised by browser and Node tests; the coverage percentage measures Python only.
 
 The Safehouse launcher matches this user's installed configuration. Tests check its command construction, but do not require Safehouse or claim to test macOS sandbox enforcement on every machine.
 

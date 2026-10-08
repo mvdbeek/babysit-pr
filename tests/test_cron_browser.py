@@ -1,6 +1,7 @@
 """Cron jobs tab in real Chromium against a temporary dashboard and state directory."""
 
 import json
+import shlex
 import threading
 import time
 
@@ -127,13 +128,15 @@ def test_define_run_edit_pause_and_delete_a_job(page, site, errors, tmp_path):
     assert jobs.snapshot()["jobs"] == []
 
 
-def test_a_running_job_streams_output_and_can_be_stopped(page, site, errors, monkeypatch):
+def test_a_running_job_streams_output_and_can_be_stopped(page, site, errors, monkeypatch, tmp_path):
     url, jobs = site
     monkeypatch.setattr(cron_jobs, "STOP_GRACE", 0.2)
+    # The job holds "second" back until the page has shown "first", however slow polling is.
+    release = tmp_path / "release"
     saved = jobs.save(
         {
             "name": "Long",
-            "command": "echo first; sleep 2; echo second; sleep 30",
+            "command": f"echo first; until [ -e {shlex.quote(str(release))} ]; do sleep 0.1; done; echo second; sleep 30",
             "schedule": {"every": 3600},
         }
     )
@@ -144,6 +147,7 @@ def test_a_running_job_streams_output_and_can_be_stopped(page, site, errors, mon
     expect(page.locator(".cron-job .badge")).to_have_text("Running")
     log = detail.locator(".cron-log")
     expect(log).to_have_text("first\n")
+    release.touch()
     expect(log).to_have_text("first\nsecond\n", timeout=10000)
     expect(detail.get_by_role("button", name="Delete")).to_be_disabled()
     detail.get_by_role("button", name="Stop").click()
