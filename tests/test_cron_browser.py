@@ -4,6 +4,7 @@ import json
 import threading
 import time
 
+import claude_accounts
 import cron_agents
 import cron_jobs
 import dashboard
@@ -315,3 +316,59 @@ def test_define_and_follow_an_agent_job(page, agent_site, errors, width, monkeyp
     expect(dialog).to_be_hidden()
     expect(detail.locator(".cron-command")).to_have_text("echo switched")
     assert "prompt" not in jobs.snapshot()["jobs"][0]
+
+
+def test_a_job_saved_on_a_hidden_default_login_opens_on_the_same_login(
+    page, agent_site, errors, monkeypatch
+):
+    url, jobs, _, _ = agent_site
+    # Default is hidden because psu is the same login; work has the most quota left.
+    monkeypatch.setattr(
+        claude_accounts,
+        "choices",
+        lambda: [
+            {"id": "psu", "label": "psu", "config_dir": "/fixture/psu", "default": True},
+            {"id": "work", "label": "work", "config_dir": "/fixture/work"},
+        ],
+    )
+    page.route(
+        "**/api/llm-usage*",
+        lambda route: route.fulfill(
+            json={
+                "accounts": [
+                    {
+                        "id": "claude:work",
+                        "agent": "claude",
+                        "account": "work",
+                        "label": "Claude · work",
+                        "windows": [],
+                        "left_percent": 90,
+                        "error": None,
+                        "checked_at": 1,
+                    }
+                ],
+                "best": "claude:work",
+                "attempted_at": 1,
+                "reader": "running",
+            }
+        ),
+    )
+    page.goto(url + "/#cron")
+    page.get_by_role("button", name="New job").click()
+    dialog = page.locator("#cron-dialog")
+    dialog.get_by_label("Name").fill("Nightly triage")
+    dialog.get_by_label("Branch", exact=True).fill("nightly")
+    dialog.get_by_label("Agent", exact=True).select_option("codex")
+    dialog.get_by_label("Prompt").fill("Triage new issues")
+    dialog.get_by_role("button", name="Save job").click()
+    expect(dialog).to_be_hidden()
+    with jobs.db() as db:
+        [job] = jobs.snapshot()["jobs"]
+        job = jobs.job(db, job["id"])
+        job.update(agent="claude", claude_account="")
+        db.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(job), job["id"]))
+    page.reload()
+    page.get_by_role("button", name="Edit").click()
+    account = dialog.locator("#cron-claude-account")
+    expect(account.locator("option")).to_have_text(["psu", "work · 90% left"])
+    expect(account).to_have_value("psu")

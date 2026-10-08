@@ -560,12 +560,16 @@
     // A saved setting the current choices lack (an uncached model, a removed account)
     // stays selected, so editing something else does not quietly drop it.
     const keep = (select, value) => {
+      // A job saved on a hidden default login opens on the named login that is the same one.
+      if (!value && ![...select.options].some((option) => option.value === ""))
+        value = [...select.options].find((option) => "default" in option.dataset)?.value;
       if (value && ![...select.options].some((option) => option.value === value)) {
         const option = node("option", `${value} (not listed)`);
         option.value = value;
         select.append(option);
       }
-      select.value = value || "";
+      if (value || [...select.options].some((option) => option.value === ""))
+        select.value = value || "";
     };
     if (job?.agent) {
       agent.value = job.agent;

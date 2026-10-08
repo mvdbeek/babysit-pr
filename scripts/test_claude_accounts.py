@@ -42,6 +42,35 @@ def save_session(home, cwd, sid):
     return path
 
 
+def test_default_login_is_hidden_when_a_named_login_is_the_same_one(stores, tmp_path):
+    default, work = stores
+    other = accounts.account_home("other", create=True)
+
+    def sign_in(path, account, org="org"):
+        path.write_text(
+            json.dumps({"oauthAccount": {"accountUuid": account, "organizationUuid": org}})
+        )
+
+    # Without a readable login, every account is offered.
+    assert [a["id"] for a in accounts.choices()] == ["default", "other", "work"]
+    # ~/.claude keeps its login beside the directory, not inside it.
+    sign_in(default / ".claude.json", "same")
+    sign_in(work / ".claude.json", "same")
+    assert [a["id"] for a in accounts.choices()] == ["default", "other", "work"]
+    sign_in(default.parent / ".claude.json", "same")
+    assert [(a["id"], a.get("default")) for a in accounts.choices()] == [
+        ("other", None),
+        ("work", True),
+    ]
+    assert [a["id"] for a in accounts.catalog()] == ["default", "other", "work"]
+    # The same person in another organization is a different login.
+    sign_in(work / ".claude.json", "same", org="elsewhere")
+    sign_in(other / ".claude.json", "someone else")
+    assert [a["id"] for a in accounts.choices()] == ["default", "other", "work"]
+    (default.parent / ".claude.json").write_text("not json")
+    assert [a["id"] for a in accounts.choices()] == ["default", "other", "work"]
+
+
 def test_accounts_discovery_validation_and_existing_custom_store(stores, tmp_path, monkeypatch):
     default, work = stores
     assert [a["id"] for a in accounts.catalog()] == ["default", "work"]

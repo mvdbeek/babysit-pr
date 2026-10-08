@@ -2200,12 +2200,18 @@ function agentFields() {
   function updateModels() {
     const choices = workspaceData.agent_choices?.[agent.value];
     const label = (id, text) => text + quotaLeft(usage?.account(usageId("claude", id)));
-    account.replaceChildren(el("option", label("", "Default")));
-    account.firstChild.value = "";
-    for (const choice of choices?.accounts ?? []) {
-      if (choice.id === "default") continue;
+    const listed = choices?.accounts ?? [];
+    const named = listed.filter((choice) => choice.id !== "default");
+    account.replaceChildren();
+    // The server leaves the default login out when a named login is the same one.
+    if (!named.length || named.length < listed.length) {
+      account.append(el("option", label("", "Default")));
+      account.firstChild.value = "";
+    }
+    for (const choice of named) {
       const option = el("option", label(choice.id, choice.label));
       option.value = choice.id;
+      if (choice.default) option.dataset.default = "";
       account.append(option);
     }
     account.disabled = agent.value !== "claude";

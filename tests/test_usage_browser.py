@@ -182,6 +182,52 @@ def test_new_task_defaults_to_the_login_with_most_quota_left(page, usage, new_ta
     expect(accounts).to_have_value("work")
 
 
+def test_hidden_default_login_leaves_only_named_logins(page, usage, new_task):
+    value, _ = usage
+    url, sent = new_task
+    # The server leaves Default out when a named login is the same one.
+    value["accounts"].pop(1)
+    page.unroute("**/api/workspaces")
+    page.route(
+        "**/api/workspaces",
+        lambda route: route.fulfill(
+            json={
+                "prs": {},
+                "issues": {},
+                "new": {},
+                "error": None,
+                "synced_at": 1234,
+                "agent_choices": {
+                    "codex": {"models": [], "efforts": []},
+                    "claude": {
+                        "accounts": [
+                            {"id": "psu", "label": "psu"},
+                            {"id": "work", "label": "work"},
+                        ],
+                        "models": [],
+                        "efforts": [],
+                    },
+                },
+            }
+        ),
+    )
+    page.goto(url)
+    page.get_by_role("button", name="New task").click()
+    dialog = page.locator("#workspace-dialog")
+    accounts = dialog.get_by_label("Claude account", exact=True)
+    expect(accounts.locator("option")).to_have_text(["psu", "work · 85% left"])
+    expect(accounts).to_have_value("work")
+    accounts.select_option("psu")
+    dialog.get_by_label("New branch").fill("try-parser")
+    dialog.get_by_label("Task", exact=True).fill("Explore")
+    dialog.get_by_role("button", name="Start task").click()
+    for _ in range(50):
+        if sent:
+            break
+        page.wait_for_timeout(100)
+    assert sent[0]["claude_account"] == "psu"
+
+
 def test_no_usage_keeps_the_previous_defaults(page, new_task):
     page.route(
         "**/api/llm-usage*",
