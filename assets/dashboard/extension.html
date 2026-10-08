@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pair browser extension · Babysitter</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/extension.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Browser extension</h1>
+      <p><a href="/">Back to dashboard</a></p>
+      <p>Pair your extension to start tasks and send follow-ups from your browser.</p>
+      <p>Copy its ID from the extension settings. Pairing again replaces its previous token.</p>
+      <form id="pair-form">
+        <label for="extension-id">Extension ID</label>
+        <input id="extension-id" required pattern="[a-p]{32}" maxlength="32" autocomplete="off" />
+        <button type="submit">Create pairing token</button>
+        <button id="revoke" type="button">Revoke access</button>
+      </form>
+      <p id="pair-status" role="status"></p>
+      <div id="token-box" hidden>
+        <label for="token">Copy this token into the extension settings</label>
+        <input id="token" readonly autocomplete="off" />
+        <button id="copy-token" type="button">Copy token</button>
+        <p>Keep this token private. It allows task launches and messages to your agents.</p>
+      </div>
+    </main>
+  </body>
+</html>

@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import agent_messages
 import attachments
+import browser_extension
 import llm_usage
 import workspace_viewer
 from issue_overview import Overview as IssueOverview
@@ -227,6 +228,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.ci_logs = ci_logs
         self.push = push
         self.allowed_hosts = set(allowed_hosts)
+        self.extension = browser_extension.Extension(home)
         super().__init__(("127.0.0.1", port), Handler)
 
 
@@ -242,6 +244,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        origin = self.headers.get("Origin")
+        if origin and self.path == "/api/extension" and self.server.extension.known_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "POST")
+            self.send_header(
+                "Access-Control-Allow-Headers", "Authorization, Content-Type, X-Babysit-Extension"
+            )
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
@@ -253,6 +263,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(code, json.dumps(value).encode(), "application/json; charset=utf-8")
 
     def do_POST(self):
+        if self.path == "/api/extension":
+            self.extension_request()
+            return
         self.close_connection = True
         host = self.headers.get("Host")
         allowed = {
@@ -289,6 +302,7 @@ class Handler(BaseHTTPRequestHandler):
                 "push-read",
                 "push-seen",
                 "notification-silence",
+                "extension-pair",
             }
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
@@ -417,6 +431,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Workspace actions are not enabled")
                 self.send_json(200, self.server.workspaces.new_task(request))
                 return
+            if action == "extension-pair":
+                self.send_json(200, self.server.extension.pair(request))
+                return
             if not isinstance(request.get("id"), str) or not request["id"]:
                 raise ValueError("Supply a watch ID")
             if action == "workspace-action":
@@ -464,6 +481,48 @@ class Handler(BaseHTTPRequestHandler):
         if len(data) != length:
             raise ValueError("The upload was cut short; attach the file again")
         self.send_json(200, attachments.save(self.server.attachments, name, data))
+
+    def extension_host(self):
+        return (
+            self.headers.get("Host")
+            in {
+                f"127.0.0.1:{self.server.server_port}",
+                f"localhost:{self.server.server_port}",
+            }
+            | self.server.allowed_hosts
+        )
+
+    def do_OPTIONS(self):
+        if (
+            self.path == "/api/extension"
+            and self.extension_host()
+            and self.server.extension.known_origin(self.headers.get("Origin"))
+            and self.headers.get("Access-Control-Request-Method") == "POST"
+        ):
+            self.send_body(204, b"", "application/json")
+        else:
+            self.send_json(403, {"error": "Pair this extension from the dashboard first"})
+
+    def extension_request(self):
+        self.close_connection = True
+        client = self.server.extension.authenticate(self.headers) if self.extension_host() else None
+        if not client:
+            self.send_json(403, {"error": "Pair this extension from the dashboard settings"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 200000:
+                raise ValueError("Invalid request size")
+            self.connection.settimeout(10)
+            request = json.loads(self.rfile.read(length))
+            if not isinstance(request, dict):
+                raise ValueError("Expected an object")
+            result = self.server.extension.dispatch(self.server, client, request)
+            self.send_json(400 if "error" in result else 200, result)
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            self.send_json(503, {"error": f"Cannot deliver task: {exc}"})
 
     def do_GET(self):
         port = self.server.server_port
@@ -707,6 +766,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/favicon.png": ("favicon.png", "image/png"),
                     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
                     "/app.js": ("app.js", "text/javascript"),
+                    "/extension.html": ("extension.html", "text/html"),
+                    "/extension.js": ("extension.js", "text/javascript"),
                     "/notifications.js": ("notifications.js", "text/javascript"),
                     "/usage.js": ("usage.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
