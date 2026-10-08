@@ -49,7 +49,7 @@ def read_json(path):
 def accounts():
     """Every login a task can be sent to: Codex, then each Claude configuration."""
     found = [{"id": "codex", "agent": "codex", "account": None, "label": "Codex"}]
-    for entry in claude_accounts.catalog():
+    for entry in claude_accounts.choices():
         found.append(
             {
                 "id": f"claude:{entry['id']}",

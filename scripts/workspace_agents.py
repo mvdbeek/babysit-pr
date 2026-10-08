@@ -155,7 +155,14 @@ def catalog(home=None):
             **({"note": note} if note else {}),
         },
         "claude": {
-            "accounts": [{"id": a["id"], "label": a["label"]} for a in claude_accounts.catalog()],
+            "accounts": [
+                {
+                    "id": a["id"],
+                    "label": a["label"],
+                    **({"default": True} if a.get("default") else {}),
+                }
+                for a in claude_accounts.choices()
+            ],
             "models": [
                 {"id": name, "efforts": CLAUDE_EFFORTS if name != "haiku" else []}
                 for name in ("fable", "opus", "sonnet", "haiku")
