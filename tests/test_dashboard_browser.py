@@ -3455,6 +3455,103 @@ def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
     assert viewer_routes["sent"][0][1]["pane"] == "w1:p1"
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopped(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    codex, claude = viewer_routes["agents"]
+    codex.update(session="s2", status="idle")
+    claude.update(session="s1", status="working")
+    sessions = [
+        {"id": "s1", "agent": "claude", "updated": 2, "size": 1, "title": "Go"},
+        {"id": "s2", "agent": "codex", "updated": 1, "size": 1, "title": "Earlier"},
+    ]
+    asked = []
+
+    def transcript(route):
+        wanted = re.search(r"session=([^&]+)", route.request.url)
+        asked.append(wanted and wanted[1])
+        shown = next((x for x in sessions if wanted and x["id"] == wanted[1]), sessions[0])
+        entry = {"role": "assistant", "text": f"Working on {shown['title']}"}
+        route.fulfill(
+            json={
+                "sessions": sessions,
+                "session": shown,
+                "entries": [entry],
+                "start": 0,
+                "total": 1,
+            }
+        )
+
+    page.route("**/api/workspace-transcript?*", transcript)
+    stops = []
+
+    def stop(route):
+        assert route.request.headers["x-babysit-action"] == "workspace-interrupt"
+        stops.append(route.request.post_data_json)
+        claude["status"] = "idle"
+        route.fulfill(json={"stopped": True, "pane": "w1:p2", "warning": None})
+
+    page.route("**/api/workspace-interrupt", stop)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    live = viewer.get_by_role("region", name="Running agents")
+    rows = live.locator(".ws-live-agent")
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_contain_text("IdleCodexin w1:p1")
+    expect(rows.nth(1)).to_contain_text("WorkingClaudein w1:p2this transcript")
+    # The session choice marks each session an agent is running.
+    options = viewer.get_by_label("Session", exact=True).locator("option")
+    expect(options.nth(0)).to_contain_text("● Working · ")
+    expect(options.nth(1)).to_contain_text("● Idle · ")
+    expect(rows.nth(0).get_by_role("button", name="Stop")).to_have_count(0)
+    page.screenshot(path=f"reports/viewer-running-agents-{width}.png")
+    rows.nth(1).get_by_role("button", name="Stop Claude in w1:p2").click()
+    expect(page.locator("#ws-live-status")).to_have_text("Stopped Claude in w1:p2.")
+    expect(rows.nth(1)).to_contain_text("Idle")
+    expect(live.get_by_role("button", name=re.compile("^Stop"))).to_have_count(0)
+    expect(options.nth(0)).to_contain_text("● Idle · ")
+    assert stops == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
+    assert not viewer_routes["sent"]
+    # Another running session's transcript is one click away.
+    rows.nth(0).get_by_role("button", name="Show its transcript").click()
+    expect(viewer.locator(".ws-msg-text")).to_have_text("Working on Earlier")
+    expect(rows.nth(0)).to_contain_text("this transcript")
+    assert asked[-1] == "s2"
+
+
+def test_a_refused_stop_says_why_and_running_agents_follow_polls(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [viewer_routes["agents"][1]]
+    viewer_routes["agents"][0].update(session="s1", status="working")
+    page.route(
+        "**/api/workspace-interrupt",
+        lambda route: route.fulfill(
+            status=400, json={"error": "The agent is not working on anything right now; refresh"}
+        ),
+    )
+    page.clock.install()
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-live")
+    live.get_by_role("button", name="Stop Claude in w1:p2").click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "The agent is not working on anything right now; refresh"
+    )
+    # The agents are read again while the transcript is open.
+    viewer_routes["agents"] = []
+    page.clock.run_for(11000)
+    expect(live.locator(".ws-live-agent")).to_have_count(0)
+    expect(page.locator("#ws-live-status")).to_be_visible()
+    page.locator("#ws-view-diff").click()
+    expect(live).to_be_hidden()
+
+
 TRANSCRIPT_MARKDOWN = """Both PRs are forwarded; **one** test is <img src=x onerror="window.injected=true"> open.
 
 **New PRs, pushed to upstream:**
@@ -3752,9 +3849,9 @@ def test_questions_render_as_cards_and_a_waiting_one_is_answered_here(
     )
     assert page.evaluate("window.injected") is None
     assert done.locator("form").count() == 0
-    # Codex asks without waiting: an option fills in a reply instead.
-    codex.get_by_role("button", name="Reply Leave it open to: Codex asks: which?").click()
-    expect(page.locator("#ws-message-text")).to_have_value("Codex asks: which?\n→ Leave it open")
+    # A question belonging to a different agent/session cannot become a plain message.
+    expect(codex).to_contain_text("No running agent in this workspace is on this session.")
+    expect(codex.get_by_role("button")).to_have_count(0)
     expect(waiting.locator(".ws-question-head")).to_contain_text("Waiting for an answer")
     submit = waiting.get_by_role("button", name="Answer in w1:p2")
     submit.click()
@@ -3937,6 +4034,76 @@ def test_files_attach_to_a_follow_up_message_and_stay_with_its_draft(
     expect(chips).to_have_count(0)
 
 
+DROP_FILES = """([target, names]) => {
+  const data = new DataTransfer();
+  for (const name of names) data.items.add(new File(["dropped"], name, {type: "image/png"}));
+  const fire = (type) =>
+    target.dispatchEvent(new DragEvent(type, {dataTransfer: data, bubbles: true, cancelable: true}));
+  fire("dragenter");
+  fire("dragover");
+  const highlighted = target.closest(".attachment-drop") !== null;
+  fire("drop");
+  return highlighted;
+}"""
+
+
+def test_files_dropped_onto_a_follow_up_message_attach(page, dashboard_site, viewer_routes):
+    url, home = dashboard_site
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    composer = page.locator("#ws-message")
+    text = page.locator("#ws-message-text")
+    # Anywhere on the composer takes the drop, and shows where it will land meanwhile.
+    for target in (text, composer.get_by_text("Message the agent")):
+        highlighted = target.evaluate(
+            "(target, names) => (" + DROP_FILES + ")([target, names])", ["shot.png"]
+        )
+        assert highlighted
+    chips = composer.locator(".attachment-list li")
+    expect(chips).to_have_count(2)
+    expect(composer).not_to_have_class(re.compile("attachment-drop"))
+    # A drag that stops arriving, as when its hovered child was redrawn, unhighlights.
+    composer.evaluate(
+        """form => {
+          const data = new DataTransfer();
+          data.items.add(new File(["x"], "late.png", {type: "image/png"}));
+          form.dispatchEvent(new DragEvent("dragenter", {dataTransfer: data, bubbles: true}));
+        }"""
+    )
+    expect(composer).to_have_class(re.compile("attachment-drop"))
+    expect(composer).not_to_have_class(re.compile("attachment-drop"))
+    # Dragged text is no attachment; it drops into the field as usual.
+    prevented = text.evaluate(
+        """field => {
+          const data = new DataTransfer();
+          data.setData("text/plain", "words");
+          return ["dragenter", "dragover", "drop"].map(type => !field.dispatchEvent(
+            new DragEvent(type, {dataTransfer: data, bubbles: true, cancelable: true})
+          ));
+        }"""
+    )
+    assert prevented == [False, False, False]
+    expect(composer).not_to_have_class(re.compile("attachment-drop"))
+    # A file dropped beside the composer is kept from opening in place of the dashboard.
+    kept = page.locator("#ws-viewer-meta").evaluate(
+        """meta => {
+          const data = new DataTransfer();
+          data.items.add(new File(["x"], "missed.png", {type: "image/png"}));
+          return !meta.dispatchEvent(
+            new DragEvent("drop", {dataTransfer: data, bubbles: true, cancelable: true})
+          );
+        }"""
+    )
+    assert kept
+    expect(chips).to_have_count(2)
+    composer.get_by_role("button", name="Send to agent").click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
+    ((_, body),) = viewer_routes["sent"]
+    assert len(body["attachments"]) == 2
+    for stored in body["attachments"]:
+        assert (home / "attachments" / stored).read_bytes() == b"dropped"
+
+
 def test_a_launch_dialog_sends_its_attachments_with_the_task(
     page, dashboard_site, issue_workspace_routes
 ):
@@ -3952,12 +4119,18 @@ def test_a_launch_dialog_sends_its_attachments_with_the_task(
         {"name": "crash.png", "mimeType": "image/png", "buffer": b"png"}
     )
     expect(dialog.locator(".attachment-list li")).to_contain_text("crash.png")
+    # Files dropped onto the dialog's form attach too.
+    dialog.get_by_label("Task", exact=True).evaluate(
+        "(target, names) => (" + DROP_FILES + ")([target.form, names])", ["trace.png"]
+    )
+    expect(dialog.locator(".attachment-list li")).to_have_count(2)
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
     page.wait_for_function("() => document.querySelector('#workspace-progress').textContent")
     (body,) = [r for r in requests if r["action"] == "create"]
     assert body["task"] == "Reproduce from the screenshot"
-    (stored,) = body["attachments"]
-    assert (home / "attachments" / stored).read_bytes() == b"png"
+    first, second = body["attachments"]
+    assert (home / "attachments" / first).read_bytes() == b"png"
+    assert (home / "attachments" / second).read_bytes() == b"dropped"
 
 
 @pytest.mark.parametrize("width", [320, 390, 1280])
@@ -4411,3 +4584,82 @@ def test_unknown_docker_access_is_indeterminate_and_disabled(page, dashboard_sit
     expect(checkbox).to_have_js_property("indeterminate", True)
     expect(page.locator("#ws-docker-status")).to_have_text("Policy unavailable")
     expect(page.get_by_role("button", name="Send to agent")).to_be_enabled()
+
+
+@pytest.mark.parametrize("width,freeform", [(1280, False), (390, True)])
+def test_codex_async_question_answers_in_the_transcript(
+    page, dashboard_site, viewer_routes, width, freeform
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "codex", "updated": 1, "size": 1, "title": "Go"}
+    question = {
+        **QUESTION,
+        "question": "Should Docker access be automatic for every message, or an Allow Docker checkbox?",
+        "header": "Docker",
+        "options": [
+            {"label": "Automatic for every message", "description": None},
+            {"label": "Optional checkbox on each message", "description": None},
+        ],
+    }
+    entry = question_entry([question], name="request_user_input_async", output='{"accepted":true}')
+    # Async agents can keep working and add entries before the question blocks them.
+    entries = [entry] + (
+        [{"role": "assistant", "text": "Still working", "time": None}] * 6 if width == 1280 else []
+    )
+    page.clock.install()
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    viewer_routes["agents"][0].update(
+        status="working" if width == 1280 else "blocked", session="s1"
+    )
+    answers = []
+
+    def answer(route):
+        answers.append(route.request.post_data_json)
+        route.fulfill(json={"answered": True, "pane": "w1:p1"})
+
+    page.route("**/api/workspace-answer", answer)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    card = page.locator("#ws-viewer .ws-question")
+    if width == 1280:
+        expect(card).to_contain_text("The agent is not waiting on this question right now.")
+        viewer_routes["agents"][0]["status"] = "blocked"
+        page.clock.fast_forward(10000)
+    expect(card).to_contain_text("Waiting for an answer")
+    if freeform:
+        card.get_by_label("Other answer to: Should Docker").fill(
+            "Allow Docker for this message only"
+        )
+    else:
+        card.get_by_label("Optional checkbox on each message", exact=True).check()
+    card.get_by_role("button", name="Answer in w1:p1").click()
+    expect(card.locator(".ws-answer-status")).to_have_text("Answered in w1:p1.")
+    assert answers == [
+        {
+            "workspace": "w1",
+            "pane": "w1:p1",
+            "session": "s1",
+            "tool": "toolu_q",
+            "answers": [
+                {"text": "Allow Docker for this message only"} if freeform else {"options": [1]}
+            ],
+        }
+    ]
+    expect(card.locator(".ws-question-head")).to_contain_text("Answered")
+    expect(card.locator(".ws-question-head")).not_to_contain_text("Waiting")
+    assert viewer_routes["sent"] == []
+    expect(page.locator("#ws-message-text")).to_have_value("")
+    expect(card.get_by_role("button", name="Answer in w1:p1")).to_be_disabled()
+    page.screenshot(path=f"reports/codex-transcript-answer-{width}.png", full_page=True)

@@ -25,6 +25,8 @@
     <link rel="stylesheet" href="/viewer.css" />
     <script src="/sentry.js" defer></script>
     <link rel="stylesheet" href="/sentry.css" />
+    <script src="/cron.js" defer></script>
+    <link rel="stylesheet" href="/cron.css" />
   </head>
   <body>
     <header>
@@ -166,6 +168,17 @@
           Scheduled <span id="scheduled-tab-count" class="count" hidden>0</span>
         </button>
         <button
+          id="cron-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="cron-panel"
+          tabindex="-1"
+          hidden
+        >
+          Cron jobs <span id="cron-tab-count" class="count" hidden>0</span>
+        </button>
+        <button
           id="workspaces-tab"
           type="button"
           role="tab"
@@ -220,6 +233,28 @@
         </p>
         <h3 class="scheduled-heading" id="scheduled-history-heading" hidden>Recent</h3>
         <ol id="scheduled-history" class="scheduled-list"></ol>
+      </section>
+      <section
+        id="cron-panel"
+        class="pr-overview"
+        role="tabpanel"
+        aria-labelledby="cron-tab"
+        tabindex="0"
+        hidden
+      >
+        <div class="toolbar">
+          <h2>Cron jobs <span id="cron-count" class="count">0</span></h2>
+          <button id="cron-new" type="button">New job</button>
+        </div>
+        <p id="cron-status" class="pr-sync" role="status">Loading cron jobs…</p>
+        <p id="cron-error" role="alert"></p>
+        <div class="cron-layout">
+          <ol id="cron-list" class="cron-list" aria-label="Cron jobs"></ol>
+          <section id="cron-detail" class="cron-detail" aria-label="Selected job"></section>
+        </div>
+        <p id="cron-empty" class="pr-sync" hidden>
+          No jobs yet. Choose <strong>New job</strong> to run a command on a schedule.
+        </p>
       </section>
       <section
         id="workspaces-panel"
@@ -971,6 +1006,10 @@
         </div>
       </div>
       <div id="ws-viewer-controls" class="ws-viewer-controls"></div>
+      <section id="ws-live" class="ws-live" aria-label="Running agents" hidden>
+        <div id="ws-live-agents"></div>
+        <p id="ws-live-status" role="status"></p>
+      </section>
       <p id="ws-viewer-meta" role="status"></p>
       <p id="ws-viewer-error" role="alert"></p>
       <div id="ws-viewer-content"></div>
@@ -1033,6 +1072,110 @@
         <button id="sentry-publish-redraft" type="button" hidden>Try again</button>
         <button id="sentry-publish-create" type="button" disabled>Create GitHub issue</button>
       </div>
+    </dialog>
+    <dialog id="cron-dialog" aria-labelledby="cron-dialog-title">
+      <div class="dialog-header">
+        <div class="dialog-heading">
+          <h2 id="cron-dialog-title">New job</h2>
+          <button id="cron-dialog-close" type="button" aria-label="Close job editor">Close</button>
+        </div>
+      </div>
+      <form id="cron-form" method="dialog">
+        <label for="cron-name">Name</label>
+        <input id="cron-name" type="text" maxlength="80" required autocomplete="off" />
+        <fieldset id="cron-kinds" class="cron-kinds">
+          <legend>Runs</legend>
+          <label
+            ><input type="radio" name="cron-kind-choice" value="agent" checked /> An agent
+            task</label
+          >
+          <label
+            ><input type="radio" name="cron-kind-choice" value="shell" /> A shell command</label
+          >
+        </fieldset>
+        <div id="cron-agent-fields" class="cron-section"></div>
+        <div id="cron-shell-fields" class="cron-section" hidden>
+          <label for="cron-command">Command</label>
+          <textarea
+            id="cron-command"
+            rows="5"
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+          ></textarea>
+          <small id="cron-shell"></small>
+          <label for="cron-cwd">Working directory</label>
+          <input
+            id="cron-cwd"
+            type="text"
+            placeholder="Home directory"
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+          />
+        </div>
+        <fieldset class="cron-frequency">
+          <legend>Frequency</legend>
+          <div class="cron-repeat">
+            <label for="cron-kind">Repeat</label>
+            <select id="cron-kind">
+              <option value="every">Every</option>
+              <option value="cron">Cron expression</option>
+            </select>
+            <span id="cron-every-fields" class="cron-every">
+              <input
+                id="cron-every"
+                type="number"
+                min="1"
+                step="1"
+                value="1"
+                aria-label="Interval"
+              />
+              <select id="cron-unit" aria-label="Interval unit">
+                <option value="60">minutes</option>
+                <option value="3600" selected>hours</option>
+                <option value="86400">days</option>
+              </select>
+            </span>
+          </div>
+          <div id="cron-expression-fields" class="cron-expression" hidden>
+            <input
+              id="cron-expression"
+              type="text"
+              placeholder="*/15 * * * *"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+              aria-label="Cron expression"
+              aria-describedby="cron-expression-help"
+            />
+            <small id="cron-expression-help"
+              >Minute, hour, day of month, month, day of week, in the dashboard host's local time.
+              For example <code>0 9 * * mon-fri</code> or <code>@daily</code>.</small
+            >
+          </div>
+        </fieldset>
+        <label for="cron-timeout">Time limit (minutes)</label>
+        <input
+          id="cron-timeout"
+          type="number"
+          min="1"
+          max="1440"
+          step="1"
+          value="60"
+          aria-describedby="cron-timeout-help"
+        />
+        <small id="cron-timeout-help"
+          >A command is stopped at the limit; an agent still working is left open in Collie.</small
+        >
+        <label class="cron-enabled"
+          ><input id="cron-enabled-input" type="checkbox" checked /> Run on schedule</label
+        >
+        <p id="cron-form-error" role="alert"></p>
+        <div class="cron-dialog-actions">
+          <button id="cron-save" type="submit" value="save">Save job</button>
+        </div>
+      </form>
     </dialog>
     <dialog id="workspace-dialog" aria-labelledby="workspace-title">
       <div class="dialog-header">

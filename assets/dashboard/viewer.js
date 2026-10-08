@@ -271,6 +271,7 @@
     byId("ws-viewer-content").replaceChildren();
     byId("ws-viewer-error").textContent = "";
     byId("ws-viewer-meta").textContent = message;
+    byId("ws-live").hidden = true;
     for (const [id, mode] of [
       ["ws-view-diff", "diff"],
       ["ws-view-transcript", "transcript"],
@@ -569,6 +570,7 @@
       );
     }
     controls.append(refreshButton());
+    renderLive();
     const content = byId("ws-viewer-content");
     if (!data.session) {
       byId("ws-viewer-meta").textContent = "";
@@ -622,9 +624,9 @@
     current.session = data.session;
     current.sessions = data.sessions;
     transcriptMeta(current);
-    // Whether a question can be answered here follows the agent's state; only a recent
-    // Claude dialog can still be waiting.
-    if (current.entries.slice(-5).some(answerable)) void fetchAgents(viewer.entry);
+    // Async questions can stay open while subsequent tool calls fill the transcript.
+    if (current.entries.some(answerable)) void fetchAgents(viewer.entry);
+    renderLive();
     if (follow) byId("ws-viewer").scrollTop = byId("ws-viewer").scrollHeight;
   }
   function prependTranscript(data) {
@@ -664,14 +666,25 @@
     notification: "Notification",
   };
   // Questions an agent asked ------------------------------------------------------
-  // Claude's dialog can be answered from here while its agent waits on it: the server
-  // types the choices into the dialog. Codex asks without waiting, so its options only
-  // offer to fill in a reply.
+  // Answers go through the matching session's question dialog, for both agents.
   function openQuestion(entry) {
-    return entry.role === "tool" && entry.questions && entry.output == null;
+    if (entry.role !== "tool" || !entry.questions || entry.error || entry.answeredHere)
+      return false;
+    if (entry.output == null) return true;
+    if (entry.name === "request_user_input_async") {
+      try {
+        const value = JSON.parse(entry.output);
+        return value.accepted === true && Object.keys(value).length === 1;
+      } catch {
+        return false;
+      }
+    }
+    return false;
   }
   function answerable(entry) {
-    return openQuestion(entry) && entry.name === "AskUserQuestion";
+    return (
+      openQuestion(entry) && /^(AskUserQuestion|request_user_input(_async)?)$/.test(entry.name)
+    );
   }
   // Claude joins a multiple-choice answer's labels with ", ", which labels may contain.
   function chosenLabels(question, answer) {
@@ -692,27 +705,31 @@
     return found;
   }
   // What decides how an open question is drawn: whether, and to whom, it can be answered.
-  function answerState() {
+  function questionAgent(entry) {
     const session = viewer?.data?.session?.id;
-    const agent = agents.find((a) => a.agent === "claude" && a.session && a.session === session);
+    const kind = entry.name === "AskUserQuestion" ? "claude" : "codex";
+    return agents.find((a) => a.agent === kind && a.session && a.session === session);
+  }
+  function answerState(entry) {
+    const agent = questionAgent(entry);
     return `${Boolean(draft)}|${agent?.pane}|${agent?.status}`;
   }
   function questionCard(entry) {
-    const claude = entry.name === "AskUserQuestion";
     const card = node("div", undefined, "ws-question");
     card.dataset.tool = entry.id || "";
-    card.dataset.state = answerState();
+    card.dataset.state = answerState(entry);
     const head = node("div", undefined, "ws-question-head");
     head.append(node("strong", entry.questions.length === 1 ? "Question" : "Questions"));
     const open = openQuestion(entry);
-    if (entry.answers) head.append(badge("Answered", "green"));
+    if (entry.answers || entry.answeredHere) head.append(badge("Answered", "green"));
     else if (entry.error) head.append(badge("Not answered", "red"));
-    else if (claude && open) head.append(badge("Waiting for an answer", "amber"));
+    else if (open && questionAgent(entry)?.status === "blocked")
+      head.append(badge("Waiting for an answer", "amber"));
     const when = stamp(entry.time);
     if (when) head.append(when);
     card.append(head);
     // A dialog that can be answered here shows its questions in the form instead.
-    const controls = claude && open ? answerControls(entry) : null;
+    const controls = answerable(entry) ? answerControls(entry) : null;
     const answering = controls?.tagName === "FORM";
     entry.questions.forEach((question) => {
       if (answering) return;
@@ -732,7 +749,6 @@
         }
         item.append(node("strong", option.label));
         if (option.description) item.append(" ", node("span", option.description, "pr-meta"));
-        if (!claude && draft) item.append(" ", replyButton(question, option.label));
         list.append(item);
       }
       if (question.options.length) section.append(list);
@@ -748,26 +764,12 @@
     if (controls) card.append(controls);
     return card;
   }
-  function replyButton(question, label) {
-    const button = node("button", "Reply with this", "ws-question-reply");
-    button.type = "button";
-    button.setAttribute("aria-label", `Reply ${label} to: ${question.question}`);
-    button.onclick = () => {
-      const field = byId("ws-message-text");
-      const line = `${question.question}\n→ ${label}`;
-      field.value = field.value.trim() ? `${field.value.trimEnd()}\n\n${line}` : line;
-      field.dispatchEvent(new Event("input"));
-      field.focus();
-    };
-    return button;
-  }
   function answerControls(entry, target = null) {
     const session = target?.session || viewer?.data?.session?.id;
-    const agent =
-      target || agents.find((a) => a.agent === "claude" && a.session && a.session === session);
+    const agent = target || questionAgent(entry);
     if (!draft) return node("p", "Answer it in the agent's terminal.", "pr-meta");
     if (!agent)
-      return node("p", "No running Claude agent in this workspace is on this session.", "pr-meta");
+      return node("p", "No running agent in this workspace is on this session.", "pr-meta");
     if (agent.status !== "blocked")
       return node("p", "The agent is not waiting on this question right now.", "pr-meta");
     const form = node("form", undefined, "ws-answer");
@@ -852,8 +854,13 @@
         submit.disabled = false;
         return;
       }
+      entry.answeredHere = true;
+      form
+        .closest(".ws-question")
+        ?.querySelector(".ws-question-head .badge")
+        ?.replaceWith(badge("Answered", "green"));
       status.textContent = `Answered in ${value.pane}.`;
-      // The transcript records the answer once the agent continues.
+      // Refresh synchronous results; async transcripts can retain just an acknowledgment.
       setTimeout(() => {
         if (viewer?.entry === current) void fetchAgents(current);
         if (viewer?.entry === current && viewer.mode === "transcript")
@@ -880,7 +887,7 @@
     if (viewer?.mode !== "transcript" || !viewer.data?.entries) return;
     viewer.data.entries.forEach((entry, index) => {
       const shown = viewer.nodes[index];
-      if (!answerable(entry) || !shown || shown.dataset.state === answerState()) return;
+      if (!answerable(entry) || !shown || shown.dataset.state === answerState(entry)) return;
       // A form being filled in is left alone.
       if (
         shown.contains(document.activeElement) ||
@@ -970,6 +977,7 @@
     byId("ws-agent-interaction").replaceChildren();
     delete byId("ws-agent-interaction").dataset.state;
     byId("ws-message-status").textContent = "";
+    byId("ws-live-status").textContent = "";
     agents = [];
     sessions = [];
     if (!entry.workspace) {
@@ -987,6 +995,7 @@
     files = window.dashboardAttachments.picker({
       files: draft.files,
       pasteTarget: byId("ws-message-text"),
+      dropTarget: form,
       onchange: (list) => {
         if (!draft || viewer?.entry !== entry) return;
         draft.files = list;
@@ -998,10 +1007,13 @@
     renderAgents("Looking for agents…");
     void fetchAgents(entry);
   }
+  // Agents are read by polls, refreshes and actions alike; only the newest answer counts.
+  let agentsRequest = 0;
   async function fetchAgents(entry) {
+    const token = ++agentsRequest;
     try {
       const value = await getJSON("/api/workspace-agents", { workspace: entry.workspace });
-      if (viewer?.entry !== entry) return;
+      if (viewer?.entry !== entry || token !== agentsRequest) return;
       if (draft.path && draft.path !== value.path) {
         // The workspace ID now names another checkout: its old draft does not apply.
         draft = { comments: [], message: "", path: value.path, files: [] };
@@ -1019,8 +1031,9 @@
       sessions = value.sessions;
       renderAgents();
       refreshQuestions();
+      renderLive();
     } catch (error) {
-      if (viewer?.entry === entry) renderAgents(error.message);
+      if (viewer?.entry === entry && token === agentsRequest) renderAgents(error.message);
     }
   }
   function agentLabel(agent) {
@@ -1031,6 +1044,11 @@
   }
   function renderAgents(message) {
     const holder = byId("ws-message-agent");
+    // Polls redraw only on a change, so an open agent choice is never swapped under
+    // the reader's finger.
+    const key = JSON.stringify([message, agents, sessions, sending, Boolean(changingDocker)]);
+    if (holder.dataset.state === key) return;
+    holder.dataset.state = key;
     // A refresh keeps the agent or session the reader picked, while it is still listed.
     const picked = holder.querySelector("select")?.value;
     const keep = (values) => (values.includes(picked) ? picked : values[0]);
@@ -1118,6 +1136,113 @@
   function selectedAgent() {
     const picked = byId("ws-message-agent").querySelector("select")?.value;
     return agents.find((agent) => agent.pane === picked) || agents[0];
+  }
+  // Running agents ------------------------------------------------------------------
+  // Above a transcript: each agent running in the workspace and what it is doing, a
+  // way to its session's transcript, and Stop, which interrupts its turn as Esc would.
+  const ACTIVITY = {
+    working: ["Working", "amber"],
+    blocked: ["Waiting for an answer", "amber"],
+    idle: ["Idle", "green"],
+    done: ["Done", "green"],
+  };
+  let stopping = null; // The pane a stop is on its way to.
+  function agentTitle(agent) {
+    return { claude: "Claude", codex: "Codex" }[agent.agent] || agent.agent || "Agent";
+  }
+  function activity(agent) {
+    return ACTIVITY[agent.status] || [agent.status || "Unknown", ""];
+  }
+  function renderLive() {
+    const holder = byId("ws-live");
+    const data = viewer?.mode === "transcript" ? viewer.data : null;
+    const shown = data?.session?.id;
+    const live = (id) => agents.find((agent) => agent.session && agent.session === id);
+    // A session with a running agent says so in the session choice.
+    const select = byId("ws-viewer-controls").querySelector('select[aria-label="Session"]');
+    for (const option of select?.options || []) {
+      const session = data?.sessions.find((s) => s.id === option.value);
+      const agent = live(option.value);
+      if (session)
+        option.textContent = (agent ? `● ${activity(agent)[0]} · ` : "") + sessionLabel(session);
+    }
+    holder.hidden = !data || !(agents.length || byId("ws-live-status").textContent);
+    if (holder.hidden) return;
+    // Polls redraw only on a change, so a focused button stays focused.
+    const list = byId("ws-live-agents");
+    const key = JSON.stringify([
+      shown,
+      stopping,
+      data.sessions.map((session) => session.id),
+      agents.map((agent) => [agent.pane, agent.agent, agent.status, agent.session]),
+    ]);
+    if (list.dataset.state === key) return;
+    list.dataset.state = key;
+    list.replaceChildren(
+      ...agents.map((agent) => {
+        const [text, tone] = activity(agent);
+        const row = node("div", undefined, "ws-live-agent");
+        row.dataset.status = agent.status || "";
+        row.append(
+          badge(text, tone),
+          node("strong", agentTitle(agent)),
+          node("span", `in ${agent.pane}`, "pr-meta"),
+        );
+        if (agent.session && agent.session === shown) {
+          row.append(node("small", "this transcript", "pr-meta"));
+        } else if (data.sessions.some((session) => session.id === agent.session)) {
+          const show = node("button", "Show its transcript");
+          show.type = "button";
+          show.onclick = () => change((state) => (state.session = agent.session));
+          row.append(show);
+        }
+        if (agent.status === "working") {
+          const stop = node("button", stopping === agent.pane ? "Stopping…" : "Stop", "ws-stop");
+          stop.type = "button";
+          stop.disabled = Boolean(stopping);
+          stop.setAttribute("aria-label", `Stop ${agentTitle(agent)} in ${agent.pane}`);
+          stop.onclick = () => void stopAgent(agent);
+          row.append(stop);
+        }
+        return row;
+      }),
+    );
+  }
+  async function stopAgent(agent) {
+    if (!viewer || stopping) return;
+    const entry = viewer.entry;
+    const status = byId("ws-live-status");
+    stopping = agent.pane;
+    status.textContent = "";
+    renderLive();
+    let message;
+    try {
+      const response = await fetch("/api/workspace-interrupt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-interrupt" },
+        body: JSON.stringify({
+          workspace: entry.workspace,
+          pane: agent.pane,
+          session: agent.session ?? null,
+        }),
+      });
+      const value = await response.json();
+      message = value.error || value.warning || `Stopped ${agentTitle(agent)} in ${value.pane}.`;
+    } catch {
+      message = "The stop could not be confirmed; refresh or check Collie.";
+    } finally {
+      stopping = null;
+    }
+    if (viewer?.entry !== entry) {
+      renderLive(); // Another viewer's Stop buttons were waiting on this one.
+      return;
+    }
+    status.textContent = message;
+    await fetchAgents(entry);
+    // The transcript records where the turn was cut off.
+    const data = viewer?.entry === entry && viewer.mode === "transcript" ? viewer.data : null;
+    if (data?.session && !viewerInflight)
+      void loadViewer({ after: Math.max(data.start, data.total - 20) });
   }
   function renderDocker() {
     const agent = selectedAgent();
@@ -1331,8 +1456,7 @@
       ...(attachments.length ? { attachments } : {}),
     };
     sending = true;
-    byId("ws-message-send").disabled = true;
-    renderDocker();
+    renderAgents();
     status.textContent = body.resume ? "Resuming the session…" : "Sending…";
     try {
       const value = await deliver(body);
@@ -1447,8 +1571,16 @@
     opener = null;
     back?.focus();
   });
-  // A live transcript keeps up while it is open and its newest entries are shown.
+  // A live transcript keeps up while it is open and its newest entries are shown, and
+  // so do its running agents.
+  let pollingAgents = false;
   setInterval(() => {
+    if (viewer?.mode === "transcript" && viewer.entry.workspace && !document.hidden) {
+      if (!pollingAgents && !stopping) {
+        pollingAgents = true;
+        void fetchAgents(viewer.entry).finally(() => (pollingAgents = false));
+      }
+    }
     const data = viewer?.data;
     if (
       viewer?.mode === "transcript" &&

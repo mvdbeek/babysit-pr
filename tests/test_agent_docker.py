@@ -82,7 +82,11 @@ def rig(request, tmp_path, monkeypatch):
             procs["foreground_processes"] = [safehouse, proc]
             rig.access = "--enable=docker" in args[-1]
         if args[:2] == ("agent", "send-keys") and not rig.stuck:
-            procs["foreground_processes"] = [{"pid": 100}]
+            # herdr joins every argument after the pane ID as literal text.
+            # Claude only exits for /exit, not a normal prompt such as -- /exit.
+            text = "".join(" ".join(c[3:]) for c in calls if c[:2] == ("pane", "send-text"))
+            if kind == "codex" or text == "/exit":
+                procs["foreground_processes"] = [{"pid": 100}]
 
     def result(*args):
         return (
@@ -119,7 +123,7 @@ def test_restart_preserves_session_pane_cwd_options_and_enables_docker(rig, tmp_
         assert rig.calls[0] == ("agent", "send-keys", "w1:p1", "ctrl+d")
     else:
         assert rig.calls[:2] == [
-            ("pane", "send-text", "w1:p1", "--", "/exit"),
+            ("pane", "send-text", "w1:p1", "/exit"),
             ("agent", "send-keys", "w1:p1", "enter"),
         ]
     command = rig.calls[-1][-1]

@@ -53,9 +53,14 @@ ENDED_WATCHES = {"closed", "stopped"}
 DIALOG_WAIT = 4
 RULE = re.compile(r"^\s*─{8,}\s*$")
 MAX_ANSWER = 2000
+# How long a stop waits for the agent to leave its turn, in milliseconds.
+STOP_WAIT = 5000
 _answer_lock = threading.Lock()
 _resume_lock = threading.RLock()
 _recent: dict[str, tuple[str, float]] = {}
+# Once any Codex answer keystroke was attempted, retries must finish in the terminal.
+# Async questions can retain only an acknowledgment in the transcript after answering.
+_codex_answered: set[tuple[str, str]] = set()
 
 
 def clean(text):
@@ -236,7 +241,10 @@ def prompt(target, text):
     """Type the message into a running agent's pane and submit it."""
     pane = target["pane"]
     if target["status"] == "blocked":
-        raise ValueError("The agent is waiting on a question or approval; answer it in Collie")
+        raise ValueError(
+            "The agent is waiting on a question or approval; "
+            "use the transcript question card, or answer it in Collie"
+        )
     try:
         # Wait only until the agent reacts (starts working or asks something), not for
         # the turn to end; herdr reports a stall when it shows no reaction in 5 s.
@@ -263,7 +271,8 @@ def prompt(target, text):
         detail = str(exc)
         if "agent_blocked" in detail:
             raise ValueError(
-                "The agent is waiting on a question or approval; answer it in Collie"
+                "The agent is waiting on a question or approval; "
+                "use the transcript question card, or answer it in Collie"
             ) from exc
         if "agent_prompt_stalled" in detail or '"timeout"' in detail:
             # Typed and submitted, but no reaction seen: never invite sending it twice.
@@ -274,6 +283,65 @@ def prompt(target, text):
             }
         raise ValueError(f"herdr could not deliver the message: {detail[-300:]}") from exc
     return {"sent": True, "pane": pane, "warning": None}
+
+
+def interrupt(request):
+    """Stop the turn a working agent is on, as Esc does in its terminal.
+
+    Both Claude Code and Codex interrupt the running turn on Esc and keep the session
+    open, so the agent can be messaged again. Only a pane still working on the named
+    session gets the key: an idle agent's Esc would edit its prompt instead.
+    """
+    if set(request) != {"workspace", "pane", "session"} or not (
+        all(isinstance(request[k], str) and request[k] for k in ("workspace", "pane"))
+        and (request["session"] is None or isinstance(request["session"], str))
+    ):
+        raise ValueError("Invalid stop parameters")
+    pane = request["pane"]
+
+    def current():
+        return next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
+
+    # Typing an answer into a dialog holds the answer lock; Esc must not land mid-answer.
+    with _resume_lock, _answer_lock:
+        target = current()
+        if target is None or target.get("session") != request["session"]:
+            raise ValueError("That session is no longer running in this pane; refresh")
+        if target["status"] != "working":
+            raise ValueError("The agent is not working on anything right now; refresh")
+        try:
+            herdr("agent", "send-keys", pane, "esc")
+        except ValueError as exc:
+            raise ValueError(f"herdr could not send Esc: {str(exc)[-300:]}") from exc
+    # The wait holds no lock, so other workspaces' messages need not queue behind it.
+    try:
+        herdr(
+            "agent",
+            "wait",
+            pane,
+            "--until",
+            "idle",
+            "--until",
+            "done",
+            "--until",
+            "blocked",
+            "--timeout",
+            str(STOP_WAIT),
+        )
+    except (ValueError, subprocess.SubprocessError):
+        # The wait also fails when the agent exited after Esc: only a pane still
+        # working on the session means the stop did not take.
+        try:
+            after = current()
+        except (ValueError, subprocess.SubprocessError):
+            after = target
+        if after and after.get("session") == request["session"] and after["status"] == "working":
+            return {
+                "stopped": False,
+                "pane": pane,
+                "warning": "Esc was sent, but the agent still shows as working; check it in Collie.",
+            }
+    return {"stopped": True, "pane": pane, "warning": None}
 
 
 def squash(text):
@@ -357,10 +425,10 @@ def dialog(pane):
     return squash("\n".join(lines[rules[-1] : end])) if rules else ""
 
 
-def wait_for(pane, shows):
+def wait_for(pane, shows, read=dialog):
     deadline = time.monotonic() + DIALOG_WAIT
     while True:
-        if shows(dialog(pane)):
+        if shows(read(pane)):
             return True
         if time.monotonic() > deadline:
             return False
@@ -379,15 +447,17 @@ def shows_question(question):
     return lambda screen: bool(heading.search(screen)) and all(r.search(screen) for r in rest)
 
 
-def answer_steps(questions, answers):
+def answer_steps(questions, answers, agent="claude"):
     """Validate one answer per question; return the keys (or text) each one needs."""
     if not isinstance(answers, list) or len(answers) != len(questions):
         raise ValueError("Answer every question")
     steps = []
     for question, given in zip(questions, answers, strict=True):
         count = len(question["options"])
+        if agent == "codex" and question["multi"]:
+            raise ValueError("Multiple selections are not supported by this Codex dialog")
         # Each choice is one digit key, "Type something." included.
-        if not count or count >= 9:
+        if (agent == "claude" and not count) or count >= 9:
             raise ValueError("This question has too many options to answer here; use Collie")
         if not isinstance(given, dict) or set(given) - {"options", "text"} or len(given) != 1:
             raise ValueError("Choose options or write an answer for each question")
@@ -397,7 +467,11 @@ def answer_steps(questions, answers):
             if question["multi"] or not text or len(text) > MAX_ANSWER:
                 raise ValueError(f"Write an answer of 1–{MAX_ANSWER:,} characters")
             # "Type something." follows the options.
-            steps.append([("key", str(count + 1)), ("text", text), ("key", "enter")])
+            steps.append(
+                [("text", text)]
+                if agent == "codex"
+                else [("key", str(count + 1)), ("text", text), ("key", "enter")]
+            )
             continue
         chosen = given["options"]
         if (
@@ -416,15 +490,21 @@ def answer_steps(questions, answers):
 
 
 def answer(request):
-    """Answer the question a running Claude agent is waiting on, through its dialog."""
+    """Serialize answers, including validation, so a queued duplicate is checked again."""
+    with _answer_lock:
+        return answer_locked(request)
+
+
+def answer_locked(request):
+    """Answer the question a running agent is waiting on, through its dialog."""
     if set(request) != {"workspace", "pane", "session", "tool", "answers"} or not all(
         isinstance(request[k], str) and request[k] for k in ("workspace", "pane", "session", "tool")
     ):
         raise ValueError("Invalid answer parameters")
     pane = request["pane"]
     target = next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
-    if target is None or target["agent"] != "claude" or target["session"] != request["session"]:
-        raise ValueError("That Claude session is no longer running in this pane; refresh")
+    if target is None or target["agent"] not in RESUME or target["session"] != request["session"]:
+        raise ValueError("That agent session is no longer running in this pane; refresh")
     if target["status"] != "blocked":
         raise ValueError("The agent is not waiting on a question; refresh")
     if request["tool"].startswith("screen:"):
@@ -442,55 +522,180 @@ def answer(request):
             ),
             None,
         )
-    if not asked or asked["output"] is not None or not asked.get("questions"):
+    if not asked or not workspace_viewer.question_pending(asked):
         raise ValueError("That question was already answered; refresh")
+    expected = {
+        "claude": {"AskUserQuestion"},
+        "codex": {"request_user_input", "request_user_input_async"},
+    }
+    if asked["name"] not in expected[target["agent"]]:
+        raise ValueError("That question's agent is no longer running in this pane; refresh")
     questions = asked["questions"]
-    steps = answer_steps(questions, request["answers"])
-    with _answer_lock:
-        typed = False
-        try:
-            for question, keys in zip(questions, steps, strict=True):
-                # The agent may have moved on, or exited and left its dialog on screen.
-                current: dict = next(
-                    (a for a in agents(request["workspace"]) if a["pane"] == pane), {}
-                )
-                if (current.get("agent"), current.get("session"), current.get("status")) != (
-                    "claude",
-                    request["session"],
-                    "blocked",
+    steps = answer_steps(questions, request["answers"], target["agent"])
+    if target["agent"] == "codex":
+        return answer_codex(request, questions, steps)
+    typed = False
+    try:
+        for question, keys in zip(questions, steps, strict=True):
+            # The agent may have moved on, or exited and left its dialog on screen.
+            current: dict = next((a for a in agents(request["workspace"]) if a["pane"] == pane), {})
+            if (current.get("agent"), current.get("session"), current.get("status")) != (
+                "claude",
+                request["session"],
+                "blocked",
+            ):
+                raise ValueError("the agent stopped waiting")
+            if request["tool"].startswith("screen:"):
+                live = live_interaction(current)["question"]
+                if not live or live["id"] != request["tool"]:
+                    raise ValueError("the dialog changed")
+            if not wait_for(pane, shows_question(question)):
+                raise ValueError("the dialog did not show the next question")
+            for kind, value in keys:
+                if kind == "text":
+                    # The text field opens on the keypress before; its editor hint
+                    # shows once it has focus.
+                    if not wait_for(pane, lambda screen: "ctrl+g to edit" in screen):
+                        raise ValueError("the answer field did not open")
+                    run("herdr", "pane", "send-text", pane, value)
+                else:
+                    if value == str(len(question["options"]) + 1) and "ctrl+g to edit" in dialog(
+                        pane
+                    ):
+                        raise ValueError("an answer field is already open")
+                    herdr("agent", "send-keys", pane, value)
+                typed = True
+        if len(questions) > 1 or any(q["multi"] for q in questions):
+            if not wait_for(pane, lambda screen: "Submit answers" in screen):
+                raise ValueError("the dialog did not offer to submit")
+            herdr("agent", "send-keys", pane, "1")
+    except (ValueError, subprocess.SubprocessError) as exc:
+        if not typed:
+            raise ValueError(
+                "The question is not on the agent's screen; answer it in Collie"
+            ) from exc
+        # Something was typed: never invite answering again from the start.
+        raise ValueError(f"Answered in part ({exc}); finish the question in Collie") from exc
+    return {"answered": True, "pane": pane}
+
+
+def codex_dialog(pane):
+    """Only the final Codex question overlay, bounded by its progress and footer.
+
+    Codex CLI 0.160 renders `Question i/n` and `enter to submit answer/all`.
+    Unlike Claude, it has no horizontal rule around the dialog.
+    """
+    screen = run("herdr", "agent", "read", pane, "--source", "visible")
+    headings = list(re.finditer(r"(?m)^\s*Question \d+/\d+[^\n]*\n", screen))
+    if not headings:
+        return ""
+    screen = screen[headings[-1].start() :]
+    footer = re.search(r"(?m)(?:^\s*|\|\s*)enter to submit (?:answer|all)\b", screen)
+    return screen[: footer.end()] if footer else ""
+
+
+def codex_question_matches(screen, question, index, total):
+    lines = screen.strip().splitlines()
+    if not lines or not re.fullmatch(
+        rf"Question {index + 1}/{total}(?: \(\d+ unanswered\))?(?: · auto-resolves in .+)?",
+        lines[0].strip(),
+    ):
+        return False
+    # The prompt ends at the first option or composer. Text elsewhere on the screen
+    # (including a similar earlier question) must not authorize sending keys.
+    body = "\n".join(lines[1:])
+    stop = re.search(r"(?m)^\s*(?:› |\d+\. |Type your answer|Add notes)", body)
+    if not stop or squash(body[: stop.start()]) != squash(question["question"]):
+        return False
+    return all(
+        re.search(rf"(?m)^\s*(?:›\s*)?{i}\. {re.escape(squash(option['label']))}(?:\s|$)", body)
+        for i, option in enumerate(question["options"], 1)
+    )
+
+
+def answer_codex(request, questions, steps):
+    pane = request["pane"]
+    identity = (request["session"], request["tool"])
+    if identity in _codex_answered:
+        raise ValueError("An answer was already attempted; check the question in Collie")
+    typed = False
+
+    def send(kind, value, shows):
+        nonlocal typed
+        if not wait_for(pane, shows, read=codex_dialog):
+            raise ValueError("the expected question or answer field is not visible")
+        current: dict = next((a for a in agents(request["workspace"]) if a["pane"] == pane), {})
+        if (current.get("agent"), current.get("session"), current.get("status")) != (
+            "codex",
+            request["session"],
+            "blocked",
+        ):
+            raise ValueError("the agent stopped waiting")
+        # An I/O error may arrive after delivery. Never offer to replay the keys.
+        typed = True
+        _codex_answered.add(identity)
+        if kind == "text":
+            run("herdr", "pane", "send-text", pane, value)
+        else:
+            herdr("agent", "send-keys", pane, value)
+
+    try:
+        for index, (question, keys) in enumerate(zip(questions, steps, strict=True)):
+
+            def matches(screen, question=question, index=index):
+                return codex_question_matches(screen, question, index, len(questions))
+
+            def options_visible(screen):
+                return matches(screen) and "to clear notes" not in screen
+
+            kind, value = keys[0]
+            if kind == "key":
+                send(kind, value, options_visible)
+                continue
+            placeholder = "Type your answer (optional)"
+            if question["options"]:
+                screen = codex_dialog(pane)
+                other = len(question["options"]) + 1
+                selected = re.search(r"(?m)^\s*› (\d+)\. ", screen)
+                if (
+                    not options_visible(screen)
+                    or not selected
+                    or not re.search(rf"(?m)^\s*(?:› )?{other}\. None of the above\s*$", screen)
+                    and not re.search(
+                        rf"(?m)^\s*(?:› )?{other}\. None of the above\s+Optionally,", screen
+                    )
                 ):
-                    raise ValueError("the agent stopped waiting")
-                if request["tool"].startswith("screen:"):
-                    live = live_interaction(current)["question"]
-                    if not live or live["id"] != request["tool"]:
-                        raise ValueError("the dialog changed")
-                if not wait_for(pane, shows_question(question)):
-                    raise ValueError("the dialog did not show the next question")
-                for kind, value in keys:
-                    if kind == "text":
-                        # The text field opens on the keypress before; its editor hint
-                        # shows once it has focus.
-                        if not wait_for(pane, lambda screen: "ctrl+g to edit" in screen):
-                            raise ValueError("the answer field did not open")
-                        run("herdr", "pane", "send-text", pane, "--", value)
-                    else:
-                        if value == str(
-                            len(question["options"]) + 1
-                        ) and "ctrl+g to edit" in dialog(pane):
-                            raise ValueError("an answer field is already open")
-                        herdr("agent", "send-keys", pane, value)
-                    typed = True
-            if len(questions) > 1 or any(q["multi"] for q in questions):
-                if not wait_for(pane, lambda screen: "Submit answers" in screen):
-                    raise ValueError("the dialog did not offer to submit")
-                herdr("agent", "send-keys", pane, "1")
-        except (ValueError, subprocess.SubprocessError) as exc:
-            if not typed:
-                raise ValueError(
-                    "The question is not on the agent's screen; answer it in Collie"
-                ) from exc
-            # Something was typed: never invite answering again from the start.
-            raise ValueError(f"Answered in part ({exc}); finish the question in Collie") from exc
+                    raise ValueError("the dialog does not offer an empty Other answer")
+                # Digits submit immediately, including Other. Navigate to Other first,
+                # then open its notes so free text never selects an unrelated option.
+                for selection in range(int(selected[1]), other):
+                    send(
+                        "key",
+                        "down",
+                        lambda s, selection=selection: (
+                            options_visible(s) and bool(re.search(rf"(?m)^\s*› {selection}\. ", s))
+                        ),
+                    )
+                send(
+                    "key",
+                    "tab",
+                    lambda s, other=other: (
+                        options_visible(s)
+                        and bool(re.search(rf"(?m)^\s*› {other}\. None of the above(?:\s|$)", s))
+                    ),
+                )
+
+                placeholder = "Add notes"
+
+            def empty(s, placeholder=placeholder):
+                return matches(s) and bool(re.search(rf"(?m)^\s*› {re.escape(placeholder)}\s*$", s))
+
+            send("text", value, empty)
+            send("key", "enter", matches)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if typed:
+            raise ValueError(f"Answer attempted ({exc}); check or finish it in Collie") from exc
+        raise ValueError(f"Nothing answered ({exc}); refresh or answer it in Collie") from exc
     return {"answered": True, "pane": pane}
 
 

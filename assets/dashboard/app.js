@@ -1685,7 +1685,7 @@ async function refresh() {
     busy = false;
   }
 }
-const pages = ["watcher", "prs", "issues", "scheduled", "workspaces", "upstream", "sentry"];
+const pages = ["watcher", "prs", "issues", "scheduled", "cron", "workspaces", "upstream", "sentry"];
 function showPage(name) {
   for (const page of pages) {
     const active = page === name;
@@ -1700,6 +1700,7 @@ function showPage(name) {
   if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));
   if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
   if (name === "sentry") window.dispatchEvent(new Event("sentry-visible"));
+  if (name === "cron") window.dispatchEvent(new Event("cron-visible"));
 }
 function overviewVisible() {
   return !$("prs-panel").hidden || !$("issues-panel").hidden;
@@ -1993,9 +1994,9 @@ function workspaceControls(item) {
     cell.append(el("small", `Scheduled for ${scheduleTime(info.scheduled[0].start_at)}`));
   return cell;
 }
-// Files for the agent, chosen beside a task or pasted into it.
+// Files for the agent, chosen beside a task, pasted into it or dropped onto its form.
 function attachmentField(form, task) {
-  const files = window.dashboardAttachments.picker({ pasteTarget: task });
+  const files = window.dashboardAttachments.picker({ pasteTarget: task, dropTarget: form });
   form.append(files.element);
   return files;
 }
@@ -2690,6 +2691,16 @@ async function newTaskDialog() {
   }
 }
 $("new-task").onclick = () => void newTaskDialog();
+// Agent settings for other views (cron jobs), with the same choices as New task.
+window.dashboardAgents = {
+  async fields() {
+    if (!workspaceData.agent_choices) await loadWorkspaces();
+    return agentFields();
+  },
+  repositories: () => get("/api/workspace-repos?all=1"),
+  searchable: searchableSelect,
+  sync: syncSelect,
+};
 // Replaced by each item's link when a batch is scheduled.
 const BATCH_URL = "{url}";
 // The scheduler's limit on waiting tasks.
