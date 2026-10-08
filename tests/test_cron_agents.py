@@ -127,6 +127,19 @@ def test_a_run_makes_the_worktree_and_starts_the_agent_in_a_new_pane(setup):
         jobs.stop(saved["id"])
 
 
+def test_a_job_left_on_default_effort_uses_the_saved_default(setup):
+    import workspace_agents
+
+    jobs, manager, _, state = setup
+    workspace_agents.save_effort_default(manager.home, {"repo": "base/repo", "effort": "ultra"})
+    saved = jobs.save(request(manager, model="fixture-codex"))
+    assert saved["effort"] == ""
+    jobs.run_now(saved["id"])
+    assert settle(jobs, saved["id"])["status"] == "running"
+    [typed] = herdr_state(state)["runs"]
+    assert typed[1].startswith("codex --model fixture-codex -c 'model_reasoning_effort=\"ultra\"'")
+
+
 def test_finished_agents_keep_their_answer_and_close_their_pane(setup, monkeypatch):
     jobs, manager, _, state = setup
     saved = jobs.save(request(manager))

@@ -11,17 +11,18 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import agent_messages
 import attachments
 import llm_usage
+import workspace_agents
 import workspace_viewer
 from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
 from pr_ci_logs import BackgroundLogs
 from pr_overview import Overview
-from pr_workspaces import Workspaces
+from pr_workspaces import COLLIE_URL, Workspaces
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
@@ -290,6 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 "push-read",
                 "push-seen",
                 "notification-silence",
+                "effort-default",
             }
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
@@ -408,6 +410,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.choose(request))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the dialog in Collie: {exc}"})
+                return
+            if action == "effort-default":
+                self.send_json(
+                    200,
+                    {
+                        "effort_defaults": workspace_agents.save_effort_default(
+                            self.server.home, request
+                        )
+                    },
+                )
                 return
             if action == "workspace-prompt-forget":
                 if not self.server.workspaces:
@@ -571,6 +583,7 @@ class Handler(BaseHTTPRequestHandler):
                         # A draft names its checkout, so a reused workspace ID cannot
                         # deliver another checkout's comments.
                         "path": workspace_viewer.workspace_checkout(workspace_id),
+                        "url": f"{COLLIE_URL}/space/{quote(workspace_id, safe='')}",
                     },
                 )
             elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:
@@ -714,6 +727,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/favicon.png": ("favicon.png", "image/png"),
                     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
                     "/app.js": ("app.js", "text/javascript"),
+                    "/collie.js": ("collie.js", "text/javascript"),
                     "/notifications.js": ("notifications.js", "text/javascript"),
                     "/usage.js": ("usage.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
