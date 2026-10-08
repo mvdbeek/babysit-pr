@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Send to Babysitter",
+  "version": "0.1.0",
+  "description": "Send page references, GitHub tasks and follow-ups to your babysit-pr dashboard.",
+  "permissions": ["activeTab", "contextMenus", "scripting", "storage"],
+  "optional_host_permissions": ["https://*/*", "http://127.0.0.1/*", "http://localhost/*"],
+  "action": { "default_title": "Send to Babysitter" },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "options_ui": { "page": "options.html", "open_in_tab": true }
+}

@@ -123,7 +123,7 @@ def sessions(workspace_id, home=None):
     ]
 
 
-def send(request, home=None):
+def send(request, home=None, *, expected_session=None):
     """Submit one message to one agent of a workspace; report what herdr saw."""
     if set(request) - {"workspace", "pane", "text", "resume"}:
         raise ValueError("Invalid message parameters")
@@ -148,6 +148,8 @@ def send(request, home=None):
     target = next((agent for agent in running if agent["pane"] == pane), None)
     if target is None:
         raise ValueError("That agent is no longer running; refresh")
+    if expected_session is not None and target.get("session") != expected_session:
+        raise ValueError("The agent session changed; reload the agent list")
     with _resume_lock:
         return prompt(target, text)
 

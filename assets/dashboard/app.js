@@ -2637,7 +2637,7 @@ async function workspaceDialog(item, handling = "") {
 }
 // A task with no PR or issue behind it, like `wtl`'s branch target: a new branch from a
 // base in any local clone, or, with a title, a GitHub issue filed first and then handled.
-async function newTaskDialog() {
+async function newTaskDialog(prefill = {}) {
   // Stands in for the dialog's item; its id becomes the operation's once one starts.
   const owner = { id: null, newTask: true };
   workspaceDialogItem = owner;
@@ -2693,7 +2693,20 @@ async function newTaskDialog() {
       syncSelect(repo);
       repo.dispatchEvent(new Event("change"));
     }
+    if (prefill.repo && !repos.some((choice) => choice.repo === prefill.repo)) {
+      everything = (await get("/api/workspace-repos?all=1")).repos;
+      if (workspaceDialogItem !== owner) return;
+      repos = everything;
+    }
     fillRepos(repos);
+    const suggested = repos.findIndex((choice) => choice.repo === prefill.repo);
+    if (suggested >= 0) repo.value = String(suggested);
+    else if (prefill.repo) {
+      repo.selectedIndex = -1;
+      form.append(
+        el("p", `Choose a local clone for ${prefill.repo}; none was found automatically.`),
+      );
+    }
     field("Repository and local clone", repo);
     if (recent.idle) {
       const idle = el("input");
@@ -2741,12 +2754,14 @@ async function newTaskDialog() {
     name.maxLength = 100;
     name.pattern = "[A-Za-z0-9][A-Za-z0-9._\\-]*";
     name.placeholder = "fix-parser";
+    name.value = prefill.name || "";
     name.autocapitalize = "off";
     name.spellcheck = false;
     field("New branch", name, branchFields);
     const base = el("input");
     base.id = "new-task-base";
     base.placeholder = "The clone’s default branch";
+    base.value = prefill.base || "";
     base.autocapitalize = "off";
     base.spellcheck = false;
     field("Base branch (optional)", base, branchFields);
@@ -2781,6 +2796,7 @@ async function newTaskDialog() {
     task.required = true;
     task.maxLength = 32000;
     task.rows = 6;
+    task.value = prefill.task || "";
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
     form.append(promptHistory(task));
@@ -2837,6 +2853,31 @@ async function newTaskDialog() {
   }
 }
 $("new-task").onclick = () => void newTaskDialog();
+function browserTaskHandoff() {
+  if (!window.location.hash.startsWith("#task=")) return;
+  const encoded = location.hash.slice(6);
+  // Consume the fragment before rendering; it never goes to the HTTP server.
+  history.replaceState(null, "", location.pathname + "#watcher");
+  try {
+    if (encoded.length > 200000) throw Error("The browser task is too large");
+    const value = JSON.parse(decodeURIComponent(encoded));
+    if (
+      !value ||
+      typeof value.task !== "string" ||
+      value.task.length > 32000 ||
+      (value.repo !== undefined && typeof value.repo !== "string") ||
+      (value.name !== undefined && typeof value.name !== "string") ||
+      (value.base !== undefined && typeof value.base !== "string")
+    )
+      throw Error("Invalid browser task");
+    void newTaskDialog(value);
+  } catch (error) {
+    $("navigation-status").hidden = false;
+    $("navigation-status").textContent = error.message;
+  }
+}
+window.addEventListener("hashchange", browserTaskHandoff);
+browserTaskHandoff();
 // Agent settings for other views (cron jobs), with the same choices as New task.
 window.dashboardAgents = {
   async fields(options) {

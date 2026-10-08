@@ -4,6 +4,12 @@ A shared watcher that waits for GitHub CI and PR activity without keeping coding
 
 The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
 
+The [Send to Babysitter browser extension](references/browser-extension.md) sends
+page references and GitHub tasks to the dashboard, starts new workspaces, and sends
+follow-ups to existing agents. It supports paired direct submission, a monitoring
+instruction checkbox, and a token-free handoff to the dashboard's New task dialog.
+Installation and manual testing instructions are in the linked guide.
+
 On mobile, selecting a watch card scrolls to its details and actions. Background
 refreshes leave the scroll position alone; reduced-motion settings are respected.
 
