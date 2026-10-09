@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { dashboardURL, githubTarget, taskText } from "../extension/shared.js";
+import { infer, suggestedTask, branchName, githubRepo } from "../extension/inference.js";
 
 for (const url of ["https://dashboard.example", "http://127.0.0.1:8765", "http://localhost:8000/"])
   assert.equal(dashboardURL(url), new URL(url).origin);
@@ -67,7 +68,17 @@ const chrome = {
     },
     onRemoved: event("removed"),
   },
-  scripting: { executeScript: async () => [{ result: "toolbar selection" }] },
+  scripting: {
+    executeScript: async () => [
+      {
+        result: {
+          selection: "toolbar selection",
+          content: "Visible page context",
+          links: "https://github.com/a/b",
+        },
+      },
+    ],
+  },
 };
 vm.runInNewContext(await readFile(new URL("../extension/background.js", import.meta.url), "utf8"), {
   chrome,
@@ -95,3 +106,47 @@ await listeners.action({ id: 2, url: "chrome://settings", title: "Settings" });
 assert.equal(Object.keys(Object.values(drafts)[2].source).length, 0);
 assert.equal(opened.length, 3);
 console.log("Extension toolbar and context-menu capture tests passed");
+
+const repos = [
+  { repo: "a/b", clone: "/a" },
+  { repo: "c/d", clone: "/c" },
+];
+const inferenceContext = {
+  repos,
+  targets: [{ repo: "a/b", url: "https://github.com/a/b/pull/1", ci: "FAILURE" }],
+  agents: [],
+};
+assert.equal(githubRepo("https://github.com/a/b/actions/runs/123"), "a/b");
+assert.equal(
+  infer({ url: "https://github.com/a/b/blob/main/file.py" }, inferenceContext).repository.clone,
+  "/a",
+);
+assert.equal(
+  infer({ url: "https://example.com", links: "https://github.com/c/d" }, inferenceContext)
+    .repository.clone,
+  "/c",
+);
+assert.equal(infer({}, inferenceContext).repository, null);
+assert.equal(infer({}, inferenceContext, {}, "Fix c/d").repository.clone, "/c");
+assert.equal(
+  infer({ url: "https://github.com/missing/repo" }, inferenceContext, { last: repos[0] })
+    .repository,
+  null,
+);
+assert.equal(infer({}, inferenceContext, { last: repos[1] }).repository.clone, "/c");
+assert.match(suggestedTask({}, { ci: "FAILURE" }), /failing CI/);
+assert.match(suggestedTask({ url: "https://github.com/a/b/issues/2" }, null), /implement a fix/);
+assert.equal(branchName("Fix parser!", "", "12345678"), "fix-parser-12345678");
+const matchedAgent = { session: "s", targets: ["https://github.com/a/b/pull/1"], repos: ["a/b"] };
+assert.equal(
+  infer(
+    { url: "https://github.com/a/b/pull/1/files" },
+    { ...inferenceContext, agents: [matchedAgent] },
+  ).matching.length,
+  1,
+);
+assert.equal(
+  infer({ url: "https://github.com/a/b" }, { ...inferenceContext, agents: [matchedAgent] }).matching
+    .length,
+  0,
+);
