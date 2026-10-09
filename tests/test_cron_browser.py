@@ -322,6 +322,44 @@ def test_define_and_follow_an_agent_job(page, agent_site, errors, width, monkeyp
     assert "prompt" not in jobs.snapshot()["jobs"][0]
 
 
+def test_an_agent_job_can_run_outside_safehouse(page, agent_site, errors, tmp_path):
+    url, jobs, _, state = agent_site
+    page.set_viewport_size({"width": 390, "height": 1000})
+    page.goto(url + "/#cron")
+    page.get_by_role("button", name="New job").click()
+    dialog = page.locator("#cron-dialog")
+    dialog.get_by_label("Name").fill("Rebase elsewhere")
+    dialog.get_by_label("Branch", exact=True).fill("nightly")
+    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    docker = dialog.get_by_label("Allow Docker in the agent’s sandbox")
+    outside = dialog.get_by_label("Run outside Safehouse (can write anywhere)")
+    expect(dialog.locator(".cron-unsandboxed-note")).to_contain_text(
+        "Agents it starts with wt stay in Safehouse"
+    )
+    expect(outside).not_to_be_checked()
+    docker.check()
+    # Docker access is a Safehouse setting: running outside it clears and locks it.
+    outside.check()
+    expect(docker).not_to_be_checked()
+    expect(docker).to_be_disabled()
+    outside.uncheck()
+    expect(docker).to_be_enabled()
+    outside.check()
+    dialog.get_by_label("Prompt").fill("Rebase the conflicting PRs")
+    page.screenshot(path=str(tmp_path / "unsandboxed-dialog.png"))
+    dialog.get_by_role("button", name="Save job").click()
+    expect(dialog).to_be_hidden()
+    [saved] = jobs.snapshot()["jobs"]
+    assert (saved["unsandboxed"], saved["docker"]) == (True, False)
+    page.locator(".cron-job").first.click()
+    detail = page.locator("#cron-detail")
+    expect(detail).to_contain_text("Claude · Outside Safehouse")
+    detail.get_by_role("button", name="Edit").click()
+    expect(outside).to_be_checked()
+    expect(docker).to_be_disabled()
+    assert page.evaluate("document.documentElement.scrollWidth") <= 390
+
+
 def test_a_job_saved_on_a_hidden_default_login_opens_on_the_same_login(
     page, agent_site, errors, monkeypatch
 ):

@@ -6,11 +6,16 @@ out. Every run uses that checkout, so changes from one run carry into the next.
 
 A run opens the checkout's herdr workspace, splits a new pane there and types the agent
 command into it, the way launches do, so the user's shell wrappers (Safehouse, Claude
-accounts) apply. The brief asks the agent to end with a marker line once the task is
-finished, as scheduled launches do; ``workspace_exit`` then follows the session and
-exits the agent once it confirms and stays idle. The run keeps the agent's final
-response and closes its pane. An agent that stops to ask a question, or is still working
-at the job's time limit, is left open in Collie and the run needs attention.
+accounts) apply. A job marked ``unsandboxed`` types ``command claude``/``command codex``
+instead, which skips the Safehouse wrapper so the agent can write anywhere, for example
+to other clones when it makes worktrees with ``wt``. Agents those launch are typed into
+panes the multiplexer's server starts, with fresh shells and the usual wrappers, so they
+are still in Safehouse; nothing marks the environment as unsandboxed. The brief asks the
+agent to end with a marker line once the task is finished, as scheduled launches do;
+``workspace_exit`` then follows the session and exits the agent once it confirms and
+stays idle. The run keeps the agent's final response and closes its pane. An agent that
+stops to ask a question, or is still working at the job's time limit, is left open in
+Collie and the run needs attention.
 """
 
 import os
@@ -85,6 +90,11 @@ def validate(request, workspaces, home):
     docker = request.get("docker", False)
     if not isinstance(docker, bool):
         raise ValueError("Expected docker to be true or false")
+    unsandboxed = request.get("unsandboxed", False)
+    if not isinstance(unsandboxed, bool):
+        raise ValueError("Expected unsandboxed to be true or false")
+    if docker and unsandboxed:
+        raise ValueError("Docker access only applies inside Safehouse; choose one")
     prompt = request.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_PROMPT:
         raise ValueError("Give the agent a prompt of 1–32,000 characters")
@@ -100,6 +110,7 @@ def validate(request, workspaces, home):
         "effort": settings["effort"],
         "claude_account": settings["claude_account"] if agent == "claude" else "",
         "docker": docker,
+        "unsandboxed": unsandboxed,
         "prompt": prompt,
     }
 
@@ -192,6 +203,8 @@ def start(job, run_id, home, src):
         docker=job["docker"],
         claude_config_dir=str(config) if config else None,
         claude_subscription=bool(job["claude_account"]),
+        # Jobs saved before the option existed lack it.
+        unsandboxed=job.get("unsandboxed", False),
     )
     # A fresh pane, as resumes use; the root pane stays a plain shell for the user.
     pane = herdr("pane", "split", anchor, "--direction", "right", "--cwd", str(path), "--no-focus")[

@@ -368,6 +368,14 @@ def sanitize_session_name(name: str) -> str:
     return UNSAFE.sub("-", name)
 
 
+# What the user's claude()/codex() shell functions add after ``safe``; a command that
+# bypasses them must add it itself.
+UNSANDBOXED_FLAGS = {
+    "claude": "--dangerously-skip-permissions",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",
+}
+
+
 def agent_words(agent: str, model: str, effort: str, extra: Sequence[str] = ()) -> list[str]:
     words = [agent]
     if model:
@@ -410,6 +418,7 @@ def agent_command(
     docker: bool = False,
     claude_config_dir: str | None = None,
     claude_subscription: bool = False,
+    unsandboxed: bool = False,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -426,8 +435,18 @@ def agent_command(
 
     ``docker`` prefixes ``SAFE_ENABLE=docker``: the shell's ``safe`` wrapper around the
     agent adds it to safehouse's ``--enable`` list, opening the Docker daemon socket.
+
+    ``unsandboxed`` types ``command <agent>`` with the flag the wrapper would add, so the
+    shell runs the agent binary directly instead of through ``safe``: no Safehouse, and
+    no permission prompts to stall an unattended run. Only cron jobs that opt in pass
+    it; ``wt`` itself never does, so agents it starts stay in Safehouse.
     """
-    command = " ".join(shlex.quote(word) for word in agent_words(agent, model, effort, extra))
+    if unsandboxed and docker:
+        raise ValueError("Docker access only applies inside Safehouse")
+    words = agent_words(agent, model, effort, extra)
+    if unsandboxed:
+        words = ["command", agent, UNSANDBOXED_FLAGS[agent], *words[1:]]
+    command = " ".join(shlex.quote(word) for word in words)
     if docker:
         command = f"SAFE_ENABLE=docker {command}"
     if prompt:
