@@ -234,6 +234,8 @@ def test_resume_options_never_replay_prompts_and_preserve_permissions():
     assert docker.resume_options(
         ["codex", "-c", 'approval_policy="never"', "resume", SID, "--", "old"], "codex", SID
     ) == ["-c", 'approval_policy="never"']
+    # The resume adds it again.
+    assert docker.resume_options(["codex", "--no-daemon", "resume", SID], "codex", SID) == []
     assert docker.resume_options(
         ["claude", "-c", "--permission-mode=default", "old"], "claude", SID
     ) == ["--permission-mode=default"]

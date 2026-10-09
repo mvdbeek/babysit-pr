@@ -90,6 +90,8 @@ def resume_options(argv, kind, session):
                 raise ValueError("The process resume ID differs from the current session")
         elif word in {"--continue", "--last"} or (kind == "claude" and word == "-c"):
             continue  # Replaced with the exact current session UUID.
+        elif kind == "codex" and word == "--no-daemon":
+            continue  # Every Codex resume adds it again.
         elif word in flags:
             kept.append(word)
         elif word.partition("=")[0] in valued:

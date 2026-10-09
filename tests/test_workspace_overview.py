@@ -1130,6 +1130,7 @@ def test_messages_need_a_single_unblocked_agent(site):
     [
         ("agent_blocked", "answer it in Collie"),
         ("agent_prompt_stalled", None),
+        ("agent_not_running", "exited instead of taking the message"),
         ("other", "could not deliver"),
     ],
 )
@@ -1363,6 +1364,24 @@ def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
     # The agent now runs: a second resume is refused, a message goes to it instead.
     with pytest.raises(ValueError, match="already running"):
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "again"}, home)
+
+
+def test_a_codex_session_resumes_without_the_shared_background_server(exited):
+    import agent_messages
+
+    state, _, checkout, home = exited
+    sid = "c0ffee00-0000-4000-8000-000000000009"
+    folder = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "10" / "03"
+    folder.mkdir(parents=True)
+    (folder / f"rollout-{sid}.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(checkout)}}) + "\n"
+    )
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "go on"}, home)
+    assert value["resumed"] == sid and value["warning"] is None
+    # On the shared server a session with other feature settings opens a dialog whose
+    # default, Cancel, the message's Enter would pick.
+    assert read(state)["runs"][0][1].startswith(f'codex --no-daemon resume {sid} -- "$(cat ')
+    assert read(state)["agents"][0]["argv"] == ["--no-daemon", "resume", sid, "--", "go on"]
 
 
 def test_a_session_open_elsewhere_gets_the_message_there(exited):
