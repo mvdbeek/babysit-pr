@@ -634,6 +634,9 @@ class Handler(BaseHTTPRequestHandler):
                 if set(query) != {"workspace"} or len(query["workspace"]) != 1:
                     raise ValueError("Supply a workspace")
                 workspace_id = query["workspace"][0]
+                # The workspace now open on this checkout: none once closed, another ID
+                # once reopened, which the viewer then follows.
+                live = workspace_viewer.live_workspace(workspace_id)
                 self.send_json(
                     200,
                     {
@@ -642,7 +645,8 @@ class Handler(BaseHTTPRequestHandler):
                         # A draft names its checkout, so a reused workspace ID cannot
                         # deliver another checkout's comments.
                         "path": workspace_viewer.workspace_checkout(workspace_id),
-                        "url": f"{COLLIE_URL}/space/{quote(workspace_id, safe='')}",
+                        "workspace": live,
+                        "url": live and f"{COLLIE_URL}/space/{quote(live, safe='')}",
                     },
                 )
             elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:

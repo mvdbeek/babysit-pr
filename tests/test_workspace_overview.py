@@ -1481,6 +1481,119 @@ def test_a_watched_session_is_left_to_the_watcher(exited):
     assert not read(state).get("runs")
 
 
+def close_workspace(state, workspace_id):
+    data = read(state)
+    data["workspaces"] = [w for w in data["workspaces"] if w["workspace_id"] != workspace_id]
+    data["agents"] = [a for a in data["agents"] if a["workspace_id"] != workspace_id]
+    data["panes"] = [p for p in data.get("panes", []) if p["workspace_id"] != workspace_id]
+    state.write_text(json.dumps(data))
+
+
+def test_a_closed_workspace_is_reopened_to_resume_its_session(exited, site, monkeypatch):
+    import agent_messages
+
+    state, sid, checkout, home = exited
+    clone = site[2]
+    assert wso_viewer.workspace_checkout("w1")  # The viewer saw it open.
+    close_workspace(state, "w1")
+    monkeypatch.setattr(wso_viewer, "CHECKOUT_TTL", 0)
+    # Its checkout is still shown, with no agent but the sessions recorded there.
+    assert wso_viewer.live_workspace("w1") is None
+    assert agent_messages.agents("w1") == []
+    assert [s["id"] for s in agent_messages.sessions("w1", home)] == [sid]
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "Now add docs"}, home)
+    assert calls(state, ["worktree", "open"]) == [
+        [
+            "worktree",
+            "open",
+            "--cwd",
+            str(clone.resolve()),
+            "--path",
+            str(checkout.resolve()),
+            "--no-focus",
+        ]
+    ]
+    data = read(state)
+    reopened = data["workspaces"][-1]["workspace_id"]
+    # The reopened workspace's own new shell runs the resume; nothing is split.
+    assert value == {"sent": True, "pane": f"{reopened}:p1", "resumed": sid, "warning": None}
+    assert "splits" not in data
+    assert data["agents"][0]["argv"] == ["--resume", sid, "--", "Now add docs"]
+    assert wso_viewer.live_workspace("w1") == reopened
+    with pytest.raises(ValueError, match="already running"):
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "again"}, home)
+
+
+def test_the_viewer_follows_a_workspace_reopened_under_a_new_id(site, tmp_path, monkeypatch):
+    _, _, _, worktrees, state, _ = site
+    assert wso_viewer.workspace_checkout("w1")
+    data = read(state)
+    data["workspaces"][0]["workspace_id"] = "w7"
+    data["agents"][0].update(workspace_id="w7", pane_id="w7:p1")
+    state.write_text(json.dumps(data))
+    monkeypatch.setattr(wso_viewer, "CHECKOUT_TTL", 0)
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            status, value = request(port, "/api/workspace-agents?workspace=w1")
+            assert status == 200 and value["workspace"] == "w7"
+            assert value["url"] == f"{wso.COLLIE_URL}/space/w7"
+            assert [agent["pane"] for agent in value["agents"]] == ["w7:p1"]
+            assert value["path"] == str((worktrees / "merged-work").resolve())
+            body = {"workspace": "w1", "text": "Carry on"}
+            status, value = request(
+                port, "/api/workspace-message", body, action="workspace-message"
+            )
+            assert status == 200 and value["pane"] == "w7:p1"
+            # Closed for good: the checkout is still shown, but nobody can be messaged.
+            close_workspace(state, "w7")
+            status, value = request(port, "/api/workspace-agents?workspace=w1")
+            assert status == 200 and value["workspace"] is None and value["url"] is None
+            assert value["agents"] == [] and value["path"].endswith("merged-work")
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_a_closed_workspace_never_follows_one_that_was_open_beside_it(site, monkeypatch):
+    _, _, _, worktrees, state, _ = site
+    checkout = str(worktrees / "merged-work")
+    data = read(state)
+    data["workspaces"].append(
+        {"workspace_id": "w5", "label": "monitor", "worktree": {"checkout_path": checkout}}
+    )
+    state.write_text(json.dumps(data))
+    assert wso_viewer.live_workspace("w1") == "w1"
+    close_workspace(state, "w1")
+    monkeypatch.setattr(wso_viewer, "CHECKOUT_TTL", 0)
+    # w5 was another workspace on the same checkout all along, not w1 reopened.
+    assert wso_viewer.live_workspace("w1") is None
+    data = read(state)
+    data["workspaces"].append(
+        {"workspace_id": "w6", "label": "merged-work", "worktree": {"checkout_path": checkout}}
+    )
+    state.write_text(json.dumps(data))
+    assert wso_viewer.live_workspace("w1") == "w6"
+    data["workspaces"].append(
+        {"workspace_id": "w8", "label": "other", "worktree": {"checkout_path": checkout}}
+    )
+    state.write_text(json.dumps(data))
+    # Two opened since: neither is known to be the one.
+    assert wso_viewer.live_workspace("w1") is None
+
+
+def test_an_id_reused_for_another_checkout_is_refused(site):
+    _, _, _, worktrees, state, _ = site
+    assert wso_viewer.workspace_checkout("w1")
+    data = read(state)
+    data["workspaces"][0]["worktree"]["checkout_path"] = str(worktrees / "dirty-work")
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="another checkout"):
+        wso_viewer.live_workspace("w1")
+
+
 def test_resume_refuses_unknown_sessions_and_mixed_targets(exited):
     import agent_messages
 
