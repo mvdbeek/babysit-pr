@@ -289,6 +289,28 @@ def test_work_or_input_in_progress_only_delays_the_exit(rig, change):
     assert state["sent"] == ["w1:p1"]
 
 
+def test_a_pane_too_short_for_the_composer_is_named_until_it_grows(rig):
+    op, record, state, step, _ = rig
+    saved = copy.deepcopy(state)
+    # Only the agent's footer fits, so neither the composer nor the receipt is visible.
+    state["info"]["scroll"] = {"offset_from_bottom": 0, "viewport_rows": 8}
+    state["screen"] = RULE + "\n  bypass permissions on (shift+tab to cycle)"
+    step()
+    step()
+    assert record["state"] == "watching" and not state["sent"]
+    assert record["confirmed_at"] == 1000 + we.SETTLE_SECONDS
+    assert record["blocked"] == (
+        "Empty composer is not yet visible; no exit key sent; the pane shows only 8 rows, "
+        "too few for the composer and final response"
+    )
+    assert record["message"] == f"Finished, but not exiting yet: {record['blocked']}"
+    state.update(info=saved["info"], screen=saved["screen"])
+    step()
+    assert "blocked" not in record
+    step()
+    assert state["sent"] == ["w1:p1"]
+
+
 @pytest.mark.parametrize("status", ["failed", "uncertain"])
 def test_a_launch_that_did_not_finish_is_not_watched(rig, status):
     op, record, state, step, _ = rig

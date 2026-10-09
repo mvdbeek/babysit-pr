@@ -717,11 +717,14 @@ class CronJobs:
             and "ready" not in record  # A finished agent settling is not over its limit.
             and now - run["started_at"] > run["timeout"]
         ):
-            record.update(
-                state="left_open",
-                message=f"Still working at the {run['timeout'] // 60} min time limit; "
-                "left open in Collie",
-            )
+            limit = f"the {run['timeout'] // 60} min time limit"
+            if "confirmed_at" in record:
+                finished = time.strftime("%H:%M", time.localtime(record["confirmed_at"]))
+                reason = record.get("blocked", "its pane never went idle")
+                message = f"Finished at {finished}, but not exited by {limit}: {reason}"
+            else:
+                message = f"Still working at {limit}"
+            record.update(state="left_open", message=f"{message}; left open in Collie")
         if not self.current(run):
             return
         if record["state"] == "watching":
