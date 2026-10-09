@@ -81,7 +81,10 @@ def agents(workspace_id, interactions=False):
 
     Only a workspace on a Git checkout qualifies, the same ones the viewer shows.
     """
-    workspace_viewer.workspace_checkout(workspace_id)  # Validates the workspace exists.
+    # Follows the checkout: a closed workspace has none, a reopened one has a new ID.
+    live = workspace_viewer.live_workspace(workspace_id)
+    if live is None:
+        return []
     found = [
         {
             "pane": agent["pane_id"],
@@ -92,7 +95,7 @@ def agents(workspace_id, interactions=False):
             "session": (agent.get("agent_session") or {}).get("value"),
         }
         for agent in herdr("agent", "list")["agents"]
-        if agent.get("workspace_id") == workspace_id and agent.get("pane_id")
+        if agent.get("workspace_id") == live and agent.get("pane_id")
     ]
     if interactions:
         for agent in found:
@@ -1009,15 +1012,54 @@ def resume(workspace_id, session_id, text, home):
             raise ValueError("The session's directory no longer exists")
         # Always a fresh pane, as launches use: an existing shell may hold a half-typed
         # line or a program that replaced it, and typing would join or feed it.
-        anchor = next(
-            (p["pane_id"] for p in herdr("pane", "list", "--workspace", workspace_id)["panes"]),
-            None,
+        live = workspace_viewer.live_workspace(workspace_id)
+        pane = None
+        if live is None:
+            # The workspace was closed since the viewer opened: open one on its checkout
+            # again, whose first pane is a new shell.
+            live, pane = reopen(root)
+            if agents(workspace_id):
+                raise ValueError(
+                    "An agent is already running in this workspace; send to it instead"
+                )
+        if pane is None:
+            anchor = next(
+                (p["pane_id"] for p in herdr("pane", "list", "--workspace", live)["panes"]),
+                None,
+            )
+            if anchor is None:
+                raise ValueError("That herdr workspace has no pane to split")
+            split = herdr(
+                "pane", "split", anchor, "--direction", "right", "--cwd", cwd, "--no-focus"
+            )
+            return launch(workspace_id, chosen, split["pane"]["pane_id"], text, home)
+        # A reopened workspace's shell starts in the checkout, not the session's directory.
+        return launch(workspace_id, chosen, pane, text, home, cwd=None if cwd == root else cwd)
+
+
+def reopen(root):
+    """Open a herdr workspace on a checkout again; its ID, and its new shell pane if any.
+
+    A linked worktree opens under its clone, as `wt` opens it; a clone's own checkout gets
+    a workspace of its own. An open that finds one already there gives no pane to type in.
+    """
+    common = Path(
+        workspace_viewer.git_text(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    if common == Path(root) / ".git":
+        opened = herdr("workspace", "create", "--cwd", root, "--no-focus")
+    else:
+        opened = herdr(
+            "worktree", "open", "--cwd", str(common.parent), "--path", root, "--no-focus"
         )
-        if anchor is None:
-            raise ValueError("That herdr workspace has no pane to split")
-        split = herdr("pane", "split", anchor, "--direction", "right", "--cwd", cwd, "--no-focus")
-        pane = split["pane"]["pane_id"]
-        return launch(workspace_id, chosen, pane, text, home)
+    pane = (opened.get("root_pane") or {}).get("pane_id")
+    live = (opened.get("workspace") or {}).get("workspace_id") or (
+        pane.split(":")[0] if isinstance(pane, str) and ":" in pane else None
+    )
+    if not live:
+        raise ValueError("herdr did not report the reopened workspace; open it in Collie")
+    # One that was already open may hold a shell in use: that one gets a split.
+    return live, None if opened.get("already_open") else pane
 
 
 def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None):

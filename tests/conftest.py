@@ -44,7 +44,9 @@ elif a[:2] == ['worktree','open']:
  existing=next((w for w in data['workspaces'] if w['worktree']['checkout_path']==path),None)
  if existing: wid=existing['workspace_id']
  else:
-  wid='w'+str(len(data['workspaces'])+1)
+  n=len(data['workspaces'])+1
+  while any(w['workspace_id']=='w'+str(n) for w in data['workspaces']): n+=1
+  wid='w'+str(n)
   data['workspaces'].append({'workspace_id':wid,'label':a[a.index('--label')+1] if '--label' in a else 'Reopened','agent_status':'unknown','worktree':{'repo_root':root,'checkout_path':path}})
  result={'already_open':bool(existing),'root_pane':{'pane_id':wid+':p1'}}
  if os.environ.get('FAKE_HERDR_NO_ROOT'): result={'already_open':False}

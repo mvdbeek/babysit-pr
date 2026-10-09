@@ -1034,7 +1034,13 @@
         byId("ws-message-status").textContent = "A saved draft for another checkout was discarded.";
       }
       draft.path = value.path;
-      if (value.url !== collieUrl) {
+      if (value.workspace && value.workspace !== entry.workspace) {
+        // Reopened under a new ID: follow it, and move the draft along.
+        storeDraft(entry, { comments: [], message: "", files: [] });
+        entry.workspace = value.workspace;
+        saveDraft();
+      }
+      if ((value.url || null) !== collieUrl) {
         collieUrl = value.url || null;
         renderLinks(entry.links);
       }
