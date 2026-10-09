@@ -211,8 +211,11 @@
     started.append(open);
     const result = node("td");
     result.append(badge(run.status));
-    if (run.message && (run.status !== "running" || run.kind === "agent"))
-      result.append(node("small", run.message));
+    if (run.message && (run.status !== "running" || run.kind === "agent")) {
+      const message = node("small");
+      message.append(window.collieText(run.message, run.agent_run?.url));
+      result.append(message);
+    }
     row.append(
       started,
       node("td", TRIGGERS[run.trigger] || run.trigger),
@@ -364,7 +367,13 @@
     );
     const head = [title, node("p", meta.join(" · "), "pr-sync")];
     head.push(node("pre", agent ? job.prompt : job.command, "cron-command"), actions);
-    if (jobErrors.has(job.id)) head.push(node("p", jobErrors.get(job.id), "cron-job-error"));
+    if (jobErrors.has(job.id)) {
+      // Runs are newest first: an error about an agent points at its latest workspace.
+      const error = node("p", undefined, "cron-job-error");
+      const latest = (job.runs || []).find((run) => run.agent_run?.url);
+      error.append(window.collieText(jobErrors.get(job.id), latest?.agent_run.url));
+      head.push(error);
+    }
     if (job.enabled && job.upcoming?.length) {
       head.push(
         node(
@@ -551,6 +560,10 @@
     branch.maxLength = 100;
     const base = text("cron-base", job?.base, "The clone’s current commit");
     const { agent, model, effort, account, settingsNote, docker, dockerLabel } = fields;
+    // Effort defaults follow the chosen repository.
+    const project = () => repos[Number(repo.value)]?.repo ?? null;
+    fields.setRepo(project());
+    repo.addEventListener("change", () => fields.setRepo(project()));
     // agentFields names its controls for the New task dialog; this one has its own.
     agent.id = "cron-agent";
     model.id = "cron-model";
@@ -560,12 +573,16 @@
     // A saved setting the current choices lack (an uncached model, a removed account)
     // stays selected, so editing something else does not quietly drop it.
     const keep = (select, value) => {
+      // A job saved on a hidden default login opens on the named login that is the same one.
+      if (!value && ![...select.options].some((option) => option.value === ""))
+        value = [...select.options].find((option) => "default" in option.dataset)?.value;
       if (value && ![...select.options].some((option) => option.value === value)) {
         const option = node("option", `${value} (not listed)`);
         option.value = value;
         select.append(option);
       }
-      select.value = value || "";
+      if (value || [...select.options].some((option) => option.value === ""))
+        select.value = value || "";
     };
     if (job?.agent) {
       agent.value = job.agent;
@@ -600,7 +617,7 @@
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    parts.push(settingsNote, dockerLabel);
+    parts.push(settingsNote, fields.effortDefaults, dockerLabel);
     field("Prompt", prompt);
     parts.push(
       node(

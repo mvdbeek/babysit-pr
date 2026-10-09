@@ -1,0 +1,48 @@
+:root {
+  color-scheme: light dark;
+  font:
+    16px/1.5 system-ui,
+    sans-serif;
+}
+body {
+  margin: 0;
+}
+main {
+  max-width: 680px;
+  margin: 32px auto;
+  padding: 0 24px 48px;
+}
+label {
+  display: block;
+  margin-top: 16px;
+  font-weight: 600;
+}
+input:not([type="checkbox"]),
+select,
+textarea {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 10px;
+  font: inherit;
+}
+button,
+.button {
+  display: inline-block;
+  padding: 10px 14px;
+  margin: 16px 8px 0 0;
+  font: inherit;
+  cursor: pointer;
+}
+textarea {
+  min-height: 120px;
+}
+#status {
+  white-space: pre-wrap;
+}
+small,
+.note {
+  opacity: 0.8;
+}
+[hidden] {
+  display: none !important;
+}

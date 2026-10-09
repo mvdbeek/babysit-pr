@@ -6,10 +6,10 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "lint": "eslint assets/dashboard/*.js scripts/test_dashboard_feedback.cjs",
+    "lint": "eslint assets/dashboard/*.js extension/*.js scripts/test_dashboard_feedback.cjs scripts/test_extension.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node scripts/test_dashboard_feedback.cjs"
+    "test": "node scripts/test_dashboard_feedback.cjs && node scripts/test_extension.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

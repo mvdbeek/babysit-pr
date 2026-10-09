@@ -76,7 +76,7 @@ _lock = threading.Lock()
 _details: dict[str, tuple[tuple, dict | None]] = {}
 DETAIL_FILES = 5000
 _parsers: dict[str, "Transcript"] = {}
-_checkouts: dict[str, tuple[float, str]] = {}
+_checkouts: dict[str, tuple[float, str, frozenset[str]]] = {}
 CHECKOUT_TTL = 30
 PARSED_FILES = 4
 
@@ -156,7 +156,9 @@ def git_text(path, *args):
 def workspace_checkout(workspace_id):
     """The checkout a herdr workspace was opened on, the same one Collie shows.
 
-    Remembered briefly: an open transcript asks again every few seconds.
+    Remembered briefly: an open transcript asks again every few seconds. Once seen, a
+    workspace's checkout outlives it, so a viewer left open across a close (or a reopen,
+    which gets a new ID) keeps its diff, transcript and sessions.
     """
     if not isinstance(workspace_id, str) or not WORKSPACE_ID.match(workspace_id):
         raise ValueError("Supply a herdr workspace")
@@ -164,32 +166,80 @@ def workspace_checkout(workspace_id):
         cached = _checkouts.get(workspace_id)
     if cached and time.monotonic() - cached[0] < CHECKOUT_TTL and Path(cached[1]).is_dir():
         return cached[1]
-    root = resolve_workspace(workspace_id)
-    with _lock:
-        _checkouts[workspace_id] = (time.monotonic(), root)
-        while len(_checkouts) > 200:
-            _checkouts.pop(next(iter(_checkouts)), None)
+    spaces = herdr("workspace", "list")["workspaces"]
+    root = resolve_workspace(workspace_id, spaces, cached[1] if cached else None)
+    remember(workspace_id, root, spaces)
     return root
 
 
-def resolve_workspace(workspace_id):
-    space = next(
-        (
-            w
-            for w in herdr("workspace", "list")["workspaces"]
-            if w.get("workspace_id") == workspace_id
-        ),
-        None,
-    )
-    if space is None:
-        raise ValueError("That herdr workspace is not open; refresh")
+def remember(workspace_id, root, spaces):
+    """Note a workspace's checkout, and the other workspaces on it while it is open.
+
+    Those others are never taken for it once it closes: a clone's own checkout often
+    holds several unrelated workspaces.
+    """
+    with _lock:
+        _, known, others = _checkouts.pop(workspace_id, (0, None, frozenset()))
+        if known != root:
+            others = frozenset()
+        if any(w.get("workspace_id") == workspace_id for w in spaces):
+            others |= {
+                w["workspace_id"]
+                for w in spaces
+                if w.get("workspace_id") != workspace_id and checkout_of(w) == root
+            }
+        # Re-inserted last, so the newest is evicted last.
+        _checkouts[workspace_id] = (time.monotonic(), root, others)
+        while len(_checkouts) > 200:
+            _checkouts.pop(next(iter(_checkouts)), None)
+
+
+def checkout_of(space):
+    """The resolved checkout a listed herdr workspace was opened on, if it still exists."""
     path = (space.get("worktree") or {}).get("checkout_path")
-    if not path or not Path(path).is_dir():
-        raise ValueError("That herdr workspace has no checkout to show")
-    root = Path(path).resolve()
-    if Path(git_text(root, "rev-parse", "--show-toplevel")).resolve() != root:
+    return str(Path(path).resolve()) if path and Path(path).is_dir() else None
+
+
+def resolve_workspace(workspace_id, spaces, known=None):
+    space = next((w for w in spaces if w.get("workspace_id") == workspace_id), None)
+    if space is not None:
+        root = checkout_of(space)
+        if root is None:
+            raise ValueError("That herdr workspace has no checkout to show")
+    elif known and Path(known).is_dir():
+        # Closed since it was last seen: its checkout is still the one to show.
+        root = known
+    else:
+        raise ValueError("That herdr workspace is not open; refresh")
+    if Path(git_text(root, "rev-parse", "--show-toplevel")).resolve() != Path(root):
         raise ValueError("That herdr workspace is not at the top of a Git checkout")
-    return str(root)
+    return root
+
+
+def live_workspace(workspace_id):
+    """The open herdr workspace for the checkout this ID names, or None.
+
+    That is the workspace itself while it is open. Once it is closed, it is the one
+    workspace opened on the same checkout since (herdr gives a reopened workspace a new
+    ID); with none, or several to choose from, there is none.
+    """
+    root = workspace_checkout(workspace_id)
+    spaces = herdr("workspace", "list")["workspaces"]
+    own = next((w for w in spaces if w.get("workspace_id") == workspace_id), None)
+    if own is not None:
+        if checkout_of(own) != root:
+            # The ID now names another checkout: never act on the remembered one.
+            raise ValueError("That herdr workspace now shows another checkout; refresh")
+        remember(workspace_id, root, spaces)
+        return workspace_id
+    with _lock:
+        others = _checkouts.get(workspace_id, (0, None, frozenset()))[2]
+    since = [
+        w["workspace_id"]
+        for w in spaces
+        if checkout_of(w) == root and w.get("workspace_id") not in others
+    ]
+    return since[0] if len(since) == 1 else None
 
 
 def bases(path):

@@ -3,7 +3,9 @@
 A message goes to one agent pane of the named workspace through `herdr agent prompt`,
 which types it and presses Enter only while the pane hosts a recognized agent, so text
 never reaches a plain shell. Nothing is sent to an agent waiting on a dialog, and
-sending does not change the agent's Docker access.
+sending does not change the agent's Docker access. A Claude agent that herdr reports
+as blocked while its screen shows an empty prompt box (and no dialog) is idle in fact;
+the message is then pasted into that box and submitted.
 
 When no agent runs there (usually it exited after finishing), the message can instead
 resume one of the sessions recorded in that checkout: the agent's own resume command,
@@ -29,6 +31,7 @@ from pathlib import Path
 import agent_docker
 import claude_accounts
 import claude_runner
+import herdr_handoff
 import workspace_viewer
 import wt
 from pr_workspaces import herdr, run
@@ -54,6 +57,12 @@ ENDED_WATCHES = {"closed", "stopped"}
 # follows, where 1 submits. Each step waits for the dialog to show what it expects.
 DIALOG_WAIT = 4
 RULE = re.compile(r"^\s*─{8,}\s*$")
+# Newer Claude Code sets a question's text off with a quote bar.
+QUOTE = re.compile(r"^(\s*)│ ?")
+# Any other Claude dialog of numbered options (a permission prompt, a plan approval)
+# takes the option's number key, which picks it and closes or advances the dialog.
+OPTION = re.compile(r"\s*(?:❯\s*)?(\d)\.\s+(.+?)\s*")
+DIALOG_HINTS = ("esc to cancel", "enter to select", "enter to confirm")
 MAX_ANSWER = 2000
 # How long a stop waits for the agent to leave its turn, in milliseconds.
 STOP_WAIT = 5000
@@ -74,7 +83,10 @@ def agents(workspace_id, interactions=False):
 
     Only a workspace on a Git checkout qualifies, the same ones the viewer shows.
     """
-    workspace_viewer.workspace_checkout(workspace_id)  # Validates the workspace exists.
+    # Follows the checkout: a closed workspace has none, a reopened one has a new ID.
+    live = workspace_viewer.live_workspace(workspace_id)
+    if live is None:
+        return []
     found = [
         {
             "pane": agent["pane_id"],
@@ -85,7 +97,7 @@ def agents(workspace_id, interactions=False):
             "session": (agent.get("agent_session") or {}).get("value"),
         }
         for agent in herdr("agent", "list")["agents"]
-        if agent.get("workspace_id") == workspace_id and agent.get("pane_id")
+        if agent.get("workspace_id") == live and agent.get("pane_id")
     ]
     if interactions:
         for agent in found:
@@ -116,7 +128,7 @@ def sessions(workspace_id, home=None):
     ]
 
 
-def send(request, home=None):
+def send(request, home=None, *, expected_session=None):
     """Submit one message to one agent of a workspace; report what herdr saw."""
     if set(request) - {"workspace", "pane", "text", "resume"}:
         raise ValueError("Invalid message parameters")
@@ -141,6 +153,8 @@ def send(request, home=None):
     target = next((agent for agent in running if agent["pane"] == pane), None)
     if target is None:
         raise ValueError("That agent is no longer running; refresh")
+    if expected_session is not None and target.get("session") != expected_session:
+        raise ValueError("The agent session changed; reload the agent list")
     with _resume_lock:
         return prompt(target, text)
 
@@ -243,10 +257,12 @@ def prompt(target, text):
     """Type the message into a running agent's pane and submit it."""
     pane = target["pane"]
     if target["status"] == "blocked":
-        raise ValueError(
-            "The agent is waiting on a question or approval; "
-            "use the transcript question card, or answer it in Collie"
-        )
+        if target["agent"] != "claude" or not idle_screen(pane):
+            raise ValueError(
+                "The agent is waiting on a question or approval; "
+                "use the transcript question card, or answer it in Collie"
+            )
+        return paste(pane, text)
     try:
         # Wait only until the agent reacts (starts working or asks something), not for
         # the turn to end; herdr reports a stall when it shows no reaction in 5 s.
@@ -353,8 +369,151 @@ def interrupt(request):
     return {"stopped": True, "pane": pane, "warning": None}
 
 
+def paste(pane, text):
+    """Submit a message through the prompt box of an agent herdr wrongly calls blocked.
+
+    `herdr agent prompt` refuses a blocked agent, so the text is pasted (bracketed, as
+    herdr does, so newlines do not submit early) and Enter pressed once the prompt box
+    shows it. A dialog that opened meanwhile never gets that Enter.
+    """
+    # Dialog choices type into the same pane; neither interleaves with the other.
+    with _answer_lock:
+        if not idle_screen(pane):
+            raise ValueError("The agent is waiting on a question or approval; answer it first")
+        run("herdr", "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~")
+        if not wait_for(pane, lambda screen: pasted(screen, text), read=herdr_handoff.read_screen):
+            raise ValueError(f"The text did not appear in the prompt box; {UNCERTAIN}")
+        herdr("agent", "send-keys", pane, "enter")
+    return {"sent": True, "pane": pane, "warning": None}
+
+
+def pasted(screen, text):
+    """Whether Claude's prompt box, under its rule and with no dialog, holds the text."""
+    lines = herdr_handoff.SGR.sub("", screen).splitlines()
+    tail = "\n".join(lines[-12:]).lower()
+    if any(hint in tail for hint in (*DIALOG_HINTS, "esc to interrupt")):
+        return False
+    prompts = [i for i, line in enumerate(lines) if line.lstrip().startswith("❯")]
+    if not prompts or prompts[-1] == 0 or not RULE.match(lines[prompts[-1] - 1]):
+        return False
+    shown = squash(lines[prompts[-1]].lstrip()[1:])
+    start = squash(text)[:20]
+    return bool(shown) and (shown.startswith("[Pasted text") or shown.startswith(start))
+
+
+def idle_screen(pane, screen=None):
+    """Whether the pane shows Claude's empty prompt box and no dialog below it."""
+    if screen is None:
+        screen = herdr_handoff.read_screen(pane)
+    plain = herdr_handoff.SGR.sub("", screen)
+    tail = "\n".join(plain.splitlines()[-12:]).lower()
+    # A turn in progress also shows an empty box, above "esc to interrupt".
+    return herdr_handoff.empty_claude_composer(screen) and not any(
+        hint in tail for hint in (*DIALOG_HINTS, "esc to interrupt")
+    )
+
+
 def squash(text):
     return " ".join(text.split())
+
+
+def last_run(numbered):
+    """The options proper: the numbered lines from the last "1.", after any numbered
+    list in the dialog's own text."""
+    firsts = [k for k, (_, n, _) in enumerate(numbered) if n == 1]
+    return numbered[firsts[-1] :] if firsts else numbered
+
+
+def unquote(line):
+    return QUOTE.sub(r"\1", line)
+
+
+def dialog_lines(lines):
+    """The lines of the dialog ending the screen, between its top rule and key hints.
+
+    A rule that sets off a "Chat about this" option is inside the dialog, not its top.
+    """
+    hints = [i for i, line in enumerate(lines) if "esc to cancel" in line.lower()]
+    if not hints or any(line.strip() for line in lines[hints[-1] + 1 :][2:]):
+        return []
+    end = hints[-1]
+    rules = [
+        i
+        for i, line in enumerate(lines[:end])
+        if RULE.match(line) and "Chat about this" not in "".join(lines[i + 1 : i + 2])
+    ]
+    return lines[rules[-1] + 1 : end] if rules else []
+
+
+def screen_choices(lines):
+    """A Claude dialog whose options can each be picked from the dashboard.
+
+    Numbered options take their number key. A list without numbers (the folder trust
+    prompt) takes arrow keys to its "❯" cursor, then Enter. Multiple-choice check boxes
+    and an open text field need more, so they are left to Collie; a "Type something."
+    option needs typing and is not offered.
+    """
+    body = dialog_lines(lines)
+    if not body or any("ctrl+g to edit" in line for line in lines[-6:]):
+        return None
+    matches = [(i, OPTION.fullmatch(line)) for i, line in enumerate(body)]
+    numbered = last_run([(i, int(m[1]), m[2]) for i, m in matches if m])
+    if len(numbered) >= 2:
+        if [n for _, n, _ in numbered] != list(range(1, len(numbered) + 1)) or any(
+            re.match(r"\[.\]", label) for _, _, label in numbered
+        ):
+            return None
+        first = numbered[0][0]
+        options = [(str(n), label) for _, n, label in numbered if label != "Type something."]
+        arrows, cursor = False, None
+    else:
+        listed = cursor_options(body, lines)
+        if not listed:
+            return None
+        first, labels, cursor = listed
+        options = [(str(n), label) for n, label in enumerate(labels, 1)]
+        arrows = True
+    text = [line.rstrip() for line in body[:first]]
+    while text and not text[0].strip():
+        text.pop(0)
+    indent = min((len(t) - len(t.lstrip()) for t in text if t.strip()), default=0)
+    # The cursor moves when the user looks through the options; that is the same dialog.
+    shown = [squash(line.replace("❯", " ")) for line in body]
+    return {
+        "id": "dialog:" + hashlib.sha256(json.dumps(shown).encode()).hexdigest(),
+        "text": "\n".join(t[indent:] for t in text).strip(),
+        "options": [{"key": key, "label": label} for key, label in options],
+        "arrows": arrows,
+        "cursor": cursor,
+    }
+
+
+def cursor_options(body, lines):
+    """An unnumbered option list: the lines aligned with the one the "❯" cursor marks.
+
+    Returns where it starts, its labels and the cursor's option, or None. A wrapped
+    label would read as two options; the cursor check before Enter catches that.
+    """
+    hints = "\n".join(lines[-4:]).lower()
+    if "enter to confirm" not in hints and "enter to select" not in hints:
+        return None
+    marked = [i for i, line in enumerate(body) if line.lstrip().startswith("❯")]
+    if len(marked) != 1:
+        return None
+
+    def column(line):
+        return len(line) - len(line.lstrip().removeprefix("❯").lstrip())
+
+    at = marked[0]
+    start, end = at, at + 1
+    while start > 0 and body[start - 1].strip() and column(body[start - 1]) == column(body[at]):
+        start -= 1
+    while end < len(body) and body[end].strip() and column(body[end]) == column(body[at]):
+        end += 1
+    labels = [line.lstrip().removeprefix("❯").strip() for line in body[start:end]]
+    if len(labels) < 2 or len(labels) > 9:
+        return None
+    return start, labels, at - start + 1
 
 
 def live_interaction(target):
@@ -364,10 +523,13 @@ def live_interaction(target):
     from the screen. Other dialogs remain visible without guessing their controls.
     """
     screen = run("herdr", "agent", "read", target["pane"], "--source", "visible")
-    result = {"screen": screen, "question": None}
+    result = {"screen": screen, "question": None, "choices": None, "idle": False}
     if target["agent"] != "claude" or not target.get("session"):
         return result
-    lines = screen.splitlines()
+    lines = [unquote(line) for line in screen.splitlines()]
+    result["choices"] = screen_choices(lines)
+    if not result["choices"]:
+        result["idle"] = idle_screen(target["pane"])
     rules = [i for i, line in enumerate(lines) if RULE.match(line)]
     if len(rules) < 2 or "Esc to cancel" not in screen or "ctrl+g to edit" in screen:
         return result
@@ -380,9 +542,10 @@ def live_interaction(target):
         return result
     numbered = []
     for index, line in enumerate(body[1:], 1):
-        match = re.fullmatch(r"\s*(?:❯\s*)?(\d)\.\s+(.+?)\s*", line)
+        match = OPTION.fullmatch(line)
         if match:
             numbered.append((index, int(match[1]), match[2]))
+    numbered = last_run(numbered)
     if (
         len(numbered) < 2
         or numbered[-1][2] != "Type something."
@@ -406,6 +569,7 @@ def live_interaction(target):
     if not question["question"]:
         return result
     signature = hashlib.sha256(json.dumps(question, sort_keys=True).encode()).hexdigest()
+    result["choices"] = None
     result["question"] = {
         "id": f"screen:{signature}",
         "name": "AskUserQuestion",
@@ -422,7 +586,8 @@ def dialog(pane):
     It starts at the last rule above it, skipping the one that sets off its "Chat about
     this" line, and ends with its key hints (the review tab has none).
     """
-    lines = run("herdr", "agent", "read", pane, "--source", "visible").splitlines()
+    screen = run("herdr", "agent", "read", pane, "--source", "visible")
+    lines = [unquote(line) for line in screen.splitlines()]
     hints = [i for i, line in enumerate(lines) if "Esc to cancel" in line]
     end = hints[-1] + 1 if hints else len(lines)
     rules = [
@@ -586,6 +751,43 @@ def answer_locked(request):
         # Something was typed: never invite answering again from the start.
         raise ValueError(f"Answered in part ({exc}); finish the question in Collie") from exc
     return {"answered": True, "pane": pane}
+
+
+def choose(request):
+    """Pick one option of the Claude dialog on an agent's screen, by its number key."""
+    with _answer_lock:
+        if set(request) != {"workspace", "pane", "session", "dialog", "option"} or not all(
+            isinstance(request[k], str) and request[k] for k in request
+        ):
+            raise ValueError("Invalid choice parameters")
+        pane = request["pane"]
+        target = next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
+        if target is None or target["agent"] != "claude" or target["session"] != request["session"]:
+            raise ValueError("That agent session is no longer running in this pane; refresh")
+        if target["status"] != "blocked":
+            raise ValueError("The agent is not waiting on a dialog; refresh")
+        choices = live_interaction(target)["choices"]
+        if not choices or choices["id"] != request["dialog"]:
+            raise ValueError("The dialog on the agent's screen changed; refresh")
+        if request["option"] not in {option["key"] for option in choices["options"]}:
+            raise ValueError("Choose one of the dialog's options")
+        if not choices["arrows"]:
+            herdr("agent", "send-keys", pane, request["option"])
+            return {"chosen": True, "pane": pane}
+        wanted = int(request["option"])
+        moves = wanted - choices["cursor"]
+        for _ in range(abs(moves)):
+            herdr("agent", "send-keys", pane, "down" if moves > 0 else "up")
+
+        def on_target(_):
+            moved = live_interaction(target)["choices"]
+            return bool(moved) and moved["id"] == choices["id"] and moved["cursor"] == wanted
+
+        # Only the cursor moved so far; Enter goes only to the dialog and option chosen.
+        if not wait_for(pane, on_target, read=lambda _: None):
+            raise ValueError("The cursor did not reach that option; nothing was confirmed")
+        herdr("agent", "send-keys", pane, "enter")
+        return {"chosen": True, "pane": pane}
 
 
 def codex_dialog(pane):
@@ -760,6 +962,7 @@ def open_elsewhere(session_id):
         (
             {
                 "pane": agent["pane_id"],
+                "agent": agent.get("agent"),
                 "status": agent.get("agent_status"),
                 "session": session_id,
             }
@@ -818,15 +1021,54 @@ def resume(workspace_id, session_id, text, home):
             raise ValueError("The session's directory no longer exists")
         # Always a fresh pane, as launches use: an existing shell may hold a half-typed
         # line or a program that replaced it, and typing would join or feed it.
-        anchor = next(
-            (p["pane_id"] for p in herdr("pane", "list", "--workspace", workspace_id)["panes"]),
-            None,
+        live = workspace_viewer.live_workspace(workspace_id)
+        pane = None
+        if live is None:
+            # The workspace was closed since the viewer opened: open one on its checkout
+            # again, whose first pane is a new shell.
+            live, pane = reopen(root)
+            if agents(workspace_id):
+                raise ValueError(
+                    "An agent is already running in this workspace; send to it instead"
+                )
+        if pane is None:
+            anchor = next(
+                (p["pane_id"] for p in herdr("pane", "list", "--workspace", live)["panes"]),
+                None,
+            )
+            if anchor is None:
+                raise ValueError("That herdr workspace has no pane to split")
+            split = herdr(
+                "pane", "split", anchor, "--direction", "right", "--cwd", cwd, "--no-focus"
+            )
+            return launch(workspace_id, chosen, split["pane"]["pane_id"], text, home)
+        # A reopened workspace's shell starts in the checkout, not the session's directory.
+        return launch(workspace_id, chosen, pane, text, home, cwd=None if cwd == root else cwd)
+
+
+def reopen(root):
+    """Open a herdr workspace on a checkout again; its ID, and its new shell pane if any.
+
+    A linked worktree opens under its clone, as `wt` opens it; a clone's own checkout gets
+    a workspace of its own. An open that finds one already there gives no pane to type in.
+    """
+    common = Path(
+        workspace_viewer.git_text(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    if common == Path(root) / ".git":
+        opened = herdr("workspace", "create", "--cwd", root, "--no-focus")
+    else:
+        opened = herdr(
+            "worktree", "open", "--cwd", str(common.parent), "--path", root, "--no-focus"
         )
-        if anchor is None:
-            raise ValueError("That herdr workspace has no pane to split")
-        split = herdr("pane", "split", anchor, "--direction", "right", "--cwd", cwd, "--no-focus")
-        pane = split["pane"]["pane_id"]
-        return launch(workspace_id, chosen, pane, text, home)
+    pane = (opened.get("root_pane") or {}).get("pane_id")
+    live = (opened.get("workspace") or {}).get("workspace_id") or (
+        pane.split(":")[0] if isinstance(pane, str) and ":" in pane else None
+    )
+    if not live:
+        raise ValueError("herdr did not report the reopened workspace; open it in Collie")
+    # One that was already open may hold a shell in use: that one gets a split.
+    return live, None if opened.get("already_open") else pane
 
 
 def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None):

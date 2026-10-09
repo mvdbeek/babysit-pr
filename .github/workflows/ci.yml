@@ -31,7 +31,7 @@ jobs:
       - run: uv run --locked tox -e lint,format,types,skill,frontend
 
   tests:
-    name: Unit, browser and coverage
+    name: Unit and browser tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -43,8 +43,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
       - name: Install Chromium system dependencies
         run: uv run --locked playwright install-deps chromium
-      - run: uv run --locked tox -e unit,browser,coverage
-      # Coverage (reports/coverage, reports/coverage.xml) and failed browser screenshots.
+      # The Chromium build follows the locked Playwright version.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - run: uv run --locked tox -e unit,browser
+      # Failed browser screenshots.
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v7

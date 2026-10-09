@@ -283,6 +283,12 @@ function closeOnBackdropClick(dialog) {
     pressedOnBackdrop = false;
   };
 }
+// `text` with any mention of Collie linking the workspace at `url`, as an `tag` element.
+function collieNote(tag, text, url, className) {
+  const node = el(tag, undefined, className);
+  node.append(window.collieText(text, url));
+  return node;
+}
 function link(label, url) {
   const node = el("a", label);
   try {
@@ -1999,7 +2005,8 @@ function workspaceControls(item) {
     cell.append(menu);
     if (matches[0].linked_pr) cell.append(el("small", `Via PR #${matches[0].linked_pr}`));
   }
-  if (info?.operation) cell.append(el("small", info.operation.message));
+  if (info?.operation)
+    cell.append(collieNote("small", info.operation.message, info.operation.result?.url));
   if (info?.scheduled?.length)
     cell.append(el("small", `Scheduled for ${scheduleTime(info.scheduled[0].start_at)}`));
   return cell;
@@ -2160,7 +2167,21 @@ function quotaLeft(entry) {
 }
 const usageId = (agent, account) =>
   agent === "codex" ? "codex" : `claude:${account || "default"}`;
-function agentFields() {
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+function savedEfforts() {
+  return workspaceData.effort_defaults ?? { effort: null, repos: {} };
+}
+// The saved effort a launch in `repo` left on Default uses, as [level, repo it was saved
+// for or null], skipping levels the agent and model lack, as the server does.
+function savedEffort(repo, levels) {
+  const saved = savedEfforts();
+  const own = repo ? saved.repos[repo.toLowerCase()] : null;
+  if (own && levels.includes(own)) return [own, repo];
+  if (saved.effort && levels.includes(saved.effort)) return [saved.effort, null];
+  return [null, null];
+}
+// `repo` is the project the launch is for; `mixed` launches in several projects.
+function agentFields({ repo = null, mixed = false } = {}) {
   const usage = window.dashboardUsage;
   const agent = el("select");
   agent.id = "workspace-agent";
@@ -2185,27 +2206,109 @@ function agentFields() {
       select.append(option);
     }
   }
-  function updateEfforts() {
+  function levels() {
     const choices = workspaceData.agent_choices?.[agent.value];
     const selected = choices?.models.find((choice) => choice.id === model.value);
+    return selected ? selected.efforts : (choices?.efforts ?? []);
+  }
+  function updateEfforts() {
     const previous = effort.value;
-    options(effort, selected ? selected.efforts : (choices?.efforts ?? []));
+    options(effort, levels());
+    const [level, from] = savedEffort(repo, levels());
+    if (level && !mixed) effort.options[0].textContent = `Default (${level})`;
     if ([...effort.options].some((option) => option.value === previous)) effort.value = previous;
     syncSelect(effort);
     settingsNote.textContent =
       !model.value && effort.value
         ? "Effort support depends on the agent’s configured model."
-        : "Default keeps the agent’s configured setting.";
+        : mixed && Object.keys(savedEfforts().repos).length
+          ? "Default effort is each project’s saved default, else the setting below."
+          : level
+            ? `Default effort is ${level}, saved for ${from || "all projects"}.` +
+              (model.value ? "" : " Support depends on the agent’s configured model.")
+            : "Default keeps the agent’s configured setting.";
+  }
+  // Saved defaults for every project and for this one; a launch left on Default uses them.
+  const effortDefaults = el("details", undefined, "effort-defaults");
+  function renderEffortDefaults() {
+    const saved = savedEfforts();
+    const known = new Set(
+      Object.values(workspaceData.agent_choices ?? {}).flatMap((choices) => choices.efforts ?? []),
+    );
+    const scopes = [[null, "All projects", "Agent’s own setting", saved.effort]];
+    if (repo && !mixed)
+      scopes.push([repo, repo, "Same as all projects", saved.repos[repo.toLowerCase()]]);
+    const selects = scopes.map(([scope, text, none, current]) => {
+      const select = el("select");
+      for (const value of ["", ...EFFORT_ORDER.filter((level) => known.has(level))]) {
+        const option = el("option", value || none);
+        option.value = value;
+        select.append(option);
+      }
+      select.value = current || "";
+      select.setAttribute("aria-label", `Default effort for ${scope || "all projects"}`);
+      const label = el("label", undefined, "effort-default");
+      label.append(`${text} `, select);
+      return { scope, select, label, current: current || "" };
+    });
+    const status = el("small", "", "effort-default-status");
+    status.setAttribute("role", "status");
+    const save = el("button", "Save defaults");
+    save.type = "button";
+    save.onclick = async () => {
+      save.disabled = true;
+      status.textContent = "Saving…";
+      try {
+        for (const { scope, select, current } of selects) {
+          if (select.value === current) continue;
+          const response = await fetch("/api/effort-default", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Babysit-Action": "effort-default" },
+            body: JSON.stringify({ ...(scope ? { repo: scope } : {}), effort: select.value }),
+          });
+          const value = await response.json();
+          if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+          workspaceData.effort_defaults = value.effort_defaults;
+        }
+        renderEffortDefaults();
+        effortDefaults.querySelector(".effort-default-status").textContent = "Saved.";
+        updateEfforts();
+      } catch (error) {
+        status.textContent = `Could not save: ${error.message}`;
+        save.disabled = false;
+      }
+    };
+    effortDefaults.replaceChildren(
+      el("summary", "Effort defaults"),
+      el("small", "Used when Reasoning effort is left on Default; a project’s own wins."),
+      ...selects.map((entry) => entry.label),
+      save,
+      status,
+    );
+  }
+  renderEffortDefaults();
+  // The project changed, as when another clone is picked.
+  function setRepo(value) {
+    if (value === repo) return;
+    repo = value;
+    renderEffortDefaults();
+    updateEfforts();
   }
   function updateModels() {
     const choices = workspaceData.agent_choices?.[agent.value];
     const label = (id, text) => text + quotaLeft(usage?.account(usageId("claude", id)));
-    account.replaceChildren(el("option", label("", "Default")));
-    account.firstChild.value = "";
-    for (const choice of choices?.accounts ?? []) {
-      if (choice.id === "default") continue;
+    const listed = choices?.accounts ?? [];
+    const named = listed.filter((choice) => choice.id !== "default");
+    account.replaceChildren();
+    // The server leaves the default login out when a named login is the same one.
+    if (!named.length || named.length < listed.length) {
+      account.append(el("option", label("", "Default")));
+      account.firstChild.value = "";
+    }
+    for (const choice of named) {
       const option = el("option", label(choice.id, choice.label));
       option.value = choice.id;
+      if (choice.default) option.dataset.default = "";
       account.append(option);
     }
     account.disabled = agent.value !== "claude";
@@ -2218,7 +2321,8 @@ function agentFields() {
     effort.value = "";
     updateEfforts();
     syncSelect(model);
-    if (agent.value === "codex" && !choices?.models.length)
+    // A saved default effort still applies without model choices; its note stays.
+    if (agent.value === "codex" && !choices?.models.length && !savedEffort(repo, levels())[0])
       settingsNote.textContent =
         choices?.note ??
         "Default keeps your settings. Codex model choices need its local model cache.";
@@ -2277,7 +2381,18 @@ function agentFields() {
   docker.type = "checkbox";
   const dockerLabel = el("label", undefined, "workspace-later");
   dockerLabel.append(docker, " Allow Docker in the agent’s sandbox");
-  return { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel };
+  return {
+    agent,
+    model,
+    effort,
+    account,
+    settingsNote,
+    usageNote,
+    docker,
+    dockerLabel,
+    effortDefaults,
+    setRepo,
+  };
 }
 // A Start later checkbox and the time it reveals. `startTime()` is null to start now,
 // the chosen time in seconds, or undefined after reporting an invalid time.
@@ -2400,8 +2515,17 @@ async function workspaceDialog(item, handling = "") {
         clone.value = "";
       }
       clone.required = true;
-      const { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel } =
-        agentFields();
+      const {
+        agent,
+        model,
+        effort,
+        account,
+        settingsNote,
+        usageNote,
+        docker,
+        dockerLabel,
+        effortDefaults,
+      } = agentFields({ repo: item.repo });
       const task = el("textarea");
       task.id = "workspace-task";
       task.required = true;
@@ -2429,7 +2553,7 @@ async function workspaceDialog(item, handling = "") {
       field("Model (optional)", model);
       field("Reasoning effort (optional)", effort);
       field("Claude account", account);
-      form.append(usageNote, settingsNote, dockerLabel);
+      form.append(usageNote, settingsNote, effortDefaults, dockerLabel);
       field("Task", task);
       form.append(promptHistory(task));
       const files = attachmentField(form, task);
@@ -2513,7 +2637,7 @@ async function workspaceDialog(item, handling = "") {
 }
 // A task with no PR or issue behind it, like `wtl`'s branch target: a new branch from a
 // base in any local clone, or, with a title, a GitHub issue filed first and then handled.
-async function newTaskDialog() {
+async function newTaskDialog(prefill = {}) {
   // Stands in for the dialog's item; its id becomes the operation's once one starts.
   const owner = { id: null, newTask: true };
   workspaceDialogItem = owner;
@@ -2567,8 +2691,22 @@ async function newTaskDialog() {
       );
       if (kept >= 0) repo.value = String(kept);
       syncSelect(repo);
+      repo.dispatchEvent(new Event("change"));
+    }
+    if (prefill.repo && !repos.some((choice) => choice.repo === prefill.repo)) {
+      everything = (await get("/api/workspace-repos?all=1")).repos;
+      if (workspaceDialogItem !== owner) return;
+      repos = everything;
     }
     fillRepos(repos);
+    const suggested = repos.findIndex((choice) => choice.repo === prefill.repo);
+    if (suggested >= 0) repo.value = String(suggested);
+    else if (prefill.repo) {
+      repo.selectedIndex = -1;
+      form.append(
+        el("p", `Choose a local clone for ${prefill.repo}; none was found automatically.`),
+      );
+    }
     field("Repository and local clone", repo);
     if (recent.idle) {
       const idle = el("input");
@@ -2616,12 +2754,14 @@ async function newTaskDialog() {
     name.maxLength = 100;
     name.pattern = "[A-Za-z0-9][A-Za-z0-9._\\-]*";
     name.placeholder = "fix-parser";
+    name.value = prefill.name || "";
     name.autocapitalize = "off";
     name.spellcheck = false;
     field("New branch", name, branchFields);
     const base = el("input");
     base.id = "new-task-base";
     base.placeholder = "The clone’s default branch";
+    base.value = prefill.base || "";
     base.autocapitalize = "off";
     base.spellcheck = false;
     field("Base branch (optional)", base, branchFields);
@@ -2633,18 +2773,30 @@ async function newTaskDialog() {
       title.required = fileIssue.checked;
       name.required = !fileIssue.checked;
     };
-    const { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel } =
-      agentFields();
+    const {
+      agent,
+      model,
+      effort,
+      account,
+      settingsNote,
+      usageNote,
+      docker,
+      dockerLabel,
+      effortDefaults,
+      setRepo,
+    } = agentFields({ repo: repos[Number(repo.value)]?.repo });
+    repo.addEventListener("change", () => setRepo(repos[Number(repo.value)]?.repo));
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    form.append(usageNote, settingsNote, dockerLabel);
+    form.append(usageNote, settingsNote, effortDefaults, dockerLabel);
     const task = el("textarea");
     task.id = "workspace-task";
     task.required = true;
     task.maxLength = 32000;
     task.rows = 6;
+    task.value = prefill.task || "";
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
     form.append(promptHistory(task));
@@ -2701,16 +2853,46 @@ async function newTaskDialog() {
   }
 }
 $("new-task").onclick = () => void newTaskDialog();
+function browserTaskHandoff() {
+  if (!window.location.hash.startsWith("#task=")) return;
+  const encoded = location.hash.slice(6);
+  // Consume the fragment before rendering; it never goes to the HTTP server.
+  history.replaceState(null, "", location.pathname + "#watcher");
+  try {
+    if (encoded.length > 200000) throw Error("The browser task is too large");
+    const value = JSON.parse(decodeURIComponent(encoded));
+    if (
+      !value ||
+      typeof value.task !== "string" ||
+      value.task.length > 32000 ||
+      (value.repo !== undefined && typeof value.repo !== "string") ||
+      (value.name !== undefined && typeof value.name !== "string") ||
+      (value.base !== undefined && typeof value.base !== "string")
+    )
+      throw Error("Invalid browser task");
+    void newTaskDialog(value);
+  } catch (error) {
+    $("navigation-status").hidden = false;
+    $("navigation-status").textContent = error.message;
+  }
+}
+window.addEventListener("hashchange", browserTaskHandoff);
+browserTaskHandoff();
 // Agent settings for other views (cron jobs), with the same choices as New task.
 window.dashboardAgents = {
-  async fields() {
+  async fields(options) {
     if (!workspaceData.agent_choices) await loadWorkspaces();
-    return agentFields();
+    return agentFields(options);
   },
   repositories: () => get("/api/workspace-repos?all=1"),
   searchable: searchableSelect,
   sync: syncSelect,
 };
+// The project a batch launches in, or mixed when its items span several.
+function projects(items) {
+  const repos = new Set(items.map((item) => item.repo?.toLowerCase()));
+  return repos.size === 1 ? { repo: items[0].repo } : { mixed: true };
+}
 // Replaced by each item's link when a batch is scheduled.
 const BATCH_URL = "{url}";
 // The scheduler's limit on waiting tasks.
@@ -2754,13 +2936,22 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
       label.htmlFor = input.id;
       form.append(label, input);
     }
-    const { agent, model, effort, account, settingsNote, usageNote, docker, dockerLabel } =
-      agentFields();
+    const {
+      agent,
+      model,
+      effort,
+      account,
+      settingsNote,
+      usageNote,
+      docker,
+      dockerLabel,
+      effortDefaults,
+    } = agentFields(projects(items));
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    form.append(usageNote, settingsNote, dockerLabel);
+    form.append(usageNote, settingsNote, effortDefaults, dockerLabel);
     let template = handleTasks[tasks[0]][1](BATCH_URL);
     if (tasks.length > 1) {
       const picker = el("select");
@@ -2953,6 +3144,7 @@ function updateWorkspaceOperation() {
   if (!workspaceDialogItem || !$("workspace-dialog").open) return;
   const op = workspaceInfo(workspaceDialogItem)?.operation;
   if (!op) return;
+  // The result below links Collie once the workspace is ready.
   $("workspace-progress").textContent = `${op.status}: ${op.message}`;
   $("workspace-log").textContent = op.log || "";
   if (op.result?.url)

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Send to Babysitter</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="compose.js" type="module"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Send to Babysitter</h1>
+      <a href="options.html" target="_blank" rel="noopener">Settings</a>
+      <button id="reload" type="button">Reload choices</button>
+      <form id="task-form">
+        <label for="mode">Send to</label>
+        <select id="mode">
+          <option value="new">New task</option>
+          <option value="target" disabled>GitHub PR or issue</option>
+          <option value="message">Existing agent</option>
+        </select>
+        <p id="target-note" class="note"></p>
+        <div id="launch-fields">
+          <label for="repo">Repository and local clone</label>
+          <select id="repo"></select>
+          <div id="branch-fields">
+            <label for="name">New branch</label>
+            <input
+              id="name"
+              pattern="[A-Za-z0-9][A-Za-z0-9._\-]*"
+              maxlength="100"
+              placeholder="fix-parser"
+            />
+            <label for="base">Base branch (optional)</label>
+            <input id="base" placeholder="Default branch" />
+          </div>
+          <label for="agent">Agent</label>
+          <select id="agent">
+            <option value="codex">Codex</option>
+            <option value="claude">Claude</option>
+          </select>
+          <label for="model">Model</label
+          ><select id="model"></select>
+          <label for="effort">Reasoning effort</label
+          ><select id="effort"></select>
+          <label for="account">Claude account</label
+          ><select id="account"></select>
+        </div>
+        <div id="message-fields" hidden>
+          <label for="recipient">Existing agent</label
+          ><select id="recipient"></select>
+        </div>
+        <label for="task">Task instructions</label>
+        <textarea
+          id="task"
+          required
+          maxlength="32000"
+          placeholder="What should the agent do?"
+        ></textarea>
+        <label
+          ><input id="babysit" type="checkbox" /> Babysit the PR after completing this task</label
+        >
+        <p class="note">
+          Requests monitoring through the babysit-pr skill. Review feedback still needs dashboard
+          approval.
+        </p>
+        <details id="reference">
+          <summary>Page reference (included with your task)</summary>
+          <label for="source-url">Page URL</label><input id="source-url" type="url" />
+          <label for="source-title">Page title</label><input id="source-title" maxlength="2000" />
+          <label for="selection">Selected text</label
+          ><textarea id="selection" maxlength="24000"></textarea>
+        </details>
+        <button id="send" type="submit">Send task</button>
+        <button id="handoff" type="button">Open in dashboard</button>
+      </form>
+      <p id="status" role="status"></p>
+      <a id="workspace" hidden target="_blank" rel="noopener">Open in Collie</a>
+      <a id="dashboard" hidden target="_blank" rel="noopener">Open dashboard</a>
+    </main>
+  </body>
+</html>

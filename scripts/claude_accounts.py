@@ -2,6 +2,7 @@
 """Named Claude logins, each with its own configuration and transcript store."""
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -52,6 +53,32 @@ def catalog():
                 {"id": entry.name, "label": entry.name, "config_dir": str(entry.resolve())}
             )
     return accounts
+
+
+def login(home):
+    """Who a configuration is signed in as, from its global config; never reads credentials.
+
+    Claude keeps ~/.claude's login in ~/.claude.json, and any other's inside that directory.
+    """
+    home = Path(home).resolve()
+    path = Path.home() / ".claude.json" if home == default_home() else home / ".claude.json"
+    try:
+        value = json.loads(path.read_text())["oauthAccount"]
+        return value["accountUuid"], value.get("organizationUuid")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def choices():
+    """Accounts to offer; the default login is left out when a named one is the same login."""
+    default, *named = catalog()
+    same = login(default["config_dir"])
+    logins = [login(a["config_dir"]) for a in named]
+    if not same or same not in logins:
+        return [default, *named]
+    # That login stands in for jobs saved on the default one.
+    stand_in = logins.index(same)
+    return [{**a, "default": True} if i == stand_in else a for i, a in enumerate(named)]
 
 
 def homes():

@@ -44,7 +44,9 @@ elif a[:2] == ['worktree','open']:
  existing=next((w for w in data['workspaces'] if w['worktree']['checkout_path']==path),None)
  if existing: wid=existing['workspace_id']
  else:
-  wid='w'+str(len(data['workspaces'])+1)
+  n=len(data['workspaces'])+1
+  while any(w['workspace_id']=='w'+str(n) for w in data['workspaces']): n+=1
+  wid='w'+str(n)
   data['workspaces'].append({'workspace_id':wid,'label':a[a.index('--label')+1] if '--label' in a else 'Reopened','agent_status':'unknown','worktree':{'repo_root':root,'checkout_path':path}})
  result={'already_open':bool(existing),'root_pane':{'pane_id':wid+':p1'}}
  if os.environ.get('FAKE_HERDR_NO_ROOT'): result={'already_open':False}
@@ -139,10 +141,21 @@ FAKES = {"gh": GH, "herdr": HERDR, "tmux": TMUX, "cmux": CMUX, "codex": AGENT, "
 
 
 def install_fakes(bin_dir: Path) -> None:
+    # -S: the fakes need only the stdlib, and skipping site keeps coverage's subprocess
+    # hook from starting (and slowing) every fake call; scripts they launch still measure.
     for name, body in FAKES.items():
         path = bin_dir / name
-        path.write_text(f"#!{sys.executable}\n" + body)
+        path.write_text(f"#!{sys.executable} -S\n" + body)
         path.chmod(0o700)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def delete_output_dir():
+    """Overrides pytest-playwright's per-session wipe of the screenshot directory.
+
+    Under xdist every worker is a session, so a late-starting worker would delete
+    an earlier one's failure screenshots; tox clears the directory once instead.
+    """
 
 
 @pytest.fixture(autouse=True)

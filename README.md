@@ -4,6 +4,12 @@ A shared watcher that waits for GitHub CI and PR activity without keeping coding
 
 The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
 
+The [Send to Babysitter browser extension](references/browser-extension.md) sends
+page references and GitHub tasks to the dashboard, starts new workspaces, and sends
+follow-ups to existing agents. It supports paired direct submission, a monitoring
+instruction checkbox, and a token-free handoff to the dashboard's New task dialog.
+Installation and manual testing instructions are in the linked guide.
+
 On mobile, selecting a watch card scrolls to its details and actions. Background
 refreshes leave the scroll position alone; reduced-motion settings are respected.
 
@@ -229,6 +235,9 @@ from the dashboard's environment (default `http://127.0.0.1:8787`). Multiple mat
 workspace names and agent status. **More actions** offers **Focus in herdr** and
 **Copy command**. Opening never sends a task to an existing agent. Only the explicit
 native focus action changes herdr focus; creation finishes with an **Open in Collie** link.
+Messages that send you to Collie, such as **Workspace ready — Open in Collie** beside
+a row or "check it in Collie" in the diff and transcript viewer, link the workspace
+there whenever it is known; the viewer also offers **Open in Collie** beside its links.
 
 When there is no workspace, **Reopen workspace** restores a verified checkout
 without starting an agent. **Create workspace** requires a task and selects Codex
@@ -364,6 +373,20 @@ policies can determine the effective model. The operation records the requested
 `model` and `effort` (null for Default), not a claim about the provider's effective
 configuration. Agent startup/provenance verification and duplicate-launch protection
 remain in place. Open/reopen actions do not apply these settings to existing sessions.
+
+**Effort defaults**, under the effort picker in every launch form (New task, Create
+workspace, Handle, batch Handle and agent cron jobs), saves a default reasoning effort
+for all projects and one for the launch's repository. A launch left on Default uses
+the repository's default, else the one for all projects, and the picker shows it as
+**Default (high)** with a note naming where it was saved. A default the chosen agent
+or model does not support is skipped, falling back to the next one and then to the
+agent's own configuration, so it never fails a launch. Defaults are resolved when the
+agent starts, so a scheduled task or cron job left on Default follows later changes;
+a workspace operation then records the effort it used. They are kept in `effort-defaults.json` in
+the state directory (`{"effort": "high", "repos": {"owner/name": "xhigh"}}`) and set
+through `POST /api/effort-default` with `{"effort": level}` or `{"repo": "owner/name",
+"effort": level}`; an empty effort clears one. The `wt` helpers on the command line do
+not read them.
 
 **Allow Docker in the agent’s sandbox**, off by default, passes `--docker` to the
 helper (the request field is `docker: true`; New task, Handle, Create workspace and
@@ -676,8 +699,9 @@ No separate manual dependency installation is needed beyond uv, Node/npm, Git,
 and zsh. The first run requires downloads; subsequent runs reuse tool caches.
 
 The default environments are `lint`, `format`, `types`, `skill`, `frontend`,
-`unit`, `browser`, and `coverage`. The coverage report depends on both test
-environments. To run independent environments concurrently:
+`unit`, and `browser`; both test environments spread tests over all CPU cores
+with pytest-xdist (pass `-- -n 0` to run serially). To run independent
+environments concurrently:
 
 ```sh
 uv run --locked tox run-parallel
@@ -687,7 +711,7 @@ Tox runs Ruff lint/format checks, mypy across the Python runtime and development
 scripts, ESLint, Prettier, zsh syntax checking, the repository-local skill
 validator, the Node interaction test, and pytest including real Chromium tests.
 Mypy checks unannotated function bodies; this is gradual typing, not strict typing
-of every JSON payload. No automated CI workflow is configured.
+of every JSON payload. GitHub Actions runs the default environments on pushes to `main` and on pull requests.
 
 Apply formatting and safe lint fixes through the separate opt-in environment:
 
@@ -700,7 +724,7 @@ For a targeted rerun, select a tox environment, for example
 
 Browser tests use a real Chromium process and a real HTTP server backed by a temporary SQLite queue. They cover comment text rendering, explicit feedback approval, stale approval rejection, cancellation/history, cleanup indicators, and mobile layout. They never start the production watcher or a coding agent. Other integration tests use fake GitHub/agent executables and temporary worktrees, and exercise timeouts, process ownership, and restart recovery.
 
-Coverage includes Python branches and instrumented child Python processes. The `coverage` tox environment writes a terminal summary, HTML at `reports/coverage/index.html`, and XML at `reports/coverage.xml`. The combined Python line/branch coverage gate is 75%. Reports and browser failure artifacts are ignored by Git. JavaScript behavior is exercised by browser and Node tests; the coverage percentage measures Python only.
+Coverage is opt-in and not part of the default run or CI: `uv run --locked tox -e coverage` runs every test under coverage, including Python branches and instrumented child Python processes. It writes a terminal summary, HTML at `reports/coverage/index.html`, and XML at `reports/coverage.xml`. The combined Python line/branch coverage gate is 75%. Reports and browser failure artifacts are ignored by Git. JavaScript behavior is exercised by browser and Node tests; the coverage percentage measures Python only.
 
 The Safehouse launcher matches this user's installed configuration. Tests check its command construction, but do not require Safehouse or claim to test macOS sandbox enforcement on every machine.
 

@@ -797,6 +797,7 @@ class Workspaces:
             **described,
             "new": self.new_operations(state),
             "agent_choices": workspace_agents.catalog(self.home),
+            "effort_defaults": workspace_agents.effort_defaults(self.home),
             "error": inventory["error"],
             "refreshing": self.refreshing,
             "synced_at": inventory["synced_at"],
@@ -1773,6 +1774,13 @@ class Workspaces:
                         if subject
                         else f"Branching {name} and starting the selected agent",
                     )
+                    if not op.get("effort"):
+                        # Left on Default: the repository's or global saved default, if any.
+                        default = workspace_agents.default_effort(
+                            self.home, pr["repo"], op["agent"], op.get("model") or ""
+                        )
+                        if default:
+                            self.save_operation(op, effort=default)
                     overrides = []
                     for key in ("model", "effort"):
                         if op.get(key):

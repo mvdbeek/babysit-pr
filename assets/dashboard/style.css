@@ -1323,6 +1323,19 @@ button:disabled {
 .workspace-start[hidden] {
   display: none;
 }
+.effort-defaults small {
+  display: block;
+  margin: 6px 0;
+  color: var(--muted);
+}
+.effort-defaults .effort-default {
+  display: grid;
+  gap: 4px;
+  margin: 6px 0;
+}
+.effort-defaults button {
+  margin-top: 4px;
+}
 .item-select {
   width: 18px;
   height: 18px;

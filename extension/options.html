@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Babysitter settings</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="options.js" type="module"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Connect to Babysitter</h1>
+      <p>Extension ID: <code id="extension-id"></code></p>
+      <form id="settings">
+        <label for="url">Dashboard URL</label>
+        <input id="url" type="url" required placeholder="https://your-dashboard.ts.net" />
+        <button id="pair" type="button">Open dashboard pairing</button>
+        <label for="token">Pairing token</label>
+        <input id="token" type="password" autocomplete="off" />
+        <p>
+          Paste the token from the dashboard to enable direct submission. Leave it empty to use
+          dashboard handoff only.
+        </p>
+        <button type="submit">Save connection</button>
+      </form>
+      <p id="status" role="status"></p>
+      <p>
+        Your token stays in this browser profile; it is not synced. Revoke access on the dashboard
+        pairing page.
+      </p>
+    </main>
+  </body>
+</html>
