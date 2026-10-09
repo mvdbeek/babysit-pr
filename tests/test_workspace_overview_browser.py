@@ -432,8 +432,9 @@ def test_diff_and_transcript_viewer(page, site, width):
     line.get_by_role("button", name="Diff", exact=True).click()
     dialog = page.locator("#ws-viewer")
     expect(dialog).to_be_visible()
+    # Comments can go to the agent: its session resumes even without a workspace.
     expect(page.locator("#ws-viewer-meta")).to_have_text(
-        "2 files changed, +1 −1 since origin/main."
+        "2 files changed, +1 −1 since origin/main. Click a line to comment on it."
     )
     expect(dialog.locator(".ws-add")).to_contain_text("+new line")
     expect(dialog.locator(".ws-del")).to_have_text("-old line\n")
@@ -557,3 +558,58 @@ def test_a_live_transcript_updates_in_place(page, site):
     expect(details).to_have_attribute("open", "")
     expect(page.locator("#ws-viewer-meta")).to_contain_text("3 entries")
     assert "after=0" in requests[-1]
+
+
+def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
+    url, _, _ = site
+    key = "/src/worktrees/repo/open-work"
+    session = {"id": "s1", "agent": "claude", "title": "Fix the crash", "updated": 1}
+    reopened = {"workspace": None}
+    agents_seen, sent = [], []
+
+    def agents(route):
+        agents_seen.append(route.request.url)
+        live = reopened["workspace"]
+        route.fulfill(
+            json={
+                "agents": (
+                    [{"pane": f"{live}:p1", "agent": "claude", "status": "working"}] if live else []
+                ),
+                "sessions": [session],
+                "path": key,
+                "workspace": live,
+                "url": live and f"https://collie.example.ts.net/space/{live}",
+            }
+        )
+
+    def message(route):
+        body = route.request.post_data_json
+        sent.append(body)
+        reopened["workspace"] = "w4"
+        pane = body.get("pane") or "w4:p1"
+        route.fulfill(json={"sent": True, "pane": pane, "resumed": body.get("resume")})
+
+    page.route("**/api/workspace-agents?*", agents)
+    page.route("**/api/workspace-message", message)
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    expect(page.locator("#ws-message-agent")).to_contain_text("No agent is running")
+    assert "key=%2Fsrc%2Fworktrees%2Frepo%2Fopen-work" in agents_seen[0]
+    dialog.get_by_label("Message the agent").fill("Keep going")
+    dialog.get_by_role("button", name="Resume and send").click()
+    expect(page.locator("#ws-message-status")).to_have_text(
+        "Resumed the session in w4:p1 and sent the message."
+    )
+    assert sent == [{"key": key, "resume": "s1", "text": "Keep going"}]
+    # The reopened workspace is followed: its agent is messaged there from now on.
+    expect(page.locator("#ws-message-agent")).to_contain_text("To claude · working")
+    expect(dialog.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://collie.example.ts.net/space/w4"
+    )
+    dialog.get_by_label("Message the agent").fill("And add a test")
+    dialog.get_by_role("button", name="Send to agent").click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w4:p1.")
+    assert sent[-1] == {"workspace": "w4", "pane": "w4:p1", "text": "And add a test"}

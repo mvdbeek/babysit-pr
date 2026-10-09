@@ -1553,6 +1553,45 @@ def test_a_closed_workspace_is_reopened_to_resume_its_session(exited, site, monk
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "again"}, home)
 
 
+def test_a_row_listed_without_a_workspace_resumes_its_session_in_a_new_one(exited, server, site):
+    port, plugin = server
+    state, sid, checkout, home = exited
+    clone = site[2]
+    close_workspace(state, "w1")
+    plugin.value = plugin.collect()
+    key = str(checkout.resolve())
+    assert rows(plugin)["merged-work"]["workspace_ids"] == []
+    query = f"/api/workspace-agents?key={quote(key, safe='')}"
+    status, value = request(port, query)
+    assert status == 200 and value["workspace"] is None and value["url"] is None
+    assert value["agents"] == [] and [s["id"] for s in value["sessions"]] == [sid]
+    assert value["path"] == key
+    for body, error in [
+        ({"key": key, "text": "x"}, "only a recorded session"),
+        ({"key": key, "workspace": "w1", "resume": sid, "text": "x"}, "only a recorded session"),
+        ({"key": "/etc", "resume": sid, "text": "x"}, "Unknown workspace"),
+    ]:
+        status, value = request(port, "/api/workspace-message", body, action="workspace-message")
+        assert status == 400 and error in value["error"], body
+    body = {"key": key, "resume": sid, "text": "Now add docs"}
+    status, value = request(port, "/api/workspace-message", body, action="workspace-message")
+    assert calls(state, ["worktree", "open"]) == [
+        ["worktree", "open", "--cwd", str(clone.resolve()), "--path", key, "--no-focus"]
+    ]
+    reopened = read(state)["workspaces"][-1]["workspace_id"]
+    assert status == 200
+    assert value == {"sent": True, "pane": f"{reopened}:p1", "resumed": sid, "warning": None}
+    assert read(state)["agents"][0]["argv"] == ["--resume", sid, "--", "Now add docs"]
+    # The row is still listed without it; the viewer finds and follows the new one.
+    status, value = request(port, query)
+    assert status == 200 and value["workspace"] == reopened
+    assert [agent["pane"] for agent in value["agents"]] == [f"{reopened}:p1"]
+    status, value = request(port, "/api/workspace-message", body, action="workspace-message")
+    assert status == 400 and "already running" in value["error"]
+    status, value = request(port, f"{query}&workspace=w1")
+    assert status == 400 and "Supply a workspace or a workspace key" in value["error"]
+
+
 def test_the_viewer_follows_a_workspace_reopened_under_a_new_id(site, tmp_path, monkeypatch):
     _, _, _, worktrees, state, _ = site
     assert wso_viewer.workspace_checkout("w1")

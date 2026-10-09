@@ -399,8 +399,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, value)
                 return
             if action == "workspace-message":
+                checkout = None
+                if "key" in request:
+                    # A Workspaces-tab row listed while no herdr workspace was open.
+                    if not self.server.workspace_overview:
+                        raise ValueError("The workspace experiment is disabled")
+                    checkout = self.server.workspace_overview.checkout(request.pop("key"))
                 try:
-                    self.send_json(200, agent_messages.send(request, self.server.home))
+                    self.send_json(
+                        200, agent_messages.send(request, self.server.home, checkout=checkout)
+                    )
                 except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     self.send_json(503, {"error": f"Nothing was typed: {exc}"})
                 return
@@ -647,15 +655,33 @@ class Handler(BaseHTTPRequestHandler):
                     )
             elif route.path == "/api/workspace-agents":
                 query = parse_qs(route.query)
-                if set(query) != {"workspace"} or len(query["workspace"]) != 1:
-                    raise ValueError("Supply a workspace")
-                workspace_id = query["workspace"][0]
-                # The workspace now open on this checkout: none once closed, another ID
-                # once reopened, which the viewer then follows.
-                live = workspace_viewer.live_workspace(workspace_id)
-                self.send_json(
-                    200,
-                    {
+                if set(query) not in ({"workspace"}, {"key"}) or any(
+                    len(values) != 1 for values in query.values()
+                ):
+                    raise ValueError("Supply a workspace or a workspace key")
+                if "key" in query:
+                    # A Workspaces-tab row listed while no herdr workspace was open: the
+                    # one open on its checkout now, which the viewer then follows.
+                    if not self.server.workspace_overview:
+                        raise ValueError("The workspace experiment is disabled")
+                    path = self.server.workspace_overview.checkout(query["key"][0])
+                    workspace_id = workspace_viewer.checkout_workspace(path)
+                else:
+                    workspace_id = query["workspace"][0]
+                if workspace_id is None:
+                    # Nobody to message, but a recorded session can be resumed.
+                    value = {
+                        "agents": [],
+                        "sessions": agent_messages.checkout_sessions(path, self.server.home),
+                        "path": path,
+                        "workspace": None,
+                        "url": None,
+                    }
+                else:
+                    # The workspace now open on this checkout: none once closed, another
+                    # ID once reopened, which the viewer then follows.
+                    live = workspace_viewer.live_workspace(workspace_id)
+                    value = {
                         "agents": agent_messages.docker_status(workspace_id),
                         "sessions": agent_messages.sessions(workspace_id, self.server.home),
                         # A draft names its checkout, so a reused workspace ID cannot
@@ -663,8 +689,8 @@ class Handler(BaseHTTPRequestHandler):
                         "path": workspace_viewer.workspace_checkout(workspace_id),
                         "workspace": live,
                         "url": live and f"{COLLIE_URL}/space/{quote(live, safe='')}",
-                    },
-                )
+                    }
+                self.send_json(200, value)
             elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:
                 query = parse_qs(route.query)
                 if any(len(values) != 1 for values in query.values()):

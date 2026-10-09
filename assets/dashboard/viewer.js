@@ -285,10 +285,17 @@
       byId(id).setAttribute("aria-selected", String(viewer?.mode === mode));
     }
   }
-  // A view names a Workspaces-tab row or a herdr workspace (anything Collie can open);
-  // only a herdr workspace has agents to message.
+  // A view names a Workspaces-tab row or a herdr workspace (anything Collie can open).
   function where(target) {
     return target.key ? { key: target.key } : { workspace: target.workspace };
+  }
+  // Whom a message goes to: the herdr workspace, or a Workspaces-tab row listed while
+  // none was open, whose recorded sessions can still be resumed.
+  function recipient(target) {
+    return target.workspace ? { workspace: target.workspace } : { key: target.key };
+  }
+  function messageable(target) {
+    return Boolean(target.workspace || target.key);
   }
   // The issue, pull request or Sentry issue the checkout serves, as {label, url, title}.
   function renderLinks(links) {
@@ -374,7 +381,7 @@
     button.type = "button";
     button.onclick = () => {
       change(() => {});
-      if (viewer?.entry.workspace) void fetchAgents(viewer.entry);
+      if (viewer && messageable(viewer.entry)) void fetchAgents(viewer.entry);
     };
     return button;
   }
@@ -955,7 +962,7 @@
   let sending = false; // A send in flight keeps the button disabled through refreshes.
   let files = null; // The composer's attachments, kept with the draft.
   function draftKey(entry) {
-    return `ws-viewer-draft:${entry.workspace}`;
+    return `ws-viewer-draft:${entry.workspace || entry.key}`;
   }
   function loadDraft(entry) {
     try {
@@ -987,8 +994,8 @@
     byId("ws-live-status").textContent = "";
     agents = [];
     sessions = [];
-    if (!entry.workspace) {
-      // A checkout without a herdr workspace has no agent to talk to.
+    if (!messageable(entry)) {
+      // A checkout without a herdr workspace or a row has no agent to talk to.
       draft = null;
       files?.destroy();
       files = null;
@@ -1019,7 +1026,7 @@
   async function fetchAgents(entry) {
     const token = ++agentsRequest;
     try {
-      const value = await getJSON("/api/workspace-agents", { workspace: entry.workspace });
+      const value = await getJSON("/api/workspace-agents", recipient(entry));
       if (viewer?.entry !== entry || token !== agentsRequest) return;
       if (draft.path && draft.path !== value.path) {
         // The workspace ID now names another checkout: its old draft does not apply.
@@ -1390,7 +1397,7 @@
         tell(status, "Docker access change could not be confirmed; refresh or check Collie.");
     } finally {
       changingDocker = false;
-      if (viewer?.entry.workspace) await fetchAgents(viewer.entry);
+      if (viewer && messageable(viewer.entry)) await fetchAgents(viewer.entry);
     }
   };
   function removeComment(id) {
@@ -1543,7 +1550,7 @@
     }
     const picked = byId("ws-message-agent").querySelector("select")?.value;
     const body = {
-      workspace: entry.workspace,
+      ...recipient(entry),
       ...(agents.length
         ? { pane: picked || agents[0].pane }
         : { resume: picked || sessions[0]?.id }),
@@ -1615,7 +1622,7 @@
       return value;
     };
     storeDraft(entry, prune(loadDraft(entry)));
-    if (!draft || viewer?.entry.workspace !== entry.workspace) return;
+    if (!draft || !viewer || draftKey(viewer.entry) !== draftKey(entry)) return;
     prune(draft);
     saveDraft();
     if (attachments.length) files?.remove(attachments);
@@ -1629,7 +1636,8 @@
   }
   byId("ws-message").addEventListener("submit", sendMessage);
   window.addEventListener("focus", () => {
-    if (viewer?.entry.workspace && byId("ws-viewer").open) void fetchAgents(viewer.entry);
+    if (viewer && messageable(viewer.entry) && byId("ws-viewer").open)
+      void fetchAgents(viewer.entry);
   });
   byId("ws-message-text").addEventListener("input", () => {
     if (!draft) return;
@@ -1672,7 +1680,7 @@
   // so do its running agents.
   let pollingAgents = false;
   setInterval(() => {
-    if (viewer?.mode === "transcript" && viewer.entry.workspace && !document.hidden) {
+    if (viewer?.mode === "transcript" && messageable(viewer.entry) && !document.hidden) {
       if (!pollingAgents && !stopping) {
         pollingAgents = true;
         void fetchAgents(viewer.entry).finally(() => (pollingAgents = false));

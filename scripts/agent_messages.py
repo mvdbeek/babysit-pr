@@ -111,7 +111,11 @@ def agents(workspace_id, interactions=False):
 
 def sessions(workspace_id, home=None):
     """Sessions recorded in the workspace's checkout that a message could resume."""
-    root = workspace_viewer.workspace_checkout(workspace_id)
+    return checkout_sessions(workspace_viewer.workspace_checkout(workspace_id), home)
+
+
+def checkout_sessions(root, home=None):
+    """Sessions recorded in a checkout that a message could resume."""
     watched = {
         job.get("session_id") for job in watch_jobs(home) if job.get("status") not in ENDED_WATCHES
     }
@@ -128,18 +132,24 @@ def sessions(workspace_id, home=None):
     ]
 
 
-def send(request, home=None, *, expected_session=None):
-    """Submit one message to one agent of a workspace; report what herdr saw."""
+def send(request, home=None, *, expected_session=None, checkout=None):
+    """Submit one message to one agent of a workspace; report what herdr saw.
+
+    With a checkout instead of a workspace (a Workspaces-tab row listed while none was
+    open), only a resume can be sent: it reopens a workspace there if none is open.
+    """
     if set(request) - {"workspace", "pane", "text", "resume"}:
         raise ValueError("Invalid message parameters")
     text = request.get("text")
     text = clean(text) if isinstance(text, str) else None
     if not text or not text.strip() or len(text) > MAX_MESSAGE:
         raise ValueError(f"Write a message of 1–{MAX_MESSAGE:,} characters")
+    if checkout is not None and (request.get("workspace") is not None or not request.get("resume")):
+        raise ValueError("Without a herdr workspace, only a recorded session can be resumed")
     if request.get("resume") is not None:
         if request.get("pane") is not None:
             raise ValueError("Resume a session or message a running agent, not both")
-        return resume(request["workspace"], request["resume"], text, home)
+        return resume(request.get("workspace"), request["resume"], text, home, root=checkout)
     pane = request.get("pane")
     if pane is not None and not isinstance(pane, str):
         raise ValueError("Choose an agent")
@@ -988,17 +998,24 @@ def prune(prompts):
             _recent.pop(key, None)
 
 
-def resume(workspace_id, session_id, text, home):
-    """Resume a recorded session in the workspace with the message as its prompt."""
+def resume(workspace_id, session_id, text, home, root=None):
+    """Resume a recorded session in the workspace with the message as its prompt.
+
+    Given a checkout root instead, the session resumes in the workspace open there, or
+    in one opened on it again.
+    """
     if not isinstance(session_id, str) or not workspace_viewer.SESSION.match(session_id):
         raise ValueError("Choose a recorded session to resume")
-    root = workspace_viewer.workspace_checkout(workspace_id)
+    if root is None:
+        root = workspace_viewer.workspace_checkout(workspace_id)
     chosen = next((s for s in workspace_viewer.sessions(root) if s["id"] == session_id), None)
     if chosen is None or chosen["agent"] not in RESUME:
         raise ValueError("That session is not recorded for this workspace")
     # One resume at a time, held until its agent shows up: a second request then sees it.
     with _resume_lock:
-        if agents(workspace_id):
+        if workspace_id is None:
+            workspace_id = workspace_viewer.checkout_workspace(root)
+        if workspace_id and agents(workspace_id):
             # Two agents on one conversation would interleave; talk to the running one.
             raise ValueError("An agent is already running in this workspace; send to it instead")
         recent = _recent.get(session_id)
@@ -1021,12 +1038,13 @@ def resume(workspace_id, session_id, text, home):
             raise ValueError("The session's directory no longer exists")
         # Always a fresh pane, as launches use: an existing shell may hold a half-typed
         # line or a program that replaced it, and typing would join or feed it.
-        live = workspace_viewer.live_workspace(workspace_id)
+        live = workspace_id and workspace_viewer.live_workspace(workspace_id)
         pane = None
-        if live is None:
-            # The workspace was closed since the viewer opened: open one on its checkout
-            # again, whose first pane is a new shell.
+        if not live:
+            # The workspace was closed since the viewer opened, or none was open: open
+            # one on its checkout again, whose first pane is a new shell.
             live, pane = reopen(root)
+            workspace_id = workspace_id or live
             if agents(workspace_id):
                 raise ValueError(
                     "An agent is already running in this workspace; send to it instead"
