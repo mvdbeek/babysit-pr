@@ -33,6 +33,7 @@ MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CODEX_EFFORTS = frozenset({"none", "minimal", "ultra"})
+CODEX_NO_UPDATE_CHECK = "check_for_update_on_startup=false"
 REPO_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 DIGITS = re.compile(r"[0-9]+")
 GITHUB = r"(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/]+)/"
@@ -370,6 +371,10 @@ def sanitize_session_name(name: str) -> str:
 
 def agent_words(agent: str, model: str, effort: str, extra: Sequence[str] = ()) -> list[str]:
     words = [agent]
+    if agent == "codex":
+        # Messages are typed into the pane; one landing on the startup update dialog would
+        # choose its default, an npm install. The dashboard offers updates instead.
+        words += ["-c", CODEX_NO_UPDATE_CHECK]
     if model:
         words += ["--model", model]
     if effort:

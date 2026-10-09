@@ -236,6 +236,14 @@ def test_resume_options_never_replay_prompts_and_preserve_permissions():
     ) == ["-c", 'approval_policy="never"']
     # The resume adds it again.
     assert docker.resume_options(["codex", "--no-daemon", "resume", SID], "codex", SID) == []
+    # Every launch adds it again; other config values stay.
+    skip = "check_for_update_on_startup=false"
+    assert docker.resume_options(
+        ["codex", "-c", skip, f"--config={skip}", "--config", "a=1", "resume", SID], "codex", SID
+    ) == ["--config", "a=1"]
+    assert docker.resume_options(
+        ["codex", "-c", "check_for_update_on_startup=true"], "codex", SID
+    ) == ["-c", "check_for_update_on_startup=true"]
     assert docker.resume_options(
         ["claude", "-c", "--permission-mode=default", "old"], "claude", SID
     ) == ["--permission-mode=default"]

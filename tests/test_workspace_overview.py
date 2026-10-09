@@ -1380,8 +1380,18 @@ def test_a_codex_session_resumes_without_the_shared_background_server(exited):
     assert value["resumed"] == sid and value["warning"] is None
     # On the shared server a session with other feature settings opens a dialog whose
     # default, Cancel, the message's Enter would pick.
-    assert read(state)["runs"][0][1].startswith(f'codex --no-daemon resume {sid} -- "$(cat ')
-    assert read(state)["agents"][0]["argv"] == ["--no-daemon", "resume", sid, "--", "go on"]
+    assert read(state)["runs"][0][1].startswith(
+        f'codex -c check_for_update_on_startup=false --no-daemon resume {sid} -- "$(cat '
+    )
+    assert read(state)["agents"][0]["argv"] == [
+        "-c",
+        "check_for_update_on_startup=false",
+        "--no-daemon",
+        "resume",
+        sid,
+        "--",
+        "go on",
+    ]
 
 
 def test_a_session_open_elsewhere_gets_the_message_there(exited):
