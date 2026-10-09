@@ -360,7 +360,8 @@ def test_wt_has_no_way_to_bypass_safehouse():
     env = {"HOME": "/home/u", "CLAUDECODE": "1", "BABYSIT_CRON_JOB": "1"}
     for agent in ("claude", "codex"):
         command = tool(env=env).command_for(options(agent=agent, prompt="go"))
-        assert command == f'{agent} "$(cat /tmp/wt-prompt.fixture)"'
+        flags = "-c check_for_update_on_startup=false " if agent == "codex" else ""
+        assert command == f'{agent} {flags}"$(cat /tmp/wt-prompt.fixture)"'
     with pytest.raises(wt.UsageError):
         wt.parse_args("wt", ["--unsandboxed", "main"])
 
@@ -374,7 +375,7 @@ def test_unsandboxed_agent_commands_skip_the_wrapper_but_not_its_flags(monkeypat
     )
     assert wt.agent_command("codex", "", "", "high", stage, unsandboxed=True) == (
         "command codex --dangerously-bypass-approvals-and-sandbox "
-        "-c 'model_reasoning_effort=\"high\"'"
+        "-c check_for_update_on_startup=false -c 'model_reasoning_effort=\"high\"'"
     )
     monkeypatch.setattr(wt.claude_accounts, "default_home", lambda: tmp_path / ".claude")
     account = tmp_path / ".claude" / "accounts" / "work"
