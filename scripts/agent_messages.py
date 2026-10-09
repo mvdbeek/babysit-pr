@@ -41,7 +41,9 @@ MAX_MESSAGE = 32000
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 UNCERTAIN = "check it in Collie before resending"
 RESUME_WAIT = 20
-RESUME = {"claude": ["--resume"], "codex": ["resume"]}
+# Codex resumes in-process: on the shared background server a session whose feature
+# settings differ opens a dialog whose default, Cancel, a typed message then selects.
+RESUME = {"claude": ["--resume"], "codex": ["--no-daemon", "resume"]}
 # A resumed agent can take a while to be recognized; until then a repeat is refused.
 RECENT_RESUME = 120
 ENDED_WATCHES = {"closed", "stopped"}
@@ -281,6 +283,13 @@ def prompt(target, text):
                 "pane": pane,
                 "warning": f"Sent, but the agent showed no reaction yet; {UNCERTAIN}.",
             }
+        if "agent_not_running" in detail:
+            # The agent left before taking the message, as one stuck in a startup dialog
+            # quits on the typed Enter; its pane shows why.
+            raise ValueError(
+                f"The agent in {pane} exited instead of taking the message; "
+                "its pane in Collie may show why"
+            ) from exc
         raise ValueError(f"herdr could not deliver the message: {detail[-300:]}") from exc
     return {"sent": True, "pane": pane, "warning": None}
 
