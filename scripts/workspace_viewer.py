@@ -242,6 +242,19 @@ def live_workspace(workspace_id):
     return since[0] if len(since) == 1 else None
 
 
+def checkout_workspace(root):
+    """The herdr workspace open on a checkout now, or None.
+
+    For a Workspaces-tab row listed while none was open: with several open, the first
+    is taken, as that row lists them.
+    """
+    spaces = herdr("workspace", "list")["workspaces"]
+    found = next((w["workspace_id"] for w in spaces if checkout_of(w) == root), None)
+    if found:
+        remember(found, root, spaces)
+    return found
+
+
 def bases(path):
     """Remote base branches by how few commits this checkout has beyond each.
 
