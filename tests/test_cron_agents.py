@@ -109,7 +109,9 @@ def test_a_run_makes_the_worktree_and_starts_the_agent_in_a_new_pane(setup):
     ]
     [typed] = data["runs"]
     assert typed[0] == launched["pane"]
-    assert typed[1].startswith("SAFE_ENABLE=docker codex --model fixture-codex -c ")
+    assert typed[1].startswith(
+        "SAFE_ENABLE=docker codex -c check_for_update_on_startup=false --model fixture-codex -c "
+    )
     # The agent got the prompt with the request to confirm completion.
     [agent] = data["agents"]
     assert agent["pane_id"] == launched["pane"]
@@ -137,7 +139,10 @@ def test_a_job_left_on_default_effort_uses_the_saved_default(setup):
     jobs.run_now(saved["id"])
     assert settle(jobs, saved["id"])["status"] == "running"
     [typed] = herdr_state(state)["runs"]
-    assert typed[1].startswith("codex --model fixture-codex -c 'model_reasoning_effort=\"ultra\"'")
+    assert typed[1].startswith(
+        "codex -c check_for_update_on_startup=false --model fixture-codex"
+        " -c 'model_reasoning_effort=\"ultra\"'"
+    )
 
 
 def test_finished_agents_keep_their_answer_and_close_their_pane(setup, monkeypatch):

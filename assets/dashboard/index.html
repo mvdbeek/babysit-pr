@@ -16,6 +16,7 @@
     <script src="/push.js" defer></script>
     <script src="/notifications.js" defer></script>
     <script src="/usage.js" defer></script>
+    <script src="/codex_update.js" defer></script>
     <script src="/attachments.js" defer></script>
     <script src="/viewer.js" defer></script>
     <script src="/app.js" defer></script>
@@ -127,6 +128,10 @@
     </dialog>
     <main>
       <p id="navigation-status" role="status" hidden></p>
+      <div id="codex-update" class="alert" role="status" hidden>
+        <span id="codex-update-text"></span>
+        <button id="codex-update-button" type="button" hidden>Update Codex</button>
+      </div>
       <div class="page-tabs" role="tablist" aria-label="Dashboard views">
         <button
           id="watcher-tab"

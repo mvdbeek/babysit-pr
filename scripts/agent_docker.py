@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import herdr_handoff as handoff
+import wt
 
 EXIT_WAIT = 20
 _exiting: set[tuple[str, int]] = set()
@@ -95,12 +96,16 @@ def resume_options(argv, kind, session):
         elif word in flags:
             kept.append(word)
         elif word.partition("=")[0] in valued:
-            kept.append(word)
-            if "=" not in word:
+            name, joined, value = word.partition("=")
+            option = [word]
+            if not joined:
                 value = next(words, None)
                 if value is None:
                     raise ValueError("Incomplete agent launch option; nothing was sent")
-                kept.append(value)
+                option.append(value)
+            if kind == "codex" and name in {"-c", "--config"} and value == wt.CODEX_NO_UPDATE_CHECK:
+                continue  # Every Codex launch adds it again.
+            kept += option
         elif word.startswith("-"):
             raise ValueError(f"Cannot preserve agent launch option {word}; restart it in Collie")
         # A positional initial prompt is intentionally omitted.

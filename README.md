@@ -535,6 +535,19 @@ private `llm-usage.json` file in the state directory. When the daemon is not
 running, or was started before this feature and needs a restart, the dialog says so
 and shows the last saved reading.
 
+## Codex updates
+
+Codex started by the babysitter (`wt`, dashboard resumes, cron agents) runs with
+`-c check_for_update_on_startup=false`: its startup update dialog defaults to
+installing, and a message typed into the pane could land on it. The dashboard checks
+the npm registry instead, at most once a day (an hour after a failed check), and
+saves the result in the private `codex-update.json` file in the state directory.
+When the registry's latest release is newer than `codex --version`, a notice names
+both versions. If the `codex` on PATH comes from an npm `@openai/codex` package,
+**Update Codex** runs `npm install -g @openai/codex@VERSION` for exactly the version
+shown, in a login shell; otherwise update it the way it was installed. New and
+resumed agents use the new version; running agents keep theirs.
+
 ## Worktree helper
 
 `scripts/wt.py` is a portable, stdlib-only Python implementation of the `wt`, `wti`

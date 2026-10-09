@@ -308,11 +308,19 @@ def test_agent_command_without_prompt_never_stages():
     )
     assert (
         wt.agent_command("codex", "", "gpt-5", "high", stage)
-        == "codex --model gpt-5 -c 'model_reasoning_effort=\"high\"'"
+        == "codex -c check_for_update_on_startup=false --model gpt-5 -c 'model_reasoning_effort=\"high\"'"
     )
     assert wt.agent_command("codex", "", "", "ultra", stage) == (
-        "codex -c 'model_reasoning_effort=\"ultra\"'"
+        "codex -c check_for_update_on_startup=false -c 'model_reasoning_effort=\"ultra\"'"
     )
+
+
+def test_only_codex_skips_its_startup_update_check():
+    # A typed message must never land on Codex's update dialog, whose default installs.
+    codex = wt.agent_words("codex", "gpt-5", "", ["resume", "x"])
+    assert codex[:3] == ["codex", "-c", "check_for_update_on_startup=false"]
+    assert codex[3:] == ["--model", "gpt-5", "resume", "x"]
+    assert not any("check_for_update" in word for word in wt.agent_words("claude", "opus", "high"))
 
 
 @pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
@@ -337,10 +345,11 @@ def test_agent_command_stages_prompt_and_quotes_only_the_path():
     command = wt.agent_command("codex", prompt, "gpt-5", "high", stage)
     assert staged == [prompt]
     assert command == (
-        "codex --model gpt-5 -c 'model_reasoning_effort=\"high\"' "
+        "codex -c check_for_update_on_startup=false --model gpt-5 "
+        "-c 'model_reasoning_effort=\"high\"' "
         "\"$(cat '/tmp/odd dir'\"'\"'s/wt-prompt.abc')\""
     )
-    assert "touch" not in command and len(command) < 120
+    assert "touch" not in command and len(command) < 160
     # The typed line does not grow with the prompt (MAX_CANON is 1024 bytes on macOS).
     short = wt.agent_command("codex", "hi", "gpt-5", "high", stage)
     assert len(command) == len(short)
@@ -556,7 +565,8 @@ def test_herdr_session_plan_for_a_new_workspace():
             "pane",
             "run",
             "w1:p1",
-            'codex --model gpt-5 -c \'model_reasoning_effort="high"\' "$(cat /tmp/wt-prompt.fixture)"',
+            "codex -c check_for_update_on_startup=false --model gpt-5"
+            ' -c \'model_reasoning_effort="high"\' "$(cat /tmp/wt-prompt.fixture)"',
         ],
     ]
     assert t.stderr.getvalue() == ""
@@ -710,7 +720,7 @@ def test_cmux_session_plan_creates_group_and_workspace():
     layout = json.loads(calls[3][9])
     assert (
         layout["children"][0]["pane"]["surfaces"][0]["command"]
-        == 'codex "$(cat /tmp/wt-prompt.fixture)"'
+        == 'codex -c check_for_update_on_startup=false "$(cat /tmp/wt-prompt.fixture)"'
     )
     assert all(c[2] == "1" for c in runner.calls), "every cmux call sets CMUX_QUIET=1"
 
@@ -995,9 +1005,14 @@ def test_wtpr_fetches_fork_branch_and_records_provenance(repo):
         "--focus",
     ]
     typed = next(c for c in data["calls"] if c[:2] == ["pane", "run"])[3]
-    assert typed.startswith('codex --model gpt-5 -c \'model_reasoning_effort="high"\' "$(cat ')
+    assert typed.startswith(
+        "codex -c check_for_update_on_startup=false --model gpt-5"
+        ' -c \'model_reasoning_effort="high"\' "$(cat '
+    )
     assert len(typed.encode()) < 300 < 1024, typed
     assert data["agents"][0]["argv"] == [
+        "-c",
+        "check_for_update_on_startup=false",
         "--model",
         "gpt-5",
         "-c",
@@ -1154,7 +1169,8 @@ def test_wt_name_reserves_a_new_branch_from_the_default_or_given_base(repo):
     assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "sentry-x-1"
     assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "main")
     data = state_of(state)
-    assert data["agents"][0]["argv"][0] == "--flag" and data["agents"][0]["task"] == "Fix"
+    assert data["agents"][0]["argv"][:3] == ["-c", "check_for_update_on_startup=false", "--flag"]
+    assert data["agents"][0]["task"] == "Fix"
     opened = next(c for c in data["calls"] if c[:2] == ["worktree", "open"])
     assert opened[opened.index("--label") + 1] == "sentry-repo-X-1" and "--no-focus" in opened
     result = run_tool("wt", "-r", "repo", "--name", "sentry-x-1", check=False)
@@ -1298,8 +1314,9 @@ def test_cmux_end_to_end_groups_by_repository(repo, monkeypatch):
     assert created[-4:] == ["--group", "g1", "--group-placement", "end"]
     layout = json.loads(created[created.index("--layout") + 1])
     command = layout["children"][0]["pane"]["surfaces"][0]["command"]
-    assert command.startswith('codex "$(cat ') and "Fix" not in command
-    staged = command[len('codex "$(cat ') : -len(')"')]
+    launch = 'codex -c check_for_update_on_startup=false "$(cat '
+    assert command.startswith(launch) and "Fix" not in command
+    staged = command[len(launch) : -len(')"')]
     assert Path(staged.strip("'")).read_text() == "Fix\n"
     # The same worktree again selects the existing workspace; a second worktree joins the group.
     result = run_tool("wt", "-r", "repo", "-p", "again", "main", "cmux-one")

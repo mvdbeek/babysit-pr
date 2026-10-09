@@ -734,7 +734,7 @@ def test_workspace_model_effort_argv_defaults_and_idempotency(
     op = finish(manager, key)
     assert op["status"] == "complete", op["log"]
     assert op["model"] == (model or None) and op["effort"] == (effort or None)
-    args = []
+    args = ["-c", "check_for_update_on_startup=false"] if agent == "codex" else []
     if model:
         args += ["--model", model]
     if effort:
@@ -826,7 +826,14 @@ def test_a_launch_left_on_default_uses_the_saved_effort(local, requested, expect
     assert op["status"] == "complete", op["log"]
     assert op["effort"] == expected
     argv = json.loads(state.read_text())["agents"][0]["argv"]
-    assert argv[:4] == ["--model", "fixture-codex", "-c", f'model_reasoning_effort="{expected}"']
+    assert argv[:6] == [
+        "-c",
+        "check_for_update_on_startup=false",
+        "--model",
+        "fixture-codex",
+        "-c",
+        f'model_reasoning_effort="{expected}"',
+    ]
 
 
 @pytest.mark.parametrize(
@@ -941,7 +948,12 @@ def test_codex_catalog_follows_the_installed_cli_version(local, monkeypatch):
     manager.action({"id": "PR_one", "action": "create", "task": "Fix", "model": "current"})
     op = finish(manager, "PR_one")
     assert op["status"] == "complete", op["log"]
-    assert json.loads(local[3].read_text())["agents"][0]["argv"][:2] == ["--model", "current"]
+    assert json.loads(local[3].read_text())["agents"][0]["argv"][:4] == [
+        "-c",
+        "check_for_update_on_startup=false",
+        "--model",
+        "current",
+    ]
     # After upgrading the CLI, its own cache is accepted and the old list is not used.
     installed("1.1.0")
     assert [m["id"] for m in catalog(manager.home)["codex"]["models"]] == ["newer-only"]
@@ -982,6 +994,8 @@ def test_pane_shell_agent_wrapper_applies_to_typed_command(local, monkeypatch, t
     assert json.loads(state.read_text())["agents"][0]["argv"][:-1] == [
         "--profile",
         "fixture-profile",
+        "-c",
+        "check_for_update_on_startup=false",
         "--model",
         "fixture-codex",
         "-c",
@@ -1030,7 +1044,7 @@ def test_docker_opt_in_reaches_the_agent_sandbox_through_wt(local, key):
     # safehouse --enable=docker, so the agent itself must see the variable.
     agent = json.loads(state.read_text())["agents"][0]
     assert agent["safe_enable"] == "docker"
-    assert agent["argv"] == [agent["task"]]
+    assert agent["argv"] == ["-c", "check_for_update_on_startup=false", agent["task"]]
 
 
 def test_docker_is_off_unless_asked_for_and_reopen_ignores_it(local):

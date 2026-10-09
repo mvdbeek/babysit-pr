@@ -215,6 +215,7 @@ class DashboardServer(ThreadingHTTPServer):
         sentry=None,
         cron=None,
         attachments: Path | None = None,
+        codex_updates=None,
     ) -> None:
         self.home = home
         self.attachments = attachments or home / "attachments"
@@ -223,6 +224,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.upstream_tests = upstream_tests
         self.sentry = sentry
         self.cron = cron
+        self.codex_updates = codex_updates
         self.workspace_overview = workspace_overview
         self.workspaces = workspaces
         self.ci = ci
@@ -306,6 +308,7 @@ class Handler(BaseHTTPRequestHandler):
                 "notification-silence",
                 "extension-pair",
                 "effort-default",
+                "codex-update",
             }
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
@@ -424,6 +427,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.choose(request))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the dialog in Collie: {exc}"})
+                return
+            if action == "codex-update":
+                if not self.server.codex_updates:
+                    raise ValueError("Codex update checks are not enabled")
+                self.server.codex_updates.update()
+                self.send_json(200, self.server.codex_updates.snapshot())
                 return
             if action == "effort-default":
                 self.send_json(
@@ -567,6 +576,13 @@ class Handler(BaseHTTPRequestHandler):
                 heartbeat = read_json(self.server.home / "heartbeat.json") or {}
                 reader = llm_usage.reader_state(self.server.home, heartbeat)
                 self.send_json(200, llm_usage.present(self.server.home, reader=reader))
+            elif route.path == "/api/codex-update":
+                self.send_json(
+                    200,
+                    self.server.codex_updates.snapshot()
+                    if self.server.codex_updates
+                    else {"available": False, "update": None},
+                )
             elif route.path == "/api/notification-preferences":
                 self.send_json(
                     200,
@@ -795,6 +811,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/collie.js": ("collie.js", "text/javascript"),
                     "/notifications.js": ("notifications.js", "text/javascript"),
                     "/usage.js": ("usage.js", "text/javascript"),
+                    "/codex_update.js": ("codex_update.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
                     "/sw.js": ("sw.js", "text/javascript"),
                     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
@@ -826,6 +843,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir=None):
+    from codex_updates import CodexUpdates
     from cron_jobs import CronJobs
     from dashboard_push import PushInbox
     from sentry_issues import SentryIssues
@@ -866,6 +884,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         sentry=sentry,
         cron=cron,
         attachments=attachments_dir,
+        codex_updates=CodexUpdates(home),
     ) as server:
         ci_logs.start()
         cron.start()
