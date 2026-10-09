@@ -155,7 +155,8 @@ def test_a_job_left_on_default_effort_uses_the_saved_default(setup):
         ({"agent": "claude"}, "command claude --dangerously-skip-permissions ", None),
         (
             {"model": "fixture-codex"},
-            "command codex --dangerously-bypass-approvals-and-sandbox --model fixture-codex ",
+            "command codex --dangerously-bypass-approvals-and-sandbox "
+            "-c check_for_update_on_startup=false --model fixture-codex ",
             None,
         ),
         (
