@@ -655,7 +655,9 @@ exits it, keeps its final response as the run's output, and closes the pane. The
 lists **Open in Collie**, **Diff** and **Transcript** for the session. An agent that stops
 to ask a question, that is still working at the job's time limit, or that cannot be
 identified is left open in Collie and the run **Needs attention**; the job skips its
-runs until no agent is open in its workspace. Agents keep running when the dashboard
+runs until no agent is open in its workspace. An agent that finished but could not be
+exited by the time limit is reported with the time it finished and the reason, for
+example a pane too short to show the agent's composer. Agents keep running when the dashboard
 restarts, and the restarted dashboard keeps following them.
 
 Commands run as you, through your login shell (`$SHELL -lc`, so your usual `PATH`

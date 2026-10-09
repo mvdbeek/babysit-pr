@@ -249,6 +249,35 @@ def test_the_time_limit_leaves_a_working_agent_open(setup, monkeypatch):
     assert run["message"] == "Still working at the 10 min time limit; left open in Collie"
 
 
+def test_the_time_limit_reports_why_a_finished_agent_was_not_exited(setup, monkeypatch):
+    clock = [time.time()]
+    jobs, manager, _, _ = setup
+    jobs.clock = lambda: clock[0]
+    saved = jobs.save(request(manager, timeout=600))
+    jobs.run_now(saved["id"])
+    settle(jobs, saved["id"])
+    confirmed = clock[0] + 60
+    monkeypatch.setattr(
+        workspace_exit,
+        "step",
+        lambda record, *a: {
+            **record,
+            "confirmed_at": confirmed,
+            "blocked": "Empty composer is not yet visible",
+            "message": "Finished, but not exiting yet: Empty composer is not yet visible",
+        },
+    )
+    clock[0] += 601
+    jobs.watch()
+    run = jobs.snapshot()["jobs"][0]["runs"][0]
+    assert run["status"] == "attention"
+    finished = time.strftime("%H:%M", time.localtime(confirmed))
+    assert run["message"] == (
+        f"Finished at {finished}, but not exited by the 10 min time limit: "
+        "Empty composer is not yet visible; left open in Collie"
+    )
+
+
 def test_a_branch_checked_out_elsewhere_is_used_where_it_is(setup):
     jobs, manager, git, _ = setup
     elsewhere = manager.src / "worktrees" / "mine"

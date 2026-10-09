@@ -32,6 +32,8 @@ LOCATE_LIMIT = 15 * 60
 WATCH_LIMIT = 7 * 86400
 # How long a finished agent must stay idle and unchanged before it is exited.
 SETTLE_SECONDS = 20
+# A shorter pane can clip the agent's composer and final response off the visible screen.
+SHORT_PANE_ROWS = 15
 
 
 class Wait(Exception):
@@ -91,6 +93,14 @@ def capture(op):
         "agent_argv": matches[0]["argv"],
         "marker": op["exit_marker"],
     }
+
+
+def short_pane(info):
+    """Why a finished agent's screen may never show its composer, or nothing."""
+    rows = info.get("scroll", {}).get("viewport_rows")
+    if rows and rows < SHORT_PANE_ROWS:
+        return f"; the pane shows only {rows} rows, too few for the composer and final response"
+    return ""
 
 
 def first_json(path):
@@ -246,12 +256,18 @@ def advance(record, op, persist, now):
         raise Wait("The agent is working")
     if not confirms(complete, target["marker"]):
         raise Leave("The agent ended its turn without confirming the task was done; left open")
+    record.setdefault("confirmed_at", now)
+    record.pop("blocked", None)
     try:
         if info.get("agent_status") not in {"idle", "done"}:
             raise Wait("Waiting for the agent to go idle")
         try:
             handoff.verify_screen(target, info, handoff.read_screen(target["pane_id"]))
+        except handoff.ScreenNotReady as exc:
+            record["blocked"] = f"{exc}{short_pane(info)}"
+            raise Wait(f"Finished, but not exiting yet: {record['blocked']}") from exc
         except RuntimeError as exc:
+            record["blocked"] = str(exc)
             raise Wait(f"Finished, but not exiting yet: {exc}") from exc
     except Wait:
         # Someone is using the pane: the settle restarts once they stop.
