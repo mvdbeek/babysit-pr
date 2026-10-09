@@ -642,10 +642,10 @@ the next three run times.
 
 An **agent task** has a repository and local clone, a branch, an optional base branch,
 the agent (Codex or Claude) with optional model, reasoning effort and Claude account,
-the Docker sandbox switch, and a prompt, as in **New task**. The job owns one
-workspace: the worktree for its branch under `~/src/worktrees/<repo>`, made from the
-base branch (or the clone's current commit) on the first run, or wherever that branch is
-already checked out, though never the clone's own checkout. Each agent job needs its
+the Docker sandbox switch, a switch to run outside Safehouse (below), and a prompt, as
+in **New task**. The job owns one workspace: the worktree for its branch under
+`~/src/worktrees/<repo>`, made from the base branch (or the clone's current commit) on
+the first run, or wherever that branch is already checked out, though never the clone's own checkout. Each agent job needs its
 own branch. Every run works there, so changes and notes carry over from one
 run to the next. A run opens the checkout's herdr workspace, splits a new pane and
 starts a fresh agent session with the prompt, through your shell's agent wrappers
@@ -659,6 +659,21 @@ runs until no agent is open in its workspace. An agent that finished but could n
 exited by the time limit is reported with the time it finished and the reason, for
 example a pane too short to show the agent's composer. Agents keep running when the dashboard
 restarts, and the restarted dashboard keeps following them.
+
+**Run outside Safehouse (can write anywhere)**, off by default, is for jobs that
+orchestrate work in other repositories, for example by making worktrees in other
+clones with `wt`, which Safehouse blocks because it grants writes to the job's own
+checkout only. The run then types `command claude --dangerously-skip-permissions …` or
+`command codex --dangerously-bypass-approvals-and-sandbox …`, which skips the shell's
+`claude`/`codex` functions and so Safehouse, while still running without permission
+prompts. The agent can then change any file you can, so only enable it for prompts you
+trust. It cannot be combined with Docker access, which is a Safehouse setting. Agents
+that such a job starts with `wt` are typed into new multiplexer panes whose shells
+come from the multiplexer's server, not from the job's agent, so they run through the
+usual wrappers and stay in Safehouse. The job's summary shows **Outside Safehouse**.
+Jobs saved before this option existed keep running in Safehouse. A session from such a
+job that you resume or answer from the dashboard is started through the wrappers again,
+so it continues inside Safehouse. Each run records whether it ran outside Safehouse.
 
 Commands run as you, through your login shell (`$SHELL -lc`, so your usual `PATH`
 applies even under launchd), with stdin closed and `BABYSIT_CRON_JOB` and

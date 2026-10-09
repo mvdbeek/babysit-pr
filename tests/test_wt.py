@@ -7,6 +7,7 @@ the fake ``gh``/``herdr``/``tmux``/``cmux``/agent executables from ``conftest.py
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -332,6 +333,65 @@ def test_docker_prefixes_the_safehouse_enable_variable(command):
         'SAFE_ENABLE=docker claude "$(cat /tmp/wt-prompt.fixture)"'
     )
     assert tool().command_for(options(prompt="go")) == 'claude "$(cat /tmp/wt-prompt.fixture)"'
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+@pytest.mark.parametrize("docker", [False, True])
+@pytest.mark.parametrize("config_dir", [None, "/home/u/.claude/accounts/work"])
+def test_agent_command_goes_through_the_shell_wrapper_by_default(agent, docker, config_dir):
+    # Nested launches (wt, resumes) type this: the claude()/codex() function and its
+    # Safehouse must apply, so the command never bypasses it.
+    command = wt.agent_command(
+        agent,
+        "go",
+        "m",
+        "high",
+        lambda _: "/tmp/p",
+        docker=docker,
+        claude_config_dir=config_dir if agent == "claude" else None,
+    )
+    assert "command " not in command and "dangerously" not in command
+    assert re.search(rf"(^|[ ;]){agent} ", command)
+
+
+def test_wt_has_no_way_to_bypass_safehouse():
+    # Even from an agent running outside Safehouse: nothing in the environment changes
+    # what wt types.
+    env = {"HOME": "/home/u", "CLAUDECODE": "1", "BABYSIT_CRON_JOB": "1"}
+    for agent in ("claude", "codex"):
+        command = tool(env=env).command_for(options(agent=agent, prompt="go"))
+        assert command == f'{agent} "$(cat /tmp/wt-prompt.fixture)"'
+    with pytest.raises(wt.UsageError):
+        wt.parse_args("wt", ["--unsandboxed", "main"])
+
+
+def test_unsandboxed_agent_commands_skip_the_wrapper_but_not_its_flags(monkeypatch, tmp_path):
+    def stage(prompt):
+        return "/tmp/p"
+
+    assert wt.agent_command("claude", "go", "opus", "", stage, unsandboxed=True) == (
+        'command claude --dangerously-skip-permissions --model opus "$(cat /tmp/p)"'
+    )
+    assert wt.agent_command("codex", "", "", "high", stage, unsandboxed=True) == (
+        "command codex --dangerously-bypass-approvals-and-sandbox "
+        "-c 'model_reasoning_effort=\"high\"'"
+    )
+    monkeypatch.setattr(wt.claude_accounts, "default_home", lambda: tmp_path / ".claude")
+    account = tmp_path / ".claude" / "accounts" / "work"
+    assert wt.agent_command(
+        "claude",
+        "go",
+        stage=stage,
+        claude_config_dir=str(account),
+        claude_subscription=True,
+        unsandboxed=True,
+    ) == (
+        f"(unset {' '.join(wt.claude_accounts.AUTH_ENV)}; CLAUDE_CONFIG_DIR={account} "
+        "SAFEHOUSE_ENV_PASS=CLAUDE_CONFIG_DIR${SAFEHOUSE_ENV_PASS:+,$SAFEHOUSE_ENV_PASS} "
+        'command claude --dangerously-skip-permissions "$(cat /tmp/p)")'
+    )
+    with pytest.raises(ValueError, match="inside Safehouse"):
+        wt.agent_command("claude", docker=True, unsandboxed=True)
 
 
 def test_agent_command_stages_prompt_and_quotes_only_the_path():

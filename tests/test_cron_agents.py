@@ -7,6 +7,7 @@ import cron_agents
 import cron_jobs
 import pytest
 import workspace_exit
+import wt
 from cron_jobs import CronJobs
 from test_pr_workspaces import local  # noqa: F401 (fixture)
 
@@ -60,6 +61,9 @@ def settle(jobs, job_id, statuses=("starting",)):
         ({"effort": "extreme"}, "effort"),
         ({"prompt": " "}, "prompt of 1"),
         ({"docker": "yes"}, "docker"),
+        ({"unsandboxed": "yes"}, "unsandboxed"),
+        ({"unsandboxed": 1}, "unsandboxed"),
+        ({"docker": True, "unsandboxed": True}, "only applies inside Safehouse"),
         ({"kind": "robot"}, "shell command or an agent task"),
     ],
 )
@@ -143,6 +147,64 @@ def test_a_job_left_on_default_effort_uses_the_saved_default(setup):
         "codex -c check_for_update_on_startup=false --model fixture-codex"
         " -c 'model_reasoning_effort=\"ultra\"'"
     )
+
+
+@pytest.mark.parametrize(
+    ("changes", "typed", "flag"),
+    [
+        ({"agent": "claude"}, "command claude --dangerously-skip-permissions ", None),
+        (
+            {"model": "fixture-codex"},
+            "command codex --dangerously-bypass-approvals-and-sandbox --model fixture-codex ",
+            None,
+        ),
+        (
+            {"agent": "claude", "claude_account": "work"},
+            "(unset ANTHROPIC_API_KEY ",
+            "CLAUDE_CONFIG_DIR=",
+        ),
+    ],
+)
+def test_an_unsandboxed_job_types_the_agent_without_its_shell_wrapper(setup, changes, typed, flag):
+    import claude_accounts
+
+    jobs, manager, _, state = setup
+    account = claude_accounts.account_home("work", create=True)
+    saved = jobs.save(request(manager, unsandboxed=True, **changes))
+    assert saved["unsandboxed"] is True and saved["docker"] is False
+    jobs.run_now(saved["id"])
+    run = settle(jobs, saved["id"])
+    assert run["status"] == "running" and run["unsandboxed"] is True
+    [(_, command)] = herdr_state(state)["runs"]
+    assert command.startswith(typed)
+    agent = changes.get("agent", "codex")
+    assert f"command {agent} {wt.UNSANDBOXED_FLAGS[agent]} " in command
+    if flag:
+        assert f"{flag}{account} " in command
+    # The typed line really runs the agent, with the flag the wrapper would have added.
+    [started] = herdr_state(state)["agents"]
+    assert started["agent"] == agent
+    assert started["argv"][0] == wt.UNSANDBOXED_FLAGS[agent]
+    if flag:
+        assert started["claude_config_dir"] == str(account)
+
+
+def test_a_job_saved_before_the_option_existed_stays_in_safehouse(setup):
+    jobs, manager, _, state = setup
+    saved = jobs.save(request(manager, agent="claude"))
+    assert saved["unsandboxed"] is False
+    # As stored by an older dashboard: no unsandboxed key at all.
+    with jobs.db() as db:
+        job = jobs.jobs(db)[0]
+        del job["unsandboxed"]
+        db.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(job), job["id"]))
+    assert "unsandboxed" not in jobs.snapshot()["jobs"][0]
+    jobs.run_now(saved["id"])
+    run = settle(jobs, saved["id"])
+    assert run["status"] == "running" and run["unsandboxed"] is False
+    [(_, command)] = herdr_state(state)["runs"]
+    assert command.startswith("claude ")
+    assert "command" not in command and "dangerously" not in command
 
 
 def test_finished_agents_keep_their_answer_and_close_their_pane(setup, monkeypatch):

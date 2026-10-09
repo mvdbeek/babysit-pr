@@ -109,6 +109,7 @@
       job.effort && `${job.effort} effort`,
       job.claude_account && `Claude account: ${job.claude_account}`,
       job.docker && "Docker",
+      job.unsandboxed && "Outside Safehouse",
     ]
       .filter(Boolean)
       .join(" · ");
@@ -570,6 +571,23 @@
     effort.id = "cron-effort";
     account.id = "cron-claude-account";
     docker.id = "cron-docker";
+    // Bypasses the shell's Safehouse wrapper for this job's own agent only.
+    const unsandboxed = node("input");
+    unsandboxed.id = "cron-unsandboxed";
+    unsandboxed.type = "checkbox";
+    const unsandboxedLabel = node("label", undefined, "workspace-later");
+    unsandboxedLabel.append(unsandboxed, " Run outside Safehouse (can write anywhere)");
+    const unsandboxedNote = node(
+      "small",
+      "The agent can change any file you can, including other clones. Agents it starts with wt stay in Safehouse.",
+      "cron-unsandboxed-note",
+    );
+    // Docker access is a Safehouse setting, so it has no meaning outside it.
+    const syncSandbox = () => {
+      if (unsandboxed.checked) docker.checked = false;
+      docker.disabled = unsandboxed.checked;
+    };
+    unsandboxed.addEventListener("change", syncSandbox);
     // A saved setting the current choices lack (an uncached model, a removed account)
     // stays selected, so editing something else does not quietly drop it.
     const keep = (select, value) => {
@@ -592,7 +610,9 @@
       keep(effort, job.effort);
       keep(account, job.claude_account);
       docker.checked = Boolean(job.docker);
+      unsandboxed.checked = Boolean(job.unsandboxed);
     }
+    syncSandbox();
     const prompt = node("textarea");
     prompt.id = "cron-prompt";
     prompt.rows = 6;
@@ -617,7 +637,7 @@
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    parts.push(settingsNote, fields.effortDefaults, dockerLabel);
+    parts.push(settingsNote, fields.effortDefaults, dockerLabel, unsandboxedLabel, unsandboxedNote);
     field("Prompt", prompt);
     parts.push(
       node(
@@ -627,7 +647,19 @@
     );
     container.replaceChildren(...parts);
     for (const select of [repo, model, effort]) tools.searchable(select);
-    agentForm = { repos, repo, branch, base, agent, model, effort, account, docker, prompt };
+    agentForm = {
+      repos,
+      repo,
+      branch,
+      base,
+      agent,
+      model,
+      effort,
+      account,
+      docker,
+      unsandboxed,
+      prompt,
+    };
   }
   function openEditor(job) {
     const sequence = ++editorSequence;
@@ -679,6 +711,7 @@
       effort: form.effort.value,
       claude_account: form.agent.value === "claude" ? form.account.value : "",
       docker: form.docker.checked,
+      unsandboxed: form.unsandboxed.checked,
       prompt: form.prompt.value,
     };
   }

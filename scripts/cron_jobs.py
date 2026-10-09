@@ -51,6 +51,7 @@ AGENT_KEYS = {
     "effort",
     "claude_account",
     "docker",
+    "unsandboxed",
     "prompt",
 }
 STOP_GRACE = 5  # Seconds between SIGTERM and SIGKILL when a run is stopped.
@@ -604,6 +605,7 @@ class CronJobs:
             # What this run started with, should the job be edited later.
             agent=job["agent"],
             claude_account=job["claude_account"],
+            unsandboxed=job.get("unsandboxed", False),
             prompt=job["prompt"],
             timeout=job["timeout"],
         )

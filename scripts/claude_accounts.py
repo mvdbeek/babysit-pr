@@ -127,7 +127,11 @@ def environment(config_dir, *, subscription=False, base=None, config_env=False):
 
 
 def shell_command(command, config_dir, *, subscription=False, config_env=False):
-    """Retain the user's shell function, including its Safehouse containment."""
+    """Retain the user's shell function, including its Safehouse containment.
+
+    The prefix only sets the environment, so a ``command claude …`` from an unsandboxed
+    cron job still bypasses the function, and ``SAFEHOUSE_ENV_PASS`` goes unused.
+    """
     if config_env is False:
         home = Path(config_dir).resolve()
         config_env = None if home == default_home() else str(home)
