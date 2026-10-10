@@ -15,6 +15,7 @@ in a pane gets the message there; one just resumed or owned by a babysit watch i
 never resumed again.
 """
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -65,14 +66,43 @@ DIALOG_HINTS = ("esc to cancel", "enter to select", "enter to confirm")
 MAX_ANSWER = 2000
 # How long a stop waits for the agent to leave its turn, in milliseconds.
 STOP_WAIT = 5000
-_answer_lock = threading.Lock()
-_resume_lock = threading.RLock()
+# Locks by (kind, name): a slow action waits only for others on its checkout, session or
+# pane, never for those elsewhere. Taken in this order of kinds.
+LOCK_ORDER = ("checkout", "session", "pane")
+_locks_guard = threading.Lock()
+_locks: dict[tuple[str, str], list] = {}
 _recent: dict[str, tuple[str, float]] = {}
 # Once any Codex answer keystroke was attempted, retries must finish in the terminal.
 # Async questions can retain only an acknowledgment in the transcript after answering.
 _codex_answered: set[tuple[str, str]] = set()
 # A default meaning "not resolved yet", since None means "resolved: no workspace open".
 _UNSET = object()
+
+
+@contextlib.contextmanager
+def locked(*keys):
+    """Hold the locks of these (kind, name) keys; a thread may take one it holds again.
+
+    Every caller takes its locks in one order (checkouts, then sessions, then panes), all
+    at once or a pane's last, so no two callers can each wait for the other. A lock nobody
+    holds or waits for is forgotten.
+    """
+    ordered = sorted(set(keys), key=lambda key: (LOCK_ORDER.index(key[0]), key[1]))
+    with _locks_guard:
+        entries = [_locks.setdefault(key, [threading.RLock(), 0]) for key in ordered]
+        for entry in entries:
+            entry[1] += 1
+    try:
+        with contextlib.ExitStack() as stack:
+            for entry in entries:
+                stack.enter_context(entry[0])
+            yield
+    finally:
+        with _locks_guard:
+            for key, entry in zip(ordered, entries, strict=True):
+                entry[1] -= 1
+                if not entry[1]:
+                    del _locks[key]
 
 
 def clean(text):
@@ -170,8 +200,7 @@ def send(request, home=None, *, expected_session=None, checkout=None):
         raise ValueError("That agent is no longer running; refresh")
     if expected_session is not None and target.get("session") != expected_session:
         raise ValueError("The agent session changed; reload the agent list")
-    with _resume_lock:
-        return prompt(target, text)
+    return prompt(target, text)
 
 
 def docker_status(workspace_id, live=_UNSET):
@@ -198,7 +227,14 @@ def set_docker(request, home=None):
         )
     ):
         raise ValueError("Invalid Docker access parameters")
-    with _resume_lock:
+    # The agent is quit and launched again: no resume of its session or in its checkout,
+    # and nothing typed into its pane, may come in between.
+    root = workspace_viewer.workspace_checkout(request["workspace"])
+    with locked(
+        ("checkout", os.path.realpath(root)),
+        ("session", request["session"]),
+        ("pane", request["pane"]),
+    ):
         target = next(
             (a for a in agents(request["workspace"]) if a["pane"] == request["pane"]), None
         )
@@ -270,6 +306,12 @@ def change_docker(target, enabled, home):
 
 def prompt(target, text):
     """Type the message into a running agent's pane and submit it."""
+    # Never interleaved with another message, an answer or a stop typed into the pane.
+    with locked(("pane", target["pane"])):
+        return prompt_locked(target, text)
+
+
+def prompt_locked(target, text):
     pane = target["pane"]
     if target["status"] == "blocked":
         if target["agent"] != "claude" or not idle_screen(pane):
@@ -342,8 +384,9 @@ def interrupt(request):
     def current():
         return next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
 
-    # Typing an answer into a dialog holds the answer lock; Esc must not land mid-answer.
-    with _resume_lock, _answer_lock:
+    # Typing a message or an answer holds the pane's lock; Esc must not land mid-answer.
+    # Only this pane's: a stop never waits for actions on other agents.
+    with locked(("pane", pane)):
         target = current()
         if target is None or target.get("session") != request["session"]:
             raise ValueError("That session is no longer running in this pane; refresh")
@@ -392,7 +435,7 @@ def paste(pane, text):
     shows it. A dialog that opened meanwhile never gets that Enter.
     """
     # Dialog choices type into the same pane; neither interleaves with the other.
-    with _answer_lock:
+    with locked(("pane", pane)):
         if not idle_screen(pane):
             raise ValueError("The agent is waiting on a question or approval; answer it first")
         run("herdr", "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~")
@@ -680,7 +723,7 @@ def answer_steps(questions, answers, agent="claude"):
 
 def answer(request):
     """Serialize answers, including validation, so a queued duplicate is checked again."""
-    with _answer_lock:
+    with locked(("pane", str(request.get("pane")))):
         return answer_locked(request)
 
 
@@ -770,7 +813,7 @@ def answer_locked(request):
 
 def choose(request):
     """Pick one option of the Claude dialog on an agent's screen, by its number key."""
-    with _answer_lock:
+    with locked(("pane", str(request.get("pane")))):
         if set(request) != {"workspace", "pane", "session", "dialog", "option"} or not all(
             isinstance(request[k], str) and request[k] for k in request
         ):
@@ -1013,8 +1056,9 @@ def resume(workspace_id, session_id, text, home, root=None):
     chosen = next((s for s in workspace_viewer.sessions(root) if s["id"] == session_id), None)
     if chosen is None or chosen["agent"] not in RESUME:
         raise ValueError("That session is not recorded for this workspace")
-    # One resume at a time, held until its agent shows up: a second request then sees it.
-    with _resume_lock:
+    # One resume of a session, and in a checkout, at a time, held until its agent shows up:
+    # a second request then sees it.
+    with locked(("checkout", os.path.realpath(root)), ("session", session_id)):
         if workspace_id is None:
             workspace_id = workspace_viewer.checkout_workspace(root)
         if workspace_id and agents(workspace_id):

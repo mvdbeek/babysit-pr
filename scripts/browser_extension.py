@@ -161,15 +161,12 @@ class Extension:
             agents, error = self.agents(workspaces, workspaces.snapshot(), workspaces.targets())
             return {"agents": agents, "error": error} if error else {"agents": agents}
         if action == "status":
-            state = workspaces.snapshot()
-            for section in ("prs", "issues", "new"):
-                values = state.get(section, {})
-                entries = values.values() if isinstance(values, dict) else values
-                for item in entries:
-                    operation = item.get("operation", item)
-                    if operation and operation.get("id") == request.get("id"):
-                        return {"operation": operation}
-            raise ValueError("Operation not found; check the dashboard")
+            # Polled while a launch runs: one record, never a whole snapshot.
+            key = request.get("id")
+            operation = workspaces.operation_status(key) if isinstance(key, str) else None
+            if not operation:
+                raise ValueError("Operation not found; check the dashboard")
+            return {"operation": operation}
         if action == "submit":
             return self.once(client, request, lambda: submit(server, request))
         raise ValueError("Unknown extension action")

@@ -66,8 +66,15 @@ BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NEW_PREFIX = "new:"
 NEW_LISTED = 86400
 NEW_LIMIT = 20
+# Why a launch without a worker in this process is uncertain: the dashboard stopped.
+INTERRUPTED = "Delivery was interrupted. Recorded resources were inspected; automatic relaunch is disabled. Reopen an existing checkout or inspect the operation log."
+NEW_INTERRUPTED = "The dashboard stopped while starting this task. Check for its issue and workspace before starting it again."
 # How often listing new tasks also deletes the expired ones from the database.
 PRUNE_SECONDS = 60
+# Finished operations, and verified checkouts that went missing, are kept this long; the
+# scheduler forgets older ones at most this often.
+HISTORY_SECONDS = 30 * 86400
+HISTORY_PRUNE_SECONDS = 3600
 # A new task lists clones whose HEAD moved this recently, unless asked for all of them.
 RECENT_CLONE_SECONDS = 90 * 86400
 REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
@@ -394,6 +401,7 @@ class Workspaces:
         self.next_poll = 0.0
         self.refreshing = False
         self.pruned_at = 0.0
+        self.history_pruned_at = 0.0
         # The snapshot requests waiting for the next computation, and the turn to compute.
         self.flight: concurrent.futures.Future | None = None
         self.flight_lock = threading.Lock()
@@ -810,11 +818,7 @@ class Workspaces:
                 with self.lock:
                     current = self.operation(pr["id"]) or op
                     if current["status"] in {"queued", "running"} and pr["id"] not in self.workers:
-                        self.save_operation(
-                            current,
-                            status="uncertain",
-                            message="Delivery was interrupted. Recorded resources were inspected; automatic relaunch is disabled. Reopen an existing checkout or inspect the operation log.",
-                        )
+                        self.save_operation(current, status="uncertain", message=INTERRUPTED)
                     op = current
             # An uncertain launch keeps the cause perform() recorded; only an agent that
             # came up resolves it, so nothing is written until then.
@@ -966,159 +970,160 @@ class Workspaces:
             raise ValueError("Watch actions can only open or reopen the registered checkout")
         if is_sentry(pr) and action in {"create", "clone-and-create"}:
             raise ValueError("Use Handle to start work on a Sentry issue")
-        with self.lock:
-            # A launch running now does not block one scheduled for later; the scheduler
-            # waits for it to finish before starting the scheduled task.
-            if action in {"create", "clone-and-create", "reopen", "handle"} and not scheduling:
-                existing = self.operation(pr["id"])
-                if existing and (
-                    existing["status"] in {"queued", "running"}
-                    or (
-                        action != "reopen"
-                        and not (action == "handle" and existing["status"] == "complete")
-                        and not (existing["status"] == "failed" and request.get("retry"))
-                    )
-                ):
-                    return {"operation": existing}
-            if inventory is None:
-                inventory = self.scan()  # A failed inventory must never authorize creation.
-            info = self.describe(pr, inventory)
-            if action in {"open", "focus", "copy", "reopen"}:
-                candidates = [
+        # A launch running now does not block one scheduled for later; the scheduler
+        # waits for it to finish before starting the scheduled task.
+        if action in {"create", "clone-and-create", "reopen", "handle"} and not scheduling:
+            existing = self.operation(pr["id"])
+            if existing and (
+                existing["status"] in {"queued", "running"}
+                or (
+                    action != "reopen"
+                    and not (action == "handle" and existing["status"] == "complete")
+                    and not (existing["status"] == "failed" and request.get("retry"))
+                )
+            ):
+                return {"operation": existing}
+        # No lock is held while git and herdr run, so snapshots and other items' actions
+        # go on meanwhile; only the reservation below takes it.
+        if action in {"open", "focus", "copy", "reopen"}:
+
+            def listed(inventory):
+                return [
                     m
-                    for m in info["matches"]
+                    for m in self.describe(pr, inventory)["matches"]
                     if m["path"] == request.get("path")
                     and m["workspace_id"] == request.get("workspace_id")
                 ]
-                if len(candidates) != 1:
-                    raise ValueError("Workspace changed; refresh and choose a verified checkout")
-                target = candidates[0]
-                fresh = checkout(target["path"])
-                current, _ = self.matches(
-                    pr,
-                    {
-                        "checkouts": [fresh] if fresh else [],
-                        "workspaces": herdr("workspace", "list")["workspaces"],
-                    },
+
+            # The chosen checkout is verified again below from fresh git and herdr data,
+            # so the cached inventory need only list it; one that does not is rescanned.
+            candidates = listed(inventory or self.inventory)
+            if len(candidates) != 1 and inventory is None:
+                candidates = listed(self.scan())
+            if len(candidates) != 1:
+                raise ValueError("Workspace changed; refresh and choose a verified checkout")
+            target = candidates[0]
+            fresh = checkout(target["path"])
+            current, _ = self.matches(
+                pr,
+                {
+                    "checkouts": [fresh] if fresh else [],
+                    "workspaces": herdr("workspace", "list")["workspaces"],
+                },
+            )
+            target = next((m for m in current if m["workspace_id"] == target["workspace_id"]), None)
+            if not target:
+                raise ValueError("Workspace changed; refresh before opening")
+            self.association(pr, target)
+            if action == "focus":
+                if not target["workspace_id"]:
+                    raise ValueError("Workspace is missing")
+                run("herdr", "workspace", "focus", target["workspace_id"])
+            if action == "copy":
+                args = (
+                    ["herdr", "workspace", "focus", target["workspace_id"]]
+                    if target["workspace_id"]
+                    else [
+                        "herdr",
+                        "worktree",
+                        "open",
+                        "--cwd",
+                        str(Path(target["common"]).parent),
+                        "--path",
+                        target["path"],
+                        "--no-focus",
+                    ]
                 )
-                target = next(
-                    (m for m in current if m["workspace_id"] == target["workspace_id"]), None
-                )
-                if not target:
-                    raise ValueError("Workspace changed; refresh before opening")
-                self.association(pr, target)
-                if action == "focus":
-                    if not target["workspace_id"]:
-                        raise ValueError("Workspace is missing")
-                    run("herdr", "workspace", "focus", target["workspace_id"])
-                if action == "copy":
-                    args = (
-                        ["herdr", "workspace", "focus", target["workspace_id"]]
-                        if target["workspace_id"]
-                        else [
-                            "herdr",
-                            "worktree",
-                            "open",
-                            "--cwd",
-                            str(Path(target["common"]).parent),
-                            "--path",
-                            target["path"],
-                            "--no-focus",
-                        ]
-                    )
-                    return {"command": shlex.join(args)}
-                if target["workspace_id"]:
-                    return {"result": target}
-                if action != "reopen":
-                    raise ValueError("Use Reopen workspace for this checkout")
-                clone = str(Path(target["common"]).parent)
+                return {"command": shlex.join(args)}
+            if target["workspace_id"]:
+                return {"result": target}
+            if action != "reopen":
+                raise ValueError("Use Reopen workspace for this checkout")
+            clone = str(Path(target["common"]).parent)
+        else:
+            if inventory is None:
+                inventory = self.scan()  # A failed inventory must never authorize creation.
+            info = self.describe(pr, inventory)
+            if info["matches"] and action != "handle":
+                raise ValueError("A verified checkout already exists; open or reopen it")
+            if request.get("agent", "codex") not in {"codex", "claude"}:
+                raise ValueError("Select Codex or Claude")
+            workspace_agents.validate(
+                request.get("agent", "codex"),
+                request.get("model", ""),
+                request.get("effort", ""),
+                self.home,
+            )
+            claude_accounts.validate(request.get("agent", "codex"), request.get("claude_account"))
+            if (
+                not request.get("task", "").strip()
+                or len(request["task"]) > 32000
+                or "\0" in request["task"]
+            ):
+                raise ValueError("Supply a task of 1–32,000 characters")
+            if (
+                not is_issue(pr)
+                and not is_sentry(pr)
+                and not (pr.get("head_repo") and pr.get("head_branch") and pr.get("head_sha"))
+            ):
+                raise ValueError("Refresh GitHub metadata before creating a workspace")
+            if action == "create" or (action == "handle" and info["clones"]):
+                chosen = True
+                clone = request.get("clone") or info["preferred_clone"]
+                if not clone and len(info["clones"]) == 1:
+                    clone = info["clones"][0]
+                if clone not in info["clones"]:
+                    raise ValueError("Choose a verified local clone")
             else:
-                if info["matches"] and action != "handle":
-                    raise ValueError("A verified checkout already exists; open or reopen it")
-                if request.get("agent", "codex") not in {"codex", "claude"}:
-                    raise ValueError("Select Codex or Claude")
-                workspace_agents.validate(
-                    request.get("agent", "codex"),
-                    request.get("model", ""),
-                    request.get("effort", ""),
-                    self.home,
-                )
-                claude_accounts.validate(
-                    request.get("agent", "codex"), request.get("claude_account")
-                )
-                if (
-                    not request.get("task", "").strip()
-                    or len(request["task"]) > 32000
-                    or "\0" in request["task"]
+                clone = info["destination"]
+                if info["clones"] or not clone or request.get("destination") != clone:
+                    raise ValueError("Clone destination changed; refresh before confirming")
+        if scheduling:
+            return {"scheduled": self.schedule(pr, action, request, clone if chosen else None)}
+        op = {
+            "id": str(uuid.uuid4()),
+            "pr": pr["id"],
+            "action": action,
+            "status": "queued",
+            "clone": clone,
+            "path": target["path"] if action == "reopen" else None,
+            "agent": None if action == "reopen" else request.get("agent", "codex"),
+            "model": None if action == "reopen" else request.get("model") or None,
+            "effort": None if action == "reopen" else request.get("effort") or None,
+            "claude_account": None if action == "reopen" else request.get("claude_account") or None,
+            # Opens the Docker socket in the agent's Safehouse sandbox (`wt --docker`).
+            "docker": action != "reopen" and request.get("docker", False),
+            "message": "Queued",
+            "log": "",
+            "created_at": time.time(),
+        }
+        if scheduled and action != "reopen":
+            op["exit_marker"] = workspace_exit.new_marker()
+        # Reserve the PR in SQLite before starting a thread (also across server instances).
+        with self.lock, self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM operations WHERE pr=?", (pr["id"],)).fetchone()
+            if row:
+                previous = json.loads(row[0])
+                if previous["status"] in {"queued", "running"} or (
+                    action != "reopen"
+                    and not (action == "handle" and previous["status"] == "complete")
+                    and (previous["status"] != "failed" or not request.get("retry"))
                 ):
-                    raise ValueError("Supply a task of 1–32,000 characters")
-                if (
-                    not is_issue(pr)
-                    and not is_sentry(pr)
-                    and not (pr.get("head_repo") and pr.get("head_branch") and pr.get("head_sha"))
-                ):
-                    raise ValueError("Refresh GitHub metadata before creating a workspace")
-                if action == "create" or (action == "handle" and info["clones"]):
-                    chosen = True
-                    clone = request.get("clone") or info["preferred_clone"]
-                    if not clone and len(info["clones"]) == 1:
-                        clone = info["clones"][0]
-                    if clone not in info["clones"]:
-                        raise ValueError("Choose a verified local clone")
-                else:
-                    clone = info["destination"]
-                    if info["clones"] or not clone or request.get("destination") != clone:
-                        raise ValueError("Clone destination changed; refresh before confirming")
-            if scheduling:
-                return {"scheduled": self.schedule(pr, action, request, clone if chosen else None)}
-            op = {
-                "id": str(uuid.uuid4()),
-                "pr": pr["id"],
-                "action": action,
-                "status": "queued",
-                "clone": clone,
-                "path": target["path"] if action == "reopen" else None,
-                "agent": None if action == "reopen" else request.get("agent", "codex"),
-                "model": None if action == "reopen" else request.get("model") or None,
-                "effort": None if action == "reopen" else request.get("effort") or None,
-                "claude_account": None
-                if action == "reopen"
-                else request.get("claude_account") or None,
-                # Opens the Docker socket in the agent's Safehouse sandbox (`wt --docker`).
-                "docker": action != "reopen" and request.get("docker", False),
-                "message": "Queued",
-                "log": "",
-                "created_at": time.time(),
-            }
-            if scheduled and action != "reopen":
-                op["exit_marker"] = workspace_exit.new_marker()
-            # Reserve the PR in SQLite before starting a thread (also across server instances).
-            with self.db() as db:
-                db.execute("BEGIN IMMEDIATE")
-                row = db.execute("SELECT data FROM operations WHERE pr=?", (pr["id"],)).fetchone()
-                if row:
-                    previous = json.loads(row[0])
-                    if previous["status"] in {"queued", "running"} or (
-                        action != "reopen"
-                        and not (action == "handle" and previous["status"] == "complete")
-                        and (previous["status"] != "failed" or not request.get("retry"))
-                    ):
-                        return {"operation": previous}
-                db.execute(
-                    "INSERT OR REPLACE INTO operations VALUES (?,?)", (pr["id"], json.dumps(op))
-                )
-                # The dashboard flags unedited prefills; the pattern also catches older tabs.
-                if action != "reopen" and not request.get("prefilled"):
-                    self.remember_prompt(db, request["task"], op["created_at"])
-                worker = threading.Thread(
-                    target=self.perform, args=(pr, op, request.get("task", "")), daemon=True
-                )
-                # Registered before the reservation commits, so no snapshot sees a queued
-                # operation without an owner and marks it uncertain.
-                self.workers[pr["id"]] = worker
-            worker.start()
-            # `started` tells the scheduler this call created the operation it returns.
-            return {"operation": copy.deepcopy(op), "started": True}
+                    return {"operation": previous}
+            db.execute("INSERT OR REPLACE INTO operations VALUES (?,?)", (pr["id"], json.dumps(op)))
+            # The dashboard flags unedited prefills; the pattern also catches older tabs.
+            if action != "reopen" and not request.get("prefilled"):
+                self.remember_prompt(db, request["task"], op["created_at"])
+            worker = threading.Thread(
+                target=self.perform, args=(pr, op, request.get("task", "")), daemon=True
+            )
+            # Registered before the reservation commits, so no snapshot sees a queued
+            # operation without an owner and marks it uncertain.
+            self.workers[pr["id"]] = worker
+        worker.start()
+        # `started` tells the scheduler this call created the operation it returns.
+        return {"operation": copy.deepcopy(op), "started": True}
 
     # -- tasks started from scratch --
 
@@ -1337,11 +1342,7 @@ class Workspaces:
                 with self.lock:
                     op = self.operation(key) or op
                     if op["status"] in {"queued", "running"} and key not in self.workers:
-                        self.save_operation(
-                            op,
-                            status="uncertain",
-                            message="The dashboard stopped while starting this task. Check for its issue and workspace before starting it again.",
-                        )
+                        self.save_operation(op, status="uncertain", message=NEW_INTERRUPTED)
             found.append(op)
         # Expired ones are only hidden above, so the cleanup need not write every poll.
         if now - self.pruned_at >= PRUNE_SECONDS:
@@ -1699,12 +1700,95 @@ class Workspaces:
         if json.dumps(record, sort_keys=True) != saved[0]:
             persist(record)
 
+    def operation_status(self, key):
+        """The current operation with this ID, as a snapshot shows it, or None.
+
+        A launch whose worker is gone is marked uncertain as describe() and
+        new_operations() mark it, without building a snapshot to find it.
+        """
+        with self.db() as db:
+            row = db.execute(
+                "SELECT pr FROM operations WHERE json_extract(data,'$.id')=?", (key,)
+            ).fetchone()
+        if not row:
+            return None
+        with self.lock:
+            op = self.operation(row[0])
+            if not op or op["id"] != key:
+                return None
+            orphaned = op["status"] in {"queued", "running"} and row[0] not in self.workers
+        if orphaned:
+            # Its worker is gone (a restart, say). Only a full description can tell whether
+            # the agent came up meanwhile, so this rare case takes the snapshot path, which
+            # recovers the launch or marks it uncertain; the extension then stops polling.
+            self.snapshot()
+        with self.lock:
+            op = self.operation(row[0])
+            if not op or op["id"] != key:
+                return None
+            if op["status"] in {"queued", "running"} and row[0] not in self.workers:
+                # No longer a target the snapshot describes.
+                new = row[0].startswith(NEW_PREFIX)
+                self.save_operation(
+                    op, status="uncertain", message=NEW_INTERRUPTED if new else INTERRUPTED
+                )
+        return op
+
     def operation_record(self, key):
         if not key:
             return None
         with self.db() as db:
             row = db.execute("SELECT data FROM operation_history WHERE id=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def prune_history(self, now=None):
+        """Forget month-old finished operations and month-missing checkouts; at most hourly.
+
+        Queued, running and uncertain operations are always kept, as is the record a
+        scheduled task names, and an item's current operation while its checkout exists.
+        A verified checkout whose path is gone is marked missing, and forgotten only after
+        a month of that; one that comes back is kept as before.
+        """
+        now = time.time() if now is None else now
+        if now - self.history_pruned_at < HISTORY_PRUNE_SECONDS:
+            return
+        self.history_pruned_at = now
+        cutoff = now - HISTORY_SECONDS
+        with self.db() as db:
+            db.execute(
+                """DELETE FROM operation_history
+                   WHERE json_extract(data,'$.status') IN ('complete','failed')
+                   AND coalesce(json_extract(data,'$.updated_at'),
+                                json_extract(data,'$.created_at'), 0) < ?
+                   AND id NOT IN (SELECT json_extract(data,'$.operation_id') FROM scheduled
+                                  WHERE json_extract(data,'$.operation_id') IS NOT NULL)""",
+                (cutoff,),
+            )
+            for key, data in db.execute("SELECT pr,data FROM operations").fetchall():
+                op = json.loads(data)
+                if (
+                    op.get("status") in {"complete", "failed"}
+                    and (op.get("updated_at") or op.get("created_at") or 0) < cutoff
+                    and not (op.get("path") and os.path.lexists(op["path"]))
+                ):
+                    db.execute("DELETE FROM operations WHERE pr=? AND data=?", (key, data))
+            for key, path, data in db.execute("SELECT pr,path,data FROM associations").fetchall():
+                record = json.loads(data)
+                if os.path.lexists(path):
+                    if "missing_at" not in record:
+                        continue
+                    del record["missing_at"]
+                elif "missing_at" not in record:
+                    record["missing_at"] = now
+                elif record["missing_at"] < cutoff:
+                    db.execute("DELETE FROM associations WHERE pr=? AND path=?", (key, path))
+                    continue
+                else:
+                    continue
+                db.execute(
+                    "UPDATE associations SET data=? WHERE pr=? AND path=?",
+                    (json.dumps(record), key, path),
+                )
 
     def next_due(self):
         with self.db() as db:
@@ -1734,6 +1818,10 @@ class Workspaces:
                 pass  # The scheduler must outlive any single failure; the next pass retries.
             try:
                 self.exit_finished()
+            except Exception:
+                pass
+            try:
+                self.prune_history()
             except Exception:
                 pass
             try:

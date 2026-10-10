@@ -24,6 +24,7 @@ import browser_extension
 import llm_usage
 import workspace_agents
 import workspace_viewer
+from dashboard_push import check_result
 from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
 from pr_ci_logs import BackgroundLogs
@@ -46,6 +47,8 @@ COMPRESS_MIN = 1024
 COMPRESS_LEVEL = 5
 # Bodies go out in chunks, so the socket timeout bounds a stall rather than a slow link.
 WRITE_CHUNK = 256 * 1024
+# A refused request's body up to this size is read and dropped to keep its connection.
+DRAIN_MAX = 256 * 1024
 # A queue write within this long of a read may share its timestamp: never cached.
 RACY_NS = 1_000_000_000
 _jobs_lock = threading.Lock()
@@ -157,6 +160,7 @@ def present_job(job):
     from pr_supervisor import approved_feedback, feedback_token
 
     feedback = job.get("pending_reviews") or []
+    check_details = snapshot.get("check_details") or []
     return {
         "feedback": feedback,
         "feedback_token": feedback_token(feedback),
@@ -185,7 +189,8 @@ def present_job(job):
         "max_repairs": job.get("max_repairs", 0),
         "pending_reviews": len(job.get("pending_reviews") or []),
         "checks": snapshot.get("checks"),
-        "check_details": snapshot.get("check_details") or [],
+        "check_details": check_details,
+        "checks_result": check_result(check_details),
         "failed_jobs": snapshot.get("failed_jobs") or [],
         "updated_at": job.get("updated_at"),
         "next_poll": job.get("next_poll"),
@@ -209,11 +214,13 @@ def status(home):
         "daemon": {"health": "unknown", "heartbeat_age": None, "max_workers": None},
     }
     try:
-        result["jobs"] = sorted(
-            (present_job(job) for job in read_jobs(home)),
-            key=lambda job: job.get("updated_at") or 0,
-            reverse=True,
-        )
+        jobs = [present_job(job) for job in read_jobs(home)]
+        for job in jobs:
+            # Every poll carries every watch: an ended one's CI details are loaded on
+            # demand (/api/watch). Its overall result stays, for notifications.
+            if job["status"] in agent_messages.ENDED_WATCHES:
+                job.update(check_details=[], failed_jobs=[], details_omitted=True)
+        result["jobs"] = sorted(jobs, key=lambda job: job.get("updated_at") or 0, reverse=True)
         heartbeat = read_json(home / "heartbeat.json") or {}
         daemon = read_json(home / "daemon.json") or {}
         age = max(0, now - heartbeat["time"]) if heartbeat.get("time") else None
@@ -343,10 +350,15 @@ class DashboardServer(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     server: DashboardServer
-    # A client that stops sending or reading frees its thread; request bodies narrow it.
+    # Polls reuse one connection (keep-alive) instead of opening one per request.
+    protocol_version = "HTTP/1.1"
+    # A client that stops sending or reading frees its thread, as does a connection idle
+    # this long between requests; request bodies narrow it.
     timeout = 30
     # Whether this request's response has begun: never start a second one.
     started = False
+    # The request body's bytes not read yet; None when unknown, which ends the connection.
+    unread: int | None = 0
 
     def log_message(self, *args):
         pass
@@ -359,6 +371,16 @@ class Handler(BaseHTTPRequestHandler):
         headers a 200 would have, without the body.
         """
         self.started = True
+        if self.unread != 0:
+            # The next request on this connection starts after this body: a small one
+            # is read and dropped, otherwise the connection ends with this response.
+            if self.unread is not None and self.unread <= DRAIN_MAX:
+                try:
+                    self.read_body(self.unread, 5)
+                except OSError:
+                    pass
+            if self.unread != 0:
+                self.close_connection = True
         encoding = None
         vary = []
         if compressible(content_type) and len(body) >= COMPRESS_MIN:
@@ -367,11 +389,15 @@ class Handler(BaseHTTPRequestHandler):
                 if compressed is None:
                     compressed = gzip.compress(body, compresslevel=COMPRESS_LEVEL, mtime=0)
                 body, encoding = compressed, "gzip"
-        if code == 304:
+        # Neither has a body, nor a length, which would describe one.
+        bodiless = code in (204, 304)
+        if bodiless:
             body = b""
         try:
             self.send_response(code)
-            if code != 304:
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            if not bodiless:
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
             if encoding:
@@ -411,17 +437,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(code, json.dumps(value).encode(), "application/json; charset=utf-8")
 
     def fail(self, code, message):
-        """An error response, unless one already began (its client may be gone)."""
-        if not self.started:
+        """An error response, unless one already began (its client may be gone).
+
+        A response cut short cannot be completed, so its connection closes rather than
+        leave a kept-alive client waiting for the rest.
+        """
+        if self.started:
+            self.close_connection = True
+        else:
             self.send_json(code, {"error": message})
+
+    def read_body(self, length, timeout):
+        """Read the request body of ``length`` bytes, each read within ``timeout`` seconds.
+
+        Only a whole body, of the length the request declared, keeps the connection open.
+        """
+        declared, self.unread = self.unread, None
+        self.connection.settimeout(timeout)
+        data = self.rfile.read(length)
+        if len(data) == length == declared:
+            self.unread = 0
+            self.connection.settimeout(self.timeout)
+        return data
 
     def guarded(self, handler):
         """Answer every request: an unexpected error is logged and becomes a 500."""
         self.started = False
+        length = self.headers.get("Content-Length")
+        try:
+            self.unread = 0 if length is None else int(length)
+        except ValueError:
+            self.unread = None
+        if self.headers.get("Transfer-Encoding") or (self.unread or 0) < 0:
+            self.unread = None  # Chunked bodies are not read: never mistaken for a request.
         try:
             handler()
         except Exception as exc:
             traceback.print_exc()
+            # A response it interrupted may be incomplete: never send another after it.
+            self.close_connection = True
             self.fail(500, f"Unexpected dashboard error: {type(exc).__name__}: {exc}")
 
     def do_GET(self):
@@ -437,7 +491,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/extension":
             self.extension_request()
             return
-        self.close_connection = True
         host = self.headers.get("Host")
         allowed = {
             f"127.0.0.1:{self.server.server_port}",
@@ -515,8 +568,7 @@ class Handler(BaseHTTPRequestHandler):
                 or self.headers.get("Content-Type") != "application/json"
             ):
                 raise ValueError("Expected a small JSON action request")
-            self.connection.settimeout(5)
-            request = json.loads(self.rfile.read(length))
+            request = json.loads(self.read_body(length, 5))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
             # Attached files become paths in the text the agent receives.
@@ -677,9 +729,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"Attach a file of at most {attachments.MAX_FILE // (1024 * 1024)} MB")
         name = unquote(self.headers.get("X-Filename") or "file")
         # A phone over the tailnet can be slow; each read still has a limit.
-        self.connection.settimeout(30)
         try:
-            data = self.rfile.read(length)
+            data = self.read_body(length, 30)
         except OSError:
             data = b""
         if len(data) != length:
@@ -708,7 +759,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(403, {"error": "Pair this extension from the dashboard first"})
 
     def extension_request(self):
-        self.close_connection = True
         client = self.server.extension.authenticate(self.headers) if self.extension_host() else None
         if not client:
             self.send_json(403, {"error": "Pair this extension from the dashboard settings"})
@@ -717,8 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 200000:
                 raise ValueError("Invalid request size")
-            self.connection.settimeout(10)
-            request = json.loads(self.rfile.read(length))
+            request = json.loads(self.read_body(length, 10))
             if not isinstance(request, dict):
                 raise ValueError("Expected an object")
             result = self.server.extension.dispatch(self.server, client, request)
@@ -747,6 +796,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route.path == "/api/status":
                 self.send_json(200, status(self.server.home))
+            elif route.path == "/api/watch":
+                # One watch with all its CI details, which the status poll leaves out of
+                # ended watches.
+                job_id = parse_qs(route.query).get("id", [""])[0]
+                job = next(
+                    (job for job in read_jobs(self.server.home) if job["id"] == job_id), None
+                )
+                if job is None:
+                    self.send_json(404, {"error": "Unknown watch"})
+                else:
+                    self.send_json(200, {"job": present_job(job)})
             elif route.path == "/api/llm-usage":
                 refresh = parse_qs(route.query).get("refresh") == ["1"]
                 llm_usage.request(self.server.home, refresh)
