@@ -1,19 +1,26 @@
-/* Diff and transcript viewer. */
+/* Diff and transcript viewer. Its padding is four variables so the sticky header and composer
+   can bleed to the edges, and a full-screen viewer can keep them clear of a notch. */
 #ws-viewer {
+  --base-y: 20px;
+  --base-x: 24px;
+  --inset-top: 0px;
+  --inset-right: 0px;
+  --inset-bottom: 0px;
+  --inset-left: 0px;
+  --view-top: max(var(--base-y), var(--inset-top));
+  --view-right: max(var(--base-x), var(--inset-right));
+  --view-bottom: max(var(--base-y), var(--inset-bottom));
+  --view-left: max(var(--base-x), var(--inset-left));
   width: min(1100px, 96vw);
   max-height: 92vh;
   max-height: 92dvh;
-  overflow: auto;
-  padding: 20px 24px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  color: var(--ink);
-  background: var(--paper);
-}
-#ws-viewer::backdrop {
-  background: #0008;
+  padding: var(--view-top) var(--view-right) var(--view-bottom) var(--view-left);
 }
 #ws-viewer.ws-viewer-full {
+  --inset-top: env(safe-area-inset-top);
+  --inset-right: env(safe-area-inset-right);
+  --inset-bottom: env(safe-area-inset-bottom);
+  --inset-left: env(safe-area-inset-left);
   width: 100%;
   max-width: none;
   height: 100dvh;
@@ -28,11 +35,11 @@
 }
 .ws-viewer-header {
   position: sticky;
-  top: -20px;
+  top: calc(var(--inset-top) - var(--view-top));
   z-index: 1;
   display: flow-root;
-  margin: -20px -24px 12px;
-  padding: 20px 24px 12px;
+  margin: calc(-1 * var(--view-top)) calc(-1 * var(--view-right)) 12px calc(-1 * var(--view-left));
+  padding: var(--view-top) var(--view-right) 12px var(--view-left);
   border-bottom: 1px solid var(--line);
   background: var(--paper);
 }
@@ -118,10 +125,10 @@
 .ws-live-agent .ws-stop {
   margin-left: auto;
   color: var(--red);
-  border-color: #dfbdb8;
+  border-color: var(--danger-line);
 }
 .ws-live-agent .ws-stop:hover {
-  background: #faeeeb;
+  background: var(--red-bg);
 }
 .ws-live-agent[data-status="working"] .badge:before {
   animation: ws-live-pulse 1.2s ease-in-out infinite;
@@ -197,16 +204,16 @@
   white-space: pre;
 }
 .ws-diff .ws-add {
-  color: #d3f2dc;
-  background: #1f3d2c;
+  color: var(--add-fg);
+  background: var(--add-bg);
 }
 .ws-diff .ws-del {
-  color: #f6d5d1;
-  background: #47241f;
+  color: var(--del-fg);
+  background: var(--del-bg);
 }
 .ws-diff .ws-hunk {
-  color: #9cc3e6;
-  background: #26333d;
+  color: var(--hunk-fg);
+  background: var(--hunk-bg);
 }
 .ws-commit {
   padding: 6px 12px;
@@ -242,7 +249,7 @@
   border: 1px solid var(--line);
 }
 .ws-user {
-  background: #eef3f8;
+  background: var(--user-bg);
 }
 .ws-msg-head {
   display: flex;
@@ -380,7 +387,7 @@
 .ws-md code {
   padding: 1px 4px;
   border-radius: 4px;
-  background: #eef1ec;
+  background: var(--inline-code);
   font:
     12px ui-monospace,
     SFMono-Regular,
@@ -413,7 +420,7 @@
   vertical-align: top;
 }
 .ws-md th {
-  background: #f6f8f4;
+  background: var(--th-md);
 }
 .ws-tool pre,
 .ws-agent-screen {
@@ -427,11 +434,11 @@
   overflow-wrap: anywhere;
 }
 .ws-tool pre + pre {
-  border-top: 1px solid #3a4a41;
+  border-top: 1px solid var(--code-line);
 }
 .ws-tool .ws-tool-error {
-  color: #f6d5d1;
-  background: #47241f;
+  color: var(--del-fg);
+  background: var(--del-bg);
 }
 .ws-earlier {
   margin-top: 12px;
@@ -446,7 +453,7 @@
   cursor: pointer;
 }
 .ws-diff span[data-line]:hover {
-  outline: 1px solid #5f7d6c;
+  outline: 1px solid var(--diff-hover);
   outline-offset: -1px;
 }
 .ws-comment-box,
@@ -483,10 +490,6 @@
   gap: 6px;
 }
 #ws-docker input[type="checkbox"] {
-  flex: none;
-  padding: 0;
-  width: auto;
-  min-width: 0;
   margin: 0;
 }
 #ws-docker-status {
@@ -494,12 +497,13 @@
 }
 .ws-message {
   position: sticky;
-  bottom: -20px;
+  bottom: calc(var(--inset-bottom) - var(--view-bottom));
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin: 16px -24px -20px;
-  padding: 12px 24px 16px;
+  margin: 16px calc(-1 * var(--view-right)) calc(-1 * var(--view-bottom))
+    calc(-1 * var(--view-left));
+  padding: 12px var(--view-right) max(16px, var(--inset-bottom)) var(--view-left);
   border-top: 1px solid var(--line);
   background: var(--paper);
 }
@@ -539,7 +543,7 @@
   overflow-wrap: anywhere;
 }
 .ws-tool pre a {
-  color: #9cc3e6;
+  color: var(--code-link);
 }
 .ws-comment-head,
 .ws-comment-chip {
@@ -557,7 +561,7 @@
   font-size: 12px;
 }
 .ws-diff span[data-line]:focus {
-  outline: 2px solid #9cc3e6;
+  outline: 2px solid var(--code-link);
   outline-offset: -2px;
 }
 .ws-message textarea {
@@ -572,20 +576,20 @@
   /* A phone screen cannot spare the room: the viewer fills it and the composer follows the content.
      A landscape phone or short window is as cramped, whatever its width. */
   #ws-viewer {
+    --base-y: 14px;
+    --base-x: 16px;
+    --inset-top: env(safe-area-inset-top);
+    --inset-right: env(safe-area-inset-right);
+    --inset-bottom: env(safe-area-inset-bottom);
+    --inset-left: env(safe-area-inset-left);
     width: 100%;
     max-width: none;
     height: 100dvh;
     max-height: none;
     margin: 0;
-    padding: 14px 16px;
     border: 0;
     border-radius: 0;
     scroll-padding-bottom: 0;
-  }
-  .ws-viewer-header {
-    top: -14px;
-    margin: -14px -16px 12px;
-    padding: 14px 16px 12px;
   }
   /* The viewer already fills a phone. */
   #ws-viewer-full {
@@ -593,8 +597,6 @@
   }
   .ws-message {
     position: static;
-    margin: 16px -16px -14px;
-    padding: 12px 16px 16px;
   }
   /* Below 16px, iOS zooms into a focused field and leaves the page zoomed. */
   #ws-viewer textarea,
@@ -695,10 +697,7 @@
 }
 .ws-answer input[type="radio"],
 .ws-answer input[type="checkbox"] {
-  flex: none;
-  width: auto;
   margin: 0;
-  padding: 0;
 }
 .ws-answer label small {
   margin-left: 4px;

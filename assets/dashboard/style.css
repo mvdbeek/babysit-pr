@@ -1,5 +1,5 @@
 :root {
-  color-scheme: light;
+  color-scheme: light dark;
   --bg: #f4f5f1;
   --paper: #fff;
   --ink: #25342f;
@@ -9,7 +9,67 @@
   --red: #ae4941;
   --amber: #966927;
   --blue: #386d9f;
+  /* Surfaces, rules and fields. */
+  --raised: #fcfdf9;
+  --hover: #eff4ec;
+  --selected: #f1f6ec;
+  --unseen: #edf5ed;
+  --chip: #e6ebe2;
+  --faint: #eff2ec;
+  --rule: #dce1d8;
+  --field-bg: #fff;
+  --field-line: #d6ddd3;
+  --popup-line: #b8c8b0;
+  --soft: #67756b;
+  --icon-mute: #9cac94;
+  --focus: #2f7a5f;
+  /* A solid green fill that carries white text. */
+  --brand: #28775a;
+  --on-brand: #fff;
+  /* Status tints behind badges, alerts and rows that changed since the last visit. */
+  --neutral-bg: #edf0eb;
+  --neutral-fg: #637066;
+  --green-bg: #e8f3eb;
+  --red-bg: #faeeeb;
+  --amber-bg: #faf1df;
+  --amber-fg: #85591c;
+  --blue-bg: #eaf0fa;
+  --danger-line: #dfbdb8;
+  --alert-bg: #fff3df;
+  --alert-line: #e5d5b4;
+  --alert-fg: #7e5924;
+  --row-new: #f0f7f0;
+  --row-changed: #fffbef;
+  --row-field: #fff0c9;
+  --change-note: #755729;
+  --chip-line: #0002;
+  /* Code, logs and diffs stay dark in both schemes; only their edges follow the theme. */
+  --code-bg: #202b25;
+  --code-fg: #d9e5d7;
+  --code-line: #3a4a41;
+  --code-link: #9cc3e6;
+  --add-fg: #d3f2dc;
+  --add-bg: #1f3d2c;
+  --del-fg: #f6d5d1;
+  --del-bg: #47241f;
+  --hunk-fg: #9cc3e6;
+  --hunk-bg: #26333d;
+  --diff-hover: #5f7d6c;
+  /* Transcript and Markdown surfaces. */
+  --user-bg: #eef3f8;
+  --inline-code: #eef1ec;
+  --th-md: #f6f8f4;
+  --th-cron: #f7f9f5;
+  /* Dialogs and floating controls. */
+  --scrim: rgb(37 52 47 / 45%);
+  --shadow-dialog: 0 16px 50px #25342f26;
+  --shadow-popup: 0 6px 18px #243a2026;
+  --shadow-float: 0 4px 14px #0003;
   --page-width: 2000px;
+  /* Header and main share one content column: 5% gutters, capped at --page-width, and never
+     under a notch (landscape) or the rounded corners of a phone. */
+  --gutter-left: max(5%, calc((100% - var(--page-width)) / 2), env(safe-area-inset-left));
+  --gutter-right: max(5%, calc((100% - var(--page-width)) / 2), env(safe-area-inset-right));
   font-family:
     Inter,
     ui-sans-serif,
@@ -21,6 +81,65 @@
   /* iOS otherwise enlarges the text of wide, unwrapped lines such as diffs. */
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111a16;
+    --paper: #18231e;
+    --ink: #e4ece6;
+    --muted: #9fb0a5;
+    --line: #2b3a33;
+    --green: #5fc79d;
+    --red: #f08b81;
+    --amber: #e3b45f;
+    --blue: #82b4e8;
+    --raised: #1c2823;
+    --hover: #24322b;
+    --selected: #1d3328;
+    --unseen: #1c3126;
+    --chip: #263530;
+    --faint: #223029;
+    --rule: #2f3f37;
+    --field-bg: #111a16;
+    --field-line: #5f7367;
+    --popup-line: #5f7367;
+    --soft: #94a79b;
+    --icon-mute: #5b6f63;
+    --focus: #74d4ab;
+    --brand: #2b7d5f;
+    --neutral-bg: #26352e;
+    --neutral-fg: #aebdb3;
+    --green-bg: #1d3b2d;
+    --red-bg: #3c2421;
+    --amber-bg: #3b3019;
+    --amber-fg: #ebc07a;
+    --blue-bg: #1d2e44;
+    --danger-line: #6f3f39;
+    --alert-bg: #382d18;
+    --alert-line: #5f4b25;
+    --alert-fg: #efcb8b;
+    --row-new: #1a3226;
+    --row-changed: #2d2814;
+    --row-field: #403414;
+    --change-note: #e4bf7d;
+    --chip-line: #fff4;
+    --code-bg: #0b110e;
+    --code-line: #2f3f37;
+    --user-bg: #1b2a3a;
+    --inline-code: #263530;
+    --th-md: #1f2c26;
+    --th-cron: #1f2c26;
+    --scrim: rgb(0 0 0 / 62%);
+    --shadow-dialog: 0 16px 50px #000a;
+    --shadow-popup: 0 6px 18px #0009;
+    --shadow-float: 0 4px 14px #0008;
+  }
+  /* The browser's dark textarea is a neutral grey; give it the fields' green-black. */
+  textarea {
+    border-color: var(--field-line);
+    background: var(--field-bg);
+    color: var(--ink);
+  }
 }
 * {
   box-sizing: border-box;
@@ -59,7 +178,7 @@ a:focus-visible,
 input:focus-visible,
 select:focus-visible,
 summary:focus-visible {
-  outline: 3px solid #2f7a5f;
+  outline: 3px solid var(--focus);
   outline-offset: 3px;
 }
 /* The scroller clips an outline drawn outside these rows, so draw it inside. */
@@ -67,13 +186,13 @@ summary:focus-visible {
   outline-offset: -3px;
 }
 header {
-  /* Header and main share one content column: 5% gutters, capped at --page-width. */
-  padding: 12px max(5%, calc((100% - var(--page-width)) / 2));
+  /* Header and main share one content column; the top edge clears a status bar or notch. */
+  padding: max(12px, env(safe-area-inset-top)) var(--gutter-right) 12px var(--gutter-left);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  background: #fcfdf9;
+  background: var(--raised);
   border-bottom: 1px solid var(--line);
 }
 .brand {
@@ -247,33 +366,24 @@ header p {
   min-width: 19px;
   padding: 2px 5px;
   border-radius: 20px;
-  background: var(--green);
-  color: white;
+  background: var(--brand);
+  color: var(--on-brand);
   font-size: 10px;
   font-weight: 700;
-  border: 2px solid #fcfdf9;
+  border: 2px solid var(--raised);
 }
 #notifications-dialog,
 #usage-dialog {
   --dialog-padding: 20px;
   position: fixed;
   /* Right edge in line with the bell: the header's own gutter. */
-  inset: 72px max(16px, 5%, calc((100% - var(--page-width)) / 2)) auto auto;
+  inset: calc(72px + env(safe-area-inset-top)) max(16px, var(--gutter-right)) auto auto;
   margin: 0;
   width: 410px;
-  max-width: calc(100vw - 32px);
-  max-height: calc(100dvh - 100px);
-  overflow-y: auto;
-  padding: 20px;
-  border: 1px solid var(--line);
+  max-width: calc(100vw - 2 * max(16px, env(safe-area-inset-left), env(safe-area-inset-right)));
+  max-height: calc(100dvh - 100px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
   border-radius: 16px;
-  background: var(--paper);
-  color: var(--ink);
-  box-shadow: 0 16px 50px #25342f26;
-}
-#notifications-dialog::backdrop,
-#usage-dialog::backdrop {
-  background: #25342f26;
+  box-shadow: var(--shadow-dialog);
 }
 .notifications-heading {
   display: flex;
@@ -333,7 +443,7 @@ header p {
   color: var(--muted);
 }
 .notification-unseen .notification-link {
-  background: #edf5ed;
+  background: var(--unseen);
   box-shadow: inset 3px 0 var(--green);
 }
 @media (max-width: 540px) {
@@ -345,8 +455,8 @@ header p {
   }
   #notifications-dialog,
   #usage-dialog {
-    right: 16px;
-    top: 64px;
+    right: max(16px, env(safe-area-inset-right));
+    top: calc(64px + env(safe-area-inset-top));
   }
   #usage-toggle {
     height: 36px;
@@ -358,7 +468,7 @@ header p {
   /* The header has no room on a phone: New task floats within thumb reach instead. */
   #new-task {
     position: fixed;
-    right: 16px;
+    right: max(16px, env(safe-area-inset-right));
     bottom: calc(16px + env(safe-area-inset-bottom));
     z-index: 5;
     justify-content: center;
@@ -366,10 +476,10 @@ header p {
     height: 52px;
     padding: 0;
     border-radius: 50%;
-    border-color: var(--green);
-    color: #fff;
-    background: var(--green);
-    box-shadow: 0 4px 14px #0003;
+    border-color: var(--brand);
+    color: var(--on-brand);
+    background: var(--brand);
+    box-shadow: var(--shadow-float);
   }
   #new-task > span[aria-hidden] {
     font-size: 28px;
@@ -383,8 +493,34 @@ header p {
   }
 }
 @media (max-width: 380px) {
+  /* The brand, usage and the bell share the first row; the connection status takes a second row
+     of its own, so nothing floats over the content. */
+  header {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
   .brand {
+    flex: 1 1 0;
     gap: 6px;
+    min-width: min-content;
+  }
+  .header-tools {
+    display: contents;
+  }
+  #usage-toggle {
+    order: 1;
+  }
+  #notifications-toggle {
+    order: 2;
+    width: 36px;
+    height: 36px;
+  }
+  .header-tools .connection {
+    order: 3;
+    flex: 1 0 100%;
+    flex-flow: row wrap;
+    align-items: center;
+    gap: 2px 8px;
   }
   .mark {
     width: 32px;
@@ -397,24 +533,13 @@ header p {
     font-size: 9px;
     padding: 6px 7px;
   }
-  #notifications-toggle {
-    width: 36px;
-    height: 36px;
-  }
-  /* No room left in the header: usage floats opposite New task, in main's spare space. */
-  #usage-toggle {
-    position: fixed;
-    left: 16px;
-    bottom: calc(22px + env(safe-area-inset-bottom));
-    z-index: 5;
-    height: 40px;
-    padding: 0 12px;
-    background: var(--paper);
-    box-shadow: 0 4px 14px #0002;
+  #notifications-dialog,
+  #usage-dialog {
+    top: calc(88px + env(safe-area-inset-top));
   }
   #usage-dialog {
-    left: 16px;
-    right: 16px;
+    left: max(16px, env(safe-area-inset-left));
+    right: max(16px, env(safe-area-inset-right));
     width: auto;
   }
 }
@@ -423,7 +548,7 @@ small {
   font-size: 11px;
 }
 main {
-  padding: 30px max(5%, calc((100% - var(--page-width)) / 2));
+  padding: 30px var(--gutter-right) max(30px, env(safe-area-inset-bottom)) var(--gutter-left);
 }
 .metrics {
   display: grid;
@@ -472,7 +597,7 @@ h2 {
 }
 .count {
   font-size: 12px;
-  background: #e6ebe2;
+  background: var(--chip);
   color: var(--muted);
   padding: 3px 7px;
   border-radius: 5px;
@@ -482,16 +607,17 @@ h2 {
   display: flex;
   gap: 8px;
 }
-input,
+/* Text fields, selects and buttons share one look; checkboxes and radios keep their own. */
+input:not([type="checkbox"], [type="radio"]),
 select,
 button {
   color: var(--ink);
-  border: 1px solid #d6ddd3;
+  border: 1px solid var(--field-line);
   border-radius: 7px;
   padding: 9px 12px;
-  background: #fff;
+  background: var(--field-bg);
 }
-input {
+input:not([type="checkbox"], [type="radio"]) {
   width: 225px;
 }
 select {
@@ -499,7 +625,7 @@ select {
 }
 @media (hover: hover) {
   button:hover {
-    background: #eff4ec;
+    background: var(--hover);
   }
 }
 .workspace {
@@ -532,7 +658,7 @@ aside {
   border-bottom: 0;
 }
 .watch.selected {
-  background: #f1f6ec;
+  background: var(--selected);
   box-shadow: inset 3px 0 var(--green);
 }
 .watch-top,
@@ -558,7 +684,7 @@ aside {
   overflow-wrap: anywhere;
 }
 .watch-summary {
-  color: #67756b;
+  color: var(--soft);
   margin: 13px 0 15px;
   font-size: 12px;
   line-height: 1.55;
@@ -577,8 +703,8 @@ aside {
   gap: 6px;
   padding: 5px 9px;
   border-radius: 5px;
-  background: #edf0eb;
-  color: #637066;
+  background: var(--neutral-bg);
+  color: var(--neutral-fg);
   font-size: 11px;
   font-weight: 550;
   white-space: nowrap;
@@ -607,20 +733,20 @@ aside {
 }
 .green {
   color: var(--green);
-  background: #e8f3eb;
+  background: var(--green-bg);
 }
 .red {
   color: var(--red);
-  background: #faeeeb;
+  background: var(--red-bg);
 }
 .amber {
   /* --amber is 4.3:1 on this tint; the badge text needs a darker shade for AA. */
-  color: #85591c;
-  background: #faf1df;
+  color: var(--amber-fg);
+  background: var(--amber-bg);
 }
 .blue {
   color: var(--blue);
-  background: #eaf0fa;
+  background: var(--blue-bg);
 }
 .ci {
   display: flex;
@@ -711,7 +837,7 @@ progress {
   gap: 12px;
   align-items: center;
   padding: 12px 0;
-  border-bottom: 1px solid #eff2ec;
+  border-bottom: 1px solid var(--faint);
 }
 .check:last-child {
   border: 0;
@@ -751,18 +877,18 @@ progress {
 .empty-icon,
 .detail-placeholder > span {
   font-size: 36px;
-  color: #9cac94;
+  color: var(--icon-mute);
 }
 .empty-icon {
   display: block;
 }
 .alert {
-  background: #fff3df;
-  border: 1px solid #e5d5b4;
+  background: var(--alert-bg);
+  border: 1px solid var(--alert-line);
   border-radius: 8px;
   padding: 13px 17px;
   margin-bottom: 20px;
-  color: #7e5924;
+  color: var(--alert-fg);
   font-size: 13px;
   overflow-wrap: anywhere;
 }
@@ -771,8 +897,8 @@ progress {
   padding: 5px 10px;
 }
 pre {
-  background: #202b25;
-  color: #d9e5d7;
+  background: var(--code-bg);
+  color: var(--code-fg);
   border-radius: 8px;
   padding: 18px;
   white-space: pre-wrap;
@@ -835,7 +961,7 @@ footer {
   .filters {
     width: 100%;
   }
-  input {
+  input:not([type="checkbox"], [type="radio"]) {
     flex: 1;
     width: 100px;
   }
@@ -859,10 +985,10 @@ footer {
 }
 @media (max-width: 540px) {
   header {
-    padding-block: 8px;
+    padding-block: max(8px, env(safe-area-inset-top)) 8px;
     gap: 8px;
   }
-  input {
+  input:not([type="checkbox"], [type="radio"]) {
     flex-basis: 100%;
   }
   select {
@@ -900,11 +1026,11 @@ footer {
 }
 .cancel-watch {
   color: var(--red);
-  border-color: #dfbdb8;
+  border-color: var(--danger-line);
 }
 @media (hover: hover) {
   .cancel-watch:hover {
-    background: #faeeeb;
+    background: var(--red-bg);
   }
 }
 button:disabled {
@@ -926,7 +1052,7 @@ button:disabled {
 }
 @media (hover: hover) {
   .metrics > button:hover {
-    background: #eff4ec;
+    background: var(--hover);
   }
 }
 
@@ -958,7 +1084,7 @@ button:disabled {
 }
 .cleanup-note {
   padding: 14px;
-  background: #faf1df;
+  background: var(--amber-bg);
   border-radius: 7px;
   margin-top: 16px;
 }
@@ -990,7 +1116,7 @@ button:disabled {
 .pr-table th {
   position: sticky;
   top: 0;
-  background: #fcfdf9;
+  background: var(--raised);
   z-index: 1;
   color: var(--muted);
   font-weight: 500;
@@ -1046,13 +1172,13 @@ button:disabled {
 }
 .item-pin[aria-pressed="true"] {
   color: var(--green);
-  background: #e8f3ec;
+  background: var(--green-bg);
 }
 @media (hover: hover) {
   .notification-silence:hover,
   .item-pin:hover {
     color: var(--green);
-    background: #e8f3ec;
+    background: var(--green-bg);
   }
 }
 .item-pin[aria-pressed="true"] svg {
@@ -1133,7 +1259,7 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 [role="tabpanel"]:focus-visible {
-  outline: 3px solid #2f7a5f;
+  outline: 3px solid var(--focus);
   outline-offset: 3px;
 }
 
@@ -1171,8 +1297,15 @@ button:disabled {
     overflow-wrap: break-word;
   }
 }
-@media (min-width: 1261px) and (max-width: 1400px) {
-  /* Tighter cells keep all columns in view down to the card breakpoint. */
+@media (min-width: 1340px) {
+  /* Wide enough to spare it: a long login breaks into two or three lines, not four or five. */
+  .pr-table .pr-author {
+    min-width: 11em;
+  }
+}
+@media (min-width: 1261px) and (max-width: 1440px) {
+  /* Tighter cells keep all columns in view down to the card breakpoint, and leave room for the
+     wider author column above. */
   .item-table th,
   .item-table td {
     padding-inline: 10px;
@@ -1182,7 +1315,7 @@ button:disabled {
   margin-top: 6px;
 }
 .pr-label {
-  border: 1px solid #0002;
+  border: 1px solid var(--chip-line);
 }
 .pr-linked-pr {
   display: inline-flex;
@@ -1242,17 +1375,6 @@ button:disabled {
 }
 #workspace-dialog {
   width: min(640px, 92vw);
-  max-height: 90vh;
-  max-height: 90dvh;
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 24px;
-  color: var(--ink);
-  background: var(--paper);
-}
-#workspace-dialog::backdrop {
-  background: #0008;
 }
 #workspace-dialog form {
   display: grid;
@@ -1301,10 +1423,7 @@ button:disabled {
   width: fit-content;
 }
 #workspace-dialog .workspace-later input {
-  width: auto;
   margin: 0;
-  padding: 0;
-  flex: none;
 }
 .workspace-start {
   display: grid;
@@ -1493,17 +1612,6 @@ button:disabled {
 }
 #ci-dialog {
   width: min(780px, 94vw);
-  max-height: 90vh;
-  max-height: 90dvh;
-  overflow: auto;
-  padding: 24px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  color: var(--ink);
-  background: var(--paper);
-}
-#ci-dialog::backdrop {
-  background: #0008;
 }
 .dialog-header {
   position: sticky;
@@ -1595,13 +1703,13 @@ button:disabled {
 }
 
 .pr-table .pr-new {
-  background: #f0f7f0;
+  background: var(--row-new);
 }
 .pr-table .pr-changed {
-  background: #fffbef;
+  background: var(--row-changed);
 }
 .pr-table .pr-field-changed {
-  background: #fff0c9;
+  background: var(--row-field);
 }
 .pr-change-badge {
   margin-top: 8px;
@@ -1609,7 +1717,7 @@ button:disabled {
 .pr-change-note {
   display: block;
   margin-top: 5px;
-  color: #755729;
+  color: var(--change-note);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
@@ -1667,10 +1775,10 @@ button:disabled {
   width: 100%;
   margin-top: 4px;
   padding: 4px;
-  border: 1px solid #b8c8b0;
+  border: 1px solid var(--popup-line);
   border-radius: 8px;
-  background: #fff;
-  box-shadow: 0 6px 18px #243a2026;
+  background: var(--field-bg);
+  box-shadow: var(--shadow-popup);
   color: var(--ink);
   font-size: 14px;
 }
@@ -1689,14 +1797,14 @@ button:disabled {
   cursor: pointer;
 }
 .select-option.active {
-  background: #eff4ec;
-  outline: 1px solid #b8c8b0;
+  background: var(--hover);
+  outline: 1px solid var(--popup-line);
   outline-offset: -1px;
 }
 @media (hover: hover) {
   .select-option:hover {
-    background: #eff4ec;
-    outline: 1px solid #b8c8b0;
+    background: var(--hover);
+    outline: 1px solid var(--popup-line);
     outline-offset: -1px;
   }
 }
@@ -1734,7 +1842,7 @@ button:disabled {
   }
 }
 .notifications-push {
-  border-top: 1px solid #dce1d8;
+  border-top: 1px solid var(--rule);
   margin-top: 16px;
   padding-top: 16px;
 }
@@ -1911,11 +2019,12 @@ button:disabled {
 }
 @media (max-width: 540px) {
   header {
-    padding-inline: 12px;
+    padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right));
   }
   main {
     /* The bottom edge leaves room to scroll the last content above the floating New task button. */
-    padding: 12px 12px calc(92px + env(safe-area-inset-bottom));
+    padding: 12px max(12px, env(safe-area-inset-right)) calc(92px + env(safe-area-inset-bottom))
+      max(12px, env(safe-area-inset-left));
   }
   .page-tabs {
     gap: 2px;
@@ -1965,7 +2074,7 @@ button:disabled {
   }
   .filters-toggle[aria-expanded="true"] {
     color: var(--green);
-    background: #e8f3eb;
+    background: var(--green-bg);
   }
   .sync-compact {
     display: inline;
@@ -1975,7 +2084,7 @@ button:disabled {
   }
   .batch-bar {
     position: sticky;
-    top: 0;
+    top: env(safe-area-inset-top);
     z-index: 3;
     margin-inline: -12px;
     padding: 12px;
@@ -2097,12 +2206,43 @@ button:disabled {
   font-size: 12px;
 }
 
-/* A modal dialog owns the screen: wheel and touch scrolling stay inside it. */
+/* The one shell every dialog shares. Each dialog names only what differs: its width, padding
+   (through --dialog-padding) and, for the popovers, its position. */
 dialog {
+  --dialog-padding: 24px;
+  /* The browser's own 1em + 3px margin, grown to clear a notch or the home indicator. */
+  max-width: calc(100% - 2 * max(1em + 3px, env(safe-area-inset-left), env(safe-area-inset-right)));
+  max-height: 90vh;
+  max-height: min(
+    90dvh,
+    calc(100% - 2 * max(1em + 3px, env(safe-area-inset-top), env(safe-area-inset-bottom)))
+  );
+  overflow: auto;
+  /* A modal dialog owns the screen: wheel and touch scrolling stay inside it. */
   overscroll-behavior: contain;
+  padding: var(--dialog-padding);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  background: var(--paper);
 }
+dialog::backdrop {
+  background: var(--scrim);
+}
+/* Scrolling the page behind a modal is locked. Hiding the root scrollbar would widen the page
+   by its width and shift everything, so the gutter stays reserved while a dialog is open. The
+   full-screen viewer fills the whole window, gutter included. */
 html:has(dialog:modal) {
   overflow: hidden;
+  scrollbar-gutter: stable;
+}
+html:has(#ws-viewer.ws-viewer-full:modal) {
+  scrollbar-gutter: auto;
+}
+@media (max-width: 600px), (max-height: 520px) {
+  html:has(#ws-viewer:modal) {
+    scrollbar-gutter: auto;
+  }
 }
 
 @media (pointer: coarse) {
@@ -2144,5 +2284,41 @@ html:has(dialog:modal) {
   }
   .select-field .select-clear {
     right: 41px;
+  }
+}
+@media (pointer: coarse) and (forced-colors: none) {
+  /* The row checkbox is a real checkbox with a 44px hit area: a transparent 12px border around a
+   20px box drawn by the background, an inset ring and, once checked, a check mark. */
+  .item-select {
+    appearance: none;
+    flex: none;
+    width: 44px;
+    height: 44px;
+    margin: 0;
+    padding: 0;
+    border: 12px solid transparent;
+    border-radius: 17px;
+    background: transparent center / 14px 14px no-repeat;
+    background-clip: content-box;
+    box-shadow: inset 0 0 0 2px var(--muted);
+  }
+  .item-select:checked {
+    background-color: var(--brand);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+    box-shadow: inset 0 0 0 2px var(--brand);
+  }
+  /* Drawn just outside the visible box, not around the whole hit area. */
+  .item-select:focus-visible {
+    outline-offset: -12px;
+  }
+}
+@media (pointer: coarse) and (forced-colors: none) and (min-width: 1261px) {
+  /* In the table, the pin column widens to hold the 44px checkbox and centres its neighbours. */
+  .item-table .item-pin-cell {
+    width: 44px;
+    text-align: center;
+  }
+  .item-table .notification-silence {
+    margin-inline: auto;
   }
 }
