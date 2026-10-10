@@ -383,12 +383,20 @@ def test_every_alerting_status_can_be_dismissed(jobs, status):
     assert jobs.dismiss(saved["id"], run["id"])["dismissed_at"]
 
 
-def test_dismissing_is_refused_unless_the_latest_run_needs_attention(jobs):
+def test_an_older_run_can_be_dismissed_too(jobs):
     saved = job(jobs)
     older = recorded(jobs, saved, "attention")
     newer = recorded(jobs, saved, "succeeded")
-    with pytest.raises(ValueError, match="Only the job's latest run can be dismissed"):
-        jobs.dismiss(saved["id"], older["id"])
+    assert jobs.dismiss(saved["id"], older["id"])["dismissed_at"]
+    latest, earlier = jobs.snapshot()["jobs"][0]["runs"]
+    assert latest["id"] == newer["id"] and "dismissed_at" not in latest
+    assert earlier["id"] == older["id"] and earlier["dismissed_at"]
+
+
+def test_dismissing_is_refused_unless_the_run_needs_attention(jobs):
+    saved = job(jobs)
+    recorded(jobs, saved, "attention")
+    newer = recorded(jobs, saved, "succeeded")
     with pytest.raises(ValueError, match="Only a run that failed or needs attention"):
         jobs.dismiss(saved["id"], newer["id"])
     with pytest.raises(ValueError, match="This job no longer exists"):
@@ -397,8 +405,10 @@ def test_dismissing_is_refused_unless_the_latest_run_needs_attention(jobs):
         jobs.dismiss(saved["id"], 5)
     with pytest.raises(ValueError, match="Supply a job ID"):
         jobs.action({"action": "dismiss", "run": newer["id"]})
+    with pytest.raises(ValueError, match="not in the job's history"):
+        jobs.dismiss(saved["id"], "999")
     other = job(jobs, name="Other")
-    with pytest.raises(ValueError, match="latest run"):
+    with pytest.raises(ValueError, match="not in the job's history"):
         jobs.dismiss(other["id"], newer["id"])
     assert all("dismissed_at" not in run for run in jobs.snapshot()["jobs"][0]["runs"])
 
