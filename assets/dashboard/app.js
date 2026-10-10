@@ -12,7 +12,8 @@ let data = null,
   tab = "checks",
   logKind = "agent",
   busy = false,
-  detailKey = null;
+  detailKey = null,
+  detailPolled = null;
 const cancelling = new Set(),
   cancelErrors = new Map(),
   approving = new Set(),
@@ -44,6 +45,7 @@ function el(tag, text, cls) {
 const searchableSelects = new WeakMap();
 let selectSequence = 0;
 let dismissSelect = null;
+const coarsePointer = window.matchMedia("(pointer: coarse)");
 function syncSelect(select) {
   searchableSelects.get(select)?.sync();
 }
@@ -107,6 +109,9 @@ function searchableSelect(select) {
     input.title = text;
     input.disabled = select.disabled;
     toggle.disabled = select.disabled;
+    // On a touch screen the keyboard would cover a short list; long ones keep typing to narrow.
+    if (coarsePointer.matches && select.options.length <= 12) input.inputMode = "none";
+    else input.removeAttribute("inputmode");
     input.setAttribute("aria-required", String(select.required));
     value.textContent = text;
     value.hidden = text.length < 32;
@@ -258,12 +263,38 @@ function ago(value) {
       ? `${Math.floor(age)}s ago`
       : age < 3600
         ? `${Math.floor(age / 60)}m ago`
-        : `${Math.floor(age / 3600)}h ago`;
+        : age < 2 * 86400
+          ? `${Math.floor(age / 3600)}h ago`
+          : age < 60 * 86400
+            ? `${Math.floor(age / 86400)}d ago`
+            : age < 365 * 86400
+              ? `${Math.floor(age / (30 * 86400))}mo ago`
+              : `${Math.floor(age / (365 * 86400))}y ago`;
 }
-function closeOnBackdropClick(dialog) {
+// Assigning even the same text replaces the node, dropping a reader's selection.
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+function polledText(job) {
+  return job.last_poll ? new Date(job.last_poll * 1000).toLocaleString() : "Not polled yet";
+}
+function closeOnBackdropClick(dialog, { keepTyped = false } = {}) {
   // A click on the backdrop targets the dialog element itself but lands outside its box.
   // Both the press and the release must be there: a text selection dragged out of the
   // box also fires a click on the dialog, and that must not close it.
+  // With `keepTyped`, text typed into the dialog's fields also keeps it open: on a phone a
+  // tap beside the form dismisses the keyboard. Escape and Close still close it.
+  const typed = new WeakSet();
+  const textFields = "textarea, input:not([type]), input[type=text]:not([role])";
+  if (keepTyped)
+    dialog.oninput = (event) => {
+      if (event.target.matches(textFields)) typed.add(event.target);
+    };
+  const holdsTyping = () =>
+    keepTyped &&
+    [...dialog.querySelectorAll(textFields)].some(
+      (field) => typed.has(field) && field.value.trim(),
+    );
   const onBackdrop = (event) => {
     if (event.target !== dialog) return false;
     const bounds = dialog.getBoundingClientRect();
@@ -279,7 +310,7 @@ function closeOnBackdropClick(dialog) {
     pressedOnBackdrop = onBackdrop(event);
   };
   dialog.onclick = (event) => {
-    if (pressedOnBackdrop && onBackdrop(event)) dialog.close();
+    if (pressedOnBackdrop && onBackdrop(event) && !holdsTyping()) dialog.close();
     pressedOnBackdrop = false;
   };
 }
@@ -469,8 +500,10 @@ function renderDetail() {
   if (!document.hidden && !$("watcher-panel").hidden) {
     window.dashboardNotifications?.seen([job.url]);
   }
+  // Every watcher cycle moves the poll times; they would rebuild the pane, reloading the
+  // log from "Loading…", so the observation time is updated in place instead.
   const key = JSON.stringify([
-    job,
+    { ...job, last_poll: undefined, next_poll: undefined, updated_at: undefined },
     tab,
     cancelling.has(job.id),
     cancelErrors.get(job.id),
@@ -479,6 +512,7 @@ function renderDetail() {
     workspaceInfo({ id: `watch:${job.id}` }),
   ]);
   if (key === detailKey) {
+    setText(detailPolled, polledText(job));
     if (tab === "logs") loadLog(job);
     return;
   }
@@ -543,13 +577,13 @@ function renderDetail() {
   }
   const body = el("div", undefined, "detail-body");
   const facts = el("div", undefined, "facts");
+  const polled = el("div", undefined, "fact");
+  detailPolled = el("span", polledText(job));
+  polled.append(el("small", "Last CI observation"), detailPolled);
   facts.append(
     fact("CI repository", job.ci_repo),
     fact("Commit", job.sha?.slice(0, 12)),
-    fact(
-      "Last CI observation",
-      job.last_poll ? new Date(job.last_poll * 1000).toLocaleString() : "Not polled yet",
-    ),
+    polled,
     fact("Pending review items", String(job.pending_reviews)),
   );
   const budget = fact("Repair budget", `${job.attempts} of ${job.max_repairs} used`);
@@ -747,29 +781,60 @@ async function handleFeedback(job, item = null) {
     render();
   }
 }
-async function get(url, signal) {
-  const r = await fetch(url, { cache: "no-store", signal });
-  const result = await r.json();
-  if (!r.ok) throw Error(result.error || `HTTP ${r.status}`);
-  return result;
+// A request stalled across a phone's sleep would hold its caller's busy flag, and stop
+// that view refreshing, for minutes; give up after `timeout` milliseconds instead.
+// `signal` still cancels it. (AbortSignal.any is missing on older iOS.)
+async function get(url, { signal, timeout = 15000 } = {}) {
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeout);
+  if (signal?.aborted) cancel();
+  signal?.addEventListener("abort", cancel);
+  try {
+    const r = await fetch(url, { cache: "no-store", signal: controller.signal });
+    const result = await r.json();
+    if (!r.ok) throw Error(result.error || `HTTP ${r.status}`);
+    return result;
+  } catch (error) {
+    throw timedOut ? Error(`No response in ${timeout / 1000} seconds`) : error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", cancel);
+  }
 }
+// Polls reload the open log; an answer overtaken by a newer one is dropped.
+let logRequests = 0,
+  logShown = 0;
 async function loadLog(job) {
   const kind = logKind;
+  const request = ++logRequests;
+  let text;
   try {
     const result = await get(`/api/log?job=${encodeURIComponent(job.id)}&kind=${kind}`);
-    if (selected === job.id && tab === "logs" && kind === logKind && $("repair-log"))
-      $("repair-log").textContent =
-        (result.truncated ? "… showing the last 64 KB …\n" : "") + result.text;
+    text = (result.truncated ? "… showing the last 64 KB …\n" : "") + result.text;
   } catch (e) {
-    if (selected === job.id && kind === logKind && $("repair-log"))
-      $("repair-log").textContent = e.message;
+    text = e.message;
   }
+  if (
+    request < logShown ||
+    selected !== job.id ||
+    tab !== "logs" ||
+    kind !== logKind ||
+    !$("repair-log")
+  )
+    return;
+  logShown = request;
+  setText($("repair-log"), text);
 }
 async function serviceLog() {
   try {
-    $("service-log").textContent = (await get("/api/log?kind=supervisor")).text;
+    setText($("service-log"), (await get("/api/log?kind=supervisor")).text);
   } catch (e) {
-    $("service-log").textContent = e.message;
+    setText($("service-log"), e.message);
   }
 }
 
@@ -827,7 +892,11 @@ function datesCell(item) {
 }
 function repoCell(repo) {
   const cell = el("td", undefined, "pr-repo");
-  cell.append(link(repo, `https://github.com/${repo}`));
+  const anchor = link(repo, `https://github.com/${repo}`);
+  // A narrow column wraps after the owner instead of mid-name.
+  const slash = repo.indexOf("/") + 1;
+  if (slash > 0) anchor.replaceChildren(repo.slice(0, slash), el("wbr"), repo.slice(slash));
+  cell.append(anchor);
   return cell;
 }
 function authorCell(login) {
@@ -1222,6 +1291,8 @@ function itemTable(spec) {
     id("alert").textContent =
       problems.join(" ") +
       (table.data.error && sync ? " Showing saved results; they may be out of date." : "");
+    // Rows are the costly part; a hidden table builds them when its tab is shown.
+    if ($(spec.panel).hidden) return;
     let newCount = 0,
       changedCount = 0;
     const rows = [];
@@ -1380,8 +1451,16 @@ function itemTable(spec) {
     // A new search, filter or sort starts at the top of the first page; refreshes keep
     // the window and scroll position.
     table.limit = PAGE_SIZE;
-    id("list").closest(".pr-table-wrap").scrollTop = 0;
+    const wrap = id("list").closest(".pr-table-wrap");
+    wrap.scrollTop = 0;
     render();
+    // Cards (narrower screens) scroll with the page, not in the wrapper: bring the list's
+    // top back, but only when it is above the screen, so typing a search never jumps.
+    if (wrap.getBoundingClientRect().top < 0)
+      wrap.scrollIntoView({
+        block: "start",
+        behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
+      });
   }
   for (const column of Object.keys(spec.columns)) {
     id(`sort-${column}`).onclick = () => sort(column, true);
@@ -1426,7 +1505,9 @@ function itemTable(spec) {
       id(name).value = "all";
       syncSelect(id(name));
     }
-    table.limit = Math.max(table.limit, items().length);
+    // Widen the window to the page holding the item; later polls keep rendering only that.
+    const index = ordered([...items()]).indexOf(item);
+    table.limit = Math.max(table.limit, Math.ceil((index + 1) / PAGE_SIZE) * PAGE_SIZE);
     table.focusedId = item.id;
     render();
     focusNotification(renderedRows.get(item.id).row);
@@ -1680,9 +1761,18 @@ const issueTable = itemTable({
   },
 });
 
-async function refresh() {
+// PR and issue data change only when the server syncs GitHub, every 5 minutes: poll them
+// every 5 seconds while shown, and every 30 otherwise for the notification bell. Each
+// period is checked a second short, so timer jitter does not skip a 5-second tick.
+let overviewsFetched = 0;
+function refreshOverviews(force = false) {
+  if (!force && Date.now() - overviewsFetched < (overviewVisible() ? 4000 : 29000)) return;
+  overviewsFetched = Date.now();
   // Issues render linked-PR CI from the PR overview, so refresh PRs first.
   void prTable.refresh().then(() => issueTable.refresh());
+}
+async function refresh(force = false) {
+  refreshOverviews(force);
   if (busy) return;
   busy = true;
   try {
@@ -1712,6 +1802,7 @@ function showPage(name) {
   $(`${name}-tab`).scrollIntoView({ block: "nearest", inline: "nearest" });
   if (name === "prs") prTable.render();
   if (name === "issues") issueTable.render();
+  if (name === "prs" || name === "issues") refreshOverviews();
   if (name === "scheduled") void refreshScheduled();
   if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));
   if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
@@ -1721,7 +1812,13 @@ function showPage(name) {
 function overviewVisible() {
   return !$("prs-panel").hidden || !$("issues-panel").hidden;
 }
+// Back and forward fire both popstate and hashchange; show each address once.
+let routedURL = null;
+function routeChanged() {
+  if (location.href !== routedURL) pageFromURL();
+}
 function pageFromURL() {
+  routedURL = location.href;
   const name = window.location.hash.slice(1);
   showPage(pages.includes(name) ? name : "watcher");
   const item = new URLSearchParams(location.search).get("item");
@@ -1791,16 +1888,17 @@ window.dashboardNavigation = {
     pageFromURL();
   },
 };
-window.addEventListener("popstate", pageFromURL);
+window.addEventListener("popstate", routeChanged);
 for (const page of pages) {
   $(`${page}-tab`).onclick = () => {
     const url = new URL(location.href);
     url.searchParams.delete("item");
     url.searchParams.delete("updates");
     history.replaceState(null, "", url);
-    navigationTarget = null;
-    window.location.hash = page;
-    showPage(page);
+    // Pushed rather than assigned to location.hash, whose events would show it again.
+    url.hash = page;
+    if (url.href !== location.href) history.pushState(null, "", url);
+    pageFromURL();
     void refreshWorkspaces();
   };
   $(`${page}-tab`).onkeydown = (event) => {
@@ -1820,7 +1918,7 @@ for (const page of pages) {
     $(`${next}-tab`).focus();
   };
 }
-window.addEventListener("hashchange", pageFromURL);
+window.addEventListener("hashchange", routeChanged);
 pageFromURL();
 $("show-attention").onclick = () => {
   $("filter").value = "attention";
@@ -1832,7 +1930,7 @@ $("show-ended").onclick = () => {
   $("search").value = "";
   render();
 };
-$("refresh").onclick = refresh;
+$("refresh").onclick = () => refresh(true);
 $("search").oninput = render;
 $("filter").onchange = render;
 $("service-details").ontoggle = () => {
@@ -1840,7 +1938,7 @@ $("service-details").ontoggle = () => {
 };
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    refresh();
+    refresh(true);
     void refreshWorkspaces();
     void refreshScheduled();
   }
@@ -1852,9 +1950,19 @@ refresh();
 
 let workspaceData = { prs: {}, issues: {}, watches: {} },
   workspaceBusy = false,
-  workspaceLoadedAt = 0;
+  workspaceLoadedAt = 0,
+  workspaceRequests = 0,
+  workspaceShown = 0;
 async function loadWorkspaces() {
-  workspaceData = await get("/api/workspaces");
+  // Dialogs load alongside the background refresh; a snapshot answering after a newer
+  // one must not replace it, and with it an operation the dialog is following.
+  const request = ++workspaceRequests;
+  // The first snapshot after a restart checks every PR's head against its checkouts with
+  // git and can take well over the default 15 seconds.
+  const value = await get("/api/workspaces", { timeout: 60000 });
+  if (request <= workspaceShown) return;
+  workspaceShown = request;
+  workspaceData = value;
   workspaceLoadedAt = Date.now();
 }
 // Overview ids are globally unique; watch ids carry a separate prefix.
@@ -1872,6 +1980,8 @@ function workspaceInfo(item) {
 function setWorkspaceOperation(item, operation) {
   const info = workspaceInfo(item);
   if (info) info.operation = operation;
+  // Snapshots already requested may predate the operation; keep it until a later one.
+  workspaceShown = workspaceRequests;
 }
 async function refreshWorkspaces() {
   // An open workspace dialog follows its operation from any tab (Sentry opens it too).
@@ -2036,6 +2146,13 @@ async function workspaceRequest(item, action, params = {}) {
 }
 function workspaceError(error) {
   $("workspace-error").textContent = error.message;
+}
+// A dialog whose discovery failed drops its "Finding…" placeholder, unless another
+// dialog has taken over meanwhile.
+function workspaceLoadError(owner, placeholder, error) {
+  if (workspaceDialogItem !== owner) return;
+  placeholder.remove();
+  workspaceError(error);
 }
 async function chooseWorkspace(item, target, action) {
   const opened = action === "open" ? window.open("about:blank", "_blank") : null;
@@ -2451,7 +2568,8 @@ async function workspaceDialog(item, handling = "") {
         ? `${item.repo} · ${item.short_id}`
         : `${item.repo} #${item.number}`;
   $("workspace-error").textContent = "";
-  $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
+  const loading = el("p", "Discovering local workspaces…");
+  $("workspace-content").replaceChildren(loading);
   $("workspace-result").replaceChildren();
   $("workspace-progress").textContent = "";
   $("workspace-log").textContent = "";
@@ -2586,6 +2704,8 @@ async function workspaceDialog(item, handling = "") {
         const start = startTime();
         if (start === undefined || uploading(files)) return;
         submit.disabled = true;
+        // Background refreshes recompute the button; it stays off until this answers.
+        submit.dataset.inflight = "true";
         $("workspace-error").textContent = "";
         try {
           const value = await workspaceRequest(
@@ -2607,6 +2727,7 @@ async function workspaceDialog(item, handling = "") {
               retry: workspaceInfo(item)?.operation?.status === "failed",
             },
           );
+          delete submit.dataset.inflight;
           if (value.scheduled) {
             // One click schedules one task; reopen the dialog to schedule another.
             submit.dataset.scheduled = "true";
@@ -2618,6 +2739,7 @@ async function workspaceDialog(item, handling = "") {
           setWorkspaceOperation(item, value.operation);
           updateWorkspaceOperation();
         } catch (error) {
+          delete submit.dataset.inflight;
           workspaceError(error);
           submit.disabled = false;
         }
@@ -2632,7 +2754,7 @@ async function workspaceDialog(item, handling = "") {
     }
     updateWorkspaceOperation();
   } catch (error) {
-    workspaceError(error);
+    workspaceLoadError(item, loading, error);
   }
 }
 // A task with no PR or issue behind it, like `wtl`'s branch target: a new branch from a
@@ -2643,7 +2765,8 @@ async function newTaskDialog(prefill = {}) {
   workspaceDialogItem = owner;
   $("workspace-title").textContent = "New task";
   $("workspace-error").textContent = "";
-  $("workspace-content").replaceChildren(el("p", "Finding local clones…"));
+  const loading = el("p", "Finding local clones…");
+  $("workspace-content").replaceChildren(loading);
   $("workspace-result").replaceChildren();
   $("workspace-progress").textContent = "";
   $("workspace-log").textContent = "";
@@ -2814,6 +2937,7 @@ async function newTaskDialog(prefill = {}) {
       const choice = repos[Number(repo.value)];
       if (uploading(files)) return;
       submit.disabled = true;
+      submit.dataset.inflight = "true";
       $("workspace-error").textContent = "";
       try {
         const response = await fetch("/api/workspace-new", {
@@ -2836,10 +2960,12 @@ async function newTaskDialog(prefill = {}) {
         });
         const value = await response.json();
         if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+        delete submit.dataset.inflight;
         owner.id = value.operation.pr;
         owner.operation = value.operation;
         updateWorkspaceOperation();
       } catch (error) {
+        delete submit.dataset.inflight;
         workspaceError(error);
         submit.disabled = false;
       }
@@ -2849,7 +2975,7 @@ async function newTaskDialog(prefill = {}) {
     searchableSelect(model);
     searchableSelect(effort);
   } catch (error) {
-    workspaceError(error);
+    workspaceLoadError(owner, loading, error);
   }
 }
 $("new-task").onclick = () => void newTaskDialog();
@@ -2907,7 +3033,8 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
   workspaceDialogItem = owner;
   $("workspace-title").textContent = `Handle ${items.length} ${items.length === 1 ? one : many}`;
   $("workspace-error").textContent = "";
-  $("workspace-content").replaceChildren(el("p", "Discovering local workspaces…"));
+  const loading = el("p", "Discovering local workspaces…");
+  $("workspace-content").replaceChildren(loading);
   $("workspace-result").replaceChildren();
   $("workspace-progress").textContent = "";
   $("workspace-log").textContent = "";
@@ -3137,7 +3264,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
     searchableSelect(effort);
     for (const entry of rows) if (entry.clone) searchableSelect(entry.clone);
   } catch (error) {
-    workspaceError(error);
+    workspaceLoadError(owner, loading, error);
   }
 }
 function updateWorkspaceOperation() {
@@ -3156,6 +3283,7 @@ function updateWorkspaceOperation() {
   const submit = $("workspace-content").querySelector("button[type=submit]");
   if (submit)
     submit.disabled =
+      submit.dataset.inflight === "true" ||
       submit.dataset.scheduled === "true" ||
       // A launch in progress does not block scheduling another for later.
       (!(submit.dataset.later === "true" && ["queued", "running"].includes(op.status)) &&
@@ -3181,7 +3309,7 @@ function syncWorkspacePolling() {
 }
 $("workspace-close").onclick = () => $("workspace-dialog").close();
 $("workspace-dialog").onclose = syncWorkspacePolling;
-closeOnBackdropClick($("workspace-dialog"));
+closeOnBackdropClick($("workspace-dialog"), { keepTyped: true });
 closeOnBackdropClick($("ws-viewer"));
 setInterval(refreshWorkspaces, 15000);
 void refreshWorkspaces();
@@ -3233,10 +3361,15 @@ function scheduledSubject(task) {
 function scheduledCard(task) {
   const card = el("li", undefined, "scheduled-task");
   card.dataset.status = task.status;
+  card.dataset.id = task.id;
   const [label, color] = scheduledNames[task.status] || [task.status, ""];
   const head = el("div", undefined, "scheduled-when");
   head.append(el("strong", scheduleTime(task.start_at)));
-  if (task.status === "scheduled") head.append(el("span", until(task.start_at), "pr-sync"));
+  if (task.status === "scheduled") {
+    const countdown = el("span", until(task.start_at), "pr-sync");
+    countdown.dataset.until = task.start_at;
+    head.append(countdown);
+  }
   head.append(el("span", label, `badge ${color}`));
   card.append(head, scheduledSubject(task));
   const request = task.request || {};
@@ -3265,6 +3398,11 @@ function scheduledCard(task) {
   );
   const details = el("details", undefined, "scheduled-text");
   details.append(el("summary", "Task"), el("pre", request.task || ""));
+  details.open = scheduledOpen.has(task.id);
+  details.ontoggle = () => {
+    if (details.open) scheduledOpen.add(task.id);
+    else scheduledOpen.delete(task.id);
+  };
   card.append(details);
   if (task.status !== "scheduled") {
     const outcome = el("p", task.message, "scheduled-message");
@@ -3289,6 +3427,10 @@ function scheduledCard(task) {
   }
   return card;
 }
+// Polls rebuild the cards only when the tasks change, so an opened task text stays open
+// and focus stays put; the countdowns are kept current in place.
+let scheduledKey = null;
+const scheduledOpen = new Set();
 function renderScheduled() {
   const tasks = scheduledData?.tasks ?? [];
   const pending = tasks.filter((task) => task.status === "scheduled");
@@ -3300,19 +3442,35 @@ function renderScheduled() {
   $("scheduled-status").textContent = !scheduledData
     ? "Loading scheduled tasks…"
     : "Tasks start at their time while the dashboard is running. A task due while it was stopped starts when it returns, up to a day late.";
-  $("scheduled-pending").replaceChildren(...pending.map(scheduledCard));
+  const key = JSON.stringify([tasks, [...scheduledCancelling]]);
+  if (key !== scheduledKey) {
+    scheduledKey = key;
+    // Give focus back to the same control of the same task.
+    const active = document.activeElement;
+    const card = active?.closest("#scheduled-panel li[data-id]");
+    const controls = (node) => [...node.querySelectorAll("a, button, summary")];
+    const position = card ? controls(card).indexOf(active) : -1;
+    $("scheduled-pending").replaceChildren(...pending.map(scheduledCard));
+    $("scheduled-history").replaceChildren(...history.map(scheduledCard));
+    const rebuilt =
+      card &&
+      [...$("scheduled-panel").querySelectorAll("li[data-id]")].find(
+        (node) => node.dataset.id === card.dataset.id,
+      );
+    if (rebuilt) controls(rebuilt)[position]?.focus({ preventScroll: true });
+  }
+  for (const node of $("scheduled-pending").querySelectorAll("[data-until]"))
+    setText(node, until(Number(node.dataset.until)));
   $("scheduled-empty").hidden = !scheduledData || pending.length > 0;
   $("scheduled-history-heading").hidden = !history.length;
-  $("scheduled-history").replaceChildren(...history.map(scheduledCard));
 }
 async function refreshScheduled() {
   if (scheduledBusy || document.hidden) return;
   scheduledBusy = true;
-  // A stalled request would hold scheduledBusy and keep the tab hidden until a reload.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
   try {
-    scheduledData = await get("/api/scheduled-tasks", controller.signal);
+    // A stalled request would hold scheduledBusy and keep the tab hidden until a reload;
+    // give up on it before the next poll.
+    scheduledData = await get("/api/scheduled-tasks", { timeout: 10000 });
     $("scheduled-error").textContent = "";
     // The tab only exists while workspace actions do; leave it if it disappears.
     if (!scheduledData.enabled && !$("scheduled-panel").hidden) showPage("watcher");
@@ -3320,7 +3478,6 @@ async function refreshScheduled() {
   } catch (error) {
     $("scheduled-error").textContent = `Cannot load scheduled tasks: ${error.message}`;
   } finally {
-    clearTimeout(timer);
     scheduledBusy = false;
   }
 }
@@ -3366,7 +3523,9 @@ function stopCILoads() {
 async function loadCI(url, generation, render, fail, attempt = 0) {
   if (generation !== ciGeneration || !$("ci-dialog").open) return;
   try {
-    if (!document.hidden && overviewVisible()) {
+    // Only polls that ran count toward giving up, not those skipped while hidden.
+    const fetching = !document.hidden && overviewVisible();
+    if (fetching) {
       const result = await get(url);
       if (generation !== ciGeneration || !$("ci-dialog").open) return;
       render(result);
@@ -3376,7 +3535,7 @@ async function loadCI(url, generation, render, fail, attempt = 0) {
       throw Error("Loading is taking longer than expected. Close and reopen to check again.");
     const timer = setTimeout(() => {
       ciTimers.delete(timer);
-      void loadCI(url, generation, render, fail, attempt + 1);
+      void loadCI(url, generation, render, fail, attempt + (fetching ? 1 : 0));
     }, 2000);
     ciTimers.add(timer);
   } catch (error) {
@@ -3388,6 +3547,7 @@ function ciReportedFailure(pr, check) {
   detail.append(el("summary", "Reported failure details"));
   const body = el("div");
   detail.append(body);
+  // Set while loading or loaded; a failed load is retried when reopened.
   let loaded = false;
   detail.ontoggle = () => {
     if (!detail.open || loaded) return;
@@ -3401,7 +3561,10 @@ function ciReportedFailure(pr, check) {
         if (!result.value && result.refreshing) return;
         body.replaceChildren();
         if (result.error) body.append(el("p", result.error, "ci-error"));
-        if (!result.value) return;
+        if (!result.value) {
+          loaded = false;
+          return;
+        }
         const value = result.value;
         if (value.title) body.append(el("strong", value.title));
         for (const text of [value.summary, value.text].filter(Boolean))
@@ -3428,7 +3591,10 @@ function ciReportedFailure(pr, check) {
             ),
           );
       },
-      (message) => body.replaceChildren(el("p", message, "ci-error")),
+      (message) => {
+        loaded = false;
+        body.replaceChildren(el("p", message, "ci-error"));
+      },
     );
   };
   return detail;
@@ -3609,6 +3775,7 @@ function ciDownloadedLog(pr, check) {
   detail.append(el("summary", "Downloaded test log"));
   const body = el("div");
   detail.append(body);
+  // Set while loading or loaded; a failed load is retried when reopened.
   let loaded = false;
   detail.ontoggle = () => {
     if (!detail.open || loaded) return;
@@ -3622,6 +3789,7 @@ function ciDownloadedLog(pr, check) {
         body.replaceChildren(el("p", result.message));
         if (result.error) body.append(el("p", result.error, "ci-error"));
         if (!result.value) {
+          if (!result.refreshing) loaded = false;
           if (["queued", "downloading", "error"].includes(result.state))
             body.append(el("small", "Downloads continue with the browser closed."));
           return;
@@ -3642,7 +3810,10 @@ function ciDownloadedLog(pr, check) {
           );
         body.append(ciLogStream(url, detail));
       },
-      (message) => body.replaceChildren(el("p", message, "ci-error")),
+      (message) => {
+        loaded = false;
+        body.replaceChildren(el("p", message, "ci-error"));
+      },
     );
   };
   return detail;
@@ -3705,7 +3876,7 @@ function ciLogStream(url, detail) {
     status.textContent = page ? "Loading more…" : "Loading log…";
     error.hidden = true;
     try {
-      const result = await get(`${url}&page=${page + 1}`, controller.signal);
+      const result = await get(`${url}&page=${page + 1}`, { signal: controller.signal });
       if (disposed || generation !== ciGeneration || !viewer.isConnected) return;
       if (
         result.page !== page + 1 ||
