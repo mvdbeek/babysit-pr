@@ -12,7 +12,8 @@ resume one of the sessions recorded in that checkout: the agent's own resume com
 with the message as its prompt, is typed into a new split of the workspace, the same way
 launches type their command, so the user's shell wrappers apply. A session already open
 in a pane gets the message there; one just resumed or owned by a babysit watch is
-never resumed again.
+never resumed again. The reader may cancel the watch that owns a session, and resume it
+in the same request, unless the watch is in the middle of a repair.
 """
 
 import contextlib
@@ -50,6 +51,7 @@ RESUME = {"claude": ["--resume"], "codex": ["--no-daemon", "resume"]}
 # A resumed agent can take a while to be recognized; until then a repeat is refused.
 RECENT_RESUME = 120
 ENDED_WATCHES = {"closed", "stopped"}
+REPAIR_RUNNING = "a babysit repair is running in this session right now"
 # Claude Code's question dialog (as of 2.1): a number key picks an option, and on a
 # single-choice question also moves on; the option after the last, "Type something.",
 # takes typed text and Enter. On a multiple-choice question number keys toggle options
@@ -151,8 +153,12 @@ def sessions(workspace_id, home=None):
 
 def checkout_sessions(root, home=None):
     """Sessions recorded in a checkout that a message could resume."""
+    # The watch that owns a session is named up front, so the reader can cancel it
+    # before resuming instead of meeting a refusal.
     watched = {
-        job.get("session_id") for job in watch_jobs(home) if job.get("status") not in ENDED_WATCHES
+        job.get("session_id"): job
+        for job in watch_jobs(home)
+        if job.get("status") not in ENDED_WATCHES
     }
     return [
         {
@@ -162,6 +168,9 @@ def checkout_sessions(root, home=None):
                 if k in {"id", "agent", "title", "updated", "claude_account"}
             },
             "watched": session["id"] in watched,
+            **(
+                {"watch": watch_summary(watched[session["id"]])} if session["id"] in watched else {}
+            ),
         }
         for session in workspace_viewer.sessions(root)
     ]
@@ -173,8 +182,13 @@ def send(request, home=None, *, expected_session=None, checkout=None):
     With a checkout instead of a workspace (a Workspaces-tab row listed while none was
     open), only a resume can be sent: it reopens a workspace there if none is open.
     """
-    if set(request) - {"workspace", "pane", "text", "resume"}:
+    if set(request) - {"workspace", "pane", "text", "resume", "stop_watch"}:
         raise ValueError("Invalid message parameters")
+    stop_watch = request.get("stop_watch")
+    if stop_watch is not None and (
+        not isinstance(stop_watch, str) or not stop_watch or request.get("resume") is None
+    ):
+        raise ValueError("Only a resume can cancel the watch that owns its session")
     text = request.get("text")
     text = clean(text) if isinstance(text, str) else None
     if not text or not text.strip() or len(text) > MAX_MESSAGE:
@@ -184,7 +198,14 @@ def send(request, home=None, *, expected_session=None, checkout=None):
     if request.get("resume") is not None:
         if request.get("pane") is not None:
             raise ValueError("Resume a session or message a running agent, not both")
-        return resume(request.get("workspace"), request["resume"], text, home, root=checkout)
+        return resume(
+            request.get("workspace"),
+            request["resume"],
+            text,
+            home,
+            root=checkout,
+            stop_watch=stop_watch,
+        )
     pane = request.get("pane")
     if pane is not None and not isinstance(pane, str):
         raise ValueError("Choose an agent")
@@ -968,12 +989,16 @@ def answer_codex(request, questions, steps):
     return {"answered": True, "pane": pane}
 
 
-def watch_owner(session_id, agent, home, config_dir=None):
-    """Why the babysit watcher owns this session, if it does.
+class Refused(ValueError):
+    """A refusal the dashboard can act on: its code and details travel with the message."""
 
-    A watch resumes its registered session headless for repairs, under a per-session
-    lock; an interactive copy alongside would make two writers on one conversation.
-    """
+    def __init__(self, message, code, **details):
+        super().__init__(message)
+        self.details = {"code": code, **details}
+
+
+def repair_running(session_id, agent, config_dir=None):
+    """Whether a babysit repair holds this session's lock right now, from any home."""
     lock_home = (
         Path(config_dir or claude_runner.config_home())
         if agent == "claude"
@@ -985,12 +1010,80 @@ def watch_owner(session_id, agent, home, config_dir=None):
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return "a babysit repair is running in this session right now"
+                return True
             fcntl.flock(handle, fcntl.LOCK_UN)
-    for job in watch_jobs(home):
-        if job.get("session_id") == session_id and job.get("status") not in ENDED_WATCHES:
-            return f"babysit watch {job.get('id')} ({job.get('status')}) resumes this session itself; stop it first"
-    return None
+    return False
+
+
+def owning_watch(session_id, home):
+    """The babysit watch, not yet ended, that resumes this session itself."""
+    return next(
+        (
+            job
+            for job in watch_jobs(home)
+            if job.get("session_id") == session_id and job.get("status") not in ENDED_WATCHES
+        ),
+        None,
+    )
+
+
+def watch_summary(job):
+    """What the composer shows of a watch that owns a session."""
+    pr = (job.get("snapshot") or {}).get("pr") or {}
+    return {
+        "id": job.get("id"),
+        "status": job.get("status"),
+        "stop_after_run": bool(job.get("stop_after_run")),
+        "repo": job.get("repo"),
+        "number": pr.get("number"),
+        "title": pr.get("title"),
+        "branch": job.get("branch") or pr.get("head_branch"),
+        "url": job.get("url"),
+    }
+
+
+def owned_message(job):
+    return f"babysit watch {job.get('id')} ({job.get('status')}) resumes this session itself; stop it first"
+
+
+def watch_owner(session_id, agent, home, config_dir=None):
+    """Why the babysit watcher owns this session, if it does.
+
+    A watch resumes its registered session headless for repairs, under a per-session
+    lock; an interactive copy alongside would make two writers on one conversation.
+    """
+    if repair_running(session_id, agent, config_dir):
+        return REPAIR_RUNNING
+    job = owning_watch(session_id, home)
+    return owned_message(job) if job else None
+
+
+def claim_from_watch(session_id, agent, home, config_dir=None, stop_watch=None):
+    """Refuse a resume the watcher owns, after cancelling the watch the reader confirmed.
+
+    The confirmed watch is cancelled only while it still owns the session. A watch in
+    the middle of a repair stops only once the repair finishes, so nothing resumes then;
+    otherwise the lock and the queue are read again before the resume goes ahead.
+    """
+    job = owning_watch(session_id, home)
+    if job and stop_watch is not None and job.get("id") == stop_watch:
+        from dashboard import cancel_watch  # The dashboard imports this module first.
+
+        stopped = cancel_watch(Path(home), stop_watch)
+        if stopped["status"] not in ENDED_WATCHES:
+            raise Refused(
+                f"Not resumed: babysit watch {stop_watch} is running a repair; it stops once "
+                "that repair finishes. Send the message then.",
+                "watch_finishing_repair",
+                watch=watch_summary(stopped),
+            )
+    if repair_running(session_id, agent, config_dir):
+        raise Refused(f"Not resumed: {REPAIR_RUNNING}", "repair_running")
+    job = owning_watch(session_id, home)
+    if job:
+        raise Refused(
+            f"Not resumed: {owned_message(job)}", "watch_owns_session", watch=watch_summary(job)
+        )
 
 
 def watch_jobs(home):
@@ -1043,11 +1136,12 @@ def prune(prompts):
             _recent.pop(key, None)
 
 
-def resume(workspace_id, session_id, text, home, root=None):
+def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
     """Resume a recorded session in the workspace with the message as its prompt.
 
     Given a checkout root instead, the session resumes in the workspace open there, or
-    in one opened on it again.
+    in one opened on it again. Given the ID of the babysit watch that owns the session,
+    the reader confirmed cancelling it first.
     """
     if not isinstance(session_id, str) or not workspace_viewer.SESSION.match(session_id):
         raise ValueError("Choose a recorded session to resume")
@@ -1073,15 +1167,17 @@ def resume(workspace_id, session_id, text, home, root=None):
         if elsewhere:
             # Already running in another workspace: talk to that agent, never a second one.
             return prompt(elsewhere, text)
-        owner = watch_owner(session_id, chosen["agent"], home, chosen.get("claude_config_dir"))
-        if owner:
-            raise ValueError(f"Not resumed: {owner}")
         # A session resumes from the directory it was recorded in (Claude looks its ID up
         # in that directory's project folder).
         details = workspace_viewer.details(chosen["_file"], chosen["agent"]) or {}
         cwd = details.get("cwd") or root
         if not Path(cwd).is_dir():
             raise ValueError("The session's directory no longer exists")
+        # Last before herdr is asked for a pane, so a confirmed cancellation is spent only
+        # on a resume that can go ahead.
+        claim_from_watch(
+            session_id, chosen["agent"], home, chosen.get("claude_config_dir"), stop_watch
+        )
         # Always a fresh pane, as launches use: an existing shell may hold a half-typed
         # line or a program that replaced it, and typing would join or feed it.
         live = workspace_id and workspace_viewer.live_workspace(workspace_id)
