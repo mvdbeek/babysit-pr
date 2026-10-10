@@ -226,8 +226,15 @@
     return account?.silenced?.includes(subject(url)?.key) || false;
   }
 
+  function applyFocus(value) {
+    const box = document.getElementById("notifications-focus");
+    if (!box || typeof value.focus !== "boolean") return;
+    box.checked = value.focus;
+    box.disabled = false;
+  }
   function applyPreferences(target, value) {
     if (value.login !== target.login || !Array.isArray(value.silenced)) return;
+    applyFocus(value);
     // Polled preferences are usually unchanged; then there is nothing to store or redraw.
     if (JSON.stringify(target.silenced) === JSON.stringify(value.silenced)) return;
     target.silenced = value.silenced;
@@ -260,6 +267,31 @@
     }
   }
 
+  const focusBox = document.getElementById("notifications-focus");
+  if (focusBox)
+    focusBox.onchange = async () => {
+      const target = account;
+      focusBox.disabled = true;
+      try {
+        const response = await fetch("/api/notification-focus", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Babysit-Action": "notification-focus",
+          },
+          body: JSON.stringify({ login: target?.login, focus: focusBox.checked }),
+        });
+        const value = await response.json();
+        if (!response.ok) throw new Error(value.error || "Could not change the preference");
+        applyFocus(value);
+        document.getElementById("notifications-focus-status").textContent = "";
+      } catch (error) {
+        focusBox.checked = !focusBox.checked;
+        document.getElementById("notifications-focus-status").textContent = error.message;
+      } finally {
+        focusBox.disabled = false;
+      }
+    };
   function silenceButton(url) {
     const button = node("button", undefined, "notification-silence");
     button.type = "button";

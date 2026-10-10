@@ -198,7 +198,7 @@ def test_nothing_floats_over_the_content_on_small_phones(
     url, _ = dashboard_site
     context, page = open_page(
         browser,
-        url,
+        url + "/#watcher",
         viewport={"width": width, "height": 700},
         is_mobile=True,
         has_touch=True,

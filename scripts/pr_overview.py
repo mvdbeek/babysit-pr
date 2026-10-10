@@ -33,6 +33,9 @@ PR_FRAGMENT = (
       author { login }
       statusCheckRollup { state }
       reviewThreads(last: 100) { nodes { isResolved } }
+      reviewRequests(first: 20) {
+        nodes { requestedReviewer { ... on User { login } ... on Team { slug } } }
+      }
     """
     + activity_fragment(pull_request=True)
     + "}"
@@ -72,6 +75,13 @@ def pr_record(node, roles):
             not thread["isResolved"]
             for thread in (node.get("reviewThreads") or {}).get("nodes") or []
         ),
+        # Who still has to review: user logins, and `team:<slug>` for team requests.
+        "review_requests": [
+            f"team:{who['slug']}" if "slug" in who else who["login"]
+            for request in (node.get("reviewRequests") or {}).get("nodes") or []
+            for who in [request.get("requestedReviewer") or {}]
+            if who.get("login") or who.get("slug")
+        ],
         "roles": roles,
         "ci": rollup.get("state", "UNKNOWN") if rollup else "NONE",
     }

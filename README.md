@@ -92,11 +92,94 @@ This clears that item locally without starting a repair or changing GitHub; it
 requires the displayed batch to still be current. Blocked repairs retain their
 feedback until handled successfully or explicitly marked addressed.
 
+## What needs you
+
+The dashboard opens on the **Needs you** tab: one list of everything waiting on you,
+merged from the watcher, your pull requests and issues, the Workspaces tab, scheduled
+tasks and cron jobs. Each row names one item, the reasons it needs you, and where to
+act: **Show in …** opens the tab that lists it and, for pull requests, issues and
+watches, reveals its row with every action that row offers, beside **Open in Collie**
+and **GitHub** links when they apply. An item
+mentioned by several sources appears once, with all its reasons; a watched pull
+request with a workspace is one row. Rows are grouped by the kind of work, newest
+activity first, and a group heading collapses its rows:
+
+- **Answer an agent**: a blocked repair, a new watch waiting for you to exit the CLI
+  session it resumes, feedback awaiting your approval (items you approved are queued,
+  not waiting), a workspace agent waiting for your answer, or a cron agent that
+  stopped without finishing.
+- **Review or merge**: your pull request approved with green CI and no open threads,
+  a pull request whose review was requested from you, or a workspace agent that
+  returned to its prompt and has not been looked at yet (herdr's **done**; an agent
+  merely sitting idle needs nobody).
+- **Unblock**: your pull request with failing CI and no live watch (a watch repairs
+  it itself; a paused one does not), changes requested or unresolved review threads
+  on your pull request, a workspace launch that failed in the last day or needs
+  checking, a scheduled task that needs checking or was missed or failed in the last
+  day, or an enabled cron job whose last run failed.
+- **Tidy up**: a watch whose pull request merged or closed, a workspace whose linked
+  items are all closed or merged (with the blockers that would stop its cleanup), or a
+  herdr workspace whose checkout is gone.
+- **Pick up**: an issue assigned to you with no open linked pull request, no checkout
+  and no scheduled task.
+
+Items with no activity for two weeks are **Parked**: listed last, folded, and left
+out of the counts, unless an agent is waiting for an answer on them. **Wait for
+activity** sets a row aside into **Waiting on others**, folded at the end, until
+something happens on the item; later activity, or a reason it did not have yet,
+brings it back by itself, and **Resume** brings it back now. An entry whose item has
+not been listed for a month (merged, closed or cleaned up meanwhile) is forgotten.
+For a watch, activity means it started or changed status, not its routine polls. Set-aside items are kept per GitHub login in the
+private `attention-triage.json` file in the state directory, so every device sees the
+same list (`POST /api/attention-triage` with `{"login", "key", "action": "wait" |
+"clear"}`).
+
+The tab's badge counts the rows; the **Watcher**, **Pull requests**, **Issues** and
+**Workspaces** tabs show a red badge only while something on them needs you, so a
+plain tab needs nothing. The header shows **N waiting** while agents (workspace or
+cron) are waiting for an answer; it opens this tab. The list refreshes every 5
+seconds while shown and every 30 seconds otherwise, from the snapshots the dashboard
+already keeps: the pull request and issue overviews on their usual five-minute
+cadence, the watch queue, the workspace inventory as last scanned (a scan is only
+started from the Workspaces tab), scheduled tasks and cron runs. No extra GitHub
+requests are made. The server builds the feed at most every 5 seconds for all tabs
+and devices; **Refresh** builds it at once. A source that fails is named in the
+status line while the rest of the list still shows. `GET /api/attention` serves the
+feed with the same access restrictions as the other API routes (`?refresh=1` skips
+the 5-second cache); `scripts/attention.py` builds it.
+
+### Alerts and the badge follow what needs you
+
+**Alert and badge only for what needs you**, in the bell's notification section, is on
+by default for each GitHub login and applies to every subscribed device. While it is
+on, a phone alert is sent for a change to an item on the Needs you list and for an
+item that newly needs you (an agent waiting for an answer, a failed launch), and the
+Home Screen badge shows how many items need you rather than how many updates are
+unseen; the bell's log and its own count are unchanged, and silenced pull requests
+neither alert nor count. While the feed cannot be read, nothing is sent rather than
+falling back to every update. The push worker reads the feed every 15 seconds while a
+device is subscribed. Turn the preference off to get the previous behaviour: an alert
+for every unseen update and a badge with the unseen count. The preference is saved with the push
+state in `dashboard-push.json` (`POST /api/notification-focus` with
+`{"login", "focus": true | false}`). As before, the background badge changes with
+each alert, and opening the dashboard brings it up to date.
+
+### Status line and compact rows
+
+Every pull request and issue row shows one line under its title with what is running
+against it: its watch (**Watch: Repairing**, **Blocked**, …), the agent in its
+workspace (**Agent: blocked**, **working**, **done**, **idle**) and a pending
+**Scheduled** launch. The line reads the snapshots the page already polls. **Compact**,
+beside the search box on both overviews, folds the author, review status, role, CI,
+assignee, comment and date columns away and moves the CI and review state onto that
+line, leaving the repository, the title with its status line, and the actions. One
+choice covers both overviews and is kept in this browser.
+
 ## Your pull requests
 
-The dashboard opens on the **Watcher** tab. Use **Pull requests** to switch to the
+Use **Pull requests** to switch to the
 PR overview and **Issues** for the issue overview; tabs support keyboard navigation,
-browser history, and direct links with `#watcher`, `#prs` or `#issues`. The PR table has separate repository, author, and draft/ready-for-review columns,
+browser history, and direct links with `#attention`, `#watcher`, `#prs` or `#issues`. The PR table has separate repository, author, and draft/ready-for-review columns,
 plus opened and last-updated timestamps. Click a metadata column heading to sort; click
 again to reverse it. Mobile layouts provide equivalent sort controls. Dates sort
 chronologically, other columns by their displayed text; missing metadata stays

@@ -246,7 +246,7 @@ def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, w
     page.keyboard.press("ArrowRight")
     expect(page.locator("#upstream-panel")).to_be_hidden()  # Hidden tabs are skipped.
     page.keyboard.press("Home")
-    expect(page.locator("#watcher-panel")).to_be_visible()
+    expect(page.locator("#attention-panel")).to_be_visible()
     page.go_back()
     expect(page.locator("#workspaces-panel")).to_be_visible()
     assert not errors

@@ -220,7 +220,7 @@ def test_link_click_survives_background_refresh(
 def test_header_branding_and_status_fit_at_all_widths(page: Page, dashboard_site, width):
     url, home = dashboard_site
     page.set_viewport_size({"width": width, "height": 900})
-    page.goto(url)
+    page.goto(url + "/#watcher")
     expect(page.locator("#updated")).to_contain_text("Refreshed")
     (home / "heartbeat.json").unlink()
     page.get_by_role("button", name="Refresh", exact=True).click()
@@ -626,7 +626,7 @@ def test_compact_dates_highlight_updated_section_only(page, dashboard_site, kind
 
 
 def open_watch(page: Page, url: str, repo: str) -> None:
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.get_by_role("button", name=f"{repo}, feature,", exact=False).click()
 
 
@@ -704,7 +704,7 @@ def test_page_tabs_scroll_without_wrapping(page: Page, dashboard_site, width: in
         "el => el.getBoundingClientRect().right <= el.parentElement.getBoundingClientRect().right + 1"
     )
     page.keyboard.press("Home")
-    expect(page.locator("#watcher-tab")).to_be_focused()
+    expect(page.locator("#attention-tab")).to_be_focused()
     assert tabs.evaluate("el => el.scrollLeft === 0")
 
 
@@ -746,7 +746,7 @@ def test_watch_selection_scrolls_to_details_only_on_mobile(
     url, _ = dashboard_site
     page.set_viewport_size({"width": width, "height": 844})
     page.emulate_media(reduced_motion=motion)
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.get_by_role("button", name="test/repo, feature,", exact=False).click()
     expect(page.locator("#detail h2")).to_be_in_viewport()
     if width == 390:
@@ -765,7 +765,7 @@ def test_mark_feedback_addressed_without_starting_a_repair(page: Page, dashboard
     url, home = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})
     page.emulate_media(reduced_motion="reduce")
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.get_by_role("button", name="test/repo, feature,", exact=False).click()
     page.get_by_role("button", name="Mark addressed", exact=True).click()
     expect(page.locator(".feedback-section")).to_have_count(0)
@@ -780,7 +780,7 @@ def test_mark_feedback_addressed_without_starting_a_repair(page: Page, dashboard
 def test_mobile_cleanup_attention_and_offline_state(page: Page, dashboard_site) -> None:
     url, home = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.locator("#show-attention").click()
     page.get_by_role("button", name="test/merged, feature,", exact=False).click()
     expect(page.locator(".cleanup-note")).to_contain_text("PR merged · ready for cleanup")
@@ -793,7 +793,7 @@ def test_mobile_cleanup_attention_and_offline_state(page: Page, dashboard_site) 
 
 def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboard_site) -> None:
     url, home = dashboard_site
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.get_by_role("tab", name="Pull requests", exact=True).click()
     rows = page.locator("#pr-list tr")
     expect(rows).to_have_count(2)
@@ -879,7 +879,7 @@ def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site
             }
         ),
     )
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.get_by_role("tab", name="Pull requests", exact=True).click()
     expect(page.locator("#pr-alert")).to_contain_text("GitHub authentication failed")
     expect(page.locator("#pr-empty")).to_contain_text("PR data is unavailable")
@@ -899,17 +899,21 @@ def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site
     expect(page.locator("#pr-alert")).to_be_hidden()
 
 
-def test_dashboard_tabs_default_to_watcher_and_support_navigation(
+def test_dashboard_tabs_default_to_needs_you_and_support_navigation(
     page: Page, dashboard_site
 ) -> None:
     url, _ = dashboard_site
     page.goto(url)
+    attention = page.get_by_role("tab", name="Needs you")
     watcher = page.get_by_role("tab", name="Watcher", exact=True)
     prs = page.get_by_role("tab", name="Pull requests", exact=True)
-    expect(watcher).to_have_attribute("aria-selected", "true")
+    expect(attention).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#attention-panel")).to_be_visible()
+    expect(page.locator("#watcher-panel")).to_be_hidden()
+    expect(page.locator(".page-tabs [role=tab]").first).to_contain_text("Needs you")
+    watcher.click()
     expect(page.locator("#watcher-panel")).to_be_visible()
     expect(page.locator("#prs-panel")).to_be_hidden()
-    expect(page.locator(".page-tabs [role=tab]").first).to_have_text("Watcher")
     watcher.focus()
     watcher.press("ArrowRight")
     expect(prs).to_be_focused()
@@ -926,18 +930,18 @@ def test_dashboard_tabs_default_to_watcher_and_support_navigation(
     expect(page.locator("#prs-panel")).to_be_visible()
     prs.focus()
     prs.press("Home")
-    expect(watcher).to_be_focused()
-    expect(page.locator("#watcher-panel")).to_be_visible()
+    expect(attention).to_be_focused()
+    expect(page.locator("#attention-panel")).to_be_visible()
     issues = page.get_by_role("tab", name="Issues", exact=True)
-    watcher.press("End")
+    attention.press("End")
     expect(issues).to_be_focused()
     expect(issues).to_have_attribute("aria-selected", "true")
     expect(page.locator("#issues-panel")).to_be_visible()
     expect(page.locator("#prs-panel")).to_be_hidden()
     expect(page).to_have_url(url + "/#issues")
     issues.press("ArrowRight")
-    expect(watcher).to_be_focused()
-    watcher.press("ArrowLeft")
+    expect(attention).to_be_focused()
+    attention.press("ArrowLeft")
     expect(issues).to_be_focused()
     issues.press("ArrowLeft")
     expect(prs).to_be_focused()
@@ -1193,7 +1197,7 @@ def test_watcher_pr_review_state(page, dashboard_site, draft, outcome, branch, l
         )
         supervisor.save_job(db, job)
     db.close()
-    page.goto(url)
+    page.goto(url + "/#watcher")
     row = page.locator("#list .watch").filter(has_text="test/repo")
     row.click()
     for target in (row.locator(".watch-top"), page.locator("#detail .detail-top")):
@@ -1210,7 +1214,7 @@ def test_watches_are_titled_by_their_pr_title(page: Page, dashboard_site) -> Non
         job["snapshot"]["pr"]["title"] = '<img src=x onerror="window.injected=true"> Fix CI'
         supervisor.save_job(db, job)
     db.close()
-    page.goto(url)
+    page.goto(url + "/#watcher")
     row = page.locator("#list .watch").filter(has_text="Fix CI")
     expect(row.locator(".watch-title")).to_have_text(
         '<img src=x onerror="window.injected=true"> Fix CI'
@@ -1282,7 +1286,7 @@ def test_watcher_workspace_open(page, dashboard_site, workspace_routes, job_id, 
             job["branch"] = branch
             supervisor.save_job(db, job)
         db.close()
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.evaluate("window.open = () => { window.opened = {location: {}}; return window.opened; }")
     if job_id == "closed":
         choose_option(page.get_by_role("combobox", name="Filter watches", exact=True), "all")
@@ -1311,7 +1315,7 @@ def test_watcher_workspace_unavailable_does_not_offer_creation(
     info, snapshot, requests = workspace_routes
     info["matches"] = []
     snapshot["watches"] = {"watch:feedback": info}
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.locator("#list .watch").filter(has_text="test/repo").click()
     expect(
         page.locator("#detail").get_by_role("button", name="Workspace unavailable")
@@ -1826,7 +1830,7 @@ def test_pr_visit_highlights_fields_and_new_rows_until_next_visit(
 
 def test_watcher_tab_does_not_consume_pr_changes(page, dashboard_site, visit_routes):
     url, _ = dashboard_site
-    page.goto(url)
+    page.goto(url + "/#watcher")
     # A hidden table keeps its count current but builds rows only when shown.
     expect(page.locator("#pr-count")).to_have_text("2 / 2")
     assert saved_visit(page) is None
@@ -3374,7 +3378,7 @@ def test_any_collie_workspace_offers_its_diff_and_transcript(
     expect(viewer).to_be_hidden()
     expect(row.get_by_role("button", name="Diff", exact=True)).to_be_focused()
     # The watcher's detail offers the same once its checkout has a workspace.
-    page.goto(url)
+    page.goto(url + "/#watcher")
     _, snapshot, _ = workspace_routes
     snapshot["watches"] = {"watch:feedback": snapshot["prs"]["pr-one"]}
     page.reload()

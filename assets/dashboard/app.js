@@ -942,7 +942,7 @@ function authorCell(login) {
   return cell;
 }
 function rolesCell(values) {
-  const cell = el("td");
+  const cell = el("td", undefined, "pr-roles-cell");
   const tags = el("div", undefined, "pr-roles");
   for (const value of values || []) tags.append(el("span", roleNames[value] || value, "badge"));
   cell.append(tags);
@@ -1411,6 +1411,8 @@ function itemTable(spec) {
         item,
         table.selected.has(item.id),
         workspaceInfo(item),
+        // Only what the status line shows: the rest of a watch changes with every poll.
+        [watchFor(item.url)?.id, watchFor(item.url)?.status],
         (item.linked_prs || []).map((pr) =>
           prTable.items().find((known) => known.repo === pr.repo && known.number === pr.number),
         ),
@@ -1643,6 +1645,7 @@ const prTable = itemTable({
     const titleLink = link(pr.title, pr.url);
     titleLink.className = "pr-title";
     title.append(titleLink, el("span", `#${pr.number}`, "pr-meta"));
+    title.append(statusLine({ ...pr, kind: "pr" }));
     const author = authorCell(pr.author);
     const readiness = el("td", undefined, "pr-readiness");
     for (const [label, color, feedback] of prReviewBadges(pr))
@@ -1650,7 +1653,7 @@ const prTable = itemTable({
         feedback ? reviewBadge(pr, label, color) : el("span", label, `badge ${color}`),
       );
     const roles = rolesCell(pr.roles);
-    const checks = el("td");
+    const checks = el("td", undefined, "pr-ci");
     checks.append(ciBadge(pr));
     const { cell: dates, updated } = datesCell(pr);
     const repo = repoCell(pr.repo);
@@ -1672,6 +1675,67 @@ const prTable = itemTable({
     };
   },
 });
+
+// Everything running against an item, on one line: CI and review state (shown only in
+// compact rows, which hide their columns), its watch, its workspace agent, and a
+// scheduled launch. Read from snapshots the page already polls; nothing is fetched.
+function watchFor(url) {
+  return (data?.jobs || []).find((job) => !ended.has(job.status) && sameSubject(job.url, url));
+}
+const agentTones = { blocked: "red", working: "blue", done: "green" };
+function statusLine(item) {
+  const line = el("div", undefined, "pr-status-line");
+  const chip = (text, tone, compactOnly) =>
+    line.append(el("span", text, `badge ${tone || ""}${compactOnly ? " pr-status-compact" : ""}`));
+  if (item.kind === "pr") {
+    const [label, color] = ciStates[item.ci] || ["Unknown", ""];
+    if (item.ci !== "SUCCESS") chip(`CI ${label.toLowerCase()}`, color, true);
+    // Without `pr-approved`: that class marks the review column's own badge.
+    for (const [label, color] of prReviewBadges(item))
+      chip(label, color.replace("pr-approved", "").trim(), true);
+  }
+  const watch = watchFor(item.url);
+  if (watch)
+    chip(
+      `Watch: ${names[watch.status] || watch.status}`,
+      watch.status === "blocked" ? "red" : watch.status === "running" ? "blue" : "",
+    );
+  const info = workspaceInfo(item);
+  const space = (info?.matches || []).find((match) => match.workspace_id);
+  if (space) chip(`Agent: ${space.agent_status}`, agentTones[space.agent_status]);
+  if (info?.scheduled?.length) chip("Scheduled", "amber");
+  return line;
+}
+// Compact rows: repository, title with its status line, and actions; the rest of the
+// columns are folded away. One choice for both overviews, kept in this browser.
+const COMPACT_KEY = "babysit-pr:compact-rows:v1";
+let compactRows = false;
+try {
+  compactRows = localStorage.getItem(COMPACT_KEY) === "1";
+} catch {
+  /* Compact rows then last for this tab only. */
+}
+function applyCompact() {
+  for (const [prefix, panel] of [
+    ["pr", "prs-panel"],
+    ["issue", "issues-panel"],
+  ]) {
+    $(panel)?.classList?.toggle("pr-compact", compactRows);
+    $(`${prefix}-compact`)?.setAttribute("aria-pressed", String(compactRows));
+  }
+}
+for (const prefix of ["pr", "issue"])
+  if ($(`${prefix}-compact`))
+    $(`${prefix}-compact`).onclick = () => {
+      compactRows = !compactRows;
+      try {
+        localStorage.setItem(COMPACT_KEY, compactRows ? "1" : "0");
+      } catch {
+        /* Still applies to this tab. */
+      }
+      applyCompact();
+    };
+applyCompact();
 
 function linkedPRBadge(issue, pr) {
   const wrap = el("span", undefined, "pr-linked-pr");
@@ -1769,6 +1833,7 @@ const issueTable = itemTable({
     const titleLink = link(issue.title, issue.url);
     titleLink.className = "pr-title";
     title.append(titleLink, el("span", `#${issue.number}`, "pr-meta"));
+    title.append(statusLine({ ...issue, kind: "issue" }));
     if (issue.labels?.length) {
       const labels = el("div", undefined, "pr-badges pr-labels");
       for (const label of issue.labels) labels.append(labelBadge(label));
@@ -1827,6 +1892,9 @@ async function refresh(force = false) {
     data = await get("/api/status");
     window.dashboardNotifications?.watcher(data);
     render();
+    // Overview rows show their watch's state; unchanged rows are left as they are.
+    if (!$("prs-panel").hidden) prTable.render();
+    if (!$("issues-panel").hidden) issueTable.render();
     revealNotification("watcher");
     if ($("service-details").open) await serviceLog();
   } catch (e) {
@@ -1839,7 +1907,17 @@ async function refresh(force = false) {
     busy = false;
   }
 }
-const pages = ["watcher", "prs", "issues", "scheduled", "cron", "workspaces", "upstream", "sentry"];
+const pages = [
+  "attention",
+  "watcher",
+  "prs",
+  "issues",
+  "scheduled",
+  "cron",
+  "workspaces",
+  "upstream",
+  "sentry",
+];
 function showPage(name) {
   for (const page of pages) {
     const active = page === name;
@@ -1856,6 +1934,8 @@ function showPage(name) {
   if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
   if (name === "sentry") window.dispatchEvent(new Event("sentry-visible"));
   if (name === "cron") window.dispatchEvent(new Event("cron-visible"));
+  // attention.js refreshes itself on load; afterwards each visit fetches at once.
+  if (name === "attention") void window.dashboardAttention?.refresh(true);
 }
 function overviewVisible() {
   return !$("prs-panel").hidden || !$("issues-panel").hidden;
@@ -1868,7 +1948,7 @@ function routeChanged() {
 function pageFromURL() {
   routedURL = location.href;
   const name = window.location.hash.slice(1);
-  showPage(pages.includes(name) ? name : "watcher");
+  showPage(pages.includes(name) ? name : "attention");
   const item = new URLSearchParams(location.search).get("item");
   navigationTarget =
     item &&

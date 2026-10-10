@@ -263,6 +263,56 @@ def test_cross_site_links_open_the_dashboard_but_no_api(serve):
     assert get(server, "/api/sentry", {"Sec-Fetch-Site": "cross-site"})[0] == 403
 
 
+def test_attention_feed_answers_without_providers_and_past_a_broken_one(serve, overview):
+    server = serve()
+    code, _, body = get(server, "/api/attention")
+    feed = json.loads(body)
+    assert code == 200
+    assert feed["items"] == []
+    assert feed["sources"]["prs"] == {"available": False}
+    assert feed["sources"]["watcher"]["available"]
+
+    class Broken:
+        def snapshot(self, start=True):
+            assert start is False  # The feed never brings a workspace scan forward.
+            raise RuntimeError("no inventory")
+
+    server = serve(overview=overview, workspace_overview=Broken())
+    feed = json.loads(get(server, "/api/attention")[2])
+    assert feed["login"] == "alice"
+    assert feed["sources"]["workspace_overview"]["error"] == (
+        "workspace_overview unavailable: no inventory"
+    )
+    assert feed["sources"]["prs"]["synced_at"]
+
+
+def test_attention_triage_sets_items_aside_and_returns_the_fresh_feed(serve, overview):
+    overview.value["prs"][0].update(
+        url="https://github.com/test/repo/pull/0",
+        roles=["author"],
+        ci="FAILURE",
+        updated_at="2027-01-15T10:00:00Z",
+    )
+    server = serve(overview=overview)
+    feed = json.loads(get(server, "/api/attention")[2])
+    [item] = feed["items"]
+    headers = {
+        "Content-Type": "application/json",
+        "X-Babysit-Action": "attention-triage",
+        "Origin": f"http://127.0.0.1:{server.server_port}",
+    }
+    body = json.dumps({"login": "alice", "key": item["key"], "action": "wait"}).encode()
+    code, _, raw = get(server, "/api/attention-triage", headers, "POST", body)
+    result = json.loads(raw)
+    assert code == 200
+    assert result["waiting"] == [item["key"]]
+    assert result["feed"]["items"] == [] and len(result["feed"]["waiting"]) == 1
+    # The cached feed is rebuilt, so the next poll agrees.
+    assert json.loads(get(server, "/api/attention")[2])["items"] == []
+    body = json.dumps({"login": "bob", "key": item["key"], "action": "clear"}).encode()
+    assert get(server, "/api/attention-triage", headers, "POST", body)[0] == 400
+
+
 def test_read_jobs_is_cached_until_the_queue_changes(tmp_path, monkeypatch):
     assert dashboard.read_jobs(tmp_path) == []
     db = open_db(tmp_path)  # WAL mode, exactly as the watcher writes it.
@@ -315,7 +365,7 @@ def test_notification_preferences_read_only_the_login(tmp_path):
     assert PushInbox(tmp_path, snapshots).preferences()["login"] == "alice"
     assert built == [1]
     inbox = PushInbox(tmp_path, snapshots, login=lambda: "alice")
-    assert inbox.preferences() == {"login": "alice", "silenced": []}
+    assert inbox.preferences() == {"login": "alice", "silenced": [], "focus": True}
     assert built == [1]  # The poll no longer builds every snapshot.
 
 

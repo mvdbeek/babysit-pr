@@ -42,7 +42,7 @@ def count(page, value):
 
 def test_notifications_group_sources_and_keep_unread_until_acknowledged(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["ci"] = "SUCCESS"
     packets["prs"]["synced_at"] += 1
@@ -75,7 +75,7 @@ def test_notifications_group_sources_and_keep_unread_until_acknowledged(page, in
 
 def test_notifications_limit_log_to_ten_distinct_items_and_survive_reload(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     template = packets["prs"]["prs"][0]
     for number in range(100, 112):
@@ -111,7 +111,7 @@ def test_visiting_lists_acknowledges_items_and_issues_remain_distinct(page, inbo
     url, packets = inbox
     issue = packets["issues"]["issues"][0]
     issue.update(number=8, url="https://github.com/test/alpha/issues/8")
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["title"] = "Changed PR"
     issue["title"] = "Changed issue"
@@ -127,7 +127,7 @@ def test_visiting_lists_acknowledges_items_and_issues_remain_distinct(page, inbo
 
 def test_notifications_ignore_stale_and_failed_snapshots_and_quiet_polls(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["status"]["jobs"][0]["updated_at"] += 10
     packets["status"]["jobs"][0]["next_poll"] = (
@@ -150,7 +150,7 @@ def test_notifications_ignore_stale_and_failed_snapshots_and_quiet_polls(page, i
 def test_notification_layout_keyboard_and_plain_text(page, inbox, width):
     url, packets = inbox
     page.set_viewport_size({"width": width, "height": 844})
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["title"] = '<img src=x onerror="window.injected=true"> A changed PR'
     packets["prs"]["synced_at"] += 1
@@ -194,7 +194,7 @@ def test_notifications_use_existing_visit_history(page, inbox):
         f"localStorage.setItem('babysit-pr:seen-prs:v1:fixture', {json.dumps(json.dumps(visit))})"
     )
     pr["title"] = "Changed since last visit"
-    page.goto(url)
+    page.goto(url + "/#watcher")
     # The changed PR and the other PR absent from the old visit are both unseen.
     count(page, 2)
     page.get_by_role("tab", name="Pull requests", exact=True).click()
@@ -203,7 +203,7 @@ def test_notifications_use_existing_visit_history(page, inbox):
 
 def test_notifications_isolate_accounts(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["title"] = "Fixture account update"
     packets["prs"]["synced_at"] += 1
@@ -227,7 +227,7 @@ def test_notifications_work_when_storage_is_unavailable(page, inbox):
     page.add_init_script(
         "Object.defineProperty(window, 'localStorage', { get() { throw new Error('Blocked'); } });"
     )
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["title"] = "In-memory update"
     packets["prs"]["synced_at"] += 1
@@ -241,7 +241,7 @@ def test_notifications_work_when_storage_is_unavailable(page, inbox):
 
 def test_opening_one_notification_marks_only_that_item_seen(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["title"] += " changed"
     packets["issues"]["issues"][0]["title"] += " changed"
@@ -325,7 +325,7 @@ def test_notification_reveals_item_beyond_first_page(page, inbox):
 
 def test_seen_state_syncs_between_browser_tabs(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["title"] = "Shared update"
     packets["prs"]["synced_at"] += 1
@@ -353,7 +353,7 @@ def test_corrupt_notification_storage_recovers(page, inbox):
     page.add_init_script(
         "localStorage.setItem('babysit-pr:notifications:v1:fixture', '{bad json');"
     )
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     packets["prs"]["prs"][0]["title"] = "Recovered update"
     packets["prs"]["synced_at"] += 1
@@ -410,7 +410,7 @@ def test_silence_button_persists_and_mutes_watcher_and_pr_updates(page, inbox):
 
 def test_own_actions_and_progress_are_quiet_but_outcomes_notify(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     job = packets["status"]["jobs"][0]
     before = job["status"]
@@ -443,7 +443,7 @@ def test_own_actions_and_progress_are_quiet_but_outcomes_notify(page, inbox):
 
 def test_repair_completed_between_browser_polls_notifies(page, inbox):
     url, packets = inbox
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     job = packets["status"]["jobs"][0]
     job.update(attempts=job.get("attempts", 0) + 1, updated_at=job["updated_at"] + 1)
@@ -481,7 +481,7 @@ def test_review_thread_count_added_after_baselines_is_not_a_change(page, inbox):
     first, second = packets["prs"]["prs"]
     first["unresolved_threads"] = 0
     packets["prs"]["synced_at"] += 1
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     second["unresolved_threads"] = 2
     packets["prs"]["synced_at"] += 1

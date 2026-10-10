@@ -375,7 +375,7 @@ def test_listing_sort_filters_keyboard_and_responsive_screenshots(page, site, er
     page.keyboard.press("End")
     expect(page.locator("#sentry-panel")).to_be_visible()
     page.keyboard.press("ArrowRight")
-    expect(page.locator("#watcher-panel")).to_be_visible()
+    expect(page.locator("#attention-panel")).to_be_visible()
     page.go_back()
     expect(page.locator("#sentry-panel")).to_be_visible()
     assert fake.refreshes == 0

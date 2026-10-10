@@ -67,7 +67,7 @@ def watches(page: Page, dashboard_site):
     page.route("**/api/status", lambda route: route.fulfill(json=status))
     page.route("**/api/watch?*", watch)
     pause_clock(page)
-    page.goto(url)
+    page.goto(url + "/#watcher")
     expect(page.locator("#list .watch")).to_have_count(2)
     page.locator("#show-ended").click()
     return {"jobs": jobs, "full": full, "state": state, "asked": asked, "held": held}
@@ -174,7 +174,7 @@ def test_watcher_notifications_use_the_server_check_result(page: Page, inbox, se
     else:
         job.pop("checks_result", None)
         job["check_details"] = [{"name": "a", "bucket": "pending"}]
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     if server == "current":
         job["checks_result"] = "SUCCESS"

@@ -63,7 +63,11 @@
         if (remote.entries[url])
           remote.entries[url].seenAt = Math.max(remote.entries[url].seenAt, at);
       }
-      const count = Object.values(remote.entries).filter((entry) => entry.at > entry.seenAt).length;
+      const unseen = Object.values(remote.entries).filter(
+        (entry) => entry.at > entry.seenAt,
+      ).length;
+      // With focus on, the badge counts what needs the user rather than unseen updates.
+      const count = remote.focus ? (remote.badge ?? unseen) : unseen;
       if ("setAppBadge" in navigator) navigator.setAppBadge(count).catch(() => {});
       registration?.active?.postMessage({
         type: "inbox",

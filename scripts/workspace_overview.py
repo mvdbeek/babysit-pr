@@ -348,9 +348,10 @@ class WorkspaceOverview:
             "roots": sorted({str(root.resolve()) for root in self.roots}),
         }
 
-    def snapshot(self):
+    def snapshot(self, start=True):
+        """The inventory as it is; `start=False` reads it without bringing a scan forward."""
         with self.lock:
-            if self.enabled and not self.loading and time.time() >= self.next_poll:
+            if start and self.enabled and not self.loading and time.time() >= self.next_poll:
                 self.loading = True
                 self.next_poll = time.time() + INTERVAL
                 threading.Thread(target=self._refresh, daemon=True).start()

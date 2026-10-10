@@ -122,6 +122,23 @@ def test_counts_unresolved_review_threads_including_outdated(monkeypatch):
     assert "reviewThreads(last: 100) { nodes { isResolved } }" in overview.PR_FRAGMENT
 
 
+def test_records_who_still_has_to_review(monkeypatch):
+    requests = {
+        "nodes": [
+            {"requestedReviewer": {"login": "bob"}},
+            {"requestedReviewer": {"slug": "core"}},
+            {"requestedReviewer": None},
+            {"requestedReviewer": {}},
+        ]
+    }
+    nodes = [pr(reviewRequests=requests), pr("bare")]
+    monkeypatch.setattr(overview, "github_page", lambda *args: page(nodes))
+    found = {item["id"]: item for item in overview.collect()["prs"]}
+    assert found["one"]["review_requests"] == ["bob", "team:core"]
+    assert found["bare"]["review_requests"] == []
+    assert "reviewRequests(first: 20)" in overview.PR_FRAGMENT
+
+
 def test_empty_search_still_lists_the_searched_roles(monkeypatch):
     monkeypatch.setattr(overview, "github_page", lambda *args: page([]))
     result = overview.collect()
