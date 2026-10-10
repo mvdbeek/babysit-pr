@@ -879,6 +879,32 @@ def test_cmux_session_reuses_workspace_and_group_and_reports_failures():
         tool(runner, {"WT_MULTIPLEXER": "cmux"}).open_session(options(repo=""), "/wt/x", "x", "/c")
 
 
+def test_claude_is_told_to_trust_the_checkout_only_when_a_session_starts(monkeypatch):
+    trusted = []
+    monkeypatch.setattr(wt.claude_accounts, "trust", lambda *args: trusted.append(args))
+    home = wt.claude_accounts.current_home()
+    herdr_new = wt.Completed(
+        0, json.dumps({"result": {"already_open": False, "root_pane": {"pane_id": "w1:p1"}}}), ""
+    )
+    for mux, results in (
+        ("herdr", [(["herdr", "worktree", "open"], herdr_new)]),
+        ("tmux", [(["tmux", "has-session"], wt.Completed(1, "", ""))]),
+        ("cmux", [(["cmux", "list-workspaces"], wt.Completed(0, '{"workspaces":[]}', ""))]),
+    ):
+        runner = FakeRunner(results, executables={mux})
+        t = tool(runner, {"WT_MULTIPLEXER": mux})
+        t.open_session(options(repo=""), f"/wt/{mux}", "x", "/c")
+        assert trusted.pop() == (home, f"/wt/{mux}")
+        # Codex has no such dialog.
+        runner = FakeRunner(results, executables={mux})
+        t = tool(runner, {"WT_MULTIPLEXER": mux})
+        t.open_session(options(agent="codex", repo=""), f"/wt/{mux}", "x", "/c")
+    # A session that is already running is only reattached.
+    runner = FakeRunner(executables={"tmux"})
+    tool(runner, {"WT_MULTIPLEXER": "tmux"}).open_session(options(), "/wt/x", "x", "/c")
+    assert trusted == []
+
+
 def test_none_and_missing_multiplexers_print_the_path():
     runner = FakeRunner()
     t = tool(runner, {"WT_MULTIPLEXER": "none"})

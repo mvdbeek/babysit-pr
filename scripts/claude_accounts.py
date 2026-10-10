@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import tempfile
 from pathlib import Path
 
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -55,18 +56,66 @@ def catalog():
     return accounts
 
 
-def login(home):
-    """Who a configuration is signed in as, from its global config; never reads credentials.
-
-    Claude keeps ~/.claude's login in ~/.claude.json, and any other's inside that directory.
-    """
+def global_config(home):
+    """Claude keeps ~/.claude's global config in ~/.claude.json, and any other's inside it."""
     home = Path(home).resolve()
-    path = Path.home() / ".claude.json" if home == default_home() else home / ".claude.json"
+    return Path.home() / ".claude.json" if home == default_home() else home / ".claude.json"
+
+
+def login(home):
+    """Who a configuration is signed in as, from its global config; never reads credentials."""
+    path = global_config(home)
     try:
         value = json.loads(path.read_text())["oauthAccount"]
         return value["accountUuid"], value.get("organizationUuid")
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def trust(home, directory):
+    """Accept Claude's folder trust dialog for a checkout babysit-pr chose, before a launch.
+
+    ``--dangerously-skip-permissions`` does not skip that dialog, so an unattended agent
+    in a new checkout would wait on it until someone answers. Claude counts a folder as
+    trusted when it or a parent has ``hasTrustDialogAccepted``; only the launch folder
+    is added, never the main clone of a worktree, which babysit-pr did not choose.
+
+    Running Claude processes rewrite this file often. Nothing is written when the folder
+    is already trusted; otherwise the file is read just before an atomic replace that
+    changes that one key. A missing or unreadable file is left alone, and no error is
+    raised: the launch goes ahead either way. ``BABYSIT_CLAUDE_TRUST=0`` turns it off.
+    Returns whether the folder is trusted now.
+    """
+    if os.environ.get("BABYSIT_CLAUDE_TRUST") == "0":
+        return False
+    directory = Path(directory).resolve()
+    # A symlinked config is updated where it points, keeping the link.
+    path = global_config(home).resolve()
+    temporary = None
+    try:
+        mode = path.stat().st_mode & 0o7777
+        config = json.loads(path.read_text())
+        projects = config.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            return False
+        for folder in (directory, *directory.parents):
+            entry = projects.get(str(folder))
+            if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
+                return True
+        entry = projects.setdefault(str(directory), {})
+        if not isinstance(entry, dict):
+            return False
+        entry["hasTrustDialogAccepted"] = True
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(json.dumps(config, indent=2, ensure_ascii=False))
+        os.replace(temporary, path)
+        return True
+    except (OSError, ValueError, AttributeError, TypeError):
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+        return False
 
 
 def choices():

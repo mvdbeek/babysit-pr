@@ -589,6 +589,15 @@ applies to newly started agents; reattaching a running workspace keeps its agent
 The shell launch preserves the user's `claude` function and forwards the selected
 directory through Safehouse. The executable launcher grants that directory only.
 
+Before Claude is typed into a checkout that babysit-pr chose (a `wt`, `wti` or `wtpr`
+worktree, a dashboard workspace or a cron job's checkout), that folder is marked
+trusted in the global config of the login Claude will use: `~/.claude.json` for the
+default, `<directory>/.claude.json` for any other. Claude's "Do you trust the files in
+this folder?" dialog would otherwise hold up an unattended start, and
+`--dangerously-skip-permissions` does not skip it. Only that folder is added, only when
+neither it nor a parent is trusted yet, and a missing or unreadable config is left
+alone. Set `BABYSIT_CLAUDE_TRUST=0` to turn this off.
+
 For babysitter registration, use `--agent claude --claude-account work`. Without
 that option, registration finds the session among the default, named and current
 `CLAUDE_CONFIG_DIR` stores and records the directory belonging to its transcript.

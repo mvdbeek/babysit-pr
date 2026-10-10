@@ -208,6 +208,30 @@ def test_a_job_saved_before_the_option_existed_stays_in_safehouse(setup):
     assert "command" not in command and "dangerously" not in command
 
 
+def test_a_claude_job_trusts_its_checkout_in_its_account_before_starting(setup, monkeypatch):
+    import claude_accounts
+
+    jobs, manager, _, state = setup
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    account = claude_accounts.account_home("work", create=True)
+    beside = claude_accounts.global_config(claude_accounts.default_home())
+    for config in (account / ".claude.json", beside):
+        config.write_text(json.dumps({"projects": {}}))
+    saved = jobs.save(request(manager, agent="claude", claude_account="work"))
+    jobs.run_now(saved["id"])
+    run = settle(jobs, saved["id"])
+    assert run["status"] == "running", run
+    path = manager.src / "worktrees" / "repo" / "nightly"
+    assert json.loads((account / ".claude.json").read_text())["projects"] == {
+        str(path.resolve()): {"hasTrustDialogAccepted": True}
+    }
+    # The default login, which this job does not use, is untouched.
+    assert json.loads(beside.read_text()) == {"projects": {}}
+    [started] = herdr_state(state)["agents"]
+    assert started["claude_config_dir"] == str(account)
+
+
 def test_finished_agents_keep_their_answer_and_close_their_pane(setup, monkeypatch):
     jobs, manager, _, state = setup
     saved = jobs.save(request(manager))

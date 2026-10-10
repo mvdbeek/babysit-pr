@@ -165,6 +165,13 @@ def github_token_from_env(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "gho_fixture_token_0000000000000000000000")
 
 
+@pytest.fixture(autouse=True)
+def no_claude_trust(monkeypatch):
+    """Launches never mark folders trusted in the user's real Claude config; the trust
+    tests turn it back on against a fake home."""
+    monkeypatch.setenv("BABYSIT_CLAUDE_TRUST", "0")
+
+
 @pytest.fixture
 def fake_tools(tmp_path, monkeypatch):
     """Fake executables first on PATH plus the JSON state file recording their calls."""
