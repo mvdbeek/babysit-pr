@@ -183,7 +183,7 @@ def test_notification_storage_forgets_items_missing_from_snapshots_for_a_day(pag
     def key(item):
         return item["url"].lower()
 
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     page.wait_for_function(
         "name => JSON.parse(localStorage.getItem(name))?.baselines?.watcher", arg=NOTIFICATIONS

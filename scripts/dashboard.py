@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import agent_messages
 import attachments
+import attention
 import browser_extension
 import llm_usage
 import workspace_agents
@@ -326,6 +327,8 @@ class DashboardServer(ThreadingHTTPServer):
     ) -> None:
         self.home = home
         self.attachments = attachments or home / "attachments"
+        self.triage = attention.Triage(home)
+        self.attention = attention.Cached(self.attention_feed)
         self.overview = overview
         self.issues = issues
         self.upstream_tests = upstream_tests
@@ -340,6 +343,26 @@ class DashboardServer(ThreadingHTTPServer):
         self.allowed_hosts = set(allowed_hosts)
         self.extension = browser_extension.Extension(home)
         super().__init__(("127.0.0.1", port), Handler)
+
+    def attention_feed(self):
+        """Every source through its own snapshot; a failing one is named, the rest answer.
+
+        The workspace inventory is read as it is: a scan starts only from its own tab.
+        """
+        return attention.collect(
+            watcher=lambda: status(self.home),
+            prs=self.overview.snapshot if self.overview else None,
+            issues=self.issues.snapshot if self.issues else None,
+            workspaces=self.workspaces.snapshot if self.workspaces else None,
+            workspace_overview=(
+                (lambda: self.workspace_overview.snapshot(start=False))
+                if self.workspace_overview
+                else None
+            ),
+            scheduled=self.workspaces.scheduled_tasks if self.workspaces else None,
+            cron=self.cron.snapshot if self.cron else None,
+            triage=self.triage,
+        )
 
     def handle_error(self, request, client_address):
         # A phone that sleeps or loses the tailnet mid-request is routine, not a fault.
@@ -530,6 +553,8 @@ class Handler(BaseHTTPRequestHandler):
                 "push-read",
                 "push-seen",
                 "notification-silence",
+                "notification-focus",
+                "attention-triage",
                 "extension-pair",
                 "effort-default",
                 "codex-update",
@@ -580,6 +605,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.server.push:
                     raise ValueError("Notification preferences are unavailable")
                 self.send_json(200, self.server.push.silence(request))
+                return
+            if action == "notification-focus":
+                if not self.server.push:
+                    raise ValueError("Notification preferences are unavailable")
+                self.send_json(200, self.server.push.focus(request))
+                return
+            if action == "attention-triage":
+                # Validated against the shared feed; the answer carries a fresh one.
+                value = self.server.triage.set(request, self.server.attention.get())
+                self.send_json(200, {**value, "feed": self.server.attention.get(fresh=True)})
                 return
             if action.startswith("push-"):
                 if not self.server.push:
@@ -962,6 +997,9 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     value = {"error": f"Workspace view unavailable: {exc}"}
                 self.send_json(200, value)
+            elif route.path == "/api/attention":
+                fresh = parse_qs(route.query).get("refresh") == ["1"]
+                self.send_json(200, self.server.attention.get(fresh=fresh))
             elif route.path == "/api/prs":
                 self.send_json(
                     200,
@@ -1086,6 +1124,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/sentry.css": ("sentry.css", "text/css"),
                     "/cron.js": ("cron.js", "text/javascript"),
                     "/cron.css": ("cron.css", "text/css"),
+                    "/attention.js": ("attention.js", "text/javascript"),
+                    "/attention.css": ("attention.css", "text/css"),
                     "/style.css": ("style.css", "text/css"),
                 }
                 if route.path not in files:
@@ -1149,6 +1189,8 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         attachments=attachments_dir,
         codex_updates=CodexUpdates(home),
     ) as server:
+        # Pushes and the Home Screen badge can follow what needs the user.
+        push.attention = server.attention.get
         ci_logs.start()
         cron.start()
         push.start()

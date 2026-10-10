@@ -1,0 +1,217 @@
+/* Needs you: grouped cards, one reason badge per signal, and attention badges on tabs. */
+.attention-count {
+  color: var(--red);
+  background: var(--red-bg);
+  font-variant-numeric: tabular-nums;
+}
+.page-tabs button[aria-selected="true"] .attention-count {
+  color: var(--red);
+}
+.agents-waiting {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--red-bg);
+  color: var(--red);
+  font-size: 12px;
+  font-weight: 550;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.agents-waiting:before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.agents-waiting:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+.attention-group {
+  margin-bottom: 22px;
+}
+.attention-group h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+}
+.attention-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+}
+.attention-toggle:before {
+  content: "▾";
+  width: 16px;
+  color: var(--muted);
+}
+.attention-toggle[aria-expanded="false"]:before {
+  content: "▸";
+}
+.attention-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.attention-item {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  overflow-wrap: anywhere;
+}
+.attention-answer {
+  border-left-color: var(--red);
+}
+.attention-review {
+  border-left-color: var(--green);
+}
+.attention-unblock {
+  border-left-color: var(--amber);
+}
+.attention-start {
+  border-left-color: var(--blue);
+}
+.attention-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.attention-subject {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+.attention-where {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.attention-title {
+  font-weight: 550;
+}
+.attention-since {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+.attention-reasons {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.attention-reasons .badge {
+  white-space: normal;
+}
+.attention-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.attention-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 13px;
+}
+#attention-error {
+  color: var(--red);
+}
+#attention-error:empty {
+  display: none;
+}
+@media (max-width: 720px) {
+  .attention-head {
+    flex-direction: column;
+    gap: 4px;
+  }
+  .attention-actions a {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+  .agents-waiting-label {
+    display: none;
+  }
+}
+/* Only a refresh button sits beside the heading, so it never needs a row of its own. */
+#attention-panel .toolbar {
+  flex-direction: row;
+  align-items: center;
+}
+#attention-panel .filters {
+  width: auto;
+}
+
+.attention-parked,
+.attention-group[data-group="waiting"] .attention-item {
+  opacity: 0.85;
+}
+.attention-triage {
+  font-size: 13px;
+  padding: 4px 10px;
+}
+/* One line under each overview title: what is running against the item. */
+.pr-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.pr-status-line:empty {
+  display: none;
+}
+.pr-status-compact {
+  display: none;
+}
+.pr-compact .pr-status-compact {
+  display: inline-flex;
+}
+.compact-toggle[aria-pressed="true"] {
+  color: var(--green);
+  background: var(--green-bg);
+}
+/* Compact rows: repository, title with status line, and actions. */
+.pr-compact .pr-table .pr-author,
+.pr-compact .pr-table .pr-readiness,
+.pr-compact .pr-table .pr-roles-cell,
+.pr-compact .pr-table .pr-ci,
+.pr-compact .pr-table .pr-assignees,
+.pr-compact .pr-table .pr-comments,
+.pr-compact .pr-table .pr-dates,
+.pr-compact .pr-table th:has([id$="-sort-author"]),
+.pr-compact .pr-table th:has([id$="-sort-readiness"]),
+.pr-compact .pr-table th:has([id$="-sort-roles"]),
+.pr-compact .pr-table th:has([id$="-sort-ci"]),
+.pr-compact .pr-table th:has([id$="-sort-assignees"]),
+.pr-compact .pr-table th:has([id$="-sort-comments"]),
+.pr-compact .pr-table th:has([id$="-sort-opened_at"]),
+.pr-compact .pr-table th:has([id$="-sort-updated_at"]) {
+  display: none;
+}
+.notifications-focus {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  margin-bottom: 8px;
+}

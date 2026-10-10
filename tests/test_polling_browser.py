@@ -83,7 +83,7 @@ def test_hidden_overview_polls_slowly_and_is_not_rebuilt(page: Page, dashboard_s
 
 def test_a_tab_click_shows_its_page_once(page: Page, dashboard_site) -> None:
     url, _ = dashboard_site
-    page.goto(url)
+    page.goto(url + "/#watcher")
     expect(page.locator("#watcher-panel")).to_be_visible()
     page.evaluate(
         """() => {
@@ -119,7 +119,7 @@ def test_a_stalled_status_poll_gives_up_and_polling_resumes(page: Page, dashboar
 
     page.route("**/api/status", status)
     pause_clock(page)
-    page.goto(url)
+    page.goto(url + "/#watcher")
     expect(page.locator("#list .watch")).to_have_count(2)
     settle(page)
     stalled = len(asked)
@@ -164,7 +164,7 @@ def test_repair_log_and_poll_time_update_without_rebuilding(page: Page, dashboar
     page.route("**/api/status", status)
     page.route("**/api/log?*", log)
     pause_clock(page)
-    page.goto(url)
+    page.goto(url + "/#watcher")
     page.get_by_role("button", name="test/repo, feature,", exact=False).click()
     page.get_by_role("tab", name="Latest repair log", exact=True).click()
     output = page.locator("#repair-log")

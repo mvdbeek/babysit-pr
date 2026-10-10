@@ -101,7 +101,7 @@ def test_publish_header_stays_reachable(page, site, width):
 def test_notification_controls_stay_reachable(page, inbox, width):
     url, packets = inbox
     page.set_viewport_size({"width": width, "height": 844})
-    page.goto(url)
+    page.goto(url + "/#watcher")
     count(page, 0)
     template = packets["prs"]["prs"][0]
     for number in range(100, 110):

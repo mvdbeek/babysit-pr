@@ -532,3 +532,93 @@ def test_repair_completed_between_polls_still_notifies(inbox):
     clock[0] += 31
     box.tick()
     assert len(sent) == 1
+
+
+def test_focus_follows_what_needs_the_user(inbox, tmp_path):
+    box, packets, sent, clock, identity, sub = inbox
+    needs = {"login": "fixture", "items": []}
+    box.attention = lambda: needs
+    assert box.preferences()["focus"] is True
+    view = read(box, identity)
+    assert view["focus"] is True and view["badge"] == 0 and view["count"] == 0
+    # A change on an item that does not need the user lands in the inbox but sends nothing.
+    change(box, packets, clock)
+    assert read(box, identity)["count"] == 1
+    assert sent == []
+    # Once the item needs the user, the next change wakes the phone with that count.
+    needs["items"] = [
+        {"key": URL, "url": URL, "since": 5, "title": "First", "parked": False},
+        {"key": "cron:1", "url": None, "since": 1, "title": "Nightly", "parked": False},
+    ]
+    change(box, packets, clock, title="Changed again")
+    assert len(sent) == 1
+    payload = sent[0][1]
+    assert payload["count"] == 2 and payload["kind"] == "needs"
+    assert payload["body"].startswith("2 need you · ")
+    assert read(box, identity)["badge"] == 2
+    # Parked and silenced items do not count; turning focus off restores unseen behaviour.
+    needs["items"][0]["parked"] = True
+    assert read(box, identity)["badge"] == 1
+    needs["items"][0]["parked"] = False
+    box.silence({"login": "fixture", "url": URL, "silenced": True})
+    assert read(box, identity)["badge"] == 1
+    box.silence({"login": "fixture", "url": URL, "silenced": False})
+    with pytest.raises(ValueError):
+        box.focus({"login": "fixture", "focus": "no"})
+    assert box.focus({"login": "fixture", "focus": False})["focus"] is False
+    view = read(box, identity)
+    # Silencing marked the entry seen, so both counts are the unseen count: none.
+    assert view["focus"] is False and view["badge"] == view["count"] == 0
+    assert PushInbox(tmp_path, lambda: packets).preferences()["focus"] is False
+    change(box, packets, clock, title="Third")
+    assert sent[-1][1]["kind"] == "unseen" and sent[-1][1]["count"] == 1
+    # Another login's feed, or a failing one, never falls back to unfocused alerts.
+    box.focus({"login": "fixture", "focus": True})
+    needs.update(login="other")
+    change(box, packets, clock, title="Fourth")
+    assert len(sent) == 2
+    view = read(box, identity)
+    assert view["focus"] is True and view["badge"] == view["count"]
+
+    def broken():
+        raise RuntimeError("no feed")
+
+    box.attention = broken
+    change(box, packets, clock, title="Fifth")
+    assert len(sent) == 2
+
+
+def test_items_that_newly_need_the_user_alert_without_an_inbox_entry(inbox):
+    box, packets, sent, clock, identity, sub = inbox
+    needs = {"login": "fixture", "items": []}
+    box.attention = lambda: needs
+    box.tick()
+    assert sent == []
+    # An agent blocked in a workspace: no GitHub change, still an alert, once.
+    needs["items"] = [
+        {"key": "workspace:/w/a", "url": None, "since": 50, "title": "agent", "parked": False}
+    ]
+    box.tick()
+    box.tick()
+    assert len(sent) == 1
+    assert sent[0][1]["body"] == "1 need you · agent" and sent[0][1]["url"] == "/#attention"
+    # Later activity on the same item alerts again; an item that left and returns too.
+    needs["items"][0]["since"] = 60
+    box.tick()
+    assert len(sent) == 2
+    needs["items"] = []
+    box.tick()
+    needs["items"] = [
+        {"key": "workspace:/w/a", "url": None, "since": 60, "title": "agent", "parked": False}
+    ]
+    box.tick()
+    assert len(sent) == 3
+    # A GitHub item with an inbox entry links to its row.
+    needs["items"] = [{"key": URL, "url": URL, "since": 70, "title": "First", "parked": False}]
+    box.tick()
+    assert sent[-1][1]["url"].startswith("/?item=")
+    # Subscribing again announces nothing that already needs the user.
+    sent.clear()
+    box.subscribe({"login": "fixture", "subscription": subscription("two")}, ORIGIN)
+    box.tick()
+    assert sent == []

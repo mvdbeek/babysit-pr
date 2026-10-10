@@ -81,7 +81,8 @@ self.addEventListener("push", (event) => {
             });
             if (response.ok) {
               const latest = await response.json();
-              payload.count = latest.count;
+              payload.count = latest.focus ? (latest.badge ?? latest.count) : latest.count;
+              payload.kind = latest.focus ? "needs" : "unseen";
               payload.revision = latest.revision;
             }
           } catch {
@@ -93,20 +94,27 @@ self.addEventListener("push", (event) => {
           return {
             ...old,
             count: Number.isSafeInteger(payload.count) && payload.count >= 0 ? payload.count : 0,
+            kind: payload.kind,
             revision: payload.revision || Date.now(),
           };
         });
       } catch {
         state = {
           count: Number.isSafeInteger(payload.count) && payload.count >= 0 ? payload.count : 0,
+          kind: payload.kind,
         };
       }
+      const needs = (state.kind || payload.kind) === "needs";
       await Promise.all([
         badge(state.count),
         self.registration.showNotification("Babysitter", {
           body: state.count
-            ? `${state.count} unseen ${state.count === 1 ? "item" : "items"}. Open Babysitter for the latest updates.`
-            : "Your dashboard is up to date.",
+            ? needs
+              ? `${state.count} ${state.count === 1 ? "item needs" : "items need"} you. Open Babysitter to see what.`
+              : `${state.count} unseen ${state.count === 1 ? "item" : "items"}. Open Babysitter for the latest updates.`
+            : needs
+              ? "Nothing needs you right now."
+              : "Your dashboard is up to date.",
           icon: "/icon-192.png",
           tag: "babysitter-updates",
           data: { url: notificationURL(payload.url) },

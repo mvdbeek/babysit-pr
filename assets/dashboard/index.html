@@ -32,6 +32,8 @@
     <link rel="stylesheet" href="/sentry.css" />
     <script src="/cron.js" defer></script>
     <link rel="stylesheet" href="/cron.css" />
+    <script src="/attention.js" defer></script>
+    <link rel="stylesheet" href="/attention.css" />
   </head>
   <body>
     <header>
@@ -69,6 +71,17 @@
           </svg>
           <span id="usage-value" aria-hidden="true">–</span>
         </button>
+        <a
+          id="agents-waiting"
+          class="agents-waiting"
+          href="#attention"
+          hidden
+          aria-label="No agents waiting for you"
+          title="Agents waiting for your answer"
+        >
+          <span id="agents-waiting-count" aria-hidden="true">0</span
+          ><span class="agents-waiting-label" aria-hidden="true">waiting</span>
+        </a>
         <button id="new-task" type="button" aria-haspopup="dialog" aria-label="New task">
           <span aria-hidden="true">+</span><span class="new-task-label">New task</span>
         </button>
@@ -111,6 +124,11 @@
       <ol id="notifications-list"></ol>
       <p id="notifications-empty">Updates will appear here as the dashboard syncs.</p>
       <div class="notifications-push">
+        <label class="notifications-focus">
+          <input id="notifications-focus" type="checkbox" checked disabled />
+          Alert and badge only for what needs you
+        </label>
+        <p id="notifications-focus-status" class="notifications-caption" role="status"></p>
         <button id="notifications-push-enable" type="button" hidden>Enable notifications</button>
         <p id="notifications-push-status" class="notifications-caption" role="status"></p>
       </div>
@@ -137,13 +155,33 @@
       </div>
       <div class="page-tabs" role="tablist" aria-label="Dashboard views">
         <button
-          id="watcher-tab"
+          id="attention-tab"
           type="button"
           role="tab"
           aria-selected="true"
+          aria-controls="attention-panel"
+          aria-describedby="attention-tab-needs"
+        >
+          Needs you
+          <span id="attention-tab-needs" hidden></span
+          ><span id="attention-tab-count" class="count attention-count" hidden aria-hidden="true"
+            >0</span
+          >
+        </button>
+        <button
+          id="watcher-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
           aria-controls="watcher-panel"
+          aria-describedby="watcher-tab-needs"
+          tabindex="-1"
         >
           Watcher
+          <span id="watcher-tab-needs" hidden></span
+          ><span id="watcher-tab-count" class="count attention-count" hidden aria-hidden="true"
+            >0</span
+          >
         </button>
         <button
           id="prs-tab"
@@ -151,9 +189,12 @@
           role="tab"
           aria-selected="false"
           aria-controls="prs-panel"
+          aria-describedby="prs-tab-needs"
           tabindex="-1"
         >
           Pull requests
+          <span id="prs-tab-needs" hidden></span
+          ><span id="prs-tab-count" class="count attention-count" hidden aria-hidden="true">0</span>
         </button>
         <button
           id="issues-tab"
@@ -161,9 +202,14 @@
           role="tab"
           aria-selected="false"
           aria-controls="issues-panel"
+          aria-describedby="issues-tab-needs"
           tabindex="-1"
         >
           Issues
+          <span id="issues-tab-needs" hidden></span
+          ><span id="issues-tab-count" class="count attention-count" hidden aria-hidden="true"
+            >0</span
+          >
         </button>
         <button
           id="scheduled-tab"
@@ -185,7 +231,7 @@
           tabindex="-1"
           hidden
         >
-          Cron jobs <span id="cron-tab-count" class="count" hidden>0</span>
+          Cron jobs <span id="cron-tab-count" class="count attention-count" hidden>0</span>
         </button>
         <button
           id="workspaces-tab"
@@ -193,10 +239,15 @@
           role="tab"
           aria-selected="false"
           aria-controls="workspaces-panel"
+          aria-describedby="workspaces-tab-needs"
           tabindex="-1"
           hidden
         >
-          Workspaces <span class="count">Experiment</span>
+          Workspaces
+          <span id="workspaces-tab-needs" hidden></span
+          ><span id="workspaces-tab-count" class="count attention-count" hidden aria-hidden="true"
+            >0</span
+          >
         </button>
         <button
           id="upstream-tab"
@@ -207,7 +258,7 @@
           tabindex="-1"
           hidden
         >
-          Upstream tests <span class="count">Experiment</span>
+          Upstream tests
         </button>
         <button
           id="sentry-tab"
@@ -218,9 +269,56 @@
           tabindex="-1"
           hidden
         >
-          Sentry <span class="count">Experiment</span>
+          Sentry
         </button>
       </div>
+      <section
+        id="attention-panel"
+        class="attention"
+        role="tabpanel"
+        aria-labelledby="attention-tab"
+        tabindex="0"
+      >
+        <div class="toolbar">
+          <h2>Needs you <span id="attention-count" class="count">0</span></h2>
+          <div class="filters">
+            <button
+              id="attention-refresh"
+              class="refresh-icon"
+              type="button"
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <p id="attention-status" class="pr-sync" role="status">Loading what needs you…</p>
+        <p id="attention-error" role="alert"></p>
+        <div id="attention-groups"></div>
+        <div id="attention-empty" class="empty" hidden>
+          <span class="empty-icon" aria-hidden="true">☕</span>
+          <h3>Nothing needs you right now</h3>
+          <p>
+            Agents waiting for an answer, approved pull requests, failing CI, failed launches and
+            workspaces ready to clean up will appear here.
+          </p>
+        </div>
+      </section>
       <section
         id="scheduled-panel"
         class="pr-overview"
@@ -523,7 +621,7 @@
           <p id="sentry-empty" class="pr-empty" hidden></p>
         </div>
       </section>
-      <section id="watcher-panel" role="tabpanel" aria-labelledby="watcher-tab" tabindex="0">
+      <section id="watcher-panel" role="tabpanel" aria-labelledby="watcher-tab" tabindex="0" hidden>
         <div id="alert" class="alert" role="status" hidden></div>
         <section class="metrics" aria-label="Overview">
           <div><span>Watching</span><strong id="watching">—</strong></div>
@@ -618,6 +716,15 @@
               placeholder="Find a PR or repo…"
               aria-label="Search pull requests"
             />
+            <button
+              id="pr-compact"
+              class="compact-toggle"
+              type="button"
+              aria-pressed="false"
+              title="Show only the repository, the title with its status line, and actions"
+            >
+              Compact
+            </button>
             <button
               id="pr-refresh"
               class="refresh-icon"
@@ -800,6 +907,15 @@
               placeholder="Find an issue, label or repo…"
               aria-label="Search issues"
             />
+            <button
+              id="issue-compact"
+              class="compact-toggle"
+              type="button"
+              aria-pressed="false"
+              title="Show only the repository, the title with its status line, and actions"
+            >
+              Compact
+            </button>
             <button
               id="issue-refresh"
               class="refresh-icon"

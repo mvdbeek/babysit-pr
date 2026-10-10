@@ -10,6 +10,7 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -383,6 +384,10 @@ def deliver(subscription, payload, key, origin):
             raise RuntimeError("Push service did not accept the notification")
 
 
+# needs(): the login follows the feed, but it cannot be read right now.
+UNAVAILABLE = "unavailable"
+
+
 class PushInbox:
     def __init__(self, home: Path, snapshots, sender=deliver, login=None):
         self.path = home / "dashboard-push.json"
@@ -396,11 +401,21 @@ class PushInbox:
         self.worker: threading.Thread | None = None
         self.devices: dict[str, dict] = {}
         self.silenced: dict[str, list[str]] = {}
+        # Per login: alerts and the badge follow what needs the user (on unless turned off).
+        self.focused: dict[str, bool] = {}
+        # The attention feed, set once the dashboard server exists; None leaves alerts as is.
+        self.attention: Callable[[], dict] | None = None
         self.load_error = False
         try:
             state = json.loads(self.path.read_text())
             self.devices = state["devices"]
             self.silenced = state.get("silenced", {})
+            self.focused = state.get("focus", {})
+            if not isinstance(self.focused, dict) or any(
+                not isinstance(login, str) or not isinstance(value, bool)
+                for login, value in self.focused.items()
+            ):
+                raise ValueError("Invalid notification preferences")
             if not isinstance(self.silenced, dict) or any(
                 not isinstance(login, str)
                 or not isinstance(urls, list)
@@ -424,13 +439,69 @@ class PushInbox:
         temp = self.path.with_suffix(".tmp")
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as stream:
-            json.dump({"devices": self.devices, "silenced": self.silenced}, stream)
+            json.dump(
+                {"devices": self.devices, "silenced": self.silenced, "focus": self.focused}, stream
+            )
         temp.replace(self.path)
 
     def preferences(self):
         login = self.login()
         with self.lock:
-            return {"login": login, "silenced": list(self.silenced.get(login, []))}
+            return {
+                "login": login,
+                "silenced": list(self.silenced.get(login, [])),
+                "focus": self.focused.get(login, True),
+            }
+
+    def focus_on(self, login):
+        return self.focused.get(login, True)
+
+    def focus(self, request):
+        """Whether alerts and the badge follow what needs this login, on every device."""
+        if self.load_error:
+            raise ValueError("The saved notification state needs repair")
+        login = self.login()
+        if not login or request.get("login") != login:
+            raise ValueError("Wait for the PR overview to finish syncing")
+        if not isinstance(request.get("focus"), bool):
+            raise ValueError("Supply the notification focus preference")
+        with self.lock:
+            self.focused[login] = request["focus"]
+            self.save()
+        return self.preferences()
+
+    def needs(self, login):
+        """What needs this login now, read outside the lock: the feed can be slow.
+
+        None when the login does not follow the feed; UNAVAILABLE when it does but the
+        feed cannot say (not wired, failed, or another login's); otherwise the items that
+        are not parked or silenced, their GitHub subjects, and their count.
+        """
+        if self.attention is None or not self.focus_on(login):
+            return None
+        try:
+            feed = self.attention()
+        except Exception:
+            return UNAVAILABLE
+        if feed.get("login") != login:
+            return UNAVAILABLE
+        with self.lock:
+            silenced = set(self.silenced.get(login, []))
+        items = [
+            {
+                "key": item["key"],
+                "url": subject(item.get("url")),
+                "since": item.get("since") or 0,
+                "title": item.get("title") or item["key"],
+            }
+            for item in feed.get("items", [])
+            if not item.get("parked") and subject(item.get("url")) not in silenced
+        ]
+        return {
+            "items": items,
+            "subjects": {item["url"] for item in items} - {None},
+            "count": len(items),
+        }
 
     def silence(self, request):
         if self.load_error:
@@ -495,11 +566,15 @@ class PushInbox:
             "publicKey": base64.urlsafe_b64encode(public).decode().rstrip("="),
         }
 
-    def view(self, device):
+    def view(self, device, needs=None):
+        """The device's state; `needs` comes from needs() read before the lock was taken."""
         return {
             "login": device["login"],
             "entries": copy.deepcopy(device["entries"]),
             "count": len(unread(device)),
+            # What the Home Screen badge shows: what needs the user, else the unseen count.
+            "badge": needs["count"] if isinstance(needs, dict) else len(unread(device)),
+            "focus": needs is not None,
             "error": device.get("error"),
             "active": bool(device.get("subscription")),
             "revision": time.time() * 1000,
@@ -512,6 +587,7 @@ class PushInbox:
     def action(self, action, request, origin):
         if action == "push-subscribe":
             return self.subscribe(request, origin)
+        needs = self.needs(request.get("login")) if isinstance(request.get("login"), str) else None
         with self.lock:
             if not isinstance(request.get("token"), str):
                 raise ValueError("Supply a device token")
@@ -533,7 +609,7 @@ class PushInbox:
                     if entry and at <= entry["at"]:
                         entry["seenAt"] = max(entry["seenAt"], at)
                 self.save()
-            return self.view(device)
+            return self.view(device, needs)
 
     def subscribe(self, request, origin):
         if not self.config()["available"]:
@@ -563,6 +639,7 @@ class PushInbox:
             raise ValueError(
                 "Wait for the PR overview to finish syncing before enabling notifications"
             )
+        needs = self.needs(login)
         with self.lock:
             for token, device in self.devices.items():
                 if (
@@ -570,7 +647,7 @@ class PushInbox:
                     and device["origin"] == origin
                     and device["login"] == login
                 ):
-                    return {**self.view(device), "token": token}
+                    return {**self.view(device, needs), "token": token}
             if len(self.devices) >= 100:
                 raise ValueError("Too many subscribed devices")
             # The subscription belongs to one account at a time on this installation.
@@ -623,10 +700,16 @@ class PushInbox:
                 if url in device["entries"]:
                     device["entries"][url]["seenAt"] = device["entries"][url]["at"]
             device["sent"] = unread(device)
+            # Nothing that already needs the user is announced on subscribing.
+            device["needs_sent"] = (
+                {item["key"]: item["since"] for item in needs["items"]}
+                if isinstance(needs, dict)
+                else {}
+            )
             token = secrets.token_urlsafe(32)
             self.devices[token] = device
             self.save()
-            return {**self.view(device), "token": token}
+            return {**self.view(device, needs), "token": token}
 
     def tick(self):
         if not self.available or self.load_error:
@@ -649,6 +732,11 @@ class PushInbox:
             if before != json.dumps(self.devices, sort_keys=True):
                 self.save()
             tokens = list(self.devices)
+            logins = {
+                device["login"] for device in self.devices.values() if device.get("subscription")
+            }
+        # The feed is read once per login, outside the lock other requests wait on.
+        needs_by_login = {login: self.needs(login) for login in logins}
         for token in tokens:
             with self.lock:
                 if token not in self.devices:
@@ -657,6 +745,11 @@ class PushInbox:
                 if not device.get("subscription") or device["retry_at"] > now:
                     continue
                 if packets.get("prs", {}).get("login") != device["login"]:
+                    continue
+                needs = needs_by_login.get(device["login"])
+                if needs is UNAVAILABLE:
+                    # Following the feed, but it cannot answer now: better quiet than an
+                    # alert for every unseen update; the next tick tries again.
                     continue
                 pending = unread(device)
                 fresh = {url: at for url, at in pending.items() if at > device["sent"].get(url, 0)}
@@ -668,15 +761,54 @@ class PushInbox:
                     if now * 1000 - device["entries"][url].get("changedAt", 0) >= 30000
                     and url not in self.silenced.get(device["login"], [])
                 }
-                if not fresh:
+                arrived = {}
+                if needs is not None:
+                    # Only changes to items that need the user wake the phone; the rest stay
+                    # in the inbox for the bell, and count as sent so they do not alert
+                    # later. An item that newly needs the user (an agent blocked, a launch
+                    # failed) alerts even without an inbox entry.
+                    skipped = {url: at for url, at in fresh.items() if url not in needs["subjects"]}
+                    fresh = {url: at for url, at in fresh.items() if url in needs["subjects"]}
+                    if skipped:
+                        device["sent"].update(skipped)
+                        self.save()
+                    sent = device.setdefault("needs_sent", {})
+                    keys = {item["key"] for item in needs["items"]}
+                    for key in [key for key in sent if key not in keys]:
+                        del sent[key]  # Gone for now; it alerts again if it comes back.
+                    arrived = {
+                        item["key"]: item
+                        for item in needs["items"]
+                        if item["key"] not in sent or item["since"] > sent[item["key"]]
+                    }
+                    # The change that made an item need the user is still settling in the
+                    # inbox: one alert covers both once it has.
+                    unsettled = any(
+                        now * 1000 - device["entries"][url].get("changedAt", 0) < 30000
+                        for url in pending
+                        if url in needs["subjects"]
+                    )
+                    if unsettled:
+                        continue
+                if not fresh and not arrived:
                     continue
-                latest = max(fresh, key=lambda url: fresh[url])
-                entry = device["entries"][latest]
+                if fresh:
+                    latest = max(fresh, key=lambda url: fresh[url])
+                    entry = device["entries"][latest]
+                    title, url = entry["title"], destination(latest, entry)
+                else:
+                    item = max(arrived.values(), key=lambda item: item["since"])
+                    title = item["title"]
+                    entry = device["entries"].get(item["url"]) if item["url"] else None
+                    url = destination(item["url"], entry) if entry else "/#attention"
+                count = needs["count"] if needs is not None else len(pending)
                 payload = {
                     "title": "Babysitter",
-                    "body": f"{len(pending)} unseen items · {entry['title'][:140]}",
-                    "count": len(pending),
-                    "url": destination(latest, entry),
+                    "body": f"{count} {'need you' if needs is not None else 'unseen items'}"
+                    f" · {title[:140]}",
+                    "count": count,
+                    "kind": "needs" if needs is not None else "unseen",
+                    "url": url,
                     "revision": now * 1000,
                 }
                 sending = copy.deepcopy(device)
@@ -700,6 +832,10 @@ class PushInbox:
                 with self.lock:
                     if device is not None and self.devices.get(token) is device:
                         device["sent"].update(fresh)
+                        if needs is not None:
+                            device.setdefault("needs_sent", {}).update(
+                                {key: item["since"] for key, item in arrived.items()}
+                            )
                         device["failures"] = 0
                         device["error"] = None
                         self.save()
