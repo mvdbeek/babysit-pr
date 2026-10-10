@@ -636,6 +636,9 @@
   background: var(--paper);
   overflow-wrap: anywhere;
 }
+.ws-watch-owner p {
+  margin: 0 0 6px;
+}
 .ws-question-head {
   display: flex;
   flex-wrap: wrap;

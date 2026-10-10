@@ -1510,6 +1510,159 @@ def test_a_watched_session_is_left_to_the_watcher(exited):
     assert not read(state).get("runs")
 
 
+def save_watch(home, sid, watch_id="w-1", **changes):
+    import pr_supervisor as supervisor
+
+    db = supervisor.open_db(home)
+    with db:
+        supervisor.save_job(
+            db,
+            {
+                "id": watch_id,
+                "status": "blocked",
+                "session_id": sid,
+                "epoch": 0,
+                "repo": BASE,
+                "url": f"https://github.com/{BASE}/pull/7",
+                "snapshot": {"pr": {"number": 7, "title": "Merged work"}},
+                **changes,
+            },
+        )
+    db.close()
+
+
+def load_watch(home, watch_id="w-1"):
+    import pr_supervisor as supervisor
+
+    db = supervisor.open_db(home)
+    try:
+        return supervisor.get_job(db, watch_id)
+    finally:
+        db.close()
+
+
+WATCH = {
+    "id": "w-1",
+    "status": "blocked",
+    "stop_after_run": False,
+    "repo": BASE,
+    "number": 7,
+    "title": "Merged work",
+    "branch": None,
+    "url": f"https://github.com/{BASE}/pull/7",
+}
+
+
+def test_a_refusal_names_the_watch_that_owns_the_session(exited):
+    import agent_messages
+
+    state, sid, _, home = exited
+    save_watch(home, sid)
+    # Named before any click, so the composer can offer to cancel it up front.
+    assert agent_messages.sessions("w1", home)[0]["watch"] == WATCH
+    with pytest.raises(agent_messages.Refused) as refused:
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "go"}, home)
+    assert str(refused.value) == (
+        "Not resumed: babysit watch w-1 (blocked) resumes this session itself; stop it first"
+    )
+    assert refused.value.details == {"code": "watch_owns_session", "watch": WATCH}
+    # Only the watch the reader confirmed is cancelled; another one is named instead.
+    with pytest.raises(agent_messages.Refused) as refused:
+        agent_messages.send(
+            {"workspace": "w1", "resume": sid, "text": "go", "stop_watch": "w-9"}, home
+        )
+    assert refused.value.details["code"] == "watch_owns_session"
+    assert load_watch(home)["status"] == "blocked"
+    with pytest.raises(ValueError, match="Only a resume can cancel"):
+        agent_messages.send({"workspace": "w1", "pane": "w1:p1", "text": "go", "stop_watch": "w-1"})
+    assert not read(state).get("runs")
+
+
+def test_cancelling_the_owning_watch_resumes_its_session(exited):
+    import agent_messages
+
+    state, sid, _, home = exited
+    save_watch(home, sid)
+    value = agent_messages.send(
+        {"workspace": "w1", "resume": sid, "text": "Address review comment", "stop_watch": "w-1"},
+        home,
+    )
+    assert value["resumed"] == sid and value["warning"] is None
+    job = load_watch(home)
+    assert job["status"] == "stopped" and job["summary"] == "Watch cancelled"
+    assert read(state)["agents"][0]["argv"] == ["--resume", sid, "--", "Address review comment"]
+    assert "watch" not in agent_messages.sessions("w1", home)[0]
+
+
+def test_a_watch_in_a_repair_is_never_resumed_over(exited):
+    import fcntl
+
+    import agent_messages
+    import claude_runner
+
+    state, sid, _, home = exited
+    save_watch(home, sid, status="running")
+    assert agent_messages.sessions("w1", home)[0]["watch"]["status"] == "running"
+    # The cancellation waits for the repair; the session is left to it meanwhile.
+    with pytest.raises(agent_messages.Refused) as refused:
+        agent_messages.send(
+            {"workspace": "w1", "resume": sid, "text": "go", "stop_watch": "w-1"}, home
+        )
+    assert refused.value.details["code"] == "watch_finishing_repair"
+    assert refused.value.details["watch"]["stop_after_run"] is True
+    job = load_watch(home)
+    assert job["status"] == "running" and job["stop_after_run"]
+    # A repair that holds the session lock refuses the resume even once the watch ended.
+    save_watch(home, sid, status="stopped")
+    lock = claude_runner.config_home() / "babysit-pr-locks" / f"{sid}.lock"
+    lock.parent.mkdir(parents=True)
+    with lock.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        with pytest.raises(agent_messages.Refused) as refused:
+            agent_messages.send(
+                {"workspace": "w1", "resume": sid, "text": "go", "stop_watch": "w-1"}, home
+            )
+    assert refused.value.details == {"code": "repair_running"}
+    assert "repair is running" in str(refused.value)
+    assert not read(state).get("runs")
+
+
+def test_an_ended_watch_does_not_block_a_resume(exited):
+    import agent_messages
+
+    state, sid, _, home = exited
+    save_watch(home, sid, status="closed")
+    session = agent_messages.sessions("w1", home)[0]
+    assert session["watched"] is False and "watch" not in session
+    # A confirmation that arrives after the watch ended just resumes.
+    value = agent_messages.send(
+        {"workspace": "w1", "resume": sid, "text": "go", "stop_watch": "w-1"}, home
+    )
+    assert value["resumed"] == sid
+    assert load_watch(home)["status"] == "closed"
+    assert len(read(state)["runs"]) == 1
+
+
+def test_the_dashboard_relays_a_watch_refusal_and_its_cancellation(exited, server):
+    port, _ = server
+    state, sid, _, home = exited
+    save_watch(home, sid)
+    body = {"workspace": "w1", "resume": sid, "text": "go"}
+    status, value = request(port, "/api/workspace-message", body, action="workspace-message")
+    assert status == 400
+    assert value == {
+        "error": "Not resumed: babysit watch w-1 (blocked) resumes this session itself; stop it first",
+        "code": "watch_owns_session",
+        "watch": WATCH,
+    }
+    status, value = request(
+        port, "/api/workspace-message", {**body, "stop_watch": "w-1"}, action="workspace-message"
+    )
+    assert status == 200 and value["resumed"] == sid, value
+    assert load_watch(home)["status"] == "stopped"
+    assert len(read(state)["runs"]) == 1
+
+
 def close_workspace(state, workspace_id):
     data = read(state)
     data["workspaces"] = [w for w in data["workspaces"] if w["workspace_id"] != workspace_id]

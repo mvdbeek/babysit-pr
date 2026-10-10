@@ -667,6 +667,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(
                         200, agent_messages.send(request, self.server.home, checkout=checkout)
                     )
+                except agent_messages.Refused as exc:
+                    # The composer acts on the code: it offers to cancel the owning watch.
+                    self.send_json(400, {"error": str(exc), **exc.details})
                 except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
                     self.send_json(503, {"error": f"Nothing was typed: {exc}"})
                 return

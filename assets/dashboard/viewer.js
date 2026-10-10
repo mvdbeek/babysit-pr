@@ -967,6 +967,10 @@
   let sessions = [];
   let changingDocker = false;
   let sending = false; // A send in flight keeps the button disabled through refreshes.
+  // Cancelling the babysit watch that owns the picked session: the question asked
+  // ({session, send}) and whether a cancellation is on its way.
+  let watchQuestion = null;
+  let cancellingWatch = false;
   let files = null; // The composer's attachments, kept with the draft.
   function draftKey(entry) {
     return `ws-viewer-draft:${entry.workspace || entry.key}`;
@@ -1077,7 +1081,15 @@
     const holder = byId("ws-message-agent");
     // Polls redraw only on a change, so an open agent choice is never swapped under
     // the reader's finger.
-    const key = JSON.stringify([message, agents, sessions, sending, Boolean(changingDocker)]);
+    const key = JSON.stringify([
+      message,
+      agents,
+      sessions,
+      sending,
+      Boolean(changingDocker),
+      watchQuestion,
+      cancellingWatch,
+    ]);
     if (holder.dataset.state === key) return;
     holder.dataset.state = key;
     // A refresh keeps the agent or session the reader picked, while it is still listed.
@@ -1124,8 +1136,6 @@
       );
       return;
     }
-    send.disabled = sending || changingDocker;
-    send.textContent = "Resume and send";
     holder.append(
       node("small", "No agent is running; the message resumes this session:", "pr-meta"),
       choice(
@@ -1136,9 +1146,155 @@
           sessionLabel(session) + (session.watched ? " (babysit watch)" : ""),
         ]),
         keep(sessions.map((session) => session.id)),
-        () => {},
+        () => {
+          watchQuestion = null;
+          renderWatch();
+        },
       ),
     );
+    renderWatch();
+  }
+  // The session a message would resume, while no agent runs.
+  function pickedSession() {
+    if (agents.length) return null;
+    const picked = byId("ws-message-agent").querySelector("select")?.value;
+    return sessions.find((session) => session.id === picked) || sessions[0] || null;
+  }
+  function watchName(watch) {
+    return `babysit watch ${watch.id} (${watch.status})`;
+  }
+  function watchSubject(watch) {
+    const number = watch.number ? `${watch.repo}#${watch.number}` : watch.branch || watch.repo;
+    return watch.title ? `${number}: ${watch.title}` : number || "its pull request";
+  }
+  // A watch in the middle of a repair holds the session until the repair finishes: its
+  // cancellation waits for that, and nothing may resume the session meanwhile.
+  function repairing(watch) {
+    return watch.status === "running" || watch.stop_after_run;
+  }
+  // The babysit watcher resumes the sessions it watches itself; the composer says so up
+  // front and offers to cancel the watch, never a second writer on one conversation.
+  function renderWatch() {
+    const session = pickedSession();
+    const watch = session?.watch;
+    const send = byId("ws-message-send");
+    send.textContent = watch && !repairing(watch) ? "Cancel watch and send…" : "Resume and send";
+    send.disabled =
+      sending || changingDocker || cancellingWatch || Boolean(watch && repairing(watch));
+    const holder = byId("ws-agent-interaction");
+    const state = JSON.stringify(["watch", session?.id, watch, watchQuestion, cancellingWatch]);
+    if (holder.dataset.state === state) return;
+    holder.dataset.state = state;
+    holder.replaceChildren();
+    if (!watch) return;
+    const card = node("div", undefined, "ws-question ws-watch-owner");
+    const intro = node(
+      "p",
+      `This session belongs to ${watchName(watch)}, for ${watchSubject(watch)}. ` +
+        "The watch resumes it itself, so it is not resumed here while the watch runs. ",
+    );
+    const show = node("a", "Show the watch");
+    show.href = watch.url ? `/?item=${encodeURIComponent(watch.url)}#watcher` : "/#watcher";
+    show.onclick = (event) => {
+      if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      byId("ws-viewer").close();
+      window.dashboardNavigation?.open(show.href);
+    };
+    intro.append(show);
+    card.append(intro);
+    const actions = node("div", undefined, "ws-choices");
+    const button = (label, onclick) => {
+      const element = node("button", label);
+      element.type = "button";
+      element.disabled = sending || cancellingWatch;
+      element.onclick = onclick;
+      actions.append(element);
+      return element;
+    };
+    if (watch.stop_after_run) {
+      card.append(
+        node(
+          "p",
+          "Its cancellation is pending: the current repair finishes first. Your message is kept; send it once the watch has stopped.",
+          "pr-meta",
+        ),
+      );
+    } else if (watchQuestion?.session === session.id) {
+      card.append(
+        node("strong", `Cancel ${watchName(watch)}?`),
+        node(
+          "p",
+          watchQuestion.send
+            ? "The watch stops monitoring this pull request, and the session is resumed here with your message."
+            : repairing(watch)
+              ? "The watch stops monitoring this pull request once its current repair finishes."
+              : "The watch stops monitoring this pull request; nothing is sent.",
+          "pr-meta",
+        ),
+      );
+      const yes = button(watchQuestion.send ? "Cancel watch and send" : "Cancel watch", () =>
+        watchQuestion.send ? void sendMessage(null, watch.id) : void cancelOwningWatch(watch),
+      );
+      button("Keep the watch", () => {
+        watchQuestion = null;
+        renderWatch();
+        send.focus();
+      });
+      card.append(actions);
+      // Asked on the reader's click: the answer is the next thing to reach for.
+      queueMicrotask(() => yes.isConnected && yes.focus());
+    } else {
+      if (repairing(watch))
+        card.append(
+          node(
+            "p",
+            "It is running a repair now, which finishes first. Your message can be sent once the watch has stopped.",
+            "pr-meta",
+          ),
+        );
+      button(repairing(watch) ? "Cancel watch after this repair" : "Cancel watch only", () => {
+        watchQuestion = { session: session.id, send: false };
+        renderWatch();
+      });
+      card.append(actions);
+    }
+    holder.append(card);
+  }
+  // The watcher's own Cancel watch, without sending anything.
+  async function cancelOwningWatch(watch) {
+    if (!viewer || cancellingWatch) return;
+    const entry = viewer.entry;
+    const status = byId("ws-message-status");
+    cancellingWatch = true;
+    watchQuestion = null;
+    renderAgents();
+    status.textContent = "Cancelling the watch…";
+    try {
+      const response = await fetch("/api/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "cancel" },
+        body: JSON.stringify({ id: watch.id }),
+      });
+      const value = await response.json();
+      if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+      if (viewer?.entry !== entry) return;
+      tell(
+        status,
+        ["stopped", "closed"].includes(value.job.status)
+          ? `Cancelled babysit watch ${watch.id}; send to resume the session here.`
+          : `Babysit watch ${watch.id} stops once its current repair finishes; send your message then.`,
+      );
+    } catch (error) {
+      if (viewer?.entry === entry)
+        tell(
+          status,
+          `Could not confirm cancellation: ${error.message}. Refresh to check the watch’s status.`,
+        );
+    } finally {
+      cancellingWatch = false;
+      if (viewer?.entry === entry) await fetchAgents(entry);
+    }
   }
   function renderInteraction() {
     const agent = selectedAgent();
@@ -1534,9 +1690,11 @@
     if (message.trim()) parts.push(message.trim());
     return parts.join("\n\n");
   }
-  async function sendMessage(event) {
-    event.preventDefault();
-    if (!viewer || !draft || sending || changingDocker) return;
+  // With stopWatch, the reader confirmed cancelling the babysit watch that owns the
+  // session; the server cancels it and resumes in one request.
+  async function sendMessage(event, stopWatch) {
+    event?.preventDefault();
+    if (!viewer || !draft || sending || changingDocker || cancellingWatch) return;
     const entry = viewer.entry;
     const comments = [...draft.comments];
     const message = byId("ws-message-text").value;
@@ -1556,21 +1714,49 @@
       return;
     }
     const picked = byId("ws-message-agent").querySelector("select")?.value;
+    const session = pickedSession();
+    if (session?.watch && !stopWatch) {
+      // Ask first: cancelling the watch is the price of resuming its session here.
+      watchQuestion = { session: session.id, send: true };
+      renderWatch();
+      return;
+    }
     const body = {
       ...recipient(entry),
       ...(agents.length
         ? { pane: picked || agents[0].pane }
         : { resume: picked || sessions[0]?.id }),
+      ...(stopWatch ? { stop_watch: stopWatch } : {}),
       text,
       ...(attachments.length ? { attachments } : {}),
     };
     sending = true;
+    watchQuestion = null;
     renderAgents();
-    status.textContent = body.resume ? "Resuming the session…" : "Sending…";
+    status.textContent = stopWatch
+      ? "Cancelling the watch and resuming the session…"
+      : body.resume
+        ? "Resuming the session…"
+        : "Sending…";
     try {
       const value = await deliver(body);
       if (value.error) {
-        if (viewer?.entry === entry) tell(status, value.error);
+        if (viewer?.entry !== entry) return;
+        const refused = sessions.find((s) => s.id === body.resume);
+        if (value.code === "watch_owns_session" && refused && value.watch) {
+          // A watch the list did not show yet: offer to cancel it, as if listed.
+          refused.watched = true;
+          refused.watch = value.watch;
+          tell(
+            status,
+            `Not sent: this session belongs to ${watchName(value.watch)}, which resumes it itself. Your message is kept.`,
+          );
+        } else if (value.code === "repair_running")
+          tell(
+            status,
+            "Not sent: a babysit repair is running in this session right now. Your message is kept; wait for the repair to finish, then send again.",
+          );
+        else tell(status, value.error);
         return;
       }
       clearSent(entry, comments, message, attachments);
@@ -1579,7 +1765,7 @@
         status,
         value.warning ||
           (value.resumed
-            ? `Resumed the session in ${value.pane} and sent the message.`
+            ? `${stopWatch ? `Cancelled babysit watch ${stopWatch}, resumed` : "Resumed"} the session in ${value.pane} and sent the message.`
             : `Sent to the agent in ${value.pane}.`),
       );
       // The transcript shows the new turn soon after; load just its tail, like the poll, so
@@ -1622,7 +1808,11 @@
       return { error: `Delivery unknown: HTTP ${response.status}; check Collie before resending.` };
     }
     if (!response.ok || value.error)
-      return { error: `Not sent: ${value.error || response.status}` };
+      return {
+        error: `Not sent: ${value.error || response.status}`,
+        code: value.code,
+        watch: value.watch,
+      };
     return value;
   }
   // Clear exactly what was sent, from storage and from whichever draft is now open (the
