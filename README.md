@@ -182,7 +182,17 @@ be missing. An unsupported or inaccessible final event shows “Unavailable”; 
 missing actor shows “Unknown actor”. Old caches work and gain activity on refresh.
 
 While the dashboard is open, one background worker refreshes GitHub at most every
-five minutes; browser refreshes and multiple tabs share the cache. Pagination fetches
+five minutes; browser refreshes and multiple tabs share the cache. In between, the
+dashboard checks GitHub notifications you participate in at the interval GitHub
+asks for (usually a minute) with a conditional request, so a quiet check costs a
+`304`. A new or updated notification for a PR (or a CI run of yours) or an issue
+refreshes that tab right away, and once more if a refresh was already running.
+The next check refreshes it again, because GitHub search can take a moment to
+list a new PR, review request or mention after notifying about it.
+Notifications miss CI results and pushes on other people's PRs, which still wait
+for the five-minute refresh. The token needs the `notifications` or `repo` scope
+(`gh auth login` grants `repo`); without it the check backs off and the tabs keep
+their five-minute refresh (`scripts/github_notifications.py`). Pagination fetches
 up to GitHub's search limit of 1,000 PRs per role, with an explicit notice if capped.
 Duplicates appear once with all matching roles. Failed requests keep the last
 complete snapshot with a visible error. Cached metadata lives in

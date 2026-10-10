@@ -190,6 +190,9 @@ class Overview:
         self.lock = threading.Lock()
         self.worker: threading.Thread | None = None
         self.next_poll = 0.0
+        # Set under the lock until the refresh's final bookkeeping, unlike thread liveness.
+        self.refreshing = False
+        self.pending = False  # A wake arrived during the running refresh.
         self.value: dict = {
             "login": None,
             self.kind.key: [],
@@ -208,17 +211,33 @@ class Overview:
         # The module-level collector is looked up at call time so tests can replace it.
         return collect(mentions=include_mentions(self.home))
 
+    def _start(self):
+        self.refreshing = True
+        self.worker = threading.Thread(target=self.refresh, daemon=True)
+        try:
+            self.worker.start()
+        except RuntimeError:
+            self.refreshing = False
+            raise
+
     def snapshot(self):
         with self.lock:
-            if time.monotonic() >= self.next_poll and not (self.worker and self.worker.is_alive()):
-                self.worker = threading.Thread(target=self.refresh, daemon=True)
-                self.worker.start()
+            if time.monotonic() >= self.next_poll and not self.refreshing:
+                self._start()
             # Shallow: refresh() replaces the value whole and nothing changes it in place,
             # so callers share its items and must copy before mutating them.
             return {
                 **self.value,
-                "refreshing": bool(self.worker and self.worker.is_alive()),
+                "refreshing": self.refreshing,
             }
+
+    def wake(self):
+        """Refresh now; a refresh already running is followed by one more."""
+        with self.lock:
+            if self.refreshing:
+                self.pending = True
+            else:
+                self._start()
 
     def refresh(self):
         try:
@@ -242,3 +261,8 @@ class Overview:
         finally:
             with self.lock:
                 self.next_poll = time.monotonic() + POLL_SECONDS
+                self.refreshing = False
+                # A wake during this refresh may describe a change its search already missed.
+                if self.pending:
+                    self.pending = False
+                    self._start()
