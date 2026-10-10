@@ -15,7 +15,7 @@
     skipped: ["Skipped", ""],
   };
   const FAILING = new Set(["failed", "timed_out", "error", "attention"]);
-  // A latest run in these raises an alert here or on Needs you; dismissing acknowledges it.
+  // A run in these is flagged until dismissed; the latest raises an alert here or on Needs you.
   const DISMISSABLE = new Set([...FAILING, "interrupted"]);
   const AGENTS = { codex: "Codex", claude: "Claude" };
   const TRIGGERS = { schedule: "Scheduled", manual: "Run now" };
@@ -283,6 +283,15 @@
           run.cwd ? `In ${run.cwd}` : null,
           agent && run.status !== "starting" ? run.message : null,
         ].filter(Boolean);
+    // The latest run's Dismiss sits with the job's actions; an older one's sits here.
+    if (run !== latest(job) && needsDismissal(run)) {
+      const dismiss = button("Dismiss", () => act(job, { action: "dismiss", run: run.id }), {
+        pending: acting.has(job.id),
+        key: "dismiss-run",
+      });
+      dismiss.title = "Mark this run as dealt with; it stays in the history";
+      head.append(dismiss);
+    }
     const parts = [head, node("p", facts.join(" · "), "pr-sync")];
     if (agent && run.agent_run) {
       // The session lives on in its workspace: open it there, or read it here.

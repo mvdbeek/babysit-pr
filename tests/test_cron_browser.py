@@ -464,6 +464,38 @@ def test_a_run_that_needs_attention_is_dismissed_on_the_cron_tab(page, site, err
     expect(page.locator("#attention-tab-count")).to_be_hidden()
 
 
+def test_an_older_run_that_needs_attention_is_dismissed_from_its_output(page, site, errors):
+    url, jobs = site
+    saved = needs_attention(jobs, "Nightly agent")
+    now = time.time()
+    with jobs.db() as db:
+        jobs.record(
+            db,
+            saved,
+            trigger="schedule",
+            due_at=now,
+            started_at=now,
+            finished_at=now + 30,
+            status="succeeded",
+            message="The agent finished and exited",
+        )
+    page.goto(url)
+    page.get_by_role("tab", name="Cron jobs").click()
+    detail = page.locator("#cron-detail")
+    # The latest run succeeded, so the job itself offers no Dismiss.
+    expect(detail.locator(".cron-actions").get_by_role("button", name="Dismiss")).to_have_count(0)
+    older = detail.locator(".cron-runs tr").filter(has_text="session transcript")
+    older.get_by_role("button").first.click()
+    head = page.locator(".cron-output-head")
+    expect(head.locator(".badge")).to_have_text("Needs attention")
+    head.get_by_role("button", name="Dismiss").click()
+    expect(head.get_by_role("button", name="Dismiss")).to_have_count(0)
+    expect(head.locator(".badge")).to_have_text("Needs attention · dismissed")
+    expect(older).to_contain_text("Needs attention · dismissed")
+    _, run = jobs.snapshot()["jobs"][0]["runs"]
+    assert run["status"] == "attention" and run["dismissed_at"]
+
+
 def test_a_run_that_needs_attention_is_dismissed_from_needs_you(page, site, errors):
     url, jobs = site
     needs_attention(jobs, "Nightly agent")
