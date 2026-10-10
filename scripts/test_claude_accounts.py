@@ -224,3 +224,120 @@ def test_quota_reads_selected_keychain_entry_without_default_fallback(stores, mo
     assert sentry_llm.claude_login(run)[0] is None
     service = "Claude Code-credentials-" + hashlib.sha256(str(work).encode()).hexdigest()[:8]
     assert calls == [["security", "find-generic-password", "-s", service, "-w"]]
+
+
+@pytest.fixture
+def trusting(stores, monkeypatch):
+    """Folder trust writes switched back on, against the fake home's stores only."""
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")
+    return stores
+
+
+def write_config(path, projects, mode=0o600):
+    path.write_text(json.dumps({"numStartups": 3, "projects": projects}, indent=2))
+    path.chmod(mode)
+
+
+def test_trust_adds_only_the_launch_folder_and_keeps_everything_else(trusting, tmp_path):
+    _, work = trusting
+    config = work / ".claude.json"
+    other = {"allowedTools": ["Bash"], "hasTrustDialogAccepted": False, "lastCost": 1.5}
+    write_config(config, {"/elsewhere": other})
+    checkout = tmp_path / "worktrees" / "repo" / "nightly"
+    checkout.mkdir(parents=True)
+    assert accounts.trust(work, checkout) is True
+    saved = json.loads(config.read_text())
+    assert saved == {
+        "numStartups": 3,
+        "projects": {
+            "/elsewhere": other,
+            str(checkout.resolve()): {"hasTrustDialogAccepted": True},
+        },
+    }
+    assert config.stat().st_mode & 0o777 == 0o600
+    # The replacement left no temporary file behind.
+    assert sorted(p.name for p in work.iterdir()) == [".claude.json"]
+    # An untrusted folder that already has an entry keeps its other fields.
+    assert accounts.trust(work, "/elsewhere") is True
+    assert json.loads(config.read_text())["projects"]["/elsewhere"] == {
+        **other,
+        "hasTrustDialogAccepted": True,
+    }
+
+
+def test_trusted_folders_and_their_subfolders_are_not_rewritten(trusting, tmp_path):
+    _, work = trusting
+    config = work / ".claude.json"
+    clone = tmp_path / "src" / "repo"
+    (clone / "lib").mkdir(parents=True)
+    write_config(config, {str(clone.resolve()): {"hasTrustDialogAccepted": True}})
+    before = config.stat()
+    assert accounts.trust(work, clone) is True
+    assert accounts.trust(work, clone / "lib") is True
+    after = config.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize("content", [None, "not json", "[]", '{"projects": []}'])
+def test_a_missing_or_unreadable_config_is_left_alone(trusting, tmp_path, content):
+    _, work = trusting
+    config = work / ".claude.json"
+    if content is not None:
+        config.write_text(content)
+    assert accounts.trust(work, tmp_path) is False
+    if content is None:
+        assert not config.exists()
+    else:
+        assert config.read_text() == content
+    assert len(list(work.iterdir())) == (content is not None)
+
+
+def test_the_default_home_trusts_in_the_config_beside_it(trusting, tmp_path):
+    default, work = trusting
+    beside = default.parent / ".claude.json"
+    write_config(beside, {}, mode=0o644)
+    write_config(work / ".claude.json", {})
+    assert accounts.trust(default, tmp_path) is True
+    assert json.loads(beside.read_text())["projects"] == {
+        str(tmp_path.resolve()): {"hasTrustDialogAccepted": True}
+    }
+    assert beside.stat().st_mode & 0o777 == 0o644
+    assert not (default / ".claude.json").exists()
+    assert json.loads((work / ".claude.json").read_text())["projects"] == {}
+
+
+def test_trust_can_be_switched_off(trusting, tmp_path, monkeypatch):
+    _, work = trusting
+    write_config(work / ".claude.json", {})
+    monkeypatch.setenv("BABYSIT_CLAUDE_TRUST", "0")
+    assert accounts.trust(work, tmp_path) is False
+    assert json.loads((work / ".claude.json").read_text())["projects"] == {}
+
+
+def test_worktree_launches_trust_their_checkout_in_the_selected_account(trusting, tmp_path):
+    default, work = trusting
+    write_config(default.parent / ".claude.json", {})
+    write_config(work / ".claude.json", {})
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    tool = wt.Tool(
+        wt.SubprocessRunner({}), {}, stdout=sys.stdout, stderr=sys.stderr, isatty=lambda: False
+    )
+    # The trial run that sizes the typed line writes nothing.
+    tool.command_for(wt.parse_args("wt", ["--claude-account", "work", "dev"]))
+    assert json.loads((work / ".claude.json").read_text())["projects"] == {}
+    options = wt.parse_args("wt", ["--claude-account", "work", "dev"])
+    tool.command_for(options, directory=str(checkout))
+    trusted = {str(checkout.resolve()): {"hasTrustDialogAccepted": True}}
+    assert json.loads((work / ".claude.json").read_text())["projects"] == trusted
+    assert json.loads((default.parent / ".claude.json").read_text())["projects"] == {}
+    # Codex has no trust dialog of Claude's to answer.
+    other = tmp_path / "other"
+    other.mkdir()
+    tool.command_for(wt.parse_args("wt", ["--codex", "dev"]), directory=str(other))
+    assert json.loads((default.parent / ".claude.json").read_text())["projects"] == {}
+    # Without an account, the inherited configuration is the one Claude reads.
+    tool.command_for(wt.parse_args("wt", ["dev"]), directory=str(other))
+    assert json.loads((default.parent / ".claude.json").read_text())["projects"] == {
+        str(other.resolve()): {"hasTrustDialogAccepted": True}
+    }

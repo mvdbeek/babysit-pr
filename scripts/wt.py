@@ -450,6 +450,7 @@ def agent_command(
     claude_subscription: bool = False,
     unsandboxed: bool = False,
     also: Sequence[AlsoCheckout] = (),
+    directory: str | None = None,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -478,6 +479,11 @@ def agent_command(
     file like the prompt. Each checkout is also an ``--add-dir`` for the agent itself,
     which a Docker restart reads back to keep the grants. ``stage`` is called once for
     the grants and once for the prompt, so it must return a new path each time.
+
+    ``directory`` is the checkout the line will be typed in. Claude is told to trust it,
+    in the configuration that Claude reads, so its folder trust dialog cannot hold up a
+    launch nobody is watching. Without a selected account, that is the one this process
+    inherited.
     """
     if unsandboxed and docker:
         raise ValueError("Docker access only applies inside Safehouse")
@@ -507,6 +513,8 @@ def agent_command(
         )
     if also and len(command.encode()) > TYPED_LIMIT:
         raise ValueError("The agent command is too long to type; use fewer --with clones")
+    if directory and agent == "claude":
+        claude_accounts.trust(claude_config_dir or claude_accounts.current_home(), directory)
     return command
 
 
@@ -906,7 +914,12 @@ class Tool:
     def multiplexer(self) -> str:
         return select_multiplexer(self.env, self.runner.which, self.herdr_running)
 
-    def command_for(self, options: Options, stage: Callable[[str], str] | None = None) -> str:
+    def command_for(
+        self,
+        options: Options,
+        stage: Callable[[str], str] | None = None,
+        directory: str | None = None,
+    ) -> str:
         try:
             home = claude_accounts.validate(options.agent, options.claude_account)
         except ValueError as exc:
@@ -923,6 +936,7 @@ class Tool:
                 str(home) if home else None,
                 bool(options.claude_account),
                 also=options.also_checkouts,
+                directory=directory,
             )
         except ValueError as exc:
             raise WtError(f"wt: {exc}") from exc
@@ -982,7 +996,7 @@ class Tool:
             return
         if not reply.root_pane:
             raise WtError(f"wt: herdr did not return a root pane for {directory}")
-        command = self.command_for(options)
+        command = self.command_for(options, directory=directory)
         # No spare terminal split here: reviewr's auto_open is off, so the workspace
         # holds just the agent; open reviewr with its toggle action when wanted.
         # pane run submits text + Enter; the pty buffers it until the new shell reads it.
@@ -993,7 +1007,7 @@ class Tool:
     def session_tmux(self, options: Options, directory: str, name: str) -> None:
         session = sanitize_session_name(name)
         if self.runner.run(["tmux", "has-session", "-t", f"={session}"]).returncode:
-            command = self.command_for(options)
+            command = self.command_for(options, directory=directory)
             for step in (
                 ["new-session", "-d", "-s", session, "-c", directory],
                 ["split-window", "-h", "-t", session, "-c", directory],
@@ -1037,7 +1051,7 @@ class Tool:
             return
         # A surface's command is typed into the pane, so it is shell-parsed: shell-quote
         # it (agent_command), then JSON-encode it inside the layout (cmux_layout).
-        layout = cmux_layout(self.command_for(options))
+        layout = cmux_layout(self.command_for(options, directory=directory))
         # Keep all workspaces made for a repository together. A cmux group always has
         # an anchor workspace, so create an empty group the first time and put this
         # worktree workspace (and all later ones) beneath it.

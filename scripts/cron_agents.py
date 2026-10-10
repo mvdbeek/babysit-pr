@@ -205,6 +205,7 @@ def start(job, run_id, home, src):
         claude_subscription=bool(job["claude_account"]),
         # Jobs saved before the option existed lack it.
         unsandboxed=job.get("unsandboxed", False),
+        directory=str(path),
     )
     # A fresh pane, as resumes use; the root pane stays a plain shell for the user.
     pane = herdr("pane", "split", anchor, "--direction", "right", "--cwd", str(path), "--no-focus")[
