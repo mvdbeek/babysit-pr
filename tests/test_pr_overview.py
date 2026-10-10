@@ -228,3 +228,40 @@ def test_corrupt_cache_and_write_failure_are_recoverable(tmp_path, monkeypatch):
     monkeypatch.setattr(overview.os, "open", Mock(side_effect=OSError("read only")))
     cache.refresh()
     assert "read only" in cache.value["error"]
+
+
+def test_wake_refreshes_now_and_again_after_a_refresh_it_interrupted(tmp_path, monkeypatch):
+    cache = overview.Overview(tmp_path)
+    cache.next_poll = float("inf")
+    entered, finish, done = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+
+    def collect(**_):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            entered.set()
+            assert finish.wait(5)
+        else:
+            done.set()
+        return {"prs": [{"id": str(len(calls))}], "login": "alice", "warnings": []}
+
+    monkeypatch.setattr(overview, "collect", collect)
+    cache.wake()
+    assert entered.wait(5)
+    cache.wake()  # Arrives mid-refresh: that search may predate the change.
+    assert len(calls) == 1
+    finish.set()
+    assert done.wait(5)
+    cache.worker.join(5)
+    assert len(calls) == 2 and cache.value["prs"] == [{"id": "2"}]
+    assert not cache.snapshot()["refreshing"]
+    assert cache.next_poll > overview.time.monotonic() + overview.POLL_SECONDS - 5
+    assert not cache.pending
+
+
+def test_failed_thread_start_does_not_leave_the_cache_refreshing(tmp_path, monkeypatch):
+    cache = overview.Overview(tmp_path)
+    monkeypatch.setattr(overview.threading.Thread, "start", Mock(side_effect=RuntimeError))
+    with pytest.raises(RuntimeError):
+        cache.wake()
+    assert not cache.refreshing

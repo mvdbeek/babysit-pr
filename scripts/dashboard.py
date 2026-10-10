@@ -1106,6 +1106,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
     from codex_updates import CodexUpdates
     from cron_jobs import CronJobs
     from dashboard_push import PushInbox
+    from github_notifications import NotificationWatch
     from sentry_issues import SentryIssues
     from upstream_tests import UpstreamTests
     from workspace_overview import WorkspaceOverview
@@ -1114,6 +1115,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
     workspace_overview = WorkspaceOverview(home, jobs=lambda: read_jobs(home))
     overview = Overview(home)
     issues = IssueOverview(home)
+    notifications = NotificationWatch({"prs": overview, "issues": issues})
     sentry = SentryIssues(home)
     workspaces = Workspaces(
         home,
@@ -1150,6 +1152,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         ci_logs.start()
         cron.start()
         push.start()
+        notifications.start()
         workspaces.start()
         url = f"http://127.0.0.1:{server.server_port}"
         print(
@@ -1172,6 +1175,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         finally:
             cron.close()
             workspaces.close()
+            notifications.close()
             push.close()
             ci_logs.close()
 
