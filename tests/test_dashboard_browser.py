@@ -3385,6 +3385,20 @@ def test_any_collie_workspace_offers_its_diff_and_transcript(
     page.locator("#list .watch").filter(has_text="test/repo").click()
     page.locator("#detail").get_by_role("button", name="Transcript", exact=True).click()
     expect(viewer).to_be_visible()
+    assert "workspace-transcript?workspace=w1" in seen[-1]
+    # Without a workspace, the watch's registered checkout is read through the watch.
+    page.keyboard.press("Escape")
+    snapshot["watches"] = {
+        "watch:feedback": {
+            **snapshot["prs"]["pr-one"],
+            "matches": [{**snapshot["prs"]["pr-one"]["matches"][0], "workspace_id": None}],
+        }
+    }
+    page.reload()
+    page.locator("#list .watch").filter(has_text="test/repo").click()
+    page.locator("#detail").get_by_role("button", name="Transcript", exact=True).click()
+    expect(viewer).to_be_visible()
+    assert "workspace-transcript?watch=feedback" in seen[-1]
 
 
 def test_a_transcript_opened_before_the_first_turn_appears_once_recorded(

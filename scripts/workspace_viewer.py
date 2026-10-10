@@ -914,17 +914,18 @@ class Transcript:
         )
 
 
-def transcript(path, session=None, before=None, after=None):
+def transcript(path, session=None, before=None, after=None, prefer=None):
     """One page of a session's conversation.
 
     The newest page by default; ``before`` pages back from an index, and ``after``
-    returns what follows an index, so an open viewer fetches only what is new.
+    returns what follows an index, so an open viewer fetches only what is new. Without
+    a ``session``, ``prefer`` is chosen when it is recorded here, else the newest.
     """
     listed = sessions(path)
     if session is None:
         if not listed:
             return {"sessions": [], "session": None, "entries": [], "start": 0, "total": 0}
-        chosen = listed[0]
+        chosen = next((s for s in listed if s["id"] == prefer), listed[0])
     else:
         if not isinstance(session, str) or not SESSION.match(session):
             raise ValueError("Choose a listed session")

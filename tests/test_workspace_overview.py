@@ -3,6 +3,7 @@
 import http.client
 import json
 import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -960,8 +961,9 @@ def test_diff_and_transcript_views_read_only_listed_checkouts(server, site, monk
     for path, error in [
         ("/api/workspace-diff?key=%2Fetc", "Unknown workspace"),
         ("/api/workspace-diff?key=workspace%3Aw2", "Unknown workspace"),
-        ("/api/workspace-diff", "Supply a workspace or a workspace key"),
-        (f"/api/workspace-diff?key={key}&workspace=w1", "Supply a workspace or"),
+        ("/api/workspace-diff", "Supply a workspace, a workspace key or a watch"),
+        (f"/api/workspace-diff?key={key}&workspace=w1", "Supply a workspace,"),
+        (f"/api/workspace-diff?key={key}&watch=w1", "Supply a workspace,"),
         (f"/api/workspace-diff?key={key}&key={key}", "once"),
         (f"/api/workspace-diff?key={key}&path=%2Fetc", "Unknown diff parameter"),
         (f"/api/workspace-diff?key={key}&base=HEAD", "listed base"),
@@ -1021,6 +1023,33 @@ def test_views_of_a_herdr_workspace_need_no_experiment(site, tmp_path, monkeypat
             ]:
                 status, value = request(port, path)
                 assert status == 400 and error in value["error"], path
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_views_of_a_watch_read_its_checkout_without_a_workspace(site, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    home = tmp_path / "plain"
+    home.mkdir()
+    queue = sqlite3.connect(home / "queue.sqlite")
+    queue.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+    job = {"id": "abc123", "cwd": str(site[3] / "dirty-work"), "session_id": None}
+    queue.execute("INSERT INTO jobs VALUES ('abc123', ?)", (json.dumps(job),))
+    queue.commit()
+    queue.close()
+    with dashboard.DashboardServer(home, 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            status, value = request(port, "/api/workspace-diff?watch=abc123")
+            assert status == 200 and value["untracked"] == ["scratch.txt"]
+            status, value = request(port, "/api/workspace-transcript?watch=abc123")
+            assert status == 200 and value["session"] is None
+            status, value = request(port, "/api/workspace-diff?watch=other")
+            assert status == 400 and "Unknown watch" in value["error"]
         finally:
             httpd.shutdown()
             thread.join(5)
@@ -1335,6 +1364,18 @@ def exited(site, tmp_path, monkeypatch):
     }
     state.write_text(json.dumps(data))
     return state, sid, checkout, plugin.home
+
+
+def test_a_resume_without_a_message_leaves_the_session_waiting(exited):
+    import agent_messages
+
+    state, sid, checkout, home = exited
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "  "}, home)
+    assert value["resumed"] == sid and value["warning"] is None
+    assert read(state)["agents"][0]["argv"] == ["--resume", sid]
+    # A message to a running agent still needs text.
+    with pytest.raises(ValueError, match="Write a message"):
+        agent_messages.send({"workspace": "w1", "text": ""}, home)
 
 
 def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
@@ -1742,7 +1783,7 @@ def test_a_row_listed_without_a_workspace_resumes_its_session_in_a_new_one(exite
     status, value = request(port, "/api/workspace-message", body, action="workspace-message")
     assert status == 400 and "already running" in value["error"]
     status, value = request(port, f"{query}&workspace=w1")
-    assert status == 400 and "Supply a workspace or a workspace key" in value["error"]
+    assert status == 400 and "Supply a workspace, a workspace key or a watch" in value["error"]
 
 
 def test_the_viewer_follows_a_workspace_reopened_under_a_new_id(site, tmp_path, monkeypatch):
