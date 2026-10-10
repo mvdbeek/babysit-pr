@@ -26,9 +26,6 @@
   border-radius: 12px;
   overflow: hidden;
 }
-.cron-list[hidden] {
-  display: none;
-}
 .cron-job {
   display: grid;
   gap: 8px;
@@ -42,6 +39,10 @@
 }
 .cron-list li:last-child .cron-job {
   border-bottom: 0;
+}
+.cron-job:focus-visible {
+  /* The list clips an outline drawn outside the row, so draw it inside. */
+  outline-offset: -3px;
 }
 .cron-job.selected {
   background: #f1f6ec;
@@ -107,9 +108,6 @@
 .cron-history,
 .cron-output {
   margin-top: 22px;
-}
-.cron-truncated[hidden] {
-  display: none;
 }
 .cron-history > small,
 .cron-truncated {
@@ -182,6 +180,7 @@
 #cron-dialog {
   width: min(640px, 92vw);
   max-height: 90vh;
+  max-height: 90dvh;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -246,10 +245,6 @@
 }
 #cron-form .cron-repeat label {
   margin: 0;
-}
-.cron-every[hidden],
-.cron-expression[hidden] {
-  display: none;
 }
 .cron-expression {
   display: grid;
@@ -345,9 +340,6 @@
 .cron-section {
   display: grid;
   gap: 8px;
-}
-.cron-section[hidden] {
-  display: none;
 }
 .cron-section > input,
 .cron-section > select,

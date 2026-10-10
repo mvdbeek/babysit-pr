@@ -167,8 +167,15 @@ def run(args, *, timeout, env=None, **kwargs) -> subprocess.CompletedProcess:
 
 
 @contextlib.contextmanager
-def command(args, env=None, **kwargs) -> Iterator[subprocess.Popen]:
-    """A streaming gh command; the slot is held until the caller is done with it."""
+def command(args, env=None, slot=True, **kwargs) -> Iterator[subprocess.Popen]:
+    """A streaming gh command; the slot is held until the caller is done with it.
+
+    ``slot=False`` is for a long-running program that is not gh itself, such as a
+    helper that only calls gh now and then: it gets the token without blocking gh.
+    """
     env = _require_token(env)
-    with SLOTS, owned_process.command(list(args), env=env, **kwargs) as proc:
+    with (
+        SLOTS if slot else contextlib.nullcontext(),
+        owned_process.command(list(args), env=env, **kwargs) as proc,
+    ):
         yield proc

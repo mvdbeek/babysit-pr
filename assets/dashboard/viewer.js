@@ -7,6 +7,8 @@
   let viewer = null;
   let viewerRequest = 0;
   let viewerInflight = 0;
+  // Run once no load is in flight any more (a reload that one could have overtaken).
+  let afterLoad = null;
   let opener = null;
   // The open workspace in Collie, once its agents are read; text that sends the
   // reader to Collie links there.
@@ -374,6 +376,11 @@
       }
     } finally {
       viewerInflight -= 1;
+      if (!viewerInflight && afterLoad) {
+        const next = afterLoad;
+        afterLoad = null;
+        next();
+      }
     }
   }
   function refreshButton() {
@@ -1575,10 +1582,18 @@
             ? `Resumed the session in ${value.pane} and sent the message.`
             : `Sent to the agent in ${value.pane}.`),
       );
-      // The transcript shows the new turn soon after.
+      // The transcript shows the new turn soon after; load just its tail, like the poll, so
+      // expanded tool calls and the scroll position stay as they are. A load still running
+      // then may predate the turn: look once more when it settles.
       if (viewer.mode === "transcript")
         setTimeout(() => {
-          if (viewer?.entry === entry && viewer.mode === "transcript") change(() => {});
+          const reload = () => {
+            if (viewer?.entry !== entry || viewer.mode !== "transcript") return;
+            const data = viewer.data;
+            void loadViewer(data?.session ? { after: Math.max(data.start, data.total - 20) } : {});
+          };
+          if (viewerInflight) afterLoad = reload;
+          else reload();
         }, 3000);
     } finally {
       sending = false;

@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -212,10 +213,29 @@ class BackgroundLogs:
                     subprocess.SubprocessError,
                 ) as exc:
                     self.error = str(exc)
+                except Exception as exc:
+                    # A bug must not end downloads for the life of the dashboard.
+                    traceback.print_exc()
+                    self.error = str(exc) or repr(exc)
+                if self.error:
+                    # A step that failed mid-download must not leave its job "downloading".
+                    with contextlib.suppress(sqlite3.Error), self.db() as db:
+                        db.execute(
+                            "UPDATE jobs SET state='error',retry=? WHERE state='downloading'",
+                            (time.time() + 3600,),
+                        )
                 self.stopping.wait(15)
 
     def budget(self, kind, limit, *, claim=False):
         now = time.time()
+        if not claim:
+            # Polled by every open log view: a read, with no write lock or cleanup.
+            with self.db() as db:
+                used = db.execute(
+                    "SELECT count(*) FROM requests WHERE kind=? AND time >= ?",
+                    (kind, now - 3600),
+                ).fetchone()[0]
+            return used < limit
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM requests WHERE time < ?", (now - 3600,))
@@ -374,8 +394,13 @@ class BackgroundLogs:
             data.update(value=value, error=None, downloaded_at=time.time(), size=len(packed))
             self.save(key, "ready", data)
             self.prune()
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-            data["error"] = str(exc)
+        except Exception as exc:
+            # Never leave a job "downloading": anything unexpected is a logged failure.
+            if not isinstance(
+                exc, (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError)
+            ):
+                traceback.print_exc()
+            data["error"] = str(exc) or repr(exc)
             # Three attempts total; absent/expired logs cannot cause an endless loop.
             state = "unavailable" if data["attempts"] >= 3 else "error"
             self.save(key, state, data, time.time() + 3600)
@@ -441,6 +466,7 @@ class BackgroundLogs:
             }
         state, raw = row
         data = json.loads(raw)
+        available = state == "queued" and self.budget("download", DOWNLOADS_PER_HOUR)
         messages = {
             "queued": "Queued for background download",
             "downloading": "Downloading failed-job log",
@@ -450,7 +476,7 @@ class BackgroundLogs:
             "obsolete": "This job is no longer a completed failure",
             "evicted": "Cached log removed to keep disk usage within the limit. Open the job on GitHub.",
         }
-        if state == "queued" and not self.budget("download", DOWNLOADS_PER_HOUR):
+        if state == "queued" and not available:
             messages[state] = "Hourly download budget reached; queued for the next available slot"
         return {
             "state": state,
@@ -458,8 +484,7 @@ class BackgroundLogs:
             "error": data.get("error"),
             "value": data.get("value"),
             "downloaded_at": data.get("downloaded_at"),
-            "refreshing": state == "downloading"
-            or (state == "queued" and self.budget("download", DOWNLOADS_PER_HOUR)),
+            "refreshing": state == "downloading" or available,
             "key": job_key,
         }
 

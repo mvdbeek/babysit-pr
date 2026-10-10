@@ -21,7 +21,6 @@ import json
 import os
 import re
 import shlex
-import sqlite3
 import subprocess
 import threading
 import time
@@ -72,19 +71,24 @@ _recent: dict[str, tuple[str, float]] = {}
 # Once any Codex answer keystroke was attempted, retries must finish in the terminal.
 # Async questions can retain only an acknowledgment in the transcript after answering.
 _codex_answered: set[tuple[str, str]] = set()
+# A default meaning "not resolved yet", since None means "resolved: no workspace open".
+_UNSET = object()
 
 
 def clean(text):
     return CONTROL.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def agents(workspace_id, interactions=False):
+def agents(workspace_id, interactions=False, live=_UNSET):
     """The agents running in a herdr workspace, for choosing whom to message.
 
     Only a workspace on a Git checkout qualifies, the same ones the viewer shows.
+    ``live`` is the open workspace a caller already resolved for this ID: None when it
+    found none open, so it is not looked up again.
     """
     # Follows the checkout: a closed workspace has none, a reopened one has a new ID.
-    live = workspace_viewer.live_workspace(workspace_id)
+    if live is _UNSET:
+        live = workspace_viewer.live_workspace(workspace_id)
     if live is None:
         return []
     found = [
@@ -104,7 +108,8 @@ def agents(workspace_id, interactions=False):
             if agent["status"] == "blocked":
                 try:
                     agent["interaction"] = live_interaction(agent)
-                except (ValueError, subprocess.SubprocessError):
+                # herdr_handoff reports a failed herdr call as a RuntimeError.
+                except (ValueError, RuntimeError, OSError, subprocess.SubprocessError):
                     agent["interaction"] = None
     return found
 
@@ -169,9 +174,9 @@ def send(request, home=None, *, expected_session=None, checkout=None):
         return prompt(target, text)
 
 
-def docker_status(workspace_id):
+def docker_status(workspace_id, live=_UNSET):
     """Report observed access; a failed probe must never look like disabled access."""
-    result = agents(workspace_id, interactions=True)
+    result = agents(workspace_id, interactions=True, live=live)
     for target in result:
         target["docker"] = None
         try:
@@ -946,15 +951,12 @@ def watch_owner(session_id, agent, home, config_dir=None):
 
 
 def watch_jobs(home):
-    path = Path(home) / "queue.sqlite" if home else None
-    if path is None or not path.exists():
+    """The watcher's queue, read-only, through the dashboard's shared cache; never mutate it."""
+    if not home:
         return []
-    # Read-only: never create the watcher's database or take part in its locking.
-    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
-    try:
-        return [json.loads(row[0]) for row in db.execute("SELECT data FROM jobs")]
-    finally:
-        db.close()
+    from dashboard import read_jobs  # The dashboard imports this module first.
+
+    return read_jobs(Path(home))
 
 
 def open_elsewhere(session_id):

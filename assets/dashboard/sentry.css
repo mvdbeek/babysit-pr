@@ -16,9 +16,6 @@
 #sentry-notices:not(:empty) {
   margin-bottom: 12px;
 }
-#sentry-panel .pr-filters {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
 .sentry-table td {
   vertical-align: top;
   overflow-wrap: anywhere;
@@ -104,6 +101,7 @@
 #sentry-publish-dialog {
   width: min(720px, 94vw);
   max-height: 90vh;
+  max-height: 90dvh;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -193,8 +191,16 @@
   #sentry-panel .filters {
     flex-wrap: wrap;
   }
+  /* Two per row: four stacked filters filled a phone's first screen. */
   #sentry-panel .pr-filters {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+/* The six columns need about 710px, so below 800px each issue stacks into a card. */
+@media (max-width: 800px) {
+  .pr-table-wrap:has(> .sentry-table) {
+    max-height: none;
+    overflow: visible;
   }
   .sentry-table thead {
     display: none;

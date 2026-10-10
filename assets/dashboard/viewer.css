@@ -2,6 +2,7 @@
 #ws-viewer {
   width: min(1100px, 96vw);
   max-height: 92vh;
+  max-height: 92dvh;
   overflow: auto;
   padding: 20px 24px;
   border: 1px solid var(--line);
@@ -98,9 +99,6 @@
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg);
-}
-.ws-live[hidden] {
-  display: none;
 }
 #ws-live-agents {
   display: flex;
@@ -505,9 +503,6 @@
   border-top: 1px solid var(--line);
   background: var(--paper);
 }
-.ws-message[hidden] {
-  display: none;
-}
 .ws-message textarea {
   width: 100%;
   font: inherit;
@@ -567,13 +562,15 @@
 }
 .ws-message textarea {
   max-height: 30vh;
+  max-height: 30dvh;
 }
 /* Keep focused lines and comment boxes clear of the sticky composer. */
 #ws-viewer {
   scroll-padding-bottom: 220px;
 }
-@media (max-width: 600px) {
-  /* A phone screen cannot spare the room: the viewer fills it and the composer follows the content. */
+@media (max-width: 600px), (max-height: 520px) {
+  /* A phone screen cannot spare the room: the viewer fills it and the composer follows the content.
+     A landscape phone or short window is as cramped, whatever its width. */
   #ws-viewer {
     width: 100%;
     max-width: none;
@@ -604,6 +601,17 @@
   #ws-viewer select,
   #ws-viewer input {
     font-size: 16px;
+  }
+}
+@media (max-height: 520px) {
+  /* Pinned, the header and composer would leave about 50px for the content. */
+  .ws-viewer-header {
+    position: static;
+  }
+}
+@media (pointer: coarse) {
+  .ws-viewer-tabs button {
+    min-height: 44px;
   }
 }
 .ws-kind-command .ws-msg-code {
@@ -663,10 +671,6 @@
 }
 .ws-question-typed {
   margin: 6px 0 0;
-}
-.ws-question-reply {
-  padding: 1px 8px;
-  font-size: 12px;
 }
 .ws-answer {
   display: grid;

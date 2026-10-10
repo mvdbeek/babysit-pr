@@ -4,6 +4,10 @@
   let snapshot = null;
   let busy = false;
   let limit = 50;
+  // What the panel was last built from; an unchanged poll leaves it (and open sections) alone.
+  let rendered = null;
+  // Keep expanded sections open when a changed snapshot rebuilds the panel.
+  const openDetails = new Set();
   const classifications = {
     likely_flaky: "Likely flaky",
     likely_broken: "Likely broken",
@@ -28,7 +32,17 @@
   function date(value) {
     return value ? new Date(value).toLocaleString() : "unavailable";
   }
-  function occurrence(value) {
+  function details(key, summary) {
+    const element = node("details");
+    element.open = openDetails.has(key);
+    element.ontoggle = () => {
+      if (element.open) openDetails.add(key);
+      else openDetails.delete(key);
+    };
+    element.append(node("summary", summary));
+    return element;
+  }
+  function occurrence(value, test) {
     const item = node("li");
     item.append(
       anchor(
@@ -42,8 +56,10 @@
         `${value.summary || ""}${value.retried ? " after retry" : ""} · ${value.current ? "Latest run" : "Historical observation"} · ${value.artifact || ""} · ${value.report || ""} · Commit ${(value.sha || "").slice(0, 12) || "unavailable"} · Updated ${date(value.updated_at)}`,
       ),
     );
-    const jobs = node("details");
-    jobs.append(node("summary", "Run jobs (artifact-to-job mapping unavailable)"));
+    const jobs = details(
+      `jobs\u0000${test}\u0000${value.run_id}\u0000${value.attempt}\u0000${value.artifact}\u0000${value.report}`,
+      "Run jobs (artifact-to-job mapping unavailable)",
+    );
     const list = node("ul");
     for (const job of value.jobs || []) {
       const entry = node("li");
@@ -57,6 +73,9 @@
   function render() {
     const data = snapshot;
     if (!data) return;
+    const state = JSON.stringify([data, byId("group").value, byId("classification").value, limit]);
+    if (state === rendered) return;
+    rendered = state;
     byId("tab").hidden = !data.enabled;
     const status = byId("status");
     byId("results").replaceChildren();
@@ -78,9 +97,8 @@
     if (data.history) {
       byId("history").textContent =
         `History: ${data.history.sampled_runs} of ${data.history.selected_runs} selected runs have individual test outcomes.`;
-      const explanation = node("details");
+      const explanation = details("classified", "How findings are classified");
       explanation.append(
-        node("summary", "How findings are classified"),
         node(
           "p",
           "Likely flaky: passed after a retry, or both passed and failed on the same commit. Likely broken: currently failing in at least two sampled runs with no observed pass. Different commits can reflect fixes or regressions. These are clues, not proof; missing tests and green workflows never count as individual passes.",
@@ -92,9 +110,9 @@
       byId("notices").append(node("p", warning, "alert"));
     }
     if (data.history?.gaps?.length) {
-      const gaps = node("details");
-      gaps.append(
-        node("summary", `${data.history.gaps.length} runs with incomplete report coverage`),
+      const gaps = details(
+        "gaps",
+        `${data.history.gaps.length} runs with incomplete report coverage`,
       );
       const list = node("ul");
       for (const gap of data.history.gaps) {
@@ -155,9 +173,9 @@
           );
         }
         const list = node("ul");
-        for (const value of group.occurrences) list.append(occurrence(value));
-        const evidence = node("details");
-        evidence.append(node("summary", "Pass / fail evidence"), list);
+        for (const value of group.occurrences) list.append(occurrence(value, group.test));
+        const evidence = details(`evidence\u0000${group.test}`, "Pass / fail evidence");
+        evidence.append(list);
         card.append(evidence);
         byId("results").append(card);
       }
@@ -194,8 +212,10 @@
             ),
           );
           for (const note of run.notes) card.append(node("p", note, "upstream-note"));
-          const details = node("details");
-          details.append(node("summary", "Jobs and test reports"));
+          const jobs = details(
+            `run\u0000${run.branch}\u0000${run.workflow}\u0000${run.run_id}`,
+            "Jobs and test reports",
+          );
           const list = node("ul");
           for (const job of run.jobs) {
             const item = node("li");
@@ -204,8 +224,8 @@
           }
           for (const failure of run.failures)
             list.append(node("li", `${failure.test} · ${failure.summary} · ${failure.artifact}`));
-          details.append(list);
-          card.append(details);
+          jobs.append(list);
+          card.append(jobs);
           byId("results").append(card);
         }
       }
@@ -220,6 +240,7 @@
       snapshot = await response.json();
       render();
     } catch (error) {
+      rendered = null; // The next snapshot restores the status line, even if unchanged.
       byId("status").textContent =
         `Upstream test API unavailable: ${error.message}. Displayed results may be stale.`;
     } finally {
@@ -236,8 +257,12 @@
   };
   byId("refresh").onclick = refresh;
   window.addEventListener("upstream-visible", refresh);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && !byId("panel").hidden) void refresh();
+  });
+  // GitHub collection runs at most every 15 minutes, so a slow poll loses nothing.
   setInterval(() => {
     if (!document.hidden && !byId("panel").hidden) void refresh();
-  }, 5000);
+  }, 30000);
   void refresh();
 })();

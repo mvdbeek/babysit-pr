@@ -583,8 +583,9 @@ class UpstreamTests:
                 self.loading = True
                 self.next_poll = time.time() + INTERVAL
                 threading.Thread(target=self._refresh, daemon=True).start()
+            # Shallow: _refresh() replaces the value whole and nothing changes it in place.
             return {
-                **copy.deepcopy(self.value),
+                **self.value,
                 "enabled": self.enabled,
                 "loading": self.loading,
                 "error": self.error,

@@ -3,7 +3,7 @@
   --bg: #f4f5f1;
   --paper: #fff;
   --ink: #25342f;
-  --muted: #728077;
+  --muted: #5b695f;
   --line: #e2e7df;
   --green: #28775a;
   --red: #ae4941;
@@ -38,20 +38,33 @@ select {
 button {
   cursor: pointer;
 }
+/* No double-tap zoom delay on controls. */
+button,
+a,
+select,
+summary {
+  touch-action: manipulation;
+}
 a {
   color: var(--green);
   text-decoration: none;
 }
-a:hover {
-  text-decoration: underline;
+@media (hover: hover) {
+  a:hover {
+    text-decoration: underline;
+  }
 }
 button:focus-visible,
 a:focus-visible,
 input:focus-visible,
 select:focus-visible,
 summary:focus-visible {
-  outline: 3px solid #85b4a2;
+  outline: 3px solid #2f7a5f;
   outline-offset: 3px;
+}
+/* The scroller clips an outline drawn outside these rows, so draw it inside. */
+.watch:focus-visible {
+  outline-offset: -3px;
 }
 header {
   /* Header and main share one content column: 5% gutters, capped at --page-width. */
@@ -102,6 +115,29 @@ header p {
   display: flex;
   align-items: center;
   gap: 14px;
+}
+@media (min-width: 541px) {
+  /* Brand and tools need about 560px between them; below that the tools drop to their own row. */
+  header {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+  .brand {
+    flex: 1 1 0;
+    min-width: min-content;
+  }
+  .header-tools {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px 14px;
+    margin-left: auto;
+  }
+}
+@media (max-width: 800px) {
+  /* The tagline only stays when it fits on one line beside the tools. */
+  header p {
+    display: none;
+  }
 }
 #notifications-toggle {
   position: relative;
@@ -221,7 +257,8 @@ header p {
 #usage-dialog {
   --dialog-padding: 20px;
   position: fixed;
-  inset: 72px max(16px, 5%) auto auto;
+  /* Right edge in line with the bell: the header's own gutter. */
+  inset: 72px max(16px, 5%, calc((100% - var(--page-width)) / 2)) auto auto;
   margin: 0;
   width: 410px;
   max-width: calc(100vw - 32px);
@@ -284,9 +321,11 @@ header p {
   text-decoration: none;
   overflow-wrap: anywhere;
 }
-.notification-link:hover {
-  background: var(--bg);
-  text-decoration: none;
+@media (hover: hover) {
+  .notification-link:hover {
+    background: var(--bg);
+    text-decoration: none;
+  }
 }
 .notification-link span,
 .notification-link time {
@@ -386,12 +425,6 @@ small {
 main {
   padding: 30px max(5%, calc((100% - var(--page-width)) / 2));
 }
-@media (max-width: 540px) {
-  /* Room to scroll the last content above the floating New task button. */
-  main {
-    padding-bottom: 92px;
-  }
-}
 .metrics {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
@@ -403,6 +436,10 @@ main {
   margin-bottom: 34px;
 }
 .metrics > * {
+  /* Labels may wrap; the figures stay on one baseline at the bottom. */
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
   padding: 0 28px;
   border-right: 1px solid var(--line);
 }
@@ -460,8 +497,10 @@ input {
 select {
   max-width: 190px;
 }
-button:hover {
-  background: #eff4ec;
+@media (hover: hover) {
+  button:hover {
+    background: #eff4ec;
+  }
 }
 .workspace {
   display: grid;
@@ -575,7 +614,8 @@ aside {
   background: #faeeeb;
 }
 .amber {
-  color: var(--amber);
+  /* --amber is 4.3:1 on this tint; the badge text needs a darker shade for AA. */
+  color: #85591c;
   background: #faf1df;
 }
 .blue {
@@ -773,6 +813,17 @@ footer {
 [hidden] {
   display: none !important;
 }
+@media (max-width: 1100px) {
+  /* Tagline and connection status no longer fit side by side with the tools. */
+  .brand-copy {
+    display: block;
+  }
+  .connection {
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 3px;
+  }
+}
 @media (max-width: 900px) {
   .workspace {
     grid-template-columns: 1fr;
@@ -791,44 +842,25 @@ footer {
   .metrics > * {
     padding: 0 18px;
   }
-  .brand-copy {
-    display: block;
+}
+@media (min-width: 901px) {
+  .filters > input {
+    /* Placeholders such as "Find a title, repo or branch…" need more than 225px. */
+    width: clamp(225px, 24vw, 360px);
   }
-  .connection {
-    align-items: flex-end;
-    flex-direction: column;
-    gap: 3px;
+  /* A long list would otherwise scroll the selected watch's details out of view. */
+  #detail {
+    position: sticky;
+    top: 16px;
+    max-height: calc(100vh - 32px);
+    max-height: calc(100dvh - 32px);
+    overflow: auto;
   }
 }
 @media (max-width: 540px) {
   header {
     padding-block: 8px;
     gap: 8px;
-  }
-  header p {
-    display: none;
-  }
-  main {
-    padding-top: 22px;
-  }
-  .metrics {
-    grid-template-columns: 1fr 1fr;
-    padding: 5px 0;
-  }
-  .metrics > * {
-    padding: 16px 20px;
-  }
-  .metrics > *:nth-child(2) {
-    border: 0;
-  }
-  .metrics > *:nth-child(-n + 2) {
-    border-bottom: 1px solid var(--line);
-  }
-  .metrics strong {
-    font-size: 26px;
-  }
-  .filters {
-    flex-wrap: wrap;
   }
   input {
     flex-basis: 100%;
@@ -870,8 +902,10 @@ footer {
   color: var(--red);
   border-color: #dfbdb8;
 }
-.cancel-watch:hover {
-  background: #faeeeb;
+@media (hover: hover) {
+  .cancel-watch:hover {
+    background: #faeeeb;
+  }
 }
 button:disabled {
   cursor: default;
@@ -887,16 +921,12 @@ button:disabled {
   background: transparent;
   text-align: left;
 }
-.metrics > button:hover {
-  background: #eff4ec;
-}
 .metrics > button:focus-visible {
   outline-offset: -3px;
 }
-@media (max-width: 540px) {
-  .metrics > #show-ended {
-    grid-column: 1/-1;
-    border-top: 1px solid var(--line);
+@media (hover: hover) {
+  .metrics > button:hover {
+    background: #eff4ec;
   }
 }
 
@@ -946,6 +976,7 @@ button:disabled {
 .pr-table-wrap {
   /* Tall screens show more rows; the sticky header stays inside this scroller. */
   max-height: max(560px, calc(100vh - 96px));
+  max-height: max(560px, calc(100dvh - 96px));
   overflow: auto;
   background: var(--paper);
   border: 1px solid var(--line);
@@ -1013,11 +1044,16 @@ button:disabled {
   stroke-width: 1.5;
   stroke-linejoin: round;
 }
-.notification-silence:hover,
-.item-pin:hover,
 .item-pin[aria-pressed="true"] {
   color: var(--green);
   background: #e8f3ec;
+}
+@media (hover: hover) {
+  .notification-silence:hover,
+  .item-pin:hover {
+    color: var(--green);
+    background: #e8f3ec;
+  }
 }
 .item-pin[aria-pressed="true"] svg {
   fill: currentColor;
@@ -1066,48 +1102,6 @@ button:disabled {
   padding: 14px;
   text-align: center;
 }
-@media (max-width: 540px) {
-  .pr-table thead {
-    display: none;
-  }
-  .pr-table tr {
-    position: relative;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    padding: 14px 14px 14px 48px;
-    border-bottom: 1px solid var(--line);
-  }
-  .pr-table td {
-    display: block;
-    padding: 6px;
-    border: 0;
-  }
-  .pr-table .item-pin-cell {
-    position: absolute;
-    top: 8px;
-    left: 2px;
-    width: 44px;
-    padding: 0;
-  }
-  .item-pin,
-  .notification-silence {
-    width: 44px;
-    height: 44px;
-  }
-  .pr-table .pr-description,
-  .pr-table .pr-repo {
-    width: auto;
-    min-width: 0;
-    grid-column: 1 / -1;
-  }
-  .pr-table .pr-dates {
-    grid-column: 1 / -1;
-  }
-  .pr-table-wrap {
-    max-height: 620px;
-  }
-}
-
 .page-tabs {
   display: flex;
   overflow-x: auto;
@@ -1139,7 +1133,7 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 [role="tabpanel"]:focus-visible {
-  outline: 3px solid #85b4a2;
+  outline: 3px solid #2f7a5f;
   outline-offset: 3px;
 }
 
@@ -1169,6 +1163,21 @@ button:disabled {
 .pr-linked {
   overflow-wrap: anywhere;
 }
+@media (min-width: 1261px) {
+  /* `anywhere` lets the table squeeze these columns to one character; keep whole words. */
+  .pr-table .pr-repo,
+  .pr-table .pr-author {
+    min-width: 8em;
+    overflow-wrap: break-word;
+  }
+}
+@media (min-width: 1261px) and (max-width: 1400px) {
+  /* Tighter cells keep all columns in view down to the card breakpoint. */
+  .item-table th,
+  .item-table td {
+    padding-inline: 10px;
+  }
+}
 .pr-labels {
   margin-top: 6px;
 }
@@ -1189,35 +1198,6 @@ button:disabled {
 .pr-mobile-sort {
   display: none;
 }
-@media (max-width: 540px) {
-  .pr-mobile-sort {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-bottom: 12px;
-  }
-  .pr-author::before {
-    content: "Author: ";
-    color: var(--muted);
-  }
-  .pr-assignees::before {
-    content: "Assignees: ";
-    color: var(--muted);
-  }
-  .pr-comments::before {
-    content: "Comments: ";
-    color: var(--muted);
-  }
-  .pr-linked::before {
-    content: "Linked PRs: ";
-    color: var(--muted);
-  }
-  .pr-comments {
-    text-align: left;
-  }
-}
-
 .pr-filters {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1235,7 +1215,7 @@ button:disabled {
   min-width: 0;
   margin-top: 6px;
 }
-@media (max-width: 540px) {
+@media (max-width: 700px) {
   .pr-filters {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1243,6 +1223,14 @@ button:disabled {
 
 .pr-actions {
   min-width: 145px;
+}
+/* Bare, inline buttons would touch; leave a gap between neighbouring actions. The negative
+   margin takes back the last row's bottom gap. */
+.workspace-actions {
+  margin-bottom: -6px;
+}
+.workspace-actions > :is(button, a, .ws-view-buttons) {
+  margin: 0 6px 6px 0;
 }
 .workspace-actions small {
   display: block;
@@ -1255,6 +1243,7 @@ button:disabled {
 #workspace-dialog {
   width: min(640px, 92vw);
   max-height: 90vh;
+  max-height: 90dvh;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -1285,9 +1274,6 @@ button:disabled {
 .new-task-fields {
   display: grid;
   gap: 10px;
-}
-.new-task-fields[hidden] {
-  display: none;
 }
 .new-task-fields input {
   width: 100%;
@@ -1324,9 +1310,6 @@ button:disabled {
   display: grid;
   gap: 6px;
 }
-.workspace-start[hidden] {
-  display: none;
-}
 .effort-defaults small {
   display: block;
   margin: 6px 0;
@@ -1352,9 +1335,6 @@ button:disabled {
   align-items: center;
   gap: 8px 12px;
   margin-bottom: 16px;
-}
-.batch-bar[hidden] {
-  display: none;
 }
 .batch-bar small {
   color: var(--muted);
@@ -1476,6 +1456,7 @@ button:disabled {
 }
 .prompt-history ul {
   max-height: 40vh;
+  max-height: 40dvh;
   overflow: auto;
   margin: 6px 0 0;
   padding: 0;
@@ -1510,15 +1491,10 @@ button:disabled {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-@media (max-width: 540px) {
-  .pr-table .pr-actions {
-    grid-column: 1 / -1;
-  }
-}
-
 #ci-dialog {
   width: min(780px, 94vw);
   max-height: 90vh;
+  max-height: 90dvh;
   overflow: auto;
   padding: 24px;
   border: 1px solid var(--line);
@@ -1701,6 +1677,7 @@ button:disabled {
 .select-options {
   display: block;
   max-height: min(260px, 35vh);
+  max-height: min(260px, 35dvh);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -1711,11 +1688,17 @@ button:disabled {
   overflow-wrap: anywhere;
   cursor: pointer;
 }
-.select-option.active,
-.select-option:hover {
+.select-option.active {
   background: #eff4ec;
   outline: 1px solid #b8c8b0;
   outline-offset: -1px;
+}
+@media (hover: hover) {
+  .select-option:hover {
+    background: #eff4ec;
+    outline: 1px solid #b8c8b0;
+    outline-offset: -1px;
+  }
 }
 .select-option[aria-selected="true"] {
   font-weight: 700;
@@ -1727,9 +1710,6 @@ button:disabled {
   color: var(--muted);
   font-size: 12px;
   overflow-wrap: anywhere;
-}
-.searchable-select [hidden] {
-  display: none;
 }
 .pr-filters > .searchable-select,
 #workspace-dialog .searchable-select {
@@ -1747,7 +1727,7 @@ button:disabled {
 .pr-filters .select-popup {
   width: max(100%, min(320px, calc(100vw - 40px)));
 }
-@media (max-width: 540px) {
+@media (max-width: 700px) {
   .pr-filters > .searchable-select:nth-child(even) .select-popup {
     left: auto;
     right: 0;
@@ -1793,12 +1773,149 @@ button:disabled {
 .pr-details-toggle {
   display: none;
 }
+/* The pull request and issue columns need about 1200px, so narrower screens stack each row into
+   a card with the sort control above. Workspaces and Sentry tables stack at their own widths. */
+@media (max-width: 1260px) {
+  .pr-table-wrap:has(> .item-table) {
+    max-height: none;
+    overflow: visible;
+  }
+  .item-table thead {
+    display: none;
+  }
+  .item-table tr {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 10px;
+    border-bottom: 1px solid var(--line);
+  }
+  .item-table td {
+    display: block;
+    padding: 6px;
+    border: 0;
+  }
+  .item-table .item-pin-cell {
+    position: absolute;
+    top: 2px;
+    right: 4px;
+    display: flex;
+    width: auto;
+    padding: 0;
+  }
+  .item-table .item-pin-cell .item-pin {
+    flex: none;
+  }
+  .item-pin,
+  .notification-silence {
+    width: 44px;
+    height: 44px;
+  }
+  .notification-silence {
+    margin-top: 0;
+  }
+  .item-select {
+    flex: none;
+    margin: 13px;
+  }
+  .item-table .pr-description,
+  .item-table .pr-repo {
+    width: auto;
+    min-width: 0;
+    grid-column: 1 / -1;
+  }
+  .item-table .pr-repo {
+    padding-right: 88px;
+    min-height: 38px;
+    display: flex;
+    align-items: center;
+  }
+  /* PR rows carry a third control, the notification toggle, beside the repository. */
+  #pr-list .pr-repo {
+    padding-right: 132px;
+  }
+  .item-table .pr-dates,
+  .item-table .pr-actions {
+    grid-column: 1 / -1;
+  }
+  .item-table .pr-actions {
+    min-width: 0;
+  }
+  .pr-label {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .pr-author::before {
+    content: "Author: ";
+    color: var(--muted);
+  }
+  .pr-assignees::before {
+    content: "Assignees: ";
+    color: var(--muted);
+  }
+  .pr-comments::before {
+    content: "Comments: ";
+    color: var(--muted);
+  }
+  .pr-linked::before {
+    content: "Linked PRs: ";
+    color: var(--muted);
+  }
+  .pr-comments {
+    text-align: left;
+  }
+  /* The column headings are gone, so sorting moves to this row. */
+  .pr-mobile-sort {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .pr-mobile-sort > label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    clip-path: inset(50%);
+    overflow: hidden;
+  }
+  .pr-mobile-sort > .searchable-select {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+    max-width: 320px;
+  }
+  .pr-mobile-sort > button {
+    min-height: 44px;
+    flex-shrink: 0;
+  }
+  .pr-mobile-sort > button:last-child {
+    width: 44px;
+    padding: 0;
+    font-size: 22px;
+  }
+  .pr-mobile-sort input {
+    min-height: 44px;
+  }
+  .pr-mobile-sort .select-popup {
+    width: max(100%, 220px);
+    left: auto;
+    right: 0;
+  }
+}
+@media (min-width: 541px) and (max-width: 1260px) {
+  /* The filters are always open here, so their toggle has nothing to do. */
+  .filters-toggle {
+    display: none;
+  }
+}
 @media (max-width: 540px) {
   header {
     padding-inline: 12px;
   }
   main {
-    padding: 12px;
+    /* The bottom edge leaves room to scroll the last content above the floating New task button. */
+    padding: 12px 12px calc(92px + env(safe-area-inset-bottom));
   }
   .page-tabs {
     gap: 2px;
@@ -1832,40 +1949,13 @@ button:disabled {
     order: 1;
     width: 100%;
   }
-  .pr-mobile-sort {
-    flex-wrap: nowrap;
-    margin-bottom: 8px;
-  }
-  .pr-mobile-sort > label {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    clip-path: inset(50%);
-    overflow: hidden;
-  }
   .pr-mobile-sort > .searchable-select {
-    flex: 1;
-    width: auto;
-    min-width: 0;
-  }
-  .pr-mobile-sort > button {
-    min-height: 44px;
-    flex-shrink: 0;
-  }
-  .pr-mobile-sort > button:last-child {
-    width: 44px;
-    padding: 0;
-    font-size: 22px;
+    max-width: none;
   }
   .pr-mobile-sort input,
   .pr-filters input {
     min-height: 44px;
     font-size: 16px;
-  }
-  .pr-mobile-sort .select-popup {
-    width: max(100%, 220px);
-    left: auto;
-    right: 0;
   }
   #pr-filters:not(.filters-expanded),
   #issue-filters:not(.filters-expanded),
@@ -1883,10 +1973,6 @@ button:disabled {
   .pr-sync {
     margin: 8px 0;
   }
-  .pr-table-wrap {
-    max-height: none;
-    overflow: visible;
-  }
   .batch-bar {
     position: sticky;
     top: 0;
@@ -1896,37 +1982,9 @@ button:disabled {
     border-bottom: 1px solid var(--line);
     background: var(--bg);
   }
-  .pr-table:not(.ws-table) tr {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    padding: 10px;
-  }
-  .pr-table .item-pin-cell {
-    left: auto;
-    right: 4px;
-    top: 2px;
-    display: flex;
-    width: auto;
-  }
-  .pr-table .pr-repo {
-    padding-right: 88px;
-    min-height: 38px;
-    display: flex;
-    align-items: center;
-  }
-  .notification-silence {
-    margin-top: 0;
-  }
   .pr-title {
     font-size: 15px;
     line-height: 1.4;
-  }
-  .pr-label {
-    max-width: 100%;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-  .pr-table .pr-actions {
-    min-width: 0;
   }
   .pr-table .pr-dates {
     position: relative;
@@ -1975,20 +2033,9 @@ button:disabled {
   }
 }
 @media (max-width: 540px) {
-  .item-select {
-    flex: none;
-    margin: 13px;
-  }
-  .pr-table .item-pin-cell .item-pin {
-    flex: none;
-  }
   #issue-batch-handle,
   #pr-batch-handle {
     margin-left: 0;
-  }
-  /* PR rows carry a third control, the notification toggle, beside the repository. */
-  #pr-list .pr-repo {
-    padding-right: 132px;
   }
 }
 .attachments {
@@ -2048,4 +2095,54 @@ button:disabled {
   flex: none;
   padding: 2px 8px;
   font-size: 12px;
+}
+
+/* A modal dialog owns the screen: wheel and touch scrolling stay inside it. */
+dialog {
+  overscroll-behavior: contain;
+}
+html:has(dialog:modal) {
+  overflow: hidden;
+}
+
+@media (pointer: coarse) {
+  /* Below 16px, iOS zooms into a focused field and leaves the page zoomed. This is the one rule
+     for every field at every width; `!important` because dialog rules name fields by id. */
+  input:not([type="checkbox"], [type="radio"]),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+  /* Targets of about 44px for fingers; applied by name rather than to every button. */
+  summary {
+    padding-block: 15px;
+  }
+  #notifications-close {
+    width: 44px;
+    height: 44px;
+  }
+  #usage-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .page-tabs button {
+    min-height: 44px;
+  }
+  .select-option {
+    padding-block: 13px;
+  }
+  .select-field input {
+    min-height: 44px;
+    padding-right: 44px;
+  }
+  .select-field:has(.select-clear:not([hidden])) input {
+    padding-right: 84px;
+  }
+  .select-field .select-toggle,
+  .select-field .select-clear {
+    width: 40px;
+  }
+  .select-field .select-clear {
+    right: 41px;
+  }
 }

@@ -190,8 +190,9 @@ def test_cache_serves_stale_data_without_duplicate_workers_and_persists(tmp_path
     snapshot = cache.snapshot()
     assert snapshot["prs"] == result["prs"]
     assert snapshot["synced_at"] and not snapshot["refreshing"]
-    snapshot["prs"].clear()
-    assert cache.snapshot()["prs"] == result["prs"]
+    # A new dict per call; the items it shares with the cache are read-only.
+    snapshot["prs"] = []
+    assert cache.snapshot()["prs"] == result["prs"] == [{"id": "one"}]
     assert fetch.call_count == 1
     assert overview.Overview(tmp_path).value["prs"] == result["prs"]
     assert (tmp_path / "pr-overview.json").stat().st_mode & 0o777 == 0o600

@@ -1806,7 +1806,8 @@ def test_pr_visit_highlights_fields_and_new_rows_until_next_visit(
 def test_watcher_tab_does_not_consume_pr_changes(page, dashboard_site, visit_routes):
     url, _ = dashboard_site
     page.goto(url)
-    expect(page.locator("#pr-list tr")).to_have_count(2)
+    # A hidden table keeps its count current but builds rows only when shown.
+    expect(page.locator("#pr-count")).to_have_text("2 / 2")
     assert saved_visit(page) is None
     page.get_by_role("tab", name="Pull requests", exact=True).click()
     expect(page.locator("#pr-changes")).to_be_visible()
@@ -1815,7 +1816,7 @@ def test_watcher_tab_does_not_consume_pr_changes(page, dashboard_site, visit_rou
     visit_routes["synced_at"] += 1
     visit_routes["prs"][0]["ci"] = "SUCCESS"
     page.get_by_role("button", name="Refresh", exact=True).click()
-    expect(page.locator("#pr-list tr").first).to_contain_text("Passed")
+    page.wait_for_function("() => prTable.data.prs[0].ci === 'SUCCESS'")
     assert saved_visit(page) == old
     page.get_by_role("tab", name="Pull requests", exact=True).click()
     expect(page.locator(".pr-changed")).to_have_count(1)
@@ -2172,7 +2173,7 @@ def test_issue_overview_columns_filters_linked_prs_and_safe_titles(
     expect(page.locator("#issue-empty")).to_have_text("No matching issues.")
     page.get_by_label("Search issues").fill("")
     assert len(dashboard.read_jobs(home)) == 3  # Discovery creates no repair watches.
-    expect(page.locator("#pr-list tr")).to_have_count(2)  # The PR tab is untouched.
+    expect(page.locator("#pr-count")).to_have_text("2 / 2")  # The PR tab is untouched.
     page.screenshot(path="reports/issues-desktop.png")
     page.set_viewport_size({"width": 390, "height": 844})
     expect(rows).to_have_count(2)
@@ -3578,6 +3579,44 @@ def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
     # The agent shown is the one addressed, even when it is the only one.
     assert viewer_routes["sent"][0][1]["pane"] == "w1:p1"
+
+
+def test_a_transcript_loading_when_a_message_is_sent_is_reloaded_once_it_settles(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = viewer_routes["agents"][:1]
+    state = {"hold": False}
+    held = []
+
+    def transcript(route):
+        if state["hold"]:
+            held.append(route)  # Answered later by the test, like a slow load.
+        else:
+            route.fallback()
+
+    page.route("**/api/workspace-transcript?*", transcript)
+    # The paused clock keeps the 10-second poll, which also loads the tail, out of the way.
+    page.clock.install()
+    page.clock.pause_at(time.time() + 1)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.locator(".ws-msg-text")).to_have_text("Opened https://github.com/o/r/pull/1).")
+    state["hold"] = True
+    viewer.get_by_role("button", name="Refresh").click()
+    expect(page.locator("#ws-message-agent")).to_have_text("To codex · idle · Fix it")
+    page.locator("#ws-message-text").fill("Thanks, now update the changelog")
+    viewer.get_by_role("button", name="Send to agent").click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
+    assert len(held) == 1
+    page.clock.run_for(3000)  # The reload due after sending finds the refresh still loading.
+    page.wait_for_timeout(200)
+    state["hold"] = False
+    # Before: it was dropped, and the sent turn waited for the next poll.
+    with page.expect_request(lambda request: "after=0" in request.url):
+        held[0].fallback()
+    expect(viewer.locator(".ws-msg-text")).to_have_text("Opened https://github.com/o/r/pull/1).")
 
 
 @pytest.mark.parametrize("width", [1280, 390])

@@ -89,6 +89,12 @@
 .ws-table .badge + small {
   margin-top: 4px;
 }
+.ws-table .pr-actions {
+  padding-bottom: 9px;
+}
+.ws-table .pr-actions > :is(button, a, .ws-view-buttons) {
+  margin: 0 6px 6px 0;
+}
 #ws-dialog {
   width: min(680px, 92vw);
   border: 1px solid var(--line);
@@ -131,10 +137,17 @@
   color: var(--red);
 }
 .ws-dialog-actions {
+  /* A long list scrolls beneath; Cancel and Clean up stay reachable. */
+  position: sticky;
+  bottom: -22px;
+  z-index: 1;
   display: flex;
   gap: 10px;
   justify-content: flex-end;
-  margin-top: 16px;
+  margin: 16px -22px -22px;
+  padding: 12px 22px;
+  border-top: 1px solid var(--line);
+  background: var(--paper);
 }
 .ws-dialog-actions button {
   padding: 8px 16px;
@@ -154,7 +167,27 @@
     margin-left: 0;
   }
 }
-@media (max-width: 540px) {
+/* The eight columns need about 840px, so below 940px each workspace stacks into a card. */
+@media (max-width: 940px) {
+  .pr-table-wrap:has(> .ws-table) {
+    max-height: none;
+    overflow: visible;
+  }
+  .ws-table thead {
+    display: none;
+  }
+  .ws-table tr {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 14px 14px 14px 48px;
+    border-bottom: 1px solid var(--line);
+  }
+  .ws-table td {
+    display: block;
+    padding: 6px;
+    border: 0;
+  }
   .ws-table .ws-select {
     position: absolute;
     top: 14px;
@@ -162,9 +195,16 @@
     width: 28px;
     padding: 0;
   }
-  .ws-table td:nth-child(2) {
+  .ws-table td:nth-child(2),
+  .ws-table .pr-actions {
     grid-column: 1 / -1;
   }
+  .ws-table .pr-actions {
+    min-width: 0;
+    padding-bottom: 0;
+  }
+}
+@media (max-width: 540px) {
   #workspaces-panel input[type="checkbox"] {
     width: 22px;
     height: 22px;

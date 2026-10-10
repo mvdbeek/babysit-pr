@@ -4,7 +4,6 @@ The search, merge, pagination and cache machinery is parametrised by a `Kind` so
 issue overview (`issue_overview.py`) shares it without copying it.
 """
 
-import copy
 import json
 import os
 import subprocess
@@ -214,8 +213,10 @@ class Overview:
             if time.monotonic() >= self.next_poll and not (self.worker and self.worker.is_alive()):
                 self.worker = threading.Thread(target=self.refresh, daemon=True)
                 self.worker.start()
+            # Shallow: refresh() replaces the value whole and nothing changes it in place,
+            # so callers share its items and must copy before mutating them.
             return {
-                **copy.deepcopy(self.value),
+                **self.value,
                 "refreshing": bool(self.worker and self.worker.is_alive()),
             }
 

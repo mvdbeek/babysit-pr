@@ -617,7 +617,13 @@ class SentryIssues:
                 self.loading = True
                 self.next_poll = time.time() + INTERVAL
                 threading.Thread(target=self._refresh, daemon=True).start()
-            value = copy.deepcopy(self.value)
+            # One level deep: decorate() and the dashboard set keys on the value and its
+            # groups and append warnings; nested data is replaced whole, never changed.
+            value = {**self.value}
+            if "groups" in value:
+                value["groups"] = [dict(group) for group in value["groups"]]
+            if "warnings" in value:
+                value["warnings"] = list(value["warnings"])
             state = {
                 "enabled": self.enabled,
                 "loading": self.loading,
@@ -765,7 +771,8 @@ class SentryIssues:
 
     def targets(self):
         with self.lock:
-            groups = copy.deepcopy(self.value.get("groups", []))
+            # Targets are new dicts; the nested data they share is never changed in place.
+            groups = self.value.get("groups", [])
         return [
             {
                 "id": f"sentry:{g['key']}",

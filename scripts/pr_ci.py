@@ -10,6 +10,7 @@ import os
 import subprocess
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
@@ -75,6 +76,8 @@ query($id: ID!) {
 }
 """
 MAX_BODY = 4000
+# Failures GitHub or the network cause; anything else is a bug and is logged.
+EXPECTED = (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError)
 # One cached review entry stays small however busy the PR: later text is left to GitHub.
 MAX_REVIEW_TEXT = 200_000
 
@@ -277,6 +280,9 @@ class CiDetails:
         self.lock = threading.Lock()
         self.entries: OrderedDict[str, dict] = OrderedDict()
         self.workers: dict[str, threading.Thread] = {}
+        # Cache writes happen outside self.lock, in order; an older state never wins.
+        self.save_lock = threading.Lock()
+        self.version = self.saved = 0
         try:
             saved = json.loads(self.path.read_text())
             self.entries.update(list(saved.items())[-MAX_ENTRIES:])
@@ -314,7 +320,10 @@ class CiDetails:
             )
             expired = time.time() >= entry["expires_at"] or (
                 # New activity moves updated_at: refetch now instead of waiting out the TTL.
-                reviews and (entry["value"] or {}).get("for_updated_at") != pr.get("updated_at")
+                # A failed fetch keeps its retry delay, whatever value it still holds.
+                reviews
+                and not entry.get("error")
+                and (entry["value"] or {}).get("for_updated_at") != pr.get("updated_at")
             )
             busy = False
             if expired and key not in self.workers:
@@ -328,6 +337,7 @@ class CiDetails:
                 self.entries.move_to_end(key)
             return {
                 **copy.deepcopy(entry),
+                "error": entry.get("error") or entry.get("save_error"),
                 "refreshing": key in self.workers or busy,
                 "busy": busy,
                 "stale": expired and entry["value"] is not None,
@@ -335,35 +345,52 @@ class CiDetails:
 
     def refresh(self, key, loader):
         try:
-            value = loader()
-            entry = {
-                "value": value,
-                "error": None,
-                "synced_at": time.time(),
-                "expires_at": time.time() + TTL,
-            }
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-            with self.lock:
-                old = self.entries.get(key, {})
-            entry = {
-                "value": old.get("value"),
-                "synced_at": old.get("synced_at"),
-                "error": str(exc),
-                "expires_at": time.time() + ERROR_TTL,
-            }
-        with self.lock:
             try:
+                value = loader()
+                entry = {
+                    "value": value,
+                    "error": None,
+                    "synced_at": time.time(),
+                    "expires_at": time.time() + TTL,
+                }
+            except Exception as exc:
+                # Any failure, expected or not, waits out ERROR_TTL rather than refetching.
+                if not isinstance(exc, EXPECTED):
+                    traceback.print_exc()
+                with self.lock:
+                    old = self.entries.get(key, {})
+                entry = {
+                    "value": old.get("value"),
+                    "synced_at": old.get("synced_at"),
+                    "error": str(exc) or repr(exc),
+                    "expires_at": time.time() + ERROR_TTL,
+                }
+            with self.lock:
                 self.entries[key] = entry
                 self.entries.move_to_end(key)
                 while len(self.entries) > MAX_ENTRIES:
                     self.entries.popitem(last=False)
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                temp = self.path.with_suffix(".tmp")
-                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w") as stream:
-                    json.dump(self.entries, stream)
-                temp.replace(self.path)
-            except OSError:
-                entry["error"] = "CI details loaded, but the local cache could not be saved"
-            finally:
+                # Serialized here, written below: readers never wait for the disk.
+                self.version += 1
+                version, payload = self.version, json.dumps(self.entries)
+            with self.save_lock:
+                if version > self.saved:
+                    try:
+                        self.path.parent.mkdir(parents=True, exist_ok=True)
+                        temp = self.path.with_suffix(".tmp")
+                        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                        with os.fdopen(fd, "w") as stream:
+                            stream.write(payload)
+                        temp.replace(self.path)
+                        self.saved = version
+                    except OSError:
+                        # Kept apart from "error", which only a failed load sets: this
+                        # value is good, so new activity may still refetch it.
+                        with self.lock:
+                            entry["save_error"] = (
+                                "CI details loaded, but the local cache could not be saved"
+                            )
+        finally:
+            # However the load ended, this key no longer counts as refreshing.
+            with self.lock:
                 self.workers.pop(key, None)
