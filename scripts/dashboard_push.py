@@ -16,6 +16,8 @@ from urllib.parse import quote, urlsplit
 
 LOG = logging.getLogger(__name__)
 PUSH_HOSTS = {"web.push.apple.com", "fcm.googleapis.com", "updates.push.services.mozilla.com"}
+# How long, in milliseconds, an item may be missing from its source before its baseline goes.
+FORGET_MISSING = 24 * 60 * 60 * 1000
 FIELDS = {
     "prs": {
         "repo": "Repository",
@@ -198,7 +200,12 @@ def samples(source, payload):
                 {field: comment.get(field) for field in ("kind", "id", "body")}
                 for comment in item.get("feedback", [])
             ]
-            values["checks"] = check_result(item.get("check_details", []))
+            # Ended watches leave out their check details, but not their overall result.
+            values["checks"] = (
+                item["checks_result"]
+                if "checks_result" in item
+                else check_result(item.get("check_details", []))
+            )
         result.append(
             {
                 "url": url,
@@ -232,7 +239,8 @@ def observe(device, source, payload, now, silenced=()):
         return
     initialized = source in device["baselines"]
     baseline = device["baselines"].setdefault(source, {})
-    for sample in samples(source, payload):
+    listed = samples(source, payload)
+    for sample in listed:
         url = sample["url"]
         old = baseline.get(url)
         if old and sample["at"] < old["at"]:
@@ -275,6 +283,20 @@ def observe(device, source, payload, now, silenced=()):
             entry["notes"][source] = {"at": entry["at"], "text": " · ".join(fields) + " updated"}
         elif source not in entry["notes"]:
             entry["notes"][source] = {"at": entry["at"], "text": "Recent activity"}
+    # As the browser inbox does: a snapshot lists all of its source's items, but one can
+    # drop out for a while. Its baseline is kept, so a return compares as usual, and is
+    # forgotten after a day missing, with CI outcomes no source still lists. Entries stay.
+    present = {sample["url"] for sample in listed}
+    for url, old in list(baseline.items()):
+        if url in present:
+            old.pop("missing", None)
+        elif "missing" not in old:
+            old["missing"] = now
+        elif now - old["missing"] >= FORGET_MISSING:
+            del baseline[url]
+    known = set().union(*device["baselines"].values())
+    for url in [url for url in device.get("outcomes", {}) if url not in known]:
+        del device["outcomes"][url]
     ordered = sorted(device["entries"], key=lambda key: device["entries"][key]["at"], reverse=True)
     for key in ordered[10:]:
         entry = device["entries"][key]

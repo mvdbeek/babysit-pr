@@ -86,8 +86,9 @@ It serves `http://127.0.0.1:8765` and refreshes saved watcher state every five
 seconds. Search/filter watches, select one for CI details and the latest repair
 logs, or expand the watcher service log. Select a watch and click **Cancel watch**
 to stop it. A running repair finishes first; the dashboard shows cancellation
-pending until it exits. Ended watches remain available under the Ended filter.
-Cancellation uses the same stop action as the CLI. The dashboard uses Python's
+pending until it exits. Ended watches remain available under the Ended filter;
+the five-second poll carries only their overall CI result, and selecting one loads
+its check and failed-job lists. Cancellation uses the same stop action as the CLI. The dashboard uses Python's
 standard library; no GitHub polling or agent runs are added. Ctrl-C stops the
 dashboard while monitoring continues. `--port PORT` changes the port;
 `--home PATH` before `dashboard` selects an existing watcher state directory.

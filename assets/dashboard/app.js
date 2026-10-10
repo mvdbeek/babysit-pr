@@ -500,6 +500,9 @@ function renderDetail() {
   if (!document.hidden && !$("watcher-panel").hidden) {
     window.dashboardNotifications?.seen([job.url]);
   }
+  // A pane opened afresh (detailKey reset) retries a failed request; polls do not.
+  const details =
+    tab === "checks" && job.details_omitted ? watchDetails(job, detailKey === null) : null;
   // Every watcher cycle moves the poll times; they would rebuild the pane, reloading the
   // log from "Loading…", so the observation time is updated in place instead.
   const key = JSON.stringify([
@@ -510,6 +513,7 @@ function renderDetail() {
     approving.has(job.id),
     feedbackErrors.get(job.id),
     workspaceInfo({ id: `watch:${job.id}` }),
+    details && [details.version, details.error, Boolean(details.job)],
   ]);
   if (key === detailKey) {
     setText(detailPolled, polledText(job));
@@ -668,16 +672,27 @@ function renderDetail() {
   const panel = el("div");
   panel.setAttribute("role", "tabpanel");
   body.append(panel);
-  if (tab === "checks") {
-    if (!job.check_details.length)
+  if (tab === "checks" && details?.error) {
+    const error = el(
+      "p",
+      `Could not load CI checks: ${details.error}. Select the watch again to retry.`,
+      "cancel-error",
+    );
+    error.setAttribute("role", "alert");
+    panel.append(error);
+  } else if (tab === "checks" && details && !details.job) {
+    panel.append(el("p", "Loading checks…", "watch-summary"));
+  } else if (tab === "checks") {
+    const { check_details, failed_jobs } = details?.job || job;
+    if (!check_details.length)
       panel.append(
         el("p", "No CI checks observed yet. Waiting does not mean green.", "watch-summary"),
       );
-    for (const check of job.check_details)
+    for (const check of check_details)
       panel.append(checkRow(check.name, check.link, check.bucket, check.workflow));
-    if (job.failed_jobs.length) {
+    if (failed_jobs.length) {
       panel.append(el("p", "Failed jobs", "section-label"));
-      for (const check of job.failed_jobs)
+      for (const check of failed_jobs)
         panel.append(checkRow(check.job_name, check.html_url, "fail", check.workflow_name));
     }
   } else {
@@ -829,6 +844,28 @@ async function loadLog(job) {
     return;
   logShown = request;
   setText($("repair-log"), text);
+}
+// Ended watches arrive without their CI details; each version (updated_at) of one is
+// fetched once, when its checks are shown, rather than on every 5-second poll.
+const watchDetailCache = new Map();
+function watchDetails(job, retry) {
+  const cached = watchDetailCache.get(job.id);
+  if (cached?.version === job.updated_at && !(retry && cached.error)) return cached;
+  const entry = { version: job.updated_at, job: null, error: null };
+  watchDetailCache.set(job.id, entry);
+  get(`/api/watch?id=${encodeURIComponent(job.id)}`)
+    .then((result) => {
+      if (!result.job) throw Error("No details were returned");
+      entry.job = result.job;
+    })
+    .catch((error) => {
+      entry.error = error.message;
+    })
+    .finally(() => {
+      if (watchDetailCache.get(job.id) === entry && selected === job.id && tab === "checks")
+        renderDetail();
+    });
+  return entry;
 }
 async function serviceLog() {
   try {
@@ -1123,24 +1160,24 @@ function itemTable(spec) {
     const value = spec.changeValue?.(item, field);
     return value === undefined ? (item[field] ?? null) : value;
   }
-  function visitSnapshot() {
-    return {
-      synced_at: table.data.synced_at,
-      [spec.key]: Object.fromEntries(
-        items().map((item) => [
-          item.id,
-          Object.fromEntries(
-            [...Object.keys(spec.changeFields), "updated_at"].map((field) => [
-              field,
-              changeValue(item, field),
-            ]),
-          ),
-        ]),
-      ),
-    };
+  // Current values for the `shown` items; any other item keeps its `previous` entry.
+  function visitSnapshot(shown = items(), previous = {}) {
+    const current = new Set(shown.map((item) => item.id));
+    const values = {};
+    for (const item of items()) {
+      if (current.has(item.id))
+        values[item.id] = Object.fromEntries(
+          [...Object.keys(spec.changeFields), "updated_at"].map((field) => [
+            field,
+            changeValue(item, field),
+          ]),
+        );
+      else if (Object.hasOwn(previous, item.id)) values[item.id] = previous[item.id];
+    }
+    return { synced_at: table.data.synced_at, [spec.key]: values };
   }
-  function readVisit(key) {
-    const saved = JSON.parse(localStorage.getItem(key));
+  function readVisit(key, raw = localStorage.getItem(key)) {
+    const saved = JSON.parse(raw);
     return saved &&
       Number.isFinite(saved.synced_at) &&
       saved[spec.key] &&
@@ -1166,11 +1203,15 @@ function itemTable(spec) {
         baseline: baseline || visitSnapshot(),
         first: !baseline,
         storage,
-        saved: null,
+        stored: null,
+        shown: null,
       });
     }
     return table.visits.get(key);
   }
+  // Only rendered rows count as seen. An item hidden by search, filters or the row window
+  // keeps its unread notification and its last saved values, so the next visit still
+  // highlights its changes; a new item joins the saved snapshot once shown.
   function rememberVisit(visit) {
     if (
       visit &&
@@ -1179,28 +1220,35 @@ function itemTable(spec) {
       table.data.synced_at >= visit.baseline.synced_at
     ) {
       window.dashboardNotifications?.seen(
-        items().map((item) => item.url),
+        table.shown.map((item) => item.url),
         table.data.login,
         spec.key,
         table.data.synced_at * 1000,
       );
     }
     if (!visit || !visit.storage || table.data.error || table.data.refreshing) return;
-    const snapshot = visitSnapshot();
-    if (snapshot.synced_at < visit.baseline.synced_at) return;
-    const serialized = JSON.stringify(snapshot);
-    if (serialized === visit.saved) return;
+    if (table.data.synced_at < visit.baseline.synced_at) return;
     try {
+      // Renders run on every keystroke, scroll and poll: with neither the shown rows nor
+      // the stored snapshot changed since this tab saved it, there is nothing to merge.
+      const raw = localStorage.getItem(visit.key);
+      const shown = JSON.stringify(visitSnapshot(table.shown));
+      if (raw !== null && raw === visit.stored && shown === visit.shown) return;
       let latest = null;
       try {
-        latest = readVisit(visit.key);
+        latest = readVisit(visit.key, raw);
       } catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
       }
-      // A slower tab must not overwrite a newer snapshot saved by another tab.
-      if (!latest || latest.synced_at <= snapshot.synced_at)
-        localStorage.setItem(visit.key, serialized);
-      visit.saved = serialized;
+      // Another tab may have saved items this one does not show.
+      const snapshot = visitSnapshot(table.shown, (latest || visit.baseline)[spec.key]);
+      // A slower tab must not overwrite a newer snapshot saved by another tab. Its shown
+      // rows are then not recorded as saved, so they are merged in once it catches up.
+      if (latest && latest.synced_at > snapshot.synced_at) return;
+      const serialized = JSON.stringify(snapshot);
+      if (serialized !== raw) localStorage.setItem(visit.key, serialized);
+      visit.stored = serialized;
+      visit.shown = shown;
     } catch {
       visit.storage = false;
     }
@@ -2759,7 +2807,8 @@ async function workspaceDialog(item, handling = "") {
 }
 // A task with no PR or issue behind it, like `wtl`'s branch target: a new branch from a
 // base in any local clone, or, with a title, a GitHub issue filed first and then handled.
-async function newTaskDialog(prefill = {}) {
+// `fromLink` marks a prefill from a #task= link, which any website can open.
+async function newTaskDialog(prefill = {}, fromLink = false) {
   // Stands in for the dialog's item; its id becomes the operation's once one starts.
   const owner = { id: null, newTask: true };
   workspaceDialogItem = owner;
@@ -2971,6 +3020,10 @@ async function newTaskDialog(prefill = {}) {
       }
     };
     $("workspace-content").replaceChildren(form);
+    if (fromLink)
+      form.before(
+        el("p", "Prefilled from a link. Check the repository and task before starting.", "alert"),
+      );
     searchableSelect(repo);
     searchableSelect(model);
     searchableSelect(effort);
@@ -2996,7 +3049,7 @@ function browserTaskHandoff() {
       (value.base !== undefined && typeof value.base !== "string")
     )
       throw Error("Invalid browser task");
-    void newTaskDialog(value);
+    void newTaskDialog(value, true);
   } catch (error) {
     $("navigation-status").hidden = false;
     $("navigation-status").textContent = error.message;

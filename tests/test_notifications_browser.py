@@ -425,6 +425,7 @@ def test_own_actions_and_progress_are_quiet_but_outcomes_notify(page, inbox):
         attempts=job.get("attempts", 0) + 1,
         updated_at=job["updated_at"] + 1,
         check_details=[{"name": "a", "bucket": "pass"}, {"name": "b", "bucket": "pending"}],
+        checks_result="PENDING",
     )
     packets["prs"]["prs"][0]["ci"] = "PENDING"
     packets["prs"]["synced_at"] += 1
@@ -434,6 +435,7 @@ def test_own_actions_and_progress_are_quiet_but_outcomes_notify(page, inbox):
         status="blocked",
         updated_at=job["updated_at"] + 1,
         check_details=[{"name": "a", "bucket": "pass"}, {"name": "b", "bucket": "fail"}],
+        checks_result="FAILURE",
     )
     refresh(page)
     count(page, 1)

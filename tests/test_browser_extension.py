@@ -62,6 +62,9 @@ class FakeWorkspaces:
         self.operations[operation["id"]] = {"operation": operation}
         return {"operation": operation}
 
+    def operation_status(self, key):
+        return self.operations.get(key, {}).get("operation")
+
     action = new_task
 
 

@@ -231,6 +231,10 @@ def test_handler_threads_have_a_socket_timeout():
     assert dashboard.Handler.timeout == 30
 
 
+def test_kept_alive_responses_are_not_held_back_by_nagle():
+    assert dashboard.Handler.disable_nagle_algorithm
+
+
 class Sentry:
     def __init__(self):
         self.refreshes = 0
@@ -313,3 +317,36 @@ def test_notification_preferences_read_only_the_login(tmp_path):
     inbox = PushInbox(tmp_path, snapshots, login=lambda: "alice")
     assert inbox.preferences() == {"login": "alice", "silenced": []}
     assert built == [1]  # The poll no longer builds every snapshot.
+
+
+def test_an_error_after_the_response_began_closes_a_kept_alive_connection(tmp_path):
+    """The client of a response cut short is not left waiting out the idle timeout."""
+    server = dashboard.DashboardServer(tmp_path, 0)
+
+    def known_origin(origin):
+        raise sqlite3.OperationalError("database is locked")
+
+    server.extension.known_origin = known_origin
+    # A paired extension's request whose reply fails after its status line was begun.
+    server.extension.authenticate = lambda headers: {"id": "fixture"}
+    server.extension.dispatch = lambda server, client, request: {"ok": True}
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/extension",
+            body=b"{}",
+            headers={"Content-Type": "application/json", "Origin": "chrome-extension://fixture"},
+        )
+        started = time.monotonic()
+        # Before: no bytes and an open socket until the 30 s idle timeout (a TimeoutError here).
+        with pytest.raises(http.client.RemoteDisconnected):
+            connection.getresponse()
+        assert time.monotonic() - started < 5
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)

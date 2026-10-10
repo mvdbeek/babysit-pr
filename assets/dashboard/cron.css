@@ -45,7 +45,7 @@
   outline-offset: -3px;
 }
 .cron-job.selected {
-  background: #f1f6ec;
+  background: var(--selected);
   box-shadow: inset 3px 0 var(--green);
 }
 .cron-job-top {
@@ -131,7 +131,7 @@
 .cron-runs th {
   position: sticky;
   top: 0;
-  background: #f7f9f5;
+  background: var(--th-cron);
   color: var(--muted);
   font-size: 12px;
   font-weight: 550;
@@ -147,7 +147,7 @@
   border-bottom: 0;
 }
 .cron-runs tr.selected td {
-  background: #f1f6ec;
+  background: var(--selected);
 }
 .cron-runs small {
   display: block;
@@ -179,17 +179,6 @@
 }
 #cron-dialog {
   width: min(640px, 92vw);
-  max-height: 90vh;
-  max-height: 90dvh;
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 24px;
-  color: var(--ink);
-  background: var(--paper);
-}
-#cron-dialog::backdrop {
-  background: #0008;
 }
 #cron-form {
   display: grid;
@@ -209,7 +198,7 @@
 }
 #cron-form textarea {
   color: var(--ink);
-  border: 1px solid #d6ddd3;
+  border: 1px solid var(--field-line);
   border-radius: 7px;
   padding: 9px 12px;
 }
@@ -252,8 +241,7 @@
 }
 /* Shared narrow-screen rules stretch inputs to full rows; these stay on one line. */
 #cron-form .cron-every input,
-#cron-form .cron-every select,
-#cron-form .cron-enabled input {
+#cron-form .cron-every select {
   flex: none;
 }
 #cron-form #cron-every {
@@ -279,9 +267,7 @@
   font-weight: 400;
 }
 #cron-form .cron-enabled input {
-  width: auto;
   margin: 0;
-  padding: 0;
 }
 .cron-dialog-actions {
   display: flex;
@@ -332,10 +318,7 @@
 }
 #cron-form .cron-kinds input,
 #cron-form .workspace-later input {
-  width: auto;
   margin: 0;
-  padding: 0;
-  flex: none;
 }
 .cron-section {
   display: grid;

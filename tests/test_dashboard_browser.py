@@ -154,12 +154,27 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
             thread.join(timeout=5)
 
 
+def xpath_literal(value: str) -> str:
+    """``value`` as an XPath string literal, whatever quotes it contains."""
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    return "concat(" + ', "\'", '.join(f"'{part}'" for part in value.split("'")) + ")"
+
+
 def choose_option(control: Locator, value: str) -> None:
     """Choose through the visible picker, including its real narrowing behavior."""
     if control.evaluate("node => node.tagName") == "SELECT":
         control.select_option(value)
         return
     wrapper = control.locator("xpath=../..")
+    # The options arrive with the page's first snapshot; wait for them like a person would.
+    expect(
+        wrapper.locator("select option").filter(
+            has=control.page.locator(f"xpath=self::*[@value={xpath_literal(value)}]")
+        )
+    ).to_have_count(1)
     label = wrapper.locator("select option").evaluate_all(
         "(options, value) => options.find(option => option.value === value).label", value
     )
@@ -224,9 +239,13 @@ def test_header_branding_and_status_fit_at_all_widths(page: Page, dashboard_site
                     && rect.top >= header.top && rect.bottom <= header.bottom;
             }"""
         )
+    # Beside each other, or (on the narrowest phones) the status on a row of its own below.
     assert page.locator(".brand").evaluate(
-        "node => node.getBoundingClientRect().right <= "
-        "document.querySelector('.connection').getBoundingClientRect().left"
+        """node => {
+            const brand = node.getBoundingClientRect();
+            const status = document.querySelector('.connection').getBoundingClientRect();
+            return brand.right <= status.left || brand.bottom <= status.top;
+        }"""
     )
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     tagline = page.locator("header p")
@@ -980,7 +999,9 @@ def test_pr_metadata_and_mobile_sort_survive_refresh_and_filtering(
     expect(filters).to_have_attribute("aria-expanded", "false")
     expect(page.locator("#pr-filters")).to_be_hidden()
     first = page.locator("#pr-list tr").first
-    assert first.bounding_box()["y"] < 300
+    # With the filters folded away the first card is on the first screen. Phones of 380px or
+    # less have a second header row for the connection status, so allow for it.
+    assert first.bounding_box()["y"] < 340
     refresh = page.get_by_role("button", name="Refresh", exact=True)
     assert refresh.bounding_box()["width"] == 44
     assert refresh.bounding_box()["y"] == page.locator("#pr-search").bounding_box()["y"]

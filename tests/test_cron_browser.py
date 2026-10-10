@@ -217,6 +217,8 @@ def test_define_and_follow_an_agent_job(page, agent_site, errors, width, monkeyp
     url, jobs, manager, state = agent_site
     page.set_viewport_size({"width": width, "height": 1000})
     page.goto(url + "/#cron")
+    # Agent jobs are offered once the first snapshot says agents can run.
+    expect(page.locator("#cron-status")).not_to_have_text("Loading cron jobs…")
     page.get_by_role("button", name="New job").click()
     dialog = page.locator("#cron-dialog")
     expect(dialog.get_by_label("An agent task")).to_be_checked()
