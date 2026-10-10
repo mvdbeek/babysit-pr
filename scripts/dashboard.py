@@ -966,13 +966,24 @@ class Handler(BaseHTTPRequestHandler):
                 if any(len(values) != 1 for values in query.values()):
                     raise ValueError("Supply each parameter once")
                 single = {name: values[0] for name, values in query.items()}
-                # A herdr workspace (what Collie opens) or a row of the Workspaces tab.
-                if ("workspace" in single) == ("key" in single):
-                    raise ValueError("Supply a workspace or a workspace key")
+                # A herdr workspace (what Collie opens), a row of the Workspaces tab, or
+                # a watch's registered checkout, which needs no workspace.
+                if len({"workspace", "key", "watch"} & set(single)) != 1:
+                    raise ValueError("Supply a workspace, a workspace key or a watch")
+                prefer = None
                 if "key" in single:
                     if not self.server.workspace_overview:
                         raise ValueError("The workspace experiment is disabled")
                     path = self.server.workspace_overview.checkout(single.pop("key"))
+                if "watch" in single:
+                    wanted = single.pop("watch")
+                    job = next(
+                        (j for j in read_jobs(self.server.home) if j.get("id") == wanted), None
+                    )
+                    if job is None:
+                        raise ValueError("Unknown watch; refresh")
+                    # The session its repairs resume opens first.
+                    path, prefer = job["cwd"], job.get("session_id")
                 # Read-only views own their failure boundary, like the inventory.
                 try:
                     if "workspace" in single:
@@ -993,7 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
                                     raise ValueError("Expected a numeric page position")
                                 positions[name] = int(single[name])
                         value = workspace_viewer.transcript(
-                            path, single.get("session"), **positions
+                            path, single.get("session"), prefer=prefer, **positions
                         )
                 except ValueError:
                     raise

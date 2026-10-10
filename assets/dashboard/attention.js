@@ -112,6 +112,23 @@
     };
     actions.append(open);
     if (item.workspace_url) actions.append(anchor("Open in Collie", item.workspace_url));
+    // Read the agent's transcript or diff here: in its workspace, as beside every other
+    // Collie link, or in a watch's checkout, where its repairs run without one.
+    const view = item.workspace_id
+      ? { workspace: item.workspace_id }
+      : item.watch?.id
+        ? { watch: item.watch.id }
+        : null;
+    if (view && window.workspaceViewer)
+      actions.append(
+        ...window.workspaceViewer.buttons({
+          ...view,
+          name: item.title || item.key,
+          links: item.number
+            ? [{ label: `${KINDS[item.kind] || ""} #${item.number}`.trim(), url: item.url }]
+            : [],
+        }),
+      );
     if (item.url) actions.append(anchor("GitHub", item.url));
     const waiting = "waiting_since" in item;
     const triage = node("button", waiting ? "Resume" : "Wait for activity", "attention-triage");

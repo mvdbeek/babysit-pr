@@ -2195,11 +2195,17 @@ function subjectLinks(item) {
   }
   return item.number ? [{ label: `PR #${item.number}`, url: item.url, title }] : [];
 }
-// Diff and Transcript for a checkout that has a herdr workspace, beside Open in Collie.
+// Diff and Transcript for a checkout that has a herdr workspace, beside Open in Collie;
+// a watch's registered checkout is read without one.
 function viewerButtons(target, item, name) {
-  return target?.workspace_id && window.workspaceViewer
+  const view = target?.workspace_id
+    ? { workspace: target.workspace_id }
+    : item?.kind === "watch"
+      ? { watch: item.id.replace(/^watch:/, "") }
+      : null;
+  return view && window.workspaceViewer
     ? window.workspaceViewer.buttons({
-        workspace: target.workspace_id,
+        ...view,
         name: name || target.name,
         links: subjectLinks(item),
       })
@@ -2299,7 +2305,10 @@ async function chooseWorkspace(item, target, action) {
         await workspaceDialog(item);
         $("workspace-error").textContent = "Use Open in Collie to continue.";
       }
-      $("workspace-result").replaceChildren(link("Open in Collie", value.result.url));
+      $("workspace-result").replaceChildren(
+        link("Open in Collie", value.result.url),
+        ...viewerButtons(value.result, item),
+      );
     } else if (value.operation) {
       setWorkspaceOperation(item, value.operation);
       updateWorkspaceOperation();

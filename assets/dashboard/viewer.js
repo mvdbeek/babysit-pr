@@ -287,9 +287,11 @@
       byId(id).setAttribute("aria-selected", String(viewer?.mode === mode));
     }
   }
-  // A view names a Workspaces-tab row or a herdr workspace (anything Collie can open).
+  // A view names a Workspaces-tab row, a herdr workspace (anything Collie can open), or
+  // a watch, whose registered checkout is read without one.
   function where(target) {
-    return target.key ? { key: target.key } : { workspace: target.workspace };
+    if (target.key) return { key: target.key };
+    return target.workspace ? { workspace: target.workspace } : { watch: target.watch };
   }
   // Whom a message goes to: the herdr workspace, or a Workspaces-tab row listed while
   // none was open, whose recorded sessions can still be resumed.
@@ -1900,7 +1902,8 @@
       void loadViewer({ after: Math.max(data.start, data.total - 20) });
   }, 10000);
   // Diff and Transcript buttons for a target: {workspace} (a herdr workspace ID) and/or
-  // {key} (a Workspaces-tab row), plus a name for the dialog title and the links it shows.
+  // {key} (a Workspaces-tab row), or {watch} (a watch ID), plus a name for the dialog
+  // title and the links it shows.
   // The pair is one element, so a narrow cell wraps it together.
   function buttons(target) {
     const pair = node("span", undefined, "ws-view-buttons");

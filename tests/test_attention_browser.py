@@ -133,6 +133,7 @@ def test_agents_chip_counts_waiting_agents_and_opens_the_tab(page: Page, dashboa
                 [("agent_blocked", "An agent is waiting for your answer")],
                 pages=["prs", "workspaces"],
                 workspace_url="http://127.0.0.1:8787/space/w1",
+                workspace_id="w1",
                 agent={"status": "blocked"},
             ),
             {
@@ -166,11 +167,64 @@ def test_agents_chip_counts_waiting_agents_and_opens_the_tab(page: Page, dashboa
     expect(first.get_by_role("link", name="GitHub")).to_have_attribute(
         "href", "https://github.com/test/alpha/pull/8"
     )
+    # Beside Open in Collie, the agent's transcript is read in place.
+    seen = []
+
+    def transcript(route):
+        seen.append(route.request.url)
+        route.fulfill(json={"sessions": [], "session": None, "entries": [], "start": 0, "total": 0})
+
+    page.route("**/api/workspace-transcript?*", transcript)
+    first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.get_by_text("No Claude or Codex session")).to_be_visible()
+    assert "workspace-transcript?workspace=w1" in seen[-1]
+    expect(viewer.locator("#ws-viewer-links").get_by_role("link", name="PR #8")).to_have_attribute(
+        "href", "https://github.com/test/alpha/pull/8"
+    )
+    page.keyboard.press("Escape")
+    expect(viewer).to_be_hidden()
     cron = page.locator(".attention-item").nth(1)
+    expect(cron.get_by_role("button", name="Transcript", exact=True)).to_have_count(0)
     expect(cron).to_contain_text("Cron job")
     expect(cron.locator(".attention-title")).to_have_text("Nightly")
     expect(cron.get_by_role("link", name="Show in Cron jobs")).to_have_attribute("href", "#cron")
     expect(cron.get_by_role("link", name="GitHub")).to_have_count(0)
+
+
+def test_a_blocked_repair_offers_its_transcript_without_a_workspace(
+    page: Page, dashboard_site
+) -> None:
+    url, _ = dashboard_site
+    blocked = feed_with(
+        [
+            item(
+                "https://github.com/test/alpha/pull/8",
+                "answer",
+                [("watch_blocked", "Repair blocked: needs a decision")],
+                pages=["watcher"],
+                watch={"id": "abc123", "status": "blocked"},
+            )
+        ],
+        pages={**EMPTY["pages"], "watcher": 1},
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=blocked))
+    seen = []
+
+    def transcript(route):
+        seen.append(route.request.url)
+        route.fulfill(json={"sessions": [], "session": None, "entries": [], "start": 0, "total": 0})
+
+    page.route("**/api/workspace-transcript?*", transcript)
+    page.goto(url + "/#attention")
+    card = page.locator(".attention-item").first
+    expect(card.get_by_role("link", name="Open in Collie")).to_have_count(0)
+    card.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.get_by_text("No Claude or Codex session")).to_be_visible()
+    assert "workspace-transcript?watch=abc123" in seen[-1]
+    # No workspace means no agent to message; the transcript is read only.
+    expect(page.locator("#ws-message")).to_be_hidden()
 
 
 def test_groups_collapse_and_stay_collapsed_across_polls(page: Page, dashboard_site) -> None:
