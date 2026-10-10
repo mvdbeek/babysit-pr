@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 
+import attention
 import cron_jobs
 import dashboard
 import pytest
@@ -337,6 +338,96 @@ def test_unknown_actions_and_bad_ids(jobs):
         jobs.log("../etc/passwd")
 
 
+# -- dismissing --
+
+
+def recorded(jobs, saved, status, **fields):
+    """A finished run as the scheduler would store it."""
+    with jobs.db() as db:
+        return jobs.record(
+            db,
+            saved,
+            trigger="schedule",
+            started_at=1000.0,
+            finished_at=1060.0,
+            status=status,
+            message=f"The {status} run",
+            **fields,
+        )
+
+
+def test_dismissing_acknowledges_the_latest_run_and_keeps_its_result(tmp_path):
+    clock = [5000.0]
+    jobs = CronJobs(tmp_path, shell=SHELL, clock=lambda: clock[0])
+    saved = job(jobs)
+    recorded(jobs, saved, "failed")
+    run = recorded(jobs, saved, "attention", kind="agent")
+    value = jobs.action({"action": "dismiss", "id": saved["id"], "run": run["id"]})
+    assert value["run"]["dismissed_at"] == 5000.0
+    latest, older = jobs.snapshot()["jobs"][0]["runs"]
+    assert latest["id"] == run["id"] and latest["dismissed_at"] == 5000.0
+    # History is not rewritten: the run keeps its status and message.
+    assert latest["status"] == "attention" and latest["message"] == "The attention run"
+    assert "dismissed_at" not in older
+    # Dismissing again changes nothing.
+    clock[0] = 6000.0
+    again = jobs.action({"action": "dismiss", "id": saved["id"], "run": run["id"]})
+    assert again["run"]["dismissed_at"] == 5000.0
+    jobs.close()
+
+
+@pytest.mark.parametrize("status", sorted(cron_jobs.DISMISSABLE))
+def test_every_alerting_status_can_be_dismissed(jobs, status):
+    saved = job(jobs)
+    run = recorded(jobs, saved, status)
+    assert jobs.dismiss(saved["id"], run["id"])["dismissed_at"]
+
+
+def test_dismissing_is_refused_unless_the_latest_run_needs_attention(jobs):
+    saved = job(jobs)
+    older = recorded(jobs, saved, "attention")
+    newer = recorded(jobs, saved, "succeeded")
+    with pytest.raises(ValueError, match="Only the job's latest run can be dismissed"):
+        jobs.dismiss(saved["id"], older["id"])
+    with pytest.raises(ValueError, match="Only a run that failed or needs attention"):
+        jobs.dismiss(saved["id"], newer["id"])
+    with pytest.raises(ValueError, match="This job no longer exists"):
+        jobs.dismiss("missing", newer["id"])
+    with pytest.raises(ValueError, match="Supply a run ID"):
+        jobs.dismiss(saved["id"], 5)
+    with pytest.raises(ValueError, match="Supply a job ID"):
+        jobs.action({"action": "dismiss", "run": newer["id"]})
+    other = job(jobs, name="Other")
+    with pytest.raises(ValueError, match="latest run"):
+        jobs.dismiss(other["id"], newer["id"])
+    assert all("dismissed_at" not in run for run in jobs.snapshot()["jobs"][0]["runs"])
+
+
+def test_a_running_run_cannot_be_dismissed(jobs):
+    saved = job(jobs, command="sleep 30")
+    recorded(jobs, saved, "failed")
+    run = jobs.run_now(saved["id"])
+    wait_for(lambda: jobs.snapshot()["jobs"][0]["running"])
+    with pytest.raises(ValueError, match="Only a run that failed or needs attention"):
+        jobs.dismiss(saved["id"], run["id"])
+    jobs.stop(saved["id"])
+    finished(jobs, saved["id"])
+
+
+def test_a_dismissed_run_leaves_needs_you_until_the_next_one_needs_attention(jobs):
+    saved = job(jobs)
+    run = recorded(jobs, saved, "attention", kind="agent")
+    [item] = attention.collect(cron=jobs.snapshot)["items"]
+    assert item["key"] == f"cron:{saved['id']}"
+    assert item["cron"] == {"id": saved["id"], "run": run["id"]}
+    jobs.dismiss(saved["id"], run["id"])
+    assert attention.collect(cron=jobs.snapshot)["items"] == []
+    newer = recorded(jobs, saved, "attention", kind="agent")
+    [item] = attention.collect(cron=jobs.snapshot)["items"]
+    assert item["cron"]["run"] == newer["id"]
+    assert item["reasons"][0]["code"] == "cron_attention"
+
+
 # -- scheduling --
 
 
@@ -475,6 +566,21 @@ def test_endpoints_define_run_and_read_jobs(site):
     assert code == 400 and "name" in value["error"]
     code, value = call(url, "/api/cron-log?run=1&run=2")
     assert code == 400
+
+
+def test_the_dismiss_endpoint_acknowledges_a_run(site):
+    url, jobs = site
+    saved = job(jobs)
+    run = recorded(jobs, saved, "attention", kind="agent")
+    body = {"action": "dismiss", "id": saved["id"], "run": run["id"]}
+    code, value = call(url, "/api/cron-action", body, action="cron-update")
+    assert code == 403
+    code, value = call(url, "/api/cron-action", body)
+    assert code == 200 and value["run"]["dismissed_at"]
+    newer = recorded(jobs, saved, "succeeded")
+    code, value = call(url, "/api/cron-action", {**body, "run": newer["id"]})
+    assert code == 400
+    assert value["error"] == "Only a run that failed or needs attention can be dismissed"
 
 
 def test_endpoints_report_a_disabled_feature(tmp_path):

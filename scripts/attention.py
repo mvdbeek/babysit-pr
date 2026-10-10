@@ -117,6 +117,7 @@ class Feed:
                 "workspace_id": None,
                 "agent": None,
                 "watch": None,
+                "cron": None,
             }
         for field, value in fields.items():
             if value is not None and item.get(field) is None:
@@ -385,7 +386,8 @@ class Feed:
         for job in snapshot.get("jobs") or []:
             runs = job.get("runs") or []
             last = runs[0] if runs else None
-            if not last:
+            # A dismissed run was dealt with; the job's next run is judged afresh.
+            if not last or last.get("dismissed_at"):
                 continue
             reasons = []
             if last.get("status") == "attention":
@@ -409,6 +411,7 @@ class Feed:
                 kind="cron",
                 title=job.get("name"),
                 since=epoch(last.get("finished_at") or last.get("updated_at")),
+                cron={"id": job.get("id"), "run": last.get("id")},
             )
 
     # -- output --

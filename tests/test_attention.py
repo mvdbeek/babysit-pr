@@ -468,6 +468,17 @@ def test_cron_jobs_report_their_last_run():
     assert attention.collect(cron={"enabled": False, "jobs": jobs}, now=NOW)["items"] == []
 
 
+def test_a_dismissed_cron_run_needs_nobody_until_a_newer_run_does():
+    dismissed = {"id": "7", "status": "attention", "message": "Asked", "dismissed_at": NOW}
+    job = {"id": "1", "name": "Agent", "enabled": True, "runs": [dismissed]}
+    assert attention.collect(cron={"enabled": True, "jobs": [job]}, now=NOW)["items"] == []
+    failed = {"id": "8", "status": "failed", "message": "Exited with status 1"}
+    job["runs"] = [failed, dismissed]
+    [item] = attention.collect(cron={"enabled": True, "jobs": [job]}, now=NOW)["items"]
+    assert item["reasons"][0]["code"] == "cron_failed"
+    assert item["cron"] == {"id": "1", "run": "8"}
+
+
 def test_the_cached_feed_is_shared_for_a_few_seconds_and_refreshed_on_demand(monkeypatch):
     calls = []
 
