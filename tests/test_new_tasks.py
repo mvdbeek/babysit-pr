@@ -274,7 +274,17 @@ def other_clone(manager, git, name="other"):
     other = manager.src / name
     other.mkdir()
     git("init", "-b", "main", cwd=other)
-    git("commit", "--allow-empty", "-m", "other", cwd=other)
+    git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "other",
+        cwd=other,
+    )
     git("remote", "add", "upstream", f"https://github.com/base/{name}.git", cwd=other)
     return other.resolve()
 

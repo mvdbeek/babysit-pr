@@ -1284,7 +1284,17 @@ def test_with_checks_the_branch_out_in_other_clones_for_the_agent(repo, monkeypa
     other = home / "src/other"
     other.mkdir()
     git("init", "-b", "main", cwd=other)
-    git("commit", "--allow-empty", "-m", "other", cwd=other)
+    git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "other",
+        cwd=other,
+    )
     git("branch", "both", cwd=other)
     monkeypatch.setenv("SAFEHOUSE_ADD_DIRS", "/granted")
     run_tool("wt", "-r", "repo", "--with", "other", "--name", "both", "-p", "Fix both")
@@ -1340,7 +1350,18 @@ def test_with_refuses_a_line_too_long_to_type_before_making_any_checkout(repo):
     names = [f"{n}{'x' * 200}" for n in range(3)]
     for name in names:
         git("init", "-q", "-b", "main", str(home / "src" / name), cwd=home)
-        git("commit", "-q", "--allow-empty", "-m", "c", cwd=home / "src" / name)
+        git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c",
+            cwd=home / "src" / name,
+        )
     withs = [word for name in names for word in ("--with", name)]
     result = run_tool("wt", "-r", "repo", *withs, "main", "wide", check=False)
     assert result.stderr.splitlines()[-1] == (
