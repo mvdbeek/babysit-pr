@@ -266,7 +266,11 @@ async function load() {
       "Choose a repository",
     );
     select("repo", draft.fields?.repo);
-    suggest();
+    try {
+      suggest();
+    } catch {
+      /* A half-typed source URL keeps the loaded context; Send reports it. */
+    }
     if (!draft.sent) $("status").textContent = context.agents_error || "Ready.";
   } catch (error) {
     context = null;

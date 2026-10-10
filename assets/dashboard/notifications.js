@@ -8,6 +8,8 @@
   let renderedList = null;
   const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
   const blank = () => ({ baselines: {}, entries: {}, outcomes: {} });
+  // How long an item may be missing from its source's snapshots before its baseline goes.
+  const FORGET_MISSING = 24 * 60 * 60 * 1000;
   const ownActivityFields = {
     IssueComment: ["comments", "updated_at"],
     ContentEdited: ["updated_at"],
@@ -25,10 +27,37 @@
     HeadRefForcePushedEvent: ["head_sha", "updated_at"],
   };
 
+  // A short stable hash, so a baseline need not keep whole comment bodies to see them change.
+  function digest(text) {
+    let h1 = 0xdeadbeef;
+    let h2 = 0x41c6ce57;
+    for (let index = 0; index < text.length; index++) {
+      const code = text.charCodeAt(index);
+      h1 = Math.imul(h1 ^ code, 2654435761);
+      h2 = Math.imul(h2 ^ code, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  }
+  function feedbackDigests(items) {
+    return Array.isArray(items)
+      ? items.map(({ kind, id, body }) => ({
+          kind,
+          id,
+          digest: digest(JSON.stringify(body ?? null)),
+        }))
+      : items;
+  }
+
   function notificationFields(source, sample, old, values) {
     if (source === "watcher" && old) {
       const checks = JSON.parse(old.values.checks || "null");
       if (Array.isArray(checks)) old.values.checks = JSON.stringify(checkResult(checks));
+      // Baselines saved before feedback bodies were stored as digests.
+      const feedback = JSON.parse(old.values.feedback || "null");
+      if (Array.isArray(feedback) && feedback.some((item) => object(item) && "body" in item))
+        old.values.feedback = JSON.stringify(feedbackDigests(feedback));
     }
     const fields = new Set(
       // A field added after the baseline was stored reads as null, not as a change.
@@ -118,8 +147,8 @@
     }
   }
 
-  function read(key) {
-    const value = JSON.parse(localStorage.getItem(key));
+  function read(raw) {
+    const value = JSON.parse(raw);
     if (!object(value) || !object(value.baselines) || !object(value.entries)) return blank();
     const result = blank();
     if (object(value.outcomes)) result.outcomes = value.outcomes;
@@ -160,7 +189,11 @@
   function sync() {
     if (!account?.storage) return;
     try {
-      account.state = read(account.key);
+      // Parse again only when another tab (or a reload) changed the saved state.
+      const raw = localStorage.getItem(account.key);
+      if (raw === account.raw) return;
+      account.raw = raw;
+      account.state = read(raw);
       account.serialized = JSON.stringify(account.state);
     } catch (error) {
       if (error instanceof SyntaxError) account.state = blank();
@@ -195,7 +228,8 @@
 
   function applyPreferences(target, value) {
     if (value.login !== target.login || !Array.isArray(value.silenced)) return;
-    const changed = JSON.stringify(target.silenced) !== JSON.stringify(value.silenced);
+    // Polled preferences are usually unchanged; then there is nothing to store or redraw.
+    if (JSON.stringify(target.silenced) === JSON.stringify(value.silenced)) return;
     target.silenced = value.silenced;
     try {
       localStorage.setItem(`${target.key}:silenced`, JSON.stringify(value.silenced));
@@ -210,7 +244,7 @@
     }
     save();
     render();
-    if (changed) window.dispatchEvent(new Event("notification-preferences"));
+    window.dispatchEvent(new Event("notification-preferences"));
   }
 
   async function refreshPreferences(target = account) {
@@ -293,7 +327,10 @@
     if (account.storage) {
       try {
         const serialized = JSON.stringify(account.state);
-        if (serialized !== account.serialized) localStorage.setItem(account.key, serialized);
+        if (serialized !== account.serialized) {
+          localStorage.setItem(account.key, serialized);
+          account.raw = serialized;
+        }
         account.serialized = serialized;
       } catch {
         account.storage = false;
@@ -462,6 +499,20 @@
         entry.notes[source] = { at: sample.seedAt || sample.at, text: sample.summary };
       }
     }
+    // Each snapshot lists all of its source's items, but one can drop out for a while (a
+    // search omits it, a role is removed and re-added): its baseline is kept, so a return
+    // compares as usual instead of as new, and forgotten only after a day missing, with CI
+    // outcomes no source still lists.
+    const listed = new Set(samples.map((sample) => subject(sample.url)?.key));
+    const now = Date.now();
+    for (const [key, old] of Object.entries(baseline)) {
+      if (listed.has(key)) delete old.missing;
+      else if (!Number.isFinite(old.missing)) old.missing = now;
+      else if (now - old.missing >= FORGET_MISSING) delete baseline[key];
+    }
+    const known = new Set(Object.values(account.state.baselines).flatMap(Object.keys));
+    for (const key of Object.keys(account.state.outcomes))
+      if (!known.has(key)) delete account.state.outcomes[key];
     save();
     render();
   }
@@ -497,6 +548,11 @@
     if (payload.error) return;
     watcherSnapshot = payload;
     if (!account) return;
+    // Actions are matched against stored values, so their feedback uses the same digests.
+    const digested = (values) =>
+      object(values) && "feedback" in values
+        ? { ...values, feedback: feedbackDigests(values.feedback) }
+        : values;
     observe(
       "watcher",
       (payload.jobs || []).map((job) => ({
@@ -504,7 +560,11 @@
         title: job.branch,
         at: (job.updated_at || 0) * 1000,
         seedAt: (job.updated_at || 0) * 1000,
-        actions: job.notification_actions,
+        actions: (job.notification_actions || []).map((action) => ({
+          ...action,
+          before: digested(action.before),
+          after: digested(action.after),
+        })),
         feedbackAuthors: job.feedback,
         values: {
           status: job.status,
@@ -513,7 +573,7 @@
           outcome: job.pr_outcome,
           attempts: job.attempts,
           approved: job.feedback_approved,
-          feedback: (job.feedback || []).map(({ kind, id, body }) => ({ kind, id, body })),
+          feedback: feedbackDigests(job.feedback || []),
           checks: checkResult(job.check_details || []),
         },
         summary: job.summary || `Watcher: ${job.status}`,

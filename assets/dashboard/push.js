@@ -13,7 +13,8 @@
   let config = null;
   let registration = null;
   let pending = {};
-  let chain = Promise.resolve();
+  let syncing = null;
+  let resync = false;
   let busy = false;
   let message = "";
   const key = () => `babysit-pr:push:v1:${login}`;
@@ -78,11 +79,17 @@
 
   function sync() {
     if (!token) return Promise.resolve();
-    const identity = { login, token };
-    chain = chain
-      .catch(() => {})
-      .then(async () => {
-        if (identity.login !== login || identity.token !== token) return;
+    // One request at a time: calls made meanwhile share a single follow-up request, so a
+    // slow or unreachable server never builds a queue that bursts when it recovers.
+    if (syncing) {
+      resync = true;
+      return syncing;
+    }
+    syncing = (async () => {
+      do {
+        resync = false;
+        if (!token) break;
+        const identity = { login, token };
         const sent = { ...pending };
         try {
           const result = await api(
@@ -90,7 +97,7 @@
             { seen: sent },
             identity,
           );
-          if (identity.login !== login || identity.token !== token) return;
+          if (identity.login !== login || identity.token !== token) continue;
           remote = result;
           for (const [url, at] of Object.entries(sent)) {
             if (pending[url] === at) delete pending[url];
@@ -98,14 +105,17 @@
           save();
           message = "";
         } catch (error) {
-          if (identity.login !== login || identity.token !== token) return;
+          if (identity.login !== login || identity.token !== token) continue;
           if (error.status === 400)
             remote = { login, entries: remote?.entries || {}, active: false, error: error.message };
           message = `${error.message}. Will retry when connected.`;
         }
         repaint();
-      });
-    return chain;
+      } while (resync);
+    })().finally(() => {
+      syncing = null;
+    });
+    return syncing;
   }
 
   function account(value) {

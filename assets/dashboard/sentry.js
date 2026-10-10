@@ -32,8 +32,10 @@
   let limit = 50;
   const rowErrors = new Map();
   const acting = new Set();
-  // Rows are rebuilt on every poll; keep expanded triage notes open across rebuilds.
+  // Rows are rebuilt when their data changes; keep expanded triage notes open across rebuilds.
   const openNotes = new Set();
+  // What the rows were last built from; an unchanged poll leaves them (and focus) alone.
+  let renderedRows = null;
   // The open publish dialog: which group, and which sanitized text was last prefilled.
   let publishKey = null;
   let prefilled = null;
@@ -292,6 +294,7 @@
     }
     const starting = ["queued", "running"].includes(entry.handling?.status);
     const handleButton = button(work && !starting ? "Handle again" : "Handle", () => handle(entry));
+    handleButton.dataset.focus = "handle";
     handleButton.disabled = starting;
     if (starting) handleButton.title = "An agent is being started for this issue.";
     cell.append(handleButton);
@@ -310,6 +313,7 @@
     const retriage = button(acting.has(entry.key) ? "Queuing…" : "Re-triage", () =>
       retriageGroup(entry),
     );
+    retriage.dataset.focus = "retriage";
     const pending = ["queued", "running"].includes(entry.triage?.status);
     retriage.disabled = !llm.triage_enabled || pending || acting.has(entry.key);
     if (!llm.triage_enabled) retriage.title = "LLM triage is disabled in the experiment config.";
@@ -362,6 +366,22 @@
       select.append(option);
     }
     select.value = values.includes(chosen) ? chosen : "all";
+    // The searchable picker shows the chosen label; redraw it with the new options.
+    window.dashboardAgents?.sync(select);
+  }
+  // Give keyboard focus back to the same control of the same row after a rebuild.
+  function rebuild(list, rows) {
+    const active = list.contains(document.activeElement) ? document.activeElement : null;
+    const control = (element) =>
+      element.dataset.focus || element.getAttribute("aria-label") || element.textContent;
+    const key = active?.closest("tr")?.dataset.key;
+    const name = active && control(active);
+    list.replaceChildren(...rows);
+    if (!active) return;
+    const line = [...list.rows].find((element) => element.dataset.key === key);
+    [...(line?.querySelectorAll("a, button, input, summary") || [])]
+      .find((element) => control(element) === name)
+      ?.focus({ preventScroll: true });
   }
   function llmLine(llm) {
     const line = byId("llm");
@@ -390,6 +410,7 @@
     notices.replaceChildren();
     if (!data.enabled) {
       byId("list").replaceChildren();
+      renderedRows = null;
       byId("more").hidden = true;
       byId("empty").hidden = true;
       byId("llm").hidden = true;
@@ -401,7 +422,19 @@
     scopeOptions();
     const shown = visible();
     byId("count").textContent = String(shown.length);
-    byId("list").replaceChildren(...shown.slice(0, limit).map(row));
+    const page = shown.slice(0, limit);
+    // Relative times ("5m ago") still advance: the minute is part of what rows depend on.
+    const rowState = JSON.stringify([
+      page,
+      data.llm?.triage_enabled,
+      [...acting],
+      [...rowErrors],
+      Math.floor(Date.now() / 60000),
+    ]);
+    if (rowState !== renderedRows) {
+      renderedRows = rowState;
+      rebuild(byId("list"), page.map(row));
+    }
     byId("more").hidden = shown.length <= limit;
     byId("more-button").textContent = `Show 50 more (${shown.length - limit} remaining)`;
     byId("empty").hidden = shown.length > 0;

@@ -18,7 +18,11 @@
   let snapshot = null;
   let busy = false;
   let pending = null;
+  // Set while a cleanup request is in flight, so a poll cannot re-enable Confirm.
+  let confirming = false;
   let ascending = false;
+  // What the rows were last built from; an unchanged poll leaves them (and focus) alone.
+  let renderedRows = null;
   const selected = new Set();
   const names = new Map();
   const opening = new Set();
@@ -117,6 +121,7 @@
   }
   function row(entry) {
     const line = node("tr");
+    line.dataset.key = entry.key;
     const choose = node("td", undefined, "ws-select");
     const box = document.createElement("input");
     box.type = "checkbox";
@@ -167,6 +172,7 @@
           : "Create workspace",
     );
     button.type = "button";
+    button.dataset.focus = "open";
     button.disabled = opening.has(entry.key) || (!entry.workspace_ids.length && entry.missing);
     button.onclick = () => openWorkspace(entry);
     actions.append(button);
@@ -242,7 +248,23 @@
         select.append(option);
       }
       select.value = names.includes(chosen) ? chosen : "all";
+      // The searchable picker shows the chosen label; redraw it with the new options.
+      window.dashboardAgents?.sync(select);
     }
+  }
+  // Give keyboard focus back to the same control of the same row after a rebuild.
+  function rebuild(list, rows) {
+    const active = list.contains(document.activeElement) ? document.activeElement : null;
+    const control = (element) =>
+      element.dataset.focus || element.getAttribute("aria-label") || element.textContent;
+    const key = active?.closest("tr")?.dataset.key;
+    const name = active && control(active);
+    list.replaceChildren(...rows);
+    if (!active) return;
+    const line = [...list.rows].find((element) => element.dataset.key === key);
+    [...(line?.querySelectorAll("a, button, input, summary") || [])]
+      .find((element) => control(element) === name)
+      ?.focus({ preventScroll: true });
   }
 
   function render() {
@@ -252,6 +274,7 @@
     const line = byId("ws-status-line");
     if (!data.enabled) {
       byId("ws-list").replaceChildren();
+      renderedRows = null;
       line.textContent =
         data.error ||
         "Workspace overview is disabled. Enable it in experiments/workspaces/config.json.";
@@ -263,7 +286,12 @@
       if (!rows().some((entry) => entry.key === key && entry.removable)) selected.delete(key);
     }
     byId("ws-count").textContent = String(shown.length);
-    byId("ws-list").replaceChildren(...shown.map(row));
+    // Rows show the entry, its selection and its open-workspace progress; times are absolute.
+    const rowState = JSON.stringify([shown, [...selected], [...opening], [...openResults]]);
+    if (rowState !== renderedRows) {
+      renderedRows = rowState;
+      rebuild(byId("ws-list"), shown.map(row));
+    }
     byId("ws-empty").hidden = shown.length > 0;
     byId("ws-empty").textContent = rows().length
       ? "No workspace matches these filters."
@@ -332,7 +360,7 @@
         content.append(item);
       }
       byId("ws-confirm").hidden = false;
-      byId("ws-confirm").disabled = false;
+      byId("ws-confirm").disabled = confirming;
       byId("ws-confirm").textContent = `Clean up ${pending.length} workspace(s)`;
       byId("ws-cancel").textContent = "Cancel";
       return;
@@ -366,7 +394,8 @@
     renderDialog();
   }
   async function confirm() {
-    if (!pending) return;
+    if (!pending || confirming) return;
+    confirming = true;
     byId("ws-confirm").disabled = true;
     byId("ws-dialog-error").textContent = "";
     const targets = pending.map((entry) => ({
@@ -393,6 +422,8 @@
     } catch (error) {
       byId("ws-dialog-error").textContent = `Cleanup was not started: ${error.message}`;
       byId("ws-confirm").disabled = false;
+    } finally {
+      confirming = false;
     }
   }
   async function refresh(force) {
