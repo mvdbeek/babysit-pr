@@ -231,6 +231,10 @@ def test_handler_threads_have_a_socket_timeout():
     assert dashboard.Handler.timeout == 30
 
 
+def test_kept_alive_responses_are_not_held_back_by_nagle():
+    assert dashboard.Handler.disable_nagle_algorithm
+
+
 class Sentry:
     def __init__(self):
         self.refreshes = 0

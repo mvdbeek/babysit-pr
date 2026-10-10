@@ -352,6 +352,9 @@ class Handler(BaseHTTPRequestHandler):
     server: DashboardServer
     # Polls reuse one connection (keep-alive) instead of opening one per request.
     protocol_version = "HTTP/1.1"
+    # Headers and body go out as separate writes; on a kept-alive connection Nagle's
+    # algorithm would hold the body until the client's delayed ACK (40 ms on Linux).
+    disable_nagle_algorithm = True
     # A client that stops sending or reading frees its thread, as does a connection idle
     # this long between requests; request bodies narrow it.
     timeout = 30

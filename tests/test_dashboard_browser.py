@@ -154,12 +154,27 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
             thread.join(timeout=5)
 
 
+def xpath_literal(value: str) -> str:
+    """``value`` as an XPath string literal, whatever quotes it contains."""
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    return "concat(" + ', "\'", '.join(f"'{part}'" for part in value.split("'")) + ")"
+
+
 def choose_option(control: Locator, value: str) -> None:
     """Choose through the visible picker, including its real narrowing behavior."""
     if control.evaluate("node => node.tagName") == "SELECT":
         control.select_option(value)
         return
     wrapper = control.locator("xpath=../..")
+    # The options arrive with the page's first snapshot; wait for them like a person would.
+    expect(
+        wrapper.locator("select option").filter(
+            has=control.page.locator(f"xpath=self::*[@value={xpath_literal(value)}]")
+        )
+    ).to_have_count(1)
     label = wrapper.locator("select option").evaluate_all(
         "(options, value) => options.find(option => option.value === value).label", value
     )
