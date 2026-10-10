@@ -13,13 +13,17 @@ Installation and manual testing instructions are in the linked guide.
 On mobile, selecting a watch card scrolls to its details and actions. Background
 refreshes leave the scroll position alone; reduced-motion settings are respected.
 
-The header bell counts unseen items across the watcher, PR, and issue views. Its
-log shows the 10 most recently updated items, combining repeated updates to the
-same PR or issue into one entry, including updates seen in both the watcher and
-PR overview. Older unseen items still contribute to the count. Opening the bell
-does not clear it: open an entry, visit its PR/issue list (or watch details), or
-choose **Mark all seen**. History uses the existing per-account visit baseline and
-is saved in this browser, with seen state shared between tabs. The first snapshot
+Closed and stopped watches load their CI checks and failed jobs when you open them,
+once per change to the watch, instead of with every 5-second refresh.
+
+The header bell counts unseen items across the watcher, PR, and issue views. Its log
+shows the 10 most recently updated items, combining repeated updates to the same PR
+or issue into one entry, including updates seen in both the watcher and PR overview.
+Older unseen items still contribute to the count. Opening the bell does not clear
+it: open an entry, show its row in the PR/issue list (or its watch details), or
+choose **Mark all seen**. Rows hidden by search or filters, or not yet loaded below
+the table, stay unseen. History uses the existing per-account visit baseline and is
+saved in this browser, with seen state shared between tabs. The first snapshot
 without prior history starts quietly. Updates come from existing dashboard
 snapshots, including changes discovered on reopening; no extra GitHub polling is
 added, and intermediate changes while the dashboard is closed may not be captured.
@@ -845,13 +849,19 @@ other activity is marked in Last updated. Labels explain the highlighted fields.
 The count follows the current filters. Highlights stay visible through refreshes,
 sorting and filtering for the rest of the visit; reloading starts a new visit.
 
-The first visit establishes a baseline. Snapshots are saved in browser local
-storage, separately for each GitHub account and dashboard origin, only while the
-PR tab is visible. Opening the Watcher tab alone does not mark PRs as seen. Failed
-or in-progress syncs do not overwrite the last saved snapshot, and an older tab
-cannot replace a newer snapshot. If browser storage is unavailable, comparisons
-still work during the current visit. This uses the existing overview data and
-adds no server storage or GitHub requests. Closed PRs leave the open-PR overview.
+Only shown rows count as seen. A PR hidden by search or filters, or below the rows
+loaded so far, keeps the values saved when you last saw it, so its changes are still
+highlighted next visit; a new PR joins the saved snapshot once shown. **Show more**
+and scrolling count the rows they add.
+
+The first visit establishes a baseline of every listed PR. Snapshots are saved in
+browser local storage, separately for each GitHub account and dashboard origin, only
+while the PR tab is visible. Opening the Watcher tab alone does not mark PRs as
+seen. Failed or in-progress syncs do not overwrite the last saved snapshot, and an
+older tab cannot replace a newer snapshot. If browser storage is unavailable,
+comparisons still work during the current visit. This uses the existing overview
+data and adds no server storage or GitHub requests. Closed PRs leave the open-PR
+overview.
 
 An opt-in [workspace overview experiment](references/workspaces.md) adds a separate dashboard tab listing your local worktrees and herdr workspaces, the pull request or issue each one belongs to, whether that item is still open or already closed or merged, and the agents running in it. Selected workspaces can be cleaned up in batches: idle agents are asked to exit, the herdr workspace is closed, the worktree is removed, and the local branch is deleted when no commit can be lost. Uncommitted changes, commits only that branch has, and working agents are shown as blockers and skipped unless you override them per row in the confirmation dialog; a checkout an unfinished watch is using is never removed at all (watches marked `closed` or `stopped` no longer protect it), and a clone's own checkout only ever has its herdr workspace closed. Enable it with `{"enabled": true}` in `experiments/workspaces/config.json` under the dashboard state directory, then restart the dashboard; delete that configuration or set `enabled` to `false` to disable it. It has isolated scanning, cache, and errors, and everything is revalidated immediately before removal.
 

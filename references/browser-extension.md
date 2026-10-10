@@ -127,8 +127,11 @@ The composer includes at most 24,000 characters of selected text; edit or remove
 the page reference before sending if needed. Instructions plus context must fit
 within the existing 32,000-character task limit. Page content is labeled untrusted.
 Captured drafts stay in session storage and are removed when their composer tabs
-close or the browser session ends. The handoff puts its prefill in a URL fragment
-that the dashboard consumes immediately; it is not sent in the HTTP request.
+close or the browser session ends; a draft whose composer never finished loading is
+removed on a later tab close once it is 10 minutes old. The handoff puts its prefill
+in a URL fragment that the dashboard consumes immediately; it is not sent in the HTTP
+request. Any website can link to such a fragment, so the dialog says the task was
+prefilled from a link and starts nothing until you submit it.
 
 If submission times out, retry the **unchanged** task. Its saved request ID prevents
 duplicate delivery, including across server restarts and composer reloads. An

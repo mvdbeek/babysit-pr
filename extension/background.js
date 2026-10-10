@@ -1,6 +1,6 @@
 async function openComposer(source) {
   const id = crypto.randomUUID();
-  await chrome.storage.session.set({ [id]: { source } });
+  await chrome.storage.session.set({ [id]: { source, createdAt: Date.now() } });
   await chrome.tabs.create({ url: chrome.runtime.getURL(`compose.html#${id}`) });
 }
 
@@ -62,12 +62,22 @@ chrome.action.onClicked.addListener(async (tab) => {
     /^https?:/.test(tab.url || "") ? { url: tab.url, title: tab.title || "", ...captured } : {},
   );
 });
+// A composer records its tab once loaded; one closed before that, or never loaded, is
+// recognized by age instead.
+const UNOPENED_DRAFT_AGE = 10 * 60 * 1000;
 chrome.tabs.onRemoved.addListener(async () => {
   // Drafts contain selected page text; retain them only while their composer tab exists.
   const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL("compose.html*") });
   const keep = new Set(tabs.map((tab) => new URL(tab.url).hash.slice(1)));
   const drafts = await chrome.storage.session.get(null);
-  await chrome.storage.session.remove(
-    Object.keys(drafts).filter((id) => drafts[id].tabId && !keep.has(id)),
-  );
+  const now = Date.now();
+  const stale = [];
+  const dated = {};
+  for (const [id, draft] of Object.entries(drafts)) {
+    if (keep.has(id)) continue;
+    if (draft.tabId || now - draft.createdAt >= UNOPENED_DRAFT_AGE) stale.push(id);
+    else if (!Number.isFinite(draft.createdAt)) dated[id] = { ...draft, createdAt: now };
+  }
+  await chrome.storage.session.remove(stale);
+  if (Object.keys(dated).length) await chrome.storage.session.set(dated);
 });

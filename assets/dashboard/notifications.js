@@ -574,7 +574,8 @@
           attempts: job.attempts,
           approved: job.feedback_approved,
           feedback: feedbackDigests(job.feedback || []),
-          checks: checkResult(job.check_details || []),
+          // Ended watches omit their check details; older servers send no checks_result.
+          checks: job.checks_result ?? checkResult(job.check_details || []),
         },
         summary: job.summary || `Watcher: ${job.status}`,
       })),
