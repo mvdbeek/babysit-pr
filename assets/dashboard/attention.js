@@ -122,6 +122,15 @@
     triage.disabled = triaging.has(item.key);
     triage.onclick = () => void setAside(item, waiting ? "clear" : "wait");
     actions.append(triage);
+    if (item.cron?.run) {
+      // The same acknowledgement as on the Cron jobs tab; an agent left open stays open.
+      const dismiss = node("button", "Dismiss", "attention-dismiss");
+      dismiss.type = "button";
+      dismiss.title = "Mark the job's latest run as dealt with";
+      dismiss.disabled = triaging.has(item.key);
+      dismiss.onclick = () => void dismissRun(item);
+      actions.append(dismiss);
+    }
     row.append(actions);
     return row;
   }
@@ -142,6 +151,30 @@
       feed = result.feed;
     } catch (error) {
       byId("attention-error").textContent = `Could not change the item: ${error.message}`;
+    } finally {
+      triaging.delete(item.key);
+      render();
+    }
+  }
+  async function dismissRun(item) {
+    if (triaging.has(item.key)) return;
+    triaging.add(item.key);
+    byId("attention-error").textContent = "";
+    render();
+    try {
+      const response = await fetch("/api/cron-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "cron-action" },
+        body: JSON.stringify({ action: "dismiss", id: item.cron.id, run: item.cron.run }),
+      });
+      const result = await response.json();
+      if (!response.ok || result.error) throw Error(result.error || `HTTP ${response.status}`);
+      // A poll already under way may predate the dismissal; this fresh feed replaces it.
+      generation += 1;
+      const fresh = await fetch("/api/attention?refresh=1", { cache: "no-store" });
+      if (fresh.ok) feed = await fresh.json();
+    } catch (error) {
+      byId("attention-error").textContent = `Could not dismiss the run: ${error.message}`;
     } finally {
       triaging.delete(item.key);
       render();

@@ -416,3 +416,66 @@ def test_a_job_saved_on_a_hidden_default_login_opens_on_the_same_login(
     account = dialog.locator("#cron-claude-account")
     expect(account.locator("option")).to_have_text(["psu", "work · 90% left"])
     expect(account).to_have_value("psu")
+
+
+def needs_attention(jobs, name):
+    """A job whose latest run left its agent open, as the scheduler records it."""
+    saved = jobs.save({"name": name, "command": "true", "schedule": {"every": 3600}})
+    now = time.time()
+    with jobs.db() as db:
+        jobs.record(
+            db,
+            saved,
+            kind="agent",
+            trigger="schedule",
+            due_at=now - 60,
+            started_at=now - 60,
+            finished_at=now,
+            status="attention",
+            message="Could not find the agent's session transcript; left open",
+        )
+    return saved
+
+
+def test_a_run_that_needs_attention_is_dismissed_on_the_cron_tab(page, site, errors):
+    url, jobs = site
+    needs_attention(jobs, "Nightly agent")
+    page.goto(url)
+    expect(page.locator(".attention-item")).to_have_count(1)
+    expect(page.locator(".attention-item")).to_contain_text("Its agent needs you")
+    page.get_by_role("tab", name="Cron jobs").click()
+    card = page.locator(".cron-job").filter(has_text="Nightly agent")
+    detail = page.locator("#cron-detail")
+    expect(card.locator(".badge")).to_have_text("Needs attention")
+    expect(page.locator("#cron-tab-count")).to_have_text("1")
+    dismiss = detail.get_by_role("button", name="Dismiss")
+    dismiss.click()
+    expect(dismiss).to_have_count(0)
+    expect(card.locator(".badge")).to_have_text("Needs attention · dismissed")
+    expect(card.locator(".badge")).to_have_class("badge")
+    # The run keeps its result in the history.
+    expect(detail.locator(".cron-runs")).to_contain_text("Needs attention · dismissed")
+    expect(detail.locator(".cron-runs")).to_contain_text("session transcript; left open")
+    expect(page.locator("#cron-tab-count")).to_be_hidden()
+    [run] = jobs.snapshot()["jobs"][0]["runs"]
+    assert run["status"] == "attention" and run["dismissed_at"]
+    page.get_by_role("tab", name="Needs you").click()
+    expect(page.locator(".attention-item")).to_have_count(0)
+    expect(page.locator("#attention-tab-count")).to_be_hidden()
+
+
+def test_a_run_that_needs_attention_is_dismissed_from_needs_you(page, site, errors):
+    url, jobs = site
+    needs_attention(jobs, "Nightly agent")
+    page.goto(url)
+    item = page.locator(".attention-item").filter(has_text="Nightly agent")
+    expect(item).to_contain_text("Its agent needs you")
+    item.get_by_role("button", name="Dismiss").click()
+    expect(page.locator(".attention-item")).to_have_count(0)
+    expect(page.locator("#attention-error")).to_be_empty()
+    assert jobs.snapshot()["jobs"][0]["runs"][0]["dismissed_at"]
+    page.get_by_role("tab", name="Cron jobs").click()
+    detail = page.locator("#cron-detail")
+    expect(page.locator(".cron-job .badge")).to_have_text("Needs attention · dismissed")
+    expect(detail.get_by_role("button", name="Run now")).to_be_visible()
+    expect(detail.get_by_role("button", name="Dismiss")).to_have_count(0)

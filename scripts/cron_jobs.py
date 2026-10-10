@@ -54,6 +54,8 @@ AGENT_KEYS = {
     "unsandboxed",
     "prompt",
 }
+# A latest run in one of these raises an alert the user can dismiss once dealt with.
+DISMISSABLE = {"attention", "failed", "timed_out", "error", "interrupted"}
 STOP_GRACE = 5  # Seconds between SIGTERM and SIGKILL when a run is stopped.
 QUIET_AFTER_EXIT = 2  # Seconds to wait for output a background child still writes.
 
@@ -431,6 +433,8 @@ class CronJobs:
             return {"run": self.run_now(request.get("id"))}
         if kind == "stop":
             return self.stop(request.get("id"))
+        if kind == "dismiss":
+            return {"run": self.dismiss(request.get("id"), request.get("run"))}
         if kind == "enable":
             if not isinstance(request.get("enabled"), bool):
                 raise ValueError("Expected enabled to be true or false")
@@ -523,6 +527,31 @@ class CronJobs:
                 )
             run.stop.set()
         return {"stopping": run.record["id"]}
+
+    def dismiss(self, key, run_id):
+        """Acknowledge the job's latest run; its status and message stay in the history.
+
+        Only an acknowledgement: an agent the run left open stays open in Collie.
+        """
+        if not isinstance(run_id, str) or not run_id.isdigit():
+            raise ValueError("Supply a run ID")
+        now = self.clock()
+        # The lock keeps this process from starting a run meanwhile; the immediate
+        # transaction keeps another process's writes out between the check and the update.
+        with self.lock, self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.job(db, key)
+            [last] = self.runs(db, key, 1) or [None]
+            if not last or last["id"] != run_id:
+                raise ValueError(
+                    "Only the job's latest run can be dismissed; refresh the dashboard"
+                )
+            if last["status"] not in DISMISSABLE:
+                raise ValueError("Only a run that failed or needs attention can be dismissed")
+            if not last.get("dismissed_at"):
+                last.update(dismissed_at=now, updated_at=now)
+                db.execute("UPDATE runs SET data=? WHERE id=?", (json.dumps(last), int(last["id"])))
+        return last
 
     # -- running --
 

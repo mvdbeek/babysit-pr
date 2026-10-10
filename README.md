@@ -824,6 +824,14 @@ status or signal). Selecting a run shows its output, which follows along live wh
 the job runs. The 50 most recent runs of each job are kept with their output. The tab
 counts jobs whose latest run failed.
 
+Once you have dealt with a latest run that failed, was interrupted or **Needs
+attention**, **Dismiss** marks it as dealt with: the job no longer counts as failing
+or appears on **Needs you**, and the run keeps its result in the history, shown as
+dismissed. Only the job's latest run can be dismissed, so the next run that fails or
+needs attention is reported again. Dismissing changes nothing else: an agent left open
+in Collie stays open, and the job keeps skipping its runs until no agent is open in
+its workspace. Cron rows on **Needs you** offer the same **Dismiss**.
+
 Jobs run only while the dashboard process runs. A job never overlaps itself: a run
 due while the previous one is still going is recorded as skipped. A run that came due
 while the dashboard was stopped starts once when it returns, up to a day late; later

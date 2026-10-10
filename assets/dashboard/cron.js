@@ -15,6 +15,8 @@
     skipped: ["Skipped", ""],
   };
   const FAILING = new Set(["failed", "timed_out", "error", "attention"]);
+  // A latest run in these raises an alert here or on Needs you; dismissing acknowledges it.
+  const DISMISSABLE = new Set([...FAILING, "interrupted"]);
   const AGENTS = { codex: "Codex", claude: "Claude" };
   const TRIGGERS = { schedule: "Scheduled", manual: "Run now" };
   let snapshot = null;
@@ -57,8 +59,10 @@
         .find((element) => element.dataset.key === active)
         ?.focus({ preventScroll: true });
   }
-  function badge(status) {
+  function badge(status, dismissed = false) {
     const [label, tone] = STATUS[status] || [status, ""];
+    // A dismissed run keeps its result, muted: the user has already dealt with it.
+    if (dismissed) return node("span", `${label} · dismissed`, "badge");
     return node("span", label, `badge ${tone}`.trim());
   }
   function when(seconds) {
@@ -132,6 +136,9 @@
   function latest(job) {
     return job.runs?.[0] ?? null;
   }
+  function needsDismissal(run) {
+    return Boolean(run && DISMISSABLE.has(run.status) && !run.dismissed_at);
+  }
 
   async function post(body) {
     const response = await fetch("/api/cron-action", {
@@ -179,7 +186,7 @@
     top.append(node("strong", job.name, "cron-job-name"));
     const last = latest(job);
     if (job.running) top.append(badge("running"));
-    else if (last) top.append(badge(last.status));
+    else if (last) top.append(badge(last.status, Boolean(last.dismissed_at)));
     const bottom = node("div", undefined, "cron-job-bottom");
     bottom.append(node("span", frequency(job.schedule)));
     bottom.append(
@@ -211,7 +218,7 @@
     open.setAttribute("aria-label", `Show output of the run started ${when(run.started_at)}`);
     started.append(open);
     const result = node("td");
-    result.append(badge(run.status));
+    result.append(badge(run.status, Boolean(run.dismissed_at)));
     if (run.message && (run.status !== "running" || run.kind === "agent")) {
       const message = node("small");
       message.append(window.collieText(run.message, run.agent_run?.url));
@@ -257,7 +264,10 @@
     const quiet = ["skipped", "missed"].includes(run.status);
     const agent = run.kind === "agent";
     const head = node("div", undefined, "cron-output-head");
-    head.append(node("h4", `Output of the run started ${when(run.started_at)}`), badge(run.status));
+    head.append(
+      node("h4", `Output of the run started ${when(run.started_at)}`),
+      badge(run.status, Boolean(run.dismissed_at)),
+    );
     const facts = quiet
       ? [run.message]
       : [
@@ -354,6 +364,22 @@
         { pending, key: "enable" },
       ),
       button("Edit", () => openEditor(job), { pending }),
+    );
+    const last = latest(job);
+    if (!job.running && needsDismissal(last)) {
+      // Only acknowledges the run: an agent it left open stays open in Collie.
+      const dismiss = button(
+        "Dismiss",
+        () =>
+          act(job, { action: "dismiss", run: last.id }, () =>
+            window.dashboardAttention?.refresh(true),
+          ),
+        { pending },
+      );
+      dismiss.title = "Mark this run as dealt with; it stays in the history";
+      actions.append(dismiss);
+    }
+    actions.append(
       button(
         "Delete",
         () => {
@@ -426,7 +452,9 @@
     const job = findJob(selectedJob);
     if (job && !job.runs.some((run) => run.id === selectedRun))
       selectedRun = job.runs[0]?.id ?? null;
-    const failing = all.filter((entry) => FAILING.has(latest(entry)?.status)).length;
+    const failing = all.filter(
+      (entry) => FAILING.has(latest(entry)?.status) && !latest(entry).dismissed_at,
+    ).length;
     byId("tab-count").hidden = !failing;
     byId("tab-count").textContent = failing;
     byId("tab-count").title = `${failing} job${failing === 1 ? "" : "s"} failed on the last run`;
