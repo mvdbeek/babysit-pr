@@ -34,6 +34,8 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CODEX_EFFORTS = frozenset({"none", "minimal", "ultra"})
 CODEX_NO_UPDATE_CHECK = "check_for_update_on_startup=false"
+# Canonical tty input drops a longer typed line (MAX_CANON is 1024 bytes on macOS).
+TYPED_LIMIT = 1000
 REPO_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 DIGITS = re.compile(r"[0-9]+")
 GITHUB = r"(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/]+)/"
@@ -57,6 +59,7 @@ VALUE_OPTIONS = {
     "--repo-path": "repo_path",
     "--worktree-root": "worktree_root",
     "--agent-arg": "agent_args",
+    "--with": "also",
 }
 WT_OPTIONS = frozenset(
     {
@@ -71,6 +74,7 @@ WT_OPTIONS = frozenset(
         "--prompt",
         "-F",
         "--prompt-file",
+        "--with",
     }
 )
 DASHBOARD_OPTIONS = frozenset(
@@ -104,6 +108,8 @@ options:
   --claude      start Claude in the left pane (default)
   --claude-account <name>  use a named Claude login (or default)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
+  --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
+                the sandboxed agent write there (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of ~/src/galaxy
@@ -141,6 +147,8 @@ options:
   --claude      start Claude in the left pane (default)
   --claude-account <name>  use a named Claude login (or default)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
+  --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
+                the sandboxed agent write there (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
@@ -167,6 +175,8 @@ options:
   --claude      start Claude in the left pane (default)
   --claude-account <name>  use a named Claude login (or default)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
+  --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
+                the sandboxed agent write there (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy
@@ -201,6 +211,14 @@ class HelpRequested(Exception):
         self.command = command
 
 
+class AlsoCheckout(NamedTuple):
+    """A ``--with`` checkout: the clone, the branch's checkout in it and its git common dir."""
+
+    clone: str
+    path: str
+    common: str
+
+
 class Options:
     """Parsed command line shared by the three commands (``wt`` lacks the dashboard flags)."""
 
@@ -219,6 +237,8 @@ class Options:
         "worktree_root",
         "focus",
         "agent_args",
+        "also",
+        "also_checkouts",
         "positional",
     )
 
@@ -237,6 +257,9 @@ class Options:
         self.worktree_root = ""
         self.focus = True
         self.agent_args: list[str] = []
+        # `--with` clones, then the checkouts open_session makes in them for the agent.
+        self.also: list[str] = []
+        self.also_checkouts: list[AlsoCheckout] = []
         self.positional: list[str] = []
 
 
@@ -285,6 +308,8 @@ def parse_args(
             elif field == "repo":
                 options.repo = value
                 options.repo_override = True
+            elif field == "also":
+                options.also.append(value)
             elif field == "agent_args":
                 if any(ord(char) < 32 or char == "\x7f" for char in value):
                     raise WtError(f"{command}: --agent-arg must not contain control characters")
@@ -424,6 +449,7 @@ def agent_command(
     claude_config_dir: str | None = None,
     claude_subscription: bool = False,
     unsandboxed: bool = False,
+    also: Sequence[AlsoCheckout] = (),
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -445,15 +471,32 @@ def agent_command(
     shell runs the agent binary directly instead of through ``safe``: no Safehouse, and
     no permission prompts to stall an unattended run. Only cron jobs that opt in pass
     it; ``wt`` itself never does, so agents it starts stay in Safehouse.
+
+    ``also`` (``--with`` checkouts) appends Safehouse grants to ``SAFEHOUSE_ADD_DIRS``,
+    which the shell already exports from safe.env: each checkout and its git common
+    dir become writable, so the agent can commit there too. The list is staged in a
+    file like the prompt. Each checkout is also an ``--add-dir`` for the agent itself,
+    which a Docker restart reads back to keep the grants. ``stage`` is called once for
+    the grants and once for the prompt, so it must return a new path each time.
     """
     if unsandboxed and docker:
         raise ValueError("Docker access only applies inside Safehouse")
+    grants = [path for checkout in also for path in (checkout.path, checkout.common)]
+    if any(":" in path for path in grants):
+        # Safehouse splits its directory lists on colons.
+        raise ValueError("A --with checkout path contains ':'")
+    added = [word for checkout in also for word in ("--add-dir", checkout.path)]
+    extra = [*added, *extra]
     words = agent_words(agent, model, effort, extra)
     if unsandboxed:
         words = ["command", agent, UNSANDBOXED_FLAGS[agent], *words[1:]]
     command = " ".join(shlex.quote(word) for word in words)
     if docker:
         command = f"SAFE_ENABLE=docker {command}"
+    if grants and not unsandboxed:
+        # Staged like the prompt, so the typed line does not grow with every path.
+        listed = shlex.quote(stage(":".join(dict.fromkeys(grants))))
+        command = f"SAFEHOUSE_ADD_DIRS=${{SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}}$(cat {listed}) {command}"
     if prompt:
         # `--` stops variadic options from swallowing the prompt.
         separator = " --" if extra else ""
@@ -462,6 +505,8 @@ def agent_command(
         command = claude_accounts.shell_command(
             command, claude_config_dir, subscription=claude_subscription
         )
+    if also and len(command.encode()) > TYPED_LIMIT:
+        raise ValueError("The agent command is too long to type; use fewer --with clones")
     return command
 
 
@@ -777,6 +822,81 @@ class Tool:
         else:
             self.git_action(repo_path, "worktree", "add", "-b", branch, directory, start_point)
 
+    def default_branch(self, repo_path: str) -> str:
+        """The branch ``origin/HEAD`` names, else ``main``."""
+        head = self.git_query(
+            repo_path, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"
+        )
+        return head.stdout.strip().removeprefix("origin/") if not head.returncode else "main"
+
+    def also_clone(self, value: str, command: str) -> str:
+        """A ``--with`` value: a repository under ``~/src`` or a clone path."""
+        expanded = os.path.expanduser(value)
+        if os.sep in value or value.startswith("~"):
+            path = os.path.abspath(expanded)
+        else:
+            if not NAME.fullmatch(value) or ".." in value:
+                raise WtError(f"{command}: --with needs a repository name or a clone path")
+            path = os.path.join(self.home, "src", value)
+        if not os.path.isdir(os.path.join(path, ".git")):
+            raise WtError(f"{command}: --with: no main clone at {path}")
+        return os.path.realpath(path)
+
+    def add_also(self, options: Options, branch: str, repo_path: str) -> None:
+        """Check ``branch`` out in each ``--with`` clone, next to the main worktree root.
+
+        A worktree that already holds the branch is used where it is, like ``wt``; a
+        local branch is reused, else the branch starts from the clone's default branch.
+        Every clone is checked before any checkout is made, and a clone's own working
+        tree is never handed to the agent.
+        """
+        if options.also_checkouts:
+            return
+        root = os.path.dirname(options.worktree_root) if options.worktree_root else ""
+        root = root or os.path.join(self.home, "src", "worktrees")
+        main = os.path.realpath(repo_path)
+        planned: list[tuple[AlsoCheckout, str]] = []
+        for clone in dict.fromkeys(options.also):
+            if clone == main:
+                continue
+            directory = self.existing_checkout(clone, branch)
+            if directory and os.path.realpath(directory) == clone:
+                raise WtError(
+                    f"wt: {branch} is checked out in {clone} itself; "
+                    "switch that clone to another branch first"
+                )
+            create = not directory
+            if create:
+                directory = os.path.join(root, os.path.basename(clone), branch)
+                if os.path.lexists(directory) or directory in (c.path for c, _ in planned):
+                    raise WtError(f"wt: {directory} exists but does not have {branch} checked out")
+            common = self.git_value(
+                clone, "rev-parse", "--path-format=absolute", "--git-common-dir"
+            )
+            checkout = AlsoCheckout(clone, directory, os.path.realpath(common))
+            if ":" in checkout.path + checkout.common:
+                raise WtError(f"wt: Safehouse cannot grant a path containing ':': {directory}")
+            planned.append((checkout, self.default_branch(clone) if create else ""))
+        # The typed line must fit before anything is made; staged paths look like this.
+        sample = os.path.join(self.env.get("TMPDIR") or "/tmp", "wt-prompt.XXXXXXXX")
+        trial = Options()
+        for slot in Options.__slots__:
+            setattr(trial, slot, getattr(options, slot))
+        trial.also_checkouts = [checkout for checkout, _ in planned]
+        self.command_for(trial, lambda _: sample)
+        for checkout, base in planned:
+            if base:
+                self.add_worktree(checkout.clone, checkout.path, branch, base)
+            else:
+                self.warn(f"wt: {branch} is already checked out at {checkout.path}; using that")
+            options.also_checkouts.append(checkout._replace(path=os.path.realpath(checkout.path)))
+        if options.prompt and options.also_checkouts:
+            listed = "\n".join(f"- {c.path}" for c in options.also_checkouts)
+            options.prompt += (
+                f"\n\nThis task also covers other repositories. Branch {branch} is checked out"
+                f" in each of these, and you can write and commit there:\n{listed}"
+            )
+
     # -- multiplexers --
 
     def herdr_running(self) -> bool:
@@ -786,22 +906,26 @@ class Tool:
     def multiplexer(self) -> str:
         return select_multiplexer(self.env, self.runner.which, self.herdr_running)
 
-    def command_for(self, options: Options) -> str:
+    def command_for(self, options: Options, stage: Callable[[str], str] | None = None) -> str:
         try:
             home = claude_accounts.validate(options.agent, options.claude_account)
         except ValueError as exc:
             raise WtError(f"wt: {exc}") from exc
-        return agent_command(
-            options.agent,
-            options.prompt,
-            options.model,
-            options.effort,
-            self.stage,
-            options.agent_args,
-            options.docker,
-            str(home) if home else None,
-            bool(options.claude_account),
-        )
+        try:
+            return agent_command(
+                options.agent,
+                options.prompt,
+                options.model,
+                options.effort,
+                stage or self.stage,
+                options.agent_args,
+                options.docker,
+                str(home) if home else None,
+                bool(options.claude_account),
+                also=options.also_checkouts,
+            )
+        except ValueError as exc:
+            raise WtError(f"wt: {exc}") from exc
 
     def open_session(self, options: Options, directory: str, name: str, repo_path: str) -> None:
         """Left pane runs the agent, right pane is a spare terminal (herdr: the agent only).
@@ -809,6 +933,7 @@ class Tool:
         The prompt only applies to a session being created; an existing one already
         has an agent in it, so reattaching warns and ignores the prompt.
         """
+        self.add_also(options, name, repo_path)
         mux = self.multiplexer()
         if mux in ("herdr", "tmux", "cmux") and not self.runner.which(mux):
             self.warn(f"wt: {mux} is not on PATH; opening nothing")
@@ -826,6 +951,12 @@ class Tool:
                 self.warn("wt: no multiplexer (WT_MULTIPLEXER=none); ignoring the prompt")
             # A subprocess cannot cd its caller: hand the path back on stdout instead.
             print(directory, file=self.stdout, flush=True)
+
+    def warn_reattached(self, options: Options) -> None:
+        if options.also_checkouts:
+            self.warn(
+                "wt: the running agent keeps its sandbox; restart it to write to --with checkouts"
+            )
 
     def session_herdr(self, options: Options, directory: str, name: str, repo_path: str) -> None:
         # herdr models a worktree as a workspace with checkout provenance and groups it
@@ -847,6 +978,7 @@ class Tool:
                 self.warn(
                     f"wt: a herdr workspace for {directory} already exists; ignoring the prompt"
                 )
+            self.warn_reattached(options)
             return
         if not reply.root_pane:
             raise WtError(f"wt: herdr did not return a root pane for {directory}")
@@ -873,8 +1005,10 @@ class Tool:
                     raise WtError(
                         f"wt: tmux {step[0]} failed: {result.stderr.strip()}".rstrip(": ")
                     )
-        elif options.prompt:
-            self.warn(f"wt: tmux session '{session}' already running; ignoring the prompt")
+        else:
+            if options.prompt:
+                self.warn(f"wt: tmux session '{session}' already running; ignoring the prompt")
+            self.warn_reattached(options)
         if self.env.get("TMUX"):
             self.runner.run(["tmux", "switch-client", "-t", session], output="inherit")
         elif self.isatty():
@@ -898,6 +1032,7 @@ class Tool:
                 self.warn(
                     f"wt: a cmux workspace for {directory} already exists; ignoring the prompt"
                 )
+            self.warn_reattached(options)
             self.cmux("select-workspace", "--workspace", ref)
             return
         # A surface's command is typed into the pane, so it is shell-parsed: shell-quote
@@ -993,12 +1128,7 @@ class Tool:
             raise WtError(f"wt: explicit worktree destination already exists: {directory}")
         if self.branch_exists(repo_path, branch):
             raise WtError(f"wt: explicit branch already exists: {branch}")
-        base = args[0] if args else ""
-        if not base:
-            head = self.git_query(
-                repo_path, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"
-            )
-            base = head.stdout.strip().removeprefix("origin/") if not head.returncode else "main"
+        base = args[0] if args else self.default_branch(repo_path)
         self.add_worktree(repo_path, directory, branch, base)
         self.open_session(options, directory, branch, repo_path)
 
@@ -1043,11 +1173,7 @@ class Tool:
             return
         if options.name and self.branch_exists(repo_path, branch):
             raise WtError(f"wti: explicit branch already exists: {branch}")
-        head = self.git_query(
-            repo_path, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"
-        )
-        base = head.stdout.strip().removeprefix("origin/") if not head.returncode else ""
-        self.add_worktree(repo_path, directory, branch, base or "main")
+        self.add_worktree(repo_path, directory, branch, self.default_branch(repo_path))
         self.open_session(options, directory, branch, repo_path)
 
     def run_wtpr(self, options: Options) -> None:
@@ -1147,6 +1273,7 @@ class Tool:
 
     def run(self, command: str, argv: Sequence[str]) -> None:
         options = parse_args(command, argv)
+        options.also = [self.also_clone(value, command) for value in options.also]
         getattr(self, f"run_{command}")(options)
 
 

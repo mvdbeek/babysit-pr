@@ -1415,6 +1415,20 @@ button:disabled {
   min-width: 0;
   font: inherit;
 }
+.new-task-also small {
+  display: block;
+  margin: 6px 0;
+  color: var(--muted);
+}
+.new-task-also-list {
+  display: grid;
+  gap: 6px;
+  max-height: 14em;
+  overflow-y: auto;
+}
+.new-task-also-list label {
+  overflow-wrap: anywhere;
+}
 .workspace-later {
   display: flex;
   align-items: center;

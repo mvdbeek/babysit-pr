@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -15,26 +16,76 @@ _exiting: set[tuple[str, int]] = set()
 SOCKETS = ("/private/var/run/docker.sock", "~/.docker/run/docker.sock")
 
 
+def sandbox_checks(pid, checks):
+    """Seatbelt answers for ``(operation, path)`` pairs: 0 allowed, 1 denied, <0 unknown."""
+    library = ctypes.CDLL("/usr/lib/libsandbox.dylib")
+    check = library.sandbox_check
+    # sandbox_check has three fixed arguments followed by the filter's argument.
+    # Declaration: WebKit/Source/WTF/wtf/spi/darwin/SandboxSPI.h.
+    check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    check.restype = ctypes.c_int
+    quiet = ctypes.c_int.in_dll(library, "SANDBOX_CHECK_NO_REPORT").value
+    return [
+        check(pid, operation, 1 | quiet, ctypes.c_char_p(os.fsencode(Path(path).expanduser())))
+        for operation, path in checks
+    ]
+
+
 def has_access(pid):
     """Check the running process's Safehouse socket file grants (macOS Seatbelt)."""
     try:
-        library = ctypes.CDLL("/usr/lib/libsandbox.dylib")
-        check = library.sandbox_check
-        # sandbox_check has three fixed arguments followed by the filter's argument.
-        # Declaration: WebKit/Source/WTF/wtf/spi/darwin/SandboxSPI.h.
-        check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-        check.restype = ctypes.c_int
-        quiet = ctypes.c_int.in_dll(library, "SANDBOX_CHECK_NO_REPORT").value
-        results = [
-            check(pid, operation, 1 | quiet, ctypes.c_char_p(os.fsencode(Path(path).expanduser())))
-            for path in SOCKETS
-            for operation in (b"file-read-data", b"file-write-data")
-        ]
+        results = sandbox_checks(
+            pid,
+            [
+                (operation, path)
+                for path in SOCKETS
+                for operation in (b"file-read-data", b"file-write-data")
+            ],
+        )
     except (OSError, AttributeError, ValueError) as exc:
         raise ValueError("Could not inspect the agent's Docker access") from exc
     if any(result < 0 for result in results):
         raise ValueError("Could not inspect the agent's Docker access")
     return all(result == 0 for result in results)
+
+
+def kept_grants(pid, options):
+    """``--add-dir`` checkouts and their git dirs the agent can write now.
+
+    ``wt --with`` grants these through ``SAFEHOUSE_ADD_DIRS``, which the restart's
+    shell does not have, so they are passed again as ``--add-dirs``. Only paths the
+    running agent can already write are kept: a restart never widens the sandbox.
+    """
+    paths = []
+    words = iter(options)
+    for word in words:
+        name, joined, value = word.partition("=")
+        if name != "--add-dir":
+            continue
+        if not joined:
+            value = next(words, "")
+        if not value or not Path(value).is_dir():
+            continue
+        paths.append(value)
+        try:
+            common = subprocess.run(
+                ["git", "-C", value, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if not common.returncode and common.stdout.strip():
+            paths.append(common.stdout.strip())
+    paths = [path for path in dict.fromkeys(paths) if ":" not in path]
+    if not paths:
+        return []
+    try:
+        results = sandbox_checks(pid, [(b"file-write-data", path) for path in paths])
+    except (OSError, AttributeError, ValueError) as exc:
+        raise ValueError("Could not inspect the agent's directory grants") from exc
+    return [path for path, result in zip(paths, results, strict=True) if result == 0]
 
 
 def process(procs, kind):
@@ -194,6 +245,10 @@ def prepare(target, info, procs, state, proc, enabled=True):
         raise ValueError("The agent's directory no longer exists")
     record["launcher"] = launcher(procs, proc, enabled)
     record["options"] = resume_options(proc["argv"], info["agent"], session)
+    grants = kept_grants(proc["pid"], record["options"])
+    if grants:
+        # The launcher ends with `-- <agent>`; Safehouse options go before it.
+        record["launcher"][-2:-2] = [f"--add-dirs={':'.join(grants)}"]
     handoff.verify_screen(record, info, handoff.read_screen(target["pane"]))
     return record
 

@@ -400,6 +400,19 @@ that to Safehouse's `--enable` list, which opens the Docker daemon socket to tha
 agent. Agents started without it keep Safehouse's default deny on container sockets.
 The operation records `docker` (false for reopen).
 
+**Also work in other repositories**, in New task, lists the other local clones (those
+the repository picker offers). Each one chosen is passed to the helper as
+`--with <clone>` (the request field is `also: [clone paths]`, at most 4, never the
+task's own clone or a clone named like its repository, which the picker leaves out). The branch name is picked so it
+is free in every chosen clone, the branch is checked out beside the task's worktree in
+each, and the agent's Safehouse sandbox may write and commit there (see the worktree
+helper below). The operation records `also` and, once ready, `also_paths`, which the
+dialog lists after the result. The follow-up composer's **Docker access** restart keeps
+these grants: for each `--add-dir` the agent was started with, the checkout and its git
+directory are passed to Safehouse as `--add-dirs` when the running agent can write them
+now. An exited session resumed from the composer starts with the shell's normal grants,
+without them.
+
 The follow-up composer's **Docker access** checkbox reflects the selected running
 agent's current socket grants. Toggle it to restart an idle agent with Docker enabled
 or disabled, preserving its exact conversation, pane, directory and supported launch
@@ -562,7 +575,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude] [--docker] [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude] [--docker] [--with repo]... [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
@@ -578,6 +591,29 @@ A branch that is already checked out is opened where it already lives -- the mai
 clone for `wt main`, or a worktree created under a different directory name --
 instead of failing on git's refusal to check the same branch out twice. The reused
 path is reported on stderr.
+
+`--with <repo>` (repeatable; a name under `~/src` or a clone path) is for changes that
+span repositories. Safehouse only lets the agent write to its own worktree and that
+repository's git directory, so it could edit another clone's worktree but not commit
+there. With `--with`, the same branch is checked out in each other clone too, under
+`~/src/worktrees/<clone>/<branch>`: a linked worktree already holding the branch is used
+where it is, an existing local branch is reused, and otherwise the branch starts from
+that clone's `origin/HEAD` (or `main`). A branch checked out in the other clone's own
+working tree is refused, so main checkouts are never handed to the agent. Every clone is
+checked before any of their checkouts is made. The grant list is staged in a private
+`$TMPDIR` file like the prompt, and the agent line is typed as
+`SAFEHOUSE_ADD_DIRS=${SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}$(cat '…') <agent>
+--add-dir <checkout>… -- …`. That extends the list `safe.env` already exports, so
+Safehouse grants write access to each checkout and its git common directory to that one
+agent. Each `--add-dir` still lengthens the typed line, so a line over 1000 bytes is
+refused rather than silently dropped. A prompt gets a closing note listing the extra
+checkouts. Reattaching to a running agent creates the checkouts but warns that the
+agent keeps its old sandbox. Safehouse splits its lists on `:`, so a path containing
+one is refused.
+
+Write access to another clone's git directory includes its `hooks/` and `config`, which
+run outside the sandbox the next time you use git there. Safehouse already grants the
+same for the task's own repository; `--with` extends it to the chosen clones only.
 
 To use it from a shell, put `scripts/` on `PATH` or symlink the three launchers into
 a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `tmux`,

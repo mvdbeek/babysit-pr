@@ -66,6 +66,9 @@ BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NEW_PREFIX = "new:"
 NEW_LISTED = 86400
 NEW_LIMIT = 20
+# Other clones a new task may also work in (`wt --with`).
+# Each one lengthens the agent line wt types, which has a ceiling.
+ALSO_LIMIT = 4
 # Why a launch without a worker in this process is uncertain: the dashboard stopped.
 INTERRUPTED = "Delivery was interrupted. Recorded resources were inspected; automatic relaunch is disabled. Reopen an existing checkout or inspect the operation log."
 NEW_INTERRUPTED = "The dashboard stopped while starting this task. Check for its issue and workspace before starting it again."
@@ -1176,6 +1179,8 @@ class Workspaces:
         With ``issue_title`` the task is first filed as a GitHub issue in ``repo`` and
         the workspace is made for that issue, as `wti` would; otherwise ``name`` is a new
         branch from ``base`` (the clone's default branch when empty), as `wt` would.
+        ``also`` lists other local clones the task covers: the branch is checked out in
+        each and the agent's sandbox may write there (`wt --with`).
         """
         allowed = {
             "repo",
@@ -1191,22 +1196,35 @@ class Workspaces:
             # Attached files, for the agent only: an issue's body is the task alone.
             "task_files",
             "docker",
+            "also",
         }
+        also = request.get("also", [])
         if (
             set(request) - allowed
-            or any(not isinstance(v, str) for k, v in request.items() if k != "docker")
+            or any(
+                not isinstance(v, str) for k, v in request.items() if k not in {"docker", "also"}
+            )
             or not isinstance(request.get("docker", False), bool)
+            or not isinstance(also, list)
+            or any(not isinstance(path, str) for path in also)
         ):
             raise ValueError("Invalid new task parameters")
         repo = request.get("repo", "")
         if not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
             raise ValueError("Choose a repository")
         clone = request.get("clone", "")
-        if not any(
-            r["repo"] == repo and r["clone"] == clone
-            for r in self.local_repositories(everything=True)["repos"]
-        ):
+        listed = self.local_repositories(everything=True)["repos"]
+        if not any(r["repo"] == repo and r["clone"] == clone for r in listed):
             raise ValueError(f"Choose a local clone of {repo}")
+        if len(also) > ALSO_LIMIT:
+            raise ValueError(f"Choose at most {ALSO_LIMIT} other repositories")
+        if len(set(also)) != len(also) or clone in also:
+            raise ValueError("Choose each other repository once, apart from the task's own")
+        if not set(also) <= {r["clone"] for r in listed}:
+            raise ValueError("Choose other repositories from the listed local clones")
+        # wt checks each one out under worktrees/<clone name>, beside worktrees/<repo>.
+        if repo.split("/")[1].lower() in {Path(path).name.lower() for path in also}:
+            raise ValueError(f"A clone named {repo.split('/')[1]} would share the task's worktrees")
         agent = request.get("agent", "codex")
         if agent not in {"codex", "claude"}:
             raise ValueError("Select Codex or Claude")
@@ -1245,6 +1263,7 @@ class Workspaces:
             "effort": request.get("effort") or None,
             "claude_account": request.get("claude_account") or None,
             "docker": request.get("docker", False),
+            "also": also,
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
             "message": "Queued",
             "log": "",
@@ -1933,8 +1952,15 @@ class Workspaces:
                         prefix = f"pr-{owner}-{pr['number']}"
                     name = prefix
                     base = self.src / "worktrees" / repo
+                    # wt puts --with checkouts beside the main one, named after their clone.
+                    also = [
+                        (Path(c), self.src / "worktrees" / Path(c).name) for c in op.get("also", [])
+                    ]
                     n = 1
-                    while os.path.lexists(base / name) or self.branch_exists(clone, name):
+                    while any(
+                        os.path.lexists(root / name) or self.branch_exists(c, name)
+                        for c, root in [(clone, base), *also]
+                    ):
                         n += 1
                         name = f"{prefix}-{n}"
                     # herdr shows the label; the branch keeps `pr-<owner>-<number>`,
@@ -1989,6 +2015,7 @@ class Workspaces:
                         f"--{op['agent']}",
                         *overrides,
                         *(["--docker"] if op.get("docker") else []),
+                        *(word for c, _ in also for word in ("--with", str(c))),
                         "--no-focus",
                         "--name",
                         name,
@@ -2039,6 +2066,18 @@ class Workspaces:
                         and item["upstream"] != self.expected_upstream(pr)
                     ):
                         raise ValueError("Resulting checkout has unexpected PR head provenance")
+                    for c, root in also:
+                        made = checkout(root / name)
+                        source = checkout(c)
+                        if (
+                            not made
+                            or not source
+                            or made["common"] != source["common"]
+                            or made["branch"] != name
+                        ):
+                            raise ValueError(f"No checkout of {name} appeared for {c}")
+                    if also:
+                        self.save_operation(op, also_paths=[str(root / name) for _, root in also])
                     self.association(pr, item)
                 for _ in range(30):
                     # Verify the one checkout this operation owns; a full inventory scan

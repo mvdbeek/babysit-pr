@@ -2904,6 +2904,64 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       };
       form.append(idleLabel);
     }
+    // Other clones the task also covers: the branch is checked out in each and the
+    // agent's sandbox may write there (`wt --with`).
+    const also = new Set();
+    const alsoBox = el("details", undefined, "new-task-also");
+    const alsoSummary = el("summary");
+    const alsoList = el("div", undefined, "new-task-also-list");
+    // At most this many: each lengthens the agent line the helper types.
+    const ALSO_LIMIT = 4;
+    function fillAlso() {
+      const main = repos[Number(repo.value)];
+      // A clone named like the task's repository would share its worktree directory.
+      const shared = main?.repo.split("/")[1].toLowerCase();
+      const clones = new Map();
+      for (const choice of repos)
+        if (
+          choice.clone !== main?.clone &&
+          choice.clone.split("/").pop().toLowerCase() !== shared &&
+          !clones.has(choice.clone)
+        )
+          clones.set(choice.clone, choice.repo);
+      for (const clone of also) if (!clones.has(clone)) also.delete(clone);
+      alsoList.replaceChildren(
+        ...[...clones].map(([clone, slug]) => {
+          const box = el("input");
+          box.type = "checkbox";
+          box.checked = also.has(clone);
+          box.onchange = () => {
+            if (box.checked) also.add(clone);
+            else also.delete(clone);
+            limitAlso();
+          };
+          const label = el("label", undefined, "workspace-later");
+          label.append(box, ` ${slug} · ${clone}`);
+          return label;
+        }),
+      );
+      if (!clones.size) alsoList.append(el("small", "No other local clones are listed."));
+      limitAlso();
+    }
+    function limitAlso() {
+      for (const box of alsoList.querySelectorAll("input"))
+        box.disabled = !box.checked && also.size >= ALSO_LIMIT;
+      alsoSummary.textContent = alsoText();
+    }
+    function alsoText() {
+      return `Also work in other repositories${also.size ? ` (${also.size})` : " (optional)"}`;
+    }
+    alsoBox.append(
+      alsoSummary,
+      el(
+        "small",
+        `The branch is checked out in each chosen clone too (up to ${ALSO_LIMIT}), and the agent can write and commit there.`,
+      ),
+      alsoList,
+    );
+    repo.addEventListener("change", fillAlso);
+    fillAlso();
+    form.append(alsoBox);
     const fileIssue = el("input");
     fileIssue.id = "new-task-file-issue";
     fileIssue.type = "checkbox";
@@ -3003,6 +3061,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
             ...(effort.value ? { effort: effort.value } : {}),
             ...(agent.value === "claude" && account.value ? { claude_account: account.value } : {}),
             ...(docker.checked ? { docker: true } : {}),
+            ...(also.size ? { also: [...also] } : {}),
             task: task.value,
             ...attached(files),
           }),
@@ -3332,6 +3391,9 @@ function updateWorkspaceOperation() {
       link("Open in Collie", op.result.url),
       // A new task's issue is filed during the operation, so the operation names it.
       ...viewerButtons(op.result, op.subject?.url ? op.subject : workspaceDialogItem),
+      ...(op.also_paths?.length
+        ? [el("small", `Also checked out: ${op.also_paths.join(", ")}`)]
+        : []),
     );
   const submit = $("workspace-content").querySelector("button[type=submit]");
   if (submit)
