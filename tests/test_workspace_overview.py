@@ -1366,6 +1366,18 @@ def exited(site, tmp_path, monkeypatch):
     return state, sid, checkout, plugin.home
 
 
+def test_a_resume_without_a_message_leaves_the_session_waiting(exited):
+    import agent_messages
+
+    state, sid, checkout, home = exited
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "  "}, home)
+    assert value["resumed"] == sid and value["warning"] is None
+    assert read(state)["agents"][0]["argv"] == ["--resume", sid]
+    # A message to a running agent still needs text.
+    with pytest.raises(ValueError, match="Write a message"):
+        agent_messages.send({"workspace": "w1", "text": ""}, home)
+
+
 def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
     import agent_messages
 
@@ -1771,7 +1783,7 @@ def test_a_row_listed_without_a_workspace_resumes_its_session_in_a_new_one(exite
     status, value = request(port, "/api/workspace-message", body, action="workspace-message")
     assert status == 400 and "already running" in value["error"]
     status, value = request(port, f"{query}&workspace=w1")
-    assert status == 400 and "Supply a workspace or a workspace key" in value["error"]
+    assert status == 400 and "Supply a workspace, a workspace key or a watch" in value["error"]
 
 
 def test_the_viewer_follows_a_workspace_reopened_under_a_new_id(site, tmp_path, monkeypatch):

@@ -293,13 +293,14 @@
     if (target.key) return { key: target.key };
     return target.workspace ? { workspace: target.workspace } : { watch: target.watch };
   }
-  // Whom a message goes to: the herdr workspace, or a Workspaces-tab row listed while
-  // none was open, whose recorded sessions can still be resumed.
+  // Whom a message goes to: the herdr workspace, or a Workspaces-tab row or watch listed
+  // while none was open, whose recorded sessions can still be resumed.
   function recipient(target) {
-    return target.workspace ? { workspace: target.workspace } : { key: target.key };
+    if (target.workspace) return { workspace: target.workspace };
+    return target.key ? { key: target.key } : { watch: target.watch };
   }
   function messageable(target) {
-    return Boolean(target.workspace || target.key);
+    return Boolean(target.workspace || target.key || target.watch);
   }
   // The issue, pull request or Sentry issue the checkout serves, as {label, url, title}.
   function renderLinks(links) {
@@ -975,7 +976,7 @@
   let cancellingWatch = false;
   let files = null; // The composer's attachments, kept with the draft.
   function draftKey(entry) {
-    return `ws-viewer-draft:${entry.workspace || entry.key}`;
+    return `ws-viewer-draft:${entry.workspace || entry.key || `watch:${entry.watch}`}`;
   }
   function loadDraft(entry) {
     try {
@@ -1102,6 +1103,7 @@
     const interaction = byId("ws-agent-interaction");
     send.textContent = "Send to agent";
     send.disabled = true;
+    byId("ws-message-reopen").hidden = true;
     byId("ws-docker").hidden = true;
     if (message) {
       interaction.replaceChildren();
@@ -1183,6 +1185,12 @@
     send.textContent = watch && !repairing(watch) ? "Cancel watch and send…" : "Resume and send";
     send.disabled =
       sending || changingDocker || cancellingWatch || Boolean(watch && repairing(watch));
+    // The same resume without a message: the session waits for the reader in Collie.
+    const reopen = byId("ws-message-reopen");
+    reopen.hidden = !session;
+    reopen.textContent =
+      watch && !repairing(watch) ? "Cancel watch and reopen…" : "Reopen in Collie";
+    reopen.disabled = send.disabled;
     const holder = byId("ws-agent-interaction");
     const state = JSON.stringify(["watch", session?.id, watch, watchQuestion, cancellingWatch]);
     if (holder.dataset.state === state) return;
@@ -1227,16 +1235,28 @@
         node("strong", `Cancel ${watchName(watch)}?`),
         node(
           "p",
-          watchQuestion.send
-            ? "The watch stops monitoring this pull request, and the session is resumed here with your message."
-            : repairing(watch)
-              ? "The watch stops monitoring this pull request once its current repair finishes."
-              : "The watch stops monitoring this pull request; nothing is sent.",
+          watchQuestion.send === "reopen"
+            ? "The watch stops monitoring this pull request, and the session is resumed in a workspace to continue in Collie; nothing is sent."
+            : watchQuestion.send
+              ? "The watch stops monitoring this pull request, and the session is resumed here with your message."
+              : repairing(watch)
+                ? "The watch stops monitoring this pull request once its current repair finishes."
+                : "The watch stops monitoring this pull request; nothing is sent.",
           "pr-meta",
         ),
       );
-      const yes = button(watchQuestion.send ? "Cancel watch and send" : "Cancel watch", () =>
-        watchQuestion.send ? void sendMessage(null, watch.id) : void cancelOwningWatch(watch),
+      const yes = button(
+        watchQuestion.send === "reopen"
+          ? "Cancel watch and reopen"
+          : watchQuestion.send
+            ? "Cancel watch and send"
+            : "Cancel watch",
+        () =>
+          watchQuestion.send === "reopen"
+            ? void reopenSession(watch.id)
+            : watchQuestion.send
+              ? void sendMessage(null, watch.id)
+              : void cancelOwningWatch(watch),
       );
       button("Keep the watch", () => {
         watchQuestion = null;
@@ -1788,6 +1808,53 @@
       if (viewer?.entry === entry) void fetchAgents(entry);
     }
   }
+  // Resume the picked session with no message, in a workspace opened on the checkout if
+  // none is: the reader continues in Collie. With stopWatch, the reader confirmed
+  // cancelling the babysit watch that owns it.
+  async function reopenSession(stopWatch) {
+    if (!viewer || sending || changingDocker || cancellingWatch) return;
+    const entry = viewer.entry;
+    const session = pickedSession();
+    if (!session) return;
+    if (session.watch && !stopWatch) {
+      watchQuestion = { session: session.id, send: "reopen" };
+      renderWatch();
+      return;
+    }
+    const status = byId("ws-message-status");
+    sending = true;
+    watchQuestion = null;
+    renderAgents();
+    status.textContent = stopWatch
+      ? "Cancelling the watch and reopening the session…"
+      : "Reopening the session…";
+    try {
+      const value = await deliver({
+        ...recipient(entry),
+        resume: session.id,
+        ...(stopWatch ? { stop_watch: stopWatch } : {}),
+        text: "",
+      });
+      if (viewer?.entry !== entry) return;
+      if (value.error) {
+        if (value.code === "watch_owns_session" && value.watch) {
+          session.watched = true;
+          session.watch = value.watch;
+          tell(status, `Not reopened: this session belongs to ${watchName(value.watch)}.`);
+        } else tell(status, value.error);
+        return;
+      }
+      tell(
+        status,
+        value.warning ||
+          `${stopWatch ? `Cancelled babysit watch ${stopWatch} and resumed` : "Resumed"} the session in ${value.pane}; continue in Collie.`,
+      );
+    } finally {
+      sending = false;
+      // The workspace now open on the checkout: the viewer follows it.
+      if (viewer?.entry === entry) void fetchAgents(entry);
+    }
+  }
   // POST the message; an error result says whether anything may have been typed.
   async function deliver(body) {
     let response;
@@ -1842,6 +1909,7 @@
     renderComments();
   }
   byId("ws-message").addEventListener("submit", sendMessage);
+  byId("ws-message-reopen").onclick = () => void reopenSession(null);
   window.addEventListener("focus", () => {
     if (viewer && messageable(viewer.entry) && byId("ws-viewer").open)
       void fetchAgents(viewer.entry);

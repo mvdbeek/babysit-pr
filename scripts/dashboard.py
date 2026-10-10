@@ -78,6 +78,14 @@ def queue_signature(path):
     return tuple(signature)
 
 
+def watch_checkout(home, watch_id):
+    """A watch's registered checkout and the session its repairs resume."""
+    job = next((j for j in read_jobs(home) if j.get("id") == watch_id), None)
+    if job is None:
+        raise ValueError("Unknown watch; refresh")
+    return job["cwd"], job.get("session_id")
+
+
 def read_jobs(home):
     """Every watch in the queue, parsed once per queue change and shared by all callers.
 
@@ -658,11 +666,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if action == "workspace-message":
                 checkout = None
+                if "key" in request and "watch" in request:
+                    raise ValueError("Supply a workspace key or a watch")
                 if "key" in request:
                     # A Workspaces-tab row listed while no herdr workspace was open.
                     if not self.server.workspace_overview:
                         raise ValueError("The workspace experiment is disabled")
                     checkout = self.server.workspace_overview.checkout(request.pop("key"))
+                if "watch" in request:
+                    # A watch's checkout, where its repairs run without a workspace.
+                    checkout, _ = watch_checkout(self.server.home, request.pop("watch"))
                 try:
                     self.send_json(
                         200, agent_messages.send(request, self.server.home, checkout=checkout)
@@ -925,16 +938,19 @@ class Handler(BaseHTTPRequestHandler):
                     )
             elif route.path == "/api/workspace-agents":
                 query = parse_qs(route.query)
-                if set(query) not in ({"workspace"}, {"key"}) or any(
+                if set(query) not in ({"workspace"}, {"key"}, {"watch"}) or any(
                     len(values) != 1 for values in query.values()
                 ):
-                    raise ValueError("Supply a workspace or a workspace key")
-                if "key" in query:
-                    # A Workspaces-tab row listed while no herdr workspace was open: the
-                    # one open on its checkout now, which the viewer then follows.
-                    if not self.server.workspace_overview:
+                    raise ValueError("Supply a workspace, a workspace key or a watch")
+                if "key" in query or "watch" in query:
+                    # A Workspaces-tab row listed while no herdr workspace was open, or a
+                    # watch's checkout: the one open on it now, which the viewer then follows.
+                    if "watch" in query:
+                        path, _ = watch_checkout(self.server.home, query["watch"][0])
+                    elif not self.server.workspace_overview:
                         raise ValueError("The workspace experiment is disabled")
-                    path = self.server.workspace_overview.checkout(query["key"][0])
+                    else:
+                        path = self.server.workspace_overview.checkout(query["key"][0])
                     workspace_id = workspace_viewer.checkout_workspace(path)
                 else:
                     workspace_id = query["workspace"][0]
@@ -976,14 +992,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("The workspace experiment is disabled")
                     path = self.server.workspace_overview.checkout(single.pop("key"))
                 if "watch" in single:
-                    wanted = single.pop("watch")
-                    job = next(
-                        (j for j in read_jobs(self.server.home) if j.get("id") == wanted), None
-                    )
-                    if job is None:
-                        raise ValueError("Unknown watch; refresh")
                     # The session its repairs resume opens first.
-                    path, prefer = job["cwd"], job.get("session_id")
+                    path, prefer = watch_checkout(self.server.home, single.pop("watch"))
                 # Read-only views own their failure boundary, like the inventory.
                 try:
                     if "workspace" in single:

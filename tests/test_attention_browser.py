@@ -216,15 +216,26 @@ def test_a_blocked_repair_offers_its_transcript_without_a_workspace(
         route.fulfill(json={"sessions": [], "session": None, "entries": [], "start": 0, "total": 0})
 
     page.route("**/api/workspace-transcript?*", transcript)
+    watch = {"id": "abc123", "status": "blocked", "repo": "test/alpha", "number": 8}
+    session = {"id": "s1", "agent": "claude", "title": "Fix it", "updated": 1, "watch": watch}
+    agents = {"agents": [], "sessions": [session], "path": "/c", "workspace": None, "url": None}
+
+    def workspace_agents(route):
+        seen.append(route.request.url)
+        route.fulfill(json=agents)
+
+    page.route("**/api/workspace-agents?*", workspace_agents)
     page.goto(url + "/#attention")
     card = page.locator(".attention-item").first
     expect(card.get_by_role("link", name="Open in Collie")).to_have_count(0)
     card.get_by_role("button", name="Transcript", exact=True).click()
     viewer = page.locator("#ws-viewer")
     expect(viewer.get_by_text("No Claude or Codex session")).to_be_visible()
-    assert "workspace-transcript?watch=abc123" in seen[-1]
-    # No workspace means no agent to message; the transcript is read only.
-    expect(page.locator("#ws-message")).to_be_hidden()
+    assert any("workspace-transcript?watch=abc123" in u for u in seen)
+    # The repair's session can be taken over from here: cancel the watch, then resume it.
+    expect(viewer.get_by_role("button", name="Cancel watch and reopen…")).to_be_visible()
+    expect(viewer.get_by_role("button", name="Cancel watch and send…")).to_be_visible()
+    assert any("workspace-agents?watch=abc123" in u for u in seen)
 
 
 def test_groups_collapse_and_stay_collapsed_across_polls(page: Page, dashboard_site) -> None:

@@ -80,3 +80,29 @@ def test_a_watch_in_a_repair_is_cancelled_after_it_and_nothing_resumes(page, own
     assert job["status"] == "running" and job["stop_after_run"]
     assert not read(state).get("runs")
     expect(dialog.get_by_label("Message the agent")).to_have_value("Address review comment")
+
+
+def test_a_watch_transcript_offers_to_cancel_it_and_reopen_the_session(page, owned):
+    url, state, sid, checkout, home = owned
+    save_watch(home, sid, cwd=str(checkout))
+    page.goto(url + "/#attention")
+    # The view a blocked repair's card opens: the watch, read without a workspace.
+    page.evaluate(
+        "window.workspaceViewer.open({ watch: 'w-1', name: 'Merged work' }, 'transcript')"
+    )
+    dialog = page.locator("#ws-viewer")
+    notice = page.locator("#ws-agent-interaction")
+    expect(notice).to_contain_text("This session belongs to babysit watch w-1 (blocked)")
+    dialog.get_by_role("button", name="Cancel watch and reopen…").click()
+    expect(notice).to_contain_text("resumed in a workspace to continue in Collie; nothing is sent")
+    assert load_watch(home)["status"] == "blocked"
+    notice.get_by_role("button", name="Cancel watch and reopen", exact=True).click()
+    expect(page.locator("#ws-message-status")).to_have_text(
+        re.compile(r"Cancelled babysit watch w-1 and resumed the session in w1:p\d+; continue")
+    )
+    assert load_watch(home)["status"] == "stopped"
+    # Resumed with no prompt: the session waits for the reader.
+    assert read(state)["agents"][0]["argv"] == ["--resume", sid]
+    # The viewer follows the workspace now open there, with its agent to message.
+    expect(dialog.get_by_role("button", name="Send to agent")).to_be_visible()
+    expect(dialog.get_by_role("button", name="Reopen in Collie")).to_be_hidden()
