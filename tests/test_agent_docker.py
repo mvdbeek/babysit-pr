@@ -118,6 +118,37 @@ def rig(request, tmp_path, monkeypatch):
     return rig
 
 
+def test_restart_keeps_with_grants_the_agent_can_write(rig, tmp_path, monkeypatch):
+    # `wt --with` granted these through SAFEHOUSE_ADD_DIRS, which is not in any argv.
+    also, other, common = tmp_path / "also", tmp_path / "other", tmp_path / "clone.git"
+    for path in (also, other, common):
+        path.mkdir()
+    rig.proc["argv"][1:1] = ["--add-dir", str(also), f"--add-dir={other}"]
+    rig.procs["foreground_processes"][0]["argv"][6:6] = rig.proc["argv"][1:4]
+    monkeypatch.setattr(
+        docker.subprocess,
+        "run",
+        lambda argv, **kw: SimpleNamespace(returncode=0, stdout=f"{common}\n"),
+    )
+    asked = []
+
+    def checks(pid, pairs):
+        asked.extend(pairs)
+        # Only `also` and the clone's git dir were granted; `other` stays read-only.
+        return [1 if path == str(other) else 0 for _, path in pairs]
+
+    monkeypatch.setattr(docker, "sandbox_checks", checks)
+    messages.change_docker(rig.target, True, tmp_path)
+    assert asked == [
+        (b"file-write-data", str(also)),
+        (b"file-write-data", str(common)),
+        (b"file-write-data", str(other)),
+    ]
+    command = rig.calls[-1][-1]
+    assert f"--enable=docker --add-dirs={also}:{common} -- {rig.kind} " in command
+    assert f"--add-dir {also}" in command
+
+
 def test_restart_preserves_session_pane_cwd_options_and_enables_docker(rig, tmp_path):
     value = messages.change_docker(rig.target, True, tmp_path)
     assert value == {"docker": True, "pane": "w1:p1", "warning": None}

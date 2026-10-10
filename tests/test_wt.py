@@ -335,6 +335,40 @@ def test_docker_prefixes_the_safehouse_enable_variable(command):
     assert tool().command_for(options(prompt="go")) == 'claude "$(cat /tmp/wt-prompt.fixture)"'
 
 
+def test_with_checkouts_widen_the_sandbox_and_become_agent_directories():
+    also = [
+        wt.AlsoCheckout("/src/a", "/wt/a/x", "/src/a/.git"),
+        wt.AlsoCheckout("/src/b", "/wt/b/x y", "/src/b/.git"),
+    ]
+    assert wt.parse_args("wti", ["--with", "a", "--with", "/src/b", "12"]).also == ["a", "/src/b"]
+    staged = []
+
+    def stage(text):
+        staged.append(text)
+        return f"/tmp/staged {len(staged)}"
+
+    # The grants extend safe.env's list and are read back from a file, like the prompt;
+    # `--` keeps the variadic --add-dir off the prompt.
+    assert wt.agent_command("claude", "go", stage=stage, docker=True, also=also) == (
+        "SAFEHOUSE_ADD_DIRS=${SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}$(cat '/tmp/staged 1') "
+        "SAFE_ENABLE=docker claude --add-dir /wt/a/x --add-dir '/wt/b/x y' -- "
+        "\"$(cat '/tmp/staged 2')\""
+    )
+    assert staged == ["/wt/a/x:/src/a/.git:/wt/b/x y:/src/b/.git", "go"]
+    assert wt.agent_command("codex", stage=lambda _: "/tmp/g", also=also[:1]) == (
+        "SAFEHOUSE_ADD_DIRS=${SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}$(cat /tmp/g) "
+        "codex -c check_for_update_on_startup=false --add-dir /wt/a/x"
+    )
+    with pytest.raises(ValueError, match="':'"):
+        wt.agent_command("claude", also=[wt.AlsoCheckout("/a", "/wt/a:b", "/a/.git")])
+    # A line the tty would silently drop fails loudly instead.
+    long = [wt.AlsoCheckout("/a", "/wt/" + "x" * 300 + str(n), "/a/.git") for n in range(3)]
+    with pytest.raises(ValueError, match="too long to type"):
+        wt.agent_command("claude", stage=lambda _: "/tmp/g", also=long)
+    with pytest.raises(wt.WtError, match="wt: The agent command is too long"):
+        tool().command_for(options(also_checkouts=long))
+
+
 @pytest.mark.parametrize("agent", ["claude", "codex"])
 @pytest.mark.parametrize("docker", [False, True])
 @pytest.mark.parametrize("config_dir", [None, "/home/u/.claude/accounts/work"])
@@ -1243,6 +1277,98 @@ def test_wt_name_reserves_a_new_branch_from_the_default_or_given_base(repo):
     assert git("rev-parse", "HEAD", cwd=home / "src/worktrees/repo/from-feature") == git(
         "rev-parse", "feature"
     )
+
+
+def test_with_checks_the_branch_out_in_other_clones_for_the_agent(repo, monkeypatch):
+    home, git, state = repo
+    other = home / "src/other"
+    other.mkdir()
+    git("init", "-b", "main", cwd=other)
+    git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "other",
+        cwd=other,
+    )
+    git("branch", "both", cwd=other)
+    monkeypatch.setenv("SAFEHOUSE_ADD_DIRS", "/granted")
+    run_tool("wt", "-r", "repo", "--with", "other", "--name", "both", "-p", "Fix both")
+    main, also = home / "src/worktrees/repo/both", home / "src/worktrees/other/both"
+    assert git("symbolic-ref", "--short", "HEAD", cwd=main) == "both"
+    # An existing local branch in the other clone is checked out, not recreated.
+    assert git("rev-parse", "HEAD", cwd=also) == git("rev-parse", "both", cwd=other)
+    agent = state_of(state)["agents"][0]
+    real = also.resolve()
+    assert agent["cwd"] == str(main.resolve())
+    assert agent["safehouse_add_dirs"] == f"/granted:{real}:{other.resolve()}/.git"
+    assert agent["argv"][:3] == ["--add-dir", str(real), "--"]
+    assert agent["task"] == (
+        "Fix both\n\nThis task also covers other repositories. Branch both is checked out in"
+        f" each of these, and you can write and commit there:\n- {real}"
+    )
+    # A worktree already holding the branch is used where it is.
+    linked = home / "linked"
+    git("worktree", "add", "-q", "-b", "elsewhere", str(linked), cwd=other)
+    result = run_tool("wt", "-r", "repo", "--with", str(other), "main", "elsewhere")
+    assert f"elsewhere is already checked out at {linked}; using that" in result.stderr
+    assert not (home / "src/worktrees/other/elsewhere").exists()
+    assert state_of(state)["agents"][-1]["argv"][1] == str(linked.resolve())
+    # A clone's own working tree is never handed over, and nothing is checked out first.
+    second = home / "src/second"
+    git("clone", "-q", str(other), str(second))
+    git("switch", "-c", "main-too", cwd=other)
+    result = run_tool(
+        "wt",
+        "-r",
+        "repo",
+        "--with",
+        "second",
+        "--with",
+        "other",
+        "feature",
+        "main-too",
+        check=False,
+    )
+    assert result.stderr.splitlines()[-1] == (
+        f"wt: main-too is checked out in {other.resolve()} itself; "
+        "switch that clone to another branch first"
+    )
+    assert not (home / "src/worktrees/second/main-too").exists()
+    result = run_tool("wt", "-r", "repo", "--with", "missing", "main", check=False)
+    assert result.stderr.strip() == f"wt: --with: no main clone at {home}/src/missing"
+    result = run_tool("wt", "-r", "repo", "--with", "a b", "main", check=False)
+    assert "--with needs a repository name or a clone path" in result.stderr
+
+
+def test_with_refuses_a_line_too_long_to_type_before_making_any_checkout(repo):
+    home, git, state = repo
+    names = [f"{n}{'x' * 200}" for n in range(3)]
+    for name in names:
+        git("init", "-q", "-b", "main", str(home / "src" / name), cwd=home)
+        git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c",
+            cwd=home / "src" / name,
+        )
+    withs = [word for name in names for word in ("--with", name)]
+    result = run_tool("wt", "-r", "repo", *withs, "main", "wide", check=False)
+    assert result.stderr.splitlines()[-1] == (
+        "wt: The agent command is too long to type; use fewer --with clones"
+    )
+    assert not any((home / "src/worktrees" / name).exists() for name in names)
+    assert not [c for c in state_of(state)["calls"] if c[:2] == ["worktree", "open"]]
 
 
 def test_wti_slug_fallback_from_remote_and_origin_head(repo, monkeypatch):

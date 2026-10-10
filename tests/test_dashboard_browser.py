@@ -4731,6 +4731,68 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
     expect(page.locator("#ws-viewer-links a")).to_have_text(["Issue #40"])
 
 
+def test_new_task_can_also_work_in_other_clones(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    snapshot = {"prs": {}, "issues": {}, "new": {}, "error": None, "synced_at": 1234}
+    page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+    now = time.time()
+    repos = [
+        {"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "upstream", "active": now},
+        {"repo": "fork/alpha", "clone": "/fixture/alpha", "remote": "origin", "active": now},
+        {"repo": "up/gamma", "clone": "/fixture/gamma", "remote": "origin", "active": now},
+        {"repo": "up/delta", "clone": "/fixture/delta", "remote": "origin", "active": now},
+    ]
+    page.route("**/api/workspace-repos*", lambda route: route.fulfill(json={"repos": repos}))
+    sent = []
+
+    def start(route):
+        sent.append(route.request.post_data_json)
+        op = {
+            "id": "op1",
+            "pr": "new:1",
+            "status": "complete",
+            "message": "Workspace ready — Open in Collie",
+            "log": "",
+            "subject": {"kind": "scratch", "repo": "up/alpha", "branch": "both"},
+            "result": {
+                "workspace_id": "w1",
+                "name": "both",
+                "path": "/fixture/worktrees/alpha/both",
+                "url": "https://collie.example.ts.net/space/w1",
+            },
+            "also_paths": ["/fixture/worktrees/gamma/both"],
+        }
+        snapshot["new"] = {op["pr"]: {"operation": op}}
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    page.goto(url)
+    page.get_by_role("button", name="New task").click()
+    dialog = page.locator("#workspace-dialog")
+    dialog.get_by_text("Also work in other repositories (optional)").click()
+    # Each other clone once; the task's own clone is not offered.
+    others = dialog.locator(".new-task-also-list label")
+    expect(others).to_have_text(["up/gamma · /fixture/gamma", "up/delta · /fixture/delta"])
+    dialog.get_by_label("up/gamma · /fixture/gamma").check()
+    dialog.get_by_label("up/delta · /fixture/delta").check()
+    expect(dialog.get_by_text("Also work in other repositories (2)")).to_be_visible()
+    # Choosing delta as the task's clone drops it from the extras.
+    picker = dialog.get_by_role("combobox", name="Repository and local clone")
+    choose_option(picker, "3")
+    expect(others).to_have_text(["up/alpha · /fixture/alpha", "up/gamma · /fixture/gamma"])
+    expect(dialog.get_by_label("up/gamma · /fixture/gamma")).to_be_checked()
+    choose_option(picker, "0")
+    expect(dialog.get_by_label("up/delta · /fixture/delta")).not_to_be_checked()
+    dialog.get_by_label("New branch").fill("both")
+    dialog.get_by_label("Task", exact=True).fill("Change both")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-result")).to_contain_text(
+        "Also checked out: /fixture/worktrees/gamma/both"
+    )
+    assert sent[0]["clone"] == "/fixture/alpha"
+    assert sent[0]["also"] == ["/fixture/gamma"]
+
+
 def test_new_task_floats_on_a_phone_without_zooming(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 390, "height": 844})

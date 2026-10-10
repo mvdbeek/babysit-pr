@@ -267,3 +267,61 @@ def test_new_task_docker_must_be_a_flag(local, docker):  # noqa: F811
     manager, _, _, _, _ = local
     with pytest.raises(ValueError, match="Invalid new task"):
         manager.new_task(request(manager, name="containers", docker=docker))
+
+
+def other_clone(manager, git, name="other"):
+    """A second recent clone; with no origin remote, wt branches it from its local main."""
+    other = manager.src / name
+    other.mkdir()
+    git("init", "-b", "main", cwd=other)
+    git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "other",
+        cwd=other,
+    )
+    git("remote", "add", "upstream", f"https://github.com/base/{name}.git", cwd=other)
+    return other.resolve()
+
+
+def test_new_task_can_also_work_in_other_clones(local, monkeypatch):  # noqa: F811
+    manager, _, git, state, _ = local
+    calls = helper_calls(manager)
+    other = other_clone(manager, git)
+    # The name is taken in the other clone, so both checkouts get the next free one.
+    git("branch", "shared", cwd=other)
+    monkeypatch.setenv("SAFEHOUSE_ADD_DIRS", "/granted")
+    value = manager.new_task(request(manager, name="shared", also=[str(other)]))
+    op = finish(manager, value["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert op["branch"] == "shared-2" and op["also"] == [str(other)]
+    also = manager.src / "worktrees/other/shared-2"
+    assert op["also_paths"] == [str(also)]
+    assert calls[0][:4] == ["wt", "--codex", "--with", str(other)]
+    assert git("symbolic-ref", "--short", "HEAD", cwd=also) == "shared-2"
+    agent = json.loads(state.read_text())["agents"][0]
+    assert agent["safehouse_add_dirs"] == f"/granted:{also.resolve()}:{other}/.git"
+    assert f"you can write and commit there:\n- {also.resolve()}" in agent["task"]
+
+
+@pytest.mark.parametrize(
+    "also",
+    ["/x", [1], ["main"], ["/elsewhere"], ["other", "other"], ["named-repo"], ["other"] * 5],
+)
+def test_new_task_other_clones_must_be_distinct_listed_clones(local, also):  # noqa: F811
+    manager, _, git, _, _ = local
+    clones = {"main": str((manager.src / "repo").resolve())}
+    clones["other"] = str(other_clone(manager, git))
+    # Checkouts of base/repo go in worktrees/repo, so a clone named "Repo" cannot join.
+    (manager.src / "repo").rename(manager.src / "main-clone")
+    clones["main"] = str((manager.src / "main-clone").resolve())
+    clones["named-repo"] = str(other_clone(manager, git, "Repo"))
+    if isinstance(also, list):
+        also = [clones.get(a, a) if isinstance(a, str) else a for a in also]
+    with pytest.raises(ValueError, match="Invalid new task|other repositor|share the task"):
+        manager.new_task(request(manager, name="x", clone=clones["main"], also=also))
