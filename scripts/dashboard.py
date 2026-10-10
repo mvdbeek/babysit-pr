@@ -2,12 +2,17 @@
 """Loopback dashboard with watch cancellation for the shared babysit-pr watcher."""
 
 import argparse
+import gzip
+import hashlib
 import json
 import re
 import signal
 import sqlite3
 import subprocess
+import sys
+import threading
 import time
+import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +32,26 @@ from pr_workspaces import COLLIE_URL, Workspaces
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
+# Responses worth compressing: the polled JSON is large and repetitive, images are not.
+COMPRESSIBLE = {
+    "application/json",
+    "application/manifest+json",
+    "image/svg+xml",
+    "text/css",
+    "text/html",
+    "text/javascript",
+    "text/plain",
+}
+COMPRESS_MIN = 1024
+COMPRESS_LEVEL = 5
+# Bodies go out in chunks, so the socket timeout bounds a stall rather than a slow link.
+WRITE_CHUNK = 256 * 1024
+# A queue write within this long of a read may share its timestamp: never cached.
+RACY_NS = 1_000_000_000
+_jobs_lock = threading.Lock()
+_jobs_cache: dict[Path, tuple] = {}
+_assets_lock = threading.Lock()
+_assets_cache: dict[str, tuple] = {}
 
 
 def read_json(path):
@@ -36,18 +61,93 @@ def read_json(path):
         return None
 
 
+def queue_signature(path):
+    """What changes when the watcher writes its queue: the database file and its WAL."""
+    signature: list[tuple[int, int, int] | None] = []
+    for name in (path, path.with_name(path.name + "-wal")):
+        try:
+            stat = name.stat()
+        except FileNotFoundError:
+            signature.append(None)
+        else:
+            signature.append((stat.st_ino, stat.st_size, stat.st_mtime_ns))
+    return tuple(signature)
+
+
 def read_jobs(home):
+    """Every watch in the queue, parsed once per queue change and shared by all callers.
+
+    The result is cached: callers must copy before mutating any part of it.
+    """
     path = home / "queue.sqlite"
-    try:
-        path.stat()
-    except FileNotFoundError:
+    before = queue_signature(path)
+    if before[0] is None:
         return []
+    with _jobs_lock:
+        cached = _jobs_cache.get(path)
+        if cached and cached[0] == before:
+            return cached[1]
     # Never create a database or take ownership of monitoring just to display it.
     db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
     try:
-        return [json.loads(row[0]) for row in db.execute("SELECT data FROM jobs")]
+        jobs = [json.loads(row[0]) for row in db.execute("SELECT data FROM jobs")]
     finally:
         db.close()
+    newest = max(part[2] for part in before if part)
+    if queue_signature(path) == before and time.time_ns() - newest > RACY_NS:
+        with _jobs_lock:
+            _jobs_cache[path] = (before, jobs)
+    return jobs
+
+
+def compressible(content_type):
+    return content_type.split(";")[0].strip().lower() in COMPRESSIBLE
+
+
+def static_asset(filename, content_type):
+    """An asset's bytes, gzip encoding and ETag, recomputed only when the file changes."""
+    path = ASSETS / filename
+    stat = path.stat()
+    signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    with _assets_lock:
+        cached = _assets_cache.get(filename)
+    if cached and cached[0] == signature:
+        return cached[1:]
+    body = path.read_bytes()
+    packed = gzip.compress(body, compresslevel=9, mtime=0) if compressible(content_type) else None
+    # Weak: the gzip and identity encodings of one file share it.
+    etag = f'W/"{hashlib.sha256(body).hexdigest()[:32]}"'
+    with _assets_lock:
+        _assets_cache[filename] = (signature, body, packed, etag)
+    return body, packed, etag
+
+
+def accepts_gzip(header):
+    """Whether Accept-Encoding allows gzip; an explicit gzip entry overrides `*`."""
+    qualities = {}
+    for part in (header or "").split(","):
+        name, _, params = part.partition(";")
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        qualities[name.strip().lower()] = quality
+    gzip_quality = qualities.get("gzip", qualities.get("x-gzip", qualities.get("*", 0.0)))
+    return gzip_quality > 0
+
+
+def etag_matches(header, etag):
+    """If-None-Match uses the weak comparison: W/ prefixes are ignored."""
+    if not header:
+        return False
+    if header.strip() == "*":
+        return True
+    opaque = etag.removeprefix("W/")
+    return any(tag.strip().removeprefix("W/") == opaque for tag in header.split(","))
 
 
 def present_job(job):
@@ -234,38 +334,106 @@ class DashboardServer(ThreadingHTTPServer):
         self.extension = browser_extension.Extension(home)
         super().__init__(("127.0.0.1", port), Handler)
 
+    def handle_error(self, request, client_address):
+        # A phone that sleeps or loses the tailnet mid-request is routine, not a fault.
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
 
 class Handler(BaseHTTPRequestHandler):
     server: DashboardServer
+    # A client that stops sending or reading frees its thread; request bodies narrow it.
+    timeout = 30
+    # Whether this request's response has begun: never start a second one.
+    started = False
 
     def log_message(self, *args):
         pass
 
-    def send_body(self, code, body, content_type):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        origin = self.headers.get("Origin")
-        if origin and self.path == "/api/extension" and self.server.extension.known_origin(origin):
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Methods", "POST")
+    def send_body(self, code, body, content_type, etag=None, compressed=None):
+        """Send a response; a client that has gone away is quietly sent nothing more.
+
+        API data is never stored by the browser; static assets are revalidated by ETag.
+        ``compressed`` is a precomputed gzip encoding of ``body``. A 304 sends the
+        headers a 200 would have, without the body.
+        """
+        self.started = True
+        encoding = None
+        vary = []
+        if compressible(content_type) and len(body) >= COMPRESS_MIN:
+            vary.append("Accept-Encoding")
+            if code != 304 and accepts_gzip(self.headers.get("Accept-Encoding")):
+                if compressed is None:
+                    compressed = gzip.compress(body, compresslevel=COMPRESS_LEVEL, mtime=0)
+                body, encoding = compressed, "gzip"
+        if code == 304:
+            body = b""
+        try:
+            self.send_response(code)
+            if code != 304:
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
+            self.send_header("Cache-Control", "no-cache" if etag else "no-store")
+            if etag:
+                self.send_header("ETag", etag)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            origin = self.headers.get("Origin")
+            if (
+                origin
+                and self.path == "/api/extension"
+                and self.server.extension.known_origin(origin)
+            ):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                vary.insert(0, "Origin")
+                self.send_header("Access-Control-Allow-Methods", "POST")
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type, X-Babysit-Extension",
+                )
+            if vary:
+                self.send_header("Vary", ", ".join(vary))
             self.send_header(
-                "Access-Control-Allow-Headers", "Authorization, Content-Type, X-Babysit-Extension"
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
             )
-        self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
-        )
-        self.end_headers()
-        self.wfile.write(body)
+            self.end_headers()
+            view = memoryview(body)
+            for start in range(0, len(view), WRITE_CHUNK):
+                self.wfile.write(view[start : start + WRITE_CHUNK])
+        except OSError:
+            # Disconnected or stalled past the timeout: nothing more can reach it.
+            self.close_connection = True
 
     def send_json(self, code, value):
         self.send_body(code, json.dumps(value).encode(), "application/json; charset=utf-8")
 
+    def fail(self, code, message):
+        """An error response, unless one already began (its client may be gone)."""
+        if not self.started:
+            self.send_json(code, {"error": message})
+
+    def guarded(self, handler):
+        """Answer every request: an unexpected error is logged and becomes a 500."""
+        self.started = False
+        try:
+            handler()
+        except Exception as exc:
+            traceback.print_exc()
+            self.fail(500, f"Unexpected dashboard error: {type(exc).__name__}: {exc}")
+
+    def do_GET(self):
+        self.guarded(self.get)
+
     def do_POST(self):
+        self.guarded(self.post)
+
+    def do_OPTIONS(self):
+        self.guarded(self.options)
+
+    def post(self):
         if self.path == "/api/extension":
             self.extension_request()
             return
@@ -496,9 +664,9 @@ class Handler(BaseHTTPRequestHandler):
                 job = cancel_watch(self.server.home, request["id"])
             self.send_json(200, {"job": job})
         except ValueError as exc:
-            self.send_json(400, {"error": str(exc)})
+            self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
-            self.send_json(503, {"error": f"Cannot update watch: {exc}"})
+            self.fail(503, f"Cannot update watch: {exc}")
 
     def upload(self, length):
         """Store a file sent as the raw request body, named by its X-Filename header."""
@@ -528,7 +696,7 @@ class Handler(BaseHTTPRequestHandler):
             | self.server.allowed_hosts
         )
 
-    def do_OPTIONS(self):
+    def options(self):
         if (
             self.path == "/api/extension"
             and self.extension_host()
@@ -556,11 +724,11 @@ class Handler(BaseHTTPRequestHandler):
             result = self.server.extension.dispatch(self.server, client, request)
             self.send_json(400 if "error" in result else 200, result)
         except ValueError as exc:
-            self.send_json(400, {"error": str(exc)})
+            self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
-            self.send_json(503, {"error": f"Cannot deliver task: {exc}"})
+            self.fail(503, f"Cannot deliver task: {exc}")
 
-    def do_GET(self):
+    def get(self):
         port = self.server.server_port
         if (
             self.headers.get("Host")
@@ -568,13 +736,14 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self.send_json(403, {"error": "Use a configured dashboard URL"})
             return
-        if (
-            self.headers.get("Sec-Fetch-Site") == "cross-site"
-            and self.headers.get("Sec-Fetch-Mode") != "navigate"
+        route = urlsplit(self.path)
+        # A cross-site link may open the dashboard, but never an API route: some GETs
+        # (`?refresh=1`) start work. Same-origin navigations still reach every route.
+        if self.headers.get("Sec-Fetch-Site") == "cross-site" and (
+            self.headers.get("Sec-Fetch-Mode") != "navigate" or route.path.startswith("/api/")
         ):
             self.send_json(403, {"error": "Cross-site access is disabled"})
             return
-        route = urlsplit(self.path)
         try:
             if route.path == "/api/status":
                 self.send_json(200, status(self.server.home))
@@ -682,7 +851,7 @@ class Handler(BaseHTTPRequestHandler):
                     # ID once reopened, which the viewer then follows.
                     live = workspace_viewer.live_workspace(workspace_id)
                     value = {
-                        "agents": agent_messages.docker_status(workspace_id),
+                        "agents": agent_messages.docker_status(workspace_id, live),
                         "sessions": agent_messages.sessions(workspace_id, self.server.home),
                         # A draft names its checkout, so a reused workspace ID cannot
                         # deliver another checkout's comments.
@@ -861,11 +1030,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 filename, mime = files[route.path]
                 content_type = mime + ("; charset=utf-8" if mime.startswith("text/") else "")
-                self.send_body(200, (ASSETS / filename).read_bytes(), content_type)
+                body, packed, etag = static_asset(filename, content_type)
+                code = 304 if etag_matches(self.headers.get("If-None-Match"), etag) else 200
+                self.send_body(code, body, content_type, etag=etag, compressed=packed)
         except ValueError as exc:
-            self.send_json(400, {"error": str(exc)})
+            self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
-            self.send_json(503, {"error": f"Cannot read watcher data: {exc}"})
+            self.fail(503, f"Cannot read watcher data: {exc}")
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir=None):
@@ -894,6 +1065,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
     push = PushInbox(
         home,
         lambda: {"prs": overview.snapshot(), "issues": issues.snapshot(), "watcher": status(home)},
+        login=lambda: overview.snapshot().get("login"),
     )
     with DashboardServer(
         home,

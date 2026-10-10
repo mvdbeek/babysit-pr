@@ -354,8 +354,10 @@ class WorkspaceOverview:
                 self.loading = True
                 self.next_poll = time.time() + INTERVAL
                 threading.Thread(target=self._refresh, daemon=True).start()
+            # Shallow: rows are never changed once listed; refreshes replace the value and
+            # publish_row() replaces the partial list. The cleanup job changes in place.
             return {
-                **copy.deepcopy(self.partial if self.partial is not None else self.value),
+                **(self.partial if self.partial is not None else self.value),
                 "enabled": self.enabled,
                 "loading": self.loading,
                 "error": self.error,

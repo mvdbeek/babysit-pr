@@ -66,6 +66,8 @@ BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NEW_PREFIX = "new:"
 NEW_LISTED = 86400
 NEW_LIMIT = 20
+# How often listing new tasks also deletes the expired ones from the database.
+PRUNE_SECONDS = 60
 # A new task lists clones whose HEAD moved this recently, unless asked for all of them.
 RECENT_CLONE_SECONDS = 90 * 86400
 REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
@@ -254,6 +256,21 @@ def workspaces_by_path(inventory):
     return spaces
 
 
+def checkout_index(inventory):
+    """Positions of checkouts by path, tracked repository and branch issue number.
+
+    A target can only match a checkout that shares one of these with it, so a snapshot
+    examines those few instead of comparing every target with every checkout.
+    """
+    index: dict[str, dict] = {"path": {}, "remote": {}, "number": {}}
+    for position, item in enumerate(inventory["checkouts"]):
+        index["path"].setdefault(item["path"], []).append(position)
+        for slug in set(item["remotes"]):
+            index["remote"].setdefault(slug, []).append(position)
+        index["number"].setdefault(branch_number(item["branch"]), []).append(position)
+    return index
+
+
 def is_issue(target):
     return target.get("kind") == "issue"
 
@@ -342,15 +359,19 @@ def verified_head(pr, item):
     if not re.fullmatch(r"[a-fA-F0-9]{40}", sha):
         return False
     key = (item["common"], sha.lower(), item.get("sha") or "")
-    if not key[2] or key not in ANCESTRY:
-        try:
-            git(item["path"], "merge-base", "--is-ancestor", sha, "HEAD")
-            ANCESTRY[key] = True
-        except ValueError:
-            ANCESTRY[key] = False
-        if len(ANCESTRY) > 10000:
-            ANCESTRY.clear()
-    return ANCESTRY[key]
+    known = ANCESTRY.get(key) if key[2] else None
+    if known is not None:
+        return known
+    try:
+        git(item["path"], "merge-base", "--is-ancestor", sha, "HEAD")
+        contained = True
+    except ValueError:
+        contained = False
+    # Snapshots run concurrently: a full cache starts over, never losing this answer.
+    if len(ANCESTRY) >= 10000:
+        ANCESTRY.clear()
+    ANCESTRY[key] = contained
+    return contained
 
 
 class Workspaces:
@@ -372,6 +393,11 @@ class Workspaces:
         }
         self.next_poll = 0.0
         self.refreshing = False
+        self.pruned_at = 0.0
+        # The snapshot requests waiting for the next computation, and the turn to compute.
+        self.flight: concurrent.futures.Future | None = None
+        self.flight_lock = threading.Lock()
+        self.compute_lock = threading.Lock()
         self.home.mkdir(parents=True, exist_ok=True)
         self.path = self.home / "pr-workspaces.sqlite"
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -538,6 +564,17 @@ class Workspaces:
             wanted: set[str] = set()
             for target in self.targets():
                 wanted.update(repositories(target))
+            # A clone whose own config names remotes, none of them wanted, is skipped without
+            # starting git. Git resolves the rest: a root whose `.git` is a file (a linked
+            # worktree), and a config whose remotes this simple reading misses (an include,
+            # a comment after a section header).
+            roots = {
+                root
+                for root in roots
+                if not (root / ".git").is_dir()
+                or not (remotes := file_remotes(root / ".git"))
+                or wanted.intersection(remotes.values())
+            }
             # Git spawns dominate; several clones resolve concurrently, merged in path order.
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                 found = pool.map(lambda root: clone_worktrees(root, wanted), sorted(roots))
@@ -548,9 +585,13 @@ class Workspaces:
                 clones.append(main)
                 for item in worktrees:
                     items[item["path"]] = item
-            # Headless watches may use checkouts outside the normal clone inventory.
+            # Headless watches may use checkouts outside the normal clone inventory; an ended
+            # one still needs its checkout to be cleaned up. A removed checkout is history:
+            # resolving it would only cost git calls.
             for path in {
-                str(Path(j["cwd"]).resolve()) for j in self.jobs() if j.get("cwd")
+                str(Path(j["cwd"]).resolve())
+                for j in self.jobs()
+                if j.get("cwd") and os.path.isdir(j["cwd"])
             } - items.keys():
                 item = checkout(path)
                 if item:
@@ -575,8 +616,11 @@ class Workspaces:
             with self.lock:
                 self.refreshing = False
 
-    def association(self, pr, item):
+    def association(self, pr, item, saved=None):
+        """Record a verified checkout for a target; ``saved`` is its stored record, if read."""
         data = {**item, "head_repo": pr.get("head_repo"), "head_branch": pr.get("head_branch")}
+        if data == saved:
+            return saved  # Snapshots re-derive it every poll; only a change is written.
         with self.db() as db:
             db.execute(
                 "INSERT OR REPLACE INTO associations VALUES (?,?,?)",
@@ -631,10 +675,19 @@ class Workspaces:
         watch = pr.get("kind") == "watch"
         sentry = is_sentry(pr)
         scratch = is_scratch(pr)
-        repos = repositories(pr)  # Hoisted: snapshots compare every target with every checkout.
+        repos = repositories(pr)
         linked_prs = (pr.get("linked_prs") or []) if issue else []
         cwd = str(Path(pr["cwd"]).resolve()) if watch else None
-        for item in inventory["checkouts"]:
+        # Only checkouts of the target's repositories, its watch directory, or (a hint
+        # for issues) its issue number can match; inventory order is kept.
+        index = state.get("index") or checkout_index(inventory)
+        if watch:
+            positions = set(index["path"].get(cwd, ()))
+        else:
+            positions = {p for slug in repos for p in index["remote"].get(slug, ())}
+            if issue:
+                positions.update(index["number"].get(pr["number"], ()))
+        for item in (inventory["checkouts"][p] for p in sorted(positions)):
             if watch and cwd != item["path"]:
                 continue
             # Hundreds of Sentry groups are described per snapshot: skip cheaply.
@@ -725,7 +778,8 @@ class Workspaces:
         # Recover the durable resource reservation even if the server exited before
         # recording its association. Name alone is never sufficient provenance.
         if op and op.get("path") and op.get("branch") and op.get("common"):
-            item = next((c for c in inventory["checkouts"] if c["path"] == op["path"]), None)
+            found = (state.get("index") or checkout_index(inventory))["path"].get(op["path"])
+            item = inventory["checkouts"][found[0]] if found else None
             if (
                 item
                 and item["common"] == op["common"]
@@ -734,9 +788,8 @@ class Workspaces:
                     is_issue(pr) or is_sentry(pr) or item["upstream"] == self.expected_upstream(pr)
                 )
             ):
-                state["associations"].setdefault(pr["id"], {})[item["path"]] = self.association(
-                    pr, item
-                )
+                saved = state["associations"].setdefault(pr["id"], {})
+                saved[item["path"]] = self.association(pr, item, saved.get(item["path"]))
         matches, suggestions = self.matches(pr, inventory, state)
         clones = [c["path"] for c in inventory["clones"] if pr["repo"].lower() in c["remotes"]]
         choice = state["clones"].get(pr["repo"].lower())
@@ -752,12 +805,19 @@ class Workspaces:
                 self.save_operation(
                     op, status="complete", result=result, message="Recovered existing workspace"
                 )
-            else:
-                self.save_operation(
-                    op,
-                    status="uncertain",
-                    message="Delivery was interrupted. Recorded resources were inspected; automatic relaunch is disabled. Reopen an existing checkout or inspect the operation log.",
-                )
+            elif op["status"] != "uncertain":
+                # The state was read before this call; the worker may have finished since.
+                with self.lock:
+                    current = self.operation(pr["id"]) or op
+                    if current["status"] in {"queued", "running"} and pr["id"] not in self.workers:
+                        self.save_operation(
+                            current,
+                            status="uncertain",
+                            message="Delivery was interrupted. Recorded resources were inspected; automatic relaunch is disabled. Reopen an existing checkout or inspect the operation log.",
+                        )
+                    op = current
+            # An uncertain launch keeps the cause perform() recorded; only an agent that
+            # came up resolves it, so nothing is written until then.
         return {
             "matches": matches,
             "suggestions": suggestions,
@@ -775,13 +835,41 @@ class Workspaces:
         return [(pr.get("head_repo") or "").lower(), pr.get("head_branch")]
 
     def snapshot(self):
+        """Every target's checkouts, workspaces and operation; callers must not modify it.
+
+        A cold one runs git for each PR head and checkout, so concurrent requests (tabs, a
+        dialog beside the poll, the extension) share one computation instead of stacking
+        more. One arriving while a computation runs waits for the next, which starts after
+        it: no answer predates its request, and an action it just took is in it.
+        """
+        with self.flight_lock:
+            if self.flight is None:
+                self.flight = concurrent.futures.Future()
+            flight = self.flight
+        with self.compute_lock:
+            # Not done: nobody has computed it yet, so it is still self.flight; detach it so
+            # later arrivals wait for the computation after this one.
+            if not flight.done():
+                with self.flight_lock:
+                    self.flight = None
+                try:
+                    flight.set_result(self.compute_snapshot())
+                except BaseException as exc:  # Every waiter sees the failure, then returns.
+                    flight.set_exception(exc)
+        return flight.result()
+
+    def compute_snapshot(self):
         with self.lock:
             if time.monotonic() >= self.next_poll and not self.refreshing:
                 self.refreshing = True
                 threading.Thread(target=self.refresh, daemon=True).start()
             inventory = copy.deepcopy(self.inventory)
         described: dict[str, dict] = {"prs": {}, "issues": {}, "watches": {}, "sentry": {}}
-        state = {**self.state(), "spaces": workspaces_by_path(inventory)}
+        state = {
+            **self.state(),
+            "spaces": workspaces_by_path(inventory),
+            "index": checkout_index(inventory),
+        }
         for target in self.targets():
             key = (
                 "watches"
@@ -1255,11 +1343,14 @@ class Workspaces:
                             message="The dashboard stopped while starting this task. Check for its issue and workspace before starting it again.",
                         )
             found.append(op)
-        with self.db() as db:
-            db.execute(
-                "DELETE FROM operations WHERE pr LIKE ? AND json_extract(data,'$.created_at') < ?",
-                (f"{NEW_PREFIX}%", now - NEW_LISTED),
-            )
+        # Expired ones are only hidden above, so the cleanup need not write every poll.
+        if now - self.pruned_at >= PRUNE_SECONDS:
+            self.pruned_at = now
+            with self.db() as db:
+                db.execute(
+                    "DELETE FROM operations WHERE pr LIKE ? AND json_extract(data,'$.created_at') < ?",
+                    (f"{NEW_PREFIX}%", now - NEW_LISTED),
+                )
         found.sort(key=lambda op: op["created_at"], reverse=True)
         return {op["pr"]: {"operation": op} for op in found[:NEW_LIMIT]}
 
@@ -1657,13 +1748,16 @@ class Workspaces:
     def run_logged(self, op, *args, pass_fds=(), timeout=600, env=None):
         """Stream bounded command output into the operation database while it runs."""
         started = time.monotonic()
-        # Clones and the worktree helper talk to GitHub: shared token, no prompts.
+        argv = list(map(str, args))
+        # Clones and the worktree helper talk to GitHub: shared token, no prompts. Only gh
+        # itself takes a gh slot: a helper running for minutes must not block other calls.
         with github_cli.command(
-            list(map(str, args)),
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             pass_fds=pass_fds,
             env=env,
+            slot=argv[0] == "gh",
         ) as proc:
             assert proc.stdout is not None
             with selectors.DefaultSelector() as selector:

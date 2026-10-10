@@ -110,7 +110,9 @@ def rig(request, tmp_path, monkeypatch):
     monkeypatch.setattr(
         messages,
         "agents",
-        lambda wid, interactions=False: [{"pane": "w1:p1", "session": SID, "agent": kind}],
+        lambda wid, interactions=False, live=None: [
+            {"pane": "w1:p1", "session": SID, "agent": kind}
+        ],
     )
     monkeypatch.setattr(messages, "run", send)
     return rig
@@ -351,3 +353,14 @@ def test_toggle_checks_access_after_restart(rig, tmp_path, monkeypatch):
     )
     assert result["docker"] is False
     assert "did not match" in result["warning"]
+
+
+def test_a_workspace_resolved_as_closed_is_not_looked_up_again(monkeypatch):
+    def unexpected(*args):
+        raise AssertionError(f"looked up {args}")
+
+    monkeypatch.setattr(messages.workspace_viewer, "live_workspace", unexpected)
+    monkeypatch.setattr(messages, "herdr", unexpected)
+    # Before: None also meant "not resolved", so a closed workspace was looked up twice.
+    assert messages.docker_status("w1", None) == []
+    assert messages.agents("w1", live=None) == []

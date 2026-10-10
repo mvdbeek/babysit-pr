@@ -362,10 +362,12 @@ def deliver(subscription, payload, key, origin):
 
 
 class PushInbox:
-    def __init__(self, home: Path, snapshots, sender=deliver):
+    def __init__(self, home: Path, snapshots, sender=deliver, login=None):
         self.path = home / "dashboard-push.json"
         self.key_path = home / "dashboard-vapid.pem"
         self.snapshots = snapshots
+        # The signed-in GitHub login without building every snapshot; polled often.
+        self.login = login or (lambda: self.snapshots().get("prs", {}).get("login"))
         self.sender = sender
         self.lock = threading.RLock()
         self.stopping = threading.Event()
@@ -404,7 +406,7 @@ class PushInbox:
         temp.replace(self.path)
 
     def preferences(self):
-        login = self.snapshots().get("prs", {}).get("login")
+        login = self.login()
         with self.lock:
             return {"login": login, "silenced": list(self.silenced.get(login, []))}
 
