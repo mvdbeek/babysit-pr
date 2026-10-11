@@ -23,6 +23,7 @@ import attachments
 import attention
 import browser_extension
 import llm_usage
+import service_control
 import workspace_agents
 import workspace_viewer
 from dashboard_push import check_result
@@ -213,6 +214,25 @@ def present_job(job):
     }
 
 
+def daemon_health(home, now=None):
+    """How the watcher daemon is doing, for the header badge and the Services dialog."""
+    now = time.time() if now is None else now
+    heartbeat = read_json(home / "heartbeat.json") or {}
+    daemon = read_json(home / "daemon.json") or {}
+    age = max(0, now - heartbeat["time"]) if heartbeat.get("time") else None
+    return {
+        "health": "healthy"
+        if age is not None and age < 15
+        else "stale"
+        if age is not None
+        else "offline",
+        "heartbeat_age": age,
+        "max_workers": daemon.get("max_workers"),
+        "pid": daemon.get("pid"),
+        "started_at": daemon.get("started_at"),
+    }
+
+
 def status(home):
     now = time.time()
     result = {
@@ -230,18 +250,7 @@ def status(home):
             if job["status"] in agent_messages.ENDED_WATCHES:
                 job.update(check_details=[], failed_jobs=[], details_omitted=True)
         result["jobs"] = sorted(jobs, key=lambda job: job.get("updated_at") or 0, reverse=True)
-        heartbeat = read_json(home / "heartbeat.json") or {}
-        daemon = read_json(home / "daemon.json") or {}
-        age = max(0, now - heartbeat["time"]) if heartbeat.get("time") else None
-        result["daemon"] = {
-            "health": "healthy"
-            if age is not None and age < 15
-            else "stale"
-            if age is not None
-            else "offline",
-            "heartbeat_age": age,
-            "max_workers": daemon.get("max_workers"),
-        }
+        result["daemon"] = daemon_health(home, now)
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
         result["error"] = f"Cannot read watcher state: {exc}"
     return result
@@ -334,6 +343,8 @@ class DashboardServer(ThreadingHTTPServer):
         codex_updates=None,
     ) -> None:
         self.home = home
+        # Set when the dashboard stops to be started again on the checkout's code.
+        self.restart = False
         self.attachments = attachments or home / "attachments"
         self.triage = attention.Triage(home)
         self.attention = attention.Cached(self.attention_feed)
@@ -566,6 +577,7 @@ class Handler(BaseHTTPRequestHandler):
                 "extension-pair",
                 "effort-default",
                 "codex-update",
+                "service-restart",
             }
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
@@ -710,6 +722,9 @@ class Handler(BaseHTTPRequestHandler):
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the dialog in Collie: {exc}"})
                 return
+            if action == "service-restart":
+                self.service_restart(request)
+                return
             if action == "codex-update":
                 if not self.server.codex_updates:
                     raise ValueError("Codex update checks are not enabled")
@@ -773,6 +788,24 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.fail(503, f"Cannot update watch: {exc}")
+
+    def service_restart(self, request):
+        """Restart the watcher daemon, or this dashboard, for the Services dialog."""
+        service = request.get("service")
+        if service not in {"daemon", "dashboard"}:
+            raise ValueError("Choose the watcher daemon or the dashboard")
+        if service == "daemon":
+            try:
+                service_control.restart_daemon(self.server.home)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.fail(503, f"Could not restart the watcher: {exc}")
+                return
+            self.send_json(200, {"daemon": daemon_health(self.server.home)})
+            return
+        # Answered before it stops: the page polls for the process that replaces this one.
+        service_control.check_restartable()
+        self.send_json(200, {"dashboard": service_control.dashboard_state()})
+        service_control.restart_dashboard(self.server)
 
     def upload(self, length):
         """Store a file sent as the raw request body, named by its X-Filename header."""
@@ -867,6 +900,14 @@ class Handler(BaseHTTPRequestHandler):
                 heartbeat = read_json(self.server.home / "heartbeat.json") or {}
                 reader = llm_usage.reader_state(self.server.home, heartbeat)
                 self.send_json(200, llm_usage.present(self.server.home, reader=reader))
+            elif route.path == "/api/service":
+                self.send_json(
+                    200,
+                    {
+                        "daemon": daemon_health(self.server.home),
+                        "dashboard": service_control.dashboard_state(),
+                    },
+                )
             elif route.path == "/api/codex-update":
                 self.send_json(
                     200,
@@ -1132,6 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/notifications.js": ("notifications.js", "text/javascript"),
                     "/usage.js": ("usage.js", "text/javascript"),
                     "/codex_update.js": ("codex_update.js", "text/javascript"),
+                    "/service.js": ("service.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
                     "/sw.js": ("sw.js", "text/javascript"),
                     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
@@ -1167,6 +1209,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir=None):
+    """Run the dashboard; the exit status asks launchd for a restart, or not."""
     from codex_updates import CodexUpdates
     from cron_jobs import CronJobs
     from dashboard_push import PushInbox
@@ -1244,6 +1287,8 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
             notifications.close()
             push.close()
             ci_logs.close()
+    # KeepAlive starts a LaunchAgent again when it exits unsuccessfully, and only then.
+    return 1 if server.restart else 0
 
 
 if __name__ == "__main__":
@@ -1258,4 +1303,4 @@ if __name__ == "__main__":
         help="Exact Host header accepted through a trusted local proxy",
     )
     args = parser.parse_args()
-    serve(args.home.expanduser().resolve(), args.port, args.open, args.allow_host)
+    raise SystemExit(serve(args.home.expanduser().resolve(), args.port, args.open, args.allow_host))

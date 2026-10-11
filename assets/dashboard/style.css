@@ -303,6 +303,51 @@ header p {
   display: grid;
   gap: 18px;
 }
+#health {
+  border: 0;
+}
+@media (hover: hover) {
+  #health:hover {
+    box-shadow: 0 0 0 1px currentColor;
+  }
+}
+#service-list {
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 18px;
+}
+#service-status:empty {
+  display: none;
+}
+.service-item {
+  display: grid;
+  gap: 8px;
+}
+.service-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.service-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.service-foot small {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.service-foot button {
+  flex: none;
+}
+.service-note {
+  color: var(--muted);
+}
 .usage-account {
   display: grid;
   gap: 8px;
@@ -624,7 +669,8 @@ select {
   max-width: 190px;
 }
 @media (hover: hover) {
-  button:hover {
+  /* A badge that is also a button keeps the color that says what it reports. */
+  button:not(.badge):hover {
     background: var(--hover);
   }
 }

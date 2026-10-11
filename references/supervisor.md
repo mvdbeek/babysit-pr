@@ -147,7 +147,9 @@ and release. An attempted handoff is never replayed, because a repeated Ctrl-D
 could exit the shell. The final response reports scheduling, not confirmed exit.
 
 `start` restarts the shared daemon after logout/reboot/failure. No login service
-is installed. `release` starts it too. The daemon lock prevents duplicate services.
+is installed. `release` starts it too. The dashboard's Services dialog does the same
+restart from the page, and can also restart a launchd-owned dashboard onto the
+checkout's current code. The daemon lock prevents duplicate services.
 `serve --max-workers 2` runs it in the foreground; `start --max-workers N` sets the
 limit when launching a new daemon. An existing daemon keeps its current limit.
 
