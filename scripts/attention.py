@@ -126,7 +126,11 @@ class Feed:
                 "cron": None,
             }
         for field, value in fields.items():
-            if value is not None and item.get(field) is None:
+            if field == "cleanup":
+                # Every checkout of the item that Tidy up can clean, from each source.
+                item.setdefault("cleanup", [])
+                item["cleanup"] += [key for key in value if key not in item["cleanup"]]
+            elif value is not None and item.get(field) is None:
                 item[field] = value
         for page in pages:
             if page not in item["pages"]:
@@ -210,7 +214,10 @@ class Feed:
                     else f"{pending} feedback items await approval"
                 )
                 reasons.append(reason("feedback", "answer", text))
-            if job.get("cleanup_ready"):
+            # Once its checkout is gone there is nothing left to clean up; the watch
+            # stays in the Watcher's history but stops asking for attention.
+            checkout = job.get("cwd")
+            if job.get("cleanup_ready") and (not checkout or os.path.isdir(checkout)):
                 outcome = (job.get("pr_outcome") or "finished").capitalize()
                 reasons.append(
                     reason(
@@ -336,6 +343,14 @@ class Feed:
                 if link.get("state") not in {"none", "unknown", "error", None}
             ]
             settled = bool(links) and all(link.get("state") in CLOSED_LINKS for link in links)
+            # The Workspaces row the page cleans up for a card that asks to be tidied.
+            cleanup = []
+            if row.get("removable") and (
+                row.get("status") == "ready"
+                or (row.get("status") == "blocked" and settled)
+                or row.get("missing")
+            ):
+                cleanup = [row.get("key")]
             if row.get("status") == "ready":
                 reasons.append(
                     reason("workspace_ready", "tidy", "Its items are closed: ready to clean up")
@@ -368,6 +383,7 @@ class Feed:
                 workspace_url=row.get("workspace_url"),
                 workspace_id=(row.get("workspace_ids") or [None])[0],
                 agent={"status": row.get("agent_status")} if row.get("agent_status") else None,
+                **({"cleanup": cleanup} if cleanup else {}),
             )
 
     def scheduled(self, snapshot, now):

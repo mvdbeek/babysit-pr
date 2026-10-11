@@ -23,6 +23,10 @@
   let ascending = false;
   // What the rows were last built from; an unchanged poll leaves them (and focus) alone.
   let renderedRows = null;
+  // The most workspaces one cleanup request may name; the server refuses more.
+  const BATCH = 50;
+  // Rows asked for beyond one batch, said in the dialog so a second run picks them up.
+  let overflow = 0;
   const selected = new Set();
   const names = new Map();
   const opening = new Set();
@@ -336,7 +340,8 @@
     if (pending) {
       byId("ws-dialog-title").textContent = `Clean up ${pending.length} workspace(s)`;
       byId("ws-dialog-intro").textContent =
-        "Agents are asked to exit, the herdr workspace is closed, the worktree is removed and the local branch deleted. Anything not merged into a remote is kept unless you override it here.";
+        "Agents are asked to exit, the herdr workspace is closed, the worktree is removed and the local branch deleted. Anything not merged into a remote is kept unless you override it here." +
+        (overflow ? ` ${overflow} more are left for another cleanup.` : "");
       // Overriding one row at a time is the whole dialog when a backlog is cleared at
       // once, so the blockers are also offered together — still never pre-ticked.
       const blocked = pending.filter((entry) => entry.blockers.length);
@@ -405,8 +410,9 @@
     byId("ws-confirm").hidden = true;
     byId("ws-cancel").textContent = "Close";
   }
-  function openDialog(targets) {
+  function openDialog(targets, left = 0) {
     pending = targets;
+    overflow = left;
     byId("ws-dialog-error").textContent = "";
     if (!byId("ws-dialog").open) byId("ws-dialog").showModal();
     renderDialog();
@@ -497,6 +503,8 @@
     pending = null;
     byId("ws-dialog").close();
   };
+  // Needs you lists what is closed; once the dialog closes it shows what remains.
+  byId("ws-dialog").addEventListener("close", () => window.dashboardAttention?.refresh(true));
   // Arriving from the attention feed, which names the item rather than the checkout:
   // its number is what the search already matches against a row's links.
   function searchRequestedItem() {
@@ -516,9 +524,26 @@
     searchRequestedItem();
     void refresh();
   });
+  // A cleanup started from Needs you is followed in the dialog, with this tab hidden.
   setInterval(() => {
-    if (!document.hidden && !byId("workspaces-panel").hidden) void refresh();
+    if (document.hidden) return;
+    if (!byId("workspaces-panel").hidden || byId("ws-dialog").open) void refresh();
   }, 5000);
+  // The same confirmation as a selection here, for the rows another view names (the
+  // Tidy up cards). Rows the scan has not listed yet are fetched first; ones no longer
+  // removable are left out, and at most one batch is listed.
+  window.dashboardWorkspaces = {
+    async cleanup(keys) {
+      if (running()) throw Error("another cleanup is still running; wait for it to finish");
+      const wanted = new Set(keys);
+      if (!rows().some((entry) => wanted.has(entry.key))) await refresh();
+      const targets = rows()
+        .filter((entry) => wanted.has(entry.key) && entry.removable)
+        .map((entry) => ({ ...entry, force: false }));
+      if (!targets.length) throw Error("none of them can be cleaned up any more");
+      openDialog(targets.slice(0, BATCH), Math.max(0, targets.length - BATCH));
+    },
+  };
   searchRequestedItem();
   void refresh();
 })();
