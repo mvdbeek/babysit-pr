@@ -1,5 +1,6 @@
 """The Needs you tab: the landing view, its groups, tab badges and the agents chip."""
 
+import json
 import re
 
 import attention
@@ -277,6 +278,58 @@ def test_a_requested_review_starts_from_its_card(
     assert requests[-1]["id"] == "pr-one"
     assert requests[-1]["action"] == "handle"
     assert requests[-1]["task"].startswith(f"Review {pr}.")
+
+
+def test_a_requested_review_also_offers_the_agent_that_is_not_the_main_reviewer(
+    page: Page, dashboard_site, workspace_routes
+) -> None:
+    url, _ = dashboard_site
+    info, _, requests = workspace_routes
+    info["matches"] = []
+    pr = "https://github.com/test/alpha/pull/8"
+    requested = feed_with([item(pr, "review", [("review_requested", "Your review is requested")])])
+    page.route("**/api/attention*", lambda route: route.fulfill(json=requested))
+    page.goto(url + "/#attention")
+    card = page.locator(".attention-item").first
+    # Codex reviews by default, so the second opinion comes from Claude.
+    expect(card.get_by_role("button", name="Review with Codex")).to_have_count(0)
+    card.get_by_role("button", name="Review with Claude").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog.get_by_label("Agent", exact=True)).to_have_value("claude")
+    expect(dialog.get_by_role("textbox", name="Task", exact=True)).to_have_value(
+        re.compile(rf"^Review {re.escape(pr)}\. ")
+    )
+    dialog.get_by_role("button", name="Handle", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1]["agent"] == "claude"
+
+
+def test_the_main_reviewer_in_settings_is_the_one_a_card_starts(
+    page: Page, dashboard_site, workspace_routes
+) -> None:
+    url, home = dashboard_site
+    info, _, requests = workspace_routes
+    info["matches"] = []
+    (home / "dashboard-settings.json").write_text(json.dumps({"reviewer": "claude"}))
+    requested = feed_with(
+        [
+            item(
+                "https://github.com/test/alpha/pull/8",
+                "review",
+                [("review_requested", "Your review is requested")],
+            )
+        ]
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=requested))
+    page.goto(url + "/#attention")
+    card = page.locator(".attention-item").first
+    expect(card.get_by_role("button", name="Review with Codex")).to_be_visible()
+    card.get_by_role("button", name="Review pull request").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog.get_by_label("Agent", exact=True)).to_have_value("claude")
+    dialog.get_by_role("button", name="Handle", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1]["agent"] == "claude"
 
 
 def test_a_review_clicked_before_the_prs_load_waits_for_them(

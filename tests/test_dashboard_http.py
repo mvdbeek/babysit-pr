@@ -498,3 +498,46 @@ def test_restarting_the_dashboard_answers_first_then_stops_serving(serve, monkey
             break
         assert time.monotonic() < deadline, "The dashboard kept serving after a restart"
         time.sleep(0.1)
+
+
+def post_settings(server, request):
+    return get(
+        server,
+        "/api/settings",
+        {"X-Babysit-Action": "settings", "Content-Type": "application/json"},
+        method="POST",
+        body=json.dumps(request).encode(),
+    )
+
+
+def test_settings_start_empty_and_keep_what_was_saved(serve, tmp_path):
+    server = serve()
+    status, _, body = get(server, "/api/settings")
+    assert status == 200
+    assert json.loads(body) == {"task_prompts": {}, "reviewer": "codex"}
+    status, _, body = post_settings(server, {"task": "prReview", "prompt": "Read {url}."})
+    assert status == 200
+    assert json.loads(body) == {"task_prompts": {"prReview": "Read {url}."}, "reviewer": "codex"}
+    assert json.loads(post_settings(server, {"reviewer": "claude"})[2])["reviewer"] == "claude"
+    # The answer is what the next page load reads, from the watcher's own home.
+    assert json.loads(get(server, "/api/settings")[2]) == {
+        "task_prompts": {"prReview": "Read {url}."},
+        "reviewer": "claude",
+    }
+    assert json.loads((tmp_path / "dashboard-settings.json").read_text())["reviewer"] == "claude"
+
+
+def test_a_prompt_without_a_link_is_refused_and_nothing_is_stored(serve, tmp_path):
+    server = serve()
+    status, _, body = post_settings(server, {"task": "prReview", "prompt": "Review it."})
+    assert status == 400
+    assert json.loads(body)["error"] == "Include {url} where the link belongs"
+    assert not (tmp_path / "dashboard-settings.json").exists()
+
+
+def test_a_long_prompt_is_accepted_over_the_small_action_limit(serve):
+    server = serve()
+    prompt = "Review {url}. " + "Look closely. " * 500
+    assert len(prompt) > 1024
+    status, _, body = post_settings(server, {"task": "prReview", "prompt": prompt})
+    assert status == 200 and json.loads(body)["task_prompts"]["prReview"] == prompt

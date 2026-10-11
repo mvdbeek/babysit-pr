@@ -21,6 +21,7 @@
     <script src="/usage.js" defer></script>
     <script src="/codex_update.js" defer></script>
     <script src="/service.js" defer></script>
+    <script src="/settings.js" defer></script>
     <script src="/attachments.js" defer></script>
     <script src="/viewer.js" defer></script>
     <script src="/app.js" defer></script>
@@ -79,6 +80,31 @@
             <path d="M4 18a8 8 0 1 1 16 0M12 18l4-6" />
           </svg>
           <span id="usage-value" aria-hidden="true">–</span>
+        </button>
+        <button
+          id="settings-toggle"
+          type="button"
+          aria-label="Settings"
+          aria-haspopup="dialog"
+          aria-controls="settings-dialog"
+          title="Settings"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="18"
+            height="18"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="3.2" />
+            <path
+              d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6 18 18M18 6l-1.4 1.4M7.4 16.6 6 18"
+            />
+          </svg>
         </button>
         <a
           id="agents-waiting"
@@ -169,6 +195,40 @@
       </p>
       <ul id="service-list"></ul>
       <p id="service-status" class="notifications-caption" role="status"></p>
+    </dialog>
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <div class="dialog-header">
+        <div class="notifications-heading">
+          <h2 id="settings-title">Settings</h2>
+          <button id="settings-close" type="button" aria-label="Close settings">×</button>
+        </div>
+      </div>
+      <p class="notifications-caption">
+        Kept with the watcher, so every device that opens this dashboard uses them.
+      </p>
+      <div class="settings-field">
+        <label for="settings-reviewer">Main reviewer</label>
+        <select id="settings-reviewer"></select>
+      </div>
+      <p id="settings-reviewer-note" class="notifications-caption"></p>
+      <div class="settings-field">
+        <label for="settings-task">Task prompt</label>
+        <select id="settings-task"></select>
+      </div>
+      <textarea
+        id="settings-prompt"
+        rows="9"
+        maxlength="8000"
+        aria-label="Task prompt text"
+      ></textarea>
+      <p class="notifications-caption">
+        {url} becomes the link to the pull request or issue the task is for.
+      </p>
+      <div class="settings-actions">
+        <button id="settings-save" type="button">Save prompt</button>
+        <button id="settings-reset" type="button">Use the default</button>
+      </div>
+      <p id="settings-status" class="notifications-caption" role="status"></p>
     </dialog>
     <main>
       <p id="navigation-status" role="status" hidden></p>

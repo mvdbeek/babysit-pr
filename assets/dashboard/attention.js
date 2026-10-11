@@ -144,21 +144,35 @@
       item.reasons.some((reason) => reason.code === "review_requested") &&
       window.dashboardTasks
     ) {
-      const review = node("button", "Review pull request", "attention-review");
-      review.type = "button";
-      // Finding the PR may wait for the Pull requests tab's first load.
-      review.onclick = async () => {
-        byId("attention-error").textContent = "";
-        review.disabled = true;
-        try {
-          await window.dashboardTasks.start("prReview", item);
-        } catch (error) {
-          byId("attention-error").textContent = `Could not start the review: ${error.message}`;
-        } finally {
-          review.disabled = false;
-        }
-      };
-      actions.append(review);
+      // The main reviewer from Settings, and the same review from the other agent, for
+      // a second opinion on work one of them already looked at.
+      const settings = window.dashboardSettings;
+      const second = settings && settings.other();
+      const starts = [["Review pull request", settings?.reviewer() ?? null, ""]];
+      if (second)
+        starts.push([
+          `Review with ${settings.name(second)}`,
+          second,
+          `A second review, from ${settings.name(second)} rather than your main reviewer.`,
+        ]);
+      for (const [label, preferred, title] of starts) {
+        const review = node("button", label, "attention-review");
+        review.type = "button";
+        if (title) review.title = title;
+        // Finding the PR may wait for the Pull requests tab's first load.
+        review.onclick = async () => {
+          byId("attention-error").textContent = "";
+          review.disabled = true;
+          try {
+            await window.dashboardTasks.start("prReview", item, { preferred });
+          } catch (error) {
+            byId("attention-error").textContent = `Could not start the review: ${error.message}`;
+          } finally {
+            review.disabled = false;
+          }
+        };
+        actions.append(review);
+      }
     }
     if (item.url) actions.append(anchor("GitHub", item.url));
     const waiting = "waiting_since" in item;
@@ -359,6 +373,9 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) void refresh(true);
   });
+  // A changed main reviewer renames the review buttons without waiting for a poll.
+  // Only once there are cards: a render before the first feed would stand in for it.
+  window.addEventListener("settings-updated", () => feed && render());
   setInterval(() => void refresh(), 5000);
   window.dashboardAttention = { refresh, feed: () => feed };
   void refresh(true);
