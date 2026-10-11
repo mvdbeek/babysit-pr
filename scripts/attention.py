@@ -47,8 +47,13 @@ RECENT = 24 * 3600
 CACHE_SECONDS = 5.0
 
 
-def reason(code, group, text):
-    return {"code": code, "group": group, "text": text}
+def reason(code, group, text, page=None):
+    """One thing an item waits on, and the page that can act on it.
+
+    `page` is only given when that is not the source which noticed it: a watch
+    reports a finished checkout, but only the Workspaces tab can clean one up.
+    """
+    return {"code": code, "group": group, "text": text, "page": page}
 
 
 def epoch(value):
@@ -112,6 +117,7 @@ class Feed:
                 "url": None,
                 "reasons": [],
                 "pages": [],
+                "page": None,
                 "since": None,
                 "workspace_url": None,
                 "workspace_id": None,
@@ -128,7 +134,7 @@ class Feed:
         known = {r["code"] for r in item["reasons"]}
         for entry in reasons:
             if entry["code"] not in known:
-                item["reasons"].append(entry)
+                item["reasons"].append({**entry, "page": entry["page"] or pages[0]})
                 known.add(entry["code"])
         since = fields.get("since")
         if since is not None and (item["since"] is None or since > item["since"]):
@@ -207,7 +213,12 @@ class Feed:
             if job.get("cleanup_ready"):
                 outcome = (job.get("pr_outcome") or "finished").capitalize()
                 reasons.append(
-                    reason("cleanup", "tidy", f"{outcome}: its checkout is ready to clean up")
+                    reason(
+                        "cleanup",
+                        "tidy",
+                        f"{outcome}: its checkout is ready to clean up",
+                        page="workspaces",
+                    )
                 )
             more, fields = self.target_reasons(targets.get(f"watch:{job.get('id')}"))
             if status not in ENDED_WATCHES:
@@ -419,6 +430,17 @@ class Feed:
     def result(self, now, sources, triage=None):
         for item in self.items.values():
             item["group"] = min(item["reasons"], key=lambda r: ORDER[r["group"]])["group"]
+            # Open the page that can act on what makes this item wait, which is not
+            # always the source that reported it first; a page the item has no row on
+            # would only strand the user, so the reporting source stands in.
+            item["page"] = next(
+                (
+                    r["page"]
+                    for r in item["reasons"]
+                    if r["group"] == item["group"] and r["page"] in item["pages"]
+                ),
+                item["pages"][0] if item["pages"] else None,
+            )
             # Parked on age alone; an agent waiting for an answer is never parked.
             if (
                 item["since"] is not None

@@ -54,9 +54,15 @@
   }
   // Where the item's row with all its actions lives: the overview tab that lists it.
   function dashboardLink(item) {
-    const page = item.pages[0];
-    if (!["prs", "issues", "watcher"].includes(page) || !item.url) return `#${page}`;
+    const page = shownOn(item);
+    if (!["prs", "issues", "watcher", "workspaces"].includes(page) || !item.url) {
+      return `#${page}`;
+    }
     return `?item=${encodeURIComponent(item.url)}#${page}`;
+  }
+  // The page that can act on what makes this item wait; older feeds only named sources.
+  function shownOn(item) {
+    return item.page || item.pages[0];
   }
   function pageName(page) {
     return (
@@ -103,8 +109,11 @@
     if (item.agent?.status) meta.push(`Agent: ${item.agent.status}`);
     if (meta.length) row.append(node("p", meta.join(" · "), "attention-meta"));
     const actions = node("div", undefined, "attention-actions");
-    const page = item.pages[0];
-    const open = anchor(`Show in ${pageName(page)}`, dashboardLink(item), "attention-show");
+    const open = anchor(
+      `Show in ${pageName(shownOn(item))}`,
+      dashboardLink(item),
+      "attention-show",
+    );
     open.onclick = (event) => {
       if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
       event.preventDefault();

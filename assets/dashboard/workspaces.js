@@ -497,9 +497,28 @@
     pending = null;
     byId("ws-dialog").close();
   };
-  window.addEventListener("workspaces-visible", () => refresh());
+  // Arriving from the attention feed, which names the item rather than the checkout:
+  // its number is what the search already matches against a row's links.
+  function searchRequestedItem() {
+    // Every other tab reads the same parameter; only the one on screen may spend it.
+    if (location.hash !== "#workspaces") return;
+    const item = new URLSearchParams(location.search).get("item");
+    const number = /^https:\/\/github\.com\/[^/]+\/[^/]+\/(?:pull|issues)\/(\d+)$/.exec(item || "");
+    if (!number) return;
+    const url = new URL(location.href);
+    url.searchParams.delete("item");
+    history.replaceState(null, "", url);
+    byId("ws-search").value = `#${number[1]}`;
+    byId("ws-status").value = "all";
+    render();
+  }
+  window.addEventListener("workspaces-visible", () => {
+    searchRequestedItem();
+    void refresh();
+  });
   setInterval(() => {
     if (!document.hidden && !byId("workspaces-panel").hidden) void refresh();
   }, 5000);
+  searchRequestedItem();
   void refresh();
 })();

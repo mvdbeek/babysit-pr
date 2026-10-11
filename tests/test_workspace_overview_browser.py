@@ -693,3 +693,26 @@ def test_only_one_blocked_row_keeps_its_own_override(page, site):
     page.get_by_role("button", name="Clean up selected").click()
     expect(page.locator(".ws-force-all")).to_have_count(0)
     expect(page.get_by_role("checkbox", name="Remove anyway")).to_have_count(1)
+
+
+def test_arriving_for_one_item_searches_its_row_out_of_the_list(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row(
+            "squashed",
+            links=[link("pr", 21, "merged")],
+            status="blocked",
+            unpushed=4,
+            blockers=[{"kind": "unpushed", "text": "4 commit(s) only on this branch"}],
+        ),
+        row("elsewhere", links=[link("pr", 22, "merged")], status="ready"),
+    ]
+    page.goto(
+        f"{url}/?item=https%3A%2F%2Fgithub.com%2F{BASE.replace('/', '%2F')}%2Fpull%2F21#workspaces"
+    )
+    expect(page.locator("#workspaces-panel")).to_be_visible()
+    expect(page.locator("#ws-search")).to_have_value("#21")
+    names = page.locator("#ws-list tr td:nth-child(2) > span")
+    expect(names).to_have_text(["squashed"])
+    # The item is spent once used, so a reload or a later filter is the user's own.
+    expect(page).to_have_url(f"{url}/#workspaces")

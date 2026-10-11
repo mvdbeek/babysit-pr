@@ -664,3 +664,57 @@ def test_corrupt_triage_state_is_reported_not_overwritten(tmp_path):
     with pytest.raises(ValueError, match="repair"):
         triage.set({"login": "me", "key": feed["items"][0]["key"], "action": "wait"}, feed)
     assert (tmp_path / attention.TRIAGE_FILE).read_text() == "[]"
+
+
+def test_an_item_opens_where_its_reason_is_acted_on_not_where_it_was_noticed():
+    link = {
+        "kind": "pr",
+        "repo": "base/repo",
+        "number": 1,
+        "title": "Fix the flaky test",
+        "url": "https://github.com/base/repo/pull/1",
+        "state": "merged",
+        "draft": False,
+    }
+    feed = attention.collect(
+        watcher={
+            "jobs": [
+                watch(status="closed", cleanup_ready=True, pr_outcome="merged"),
+                watch(
+                    id="alone",
+                    url="https://github.com/base/repo/pull/9",
+                    number=9,
+                    status="closed",
+                    cleanup_ready=True,
+                    pr_outcome="merged",
+                ),
+            ]
+        },
+        workspace_overview={
+            "enabled": True,
+            "workspaces": [
+                workspace_row(
+                    status="blocked",
+                    links=[link],
+                    blockers=[{"kind": "unpushed", "text": "4 commit(s) only on this branch"}],
+                )
+            ],
+        },
+        now=NOW,
+    )
+    found = by_key(feed)
+    both = found["https://github.com/base/repo/pull/1"]
+    # The watch reported it first and cleans up nothing; only Workspaces can act.
+    assert both["pages"] == ["watcher", "workspaces"] and both["page"] == "workspaces"
+    # Without a Workspaces row to open, the watch that noticed it stands in.
+    assert found["https://github.com/base/repo/pull/9"]["page"] == "watcher"
+
+
+def test_an_item_opens_on_the_page_owning_its_most_pressing_reason():
+    feed = attention.collect(
+        watcher={"jobs": [watch(status="blocked", summary="tests fail")]},
+        prs={"prs": [pr(ci="FAILURE")]},
+        now=NOW,
+    )
+    item = by_key(feed)["https://github.com/base/repo/pull/1"]
+    assert item["group"] == "answer" and item["page"] == "watcher"
