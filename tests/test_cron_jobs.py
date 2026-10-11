@@ -488,9 +488,12 @@ def test_a_late_run_catches_up_once_and_a_very_late_one_is_missed(tmp_path):
 
 def test_runs_left_running_by_a_previous_process_are_interrupted(tmp_path):
     jobs = CronJobs(tmp_path, shell=SHELL)
-    saved = job(jobs, command="sleep 30")
-    jobs.run_now(saved["id"])
-    wait_for(lambda: jobs.snapshot()["jobs"][0]["running"])
+    saved = job(jobs, command="echo started; sleep 30")
+    run = jobs.run_now(saved["id"])
+    # Running is marked before the command starts; a child still being forked shares
+    # the lock, so wait until the command has written something.
+    log = jobs.log_path(run["id"])
+    wait_for(lambda: log.exists() and log.stat().st_size)
     # A process that died without cleanup leaves its lock, and its run row, behind.
     jobs.owner.close()
     restarted = CronJobs(tmp_path, shell=SHELL)
