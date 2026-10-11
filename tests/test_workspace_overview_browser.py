@@ -473,7 +473,21 @@ def test_viewer_reports_errors_and_skips_rows_without_a_checkout(page, site):
     plugin.value["workspaces"] = [
         *copy.deepcopy(WORKSPACES),
         row("gone", key="workspace:w5", path=None, status="missing", missing=True),
+        row(
+            "herdr-only",
+            key="workspace:w6",
+            path="/elsewhere/herdr-only",
+            workspace_ids=["w6"],
+            workspace_url="http://127.0.0.1:8787/space/w6",
+        ),
     ]
+    seen = []
+
+    def transcript(route):
+        seen.append(route.request.url)
+        route.fulfill(json={"sessions": [], "session": None, "entries": [], "start": 0, "total": 0})
+
+    page.route("**/api/workspace-transcript?*", transcript)
 
     def diff(route):
         if "scope=uncommitted" in route.request.url:
@@ -485,6 +499,12 @@ def test_viewer_reports_errors_and_skips_rows_without_a_checkout(page, site):
     page.goto(url + "/#workspaces")
     gone = page.locator("#ws-list tr").filter(has=page.get_by_text("gone", exact=True))
     expect(gone.get_by_role("button", name="Diff")).to_have_count(0)
+    # A row that is only a herdr workspace is read through the workspace.
+    herdr_only = page.locator("#ws-list tr").filter(has=page.get_by_text("herdr-only", exact=True))
+    herdr_only.get_by_role("button", name="Transcript", exact=True).click()
+    expect(page.locator("#ws-viewer").get_by_text("No Claude or Codex session")).to_be_visible()
+    assert "workspace=w6" in seen[-1] and "key=" not in seen[-1]
+    page.keyboard.press("Escape")
     line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
     line.get_by_role("button", name="Diff", exact=True).click()
     expect(page.locator("#ws-viewer-error")).to_have_text("Unknown workspace; refresh")

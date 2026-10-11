@@ -13,7 +13,8 @@ with the message as its prompt, is typed into a new split of the workspace, the 
 launches type their command, so the user's shell wrappers apply. A session already open
 in a pane gets the message there; one just resumed or owned by a babysit watch is
 never resumed again. The reader may cancel the watch that owns a session, and resume it
-in the same request, unless the watch is in the middle of a repair.
+in the same request, unless the watch is in the middle of a repair. A resume may also go
+without a message, leaving the session waiting for the reader in Collie.
 """
 
 import contextlib
@@ -191,7 +192,10 @@ def send(request, home=None, *, expected_session=None, checkout=None):
         raise ValueError("Only a resume can cancel the watch that owns its session")
     text = request.get("text")
     text = clean(text) if isinstance(text, str) else None
-    if not text or not text.strip() or len(text) > MAX_MESSAGE:
+    # A resume may go without one: the session then waits in Collie for the reader.
+    if request.get("resume") is not None and not (text or "").strip():
+        text = ""
+    elif not text or not text.strip() or len(text) > MAX_MESSAGE:
         raise ValueError(f"Write a message of 1–{MAX_MESSAGE:,} characters")
     if checkout is not None and (request.get("workspace") is not None or not request.get("resume")):
         raise ValueError("Without a herdr workspace, only a recorded session can be resumed")
@@ -1137,7 +1141,7 @@ def prune(prompts):
 
 
 def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
-    """Resume a recorded session in the workspace with the message as its prompt.
+    """Resume a recorded session in the workspace with the message, if any, as its prompt.
 
     Given a checkout root instead, the session resumes in the workspace open there, or
     in one opened on it again. Given the ID of the babysit watch that owns the session,
@@ -1166,6 +1170,8 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
         elsewhere = open_elsewhere(session_id)
         if elsewhere:
             # Already running in another workspace: talk to that agent, never a second one.
+            if not text:
+                raise ValueError(f"This session is already running in {elsewhere['pane']}")
             return prompt(elsewhere, text)
         # A session resumes from the directory it was recorded in (Claude looks its ID up
         # in that directory's project folder).

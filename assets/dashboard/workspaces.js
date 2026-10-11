@@ -176,11 +176,13 @@
     button.disabled = opening.has(entry.key) || (!entry.workspace_ids.length && entry.missing);
     button.onclick = () => openWorkspace(entry);
     actions.append(button);
-    // Only scanned checkouts have a diff or transcripts to read.
-    if (entry.key === entry.path && !entry.missing) {
+    // Scanned checkouts are read by their row; a row that is only a herdr workspace is
+    // read through that workspace.
+    const scanned = entry.key === entry.path && !entry.missing;
+    if (scanned || entry.workspace_ids.length) {
       actions.append(
         ...window.workspaceViewer.buttons({
-          key: entry.key,
+          ...(scanned ? { key: entry.key } : {}),
           workspace: entry.workspace_ids[0],
           name: entry.name,
           links: entry.links

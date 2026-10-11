@@ -456,6 +456,16 @@ def test_transcript_defaults_to_the_newest_session_and_pages_backwards(stores, m
     assert first["start"] == 0 and [e["text"] for e in first["entries"]][0] == "Fix the crash"
 
 
+def test_transcript_prefers_a_recorded_session_over_the_newest(stores):
+    checkout, _, _ = stores
+    listed = wv.transcript(checkout)["sessions"]
+    assert len(listed) > 1
+    older = listed[-1]["id"]
+    assert wv.transcript(checkout, prefer=older)["session"]["id"] == older
+    # One not recorded here falls back to the newest.
+    assert wv.transcript(checkout, prefer=f"{SID[:-1]}1")["session"]["id"] == listed[0]["id"]
+
+
 def test_transcript_refuses_unlisted_sessions(stores, tmp_path):
     checkout, _, _ = stores
     for session in ("../../etc/passwd", f"{SID[:-1]}1", "x"):
