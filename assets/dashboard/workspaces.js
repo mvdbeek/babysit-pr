@@ -337,6 +337,22 @@
       byId("ws-dialog-title").textContent = `Clean up ${pending.length} workspace(s)`;
       byId("ws-dialog-intro").textContent =
         "Agents are asked to exit, the herdr workspace is closed, the worktree is removed and the local branch deleted. Anything not merged into a remote is kept unless you override it here.";
+      // Overriding one row at a time is the whole dialog when a backlog is cleared at
+      // once, so the blockers are also offered together — still never pre-ticked.
+      const blocked = pending.filter((entry) => entry.blockers.length);
+      if (blocked.length > 1) {
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = blocked.every((entry) => entry.force);
+        box.onchange = () => {
+          for (const entry of blocked) entry.force = box.checked;
+          renderDialog();
+        };
+        label.className = "ws-force-all";
+        label.append(box, ` Remove anyway: every blocker on all ${blocked.length} of them`);
+        content.append(label);
+      }
       for (const entry of pending) {
         const item = node("div", undefined, "ws-target");
         item.append(node("strong", entry.name));
