@@ -488,7 +488,6 @@ def test_restarting_the_dashboard_answers_first_then_stops_serving(serve, monkey
     server = serve()
     status, _, body = post_service(server, "dashboard")
     assert status == 200 and json.loads(body)["dashboard"]["pid"] == os.getpid()
-    assert server.restart is True
     # Only a stopped server frees its port; nothing else answers on it afterwards.
     deadline = time.monotonic() + 10
     while True:
@@ -498,6 +497,8 @@ def test_restarting_the_dashboard_answers_first_then_stops_serving(serve, monkey
             break
         assert time.monotonic() < deadline, "The dashboard kept serving after a restart"
         time.sleep(0.1)
+    # The answer goes out before the flag is set, so it is read once serving has stopped.
+    assert server.restart is True
 
 
 def post_settings(server, request):
