@@ -1002,6 +1002,8 @@ function itemTable(spec) {
   let renderedRows = new Map();
   const table = {
     data: null,
+    // Why the last refresh failed, until one succeeds.
+    error: null,
     busy: false,
     sort: spec.defaultSort,
     ascending: false,
@@ -1475,22 +1477,34 @@ function itemTable(spec) {
     if (select.selectedOptions[0]?.disabled) select.value = "all";
     syncSelect(select);
   }
-  async function refresh() {
-    if (table.busy) return;
-    table.busy = true;
-    try {
-      table.data = await get(spec.endpoint);
-      searchedRoles(table.data.roles);
-      window.dashboardNotifications?.overview(spec.key, table.data, spec.changeFields, changeValue);
-      render();
-      revealNotification(spec.key);
-    } catch (error) {
-      id("alert").hidden = false;
-      id("alert").textContent =
-        `${spec.text.refreshError}: ${error.message}. Saved results may be out of date.`;
-    } finally {
-      table.busy = false;
-    }
+  // A refresh asked for while one is under way waits for that one.
+  let loading = null;
+  function refresh() {
+    loading ??= (async () => {
+      table.busy = true;
+      try {
+        table.data = await get(spec.endpoint);
+        table.error = null;
+        searchedRoles(table.data.roles);
+        window.dashboardNotifications?.overview(
+          spec.key,
+          table.data,
+          spec.changeFields,
+          changeValue,
+        );
+        render();
+        revealNotification(spec.key);
+      } catch (error) {
+        table.error = error.message;
+        id("alert").hidden = false;
+        id("alert").textContent =
+          `${spec.text.refreshError}: ${error.message}. Saved results may be out of date.`;
+      } finally {
+        table.busy = false;
+        loading = null;
+      }
+    })();
+    return loading;
   }
   function showMore() {
     if (id("more").hidden) return;
@@ -3214,6 +3228,20 @@ window.dashboardAgents = {
   repositories: () => get("/api/workspace-repos?all=1"),
   searchable: searchableSelect,
   sync: syncSelect,
+};
+// A PR task started from another view (Needs you), in the same dialog as on its row.
+window.dashboardTasks = {
+  async start(kind, { repo, number }) {
+    const find = () =>
+      prTable
+        .items()
+        .find((pr) => pr.repo?.toLowerCase() === repo?.toLowerCase() && pr.number === number);
+    if (!find()) await prTable.refresh();
+    const pr = find();
+    if (!pr && prTable.error) throw Error(`Cannot load pull requests: ${prTable.error}`);
+    if (!pr) throw Error("The pull request is no longer in the overview.");
+    await workspaceDialog({ ...pr, kind: "pr" }, handleTasks[kind][1](pr.url));
+  },
 };
 // The project a batch launches in, or mixed when its items span several.
 function projects(items) {

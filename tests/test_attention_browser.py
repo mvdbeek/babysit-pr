@@ -1,9 +1,12 @@
 """The Needs you tab: the landing view, its groups, tab badges and the agents chip."""
 
+import re
+
 import attention
 import pytest
 from playwright.sync_api import Page, expect
 from test_dashboard_browser import dashboard_site as dashboard_site  # noqa: F401 - fixture
+from test_dashboard_browser import workspace_routes as workspace_routes  # noqa: F401 - fixture
 
 pytestmark = pytest.mark.browser
 
@@ -236,6 +239,119 @@ def test_a_blocked_repair_offers_its_transcript_without_a_workspace(
     expect(viewer.get_by_role("button", name="Cancel watch and reopen…")).to_be_visible()
     expect(viewer.get_by_role("button", name="Cancel watch and send…")).to_be_visible()
     assert any("workspace-agents?watch=abc123" in u for u in seen)
+
+
+def test_a_requested_review_starts_from_its_card(
+    page: Page, dashboard_site, workspace_routes
+) -> None:
+    url, _ = dashboard_site
+    info, _, requests = workspace_routes
+    info["matches"] = []
+    pr = "https://github.com/test/alpha/pull/8"
+    requested = feed_with(
+        [
+            item(pr, "review", [("review_requested", "Your review is requested")]),
+            item(
+                "https://github.com/test/alpha/pull/9",
+                "review",
+                [("review_requested", "Your review is requested")],
+                number=9,
+                workspace_id="w1",
+                workspace_url="https://collie.example.ts.net/space/w1",
+            ),
+        ]
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=requested))
+    page.goto(url + "/#attention")
+    cards = page.locator(".attention-item")
+    # A review already under way links its workspace instead of offering another.
+    expect(cards.nth(1).get_by_role("link", name="Open in Collie")).to_be_visible()
+    expect(cards.nth(1).get_by_role("button", name="Review pull request")).to_have_count(0)
+    cards.first.get_by_role("button", name="Review pull request").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog).to_be_visible()
+    task = dialog.get_by_role("textbox", name="Task", exact=True)
+    expect(task).to_have_value(re.compile(rf"^Review {re.escape(pr)}\. "))
+    dialog.get_by_role("button", name="Handle", exact=True).click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert requests[-1]["id"] == "pr-one"
+    assert requests[-1]["action"] == "handle"
+    assert requests[-1]["task"].startswith(f"Review {pr}.")
+
+
+def test_a_review_clicked_before_the_prs_load_waits_for_them(
+    page: Page, dashboard_site, workspace_routes
+) -> None:
+    url, _ = dashboard_site
+    workspace_routes[0]["matches"] = []
+    requested = feed_with(
+        [
+            item(
+                "https://github.com/Test/Alpha/pull/8",
+                "review",
+                [("review_requested", "Your review is requested")],
+                repo="Test/Alpha",
+            )
+        ]
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=requested))
+    held = []
+    page.route("**/api/prs*", lambda route: held.append(route))
+    page.goto(url + "/#attention")
+    button = page.get_by_role("button", name="Review pull request")
+    expect(button).to_be_visible()
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(20)
+    button.click()
+    expect(button).to_be_disabled()
+    expect(page.locator("#workspace-dialog")).to_be_hidden()
+    page.unroute("**/api/prs*")
+    for route in held:
+        route.continue_()
+    # The card's link differs in case from the overview's; the PR is the same one.
+    expect(page.locator("#workspace-dialog")).to_be_visible()
+    expect(page.locator("#workspace-task")).to_have_value(re.compile(r"^Review https://"))
+    expect(page.locator("#attention-error")).to_be_hidden()
+
+
+def test_a_review_of_a_pr_gone_from_the_overview_says_so(page: Page, dashboard_site) -> None:
+    url, _ = dashboard_site
+    gone = feed_with(
+        [
+            item(
+                "https://github.com/test/alpha/pull/404",
+                "review",
+                [("review_requested", "Your review is requested")],
+                number=404,
+            )
+        ]
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=gone))
+    page.goto(url + "/#attention")
+    page.get_by_role("button", name="Review pull request").click()
+    expect(page.locator("#attention-error")).to_have_text(
+        "Could not start the review: The pull request is no longer in the overview."
+    )
+    expect(page.locator("#workspace-dialog")).to_be_hidden()
+
+
+def test_a_review_whose_prs_cannot_load_says_why(page: Page, dashboard_site) -> None:
+    url, _ = dashboard_site
+    requested = feed_with(
+        [item("https://github.com/test/alpha/pull/8", "review", [("review_requested", "Yours")])]
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=requested))
+    page.route(
+        "**/api/prs*", lambda route: route.fulfill(status=503, json={"error": "GitHub is down"})
+    )
+    page.goto(url + "/#attention")
+    page.get_by_role("button", name="Review pull request").click()
+    expect(page.locator("#attention-error")).to_contain_text(
+        "Could not start the review: Cannot load pull requests:"
+    )
+    expect(page.locator("#workspace-dialog")).to_be_hidden()
 
 
 def test_groups_collapse_and_stay_collapsed_across_polls(page: Page, dashboard_site) -> None:

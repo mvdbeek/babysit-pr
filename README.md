@@ -99,7 +99,9 @@ merged from the watcher, your pull requests and issues, the Workspaces tab, sche
 tasks and cron jobs. Each row names one item, the reasons it needs you, and where to
 act: **Show in …** opens the tab that lists it and, for pull requests, issues and
 watches, reveals its row with every action that row offers, beside **Open in Collie**
-and **GitHub** links when they apply. An item
+and **GitHub** links when they apply. A pull request whose review is requested from
+you offers **Review pull request**, the same prefilled task dialog as the Pull
+requests tab's batch action; once its workspace exists the card links that instead. An item
 mentioned by several sources appears once, with all its reasons; a watched pull
 request with a workspace is one row. Rows are grouped by the kind of work, newest
 activity first, and a group heading collapses its rows:
