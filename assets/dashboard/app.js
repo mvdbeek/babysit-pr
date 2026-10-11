@@ -2157,33 +2157,14 @@ function workspaceCell(item) {
   cell.append(workspaceControls(item));
   return cell;
 }
-const handleTasks = {
-  prReview: [
-    "Review pull request",
-    (url) =>
-      `Review ${url}. Read its description, linked issues, and the full diff against its base branch, then check out the branch and run the relevant tests where they would confirm or rule out a problem. Look for correctness bugs, regressions, missing tests, and unclear or unnecessarily complex code. Do not push, comment, or submit a review on GitHub. Report each finding ranked by severity with file and line references, and say what you verified.`,
-  ],
-  issue: [
-    "Handle issue",
-    (url) =>
-      `Investigate and resolve ${url}. Read the issue and relevant code, implement the fix, and run the appropriate tests. Summarize the changes and validation.`,
-  ],
-  ci: [
-    "Handle failing tests",
-    (url) =>
-      `Investigate and fix the failing tests and CI checks for ${url}. Inspect the latest check results and failure logs, reproduce the failures where possible, fix their root causes, and run the relevant tests. Summarize the changes, validation, and any remaining failures.`,
-  ],
-  review: [
-    "Handle review comments",
-    (url) =>
-      `Address the review feedback on ${url}. Read the submitted reviews and every unresolved review thread, including outdated ones, make the requested changes where they are sound, and run the relevant tests. Do not reply to or resolve threads on GitHub. Summarize each comment with what you changed, or why you did not.`,
-  ],
-};
+// Each Handle button prefills a task. Its wording, and any the person changed in
+// Settings, live in settings.js; `{url}` there becomes the item's link.
+const taskLabel = (kind) => window.dashboardSettings.label(kind);
+const taskPrompt = (kind, url) => window.dashboardSettings.prompt(kind, url);
 function handleTaskButton(item, kind) {
-  const [label, task] = handleTasks[kind];
-  return workspaceButton(label, () => {
+  return workspaceButton(taskLabel(kind), () => {
     $("ci-dialog").close();
-    void workspaceDialog(item, task(item.url));
+    void workspaceDialog(item, taskPrompt(kind, item.url));
   });
 }
 // What a checkout serves, for the viewer's header: the PR, or the issue and the PRs
@@ -2449,7 +2430,8 @@ function savedEffort(repo, levels) {
   return [null, null];
 }
 // `repo` is the project the launch is for; `mixed` launches in several projects.
-function agentFields({ repo = null, mixed = false } = {}) {
+// `preferred` preselects an agent the person already chose, as a second review does.
+function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
   const usage = window.dashboardUsage;
   const agent = el("select");
   agent.id = "workspace-agent";
@@ -2642,6 +2624,11 @@ function agentFields({ repo = null, mixed = false } = {}) {
     personChose = true;
     updateEfforts();
   };
+  if (preferred) {
+    agent.value = preferred;
+    personChose = true;
+    updateModels();
+  }
   applyUsage();
   window.addEventListener("usage-updated", onUsage);
   const docker = el("input");
@@ -2710,7 +2697,7 @@ function startLaterFields() {
   return { later, laterLabel, startAt, startFields, startTime };
 }
 // `handling` is the prefilled task text of a Handle action, or empty for plain creation.
-async function workspaceDialog(item, handling = "") {
+async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
   workspaceDialogItem = item;
   $("workspace-title").textContent =
     item.kind === "watch"
@@ -2794,7 +2781,7 @@ async function workspaceDialog(item, handling = "") {
         docker,
         dockerLabel,
         effortDefaults,
-      } = agentFields({ repo: item.repo });
+      } = agentFields({ repo: item.repo, preferred });
       const task = el("textarea");
       task.id = "workspace-task";
       task.required = true;
@@ -3231,7 +3218,7 @@ window.dashboardAgents = {
 };
 // A PR task started from another view (Needs you), in the same dialog as on its row.
 window.dashboardTasks = {
-  async start(kind, { repo, number }) {
+  async start(kind, { repo, number }, { preferred = null } = {}) {
     const find = () =>
       prTable
         .items()
@@ -3240,7 +3227,7 @@ window.dashboardTasks = {
     const pr = find();
     if (!pr && prTable.error) throw Error(`Cannot load pull requests: ${prTable.error}`);
     if (!pr) throw Error("The pull request is no longer in the overview.");
-    await workspaceDialog({ ...pr, kind: "pr" }, handleTasks[kind][1](pr.url));
+    await workspaceDialog({ ...pr, kind: "pr" }, taskPrompt(kind, pr.url), { preferred });
   },
 };
 // The project a batch launches in, or mixed when its items span several.
@@ -3308,12 +3295,12 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
     form.append(usageNote, settingsNote, effortDefaults, dockerLabel);
-    let template = handleTasks[tasks[0]][1](BATCH_URL);
+    let template = taskPrompt(tasks[0], BATCH_URL);
     if (tasks.length > 1) {
       const picker = el("select");
       picker.id = "workspace-template";
       for (const key of tasks) {
-        const option = el("option", handleTasks[key][0]);
+        const option = el("option", taskLabel(key));
         option.value = key;
         picker.append(option);
       }
@@ -3325,7 +3312,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
           return;
         }
         chosen = picker.value;
-        template = handleTasks[chosen][1](BATCH_URL);
+        template = taskPrompt(chosen, BATCH_URL);
         task.value = template;
         task.setCustomValidity("");
       };

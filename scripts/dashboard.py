@@ -22,6 +22,7 @@ import agent_messages
 import attachments
 import attention
 import browser_extension
+import dashboard_settings
 import llm_usage
 import service_control
 import workspace_agents
@@ -576,6 +577,7 @@ class Handler(BaseHTTPRequestHandler):
                 "attention-triage",
                 "extension-pair",
                 "effort-default",
+                "settings",
                 "codex-update",
                 "service-restart",
             }
@@ -608,6 +610,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-message",
                         "workspace-answer",
                         "workspace-prompt-forget",
+                        "settings",
                         "sentry-action",
                         "cron-action",
                     }
@@ -730,6 +733,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Codex update checks are not enabled")
                 self.server.codex_updates.update()
                 self.send_json(200, self.server.codex_updates.snapshot())
+                return
+            if action == "settings":
+                self.send_json(200, dashboard_settings.save(self.server.home, request))
                 return
             if action == "effort-default":
                 self.send_json(
@@ -1137,6 +1143,8 @@ class Handler(BaseHTTPRequestHandler):
                     if self.server.workspaces
                     else {"repos": [], "idle": 0},
                 )
+            elif route.path == "/api/settings":
+                self.send_json(200, dashboard_settings.settings(self.server.home))
             elif route.path == "/api/workspace-prompts":
                 self.send_json(
                     200,
@@ -1174,6 +1182,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/usage.js": ("usage.js", "text/javascript"),
                     "/codex_update.js": ("codex_update.js", "text/javascript"),
                     "/service.js": ("service.js", "text/javascript"),
+                    "/settings.js": ("settings.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
                     "/sw.js": ("sw.js", "text/javascript"),
                     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),

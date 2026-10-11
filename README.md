@@ -101,7 +101,9 @@ act: **Show in …** opens the tab that lists it and, for pull requests, issues 
 watches, reveals its row with every action that row offers, beside **Open in Collie**
 and **GitHub** links when they apply. A pull request whose review is requested from
 you offers **Review pull request**, the same prefilled task dialog as the Pull
-requests tab's batch action; once its workspace exists the card links that instead. An item
+requests tab's batch action, started with the main reviewer from Settings, and
+**Review with Claude** (or **Review with Codex**) for the same review from the other
+agent; once its workspace exists the card links those instead. An item
 mentioned by several sources appears once, with all its reasons; a watched pull
 request with a workspace is one row. Rows are grouped by the kind of work, newest
 activity first, and a group heading collapses its rows:
@@ -354,7 +356,8 @@ filter lists them. Clicking either badge opens the review summaries and every
 unresolved thread's comments, fetched on demand and cached like CI details until the
 PR next changes. Its task asks the agent to address the feedback without replying
 to or resolving threads on GitHub. Each Handle action prefills an
-editable task and reuses the agent, model, and reasoning-effort selectors. **Handle**
+editable task, which Settings can reword, and reuses the agent, model, and
+reasoning-effort selectors. **Handle**
 starts a new workspace, including when a matching checkout already exists, so an
 existing agent keeps its task. An in-progress launch is reused; after completion,
 a later Handle submission can start another task in a separate checkout.
@@ -668,6 +671,25 @@ both versions. If the `codex` on PATH comes from an npm `@openai/codex` package,
 **Update Codex** runs `npm install -g @openai/codex@VERSION` for exactly the version
 shown, in a login shell; otherwise update it the way it was installed. New and
 resumed agents use the new version; running agents keep theirs.
+
+## Settings
+
+The gear in the header opens **Settings**, kept with the watcher in
+`dashboard-settings.json` under its home, so every device that opens the dashboard
+sees the same ones. Nothing here changes a running agent; the next task started from
+the page uses them.
+
+**Main reviewer** is the agent a review starts with: Codex, or Claude. A card on
+Needs you whose review is requested offers that agent's **Review pull request** and
+the other agent's **Review with …**, so a second opinion is one press away. Any
+dialog's Agent selector still overrides it.
+
+**Task prompt** is the task each Handle button prefills: Review pull request, Handle
+issue, Handle failing tests, and Handle review comments. Pick one, edit it, and press
+**Save prompt**; `{url}` becomes the link to the pull request or issue, and a prompt
+without it is refused. A changed task is marked _(edited)_ in the picker, and **Use
+the default** restores the page's own wording. The review task asks for a read of the
+diff and the code around it; it does not ask the agent to run the tests.
 
 ## Services
 

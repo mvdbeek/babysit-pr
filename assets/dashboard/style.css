@@ -348,6 +348,47 @@ header p {
 .service-note {
   color: var(--muted);
 }
+#settings-dialog {
+  width: 560px;
+}
+.settings-field {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+.settings-field label {
+  font-weight: 600;
+}
+.settings-field select {
+  flex: 1;
+  max-width: none;
+  min-width: 0;
+}
+#settings-prompt {
+  width: 100%;
+  margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--field-line);
+  border-radius: 7px;
+  font: inherit;
+  /* A long prompt wraps rather than scrolling sideways on a phone. */
+  resize: vertical;
+}
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+#settings-status:empty {
+  display: none;
+}
+@media (max-width: 600px) {
+  #settings-prompt {
+    font-size: 16px;
+  }
+}
 .usage-account {
   display: grid;
   gap: 8px;
@@ -537,9 +578,9 @@ header p {
     clip-path: inset(50%);
   }
 }
-@media (max-width: 380px) {
-  /* The brand, usage and the bell share the first row; the connection status takes a second row
-     of its own, so nothing floats over the content. */
+@media (max-width: 440px) {
+  /* The brand, usage, settings and the bell share the first row; the connection status takes a
+     second row of its own, so nothing floats over the content. */
   header {
     flex-wrap: wrap;
     row-gap: 6px;
@@ -552,7 +593,8 @@ header p {
   .header-tools {
     display: contents;
   }
-  #usage-toggle {
+  #usage-toggle,
+  #settings-toggle {
     order: 1;
   }
   #notifications-toggle {
