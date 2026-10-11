@@ -3216,18 +3216,35 @@ window.dashboardAgents = {
   searchable: searchableSelect,
   sync: syncSelect,
 };
-// A PR task started from another view (Needs you), in the same dialog as on its row.
+// The overview's row for a PR another view names; the card's link may differ in case.
+function overviewPr({ repo, number }) {
+  return prTable
+    .items()
+    .find((pr) => pr.repo?.toLowerCase() === repo?.toLowerCase() && pr.number === number);
+}
+// PR tasks started from another view (Needs you), in the same dialogs as on the PR tab.
 window.dashboardTasks = {
-  async start(kind, { repo, number }, { preferred = null } = {}) {
-    const find = () =>
-      prTable
-        .items()
-        .find((pr) => pr.repo?.toLowerCase() === repo?.toLowerCase() && pr.number === number);
-    if (!find()) await prTable.refresh();
-    const pr = find();
+  async start(kind, item, { preferred = null } = {}) {
+    if (!overviewPr(item)) await prTable.refresh();
+    const pr = overviewPr(item);
     if (!pr && prTable.error) throw Error(`Cannot load pull requests: ${prTable.error}`);
     if (!pr) throw Error("The pull request is no longer in the overview.");
     await workspaceDialog({ ...pr, kind: "pr" }, taskPrompt(kind, pr.url), { preferred });
+  },
+  // One task for several PRs, scheduled apart as the PR tab's batch does. `done`
+  // receives the items whose task was scheduled; the answer names any not found.
+  async batch(kind, items, { preferred = null, done = () => {} } = {}) {
+    if (items.some((item) => !overviewPr(item))) await prTable.refresh();
+    const found = items.filter(overviewPr);
+    if (!found.length && prTable.error) throw Error(`Cannot load pull requests: ${prTable.error}`);
+    if (!found.length) throw Error("The pull requests are no longer in the overview.");
+    const prs = found.map(overviewPr);
+    void batchDialog(
+      prs,
+      (ids) => done(found.filter((item, index) => ids.includes(prs[index].id))),
+      { nouns: ["pull request", "pull requests"], tasks: [kind], preferred },
+    );
+    return { missing: items.filter((item) => !found.includes(item)) };
   },
 };
 // The project a batch launches in, or mixed when its items span several.
@@ -3243,7 +3260,7 @@ const BATCH_LIMIT = 100;
 // scheduler, `Minutes between starts` apart; `done` receives the ids that were scheduled.
 // `nouns` names one and several items; `tasks` lists the handleTasks keys offered, the
 // first being the default.
-async function batchDialog(items, done, { nouns: [one, many], tasks }) {
+async function batchDialog(items, done, { nouns: [one, many], tasks, preferred = null }) {
   // Stands in for the dialog's item, so a dialog opened meanwhile wins the await below.
   const owner = { batch: true };
   workspaceDialogItem = owner;
@@ -3289,7 +3306,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks }) {
       docker,
       dockerLabel,
       effortDefaults,
-    } = agentFields(projects(items));
+    } = agentFields({ ...projects(items), preferred });
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);

@@ -23,6 +23,8 @@
   const triaging = new Set();
   // A poll answered after a triage click must not bring back the state before it.
   let generation = 0;
+  // Requested reviews picked for one batch, by card key; kept across polls.
+  const chosen = new Set();
 
   function node(tag, text, className) {
     const element = document.createElement(tag);
@@ -76,14 +78,37 @@
       }[page] || page
     );
   }
+  // A requested review with no workspace yet: the card can start it, alone or in a batch.
+  function reviewable(item) {
+    return (
+      !item.workspace_id &&
+      item.reasons.some((reason) => reason.code === "review_requested") &&
+      Boolean(window.dashboardTasks)
+    );
+  }
+  function itemLabel(item) {
+    return [KINDS[item.kind] || "", item.repo, item.number ? `#${item.number}` : ""]
+      .filter(Boolean)
+      .join(" ");
+  }
   function card(item) {
     const row = node("li", undefined, `attention-item attention-${item.group}`);
     row.dataset.key = item.key;
     const head = node("div", undefined, "attention-head");
     const subject = node("div", undefined, "attention-subject");
-    const label = [KINDS[item.kind] || "", item.repo, item.number ? `#${item.number}` : ""]
-      .filter(Boolean)
-      .join(" ");
+    const label = itemLabel(item);
+    if (item.group === "review" && reviewable(item)) {
+      const pick = node("input", undefined, "attention-pick");
+      pick.type = "checkbox";
+      pick.checked = chosen.has(item.key);
+      pick.setAttribute("aria-label", `Select ${label || item.title} for a batch review`);
+      pick.onchange = () => {
+        if (pick.checked) chosen.add(item.key);
+        else chosen.delete(item.key);
+        syncPicks();
+      };
+      subject.append(pick);
+    }
     if (label) subject.append(node("span", label, "attention-where"));
     subject.append(
       item.url
@@ -174,6 +199,14 @@
         actions.append(review);
       }
     }
+    // Its checkout is closed or merged: the Workspaces confirmation, from here.
+    if (item.cleanup?.length && window.dashboardWorkspaces) {
+      const clean = node("button", "Clean up", "attention-cleanup");
+      clean.type = "button";
+      clean.title = "Close its workspace and remove its checkout, once you confirm";
+      clean.onclick = () => void cleanUp([item], clean);
+      actions.append(clean);
+    }
     if (item.url) actions.append(anchor("GitHub", item.url));
     const waiting = "waiting_since" in item;
     const triage = node("button", waiting ? "Resume" : "Wait for activity", "attention-triage");
@@ -242,6 +275,87 @@
       render();
     }
   }
+  async function cleanUp(items, button) {
+    byId("attention-error").textContent = "";
+    button.disabled = true;
+    try {
+      await window.dashboardWorkspaces.cleanup(items.flatMap((item) => item.cleanup));
+    } catch (error) {
+      byId("attention-error").textContent = `Could not clean up: ${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  }
+  // The checkboxes and the batch controls follow the selection without a rebuild.
+  function syncPicks() {
+    const groups = byId("attention-groups");
+    for (const pick of groups.querySelectorAll(".attention-pick"))
+      pick.checked = chosen.has(pick.closest("[data-key]").dataset.key);
+    const start = groups.querySelector(".attention-review-selected");
+    if (!start) return;
+    start.textContent = chosen.size ? `Review ${chosen.size} selected…` : "Review selected…";
+    start.disabled = !chosen.size;
+    const all = groups.querySelector(".attention-select-all");
+    const picks = groups.querySelectorAll(".attention-pick");
+    all.textContent = chosen.size === picks.length ? "Clear selection" : "Select all";
+  }
+  async function reviewChosen(button) {
+    const items = (feed?.items || []).filter((item) => chosen.has(item.key));
+    byId("attention-error").textContent = "";
+    button.disabled = true;
+    try {
+      const { missing } = await window.dashboardTasks.batch("prReview", items, {
+        preferred: window.dashboardSettings?.reviewer() ?? null,
+        // Scheduled ones leave the selection; any that failed stay picked to retry.
+        done: (scheduled) => {
+          for (const item of scheduled) chosen.delete(item.key);
+          syncPicks();
+        },
+      });
+      if (missing.length)
+        byId("attention-error").textContent =
+          `Left out, no longer in the overview: ${missing.map(itemLabel).join(", ")}`;
+    } catch (error) {
+      byId("attention-error").textContent = `Could not start the reviews: ${error.message}`;
+    } finally {
+      button.disabled = !chosen.size;
+    }
+  }
+  // Actions on a whole group: clean up every Tidy up checkout, or review a selection.
+  function tools(entry, items) {
+    const bar = node("div", undefined, "attention-tools");
+    const keys = entry.key === "tidy" ? items.flatMap((item) => item.cleanup || []) : [];
+    if (keys.length && window.dashboardWorkspaces) {
+      const all = node(
+        "button",
+        `Clean up ${keys.length} workspace${keys.length === 1 ? "" : "s"}…`,
+        "attention-cleanup-all",
+      );
+      all.type = "button";
+      all.title = "Every checkout listed here, in one confirmation";
+      all.onclick = () => void cleanUp(items, all);
+      bar.append(all);
+    }
+    if (entry.key === "review" && items.filter(reviewable).length > 1) {
+      const all = node("button", "Select all", "attention-select-all");
+      all.type = "button";
+      all.onclick = () => {
+        const eligible = items.filter(reviewable);
+        const every = eligible.every((item) => chosen.has(item.key));
+        for (const item of eligible) {
+          if (every) chosen.delete(item.key);
+          else chosen.add(item.key);
+        }
+        syncPicks();
+      };
+      const start = node("button", "Review selected…", "attention-review-selected");
+      start.type = "button";
+      start.title = "One review task for each, scheduled apart, starting with your main reviewer";
+      start.onclick = () => void reviewChosen(start);
+      bar.append(all, start);
+    }
+    return bar.childElementCount ? bar : null;
+  }
   function group(entry, items) {
     const section = node("section", undefined, "attention-group");
     section.dataset.group = entry.key;
@@ -255,15 +369,18 @@
     list.id = `attention-list-${entry.key}`;
     list.hidden = collapsed.has(entry.key);
     list.append(...items.map(card));
+    const bar = tools(entry, items);
+    if (bar) bar.hidden = list.hidden;
     // Folded in place: the button keeps focus and nothing else is rebuilt.
     toggle.onclick = () => {
       if (collapsed.has(entry.key)) collapsed.delete(entry.key);
       else collapsed.add(entry.key);
       list.hidden = collapsed.has(entry.key);
+      if (bar) bar.hidden = list.hidden;
       toggle.setAttribute("aria-expanded", String(!list.hidden));
     };
     heading.append(toggle);
-    section.append(heading, list);
+    section.append(heading, ...(bar ? [bar] : []), list);
     return section;
   }
   function badges() {
@@ -322,6 +439,11 @@
       return;
     }
     renderedKey = key;
+    // A pick whose card no longer offers a review drops out of the selection.
+    const offered = new Set(
+      items.filter((item) => item.group === "review" && reviewable(item)).map((item) => item.key),
+    );
+    for (const pick of [...chosen]) if (!offered.has(pick)) chosen.delete(pick);
     // Give focus back to the same control of the same card or group after the rebuild.
     const active = document.activeElement;
     const owner = active?.closest("#attention-groups [data-key], #attention-groups [data-group]");
@@ -346,6 +468,7 @@
       if (same) controls(same)[position]?.focus({ preventScroll: true });
     }
     byId("attention-empty").hidden = !feed || items.length > 0;
+    syncPicks();
   }
   async function refresh(force = false) {
     // Every 5 seconds while shown (the tab badges need it everywhere, so 30 otherwise).

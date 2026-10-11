@@ -103,7 +103,14 @@ and **GitHub** links when they apply. A pull request whose review is requested f
 you offers **Review pull request**, the same prefilled task dialog as the Pull
 requests tab's batch action, started with the main reviewer from Settings, and
 **Review with Claude** (or **Review with Codex**) for the same review from the other
-agent; once its workspace exists the card links those instead. An item
+agent; once its workspace exists the card links those instead. With two or more
+requested reviews, tick each card's box (or **Select all**) and press **Review N
+selected…**: the Pull requests tab's batch dialog opens on the review task, starting
+with the main reviewer, and each review is scheduled apart from the next. A Tidy up
+card whose checkout can be cleaned up offers **Clean up**, and the group offers
+**Clean up N workspaces…** for all of them: both open the Workspaces tab's
+confirmation, which lists what would be lost row by row and removes nothing until you
+confirm (at most 50 at a time). An item
 mentioned by several sources appears once, with all its reasons; a watched pull
 request with a workspace is one row. Rows are grouped by the kind of work, newest
 activity first, and a group heading collapses its rows:
@@ -121,7 +128,8 @@ activity first, and a group heading collapses its rows:
   on your pull request, a workspace launch that failed in the last day or needs
   checking, a scheduled task that needs checking or was missed or failed in the last
   day, or an enabled cron job whose last run failed.
-- **Tidy up**: a watch whose pull request merged or closed, a workspace whose linked
+- **Tidy up**: a watch whose pull request merged or closed while its checkout is still
+  on disk, a workspace whose linked
   items are all closed or merged (with the blockers that would stop its cleanup), or a
   herdr workspace whose checkout is gone.
 - **Pick up**: an issue assigned to you with no open linked pull request, no checkout

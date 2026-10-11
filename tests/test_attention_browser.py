@@ -2,12 +2,15 @@
 
 import json
 import re
+import time
 
 import attention
 import pytest
 from playwright.sync_api import Page, expect
 from test_dashboard_browser import dashboard_site as dashboard_site  # noqa: F401 - fixture
 from test_dashboard_browser import workspace_routes as workspace_routes  # noqa: F401 - fixture
+from test_workspace_overview_browser import link as overview_link
+from test_workspace_overview_browser import row as overview_row
 
 pytestmark = pytest.mark.browser
 
@@ -330,6 +333,162 @@ def test_the_main_reviewer_in_settings_is_the_one_a_card_starts(
     dialog.get_by_role("button", name="Handle", exact=True).click()
     expect(page.locator("#workspace-progress")).to_contain_text("running")
     assert requests[-1]["agent"] == "claude"
+
+
+@pytest.fixture
+def tidy(page: Page):
+    """Two closed checkouts on the Tidy up list, and a stubbed Workspaces cleanup."""
+    ready = overview_row("merged-work", status="ready", links=[overview_link("pr", 7, "merged")])
+    dirty = overview_row(
+        "dirty-work",
+        status="blocked",
+        links=[overview_link("issue", 12, "closed")],
+        blockers=[{"kind": "dirty", "text": "3 uncommitted change(s)"}],
+    )
+    snapshot = {"enabled": True, "workspaces": [ready, dirty], "synced_at": time.time()}
+    page.route("**/api/workspace-overview*", lambda route: route.fulfill(json=snapshot))
+    posted = []
+
+    def cleanup(route):
+        posted.append(route.request.post_data_json)
+        # Like the server, later scans report the cleanup that is running.
+        snapshot["cleanup"] = {"status": "running", "results": []}
+        route.fulfill(json={"accepted": True, "cleanup": snapshot["cleanup"]})
+
+    page.route("**/api/workspace-cleanup", cleanup)
+    tidy_up = feed_with(
+        [
+            item(
+                "https://github.com/base/repo/pull/7",
+                "tidy",
+                [("workspace_ready", "Its items are closed: ready to clean up")],
+                repo="base/repo",
+                number=7,
+                cleanup=[ready["key"]],
+            ),
+            item(
+                "https://github.com/base/repo/issues/12",
+                "tidy",
+                [("workspace_blocked", "Its items are closed, but: 3 uncommitted change(s)")],
+                kind="issue",
+                repo="base/repo",
+                number=12,
+                cleanup=[dirty["key"]],
+            ),
+        ]
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=tidy_up))
+    return ready, dirty, posted
+
+
+def test_a_tidy_card_cleans_up_its_checkout_after_the_same_confirmation(
+    page: Page, dashboard_site, tidy
+) -> None:
+    url, _ = dashboard_site
+    ready, _, posted = tidy
+    page.goto(url + "/#attention")
+    page.locator(".attention-item").first.get_by_role("button", name="Clean up", exact=True).click()
+    dialog = page.locator("#ws-dialog")
+    expect(page.locator("#ws-dialog-title")).to_have_text("Clean up 1 workspace(s)")
+    expect(dialog).to_contain_text("merged-work")
+    expect(dialog).not_to_contain_text("dirty-work")
+    assert posted == []  # Nothing is removed before the confirmation.
+    page.locator("#ws-confirm").click()
+    expect(page.locator("#ws-dialog-title")).to_have_text("Cleaning up…")
+    assert posted == [{"targets": [{"key": ready["key"], "approve": []}]}]
+
+
+def test_tidy_up_cleans_up_every_listed_checkout_at_once(page: Page, dashboard_site, tidy) -> None:
+    url, _ = dashboard_site
+    ready, dirty, posted = tidy
+    page.goto(url + "/#attention")
+    group = page.locator(".attention-group[data-group=tidy]")
+    group.get_by_role("button", name="Clean up 2 workspaces…").click()
+    dialog = page.locator("#ws-dialog")
+    expect(page.locator("#ws-dialog-title")).to_have_text("Clean up 2 workspace(s)")
+    # What would be lost is still offered row by row, and never pre-ticked.
+    override = dialog.get_by_label("Remove anyway: 3 uncommitted change(s)")
+    expect(override).not_to_be_checked()
+    override.check()
+    page.locator("#ws-confirm").click()
+    expect(page.locator("#ws-dialog-title")).to_have_text("Cleaning up…")
+    assert posted == [
+        {
+            "targets": [
+                {"key": ready["key"], "approve": []},
+                {"key": dirty["key"], "approve": ["dirty"]},
+            ]
+        }
+    ]
+
+
+def test_several_requested_reviews_start_from_one_dialog(
+    page: Page, dashboard_site, workspace_routes
+) -> None:
+    url, home = dashboard_site
+    (home / "dashboard-settings.json").write_text(json.dumps({"reviewer": "claude"}))
+    info, snapshot, _ = workspace_routes
+    for entry in snapshot["prs"].values():
+        entry["matches"] = []
+    batches = []
+
+    def batch(route):
+        body = route.request.post_data_json
+        batches.append(body)
+        route.fulfill(
+            json={
+                "results": [
+                    {"id": entry["id"], "scheduled": {"start_at": time.time()}}
+                    for entry in body["items"]
+                ]
+            }
+        )
+
+    page.route("**/api/workspace-batch", batch)
+    requested = [("review_requested", "Your review is requested")]
+    review = feed_with(
+        [
+            item("https://github.com/test/alpha/pull/8", "review", requested),
+            item(
+                "https://github.com/test/beta/pull/9",
+                "review",
+                requested,
+                repo="test/beta",
+                number=9,
+            ),
+            item(
+                "https://github.com/test/alpha/pull/10",
+                "review",
+                [("ready_to_merge", "Approved with green CI")],
+                number=10,
+            ),
+        ]
+    )
+    page.route("**/api/attention*", lambda route: route.fulfill(json=review))
+    page.goto(url + "/#attention")
+    group = page.locator(".attention-group[data-group=review]")
+    # Only requested reviews can be picked; nothing is picked to begin with.
+    picks = group.get_by_role("checkbox")
+    expect(picks).to_have_count(2)
+    expect(group.get_by_role("button", name="Review selected…")).to_be_disabled()
+    group.get_by_role("checkbox", name="Select PR test/beta #9 for a batch review").check()
+    expect(group.get_by_role("button", name="Review 1 selected…")).to_be_enabled()
+    group.get_by_role("button", name="Select all").click()
+    expect(picks.first).to_be_checked()
+    expect(group.get_by_role("button", name="Clear selection")).to_be_visible()
+    group.get_by_role("button", name="Review 2 selected…").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(page.locator("#workspace-title")).to_have_text("Handle 2 pull requests")
+    # The main reviewer from Settings starts them; the dialog can still pick the other.
+    expect(dialog.get_by_label("Agent", exact=True)).to_have_value("claude")
+    expect(page.locator("#workspace-task")).to_have_value(re.compile(r"^Review \{url\}\. "))
+    dialog.get_by_role("button", name="Schedule 2 tasks").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Scheduled 2 of 2")
+    assert batches[-1]["agent"] == "claude"
+    assert [entry["id"] for entry in batches[-1]["items"]] == ["pr-one", "pr-two"]
+    # Scheduled reviews leave the selection.
+    expect(picks.first).not_to_be_checked()
+    expect(picks.last).not_to_be_checked()
 
 
 def test_a_review_clicked_before_the_prs_load_waits_for_them(

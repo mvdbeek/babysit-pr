@@ -52,8 +52,15 @@ def dashboard_site(tmp_path: Path) -> Iterator[tuple[str, Path]]:
         running.update(id="running", repo="test/running", status="running", pending_reviews=[])
         supervisor.save_job(db, running)
         closed = copy.deepcopy(base)
+        # A merged watch only asks to be tidied while its checkout is still on disk.
+        (tmp_path / "merged-checkout").mkdir()
         closed.update(
-            id="closed", repo="test/merged", status="closed", pending_reviews=[], cleanup_ready=True
+            id="closed",
+            repo="test/merged",
+            status="closed",
+            pending_reviews=[],
+            cleanup_ready=True,
+            cwd=str(tmp_path / "merged-checkout"),
         )
         closed["snapshot"]["pr"].update(merged=True, closed=True)
         supervisor.save_job(db, closed)

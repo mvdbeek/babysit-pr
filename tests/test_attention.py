@@ -219,6 +219,52 @@ def test_watch_reasons_cover_feedback_release_and_cleanup():
     assert found["watch:branch"]["title"] == "ci-fix" and found["watch:branch"]["kind"] == "branch"
 
 
+def test_a_finished_watch_whose_checkout_is_gone_has_nothing_to_tidy(tmp_path):
+    kept = tmp_path / "feature"
+    kept.mkdir()
+    jobs = [
+        watch(id="kept", url="u/kept", status="closed", cleanup_ready=True, cwd=str(kept)),
+        watch(
+            id="gone", url="u/gone", status="closed", cleanup_ready=True, cwd=str(tmp_path / "x")
+        ),
+    ]
+    found = by_key(attention.collect(watcher={"jobs": jobs}, now=NOW))
+    assert codes(found["u/kept"]) == ["cleanup"]
+    assert "u/gone" not in found
+
+
+def test_a_tidy_card_names_the_checkouts_it_can_clean_up():
+    def link(number, state="merged"):
+        return {
+            "kind": "pr",
+            "repo": "base/repo",
+            "number": number,
+            "title": f"PR {number}",
+            "url": f"https://github.com/base/repo/pull/{number}",
+            "state": state,
+        }
+
+    blocked = [{"kind": "dirty", "text": "1 uncommitted change(s)"}]
+    rows = [
+        # Two checkouts of one merged PR: one card, both cleaned up together.
+        workspace_row(key="/w/a", status="ready", removable=True, links=[link(1)]),
+        workspace_row(
+            key="/w/b", status="blocked", removable=True, blockers=blocked, links=[link(1)]
+        ),
+        workspace_row(key="/w/open", status="active", removable=True, links=[link(2, "open")]),
+        workspace_row(key="/w/kept", status="blocked", removable=False, links=[link(3)]),
+        workspace_row(key="/w/gone", status="unlinked", removable=True, missing=True),
+    ]
+    found = by_key(
+        attention.collect(workspace_overview={"enabled": True, "workspaces": rows}, now=NOW)
+    )
+    assert found["https://github.com/base/repo/pull/1"]["cleanup"] == ["/w/a", "/w/b"]
+    # Open work needs nobody; a checkout that can never be removed here offers nothing.
+    assert "https://github.com/base/repo/pull/2" not in found
+    assert "cleanup" not in found["https://github.com/base/repo/pull/3"]
+    assert found["workspace:/w/gone"]["cleanup"] == ["/w/gone"]
+
+
 def test_issues_need_picking_up_only_when_nothing_has_started():
     issue = {
         "id": "I1",
