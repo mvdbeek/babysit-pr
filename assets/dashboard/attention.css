@@ -166,6 +166,7 @@
 .attention-group[data-group="waiting"] .attention-item {
   opacity: 0.85;
 }
+.attention-review,
 .attention-triage,
 .attention-dismiss {
   font-size: 13px;

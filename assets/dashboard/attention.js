@@ -138,6 +138,28 @@
             : [],
         }),
       );
+    // A requested review starts here; once its workspace exists the card links that instead.
+    if (
+      !item.workspace_id &&
+      item.reasons.some((reason) => reason.code === "review_requested") &&
+      window.dashboardTasks
+    ) {
+      const review = node("button", "Review pull request", "attention-review");
+      review.type = "button";
+      // Finding the PR may wait for the Pull requests tab's first load.
+      review.onclick = async () => {
+        byId("attention-error").textContent = "";
+        review.disabled = true;
+        try {
+          await window.dashboardTasks.start("prReview", item);
+        } catch (error) {
+          byId("attention-error").textContent = `Could not start the review: ${error.message}`;
+        } finally {
+          review.disabled = false;
+        }
+      };
+      actions.append(review);
+    }
     if (item.url) actions.append(anchor("GitHub", item.url));
     const waiting = "waiting_since" in item;
     const triage = node("button", waiting ? "Resume" : "Wait for activity", "attention-triage");
