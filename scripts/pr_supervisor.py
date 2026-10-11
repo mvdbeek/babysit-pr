@@ -1176,7 +1176,8 @@ def main():
         import dashboard
 
         try:
-            dashboard.serve(
+            # A non-zero status is how the dashboard asks launchd to start it again.
+            return dashboard.serve(
                 home,
                 args.port,
                 args.open,
@@ -1186,7 +1187,6 @@ def main():
         except OSError as exc:
             emit({"error": str(exc)})
             return 1
-        return 0
     db = open_db(home)
     try:
         if args.command == "register":

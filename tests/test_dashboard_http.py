@@ -7,12 +7,14 @@ import email.message
 import gzip
 import http.client
 import json
+import os
 import sqlite3
 import threading
 import time
 
 import dashboard
 import pytest
+import service_control
 from pr_overview import Overview
 from pr_supervisor import open_db, save_job
 
@@ -400,3 +402,99 @@ def test_an_error_after_the_response_began_closes_a_kept_alive_connection(tmp_pa
         server.shutdown()
         server.server_close()
         thread.join(5)
+
+
+def post_service(server, service):
+    return get(
+        server,
+        "/api/service-restart",
+        {"X-Babysit-Action": "service-restart", "Content-Type": "application/json"},
+        method="POST",
+        body=json.dumps({"service": service}).encode(),
+    )
+
+
+def test_the_service_route_reports_both_services(serve, tmp_path, monkeypatch):
+    monkeypatch.setattr(service_control, "launchd_label", lambda: "net.example.dashboard")
+    (tmp_path / "heartbeat.json").write_text(json.dumps({"time": time.time()}))
+    (tmp_path / "daemon.json").write_text(json.dumps({"pid": 4321, "max_workers": 3}))
+    server = serve()
+    status, _, body = get(server, "/api/service")
+    value = json.loads(body)
+    assert status == 200
+    assert value["daemon"]["health"] == "healthy" and value["daemon"]["pid"] == 4321
+    assert value["daemon"]["max_workers"] == 3
+    assert value["dashboard"] == {
+        "pid": os.getpid(),
+        "started_at": service_control.STARTED_AT,
+        "service": "net.example.dashboard",
+    }
+
+
+def test_restarting_the_watcher_answers_with_the_new_daemon(serve, tmp_path, monkeypatch):
+    restarted = []
+
+    def restart(home):
+        restarted.append(home)
+        (home / "heartbeat.json").write_text(json.dumps({"time": time.time()}))
+        (home / "daemon.json").write_text(json.dumps({"pid": 777, "max_workers": 2}))
+
+    monkeypatch.setattr(service_control, "restart_daemon", restart)
+    server = serve()
+    status, _, body = post_service(server, "daemon")
+    assert status == 200 and restarted == [tmp_path]
+    assert json.loads(body)["daemon"] == {
+        "health": "healthy",
+        "heartbeat_age": pytest.approx(0, abs=5),
+        "max_workers": 2,
+        "pid": 777,
+        "started_at": None,
+    }
+
+
+def test_a_watcher_that_will_not_stop_is_reported_without_a_traceback(serve, monkeypatch, capsys):
+    def refuse(home):
+        raise RuntimeError("The watcher did not stop within 15 seconds; stop it in a terminal")
+
+    monkeypatch.setattr(service_control, "restart_daemon", refuse)
+    server = serve()
+    status, _, body = post_service(server, "daemon")
+    assert status == 503
+    assert json.loads(body)["error"] == (
+        "Could not restart the watcher: The watcher did not stop within 15 seconds; "
+        "stop it in a terminal"
+    )
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_an_unknown_service_is_refused(serve):
+    server = serve()
+    status, _, body = post_service(server, "everything")
+    assert status == 400
+    assert json.loads(body)["error"] == "Choose the watcher daemon or the dashboard"
+
+
+def test_a_dashboard_nothing_would_restart_keeps_serving(serve, monkeypatch):
+    monkeypatch.setattr(service_control, "launchd_label", lambda: None)
+    server = serve()
+    status, _, body = post_service(server, "dashboard")
+    assert status == 400 and "not a launchd job" in json.loads(body)["error"]
+    assert server.restart is False
+    assert get(server, "/api/service")[0] == 200
+
+
+def test_restarting_the_dashboard_answers_first_then_stops_serving(serve, monkeypatch):
+    monkeypatch.setattr(service_control, "launchd_label", lambda: "net.example.dashboard")
+    server = serve()
+    status, _, body = post_service(server, "dashboard")
+    assert status == 200 and json.loads(body)["dashboard"]["pid"] == os.getpid()
+    assert server.restart is True
+    # Only a stopped server frees its port; nothing else answers on it afterwards.
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            get(server, "/api/service")
+        except OSError:
+            break
+        assert time.monotonic() < deadline, "The dashboard kept serving after a restart"
+        time.sleep(0.1)

@@ -667,6 +667,28 @@ both versions. If the `codex` on PATH comes from an npm `@openai/codex` package,
 shown, in a login shell; otherwise update it the way it was installed. New and
 resumed agents use the new version; running agents keep theirs.
 
+## Services
+
+The health badge in the header opens **Services**, where the two processes behind the
+page can be restarted without a terminal: the watcher daemon that polls GitHub and
+starts repairs, and the dashboard that serves the page. Each row names the process
+(pid, how long it has been up, and the daemon's repair limit) and its state.
+
+**Restart** on the watcher stops the daemon in `daemon.json` and starts a new one
+with the same repair limit, as `pr_supervisor.py start` does. The pid is signalled
+only when it still names a supervisor, so a stale pid file whose number has been
+handed to another program is reported, not killed. Repairs already running are
+detached and keep going; the new daemon reconciles their results. A daemon that has
+stopped is simply started.
+
+**Restart** on the dashboard stops it so launchd starts it again, which is how a
+dashboard picks up a pulled checkout. It exits with a non-zero status, because
+`KeepAlive`/`SuccessfulExit` is what starts it again. The page waits for a dashboard
+with a different pid to answer and then reloads itself on the new code. A dashboard
+that launchd does not own cannot do this: `XPC_SERVICE_NAME` names its job and
+launchd is asked which pid holds that label, so a dashboard started by hand, or any
+process that merely inherited the variable, says so instead and keeps serving.
+
 ## Worktree helper
 
 `scripts/wt.py` is a portable, stdlib-only Python implementation of the `wt`, `wti`
