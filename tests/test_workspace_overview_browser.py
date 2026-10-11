@@ -633,3 +633,86 @@ def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
     dialog.get_by_role("button", name="Send to agent").click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w4:p1.")
     assert sent[-1] == {"workspace": "w4", "pane": "w4:p1", "text": "And add a test"}
+
+
+def test_one_override_covers_every_blocked_row_in_a_batch(page, site):
+    url, plugin, removed = site
+    plugin.value["workspaces"] = [
+        row(
+            "squashed",
+            links=[link("pr", 21, "merged")],
+            status="blocked",
+            unpushed=4,
+            blockers=[{"kind": "unpushed", "text": "4 commit(s) only on this branch"}],
+        ),
+        row(
+            "scratch",
+            links=[link("issue", 22, "closed")],
+            status="blocked",
+            changes=1,
+            blockers=[{"kind": "dirty", "text": "1 uncommitted change(s)"}],
+        ),
+        row("clean", links=[link("pr", 23, "merged")], status="ready"),
+    ]
+    page.goto(url + "/#workspaces")
+    page.get_by_role("checkbox", name="Select all shown").check()
+    page.get_by_role("button", name="Clean up selected").click()
+    dialog = page.locator("#ws-dialog")
+    every = page.get_by_role("checkbox", name="Remove anyway: every blocker on all 2 of them")
+    expect(every).not_to_be_checked()
+    every.check()
+    for name in ("4 commit(s) only on this branch", "1 uncommitted change(s)"):
+        expect(page.get_by_role("checkbox", name=f"Remove anyway: {name}")).to_be_checked()
+    # Unticking one row leaves the rest overridden and the batch control follows.
+    page.get_by_role("checkbox", name="Remove anyway: 1 uncommitted change(s)").uncheck()
+    expect(every).not_to_be_checked()
+    every.check()
+    page.get_by_role("button", name="Clean up 3 workspace(s)").click()
+    expect(dialog).to_contain_text("Cleanup results")
+    assert {target["key"]: target["approve"] for target in removed} == {
+        "/src/worktrees/repo/squashed": ["unpushed"],
+        "/src/worktrees/repo/scratch": ["dirty"],
+        "/src/worktrees/repo/clean": [],
+    }
+
+
+def test_only_one_blocked_row_keeps_its_own_override(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row(
+            "squashed",
+            links=[link("pr", 21, "merged")],
+            status="blocked",
+            unpushed=4,
+            blockers=[{"kind": "unpushed", "text": "4 commit(s) only on this branch"}],
+        ),
+        row("clean", links=[link("pr", 23, "merged")], status="ready"),
+    ]
+    page.goto(url + "/#workspaces")
+    page.get_by_role("checkbox", name="Select all shown").check()
+    page.get_by_role("button", name="Clean up selected").click()
+    expect(page.locator(".ws-force-all")).to_have_count(0)
+    expect(page.get_by_role("checkbox", name="Remove anyway")).to_have_count(1)
+
+
+def test_arriving_for_one_item_searches_its_row_out_of_the_list(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row(
+            "squashed",
+            links=[link("pr", 21, "merged")],
+            status="blocked",
+            unpushed=4,
+            blockers=[{"kind": "unpushed", "text": "4 commit(s) only on this branch"}],
+        ),
+        row("elsewhere", links=[link("pr", 22, "merged")], status="ready"),
+    ]
+    page.goto(
+        f"{url}/?item=https%3A%2F%2Fgithub.com%2F{BASE.replace('/', '%2F')}%2Fpull%2F21#workspaces"
+    )
+    expect(page.locator("#workspaces-panel")).to_be_visible()
+    expect(page.locator("#ws-search")).to_have_value("#21")
+    names = page.locator("#ws-list tr td:nth-child(2) > span")
+    expect(names).to_have_text(["squashed"])
+    # The item is spent once used, so a reload or a later filter is the user's own.
+    expect(page).to_have_url(f"{url}/#workspaces")

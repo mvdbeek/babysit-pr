@@ -118,12 +118,17 @@
 .ws-target .badge {
   margin: 4px 0;
 }
-.ws-target label {
+.ws-target label,
+.ws-force-all {
   display: flex;
   align-items: flex-start;
   gap: 8px;
   margin-top: 6px;
   color: var(--amber);
+}
+.ws-force-all {
+  font-weight: 600;
+  padding-bottom: 10px;
 }
 #ws-dialog-error {
   color: var(--red);

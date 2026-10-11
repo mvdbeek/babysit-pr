@@ -157,6 +157,39 @@ def transcript_updates(paths, src):
     return updates
 
 
+def landed(path, missing, merges):
+    """Of commits no remote carries by name, those whose content is upstream anyway.
+
+    A branch rebased before it merged keeps every change and loses every commit name,
+    so the local copy looks entirely unpushed while the base carries the same patches.
+    `git cherry` compares patch ids rather than names and marks those `-`. It skips
+    merge commits, which hold nothing of their own beyond a conflict resolution, so a
+    merge is landed exactly when its combined diff against all parents is empty.
+
+    Unknowable is not landed, and the error is always towards keeping work: without a
+    base branch, when Git declines to answer, or when a squash folded several commits
+    into one patch equal to none of them, every commit stays counted.
+    """
+    try:
+        base = git(path, "rev-parse", "--abbrev-ref", "origin/HEAD")
+        equivalent = {
+            line[2:].strip()
+            for line in git(path, "cherry", base, "HEAD").splitlines()
+            if line.startswith("-")
+        }
+    except (OSError, ValueError, subprocess.SubprocessError):
+        equivalent = set()
+    found = {sha for sha in missing if sha in equivalent}
+    for sha in merges - found:
+        try:
+            # -U0 keeps an evil merge's combined diff small; only its emptiness matters.
+            if not git(path, "show", "--format=", "--cc", "-U0", sha, strip=False).strip():
+                found.add(sha)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    return found
+
+
 def local_state(path, branch=None):
     """Uncommitted changes and commits only this branch has, without touching either."""
     try:
@@ -174,23 +207,32 @@ def local_state(path, branch=None):
         # lost with this worktree, so those are the ones worth blocking on.
         # `--exclude` matches `--branches` with the refs/heads/ prefix already stripped.
         exclude = [f"--exclude={branch}"] if branch else []
-        unpushed = git(
+        missing, merges = set(), set()
+        for record in git(
             path,
             "--no-optional-locks",
             "rev-list",
             f"--max-count={MAX_UNPUSHED}",
-            "--count",
+            "--parents",
             "HEAD",
             "--not",
             "--remotes",
             *exclude,
             "--branches",
             "--tags",
-        )
+        ).splitlines():
+            sha, *parents = record.split()
+            missing.add(sha)
+            if len(parents) > 1:
+                merges.add(sha)
+        # Carrying a name no remote knows is not the same as carrying lost work, and
+        # reading the whole set is only affordable while it stays under the ceiling.
+        if missing and len(missing) < MAX_UNPUSHED:
+            missing -= landed(path, missing, merges)
         return {
             **checkout_times(path, changes),
             "changes": counted(changes, MAX_CHANGES),
-            "unpushed": int(unpushed or 0),
+            "unpushed": len(missing),
             "error": None,
         }
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -997,10 +1039,11 @@ class WorkspaceOverview:
     def delete_branch(self, job, index, row, steps, approved):
         """Delete the branch only when no commit can be lost, and say so when it is kept.
 
-        `unpushed == 0` means a remote ref or another local branch carries every commit,
-        so a forced delete loses nothing even when Git calls the branch unmerged — which
-        is the normal state after a squash merge. Otherwise `-d` decides, and a branch
-        Git refuses to delete is kept with the worktree already gone.
+        `unpushed == 0` means a remote ref, another local branch or the base branch's
+        own history carries every commit's changes, so a forced delete loses nothing
+        even when Git calls the branch unmerged — which is the normal state after a
+        squash merge. Otherwise `-d` decides, and a branch Git refuses to delete is
+        kept with the worktree already gone.
         """
         branch = row.get("branch")
         if not row["remove_worktree"] or not branch or not BRANCH_NAME.fullmatch(branch):

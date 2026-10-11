@@ -2825,3 +2825,94 @@ def test_codex_answer_is_not_replayed_after_its_session_moves_panes(codex_asking
     with pytest.raises(ValueError, match="already attempted"):
         agent_messages.answer({**body, "pane": "w1:p2"})
     assert keys_sent(state) == [["2"]]
+
+
+@pytest.fixture
+def rewritten(tmp_path):
+    """A clone whose branch was rebased upstream: same changes under different names."""
+    clone = tmp_path / "repo"
+    clone.mkdir()
+
+    def git(*args, cwd=clone):
+        return subprocess.check_output(["git", "-C", str(cwd), *args], text=True).strip()
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Fixture")
+    git("config", "user.email", "fixture@example.test")
+    git("config", "commit.gpgsign", "false")
+    (clone / "base.txt").write_text("base\n")
+    git("add", ".")
+    git("commit", "-m", "base")
+    git("branch", "work")
+    for name in ("one", "two"):
+        (clone / f"{name}.txt").write_text(f"{name}\n")
+        git("add", ".")
+        git("commit", "-m", f"add {name}")
+    # What the maintainer merged: the same two patches, replayed under new names.
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git("reset", "--hard", "work")
+    return clone, git
+
+
+def test_a_rebased_branch_keeps_no_commits_of_its_own(rewritten, tmp_path):
+    clone, git = rewritten
+    work = tmp_path / "work"
+    git("worktree", "add", str(work), "work")
+    for name in ("one", "two"):
+        (work / f"{name}.txt").write_text(f"{name}\n")
+        git("add", ".", cwd=work)
+        git("commit", "-m", f"add {name} (local)", cwd=work)
+    # The same two changes under local names: no remote carries the SHAs, all the work.
+    assert (
+        git(
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            "--remotes",
+            "--exclude=work",
+            "--branches",
+            cwd=work,
+        )
+        == "2"
+    )
+    assert wso.local_state(str(work), "work")["unpushed"] == 0
+
+
+def test_an_unlanded_commit_still_counts_on_a_rebased_branch(rewritten, tmp_path):
+    clone, git = rewritten
+    work = tmp_path / "work"
+    git("worktree", "add", str(work), "work")
+    for name in ("one", "two"):
+        (work / f"{name}.txt").write_text(f"{name}\n")
+        git("add", ".", cwd=work)
+        git("commit", "-m", f"add {name} (local)", cwd=work)
+    (work / "three.txt").write_text("three\n")
+    git("add", ".", cwd=work)
+    git("commit", "-m", "add three", cwd=work)
+    assert wso.local_state(str(work), "work")["unpushed"] == 1
+
+
+def test_without_a_base_branch_every_commit_is_kept(rewritten, tmp_path):
+    clone, git = rewritten
+    git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    work = tmp_path / "work"
+    git("worktree", "add", str(work), "work")
+    (work / "one.txt").write_text("one\n")
+    git("add", ".", cwd=work)
+    git("commit", "-m", "add one (local)", cwd=work)
+    assert wso.local_state(str(work), "work")["unpushed"] == 1
+
+
+def test_a_merge_counts_only_when_it_resolved_something_itself(rewritten, tmp_path):
+    clone, git = rewritten
+    work = tmp_path / "work"
+    git("worktree", "add", str(work), "work")
+    git("merge", "--no-ff", "-m", "merge main", "main", cwd=work)
+    # Nothing but the join of two upstream histories: the merge carries no work.
+    assert wso.local_state(str(work), "work")["unpushed"] == 0
+    (work / "one.txt").write_text("resolved differently\n")
+    git("add", ".", cwd=work)
+    git("commit", "--amend", "--no-edit", cwd=work)
+    assert wso.local_state(str(work), "work")["unpushed"] == 1
