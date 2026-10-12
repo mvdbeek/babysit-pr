@@ -145,7 +145,16 @@ def checkout(job, src):
             git(clone, "worktree", "add", str(directory), job["branch"], timeout=120)
     branch = git(str(directory), "rev-parse", "--abbrev-ref", "HEAD")
     if branch != job["branch"]:
-        raise ValueError(f"{directory} has {branch} checked out instead of {job['branch']}")
+        # A run may leave its checkout on another branch, such as one it opened a pull
+        # request from; the next run starts on the job's own again, unless that would
+        # carry someone's uncommitted changes along.
+        stated = f"{directory} has {branch} checked out instead of {job['branch']}"
+        if git(str(directory), "status", "--porcelain", "--untracked-files=no"):
+            raise ValueError(f"{stated}, with uncommitted changes")
+        try:
+            git(str(directory), "switch", "--quiet", job["branch"])
+        except ValueError as exc:
+            raise ValueError(f"{stated}, and switching back failed: {exc}") from exc
     return directory.resolve()
 
 
