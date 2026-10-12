@@ -388,6 +388,33 @@ def test_the_clones_own_checkout_is_never_used(setup):
     assert "checked out in the clone itself" in run["message"]
 
 
+def test_a_checkout_left_on_another_branch_goes_back_to_the_jobs(setup):
+    _, manager, git, _ = setup
+    job = request(manager, branch="merge-forward")
+    path = cron_agents.checkout(job, manager.src)
+    # The last run opened a pull request from a branch of its own and stayed there.
+    git("switch", "-q", "-c", "merge-release", cwd=path)
+    (path / "untracked.txt").write_text("kept")
+    assert cron_agents.checkout(job, manager.src) == path
+    assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=path) == "merge-forward"
+    assert (path / "untracked.txt").read_text() == "kept"
+
+
+def test_a_checkout_on_another_branch_with_changes_is_left_alone(setup):
+    _, manager, git, _ = setup
+    job = request(manager, branch="merge-forward")
+    path = cron_agents.checkout(job, manager.src)
+    git("switch", "-q", "-c", "merge-release", cwd=path)
+    (path / "notes.txt").write_text("merged")
+    git("add", "notes.txt", cwd=path)
+    git("commit", "-q", "-m", "Merge", cwd=path)
+    (path / "notes.txt").write_text("half done")
+    with pytest.raises(ValueError, match="instead of merge-forward, with uncommitted changes"):
+        cron_agents.checkout(job, manager.src)
+    assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=path) == "merge-release"
+    assert (path / "notes.txt").read_text() == "half done"
+
+
 def test_two_jobs_cannot_share_a_branch(setup):
     jobs, manager, _, _ = setup
     jobs.save(request(manager))

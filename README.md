@@ -843,7 +843,9 @@ in **New task**. The job owns one workspace: the worktree for its branch under
 `~/src/worktrees/<repo>`, made from the base branch (or the clone's current commit) on
 the first run, or wherever that branch is already checked out, though never the clone's own checkout. Each agent job needs its
 own branch. Every run works there, so changes and notes carry over from one
-run to the next. A run opens the checkout's herdr workspace, splits a new pane and
+run to the next. A run that left the checkout on another branch, say one it opened a
+pull request from, is switched back to the job's branch when the next run starts;
+uncommitted changes on that branch stop the run instead. A run opens the checkout's herdr workspace, splits a new pane and
 starts a fresh agent session with the prompt, through your shell's agent wrappers
 (Safehouse, Claude accounts) like other launches. As with **Start later** tasks, the
 agent is asked to end with a marker once the task is finished; the dashboard then
