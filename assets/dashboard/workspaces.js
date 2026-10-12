@@ -342,9 +342,26 @@
       byId("ws-dialog-intro").textContent =
         "Agents are asked to exit, the herdr workspace is closed, the worktree is removed and the local branch deleted. Anything not merged into a remote is kept unless you override it here." +
         (overflow ? ` ${overflow} more are left for another cleanup.` : "");
+      const chosen = pending.filter((entry) => !entry.skip);
+      // A batch from Needs you is every card's checkout; any of them can be left out,
+      // or all of them, to pick a few.
+      if (pending.length > 1) {
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = chosen.length === pending.length;
+        box.indeterminate = chosen.length > 0 && chosen.length < pending.length;
+        box.onchange = () => {
+          for (const entry of pending) entry.skip = !box.checked;
+          renderDialog();
+        };
+        label.className = "ws-include-all";
+        label.append(box, ` All ${pending.length} workspaces`);
+        content.append(label);
+      }
       // Overriding one row at a time is the whole dialog when a backlog is cleared at
       // once, so the blockers are also offered together — still never pre-ticked.
-      const blocked = pending.filter((entry) => entry.blockers.length);
+      const blocked = chosen.filter((entry) => entry.blockers.length);
       if (blocked.length > 1) {
         const label = document.createElement("label");
         const box = document.createElement("input");
@@ -360,14 +377,28 @@
       }
       for (const entry of pending) {
         const item = node("div", undefined, "ws-target");
-        item.append(node("strong", entry.name));
-        item.append(
+        item.classList.toggle("ws-skipped", Boolean(entry.skip));
+        const include = document.createElement("label");
+        include.className = "ws-include";
+        const pick = document.createElement("input");
+        pick.type = "checkbox";
+        pick.checked = !entry.skip;
+        pick.setAttribute("aria-label", `Clean up ${entry.name}`);
+        pick.onchange = () => {
+          entry.skip = !pick.checked;
+          renderDialog();
+        };
+        const named = node("span");
+        named.append(
+          node("strong", entry.name),
           node("small", `${entry.repo || ""} · ${entry.branch || "no branch"}`, "pr-meta"),
         );
+        include.append(pick, named);
+        item.append(include);
         if (!entry.remove_worktree) {
           item.append(node("small", "Only the herdr workspace is closed.", "pr-meta"));
         }
-        if (entry.blockers.length) {
+        if (entry.blockers.length && !entry.skip) {
           const label = document.createElement("label");
           const box = document.createElement("input");
           box.type = "checkbox";
@@ -383,8 +414,8 @@
         content.append(item);
       }
       byId("ws-confirm").hidden = false;
-      byId("ws-confirm").disabled = confirming;
-      byId("ws-confirm").textContent = `Clean up ${pending.length} workspace(s)`;
+      byId("ws-confirm").disabled = confirming || !chosen.length;
+      byId("ws-confirm").textContent = `Clean up ${chosen.length} workspace(s)`;
       byId("ws-cancel").textContent = "Cancel";
       return;
     }
@@ -418,15 +449,16 @@
     renderDialog();
   }
   async function confirm() {
-    if (!pending || confirming) return;
+    const chosen = (pending || []).filter((entry) => !entry.skip);
+    if (!chosen.length || confirming) return;
     confirming = true;
     byId("ws-confirm").disabled = true;
     byId("ws-dialog-error").textContent = "";
-    const targets = pending.map((entry) => ({
+    const targets = chosen.map((entry) => ({
       key: entry.key,
       approve: entry.force ? [...new Set(entry.blockers.map((item) => item.kind))] : [],
     }));
-    for (const entry of pending) names.set(entry.key, entry.name);
+    for (const entry of chosen) names.set(entry.key, entry.name);
     try {
       const response = await fetch("/api/workspace-cleanup", {
         method: "POST",
@@ -495,7 +527,7 @@
     // Only what the filters still show is submitted; a hidden row is never swept in.
     const targets = visible()
       .filter((entry) => selected.has(entry.key))
-      .map((entry) => ({ ...entry, force: false }));
+      .map((entry) => ({ ...entry, force: false, skip: false }));
     if (targets.length) openDialog(targets);
   };
   byId("ws-confirm").onclick = confirm;
@@ -539,7 +571,7 @@
       if (!rows().some((entry) => wanted.has(entry.key))) await refresh();
       const targets = rows()
         .filter((entry) => wanted.has(entry.key) && entry.removable)
-        .map((entry) => ({ ...entry, force: false }));
+        .map((entry) => ({ ...entry, force: false, skip: false }));
       if (!targets.length) throw Error("none of them can be cleaned up any more");
       openDialog(targets.slice(0, BATCH), Math.max(0, targets.length - BATCH));
     },
