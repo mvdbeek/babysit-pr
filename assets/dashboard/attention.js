@@ -199,7 +199,7 @@
         actions.append(review);
       }
     }
-    // Its checkout is closed or merged: the Workspaces confirmation, from here.
+    // Its checkout, through the Workspaces confirmation, which lists what would be lost.
     if (item.cleanup?.length && window.dashboardWorkspaces) {
       const clean = node("button", "Clean up", "attention-cleanup");
       clean.type = "button";

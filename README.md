@@ -106,11 +106,12 @@ requests tab's batch action, started with the main reviewer from Settings, and
 agent; once its workspace exists the card links those instead. With two or more
 requested reviews, tick each card's box (or **Select all**) and press **Review N
 selected…**: the Pull requests tab's batch dialog opens on the review task, starting
-with the main reviewer, and each review is scheduled apart from the next. A Tidy up
-card whose checkout can be cleaned up offers **Clean up**, and the group offers
-**Clean up N workspaces…** for all of them: both open the Workspaces tab's
-confirmation, which lists what would be lost row by row and removes nothing until you
-confirm (at most 50 at a time). An item
+with the main reviewer, and each review is scheduled apart from the next. Any card
+with a workspace the dashboard may remove offers **Clean up**, finished or not, and
+the Tidy up group offers **Clean up N workspaces…** for all of its cards: both open
+the Workspaces tab's confirmation, which lists what would be lost row by row and
+removes nothing until you confirm (at most 50 at a time). Each row there can be
+unticked, or all of them at once, to clean up only some. An item
 mentioned by several sources appears once, with all its reasons; a watched pull
 request with a workspace is one row. Rows are grouped by the kind of work, newest
 activity first, and a group heading collapses its rows:

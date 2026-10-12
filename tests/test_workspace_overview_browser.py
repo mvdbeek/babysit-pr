@@ -676,6 +676,37 @@ def test_one_override_covers_every_blocked_row_in_a_batch(page, site):
     }
 
 
+def test_rows_can_be_left_out_of_a_cleanup_down_to_none(page, site):
+    url, plugin, removed = site
+    plugin.value["workspaces"] = [
+        row(
+            "scratch",
+            links=[link("issue", 22, "closed")],
+            status="blocked",
+            changes=1,
+            blockers=[{"kind": "dirty", "text": "1 uncommitted change(s)"}],
+        ),
+        row("clean", links=[link("pr", 23, "merged")], status="ready"),
+        row("other", links=[link("pr", 24, "merged")], status="ready"),
+    ]
+    page.goto(url + "/#workspaces")
+    page.get_by_role("checkbox", name="Select all shown").check()
+    page.get_by_role("button", name="Clean up selected").click()
+    every = page.get_by_role("checkbox", name="All 3 workspaces")
+    expect(every).to_be_checked()
+    every.uncheck()
+    for name in ("scratch", "clean", "other"):
+        expect(page.get_by_role("checkbox", name=f"Clean up {name}")).not_to_be_checked()
+    # A row left out offers no override; with none chosen there is nothing to confirm.
+    expect(page.get_by_role("checkbox", name="Remove anyway")).to_have_count(0)
+    expect(page.get_by_role("button", name="Clean up 0 workspace(s)")).to_be_disabled()
+    page.get_by_role("checkbox", name="Clean up clean").check()
+    expect(every).not_to_be_checked()
+    page.get_by_role("button", name="Clean up 1 workspace(s)").click()
+    expect(page.locator("#ws-dialog")).to_contain_text("Cleanup results")
+    assert [target["key"] for target in removed] == ["/src/worktrees/repo/clean"]
+
+
 def test_only_one_blocked_row_keeps_its_own_override(page, site):
     url, plugin, _ = site
     plugin.value["workspaces"] = [

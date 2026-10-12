@@ -252,6 +252,13 @@ def test_a_tidy_card_names_the_checkouts_it_can_clean_up():
             key="/w/b", status="blocked", removable=True, blockers=blocked, links=[link(1)]
         ),
         workspace_row(key="/w/open", status="active", removable=True, links=[link(2, "open")]),
+        workspace_row(
+            key="/w/done",
+            status="active",
+            removable=True,
+            agents=[{"status": "done"}],
+            links=[link(4, "open")],
+        ),
         workspace_row(key="/w/kept", status="blocked", removable=False, links=[link(3)]),
         workspace_row(key="/w/gone", status="unlinked", removable=True, missing=True),
     ]
@@ -262,6 +269,8 @@ def test_a_tidy_card_names_the_checkouts_it_can_clean_up():
     # Open work needs nobody; a checkout that can never be removed here offers nothing.
     assert "https://github.com/base/repo/pull/2" not in found
     assert "cleanup" not in found["https://github.com/base/repo/pull/3"]
+    # A card listed for its agent offers its checkout too; the confirmation says what is kept.
+    assert found["https://github.com/base/repo/pull/4"]["cleanup"] == ["/w/done"]
     assert found["workspace:/w/gone"]["cleanup"] == ["/w/gone"]
 
 

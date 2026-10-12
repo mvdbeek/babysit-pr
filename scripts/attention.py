@@ -343,14 +343,9 @@ class Feed:
                 if link.get("state") not in {"none", "unknown", "error", None}
             ]
             settled = bool(links) and all(link.get("state") in CLOSED_LINKS for link in links)
-            # The Workspaces row the page cleans up for a card that asks to be tidied.
-            cleanup = []
-            if row.get("removable") and (
-                row.get("status") == "ready"
-                or (row.get("status") == "blocked" and settled)
-                or row.get("missing")
-            ):
-                cleanup = [row.get("key")]
+            # The Workspaces row a card cleans up: any it may remove, done with or not, since
+            # the confirmation lists what would be lost and keeps it unless overridden.
+            cleanup = [row["key"]] if row.get("removable") and row.get("key") else []
             if row.get("status") == "ready":
                 reasons.append(
                     reason("workspace_ready", "tidy", "Its items are closed: ready to clean up")
