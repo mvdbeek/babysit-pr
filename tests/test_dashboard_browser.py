@@ -4086,6 +4086,49 @@ def test_questions_render_as_cards_and_a_waiting_one_is_answered_here(
     ]
 
 
+def test_a_question_the_transcript_shows_is_not_drawn_again_below_it(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    entries = [question_entry([QUESTION])]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    # herdr reads the same dialog off the agent's screen.
+    agent = viewer_routes["agents"][1]
+    agent.update(
+        status="blocked",
+        session="s1",
+        interaction={
+            "screen": "A live terminal question",
+            "question": question_entry([QUESTION], id="screen:question"),
+        },
+    )
+    viewer_routes["agents"] = [agent]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    expect(page.locator("#ws-viewer .ws-transcript .ws-question form")).to_have_count(1)
+    interaction = page.locator("#ws-agent-interaction")
+    expect(interaction).to_have_text(
+        "The agent is waiting for an answer to its question above. Your message is saved."
+    )
+    expect(page.get_by_role("button", name="Answer in w1:p2")).to_have_count(1)
+    # Without the transcript on screen, the live question is the only place to answer it.
+    page.locator("#ws-view-diff").click()
+    expect(interaction).to_contain_text("Live question from the agent")
+    expect(page.get_by_role("button", name="Answer in w1:p2")).to_have_count(1)
+
+
 @pytest.mark.parametrize("width", [390, 1280])
 def test_missing_question_is_answerable_without_the_transcript(
     page, dashboard_site, viewer_routes, width
