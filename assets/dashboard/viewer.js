@@ -444,6 +444,7 @@
     controls.append(refreshButton());
   }
   function renderDiff(data) {
+    syncInteraction();
     viewer.scope = data.scope;
     diffControls(data);
     const files = data.files.length;
@@ -610,7 +611,13 @@
     viewer.nodes = data.entries.map((entry) => transcriptEntry(entry, agentName(data)));
     list.append(...viewer.nodes);
     content.append(list);
+    syncInteraction();
     if (follow) byId("ws-viewer").scrollTop = byId("ws-viewer").scrollHeight;
+  }
+  // The live question box depends on the transcript; it is redrawn only while it is the
+  // agents' box being shown, not a message standing in for it.
+  function syncInteraction() {
+    if ("state" in byId("ws-agent-interaction").dataset) renderInteraction();
   }
   function nearBottom() {
     const scroller = byId("ws-viewer");
@@ -651,6 +658,7 @@
     // Async questions can stay open while subsequent tool calls fill the transcript.
     if (current.entries.some(answerable)) void fetchAgents(viewer.entry);
     renderLive();
+    syncInteraction();
     if (follow) byId("ws-viewer").scrollTop = byId("ws-viewer").scrollHeight;
   }
   function prependTranscript(data) {
@@ -1318,23 +1326,40 @@
       if (viewer?.entry === entry) await fetchAgents(entry);
     }
   }
+  // The transcript on screen already draws this agent's open question with its form: an
+  // agent shows one dialog at a time, so the live one is that same question.
+  function questionInTranscript(agent) {
+    if (viewer?.mode !== "transcript" || !agent?.session) return false;
+    return (viewer.data?.entries || []).some(
+      (entry) => answerable(entry) && questionAgent(entry)?.pane === agent.pane,
+    );
+  }
   function renderInteraction() {
     const agent = selectedAgent();
     // herdr can call an agent blocked while its screen shows an empty prompt box.
     const blocked = agent?.status === "blocked" && !agent.interaction?.idle;
     byId("ws-message-send").disabled = sending || changingDocker || blocked;
     const holder = byId("ws-agent-interaction");
-    const state = JSON.stringify([agent?.pane, agent?.session, blocked, agent?.interaction]);
+    const above = blocked && questionInTranscript(agent);
+    const state = JSON.stringify([agent?.pane, agent?.session, blocked, above, agent?.interaction]);
     if (holder.dataset.state === state) return;
     holder.dataset.state = state;
     holder.replaceChildren();
     if (!blocked) return;
     holder.append(
-      node("p", "The agent is waiting for an answer. Your message is saved.", "pr-meta"),
+      node(
+        "p",
+        above
+          ? "The agent is waiting for an answer to its question above. Your message is saved."
+          : "The agent is waiting for an answer. Your message is saved.",
+        "pr-meta",
+      ),
     );
     const question = agent.interaction?.question;
     const choices = agent.interaction?.choices;
-    if (question) {
+    if (question && above) {
+      // Answered in the transcript's card; drawing it twice invites answering twice.
+    } else if (question) {
       const card = node("div", undefined, "ws-question");
       card.append(node("strong", "Live question from the agent"), answerControls(question, agent));
       holder.append(card);
