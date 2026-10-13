@@ -274,6 +274,35 @@ def test_a_tidy_card_names_the_checkouts_it_can_clean_up():
     assert found["workspace:/w/gone"]["cleanup"] == ["/w/gone"]
 
 
+def test_a_finished_watch_cleans_up_a_checkout_its_open_issue_keeps_active(tmp_path):
+    checkout = tmp_path / "fix"
+    checkout.mkdir()
+    url = "https://github.com/base/repo/pull/5"
+    merged = {"kind": "pr", "number": 5, "url": url, "state": "merged", "title": "Fix"}
+    issue = {"kind": "issue", "number": 4, "url": "u/issue", "state": "open", "title": "Bug"}
+    # The checkout also links its still-open issue, so Workspaces calls it active and gives
+    # the row no reason to be listed; the closed watch lists the pull request instead.
+    found = by_key(
+        attention.collect(
+            watcher={
+                "jobs": [
+                    watch(id="w", url=url, status="closed", cleanup_ready=True, cwd=str(checkout))
+                ]
+            },
+            workspace_overview={
+                "enabled": True,
+                "workspaces": [
+                    workspace_row(key=str(checkout), removable=True, links=[merged, issue])
+                ],
+            },
+            now=NOW,
+        )
+    )
+    assert codes(found[url]) == ["cleanup"]
+    assert found[url]["cleanup"] == [str(checkout)]
+    assert "u/issue" not in found
+
+
 def test_issues_need_picking_up_only_when_nothing_has_started():
     issue = {
         "id": "I1",
