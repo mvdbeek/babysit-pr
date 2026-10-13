@@ -1266,6 +1266,64 @@ function itemTable(spec) {
     if (!fields.length && old.updated_at === (item.updated_at ?? null)) return null;
     return { isNew: false, fields };
   }
+  // Built outside render(): a kept row's handlers then hold only this item, not the
+  // whole snapshot render() was filtering, which kept rows built over many polls
+  // would otherwise retain one copy each of.
+  function rowFor(item, change, pins) {
+    const row = el("tr");
+    if (table.focusedId === item.id) {
+      row.classList.add("notification-target");
+      row.tabIndex = -1;
+    }
+    const { cells, title, fields, updated } = spec.row(item);
+    const dates = updated.parentElement;
+    const expanded = table.expandedDetails.has(item.id);
+    dates.classList.toggle("dates-expanded", expanded);
+    const detailsToggle = el("button", expanded ? "Less" : "Details", "pr-details-toggle");
+    detailsToggle.type = "button";
+    detailsToggle.setAttribute("aria-expanded", String(expanded));
+    detailsToggle.setAttribute(
+      "aria-label",
+      `Dates and activity for ${spec.text.short} ${item.repo} #${item.number}`,
+    );
+    detailsToggle.onclick = () => {
+      if (expanded) table.expandedDetails.delete(item.id);
+      else table.expandedDetails.add(item.id);
+      render();
+      renderedRows.get(item.id)?.row.querySelector(".pr-details-toggle").focus();
+    };
+    dates.append(detailsToggle);
+    const pinCell = el("td", undefined, "item-pin-cell");
+    pinCell.append(pinButton(item, pins));
+    if (spec.batch) pinCell.append(selectBox(item));
+    if (spec.key === "prs" && window.dashboardNotifications?.silenceButton)
+      pinCell.append(window.dashboardNotifications.silenceButton(item.url));
+    if (change) {
+      row.classList.add(change.isNew ? "pr-new" : "pr-changed");
+      title.append(
+        el(
+          "span",
+          change.isNew ? "New" : "Updated",
+          `badge ${change.isNew ? "blue" : "amber"} pr-change-badge`,
+        ),
+      );
+      title.append(
+        el(
+          "small",
+          change.isNew
+            ? "Since your last visit"
+            : change.fields.length
+              ? change.fields.map((field) => spec.changeFields[field]).join(" · ")
+              : spec.text.activity,
+          "pr-change-note",
+        ),
+      );
+      for (const field of change.fields) fields[field].classList.add("pr-field-changed");
+      if (!change.isNew && !change.fields.length) updated.classList.add("pr-field-changed");
+    }
+    row.append(pinCell, ...cells, workspaceCell({ ...item, kind: spec.prefix }));
+    return row;
+  }
   function render() {
     if (!table.data) return;
     const all = items();
@@ -1355,58 +1413,7 @@ function itemTable(spec) {
       }
       // Change counts cover the whole filtered list; only the current window gets rows.
       if (index >= table.limit) continue;
-      const row = el("tr");
-      if (table.focusedId === item.id) {
-        row.classList.add("notification-target");
-        row.tabIndex = -1;
-      }
-      const { cells, title, fields, updated } = spec.row(item);
-      const dates = updated.parentElement;
-      const expanded = table.expandedDetails.has(item.id);
-      dates.classList.toggle("dates-expanded", expanded);
-      const detailsToggle = el("button", expanded ? "Less" : "Details", "pr-details-toggle");
-      detailsToggle.type = "button";
-      detailsToggle.setAttribute("aria-expanded", String(expanded));
-      detailsToggle.setAttribute(
-        "aria-label",
-        `Dates and activity for ${spec.text.short} ${item.repo} #${item.number}`,
-      );
-      detailsToggle.onclick = () => {
-        if (expanded) table.expandedDetails.delete(item.id);
-        else table.expandedDetails.add(item.id);
-        render();
-        renderedRows.get(item.id)?.row.querySelector(".pr-details-toggle").focus();
-      };
-      dates.append(detailsToggle);
-      const pinCell = el("td", undefined, "item-pin-cell");
-      pinCell.append(pinButton(item, pins));
-      if (spec.batch) pinCell.append(selectBox(item));
-      if (spec.key === "prs" && window.dashboardNotifications?.silenceButton)
-        pinCell.append(window.dashboardNotifications.silenceButton(item.url));
-      if (change) {
-        row.classList.add(change.isNew ? "pr-new" : "pr-changed");
-        title.append(
-          el(
-            "span",
-            change.isNew ? "New" : "Updated",
-            `badge ${change.isNew ? "blue" : "amber"} pr-change-badge`,
-          ),
-        );
-        title.append(
-          el(
-            "small",
-            change.isNew
-              ? "Since your last visit"
-              : change.fields.length
-                ? change.fields.map((field) => spec.changeFields[field]).join(" · ")
-                : spec.text.activity,
-            "pr-change-note",
-          ),
-        );
-        for (const field of change.fields) fields[field].classList.add("pr-field-changed");
-        if (!change.isNew && !change.fields.length) updated.classList.add("pr-field-changed");
-      }
-      row.append(pinCell, ...cells, workspaceCell({ ...item, kind: spec.prefix }));
+      const row = rowFor(item, change, pins);
       // Keep the original link between mouse-down and mouse-up during quiet polls.
       // Compare callback inputs too: identical markup can still carry new action data.
       const key = JSON.stringify([
