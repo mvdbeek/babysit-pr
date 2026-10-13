@@ -97,11 +97,16 @@ class Feed:
         # herdr workspace -> item key, so a Workspaces row joins the item it belongs to even
         # when its own link lookup is stale or missing.
         self.by_workspace: dict[str, str] = {}
+        # Checkouts a source with no reason of its own can clean up, such as a Workspaces row
+        # whose item another source lists: the card that lists it offers them too.
+        self.unlisted_cleanup: dict[str, list] = {}
 
     def add(self, key, reasons, pages, **fields):
         """Record reasons for an item; a known key gains the reasons and pages."""
         reasons = [r for r in reasons if r]
         if not reasons:
+            if fields.get("cleanup"):
+                self.unlisted_cleanup.setdefault(subject_key(key), []).extend(fields["cleanup"])
             return
         key = subject_key(key)
         if fields.get("workspace_id"):
@@ -439,6 +444,9 @@ class Feed:
     # -- output --
 
     def result(self, now, sources, triage=None):
+        for key, cleanup in self.unlisted_cleanup.items():
+            if key in self.items:
+                self.add(key, self.items[key]["reasons"], [], cleanup=cleanup)
         for item in self.items.values():
             item["group"] = min(item["reasons"], key=lambda r: ORDER[r["group"]])["group"]
             # Open the page that can act on what makes this item wait, which is not
