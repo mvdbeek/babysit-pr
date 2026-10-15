@@ -1,12 +1,12 @@
 """Restarting the watcher daemon and the dashboard, against isolated state only.
 
 Every daemon here runs in a temporary home with an empty queue, so it polls nothing
-and starts no agent. The launchd checks use a fake ``launchctl`` on PATH.
+and starts no agent. Process inspection sees only children started by the test and
+does not require host ``ps`` access. The launchd checks use a fake ``launchctl`` on PATH.
 """
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -21,23 +21,46 @@ printf '%s = {\\n\\tstate = running\\n\\tpid = %s\\n}\\n' "$2" "$FAKE_LAUNCHCTL_
 """
 
 
+@pytest.fixture(autouse=True)
+def isolated_process_table(monkeypatch):
+    """Keep real child lifecycles, with ps limited to this test's subprocesses."""
+    children = {}
+    popen = subprocess.Popen
+    run = subprocess.run
+
+    def start(argv, *args, **kwargs):
+        child = popen(argv, *args, **kwargs)
+        children[child.pid] = child
+        return child
+
+    def inspect(argv, *args, **kwargs):
+        if argv[0] != "ps":
+            return run(argv, *args, **kwargs)
+        assert argv == ["ps", "-p", argv[2], "-o", "args="]
+        child = children.get(int(argv[2]))
+        alive = child is not None and child.poll() is None
+        return subprocess.CompletedProcess(
+            argv, 0 if alive else 1, " ".join(child.args) + "\n" if alive else "", ""
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", start)
+    monkeypatch.setattr(subprocess, "run", inspect)
+    yield
+    for child in children.values():
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
 @pytest.fixture
 def daemon(tmp_path):
     """A real supervisor in a temporary home, always stopped again."""
-    started = []
 
     def start():
         supervisor.start_daemon(tmp_path, 2)
-        state = wait_for(lambda: recorded(tmp_path))
-        started.append(state)
-        return state
+        return wait_for(lambda: recorded(tmp_path))
 
-    yield start
-    for state in [service_control.read_state(tmp_path / "daemon.json"), *started]:
-        try:
-            os.kill(state["pid"], signal.SIGKILL)
-        except (KeyError, ProcessLookupError, PermissionError):
-            pass  # Already stopped by the test, or never started.
+    return start
 
 
 def recorded(home):
