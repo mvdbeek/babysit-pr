@@ -254,7 +254,11 @@ def test_define_and_follow_an_agent_job(page, agent_site, errors, width, monkeyp
     expect(detail).to_contain_text("Codex · fixture-codex · high effort · Docker")
     expect(detail.locator(".cron-command")).to_have_text("Triage new issues")
     detail.get_by_role("button", name="Run now").click()
-    expect(detail.locator(".cron-runs")).to_contain_text("Waiting for the agent to finish")
+    # Creating the real worktree and starting the fake agent can exceed the default
+    # five-second assertion timeout while the full browser suite runs in parallel.
+    expect(detail.locator(".cron-runs")).to_contain_text(
+        "Waiting for the agent to finish", timeout=20000
+    )
     expect(detail.get_by_role("button", name="Run now")).to_be_disabled()
     expect(detail.get_by_role("link", name="Open in Collie")).to_have_attribute(
         "href", "http://127.0.0.1:8787/space/w1"
