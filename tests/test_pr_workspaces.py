@@ -14,6 +14,7 @@ import dashboard
 import issue_overview
 import pr_workspaces as pw
 import pytest
+import workspace_viewer
 from conftest import install_fakes
 from pr_overview import Overview
 
@@ -504,6 +505,94 @@ def test_reopen_after_completed_creation_does_not_start_second_agent(local):
     assert len(json.loads(state.read_text())["agents"]) == 1
     with manager.db() as db:
         assert db.execute("SELECT count(*) FROM operation_history").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("route", ["diff", "transcript", "agents"])
+def test_viewer_recovers_a_closed_workspace_after_restart(local, route):
+    manager, pr, _, state, _ = local
+    path = make_checkout(local)
+    result = {**pw.checkout(path), "workspace_id": "closed-space"}
+    manager.save_operation({"id": "old-operation", "pr": pr["id"], "result": result})
+    # A newer operation must not hide the old dialog's result.
+    manager.save_operation({"id": "new-operation", "pr": pr["id"]})
+    restarted = pw.Workspaces(manager.home, manager.overview, lambda: [], manager.src)
+    assert not workspace_viewer._checkouts
+    sid = "01a1064c-4c81-7232-ad79-a967ee51fac2"
+    session = (
+        Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "10" / "15" / f"rollout-{sid}.jsonl"
+    )
+    session.parent.mkdir(parents=True)
+    session.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in [
+                {"type": "session_meta", "payload": {"id": sid, "cwd": str(path)}},
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Fix the crash"}],
+                    },
+                },
+            ]
+        )
+        + "\n"
+    )
+    # A workspace already alongside it is not evidence of a reopen and must not
+    # become a message recipient merely because its checkout is the same.
+    space(state, path, manager.src / "repo", wid="other-space")
+    with dashboard.DashboardServer(manager.home, 0, workspaces=restarted) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=10)
+            conn.request("GET", f"/api/workspace-{route}?workspace=closed-space")
+            response = conn.getresponse()
+            value = json.loads(response.read())
+            conn.close()
+            assert response.status == 200, value
+            assert "error" not in value
+            assert workspace_viewer.workspace_checkout("closed-space") == str(path.resolve())
+            if route == "diff":
+                assert value["scope"] == "uncommitted"
+            elif route == "transcript":
+                assert value["session"]["id"] == sid
+                assert value["entries"][0]["text"] == "Fix the crash"
+            else:
+                assert value["path"] == str(path.resolve())
+                assert value["agents"] == [] and value["workspace"] is None
+                assert [session["id"] for session in value["sessions"]] == [sid]
+            assert workspace_viewer.live_workspace("closed-space") is None
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+@pytest.mark.parametrize("change", ["branch", "common", "missing", "ambiguous", "unknown"])
+def test_recorded_workspace_recovery_rejects_unverified_checkouts(local, change):
+    manager, pr, git, _, _ = local
+    path = make_checkout(local)
+    result = {**pw.checkout(path), "workspace_id": "closed-space"}
+    if change == "common":
+        result["common"] = str(manager.src / "other" / ".git")
+    manager.save_operation({"id": "old-operation", "pr": pr["id"], "result": result})
+    if change == "branch":
+        git("switch", "-c", "other-branch", cwd=path)
+    elif change == "missing":
+        shutil.rmtree(path)
+    elif change == "ambiguous":
+        manager.save_operation(
+            {
+                "id": "other-operation",
+                "pr": pr["id"],
+                "result": {**result, "path": str(manager.src / "repo")},
+            }
+        )
+    workspace_id = "unknown-space" if change == "unknown" else "closed-space"
+    assert manager.recorded_checkout(workspace_id) is None
+    with pytest.raises(ValueError, match="not open"):
+        workspace_viewer.workspace_checkout(workspace_id, manager.recorded_checkout)
 
 
 def test_recover_reservation_before_association_was_saved(local):
