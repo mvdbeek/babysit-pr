@@ -153,7 +153,7 @@ def git_text(path, *args):
     return git_output(path, *args, limit=256 * 1024)[0].strip()
 
 
-def workspace_checkout(workspace_id):
+def workspace_checkout(workspace_id, recorded_checkout=None):
     """The checkout a herdr workspace was opened on, the same one Collie shows.
 
     Remembered briefly: an open transcript asks again every few seconds. Once seen, a
@@ -167,12 +167,21 @@ def workspace_checkout(workspace_id):
     if cached and time.monotonic() - cached[0] < CHECKOUT_TTL and Path(cached[1]).is_dir():
         return cached[1]
     spaces = herdr("workspace", "list")["workspaces"]
-    root = resolve_workspace(workspace_id, spaces, cached[1] if cached else None)
-    remember(workspace_id, root, spaces)
+    known = cached[1] if cached else None
+    recovered = False
+    if (
+        known is None
+        and recorded_checkout
+        and not any(w.get("workspace_id") == workspace_id for w in spaces)
+    ):
+        known = recorded_checkout(workspace_id)
+        recovered = known is not None
+    root = resolve_workspace(workspace_id, spaces, known)
+    remember(workspace_id, root, spaces, recovered=recovered)
     return root
 
 
-def remember(workspace_id, root, spaces):
+def remember(workspace_id, root, spaces, *, recovered=False):
     """Note a workspace's checkout, and the other workspaces on it while it is open.
 
     Those others are never taken for it once it closes: a clone's own checkout often
@@ -182,7 +191,10 @@ def remember(workspace_id, root, spaces):
         _, known, others = _checkouts.pop(workspace_id, (0, None, frozenset()))
         if known != root:
             others = frozenset()
-        if any(w.get("workspace_id") == workspace_id for w in spaces):
+        # After recovery from an operation, we cannot tell whether an existing workspace
+        # is a reopen or was already beside the old one. Keep reading the checkout, but
+        # do not select those workspaces as message recipients on that evidence alone.
+        if recovered or any(w.get("workspace_id") == workspace_id for w in spaces):
             others |= {
                 w["workspace_id"]
                 for w in spaces

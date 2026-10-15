@@ -1760,6 +1760,32 @@ class Workspaces:
             row = db.execute("SELECT data FROM operation_history WHERE id=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def recorded_checkout(self, workspace_id):
+        """Recover a closed workspace's checkout from a verified operation result.
+
+        A saved result can outlive herdr's ID and the viewer's in-memory cache. Require
+        its repository and branch to still match before exposing the recorded checkout.
+        """
+        with self.db() as db:
+            records = db.execute(
+                "SELECT data FROM operation_history "
+                "WHERE json_extract(data, '$.result.workspace_id') = ?",
+                (workspace_id,),
+            ).fetchall()
+        results = [json.loads(row[0])["result"] for row in records]
+        identities = {
+            (result.get("path"), result.get("common"), result.get("branch")) for result in results
+        }
+        if len(identities) != 1:
+            return None
+        path, common, branch = identities.pop()
+        if not path or not common or not branch:
+            return None
+        item = checkout(path)
+        if item and item["common"] == common and item["branch"] == branch:
+            return item["path"]
+        return None
+
     def prune_history(self, now=None):
         """Forget month-old finished operations and month-missing checkouts; at most hourly.
 

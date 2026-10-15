@@ -384,6 +384,11 @@ class DashboardServer(ThreadingHTTPServer):
             triage=self.triage,
         )
 
+    def workspace_checkout(self, workspace_id):
+        return workspace_viewer.workspace_checkout(
+            workspace_id, self.workspaces.recorded_checkout if self.workspaces else None
+        )
+
     def handle_error(self, request, client_address):
         # A phone that sleeps or loses the tailnet mid-request is routine, not a fault.
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
@@ -1001,6 +1006,7 @@ class Handler(BaseHTTPRequestHandler):
                     workspace_id = workspace_viewer.checkout_workspace(path)
                 else:
                     workspace_id = query["workspace"][0]
+                    self.server.workspace_checkout(workspace_id)
                 if workspace_id is None:
                     # Nobody to message, but a recorded session can be resumed.
                     value = {
@@ -1044,7 +1050,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Read-only views own their failure boundary, like the inventory.
                 try:
                     if "workspace" in single:
-                        path = workspace_viewer.workspace_checkout(single.pop("workspace"))
+                        path = self.server.workspace_checkout(single.pop("workspace"))
                     if route.path == "/api/workspace-diff":
                         if set(single) - {"scope", "base"}:
                             raise ValueError("Unknown diff parameter")
