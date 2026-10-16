@@ -157,6 +157,14 @@ def test_pr_reasons_follow_authorship_review_state_and_ci():
         pr(id="ready-red", url="u/ready-red", review_decision="APPROVED", ci="FAILURE"),
         pr(id="theirs", url="u/theirs", roles=["reviewer"], ci="FAILURE", review_requests=["me"]),
         pr(id="team", url="u/team", roles=["reviewer"], review_requests=["team:core"]),
+        pr(
+            id="my-team",
+            url="u/my-team",
+            roles=["reviewer", "requested"],
+            review_requests=["bob", "team:core"],
+        ),
+        # The search index still lists a request the team has already answered.
+        pr(id="answered", url="u/answered", roles=["reviewer", "requested"]),
         pr(id="quiet", url="u/quiet"),
     ]
     feed = attention.collect(prs={"login": "me", "prs": prs}, now=NOW)
@@ -170,7 +178,11 @@ def test_pr_reasons_follow_authorship_review_state_and_ci():
     assert codes(found["u/ready-red"]) == ["ci_failing"]
     # Someone else's failing CI is theirs to fix; a requested review is mine to give.
     assert codes(found["u/theirs"]) == ["review_requested"]
+    # A team request is mine only when the search says the team is mine.
     assert "u/team" not in found
+    assert codes(found["u/my-team"]) == ["review_requested"]
+    assert found["u/my-team"]["reasons"][0]["text"] == "Your team's review is requested (core)"
+    assert "u/answered" not in found
     assert "u/quiet" not in found
 
 

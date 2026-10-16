@@ -878,6 +878,7 @@ async function serviceLog() {
 const roleNames = {
   author: "Author",
   reviewer: "Reviewer",
+  requested: "Review requested",
   assignee: "Assignee",
   mentioned: "Mentioned",
   participant: "Participant",

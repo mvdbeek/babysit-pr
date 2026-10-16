@@ -50,14 +50,15 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
             page([pr(updated="2026-09-11T13:00:00Z", ci="FAILURE")]),
             page([pr(updated="2026-09-11T11:00:00Z"), pr("three", ci="PENDING")]),
             page([pr(updated="2026-09-11T10:00:00Z")]),
+            page([pr(updated="2026-09-11T09:00:00Z")]),
         ]
     )
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect()
     assert len(result["prs"]) == 3
     first = result["prs"][0]
-    assert first["roles"] == ["author", "assignee", "reviewer", "mentioned"]
-    assert result["roles"] == ["author", "assignee", "reviewer", "mentioned"]
+    assert first["roles"] == ["author", "assignee", "reviewer", "requested", "mentioned"]
+    assert result["roles"] == ["author", "assignee", "reviewer", "requested", "mentioned"]
     assert first["ci"] == "FAILURE"
     assert (first["head_repo"], first["head_branch"], first["head_sha"]) == (
         "fork/repo",
@@ -69,7 +70,8 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
     assert result["prs"][1]["ci"] == "NONE"
     assert result["prs"][1]["author"] is None
     assert fetch.call_args_list[1].args[1] == "next"
-    assert "review-involves:@me" in fetch.call_args_list[-2].args[0]
+    assert "review-involves:@me" in fetch.call_args_list[-3].args[0]
+    assert "review-requested:@me" in fetch.call_args_list[-2].args[0]
     assert fetch.call_args_list[-1].args[0] == "is:pr is:open mentions:@me sort:updated-desc"
     assert result["login"] == "alice" and not result["warnings"]
 
@@ -78,7 +80,11 @@ def test_mentions_can_be_left_out(monkeypatch):
     fetch = Mock(return_value=page([pr()]))
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect(mentions=False)
-    assert result["roles"] == result["prs"][0]["roles"] == ["author", "assignee", "reviewer"]
+    assert (
+        result["roles"]
+        == result["prs"][0]["roles"]
+        == ["author", "assignee", "reviewer", "requested"]
+    )
     assert not any("mentions:" in call.args[0] for call in fetch.call_args_list)
 
 
@@ -143,15 +149,15 @@ def test_empty_search_still_lists_the_searched_roles(monkeypatch):
     monkeypatch.setattr(overview, "github_page", lambda *args: page([]))
     result = overview.collect()
     assert result["prs"] == []
-    assert result["roles"] == ["author", "assignee", "reviewer", "mentioned"]
+    assert result["roles"] == ["author", "assignee", "reviewer", "requested", "mentioned"]
 
 
 def test_search_limit_is_visible(monkeypatch):
-    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(20)] + [page()] * 3)
+    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(20)] + [page()] * 4)
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect()
     assert result["warnings"] == ["Only the most recently updated 1,000 author PRs are shown."]
-    assert fetch.call_count == 23
+    assert fetch.call_count == 24
 
 
 @pytest.mark.parametrize(

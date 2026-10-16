@@ -21,6 +21,8 @@ ROLES = {
     "author": "author",
     "assignee": "assignee",
     "reviewer": "review-involves",
+    # GitHub resolves team membership for this search; `reviewRequests` only names the team.
+    "requested": "review-requested",
     "mentioned": "mentions",
 }
 SETTINGS = "overview-config.json"
