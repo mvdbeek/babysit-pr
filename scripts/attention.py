@@ -288,8 +288,15 @@ class Feed:
                 reasons.append(
                     reason("approved", "review", "Approved with green CI: ready to merge")
                 )
-            if not mine and self.login and self.login in (pr.get("review_requests") or []):
+            requests = pr.get("review_requests") or []
+            teams = [who.removeprefix("team:") for who in requests if who.startswith("team:")]
+            if not mine and self.login and self.login in requests:
                 reasons.append(reason("review_requested", "review", "Your review is requested"))
+            elif not mine and "requested" in roles and teams:
+                # The search knows the team is yours; the live request list confirms it is
+                # still open, since the search index lags behind a submitted review.
+                text = f"Your team's review is requested ({', '.join(teams)})"
+                reasons.append(reason("review_requested", "review", text))
             more, fields = self.target_reasons(targets.get(pr.get("id")))
             reasons.extend(more)
             self.add(

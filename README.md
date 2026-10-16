@@ -121,9 +121,9 @@ activity first, and a group heading collapses its rows:
   not waiting), a workspace agent waiting for your answer, or a cron agent that
   stopped without finishing.
 - **Review or merge**: your pull request approved with green CI and no open threads,
-  a pull request whose review was requested from you, or a workspace agent that
-  returned to its prompt and has not been looked at yet (herdr's **done**; an agent
-  merely sitting idle needs nobody).
+  a pull request whose review was requested from you or from a team you are on, or a
+  workspace agent that returned to its prompt and has not been looked at yet (herdr's
+  **done**; an agent merely sitting idle needs nobody).
 - **Unblock**: your pull request with failing CI and no live watch (a watch repairs
   it itself; a paused one does not), changes requested or unresolved review threads
   on your pull request, a workspace launch that failed in the last day or needs
@@ -223,8 +223,9 @@ Space, retain keyboard focus when rows move, and have touch-sized targets on mob
 
 The dashboard also discovers open GitHub PRs you authored, are assigned to, are
 involved in reviewing (including team requests and completed reviews), or are
-@mentioned in (**Mentioned**: the description or a comment names you). It uses the
-active `gh` account on github.com. No registration is needed. These PRs are a
+@mentioned in (**Mentioned**: the description or a comment names you). **Review
+requested** marks the PRs still waiting on a review from you or one of your teams.
+It uses the active `gh` account on github.com. No registration is needed. These PRs are a
 read-only discovery results. Workspace actions require an explicit click and never register repair watches.
 
 Mention searches are on by default for both PRs and issues. To turn them off, write
