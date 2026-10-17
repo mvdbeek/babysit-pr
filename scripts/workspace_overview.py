@@ -35,8 +35,12 @@ SETTLED_TTL = 21600
 NONE_TTL = 3600
 BASE_TTL = 86400
 CALL_BUDGET = 100
-MAX_WORKTREES = 300
+LOOKUP_BATCH = 50  # Lookups per GraphQL request; each costs GitHub one rate-limit point.
+HEAD_PULLS = 20  # Pull requests read per head branch name, across every fork.
+MAX_DIGITS = 9
 MAX_TARGETS = 50
+# Lookups the last scan used are always kept, so live entries are never evicted only
+# to be fetched again; this many others survive for checkouts that may come back.
 MAX_LINKS = 500
 MAX_STATE = 4 * 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -68,17 +72,27 @@ def git(path, *args, timeout=60, strip=True):
     return result.stdout.strip() if strip else result.stdout
 
 
-def gh_json(endpoint, timeout=20):
-    """One bounded, read-only GitHub REST call through the authenticated `gh`."""
+def gh_json(endpoint, payload=None, timeout=20):
+    """One bounded, read-only GitHub call through the authenticated `gh`.
+
+    A `payload` is a GraphQL query. `gh` exits non-zero when any part of one fails, yet
+    still prints the partial answer, whose per-alias errors the caller sorts out.
+    """
+    args = ["gh", "api", "--hostname", "github.com", endpoint]
     result = github_cli.run(
-        ["gh", "api", "--hostname", "github.com", endpoint],
+        [*args, "--input", "-"] if payload is not None else args,
+        input=json.dumps(payload) if payload is not None else None,
         text=True,
         timeout=timeout,
     )
-    if result.returncode:
-        raise ValueError((result.stderr or result.stdout or "GitHub request failed")[-400:].strip())
     if len(result.stdout) > MAX_RESPONSE:
         raise ValueError("GitHub response exceeded byte limit")
+    if result.returncode:
+        if payload is not None and result.stdout.startswith("{"):
+            value = json.loads(result.stdout)
+            if isinstance(value.get("data"), dict):
+                return value
+        raise ValueError((result.stderr or result.stdout or "GitHub request failed")[-400:].strip())
     return json.loads(result.stdout)
 
 
@@ -90,11 +104,11 @@ class Budget:
         self.limit = CALL_BUDGET if limit is None else limit
         self.calls = 0
 
-    def get(self, endpoint):
+    def get(self, endpoint, payload=None):
         if self.calls >= self.limit:
             raise ValueError("GitHub request budget exhausted for this refresh")
         self.calls += 1
-        return self.fetch(endpoint)
+        return self.fetch(endpoint) if payload is None else self.fetch(endpoint, payload)
 
 
 def counted(value, limit):
@@ -257,12 +271,18 @@ def candidates(item, base, origin_owner):
             found.append(("head", f"{upstream[0].split('/')[0]}:{branch}"))
         if origin_owner:
             found.append(("head", f"{origin_owner}:{branch}"))
+    # A number past GraphQL's 32-bit Int would fail every lookup batched with it.
     for name in dict.fromkeys([branch, directory]):
         issue = ISSUE_NAME.match(name)
-        if issue:
+        if issue and len(issue[1]) <= MAX_DIGITS:
             found.append(("issue", issue[1]))
         pull = PR_NAME.match(name)
-        if pull and base and pull[1].lower() == base.split("/")[0].lower():
+        if (
+            pull
+            and len(pull[2]) <= MAX_DIGITS
+            and base
+            and pull[1].lower() == base.split("/")[0].lower()
+        ):
             found.append(("pr", pull[2]))
     return list(dict.fromkeys(found))
 
@@ -294,11 +314,113 @@ def link_record(kind, value, base):
     }
 
 
-def fetch_link(budget, base, kind, key):
-    if kind == "issue":
-        return link_record("issue", budget.get(f"repos/{base}/issues/{key}"), base)
-    if kind == "pr":
-        return link_record("pr", budget.get(f"repos/{base}/pulls/{key}"), base)
+PULL_FIELDS = "__typename number title url state isDraft headRepositoryOwner { login }"
+ISSUE_FIELDS = "__typename number title url state"
+
+
+def lookup_query(targets):
+    """One repository's lookups as aliased GraphQL fields, each answered on its own.
+
+    A head target reads the newest pull requests from that branch name in every fork at
+    once, so all candidate owners of one branch share a single alias.
+    """
+    declared = ["$owner: String!", "$name: String!"]
+    fields, variables = [], {}
+    for index, (kind, value) in enumerate(targets):
+        alias = f"a{index}"
+        if kind == "head":
+            declared.append(f"${alias}: String!")
+            variables[alias] = value
+            fields.append(
+                f"{alias}: pullRequests(headRefName: ${alias}, first: {HEAD_PULLS}, "
+                f"orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ {PULL_FIELDS} }} }}"
+            )
+        else:
+            declared.append(f"${alias}: Int!")
+            variables[alias] = int(value)
+            fields.append(
+                f"{alias}: issueOrPullRequest(number: ${alias}) {{ "
+                f"... on Issue {{ {ISSUE_FIELDS} }} ... on PullRequest {{ {PULL_FIELDS} }} }}"
+            )
+    query = f"query({', '.join(declared)}) {{ repository(owner: $owner, name: $name) {{ {' '.join(fields)} }} }}"
+    return query, variables
+
+
+def graph_link(node, base):
+    """A GraphQL issue or pull request through the same normalization as REST payloads."""
+    pull = node.get("__typename") == "PullRequest"
+    value = {
+        "number": node.get("number"),
+        "title": node.get("title"),
+        "html_url": node.get("url"),
+        "state": node.get("state"),
+        "merged": node.get("state") == "MERGED",
+        "draft": node.get("isDraft"),
+    }
+    return link_record("pr" if pull else "issue", value, base)
+
+
+def fetch_links(budget, base, targets):
+    """Resolve one repository's targets in one request: per target, nodes or an error.
+
+    A head target answers with its pull request nodes, a number target with its issue
+    or pull request. A failure confined to one alias, such as an unknown number, fails
+    only that target; anything else fails the whole request.
+    """
+    owner, name = base.split("/")
+    query, variables = lookup_query(targets)
+    value = budget.get(
+        "graphql", {"query": query, "variables": {"owner": owner, "name": name, **variables}}
+    )
+    errors = {}
+    for error in value.get("errors") or []:
+        path = error.get("path") or []
+        message = str(error.get("message") or "GitHub lookup failed")[:200]
+        if len(path) < 2 or path[0] != "repository":
+            raise ValueError(message)
+        errors[path[1]] = ValueError(message)
+    repository = (value.get("data") or {}).get("repository")
+    if not isinstance(repository, dict):
+        raise ValueError("Unexpected GitHub lookup response")
+    answers: dict[tuple, list | dict | ValueError] = {}
+    for index, target in enumerate(targets):
+        alias = f"a{index}"
+        found = repository.get(alias)
+        if alias in errors:
+            answers[target] = errors[alias]
+        elif (
+            target[0] == "head" and isinstance(found, dict) and isinstance(found.get("nodes"), list)
+        ):
+            answers[target] = found["nodes"]
+        elif target[0] == "number" and isinstance(found, dict):
+            answers[target] = found
+        else:
+            answers[target] = ValueError("Unexpected GitHub lookup answer")
+    return answers
+
+
+def answer_link(answer, base, kind, key):
+    """The link one target's answer gives this candidate; a head picks its fork owner.
+
+    None means the answer cannot tell: a full page of other forks' pull requests from
+    that branch name may push this owner's off the end, so absence proves nothing.
+    """
+    if kind != "head":
+        return graph_link(answer, base)
+    owner = key.partition(":")[0].lower()
+    nodes = [node for node in answer if isinstance(node, dict)]
+    found = [
+        node
+        for node in nodes
+        if ((node.get("headRepositoryOwner") or {}).get("login") or "").lower() == owner
+    ]
+    if found:
+        return graph_link(max(found, key=lambda node: node.get("number") or 0), base)
+    return None if len(answer) >= HEAD_PULLS else link_record("none", {}, base)
+
+
+def fetch_head(budget, base, key):
+    """One fork owner's pull requests from a branch, filtered by GitHub itself."""
     owner, _, branch = key.partition(":")
     found = budget.get(
         f"repos/{base}/pulls?state=all&per_page=5&sort=created&direction=desc"
@@ -346,6 +468,7 @@ class WorkspaceOverview:
         self.config: dict = {}
         self.links: dict = {}
         self.bases: dict = {}
+        self.live: set[str] = set()  # Link cache keys the latest scan looked up.
         self.job: dict | None = None
         self.value: dict = {"workspaces": [], "warnings": [], "synced_at": None}
         self.partial: dict | None = None
@@ -461,8 +584,12 @@ class WorkspaceOverview:
 
     def save(self):
         with self.lock:
-            recent = sorted(self.links.items(), key=lambda kv: kv[1].get("checked_at", 0))
-            self.links = dict(recent[-MAX_LINKS:])
+            recent = sorted(
+                (kv for kv in self.links.items() if kv[0] not in self.live),
+                key=lambda kv: kv[1].get("checked_at", 0),
+            )
+            kept = {key for key, _ in recent[-MAX_LINKS:]} | self.live
+            self.links = {key: value for key, value in self.links.items() if key in kept}
             # Clones come and go; a base repository nobody asked about expires with its TTL.
             cutoff = time.time() - BASE_TTL
             self.bases = {
@@ -564,8 +691,80 @@ class WorkspaceOverview:
         }
         return base, owner
 
-    def resolve_links(self, item, base, origin_owner, budget, warnings):
-        """Resolve each candidate once, newest cache first, and never twice per refresh."""
+    def due_links(self, wanted):
+        """Lookups missing or expired, never-resolved first, then the longest aged."""
+        now = time.time()
+        due = []
+        for cache_key, lookup in wanted.items():
+            saved = self.links.get(cache_key)
+            if not saved:
+                due.append((-1.0, cache_key, lookup))
+            elif now - saved.get("checked_at", 0) >= link_ttl(saved["link"]):
+                due.append((saved.get("checked_at", 0), cache_key, lookup))
+        due.sort(key=lambda entry: entry[0])
+        return [(cache_key, lookup) for _, cache_key, lookup in due]
+
+    def refresh_links(self, due, budget):
+        """Fetch the due lookups in batches, in their order of urgency.
+
+        Lookups are grouped per repository into one alias per head branch or number, so
+        a whole inventory usually costs a handful of requests. Should the budget still
+        run out, entries nobody has seen yet go before ones that merely aged. Returns
+        each cache key left unrefreshed with the reason.
+        """
+        grouped: dict[str, dict] = {}
+        for rank, (cache_key, (base, kind, key)) in enumerate(due):
+            target = ("head", key.partition(":")[2]) if kind == "head" else ("number", key)
+            group = grouped.setdefault(base, {}).setdefault(target, {"rank": rank, "keys": []})
+            group["keys"].append((cache_key, kind, key))
+        # Targets keep their most urgent rank, so ordering chunks by their first target
+        # interleaves repositories by urgency.
+        chunks = []
+        for base, targets in grouped.items():
+            items = [(target, group["keys"]) for target, group in targets.items()]
+            for start in range(0, len(items), LOOKUP_BATCH):
+                first = targets[items[start][0]]["rank"]
+                chunks.append((first, base, items[start : start + LOOKUP_BATCH]))
+        chunks.sort(key=lambda chunk: chunk[0])
+        failed = {}
+        limited = None
+        for _, base, items in chunks:
+            try:
+                if limited:
+                    raise ValueError(limited)  # Further requests would only fail too.
+                answers = fetch_links(budget, base, [target for target, _ in items])
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                if "rate limit" in str(exc).lower():
+                    limited = str(exc)
+                failed.update(
+                    {cache_key: str(exc) for _, group in items for cache_key, _, _ in group}
+                )
+                continue
+            for target, group in items:
+                answer = answers[target]
+                for cache_key, kind, key in group:
+                    if isinstance(answer, Exception):
+                        failed[cache_key] = str(answer)
+                        continue
+                    try:
+                        link = answer_link(answer, base, kind, key)
+                        if link is None:
+                            link = fetch_head(budget, base, key)
+                    except (
+                        AttributeError,
+                        TypeError,
+                        KeyError,
+                        OSError,
+                        ValueError,
+                        subprocess.SubprocessError,
+                    ) as exc:
+                        failed[cache_key] = str(exc) or "Unexpected GitHub lookup answer"
+                        continue
+                    self.links[cache_key] = {"link": link, "checked_at": time.time()}
+        return failed
+
+    def resolve_links(self, item, base, origin_owner, failed):
+        """A checkout's links from the cache this scan refreshed; stale if any failed."""
         links: list[dict] = []
         stale = head_found = False
         for kind, key in candidates(item, base, origin_owner):
@@ -573,18 +772,10 @@ class WorkspaceOverview:
                 continue  # One head reference is enough; the rest would repeat it.
             cache_key = f"{base}#{kind}#{key}"
             saved = self.links.get(cache_key)
-            if saved and time.time() - saved.get("checked_at", 0) < link_ttl(saved["link"]):
-                link = saved["link"]
-            else:
-                try:
-                    link = fetch_link(budget, base, kind, key)
-                    self.links[cache_key] = {"link": link, "checked_at": time.time()}
-                except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    stale = True
-                    if not saved:
-                        warnings.append(f"{base} {kind} {key}: {exc}")
-                        continue
-                    link = saved["link"]
+            stale = stale or cache_key in failed
+            if not saved:
+                continue
+            link = saved["link"]
             if link["state"] == "none":
                 continue
             head_found = head_found or kind == "head"
@@ -616,46 +807,83 @@ class WorkspaceOverview:
         # herdr holds it open, and its branch never contributes a pull request lookup.
         selected = [path for path in checkouts if path not in clones or path in opened]
         selected.sort(key=lambda path: (path not in opened, path))
-        if len(selected) > MAX_WORKTREES:
-            warnings.append(f"{len(selected)} checkouts found; showing the first {MAX_WORKTREES}.")
-            selected = selected[:MAX_WORKTREES]
         budget = Budget(self.fetch)
         updates = transcript_updates(set(selected), self.src.resolve())
         rows = self.orphan_rows(spaces, agents, checkouts)
         for row in rows:
             if publish:
                 publish(row)
-        # Resolve each clone once per scan, sharing its answer across all its worktrees.
-        bases = {}
+        # Resolve each clone once per scan, sharing its answer across all its worktrees,
+        # and gather every checkout's lookups so they are fetched together.
+        bases, wanted = {}, {}
+        needs: dict[str, set[str]] = {}
+        for path in selected:
+            item = checkouts[path]
+            root = str(Path(item["common"]).parent)
+            clone = clones.get(root)
+            if root not in bases:
+                bases[root] = self.base_repo(clone, budget, warnings) if clone else (None, None)
+            base, owner = bases[root]
+            if base and path not in clones:
+                needs[path] = set()
+                for kind, key in candidates(item, base, owner):
+                    wanted[f"{base}#{kind}#{key}"] = (base, kind, key)
+                    needs[path].add(f"{base}#{kind}#{key}")
+        with self.lock:
+            self.live = set(wanted)
+        due = self.due_links(wanted)
+        refreshing = {cache_key for cache_key, _ in due}
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            lookups = pool.submit(self.refresh_links, due, budget)
             pending = {
                 pool.submit(local_state, path, checkouts[path].get("branch")): path
                 for path in selected
             }
-            for future in concurrent.futures.as_completed(pending):
-                path = pending[future]
+
+            def add(path, state):
                 item = checkouts[path]
                 main = path in clones
-                root = str(Path(item["common"]).parent)
-                clone = clones.get(root)
-                if root not in bases:
-                    bases[root] = self.base_repo(clone, budget, warnings) if clone else (None, None)
-                base, owner = bases[root]
+                base, owner = bases[str(Path(item["common"]).parent)]
                 if main:
                     links: list[dict] = []
                     stale = False
                 elif base:
-                    links, stale = self.resolve_links(item, base, owner, budget, warnings)
+                    failed = lookups.result() if needs[path] & refreshing else {}
+                    links, stale = self.resolve_links(item, base, owner, failed)
                 else:
                     links, stale = [], True
-                row = self.row(
-                    item, future.result(), links, stale, spaces, agents, watched, base, main
-                )
+                row = self.row(item, state, links, stale, spaces, agents, watched, base, main)
                 if path in updates:
                     row["updated_at"] = max(row.get("updated_at") or 0, updates[path])
                 rows.append(row)
                 if publish:
                     publish(row)
+
+            # A row whose lookups are all fresh need not wait for GitHub; the others are
+            # held back until the refresh finishes, without blocking the rows behind them.
+            waiting: list[tuple[str, dict]] = []
+            for future in concurrent.futures.as_completed([*pending, lookups]):
+                if future is lookups:
+                    for path, state in waiting:
+                        add(path, state)
+                    waiting = []
+                    continue
+                path = pending[future]
+                if needs.get(path, set()) & refreshing and not lookups.done():
+                    waiting.append((path, future.result()))
+                else:
+                    add(path, future.result())
+        # Only lookups never answered are worth a warning; the rest keep their last answer.
+        # One shared cause, such as a failed request, is reported once for all it affected.
+        unresolved: dict[str, list] = {}
+        for cache_key, reason in lookups.result().items():
+            if cache_key not in self.links:
+                unresolved.setdefault(reason, []).append(wanted[cache_key])
+        for reason, missed in unresolved.items():
+            if len(missed) == 1:
+                warnings.append("{} {} {}: {}".format(*missed[0], reason))
+            else:
+                warnings.append(f"{len(missed)} GitHub lookups unresolved: {reason}")
         return {
             "workspaces": self.sorted_rows(rows),
             "warnings": warnings,

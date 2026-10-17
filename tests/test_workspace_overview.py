@@ -3,6 +3,7 @@
 import http.client
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import threading
@@ -34,6 +35,8 @@ class FakeGitHub:
     def __init__(self):
         self.calls = []
         self.fail = set()
+        self.graphql_error = "gh: Something went wrong"
+        self.owners = {}  # Head -> login as GitHub spells it, when it differs.
         self.repos = {
             "repos/fork/repo": {
                 "full_name": "fork/repo",
@@ -84,23 +87,78 @@ class FakeGitHub:
             ],
         }
 
-    def __call__(self, endpoint):
+    def __call__(self, endpoint, payload=None):
+        if endpoint == "graphql":
+            return self.graphql(payload)
         self.calls.append(endpoint)
         if endpoint in self.fail:
             raise ValueError("gh: Not Found (HTTP 404)")
         if endpoint in self.repos:
             return self.repos[endpoint]
         if "/pulls?" in endpoint:
-            head = endpoint.split("head=")[1]
-            return self.heads.get(head, [])
-        for kind, table in (("issues", self.issues), ("pulls", self.pulls)):
-            prefix = f"repos/{BASE}/{kind}/"
-            if endpoint.startswith(prefix):
-                number = endpoint[len(prefix) :]
-                if number not in table:
-                    raise ValueError("gh: Not Found (HTTP 404)")
-                return table[number]
+            return self.heads.get(endpoint.split("head=")[1], [])
         raise ValueError(f"gh: unexpected endpoint {endpoint}")
+
+    @staticmethod
+    def node(value, typename, owner=None):
+        merged = value.get("merged_at")
+        node = {
+            "__typename": typename,
+            "number": value["number"],
+            "title": value["title"],
+            "url": value["html_url"],
+            "state": "MERGED" if merged else value["state"].upper(),
+        }
+        if typename == "PullRequest":
+            node["isDraft"] = bool(value.get("draft"))
+            node["headRepositoryOwner"] = {"login": owner} if owner else None
+        return node
+
+    def graphql(self, payload):
+        """Answers aliased lookups from the same tables, recording one call per request."""
+        variables = payload["variables"]
+        repo = f"{variables['owner']}/{variables['name']}"
+        fields = re.findall(r"(a\d+): (pullRequests|issueOrPullRequest)", payload["query"])
+        lookups = [("head" if f == "pullRequests" else "number", variables[a]) for a, f in fields]
+        self.calls.append(("graphql", repo, tuple(lookups)))
+        if "graphql" in self.fail:
+            raise ValueError(self.graphql_error)
+        if repo != BASE:
+            missing = {"type": "NOT_FOUND", "path": ["repository"], "message": "Not found"}
+            return {"data": {"repository": None}, "errors": [missing]}
+        first = (
+            int(re.search(r"first: (\d+)", payload["query"])[1])
+            if "first:" in payload["query"]
+            else 0
+        )
+        data, errors = {}, []
+        for alias, (kind, value) in zip((a for a, _ in fields), lookups, strict=True):
+            if kind == "head":
+                nodes = [
+                    self.node(pull, "PullRequest", self.owners.get(head, head.split(":")[0]))
+                    for head, pulls in self.heads.items()
+                    if head.split(":", 1)[1] == value
+                    for pull in pulls
+                ]
+                nodes.sort(key=lambda node: -node["number"])
+                data[alias] = {"nodes": nodes[:first]}
+            elif str(value) in self.pulls:
+                data[alias] = self.node(self.pulls[str(value)], "PullRequest", "fork")
+            elif str(value) in self.issues:
+                data[alias] = self.node(self.issues[str(value)], "Issue")
+            else:
+                data[alias] = None
+                errors.append(
+                    {
+                        "type": "NOT_FOUND",
+                        "path": ["repository", alias],
+                        "message": f"Could not resolve to an issue or pull request with the number of {value}.",
+                    }
+                )
+        return {"data": {"repository": data}, **({"errors": errors} if errors else {})}
+
+    def lookups(self):
+        return [lookup for call in self.calls if call[0] == "graphql" for lookup in call[2]]
 
 
 @pytest.fixture
@@ -215,7 +273,10 @@ def test_lists_worktrees_with_links_agents_and_local_state(site):
     # The clone's own checkout has no herdr workspace, so it is not a listed workspace.
     assert "repo" not in found
     assert found["gone"]["missing"] and found["gone"]["removable"]
-    assert f"repos/{BASE}/pulls/9" not in fake.calls
+    assert ("number", 9) not in fake.lookups()
+    # Every checkout's lookups share one request, and both fork owners of a branch one alias.
+    assert [call[:2] for call in fake.calls] == [("graphql", BASE)]
+    assert fake.lookups().count(("head", "merged-work")) == 1
 
 
 def test_checkout_times_follow_edits_and_head_without_advancing_on_inspection(site):
@@ -311,12 +372,28 @@ def test_base_tracking_and_foreign_names_never_become_links():
     assert wso.candidates(item, BASE, "fork") == [("head", "fork:topic")]
     release = {"path": "/w/release_26.1", "branch": "release_26.1", "upstream": None}
     assert wso.candidates(release, BASE, "fork") == []
+    huge = {"path": "/w/issue-1234567890", "branch": None, "upstream": None}
+    assert wso.candidates(huge, BASE, "fork") == []
     named = {"path": "/w/pr-other-4", "branch": "pr-other-4", "upstream": None}
     assert wso.candidates(named, BASE, "fork") == [("head", "fork:pr-other-4")]
     mine = {"path": "/w/pr-base-4-2", "branch": "pr-base-4-2", "upstream": None}
     assert ("pr", "4") in wso.candidates(mine, BASE, "fork")
     fork_head = {"path": "/w/fix", "branch": "fix", "upstream": ["other/repo", "fix"]}
     assert wso.candidates(fork_head, BASE, "fork")[0] == ("head", "other:fix")
+
+
+def test_saving_keeps_every_live_link_and_only_the_newest_others(site, monkeypatch):
+    plugin, *_ = site
+    plugin.collect()
+    live = set(plugin.links)
+    assert live == plugin.live
+    for index in range(3):
+        plugin.links[f"{BASE}#issue#{900 + index}"] = {"link": {}, "checked_at": index + 1}
+    for key in live:
+        plugin.links[key]["checked_at"] = 0  # Older than every leftover.
+    monkeypatch.setattr(wso, "MAX_LINKS", 1)
+    plugin.save()
+    assert set(plugin.links) == live | {f"{BASE}#issue#902"}
 
 
 def test_links_are_cached_reused_and_bounded_by_the_request_budget(site, monkeypatch):
@@ -360,9 +437,162 @@ def test_refresh_only_fetches_expired_github_links(site):
     fake.calls.clear()
     plugin.links[f"{BASE}#head#fork:merged-work"]["checked_at"] -= wso.SETTLED_TTL
     plugin.collect()
-    assert fake.calls == [
-        f"repos/{BASE}/pulls?state=all&per_page=5&sort=created&direction=desc&head=fork:merged-work"
+    assert fake.calls == [("graphql", BASE, (("head", "merged-work"),))]
+
+
+def test_one_head_lookup_answers_every_fork_owner_of_a_branch(site):
+    plugin, fake, _, worktrees, _, git = site
+    git("remote", "add", "other", "https://github.com/other/repo.git")
+    git("config", "branch.merged-work.remote", "other")
+    git("config", "branch.merged-work.merge", "refs/heads/merged-work")
+    fake.heads["other:merged-work"] = [
+        {
+            "number": 30,
+            "title": "Other fork",
+            "html_url": f"https://github.com/{BASE}/pull/30",
+            "state": "open",
+        }
     ]
+    links = rows(plugin)["merged-work"]["links"]
+    assert [link["number"] for link in links] == [30]
+    assert fake.lookups().count(("head", "merged-work")) == 1
+    assert plugin.links[f"{BASE}#head#fork:merged-work"]["link"]["number"] == 7
+
+
+def test_an_unknown_number_fails_only_its_own_lookup(site):
+    plugin, fake, _, worktrees, _, git = site
+    git("worktree", "add", "-b", "issue-404-gone", str(worktrees / "issue-404-gone"))
+    value = plugin.collect()
+    found = {row["name"]: row for row in value["workspaces"]}
+    assert found["issue-404-gone"]["stale_links"] and not found["issue-404-gone"]["links"]
+    assert found["issue-12-crash"]["links"][0]["number"] == 12
+    assert not found["issue-12-crash"]["stale_links"]
+    assert any("issue 404: Could not resolve" in warning for warning in value["warnings"])
+    assert f"{BASE}#issue#404" not in plugin.links
+
+
+def test_an_exhausted_budget_resolves_never_seen_lookups_before_aged_ones(site, monkeypatch):
+    plugin, fake, _, worktrees, _, git = site
+    plugin.collect()
+    for entry in plugin.links.values():
+        entry["checked_at"] -= wso.SETTLED_TTL
+    git("worktree", "add", "-b", "issue-44-new", str(worktrees / "issue-44-new"))
+    fake.calls.clear()
+    monkeypatch.setattr(wso, "LOOKUP_BATCH", 1)
+    monkeypatch.setattr(wso, "CALL_BUDGET", 2)
+    value = plugin.collect()
+    assert sorted(fake.lookups()) == [("head", "issue-44-new"), ("number", 44)]
+    found = {row["name"]: row for row in value["workspaces"]}
+    assert found["issue-44-new"]["links"][0]["state"] == "open"
+    # Aged entries keep their last answer, marked stale, without a warning.
+    assert found["merged-work"]["links"][0]["number"] == 7 and found["merged-work"]["stale_links"]
+    assert not any("budget" in warning for warning in value["warnings"])
+
+
+def test_fork_owners_match_whatever_case_github_spells_them_in(site):
+    plugin, fake, *_ = site
+    fake.owners["fork:merged-work"] = "Fork"
+    assert rows(plugin)["merged-work"]["links"][0]["number"] == 7
+
+
+def test_a_crowded_branch_name_is_settled_by_the_exact_head_query(site, monkeypatch):
+    plugin, fake, *_ = site
+    monkeypatch.setattr(wso, "HEAD_PULLS", 1)
+    fake.heads["other:merged-work"] = [
+        {
+            "number": 99,
+            "title": "Another fork's newer branch",
+            "html_url": f"https://github.com/{BASE}/pull/99",
+            "state": "open",
+        }
+    ]
+    links = rows(plugin)["merged-work"]["links"]
+    assert [link["number"] for link in links] == [7]
+    assert (
+        f"repos/{BASE}/pulls?state=all&per_page=5&sort=created&direction=desc&head=fork:merged-work"
+        in fake.calls
+    )
+
+
+def test_a_failed_request_is_reported_once_and_a_rate_limit_stops_the_scan(site, monkeypatch):
+    plugin, fake, *_ = site
+    fake.fail.add("graphql")
+    value = plugin.collect()
+    unresolved = [w for w in value["warnings"] if "unresolved" in w]
+    assert len(unresolved) == 1
+    assert re.fullmatch(r"\d+ GitHub lookups unresolved: gh: Something went wrong", unresolved[0])
+    assert all(row["stale_links"] for row in value["workspaces"] if row["branch"])
+    fake.calls.clear()
+    fake.graphql_error = "gh: API rate limit exceeded for user ID 1"
+    monkeypatch.setattr(wso, "LOOKUP_BATCH", 1)
+    plugin.collect()
+    assert len([call for call in fake.calls if call[0] == "graphql"]) == 1
+
+
+def test_an_unknown_repository_fails_its_lookups_without_caching(site):
+    plugin, fake, *_ = site
+    plugin.collect()
+    plugin.links.clear()
+    for entry in plugin.bases.values():
+        entry["repo"] = "gone/repo"
+    value = plugin.collect()
+    assert any("unresolved: Not found" in warning for warning in value["warnings"])
+    assert not plugin.links
+
+
+def test_rows_with_fresh_links_do_not_wait_for_github(site, monkeypatch):
+    plugin, fake, _, worktrees, *_ = site
+    plugin.collect()
+    plugin.links[f"{BASE}#head#fork:merged-work"]["checked_at"] -= wso.SETTLED_TTL
+    gate = threading.Event()
+    published = threading.Event()
+    answer = fake.graphql
+
+    def slow(payload):
+        assert gate.wait(timeout=10)
+        return answer(payload)
+
+    def publish(row):
+        if row["name"] == "dirty-work":
+            published.set()
+
+    monkeypatch.setattr(fake, "graphql", slow)
+    worker = threading.Thread(target=plugin.collect, kwargs={"publish": publish})
+    worker.start()
+    try:
+        assert published.wait(timeout=10)
+    finally:
+        gate.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+
+
+def test_partial_graphql_answers_never_look_like_lost_credentials():
+    def result(stdout, stderr=""):
+        return subprocess.CompletedProcess(["gh"], 1, stdout, stderr)
+
+    titles = '{"data":{"repository":{"a0":{"title":"Fix gh auth login"}}}}'
+    assert not wso.github_cli.unauthenticated(result(titles, "gh: Could not resolve"))
+    assert not wso.github_cli.unauthenticated(result(titles.encode(), b""))
+    assert wso.github_cli.unauthenticated(result(titles, "gh: HTTP 401"))
+    assert wso.github_cli.unauthenticated(result("Requires authentication"))
+
+
+def test_gh_keeps_a_partial_graphql_answer_and_rejects_other_failures(monkeypatch):
+    answer = {"data": {"repository": {"a0": None}}, "errors": [{"path": ["repository", "a0"]}]}
+    seen = []
+
+    def run(args, **kwargs):
+        seen.append((args, kwargs.get("input")))
+        stdout = json.dumps(answer) if "graphql" in args else ""
+        return subprocess.CompletedProcess(args, 1, stdout, "gh: Not Found")
+
+    monkeypatch.setattr(wso.github_cli, "run", run)
+    assert wso.gh_json("graphql", {"query": "q"}) == answer
+    assert seen[0][0][-2:] == ["--input", "-"] and json.loads(seen[0][1]) == {"query": "q"}
+    with pytest.raises(ValueError, match="Not Found"):
+        wso.gh_json("repos/fork/repo")
+    assert seen[1] == (["gh", "api", "--hostname", "github.com", "repos/fork/repo"], None)
 
 
 def finish(plugin, started=None):

@@ -140,10 +140,11 @@ def unauthenticated(result: subprocess.CompletedProcess) -> bool:
     if not result.returncode:
         return False
     text = ""
-    for stream in (result.stderr, result.stdout):
+    for stream, output in ((result.stderr, False), (result.stdout, True)):
         if isinstance(stream, bytes):
-            text += stream.decode("utf-8", errors="replace")
-        elif stream:
+            stream = stream.decode("utf-8", errors="replace")
+        # A partial GraphQL answer is data, and its titles may quote these markers.
+        if stream and not (output and stream.startswith('{"data":')):
             text += stream
     return any(marker in text for marker in UNAUTHENTICATED)
 
