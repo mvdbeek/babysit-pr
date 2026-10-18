@@ -1008,6 +1008,19 @@
   function saveDraft() {
     if (draft && viewer) storeDraft(viewer.entry, draft);
   }
+  // The message field grows with its text, up to the CSS max-height, and scrolls past that.
+  function fitMessage() {
+    const field = byId("ws-message-text");
+    if (!field.offsetParent) return;
+    field.style.height = "auto";
+    field.style.height = `${field.scrollHeight + field.offsetHeight - field.clientHeight}px`;
+  }
+  function setMessage(text) {
+    byId("ws-message-text").value = text;
+    fitMessage();
+  }
+  // A new width rewraps the text, and an opening dialog first gives the field a size.
+  new ResizeObserver(fitMessage).observe(byId("ws-message"));
   function openComposer(entry) {
     const form = byId("ws-message");
     byId("ws-agent-interaction").replaceChildren();
@@ -1026,7 +1039,7 @@
     }
     form.hidden = false;
     draft = loadDraft(entry);
-    byId("ws-message-text").value = draft.message;
+    setMessage(draft.message);
     files?.destroy();
     files = window.dashboardAttachments.picker({
       files: draft.files,
@@ -1055,7 +1068,7 @@
         draft = { comments: [], message: "", path: value.path, files: [] };
         files?.clear();
         storeDraft(entry, draft);
-        byId("ws-message-text").value = "";
+        setMessage("");
         byId("ws-viewer-content")
           .querySelectorAll(".ws-comment-note")
           .forEach((note) => note.remove());
@@ -1925,7 +1938,7 @@
     prune(draft);
     saveDraft();
     if (attachments.length) files?.remove(attachments);
-    if (byId("ws-message-text").value === message) byId("ws-message-text").value = "";
+    if (byId("ws-message-text").value === message) setMessage("");
     byId("ws-viewer-content")
       .querySelectorAll(".ws-comment-note")
       .forEach((note) => {
@@ -1940,6 +1953,7 @@
       void fetchAgents(viewer.entry);
   });
   byId("ws-message-text").addEventListener("input", () => {
+    fitMessage();
     if (!draft) return;
     draft.message = byId("ws-message-text").value;
     saveDraft();
