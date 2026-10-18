@@ -4440,6 +4440,39 @@ def test_files_attach_to_a_follow_up_message_and_stay_with_its_draft(
     expect(chips).to_have_count(0)
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_the_follow_up_field_grows_with_its_text_beside_the_send_button(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    text = page.locator("#ws-message-text")
+    send = page.locator("#ws-message-send")
+    expect(send).to_be_visible()
+    field, button = text.bounding_box(), send.bounding_box()
+    assert button["x"] >= field["x"] + field["width"]
+    assert button["y"] + button["height"] <= field["y"] + field["height"] + 1
+    scrolls = "field => field.scrollHeight > field.clientHeight"
+    text.fill("Please rebase onto main, rerun the failing integration job and tell me what broke.")
+    assert not text.evaluate(scrolls)
+    grown = text.bounding_box()["height"]
+    text.fill("\n".join(f"line {n}" for n in range(60)))
+    # Past its cap the field scrolls rather than pushing the transcript away.
+    assert text.evaluate(scrolls)
+    assert text.bounding_box()["height"] <= 0.3 * 900 + 1
+    page.screenshot(path=f"reports/composer-field-{width}.png")
+    text.fill("")
+    assert text.bounding_box()["height"] <= grown
+    # A sent message empties the field, which shrinks back with it.
+    text.fill("\n".join(f"line {n}" for n in range(8)))
+    send.click()
+    expect(page.locator("#ws-message-status")).to_have_text(re.compile("Sent to the agent"))
+    expect(text).to_have_value("")
+    assert text.bounding_box()["height"] <= grown
+
+
 DROP_FILES = """([target, names]) => {
   const data = new DataTransfer();
   for (const name of names) data.items.add(new File(["dropped"], name, {type: "image/png"}));

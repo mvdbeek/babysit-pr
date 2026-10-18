@@ -507,10 +507,21 @@
   border-top: 1px solid var(--line);
   background: var(--paper);
 }
+.ws-message-input {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
 .ws-message textarea {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   font: inherit;
-  resize: vertical;
+  /* The field sizes itself to its text. */
+  resize: none;
+}
+#ws-message-send {
+  flex: none;
+  max-width: 9em;
 }
 .ws-message-actions {
   display: flex;
