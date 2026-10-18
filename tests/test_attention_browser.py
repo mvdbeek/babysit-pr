@@ -290,11 +290,15 @@ def test_a_review_from_needs_you_opens_from_the_background_snapshot(
     info, snapshot, _ = workspace_routes
     info["matches"] = []
     snapshot["synced_at"] = 1
-    loads = []
+    state = {"stall": False}
+    held = []
 
     def workspaces(route):
-        loads.append(route.request.url)
-        route.fulfill(json=snapshot)
+        # Once warm, every snapshot stalls as a slow one does; background polls may still ask.
+        if state["stall"]:
+            held.append(route)
+        else:
+            route.fulfill(json=snapshot)
 
     page.route("**/api/workspaces", workspaces)
     pr = "https://github.com/test/alpha/pull/8"
@@ -303,12 +307,13 @@ def test_a_review_from_needs_you_opens_from_the_background_snapshot(
     # Needs you is the default tab; it keeps the snapshot loaded before any dialog asks.
     with page.expect_response("**/api/workspaces"):
         page.goto(url + "/#attention")
-    before = len(loads)
+    state["stall"] = True
     page.locator(".attention-item").first.get_by_role("button", name="Review pull request").click()
     expect(
         page.locator("#workspace-dialog").get_by_role("textbox", name="Task", exact=True)
     ).to_be_visible()
-    assert len(loads) == before
+    for route in held:
+        route.fulfill(json=snapshot)
 
 
 def test_a_requested_review_also_offers_the_agent_that_is_not_the_main_reviewer(
