@@ -283,6 +283,34 @@ def test_a_requested_review_starts_from_its_card(
     assert requests[-1]["task"].startswith(f"Review {pr}.")
 
 
+def test_a_review_from_needs_you_opens_from_the_background_snapshot(
+    page: Page, dashboard_site, workspace_routes
+) -> None:
+    url, _ = dashboard_site
+    info, snapshot, _ = workspace_routes
+    info["matches"] = []
+    snapshot["synced_at"] = 1
+    loads = []
+
+    def workspaces(route):
+        loads.append(route.request.url)
+        route.fulfill(json=snapshot)
+
+    page.route("**/api/workspaces", workspaces)
+    pr = "https://github.com/test/alpha/pull/8"
+    requested = feed_with([item(pr, "review", [("review_requested", "Your review is requested")])])
+    page.route("**/api/attention*", lambda route: route.fulfill(json=requested))
+    # Needs you is the default tab; it keeps the snapshot loaded before any dialog asks.
+    with page.expect_response("**/api/workspaces"):
+        page.goto(url + "/#attention")
+    before = len(loads)
+    page.locator(".attention-item").first.get_by_role("button", name="Review pull request").click()
+    expect(
+        page.locator("#workspace-dialog").get_by_role("textbox", name="Task", exact=True)
+    ).to_be_visible()
+    assert len(loads) == before
+
+
 def test_a_requested_review_also_offers_the_agent_that_is_not_the_main_reviewer(
     page: Page, dashboard_site, workspace_routes
 ) -> None:

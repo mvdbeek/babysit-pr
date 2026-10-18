@@ -2135,7 +2135,12 @@ function setWorkspaceOperation(item, operation) {
 }
 async function refreshWorkspaces() {
   // An open workspace dialog follows its operation from any tab (Sentry opens it too).
-  const visible = overviewVisible() || !$("watcher-panel").hidden || $("workspace-dialog").open;
+  // Needs you, the default tab, starts reviews in it: kept warm, the dialog opens at once.
+  const visible =
+    overviewVisible() ||
+    !$("watcher-panel").hidden ||
+    !$("attention-panel").hidden ||
+    $("workspace-dialog").open;
   if (workspaceBusy || document.hidden || !visible) return;
   workspaceBusy = true;
   try {
