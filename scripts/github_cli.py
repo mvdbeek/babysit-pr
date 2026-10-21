@@ -9,6 +9,9 @@ Keychain) queue up behind them. This module resolves the token once through
 `gh auth token`, passes it to each child as GH_TOKEN so gh never opens the
 keyring, keeps git and gh from prompting, and caps concurrent gh processes.
 
+A token kept for the babysitter alone, in TOKEN_FILE, is used instead of the gh
+login: it can carry fewer scopes, and replacing it touches no other device.
+
 Without a token gh would fall back to unauthenticated requests, each still
 opening the keyring first and burning the per-IP rate limit, so no gh process is
 started until a token is known; callers get one clear failure instead.
@@ -24,8 +27,11 @@ import subprocess
 import threading
 import time
 from collections.abc import Iterator, Mapping
+from pathlib import Path
 
 import owned_process
+
+TOKEN_FILE = Path("~/.config/babysit-pr/github-token").expanduser()
 
 LOOKUP_TIMEOUT = 20
 RETRY_AFTER = 60
@@ -75,9 +81,12 @@ class Credentials:
             return self._token
 
     def explain(self) -> str:
+        # A broken token file names itself; otherwise gh's answer is the reason.
+        source = "" if self.reason.startswith(str(TOKEN_FILE)) else "gh auth token: "
         return (
-            f"GitHub CLI has no usable token in this environment (gh auth token: {self.reason}). "
-            "Run `gh auth login` where the babysitter runs; a launchd service or sandbox that "
+            f"GitHub CLI has no usable token in this environment ({source}{self.reason}). "
+            f"Save a token for the babysitter in {TOKEN_FILE} (mode 0600), or run "
+            "`gh auth login` where the babysitter runs; a launchd service or sandbox that "
             "cannot read the Keychain needs `gh auth login --insecure-storage` or GH_TOKEN."
         )
 
@@ -90,6 +99,17 @@ class Credentials:
 
     @staticmethod
     def _lookup() -> tuple[str | None, str]:
+        try:
+            token = TOKEN_FILE.read_text().strip()
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError) as exc:
+            # Never the gh login instead: that would quietly widen what the babysitter can do.
+            return None, f"{TOKEN_FILE} is unreadable ({exc})"
+        else:
+            if not TOKEN.fullmatch(token):
+                return None, f"{TOKEN_FILE} does not hold a token"
+            return token, "ok"
         try:
             result = owned_process.run(
                 ["gh", "auth", "token", "--hostname", "github.com"],
