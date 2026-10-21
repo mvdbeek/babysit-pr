@@ -4,6 +4,7 @@ Every server runs on a free loopback port with temporary state and fake provider
 """
 
 import email.message
+import errno
 import gzip
 import http.client
 import json
@@ -229,12 +230,46 @@ def test_disconnects_are_not_logged_as_server_errors(tmp_path, capsys):
         server.server_close()
 
 
+class ResetBeforeAccept:
+    """A connection its client reset while queued: macOS refuses socket options on it."""
+
+    def __init__(self):
+        self.closed = False
+
+    def setsockopt(self, *args):
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    def settimeout(self, timeout):
+        pass
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def test_a_connection_reset_before_it_was_accepted_is_not_logged(tmp_path, capsys):
+    server = dashboard.DashboardServer(tmp_path, 0)
+    try:
+        connection = ResetBeforeAccept()
+        server.process_request_thread(connection, ("127.0.0.1", 1))
+        assert connection.closed
+        assert capsys.readouterr().err == ""
+    finally:
+        server.server_close()
+
+
 def test_handler_threads_have_a_socket_timeout():
     assert dashboard.Handler.timeout == 30
 
 
 def test_kept_alive_responses_are_not_held_back_by_nagle():
     assert dashboard.Handler.disable_nagle_algorithm
+
+
+def test_connections_queue_while_the_accept_loop_is_busy():
+    assert dashboard.DashboardServer.request_queue_size >= 128
 
 
 class Sentry:
