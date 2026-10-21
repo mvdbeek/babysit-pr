@@ -2,6 +2,7 @@
 """Loopback dashboard with watch cancellation for the shared babysit-pr watcher."""
 
 import argparse
+import errno
 import gzip
 import hashlib
 import json
@@ -324,6 +325,9 @@ def attach_handling(value, workspaces):
 
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
+    # Connections wait here while the accept loop is busy; the default of 5 overflows
+    # under a few polling tabs, and the proxy in front then answers 502.
+    request_queue_size = 128
 
     def __init__(
         self,
@@ -410,6 +414,16 @@ class Handler(BaseHTTPRequestHandler):
     started = False
     # The request body's bytes not read yet; None when unknown, which ends the connection.
     unread: int | None = 0
+
+    def setup(self):
+        try:
+            super().setup()
+        except OSError as exc:
+            # macOS refuses socket options on a connection its client reset while it
+            # waited to be accepted: a disconnect, not a fault.
+            if exc.errno == errno.EINVAL:
+                raise ConnectionResetError(errno.ECONNRESET, "Client left before setup") from exc
+            raise
 
     def log_message(self, *args):
         pass
