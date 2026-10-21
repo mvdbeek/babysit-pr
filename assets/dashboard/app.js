@@ -2147,7 +2147,9 @@ async function refreshWorkspaces() {
     await loadWorkspaces();
     prTable.render();
     issueTable.render();
-    renderDetail();
+    // The watcher's detail waits for its own status; a snapshot can arrive first, and a
+    // throw here would mark the snapshot failed, sending every dialog to load another.
+    if (data) renderDetail();
     updateWorkspaceOperation();
   } catch (error) {
     workspaceData.error = error.message;

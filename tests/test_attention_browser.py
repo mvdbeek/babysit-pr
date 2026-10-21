@@ -301,6 +301,9 @@ def test_a_review_from_needs_you_opens_from_the_background_snapshot(
             route.fulfill(json=snapshot)
 
     page.route("**/api/workspaces", workspaces)
+    # The watcher status answers last, as it did on CI: the snapshot is still good.
+    statuses = []
+    page.route("**/api/status", lambda route: statuses.append(route))
     pr = "https://github.com/test/alpha/pull/8"
     requested = feed_with([item(pr, "review", [("review_requested", "Your review is requested")])])
     page.route("**/api/attention*", lambda route: route.fulfill(json=requested))
@@ -314,6 +317,8 @@ def test_a_review_from_needs_you_opens_from_the_background_snapshot(
     ).to_be_visible()
     for route in held:
         route.fulfill(json=snapshot)
+    for route in statuses:
+        route.continue_()
 
 
 def test_a_requested_review_also_offers_the_agent_that_is_not_the_main_reviewer(
