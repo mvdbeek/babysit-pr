@@ -102,11 +102,12 @@ def test_issue_mentions_follow_the_shared_setting(tmp_path, monkeypatch):
 
 
 def test_search_limit_names_issues(monkeypatch):
-    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(20)] + [page()] * 3)
+    pages = pr_overview.SEARCH_LIMIT // pr_overview.PAGE_SIZE
+    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(pages)] + [page()] * 3)
     monkeypatch.setattr(pr_overview, "github_page", fetch)
     result = issue_overview.collect()
     assert result["warnings"] == ["Only the most recently updated 1,000 author issues are shown."]
-    assert fetch.call_count == 23
+    assert fetch.call_count == pages + 3
 
 
 def test_fragment_is_sent_in_the_graphql_query(monkeypatch):

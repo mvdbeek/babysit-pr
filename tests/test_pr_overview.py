@@ -153,11 +153,39 @@ def test_empty_search_still_lists_the_searched_roles(monkeypatch):
 
 
 def test_search_limit_is_visible(monkeypatch):
-    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(20)] + [page()] * 4)
+    pages = overview.SEARCH_LIMIT // overview.PAGE_SIZE
+    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(pages)] + [page()] * 4)
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect()
     assert result["warnings"] == ["Only the most recently updated 1,000 author PRs are shown."]
-    assert fetch.call_count == 24
+    assert fetch.call_count == pages + 4
+
+
+def timed_out(status):
+    return overview.SearchTimeout(f"GitHub request failed: gh: HTTP {status}")
+
+
+def test_a_page_github_timed_out_on_is_asked_again_in_smaller_pages(monkeypatch):
+    fetch = Mock(
+        side_effect=[page([pr()], "next"), timed_out(504), timed_out(502), page([pr("two")])]
+        + [page()] * 4
+    )
+    monkeypatch.setattr(overview, "github_page", fetch)
+    result = overview.collect()
+    assert [item["id"] for item in result["prs"]] == ["one", "two"]
+    author = fetch.call_args_list[:4]
+    assert [call.args[1] for call in author] == [None, "next", "next", "next"]
+    assert [call.args[3] for call in author] == [25, 25, 12, 6]
+    # The next role starts at the full page size again.
+    assert fetch.call_args_list[4].args[3] == overview.PAGE_SIZE
+
+
+def test_a_search_that_times_out_even_in_the_smallest_pages_fails_the_refresh(monkeypatch):
+    fetch = Mock(side_effect=timed_out(504))
+    monkeypatch.setattr(overview, "github_page", fetch)
+    with pytest.raises(overview.SearchTimeout, match="HTTP 504"):
+        overview.collect()
+    assert [call.args[3] for call in fetch.call_args_list] == [25, 12, 6, 5]
 
 
 @pytest.mark.parametrize(
@@ -179,11 +207,22 @@ def test_github_command_uses_json_stdin_and_reports_api_failures(monkeypatch):
     assert overview.github_page("is:open", "cursor") == page()
     args, kwargs = run.call_args
     assert args[0] == ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"]
-    assert json.loads(kwargs["input"])["variables"] == {"query": "is:open", "cursor": "cursor"}
+    assert json.loads(kwargs["input"])["variables"] == {
+        "query": "is:open",
+        "cursor": "cursor",
+        "first": overview.PAGE_SIZE,
+    }
     assert kwargs["timeout"] == 45
+    overview.github_page("is:open", None, overview.PR_FRAGMENT, 6)
+    assert json.loads(run.call_args.kwargs["input"])["variables"]["first"] == 6
     run.return_value = subprocess.CompletedProcess([], 1, "", "rate limit exceeded")
-    with pytest.raises(ValueError, match="rate limit"):
+    with pytest.raises(ValueError, match="rate limit") as failure:
         overview.github_page("query")
+    assert not isinstance(failure.value, overview.SearchTimeout)
+    for status in ("502", "504"):
+        run.return_value = subprocess.CompletedProcess([], 1, "", f"gh: HTTP {status}")
+        with pytest.raises(overview.SearchTimeout, match=f"HTTP {status}"):
+            overview.github_page("query")
     run.return_value = subprocess.CompletedProcess([], 0, '{"errors": [{"message": "denied"}]}', "")
     with pytest.raises(ValueError, match="incomplete"):
         overview.github_page("query")
