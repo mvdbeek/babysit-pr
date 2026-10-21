@@ -6,6 +6,7 @@ issue overview (`issue_overview.py`) shares it without copying it.
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -17,6 +18,13 @@ import github_cli
 from latest_activity import activity_fragment, latest_activity, notification_activity
 
 POLL_SECONDS = 300
+# GitHub search exposes at most this many results per query.
+SEARCH_LIMIT = 1000
+# Nodes per search page. GitHub stops a GraphQL query after about 10 seconds and answers
+# 502 or 504; 50 PRs with their threads and activity took that long, 25 about 6 seconds.
+PAGE_SIZE = 25
+MIN_PAGE_SIZE = 5
+TIMED_OUT = re.compile(r"\bHTTP 50[24]\b")
 ROLES = {
     "author": "author",
     "assignee": "assignee",
@@ -43,9 +51,9 @@ PR_FRAGMENT = (
     + "}"
 )
 QUERY = """
-query($query: String!, $cursor: String) {
+query($query: String!, $cursor: String, $first: Int!) {
   viewer { login }
-  search(query: $query, type: ISSUE, first: 50, after: $cursor) {
+  search(query: $query, type: ISSUE, first: $first, after: $cursor) {
     issueCount
     pageInfo { hasNextPage endCursor }
     nodes { %s }
@@ -113,8 +121,15 @@ PRS = Kind(
 )
 
 
-def github_page(query, cursor=None, fragment=PR_FRAGMENT):
-    payload = {"query": QUERY % fragment, "variables": {"query": query, "cursor": cursor}}
+class SearchTimeout(ValueError):
+    """GitHub gave up on a search page; a smaller one may fit inside its time limit."""
+
+
+def github_page(query, cursor=None, fragment=PR_FRAGMENT, first=PAGE_SIZE):
+    payload = {
+        "query": QUERY % fragment,
+        "variables": {"query": query, "cursor": cursor, "first": first},
+    }
     result = github_cli.run(
         ["gh", "api", "--hostname", "github.com", "graphql", "--input", "-"],
         input=json.dumps(payload),
@@ -122,7 +137,8 @@ def github_page(query, cursor=None, fragment=PR_FRAGMENT):
         timeout=45,
     )
     if result.returncode:
-        raise ValueError(f"GitHub request failed: {result.stderr.strip()[:500]}")
+        message = f"GitHub request failed: {result.stderr.strip()[:500]}"
+        raise (SearchTimeout if TIMED_OUT.search(result.stderr) else ValueError)(message)
     response = json.loads(result.stdout)
     if response.get("errors"):
         raise ValueError("GitHub returned incomplete data; retrying on the next refresh")
@@ -152,11 +168,19 @@ def collect(kind: Kind = PRS, mentions=True):
         role: qualifier for role, qualifier in kind.roles.items() if mentions or role != "mentioned"
     }
     for role, qualifier in searched.items():
-        cursor = None
-        for _ in range(20):  # GitHub search exposes at most 1,000 results per query.
-            data = github_page(
-                f"{kind.search} {qualifier}:@me sort:updated-desc", cursor, kind.fragment
-            )
+        cursor, size, listed = None, PAGE_SIZE, 0
+        while listed < SEARCH_LIMIT:
+            try:
+                data = github_page(
+                    f"{kind.search} {qualifier}:@me sort:updated-desc", cursor, kind.fragment, size
+                )
+            except SearchTimeout:
+                # A slow moment at GitHub: the same page again, half as long.
+                if size <= MIN_PAGE_SIZE:
+                    raise
+                size = max(MIN_PAGE_SIZE, size // 2)
+                continue
+            listed += size
             if login is not None and login != data["viewer"]["login"]:
                 raise ValueError("GitHub account changed during refresh; retrying")
             login = data["viewer"]["login"]
@@ -173,7 +197,7 @@ def collect(kind: Kind = PRS, mentions=True):
                 items[key] = kind.record(node, roles)
             page = search["pageInfo"]
             if not page["hasNextPage"]:
-                if search["issueCount"] > 1000:
+                if search["issueCount"] > SEARCH_LIMIT:
                     warnings.append(
                         f"Only the most recently updated 1,000 {role} {kind.label}s are shown."
                     )
