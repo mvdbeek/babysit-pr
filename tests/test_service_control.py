@@ -136,9 +136,11 @@ def test_restarting_the_daemon_replaces_it_and_keeps_its_workers(tmp_path, daemo
     assert after["pid"] != before["pid"]
     assert after["max_workers"] == 3
     assert service_control.running_pid(tmp_path) == after["pid"]
-    # The new daemon is really watching: it heartbeats within its first seconds.
-    beat = wait_for(lambda: service_control.read_state(tmp_path / "heartbeat.json").get("pid"))
-    assert beat == after["pid"]
+    # The new daemon is really watching: it heartbeats within its first seconds. The old
+    # one's last heartbeat is still on disk until then.
+    assert wait_for(
+        lambda: service_control.read_state(tmp_path / "heartbeat.json").get("pid") == after["pid"]
+    )
 
 
 def test_a_daemon_can_be_started_when_none_is_running(tmp_path, daemon):
