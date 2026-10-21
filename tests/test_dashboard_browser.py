@@ -4451,7 +4451,10 @@ def test_the_follow_up_field_grows_with_its_text_beside_the_send_button(
     text = page.locator("#ws-message-text")
     send = page.locator("#ws-message-send")
     expect(send).to_be_visible()
-    field, button = text.bounding_box(), send.bounding_box()
+    # Both boxes from one layout: the sticky composer moves while the transcript loads.
+    field, button = send.evaluate(
+        "send => [document.getElementById('ws-message-text'), send].map(node => node.getBoundingClientRect().toJSON())"
+    )
     assert button["x"] >= field["x"] + field["width"]
     assert button["y"] + button["height"] <= field["y"] + field["height"] + 1
     scrolls = "field => field.scrollHeight > field.clientHeight"
