@@ -15,10 +15,12 @@ TOKEN = "gho_0123456789abcdefghijklmnopqrstuvwxyz"
 
 
 @pytest.fixture
-def fresh(monkeypatch):
-    """A process-fresh credential cache, without the fixture token in the environment."""
+def fresh(monkeypatch, tmp_path):
+    """A process-fresh credential cache, without the fixture token in the environment
+    or a babysitter token file (the user's real one is never read)."""
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(github_cli, "TOKEN_FILE", tmp_path / "config" / "github-token")
     credentials = github_cli.Credentials()
     monkeypatch.setattr(github_cli, "CREDENTIALS", credentials)
     return credentials
@@ -87,6 +89,30 @@ def test_environment_token_skips_the_keyring_lookup(fresh, fake_gh, monkeypatch)
     assert env["GH_TOKEN"] == TOKEN
     assert env["HOME"] == "/nowhere"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert fake_gh() == []
+
+
+def test_the_babysitter_token_file_is_used_instead_of_the_gh_login(fresh, fake_gh):
+    babysitter = "ghp_babysitter0123456789abcdefghijklmnop"
+    github_cli.TOKEN_FILE.parent.mkdir()
+    github_cli.TOKEN_FILE.write_text(babysitter + "\n")
+    github_cli.run(["gh", "api", "user"], text=True, timeout=10)
+    assert [(c["args"], c["env"]["GH_TOKEN"]) for c in fake_gh()] == [(["api", "user"], babysitter)]
+
+
+@pytest.mark.parametrize("content", ["", "not a token\n", b"\xff" * 40])
+def test_a_broken_token_file_is_reported_without_falling_back_to_the_gh_login(
+    fresh, fake_gh, content
+):
+    github_cli.TOKEN_FILE.parent.mkdir()
+    if isinstance(content, bytes):
+        github_cli.TOKEN_FILE.write_bytes(content)
+    else:
+        github_cli.TOKEN_FILE.write_text(content)
+    result = github_cli.run(["gh", "api", "user"], text=True, timeout=10)
+    assert result.returncode == 1
+    assert f"environment ({github_cli.TOKEN_FILE} " in result.stderr
+    assert "gh auth token:" not in result.stderr
     assert fake_gh() == []
 
 
