@@ -21,6 +21,13 @@ BRIEF = (
     "Leave the line out if you stop to ask a question or cannot finish; the session then "
     "stays open for the user.\n"
 )
+# For a message sent to an agent already at work; its own turn is the one followed.
+FOLLOW_UP = (
+    "\n\nWhen this is done and nothing more is needed from me, end your final response "
+    "with this line:\n{marker}\n"
+    "Leave the line out if you stop to ask a question or cannot finish; the session then "
+    "stays open for me.\n"
+)
 DATABASE = "pr-workspaces.sqlite"
 TABLE = "CREATE TABLE IF NOT EXISTS exit_watches (id TEXT PRIMARY KEY, data TEXT)"
 
@@ -31,6 +38,10 @@ def new_marker():
 
 def brief(marker):
     return BRIEF.format(marker=marker)
+
+
+def follow_up(marker):
+    return FOLLOW_UP.format(marker=marker)
 
 
 def watching(now=None):

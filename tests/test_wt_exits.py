@@ -291,3 +291,25 @@ def test_an_unreadable_watch_hides_no_others(local):  # noqa: F811
     with manager.db() as db:
         db.execute("INSERT INTO exit_watches VALUES ('odd', ?)", (json.dumps({"id": "odd"}),))
     assert [w["id"] for w in manager.scheduled_tasks()["launched"]] == [good["id"]]
+
+
+def test_a_message_s_watch_follows_its_running_agent_at_once(local, monkeypatch):  # noqa: F811
+    manager, _, _, state, _ = local
+    path = manager.src / "repo"
+    # No agent listed yet would keep a launch "running"; a message's agent already runs.
+    watch = register(manager, path, created_at=1000, follow_up=True, session_id="s1")
+    plain = register(manager, path, created_at=1000)
+    seen = {}
+
+    def step(record, op, persist, now=None):
+        seen[op["created_at"], op.get("follow_up")] = op
+        return record
+
+    monkeypatch.setattr(pw.workspace_exit, "step", step)
+    manager.exit_launched(now=1010)
+    message, launch = seen[1000, True], seen[1000, None]
+    assert message["status"] == "complete"
+    assert (message["pane_id"], message["session_id"]) == (watch["pane_id"], "s1")
+    # A wt launch is unchanged: it waits for its agent, and capture searches its workspace.
+    assert launch["status"] == "running" and "pane_id" not in launch
+    assert plain["id"] != watch["id"]

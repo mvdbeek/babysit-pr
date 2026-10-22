@@ -3146,3 +3146,105 @@ def test_a_merge_counts_only_when_it_resolved_something_itself(rewritten, tmp_pa
     git("add", ".", cwd=work)
     git("commit", "--amend", "--no-edit", cwd=work)
     assert wso.local_state(str(work), "work")["unpushed"] == 1
+
+
+def exit_watches(home):
+    import exit_watch
+
+    with exit_watch.connect(home) as db:
+        return [json.loads(data) for (data,) in db.execute("SELECT data FROM exit_watches")]
+
+
+def test_a_message_can_ask_its_agent_to_quit_when_done(site):
+    import agent_messages
+    import exit_watch
+
+    plugin, _, _, worktrees, state, _ = site
+    body = {"workspace": "w1", "text": "Approve and merge", "exit_when_done": True}
+    value = agent_messages.send(body, plugin.home)
+    assert value["sent"] and value["warning"] is None
+    ((pane, typed),) = read(state)["prompts"]
+    marker = re.search(r"\[babysit-done:[0-9a-f]{16}\]", typed)[0]
+    assert typed == "Approve and merge" + exit_watch.follow_up(marker)
+    (watch,) = exit_watches(plugin.home)
+    assert watch["id"] == value["exit_watch"]
+    assert (watch["pane_id"], watch["workspace_id"], watch["agent"]) == (pane, "w1", "codex")
+    assert watch["follow_up"] and watch["marker"] == marker
+    assert watch["path"] == str((worktrees / "merged-work").resolve())
+    assert watch["label"] == "Message: Approve and merge"
+    assert watch["exit"]["state"] == "watching"
+    # Without the flag a message is typed as written and nothing is watched.
+    agent_messages.send({"workspace": "w1", "text": "Thanks"}, plugin.home)
+    assert read(state)["prompts"][-1] == [pane, "Thanks"]
+    assert len(exit_watches(plugin.home)) == 1
+
+
+def test_a_resumed_session_can_quit_when_done(exited):
+    import agent_messages
+
+    state, sid, checkout, home = exited
+    body = {"workspace": "w1", "resume": sid, "text": "Approve and merge", "exit_when_done": True}
+    value = agent_messages.send(body, home)
+    (watch,) = exit_watches(home)
+    assert value["exit_watch"] == watch["id"] and watch["pane_id"] == value["pane"]
+    assert watch["session_id"] == sid and watch["agent"] == "claude"
+    assert watch["marker"] in read(state)["agents"][0]["argv"][-1]
+
+
+def test_a_message_whose_agent_cannot_be_found_says_it_will_not_quit(site, monkeypatch):
+    import agent_messages
+
+    plugin, *_ = site
+    # Typed, but herdr no longer lists the agent in that pane.
+    monkeypatch.setattr(
+        agent_messages,
+        "prompt",
+        lambda target, text: {"sent": True, "pane": "w1:p9", "warning": None},
+    )
+    body = {"workspace": "w1", "text": "Approve and merge", "exit_when_done": True}
+    value = agent_messages.send(body, plugin.home)
+    assert value["sent"] and value["warning"] == agent_messages.QUIT_UNWATCHED
+    assert "exit_watch" not in value and exit_watches(plugin.home) == []
+
+
+@pytest.mark.parametrize(
+    "body, error",
+    [
+        ({"workspace": "w1", "text": "x", "exit_when_done": "yes"}, "exit_when_done flag"),
+        ({"workspace": "w1", "resume": "s", "text": "", "exit_when_done": True}, "Write a message"),
+    ],
+)
+def test_quitting_after_a_message_needs_a_flag_and_a_message(site, body, error):
+    import agent_messages
+
+    plugin, _, _, _, state, _ = site
+    with pytest.raises(ValueError, match=error):
+        agent_messages.send(body, plugin.home)
+    assert not read(state).get("prompts")
+
+
+def test_a_typed_message_is_never_reported_unsent_when_its_watch_fails(site, monkeypatch):
+    import agent_messages
+
+    plugin, *_ = site
+    real_herdr, real_prompt, typed = agent_messages.herdr, agent_messages.prompt, []
+
+    def prompt(target, text):
+        typed.append(text)
+        return real_prompt(target, text)
+
+    def herdr(*args):
+        value = real_herdr(*args)
+        if typed and args[:2] == ("agent", "list"):
+            # After delivery herdr lists the agent without its workspace.
+            value["agents"] = [
+                {k: v for k, v in a.items() if k != "workspace_id"} for a in value["agents"]
+            ]
+        return value
+
+    monkeypatch.setattr(agent_messages, "prompt", prompt)
+    monkeypatch.setattr(agent_messages, "herdr", herdr)
+    body = {"workspace": "w1", "text": "Approve and merge", "exit_when_done": True}
+    value = agent_messages.send(body, plugin.home)
+    assert value["sent"] and value["warning"] == agent_messages.QUIT_UNWATCHED
+    assert len(typed) == 1 and exit_watches(plugin.home) == []

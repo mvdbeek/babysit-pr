@@ -5017,6 +5017,52 @@ def test_an_exited_agent_is_resumed_with_the_message(page, dashboard_site, viewe
     }
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_approve_and_merge_can_quit_the_agent_once_it_is_done(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    viewer_routes["agents"] = []
+    sent = []
+
+    def message(route):
+        body = route.request.post_data_json
+        sent.append(body)
+        watched = {"exit_watch": "x1"} if body.get("exit_when_done") else {}
+        route.fulfill(
+            json={"sent": True, "pane": "w1:p3", "resumed": body["resume"], "warning": None}
+            | watched
+        )
+
+    page.route("**/api/workspace-message", message)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    quit_when_done = viewer.get_by_label("Quit the agent when it is done")
+    expect(quit_when_done).not_to_be_checked()
+    viewer.get_by_label("Message the agent").fill("Approve and merge")
+    quit_when_done.check()
+    page.screenshot(path=f"reports/quit-after-message-{width}.png")
+    viewer.get_by_role("button", name="Resume and send").click()
+    expect(page.locator("#ws-message-status")).to_have_text(
+        "Resumed the session in w1:p3 and sent the message. It quits once it marks the task done."
+    )
+    assert sent == [
+        {"workspace": "w1", "resume": "s-new", "text": "Approve and merge", "exit_when_done": True}
+    ]
+    # Each message asks anew.
+    expect(quit_when_done).not_to_be_checked()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    # A box ticked and left unsent never carries over to the next agent opened.
+    quit_when_done.check()
+    page.keyboard.press("Escape")
+    expect(viewer).to_be_hidden()
+    page.locator("#pr-list tr").nth(1).get_by_role("button", name="Diff", exact=True).click()
+    expect(quit_when_done).to_be_visible()
+    expect(quit_when_done).not_to_be_checked()
+
+
 def test_nothing_to_send_without_an_agent_or_a_session(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     viewer_routes["agents"] = []
