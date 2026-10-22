@@ -9,11 +9,13 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 from pathlib import Path
 
+import exit_watch
 import pytest
 import wt
 
@@ -543,9 +545,12 @@ def test_parse_herdr_open():
     reply = wt.parse_herdr_open(
         json.dumps({"result": {"already_open": False, "root_pane": {"pane_id": "w1:p1"}}})
     )
-    assert reply == wt.HerdrOpen(False, "w1:p1")
-    assert wt.parse_herdr_open(json.dumps({"result": {"already_open": True}})) == (True, "")
-    assert wt.parse_herdr_open(json.dumps({"result": {}})) == (False, "")
+    # Without a workspace in the reply, the root pane id names it.
+    assert reply == wt.HerdrOpen(False, "w1:p1", "w1")
+    reply = {"root_pane": {"pane_id": "p9"}, "workspace": {"workspace_id": "ws-3"}}
+    assert wt.parse_herdr_open(json.dumps({"result": reply})) == (False, "p9", "ws-3")
+    assert wt.parse_herdr_open(json.dumps({"result": {"already_open": True}})) == (True, "", "")
+    assert wt.parse_herdr_open(json.dumps({"result": {}})) == (False, "", "")
     with pytest.raises(wt.WtError, match="herdr worktree open failed: no such checkout"):
         wt.parse_herdr_open(json.dumps({"error": {"message": "no such checkout"}}))
     with pytest.raises(wt.WtError, match="returned no JSON: garbage"):
@@ -715,6 +720,141 @@ def test_herdr_session_failures():
     )
     with pytest.raises(wt.WtError, match="pane run failed"):
         tool(runner, {"WT_MULTIPLEXER": "herdr"}).open_session(options(), "/wt/x", "x", "/clone")
+
+
+def watches(home):
+    """The exit watches recorded under a dashboard state home."""
+    if not (home / "pr-workspaces.sqlite").exists():
+        return []
+    db = sqlite3.connect(home / "pr-workspaces.sqlite")
+    try:
+        return [json.loads(data) for (data,) in db.execute("SELECT data FROM exit_watches")]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
+def test_every_command_takes_exit_when_done(command):
+    assert wt.parse_args(command, ["--exit-when-done", "-p", "go", "7"]).exit_when_done
+    assert not wt.parse_args(command, ["-p", "go", "7"]).exit_when_done
+    assert "--exit-when-done" in wt.HELP[command]
+
+
+@pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
+def test_exit_when_done_is_refused_before_anything_is_made(command, tmp_path):
+    runner = FakeRunner(executables={"herdr", "tmux"})
+    env = {"HOME": str(tmp_path), "WT_MULTIPLEXER": "herdr"}
+    with pytest.raises(wt.UsageError, match=f"{command}: --exit-when-done needs a prompt"):
+        tool(runner, env).run(command, ["--exit-when-done", "7"])
+    for mux in ("tmux", "cmux", "none"):
+        with pytest.raises(wt.WtError, match=f"needs herdr \\(WT_MULTIPLEXER is {mux}\\)"):
+            tool(runner, {**env, "WT_MULTIPLEXER": mux}).run(
+                command, ["--exit-when-done", "-p", "go", "7"]
+            )
+    with pytest.raises(wt.WtError, match="needs herdr \\(herdr is not on PATH\\)"):
+        tool(FakeRunner(), env).run(command, ["--exit-when-done", "-p", "go", "7"])
+    with pytest.raises(wt.WtError, match="needs herdr \\(WT_MULTIPLEXER=auto chose tmux\\)"):
+        tool(FakeRunner(executables={"tmux"}), {"HOME": str(tmp_path)}).run(
+            command, ["--exit-when-done", "-p", "go", "7"]
+        )
+    # A state home that cannot hold the watch is found before any checkout is made.
+    blocked = tmp_path / "blocked"
+    blocked.write_text("")
+    with pytest.raises(wt.WtError, match=f"cannot record its watch in {blocked}"):
+        tool(runner, {**env, "BABYSIT_HOME": str(blocked)}).run(
+            command, ["--exit-when-done", "-p", "go", "7"]
+        )
+    assert runner.calls == []
+
+
+def herdr_open(reply):
+    return FakeRunner(
+        [(["herdr", "worktree", "open"], wt.Completed(0, json.dumps({"result": reply}), ""))],
+        executables={"herdr"},
+    )
+
+
+def test_exit_when_done_records_a_watch_and_asks_for_the_marker(tmp_path):
+    staged = []
+    runner = herdr_open({"already_open": False, "root_pane": {"pane_id": "w4:p1"}})
+    home = tmp_path / "state"
+    t = tool(
+        runner,
+        {"HOME": "/home/u", "WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)},
+        stage=lambda prompt: staged.append(prompt) or "/tmp/wt-prompt.fixture",
+    )
+    (tmp_path / "wt").mkdir()
+    t.open_session(
+        options(agent="codex", prompt="Review", exit_when_done=True),
+        str(tmp_path / "wt"),
+        "review-pr-7",
+        "/clone",
+    )
+    [watch] = watches(home)
+    marker = watch["marker"]
+    assert re.fullmatch(r"\[babysit-done:[0-9a-f]{16}\]", marker)
+    assert staged == ["Review" + exit_watch.brief(marker)]
+    assert {k: watch[k] for k in ("label", "path", "workspace_id", "pane_id", "agent")} == {
+        "label": "review-pr-7",
+        "path": str((tmp_path / "wt").resolve()),
+        "workspace_id": "w4",
+        "pane_id": "w4:p1",
+        "agent": "codex",
+    }
+    assert watch["claude_account"] is None
+    assert watch["exit"]["state"] == "watching"
+    assert watch["exit"]["since"] == watch["created_at"]
+    assert runner.calls[-1][0][:4] == ["herdr", "pane", "run", "w4:p1"]
+    assert t.stderr.getvalue() == ""
+
+
+def test_exit_when_done_on_reattach_warns_and_records_nothing(tmp_path):
+    home = tmp_path / "state"
+    runner = herdr_open({"already_open": True})
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)})
+    t.open_session(options(prompt="Fix", exit_when_done=True), "/wt/x", "x", "/clone")
+    assert len(runner.calls) == 1
+    assert t.stderr.getvalue() == (
+        "wt: a herdr workspace for /wt/x already exists; ignoring the prompt and --exit-when-done\n"
+    )
+    assert watches(home) == []
+
+
+def test_exit_when_done_records_nothing_when_the_agent_is_not_typed(tmp_path):
+    home = tmp_path / "state"
+    runner = herdr_open({"root_pane": {"pane_id": "w1:p1"}})
+    runner.results.append((["herdr", "pane", "run"], wt.Completed(1, "", "gone")))
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)})
+    with pytest.raises(wt.WtError, match="pane run failed: gone"):
+        t.open_session(options(prompt="Fix", exit_when_done=True), "/wt/x", "x", "/clone")
+    assert watches(home) == []
+    # A reply that names no workspace types nothing: the dashboard could not find the agent.
+    runner = herdr_open({"root_pane": {"pane_id": "p1"}})
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)})
+    with pytest.raises(wt.WtError, match="did not name the workspace for /wt/x"):
+        t.open_session(options(prompt="Fix", exit_when_done=True), "/wt/x", "x", "/clone")
+    assert len(runner.calls) == 1 and watches(home) == []
+    # Nor does an agent command that cannot be built, or a pane run that blows up.
+    runner = herdr_open({"root_pane": {"pane_id": "w1:p1"}})
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)})
+    with pytest.raises(wt.WtError, match="Unknown Claude account"):
+        t.open_session(
+            options(prompt="Fix", claude_account="nobody", exit_when_done=True), "/wt/x", "x", "/c"
+        )
+    assert runner.calls == [] and watches(home) == []
+
+    class Interrupted(FakeRunner):
+        def run(self, argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "run"]:
+                assert len(watches(home)) == 1  # Saved before the command is typed.
+                raise KeyboardInterrupt
+            return super().run(argv, **kwargs)
+
+    runner = Interrupted(herdr_open({"root_pane": {"pane_id": "w1:p1"}}).results, {"herdr"})
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)})
+    with pytest.raises(KeyboardInterrupt):
+        t.open_session(options(prompt="Fix", exit_when_done=True), "/wt/x", "x", "/clone")
+    assert watches(home) == []
 
 
 def test_tmux_session_plan_new_session_detached_hint():
@@ -1045,6 +1185,7 @@ def repo(tmp_path, fake_tools, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("WT_MULTIPLEXER", "herdr")
+    monkeypatch.delenv("BABYSIT_HOME", raising=False)
     monkeypatch.delenv("HERDR_ENV", raising=False)
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
@@ -1170,6 +1311,44 @@ def test_wtpr_reattach_verifies_checkout_and_ignores_prompt(repo):
     assert "explicit worktree destination already exists" in result.stderr
     result = run_tool("wtpr", "-r", "repo", "--name", "elsewhere", "7", check=False)
     assert result.stderr.strip() == "wtpr: explicit branch already exists: elsewhere"
+
+
+def test_wtpr_exit_when_done_end_to_end(repo, tmp_path, monkeypatch):
+    home, git, state = repo
+    git("branch", "-D", "feature")
+    monkeypatch.setenv("BABYSIT_HOME", str(tmp_path / "state"))
+    brief = home / "brief.md"
+    brief.write_text("Review this PR and write the report.\n")
+    run_tool("wtpr", "-r", "repo", "-F", str(brief), "--exit-when-done", "7")
+    path = home / "src/worktrees/repo/feature"
+    [watch] = watches(tmp_path / "state")
+    data = state_of(state)
+    [agent] = data["agents"]
+    # The agent's prompt ends with the marker line, and the watch names its pane.
+    assert agent["task"].startswith("Review this PR and write the report.\n\n")
+    assert agent["task"].rstrip("\n").splitlines()[-2] == watch["marker"]
+    assert (watch["workspace_id"], watch["pane_id"]) == (agent["workspace_id"], "w1:p1")
+    assert watch["path"] == str(path.resolve()) == str(Path(agent["cwd"]).resolve())
+    assert watch["agent"] == agent["agent"] == "claude" and watch["claude_account"] is None
+    # Reattaching ignores the prompt and records no second watch.
+    result = run_tool("wtpr", "-r", "repo", "-p", "again", "--exit-when-done", "7")
+    assert "ignoring the prompt and --exit-when-done" in result.stderr
+    assert len(watches(tmp_path / "state")) == 1 and len(state_of(state)["agents"]) == 1
+    # Without herdr nothing is made.
+    result = run_tool(
+        "wt",
+        "-p",
+        "x",
+        "--exit-when-done",
+        "-r",
+        "repo",
+        "main",
+        "other",
+        check=False,
+        env={**os.environ, "WT_MULTIPLEXER": "tmux"},
+    )
+    assert result.returncode == 1 and "needs herdr" in result.stderr
+    assert not (home / "src/worktrees/repo/other").exists()
 
 
 def test_wtpr_dashboard_flags_and_no_focus(repo, tmp_path):

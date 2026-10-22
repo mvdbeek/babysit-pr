@@ -27,6 +27,7 @@ from urllib.parse import quote
 
 import attachments
 import claude_accounts
+import exit_watch
 import github_cli
 import owned_process
 import workspace_agents
@@ -58,6 +59,9 @@ SCHEDULE_MISSED_AFTER = 86400
 SCHEDULE_PENDING_LIMIT = 100
 SCHEDULE_HISTORY = 50
 SCHEDULE_POLL_SECONDS = 30
+# `wt --exit-when-done` returns once the agent command is typed; the agent shows up later.
+LAUNCH_START_SECONDS = 120
+LAUNCH_HISTORY = 100
 # Batch Handle: the most a batch's starts may be spread apart, and its task's item link.
 BATCH_INTERVAL_LIMIT = 86400
 BATCH_URL = "{url}"
@@ -384,6 +388,69 @@ def verified_head(pr, item):
     return contained
 
 
+def agent_in(workspace_id, path, agent):
+    """Whether herdr shows this kind of agent in the workspace, working in the checkout."""
+    path = Path(path).resolve()
+    return any(
+        a.get("workspace_id") == workspace_id
+        and a.get("agent") == agent
+        and Path(a.get("cwd") or "/missing").resolve() == path
+        for a in herdr("agent", "list")["agents"]
+    )
+
+
+def launched_operation(watch, now):
+    """What ``workspace_exit`` reads about a ``wt --exit-when-done`` launch.
+
+    wt returns once it has typed the agent command, so the launch counts as finished
+    when the agent shows up in its workspace, or after a while without it, when the
+    watch then leaves it.
+    """
+    started = (
+        "target" in watch["exit"]
+        or now - watch["created_at"] > LAUNCH_START_SECONDS
+        or agent_in(watch["workspace_id"], watch["path"], watch["agent"])
+    )
+    return {
+        "status": "complete" if started else "running",
+        "exit_marker": watch["marker"],
+        "path": watch["path"],
+        "result": {"workspace_id": watch["workspace_id"]},
+        "agent": watch["agent"],
+        "claude_account": watch.get("claude_account"),
+        "created_at": watch["created_at"],
+        "updated_at": watch["created_at"],
+    }
+
+
+def close_launched(watch, record):
+    """Close what an exited ``wt`` agent leaves: its workspace when the agent's pane was
+    all it held, else the pane alone; only once nothing but the shell runs there.
+
+    The checkout and its branch stay, so the session can be resumed later. Returns the
+    end of the watch's message.
+    """
+    target = record.get("target") or {}
+    pane = target.get("pane_id")
+    if pane != watch["pane_id"]:
+        return "; its pane is still open"
+    try:
+        procs = herdr("pane", "process-info", "--pane", pane)["process_info"]
+        # The same shell the agent ran in, so a pane id reused since then is left alone.
+        if procs.get("shell_pid") != target.get("shell_pid") or any(
+            p.get("pid") != procs["shell_pid"] for p in procs.get("foreground_processes") or []
+        ):
+            return "; its pane is still open"
+        panes = herdr("pane", "list", "--workspace", watch["workspace_id"])["panes"]
+        if [p.get("pane_id") for p in panes] == [pane]:
+            herdr("workspace", "close", watch["workspace_id"])
+            return "; its workspace was closed"
+        herdr("pane", "close", pane)
+        return "; its pane was closed"
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return "; its pane is still open"
+
+
 class Workspaces:
     def __init__(self, home, overview, jobs, src=None, issues=None, sentry=None):
         self.home = Path(home)
@@ -444,16 +511,19 @@ class Workspaces:
                     message="The dashboard stopped while starting this task. Check the item's workspace before scheduling it again.",
                 )
                 db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), key))
+            # `wt --exit-when-done` creates it too, if it runs before the dashboard ever did.
+            db.execute(exit_watch.TABLE)
             # An exit the previous process began may have pressed a key; never repeat it.
-            for key, data in db.execute(
-                "SELECT id,data FROM scheduled WHERE json_extract(data,'$.exit.state')='exiting'"
-            ).fetchall():
-                task = json.loads(data)
-                task["exit"].update(
-                    state="unconfirmed",
-                    message="The dashboard stopped while exiting the agent; check its pane.",
-                )
-                db.execute("UPDATE scheduled SET data=? WHERE id=?", (json.dumps(task), key))
+            for table in ("scheduled", "exit_watches"):
+                for key, data in db.execute(
+                    f"SELECT id,data FROM {table} WHERE json_extract(data,'$.exit.state')='exiting'"
+                ).fetchall():
+                    task = json.loads(data)
+                    task["exit"].update(
+                        state="unconfirmed",
+                        message="The dashboard stopped while exiting the agent; check its pane.",
+                    )
+                    db.execute(f"UPDATE {table} SET data=? WHERE id=?", (json.dumps(task), key))
         # A fresh process must inspect resources; it never resubmits an uncertain launch.
         self.workers: dict[str, threading.Thread] = {}
         self.started_at = time.time()
@@ -899,14 +969,7 @@ class Workspaces:
         }
 
     def agent_started(self, target, agent):
-        if not agent:
-            return True
-        return any(
-            a["workspace_id"] == target["workspace_id"]
-            and a.get("agent") == agent
-            and str(Path(a.get("cwd") or "/missing").resolve()) == target["path"]
-            for a in herdr("agent", "list")["agents"]
-        )
+        return not agent or agent_in(target["workspace_id"], target["path"], agent)
 
     def action(self, request, inventory=None, scheduled=False):
         """Validate and perform one workspace action.
@@ -1579,7 +1642,12 @@ class Workspaces:
             key=lambda t: t["updated_at"],
             reverse=True,
         )
-        return {"enabled": True, "time": time.time(), "tasks": pending + done}
+        return {
+            "enabled": True,
+            "time": time.time(),
+            "tasks": pending + done,
+            "launched": self.launched_exits(),
+        }
 
     def cancel_scheduled(self, key):
         with self.db() as db:
@@ -1696,8 +1764,11 @@ class Workspaces:
                 continue  # One watch must not stop the others; the next pass retries it.
 
     def exit_one(self, task, now=None):
-        op = self.operation_record(task.get("operation_id"))
-        saved = [json.dumps(task["exit"], sort_keys=True)]
+        self.follow_exit("scheduled", task, self.operation_record(task.get("operation_id")), now)
+
+    def follow_exit(self, table, row, op, now=None, exited=None):
+        """Advance the exit watch kept in ``row["exit"]``; ``exited`` tidies up after an exit."""
+        saved = [json.dumps(row["exit"], sort_keys=True)]
 
         def persist(record):
             # Compare and swap: a key is sent only after this process claims the watch it
@@ -1705,19 +1776,72 @@ class Workspaces:
             # Not save_scheduled: progress must not reorder the outcome list.
             with self.db() as db:
                 db.execute("BEGIN IMMEDIATE")
-                row = db.execute("SELECT data FROM scheduled WHERE id=?", (task["id"],)).fetchone()
-                current = json.loads(row[0]) if row else None
+                found = db.execute(f"SELECT data FROM {table} WHERE id=?", (row["id"],)).fetchone()
+                current = json.loads(found[0]) if found else None
                 if not current or json.dumps(current.get("exit"), sort_keys=True) != saved[0]:
                     raise workspace_exit.Leave("This watch changed elsewhere; nothing was sent")
                 current["exit"] = record
                 db.execute(
-                    "UPDATE scheduled SET data=? WHERE id=?", (json.dumps(current), task["id"])
+                    f"UPDATE {table} SET data=? WHERE id=?", (json.dumps(current), row["id"])
                 )
             saved[0] = json.dumps(record, sort_keys=True)
 
-        record = workspace_exit.step(task["exit"], op, persist, now)
+        record = workspace_exit.step(row["exit"], op, persist, now)
+        if exited and record["state"] == "exited":
+            exited(record)
         if json.dumps(record, sort_keys=True) != saved[0]:
             persist(record)
+
+    def exit_launched(self, now=None):
+        """Exit the agents ``wt --exit-when-done`` started once they confirm they are done."""
+        with self.db() as db:
+            watches = [
+                json.loads(data)
+                for (data,) in db.execute(
+                    "SELECT data FROM exit_watches WHERE json_extract(data,'$.exit.state')='watching'"
+                )
+            ]
+        for watch in watches:
+            try:
+                self.exit_launch(watch, now)
+            except Exception:
+                continue  # One watch must not stop the others; the next pass retries it.
+
+    def exit_launch(self, watch, now=None):
+        now = time.time() if now is None else now
+
+        def exited(record):
+            try:
+                record["message"] += close_launched(watch, record)
+            except Exception as exc:
+                # The agent is gone either way; the watch must still record that.
+                record["message"] += f"; its pane is still open ({exc})"
+
+        self.follow_exit("exit_watches", watch, launched_operation(watch, now), now, exited)
+
+    def launched_exits(self):
+        """``wt --exit-when-done`` watches, newest first, as the Scheduled tab lists them."""
+        with self.db() as db:
+            rows = [data for (data,) in db.execute("SELECT data FROM exit_watches")]
+        listed = []
+        for data in rows:
+            try:
+                w = json.loads(data)
+                listed.append(
+                    {
+                        "id": w["id"],
+                        "label": w["label"],
+                        "path": w["path"],
+                        "agent": w["agent"],
+                        "created_at": float(w["created_at"]),
+                        "state": w["exit"]["state"],
+                        "message": w["exit"]["message"],
+                        "url": f"{COLLIE_URL}/space/{quote(w['workspace_id'], safe='')}",
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue  # A row this version cannot read must not hide the others.
+        return sorted(listed, key=lambda w: w["created_at"], reverse=True)
 
     def operation_status(self, key):
         """The current operation with this ID, as a snapshot shows it, or None.
@@ -1787,7 +1911,8 @@ class Workspaces:
         return None
 
     def prune_history(self, now=None):
-        """Forget month-old finished operations and month-missing checkouts; at most hourly.
+        """Forget month-old finished operations, exit watches and month-missing checkouts;
+        at most hourly.
 
         Queued, running and uncertain operations are always kept, as is the record a
         scheduled task names, and an item's current operation while its checkout exists.
@@ -1817,6 +1942,15 @@ class Workspaces:
                     and not (op.get("path") and os.path.lexists(op["path"]))
                 ):
                     db.execute("DELETE FROM operations WHERE pr=? AND data=?", (key, data))
+            # Finished `wt --exit-when-done` watches: the most recent ones from the last month.
+            db.execute(
+                """DELETE FROM exit_watches
+                   WHERE coalesce(json_extract(data,'$.exit.state'),'') NOT IN ('watching','exiting')
+                   AND (json_extract(data,'$.created_at') < ?
+                        OR id NOT IN (SELECT id FROM exit_watches
+                                      ORDER BY json_extract(data,'$.created_at') DESC LIMIT ?))""",
+                (cutoff, LAUNCH_HISTORY),
+            )
             for key, path, data in db.execute("SELECT pr,path,data FROM associations").fetchall():
                 record = json.loads(data)
                 if os.path.lexists(path):
@@ -1863,6 +1997,10 @@ class Workspaces:
                 pass  # The scheduler must outlive any single failure; the next pass retries.
             try:
                 self.exit_finished()
+            except Exception:
+                pass
+            try:
+                self.exit_launched()
             except Exception:
                 pass
             try:

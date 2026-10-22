@@ -3678,6 +3678,28 @@ function scheduledCard(task) {
   }
   return card;
 }
+const launchedNames = {
+  watching: ["Watching", "blue"],
+  exiting: ["Exiting", "blue"],
+  exited: ["Exited", "green"],
+  left_open: ["Left open", "amber"],
+  unconfirmed: ["Check pane", "amber"],
+};
+// A `wt --exit-when-done` launch: the dashboard only follows its agent.
+function launchedCard(watch) {
+  const card = el("li", undefined, "scheduled-task");
+  card.dataset.id = watch.id;
+  const [label, color] = launchedNames[watch.state] || [watch.state, ""];
+  const head = el("div", undefined, "scheduled-when");
+  head.append(el("strong", scheduleTime(watch.created_at)), el("span", label, `badge ${color}`));
+  const subject = el("div", undefined, "scheduled-subject");
+  subject.append(el("span", watch.label), el("span", watch.path, "scheduled-title"));
+  card.append(head, subject, el("small", `Agent: ${watch.message}`, "scheduled-exit"));
+  const open = el("div", undefined, "scheduled-open");
+  open.append(link("Open in Collie", watch.url));
+  card.append(open);
+  return card;
+}
 // Polls rebuild the cards only when the tasks change, so an opened task text stays open
 // and focus stays put; the countdowns are kept current in place.
 let scheduledKey = null;
@@ -3693,7 +3715,8 @@ function renderScheduled() {
   $("scheduled-status").textContent = !scheduledData
     ? "Loading scheduled tasks…"
     : "Tasks start at their time while the dashboard is running. A task due while it was stopped starts when it returns, up to a day late.";
-  const key = JSON.stringify([tasks, [...scheduledCancelling]]);
+  const launched = scheduledData?.launched ?? [];
+  const key = JSON.stringify([tasks, launched, [...scheduledCancelling]]);
   if (key !== scheduledKey) {
     scheduledKey = key;
     // Give focus back to the same control of the same task.
@@ -3703,6 +3726,7 @@ function renderScheduled() {
     const position = card ? controls(card).indexOf(active) : -1;
     $("scheduled-pending").replaceChildren(...pending.map(scheduledCard));
     $("scheduled-history").replaceChildren(...history.map(scheduledCard));
+    $("launched-list").replaceChildren(...launched.map(launchedCard));
     const rebuilt =
       card &&
       [...$("scheduled-panel").querySelectorAll("li[data-id]")].find(
@@ -3714,6 +3738,7 @@ function renderScheduled() {
     setText(node, until(Number(node.dataset.until)));
   $("scheduled-empty").hidden = !scheduledData || pending.length > 0;
   $("scheduled-history-heading").hidden = !history.length;
+  $("launched-heading").hidden = !launched.length;
 }
 async function refreshScheduled() {
   if (scheduledBusy || document.hidden) return;
