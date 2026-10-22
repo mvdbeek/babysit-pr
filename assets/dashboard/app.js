@@ -975,6 +975,8 @@ function sortedNames(values) {
   return [...(values || [])].sort();
 }
 function prReviewBadges(pr) {
+  if (pr.state === "MERGED") return [["Merged", "green"]];
+  if (pr.state === "CLOSED") return [["Closed", ""]];
   const badges = pr.draft ? [["Draft", ""]] : [];
   if (pr.review_decision === "APPROVED") badges.push(["Approved", "green pr-approved"]);
   else if (pr.review_decision === "CHANGES_REQUESTED")
@@ -989,7 +991,10 @@ function prReviewBadges(pr) {
   return badges;
 }
 function prNeedsChanges(pr) {
-  return pr.review_decision === "CHANGES_REQUESTED" || pr.unresolved_threads > 0;
+  return (
+    (!pr.state || pr.state === "OPEN") &&
+    (pr.review_decision === "CHANGES_REQUESTED" || pr.unresolved_threads > 0)
+  );
 }
 
 // One sortable, filterable overview table with "since your last visit" highlighting.
@@ -1613,12 +1618,12 @@ const prTable = itemTable({
     }),
   text: {
     short: "PR",
-    open: "Open PRs",
+    open: "Pull requests",
     activity: "PR activity changed",
     noMatch: "No matching pull requests.",
-    none: "No open pull requests for your roles.",
+    none: "No pull requests for your roles.",
     unavailable: "PR data is unavailable. Check GitHub authentication and the sync error above.",
-    loading: "Loading your open pull requests…",
+    loading: "Loading your pull requests…",
     refreshError: "Cannot refresh PR overview",
   },
   changeFields: {
@@ -1629,10 +1634,12 @@ const prTable = itemTable({
     review_decision: "Review",
     unresolved_threads: "Review threads",
     draft: "Draft status",
+    state: "PR state",
     roles: "Your role",
     head_sha: "New commits",
   },
   changeValue(pr, field) {
+    if (field === "state") return pr.state || "OPEN";
     if (field === "roles") return sortedNames(pr.roles);
     // Zero threads equals an absent count, so snapshots saved before it existed stay quiet.
     if (field === "unresolved_threads") return pr.unresolved_threads || null;
@@ -1660,7 +1667,14 @@ const prTable = itemTable({
     (f.ci === "all" || pr.ci === f.ci || (f.ci === "UNKNOWN" && !ciStates[pr.ci])) &&
     (f.repo === "all" || pr.repo === f.repo) &&
     (f.review === "all" ||
-      (f.review === "feedback" ? prNeedsChanges(pr) : f.review === "draft" ? pr.draft : !pr.draft)),
+      (f.review === "merged" || f.review === "closed"
+        ? pr.state === f.review.toUpperCase()
+        : (!pr.state || pr.state === "OPEN") &&
+          (f.review === "feedback"
+            ? prNeedsChanges(pr)
+            : f.review === "draft"
+              ? pr.draft
+              : !pr.draft))),
   searchText: (pr) => `${pr.repo} ${pr.title} ${pr.number} ${pr.author || ""}`,
   row(pr) {
     const title = el("td", undefined, "pr-description");
@@ -1691,6 +1705,7 @@ const prTable = itemTable({
         review_decision: readiness,
         unresolved_threads: readiness,
         draft: readiness,
+        state: readiness,
         roles,
         head_sha: updated,
       },

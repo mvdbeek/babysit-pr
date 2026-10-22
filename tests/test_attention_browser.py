@@ -5,10 +5,14 @@ import re
 import time
 
 import attention
+import pr_overview
 import pytest
 from playwright.sync_api import Page, expect
+from test_dashboard_browser import choose_option
 from test_dashboard_browser import dashboard_site as dashboard_site  # noqa: F401 - fixture
 from test_dashboard_browser import workspace_routes as workspace_routes  # noqa: F401 - fixture
+from test_pr_overview import page as search_page
+from test_pr_overview import pr as search_pr
 from test_workspace_overview_browser import link as overview_link
 from test_workspace_overview_browser import row as overview_row
 
@@ -128,6 +132,44 @@ def test_show_in_tab_reveals_the_item_on_its_overview(page: Page, dashboard_site
     page.get_by_role("link", name="Show in Watcher").click()
     expect(page.locator("#watcher-panel")).to_be_visible()
     expect(page.locator("#detail")).to_contain_text("Feedback awaits approval")
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+def test_a_mention_on_a_finished_pr_appears_in_both_tabs(page, dashboard_site, monkeypatch, state):
+    url, _ = dashboard_site
+    mentioned = search_pr(
+        "mentioned",
+        number=1764,
+        title="Update PhysiCell Studio",
+        state=state,
+        reviewDecision="APPROVED",
+    )
+    monkeypatch.setattr(
+        pr_overview,
+        "github_page",
+        lambda query, *args: search_page([mentioned] if "mentions:" in query else []),
+    )
+    snapshot = {**pr_overview.collect(), "synced_at": time.time(), "error": None}
+    monkeypatch.setattr(pr_overview.Overview, "snapshot", lambda self: snapshot)
+    page.goto(url)
+    card = page.locator(".attention-item").filter(has_text="Update PhysiCell Studio")
+    expect(card).to_be_visible()
+    expect(card).to_contain_text("You were mentioned")
+    expect(card.get_by_role("button", name="Review pull request", exact=True)).to_have_count(0)
+    card.get_by_role("link", name="Show in Pull requests").click()
+    row = page.locator("#pr-list tr").filter(has_text="Update PhysiCell Studio")
+    expect(row).to_be_visible()
+    expect(row.locator(".pr-readiness")).to_have_text(state.capitalize())
+    expect(row).not_to_contain_text("Ready for review")
+    expect(page.locator("#pr-sync")).to_contain_text("Pull requests")
+    review_filter = page.get_by_role("combobox", name="Filter pull requests by review status")
+    for value in ("ready", "draft", "feedback"):
+        choose_option(review_filter, value)
+        expect(row).to_have_count(0)
+    choose_option(review_filter, state.lower())
+    expect(row).to_be_visible()
+    choose_option(page.get_by_role("combobox", name="Filter pull requests by role"), "mentioned")
+    expect(row).to_be_visible()
 
 
 def test_agents_chip_counts_waiting_agents_and_opens_the_tab(page: Page, dashboard_site) -> None:

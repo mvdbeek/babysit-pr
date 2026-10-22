@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import github_cli
@@ -20,6 +21,8 @@ from latest_activity import activity_fragment, latest_activity, notification_act
 POLL_SECONDS = 300
 # GitHub search exposes at most this many results per query.
 SEARCH_LIMIT = 1000
+# Keep post-closure discussion without scanning years of finished PRs on every refresh.
+CLOSED_MENTION_DAYS = 30
 # Nodes per search page. GitHub stops a GraphQL query after about 10 seconds and answers
 # 502 or 504; 50 PRs with their threads and activity took that long, 25 about 6 seconds.
 PAGE_SIZE = 25
@@ -71,6 +74,7 @@ def pr_record(node, roles):
         "url": node["url"],
         "repo": node["repository"]["nameWithOwner"],
         "author": (node.get("author") or {}).get("login"),
+        "state": node["state"],
         "head_repo": (node.get("headRepository") or {}).get("nameWithOwner"),
         "head_branch": node.get("headRefName"),
         "head_sha": node.get("headRefOid"),
@@ -108,6 +112,8 @@ class Kind:
     fragment: str  # GraphQL inline fragment for one search node.
     cache: str  # Cache file name under the watcher state directory.
     record: Callable[[dict, list[str]], dict] = field(repr=False)
+    # Discussions can still need a response after a PR has merged or closed.
+    mention_search: str | None = None
 
 
 PRS = Kind(
@@ -118,6 +124,7 @@ PRS = Kind(
     fragment=PR_FRAGMENT,
     cache="pr-overview.json",
     record=pr_record,
+    mention_search="is:pr is:closed",
 )
 
 
@@ -167,12 +174,27 @@ def collect(kind: Kind = PRS, mentions=True):
     searched = {
         role: qualifier for role, qualifier in kind.roles.items() if mentions or role != "mentioned"
     }
-    for role, qualifier in searched.items():
+    searches = [
+        (role, f"{kind.search} {qualifier}:@me", {"OPEN"}) for role, qualifier in searched.items()
+    ]
+    if mentions and kind.mention_search:
+        since = (datetime.now(UTC) - timedelta(days=CLOSED_MENTION_DAYS)).date().isoformat()
+        searches.append(
+            (
+                "mentioned",
+                f"{kind.mention_search} mentions:@me updated:>={since}",
+                {"CLOSED", "MERGED"},
+            )
+        )
+    for role, query, states in searches:
         cursor, size, listed = None, PAGE_SIZE, 0
         while listed < SEARCH_LIMIT:
             try:
                 data = github_page(
-                    f"{kind.search} {qualifier}:@me sort:updated-desc", cursor, kind.fragment, size
+                    f"{query} sort:updated-desc",
+                    cursor,
+                    kind.fragment,
+                    size,
                 )
             except SearchTimeout:
                 # A slow moment at GitHub: the same page again, half as long.
@@ -186,7 +208,7 @@ def collect(kind: Kind = PRS, mentions=True):
             login = data["viewer"]["login"]
             search = data["search"]
             for node in search["nodes"]:
-                if not node or node.get("state") != "OPEN":
+                if not node or node.get("state") not in states:
                     continue
                 key = node["id"]
                 roles = items[key]["roles"] if key in items else []
