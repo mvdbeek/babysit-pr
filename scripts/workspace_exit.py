@@ -20,12 +20,12 @@ from pathlib import Path
 import claude_accounts
 import herdr_handoff as handoff
 
-BRIEF = (
-    "\n\nThis task was scheduled to run unattended. When it is finished and nothing more "
-    "is needed from the user, end your final response with this line:\n{marker}\n"
-    "Leave the line out if you stop to ask a question or cannot finish; the session then "
-    "stays open for the user.\n"
-)
+# Shared with wt, which must stay cheap to import.
+from exit_watch import BRIEF as BRIEF
+from exit_watch import brief as brief
+from exit_watch import new_marker as new_marker
+from exit_watch import watching as watching
+
 # A session transcript appears once the agent records its first prompt.
 LOCATE_LIMIT = 15 * 60
 # An agent still working after this long is left to the user.
@@ -42,22 +42,6 @@ class Wait(Exception):
 
 class Leave(Exception):
     """Stop watching and leave the agent open."""
-
-
-def new_marker():
-    return f"[babysit-done:{uuid.uuid4().hex[:16]}]"
-
-
-def brief(marker):
-    return BRIEF.format(marker=marker)
-
-
-def watching(now=None):
-    return {
-        "state": "watching",
-        "since": time.time() if now is None else now,
-        "message": "Waiting for the agent to finish",
-    }
 
 
 def capture(op):

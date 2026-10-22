@@ -400,7 +400,9 @@ handoff does. The pane, its shell and the worktree stay. A turn that ends any ot
 way (for example with a question), any later turn, or a changed agent process
 leaves the agent open and stops watching. A draft in the input box or a scrolled
 terminal only delays the exit and restarts the 20 seconds. The Scheduled tab shows
-the result under **Agent:**. Tasks started immediately are never exited.
+the result under **Agent:**. Tasks started immediately are never exited. Sessions
+started with `wt --exit-when-done` (see [Worktree helper](#worktree-helper)) are
+followed the same way and listed under their own heading on the Scheduled tab.
 
 ### Handling several issues
 
@@ -558,8 +560,8 @@ only when starting a new session. Codex receives `--model` and
 `-c 'model_reasoning_effort="…"'`; Claude receives `--model` and `--effort`.
 CLI configuration precedence and organization policies still apply, including
 Codex managed new-thread defaults that can change when either override is supplied.
-Keep `wt.py` and `claude_accounts.py` alongside `pr_workspaces.py` when distributing the scripts; there is
-no separate installed helper to update.
+Keep `wt.py`, `claude_accounts.py` and `exit_watch.py` alongside `pr_workspaces.py` when
+distributing the scripts; there is no separate installed helper to update.
 
 References (verified against installed CLI help and official documentation):
 
@@ -733,7 +735,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude] [--docker] [--with repo]... [-r repo] [-p text|-F file] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude] [--docker] [--with repo]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
@@ -792,6 +794,30 @@ typed agent command reads it back with `"$(cat '…')"`, so the line the multipl
 types stays short whatever the prompt's size (canonical tty input silently drops
 lines over 1024 bytes on macOS). A prompt only applies to a session being created;
 reattaching to an existing worktree warns on stderr that the prompt was ignored.
+
+`--exit-when-done` (all three commands) is for unattended sessions, such as per-PR
+reviews fanned out by a cron agent, that should end once they are done. It needs a
+prompt and herdr, and is refused before anything is made with tmux, cmux or `none`,
+because the dashboard finds, exits and closes the agent through its herdr pane. The
+prompt gets the same closing instruction scheduled tasks use, asking for a
+`[babysit-done:…]` last line. Before typing the agent command, `wt` records a watch
+(workspace, pane, checkout, agent, marker and start time) in the `exit_watches` table
+of the dashboard's `pr-workspaces.sqlite`, under `$BABYSIT_HOME` or
+`~/.local/state/babysit-pr`; Safehouse already lets agents write there. The
+dashboard follows it like a scheduled task's agent: once the first turn ends with
+the marker and the agent stays idle for 20 seconds, it presses Ctrl-D. It then closes
+the herdr workspace if the agent's pane was its only pane, or only the pane
+otherwise, and only if nothing but the shell is left running in it. The worktree and
+branch always stay, so the session can be resumed from the dashboard later. A
+question, a later turn, a changed process, or no agent showing up within two minutes
+leaves the agent open and ends the watch. Nothing exits while no dashboard runs on
+that state home: the watch waits, and a dashboard started within the week picks it
+up. Two dashboards on one home claim each exit with a compare-and-swap, so only one
+sends the key. Reattaching to an existing session ignores the flag along with the
+prompt, with a warning, and records nothing. The Scheduled tab lists these watches
+with their outcome and an **Open in Collie** link; finished ones are kept for a
+month, at most the latest 100.
+
 Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
 the planning code without processes and the whole tool against temporary
 repositories with fake `gh`, `herdr`, `tmux`, `cmux` and agent executables.

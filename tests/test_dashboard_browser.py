@@ -3133,6 +3133,56 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
     assert cancels == [("schedule-cancel", {"id": "later"})]
 
 
+@pytest.mark.parametrize("width", [1280, 390])
+def test_scheduled_tab_lists_wt_exit_watches(page, dashboard_site, width):
+    url, _ = dashboard_site
+    now = time.time()
+    launched = [
+        {
+            "id": "a1",
+            "label": "review-pr-12",
+            "path": "/Users/someone/src/worktrees/a-repository-with-a-long-name/review-pr-12",
+            "agent": "claude",
+            "created_at": now - 60,
+            "state": "exited",
+            "message": "The agent confirmed the task was done and exited; its workspace was closed",
+            "url": "https://collie.example.ts.net/space/w7",
+        },
+        {
+            "id": "a2",
+            "label": '<img src=x onerror="window.injected=true">',
+            "path": "/wt/x",
+            "agent": "codex",
+            "created_at": now - 120,
+            "state": "left_open",
+            "message": "The agent ended its turn without confirming the task was done; left open",
+            "url": "https://collie.example.ts.net/space/w8",
+        },
+    ]
+    page.route(
+        "**/api/scheduled-tasks",
+        lambda route: route.fulfill(
+            json={"enabled": True, "time": now, "tasks": [], "launched": launched}
+        ),
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#scheduled")
+    expect(page.locator("#launched-heading")).to_be_visible()
+    items = page.locator("#launched-list li")
+    expect(items).to_have_count(2)
+    expect(items.first).to_contain_text("Exited")
+    expect(items.first).to_contain_text("review-pr-12")
+    expect(items.first).to_contain_text("Agent: The agent confirmed the task was done and exited")
+    expect(items.first.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "https://collie.example.ts.net/space/w7"
+    )
+    expect(items.last).to_contain_text("Left open")
+    assert page.locator("#scheduled-panel img").count() == 0
+    assert not page.evaluate("window.injected")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/scheduled-launched-{width}.png", full_page=True)
+
+
 def test_scheduled_tab_is_hidden_without_workspace_actions(page, dashboard_site):
     url, _ = dashboard_site
     page.goto(url + "/#scheduled")

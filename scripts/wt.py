@@ -75,6 +75,7 @@ WT_OPTIONS = frozenset(
         "-F",
         "--prompt-file",
         "--with",
+        "--exit-when-done",
     }
 )
 DASHBOARD_OPTIONS = frozenset(
@@ -115,6 +116,7 @@ options:
   -r repo       use ~/src/<repo> instead of ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
+  --exit-when-done  have the dashboard exit the agent once it says the task is done
   -h, --help    show this help
 
 dashboard options (a new branch from the remote default branch unless <base> is given):
@@ -125,11 +127,20 @@ dashboard options (a new branch from the remote default branch unless <base> is 
 The prompt only applies to a session being created; if one is already running for
 the worktree it is reattached and the prompt is ignored (with a warning).
 
+--exit-when-done needs a prompt and herdr. The prompt asks the agent to end its final
+answer with a marker line, and a watch is recorded for the dashboard (in
+$BABYSIT_HOME, default ~/.local/state/babysit-pr). Once the agent's first turn ends
+with the marker and it stays idle, the dashboard exits it and closes its pane, or its
+workspace when that pane was all it held. The worktree and branch stay. A question, a
+later turn or no marker leaves the agent open. Nothing exits while no dashboard runs.
+
 examples:
   # fire off a fix with a brief, no pasting
   wt -F /tmp/diagnosis.md release_26.1 workflow-copy-drops-readme
   wt -p 'Fix the failing tests in lib/galaxy/tools' dev my-branch
   wt --codex -p 'Review this PR for security issues' 22886
+  # an unattended review the dashboard exits once it is done
+  wt -F /tmp/review-brief.md --exit-when-done 22886
 """
 
 WTI_HELP = """\
@@ -154,6 +165,8 @@ options:
   -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
+  --exit-when-done  have the dashboard exit the agent once it says the task is done
+                (see wt --help)
   --name <name>           reserve a new worktree and branch with this explicit name
   --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
@@ -182,6 +195,8 @@ options:
   -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
+  --exit-when-done  have the dashboard exit the agent once it says the task is done
+                (see wt --help)
   --name <name>           reserve a new worktree and branch with this explicit name
   --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
@@ -239,6 +254,7 @@ class Options:
         "agent_args",
         "also",
         "also_checkouts",
+        "exit_when_done",
         "positional",
     )
 
@@ -260,6 +276,7 @@ class Options:
         # `--with` clones, then the checkouts open_session makes in them for the agent.
         self.also: list[str] = []
         self.also_checkouts: list[AlsoCheckout] = []
+        self.exit_when_done = False
         self.positional: list[str] = []
 
 
@@ -298,6 +315,8 @@ def parse_args(
             options.docker = True
         elif flag == "--no-focus":
             options.focus = False
+        elif flag == "--exit-when-done":
+            options.exit_when_done = True
         else:
             if len(args) < 2 or not args[1]:
                 raise WtError(f"{command}: {flag} needs a value")
@@ -581,10 +600,14 @@ def herdr_is_running(output: str) -> bool:
 class HerdrOpen(NamedTuple):
     already_open: bool
     root_pane: str
+    workspace_id: str = ""
 
 
 def parse_herdr_open(output: str) -> HerdrOpen:
-    """``already_open`` and the root pane id from ``herdr worktree open``'s JSON reply."""
+    """``already_open``, the root pane id and the workspace id from ``herdr worktree open``.
+
+    A reply without the workspace names it in the root pane id, ``<workspace>:<pane>``.
+    """
     try:
         reply = json.loads(output)
     except ValueError:
@@ -598,7 +621,12 @@ def parse_herdr_open(output: str) -> HerdrOpen:
         raise WtError("wt: unexpected herdr reply")
     root = result.get("root_pane")
     pane = root.get("pane_id") if isinstance(root, dict) else None
-    return HerdrOpen(result.get("already_open") is True, pane if isinstance(pane, str) else "")
+    pane = pane if isinstance(pane, str) else ""
+    space = result.get("workspace")
+    workspace = space.get("workspace_id") if isinstance(space, dict) else None
+    if not isinstance(workspace, str) or not workspace:
+        workspace = pane.split(":")[0] if ":" in pane else ""
+    return HerdrOpen(result.get("already_open") is True, pane, workspace)
 
 
 def herdr_error_message(output: str) -> str:
@@ -762,6 +790,10 @@ class Tool:
         self.isatty = isatty or (lambda: sys.stdin is not None and sys.stdin.isatty())
         self.stage = stage or stage_prompt
         self.home = self.env.get("HOME") or os.path.expanduser("~")
+        # The dashboard's state home, where --exit-when-done records its watch.
+        self.babysit_home = self.env.get("BABYSIT_HOME") or os.path.join(
+            self.home, ".local", "state", "babysit-pr"
+        )
 
     # -- small process helpers --
 
@@ -989,20 +1021,78 @@ class Tool:
         if reply.already_open:
             # Existing workspaces retain their agents; focus follows the explicit option.
             if options.prompt:
+                also = " and --exit-when-done" if options.exit_when_done else ""
                 self.warn(
-                    f"wt: a herdr workspace for {directory} already exists; ignoring the prompt"
+                    f"wt: a herdr workspace for {directory} already exists; "
+                    f"ignoring the prompt{also}"
                 )
             self.warn_reattached(options)
             return
         if not reply.root_pane:
             raise WtError(f"wt: herdr did not return a root pane for {directory}")
+        watch, marker = None, ""
+        if options.exit_when_done:
+            import exit_watch
+
+            if not reply.workspace_id:
+                raise WtError(f"wt: herdr did not name the workspace for {directory}")
+            marker = exit_watch.new_marker()
+            # Last, after any --with note: the brief asks for the marker as the final line.
+            options.prompt += exit_watch.brief(marker)
         command = self.command_for(options, directory=directory)
+        if options.exit_when_done:
+            # Recorded before the command is typed, so no agent waits on an unsaved watch.
+            watch = self.watch_exit(options, directory, name, reply, marker)
         # No spare terminal split here: reviewr's auto_open is off, so the workspace
         # holds just the agent; open reviewr with its toggle action when wanted.
         # pane run submits text + Enter; the pty buffers it until the new shell reads it.
-        result = self.runner.run(["herdr", "pane", "run", reply.root_pane, command])
+        try:
+            result = self.runner.run(["herdr", "pane", "run", reply.root_pane, command])
+        except BaseException:
+            self.forget_watch(watch)
+            raise
         if result.returncode:
+            self.forget_watch(watch)
             raise WtError(f"wt: herdr pane run failed: {result.stderr.strip()}".rstrip(": "))
+
+    def forget_watch(self, watch: str | None) -> None:
+        if watch:
+            import exit_watch
+
+            try:
+                exit_watch.forget(self.babysit_home, watch)
+            except OSError:
+                pass  # The dashboard leaves it once no agent shows up in the pane.
+
+    def watch_exit(
+        self, options: Options, directory: str, name: str, reply: HerdrOpen, marker: str
+    ) -> str:
+        """Record the exit watch the dashboard follows for the agent about to be typed."""
+        import time
+        import uuid
+
+        import exit_watch
+
+        now = time.time()
+        watch = {
+            "id": uuid.uuid4().hex,
+            "label": sanitize_session_name(options.label or name),
+            "path": os.path.realpath(directory),
+            "workspace_id": reply.workspace_id,
+            "pane_id": reply.root_pane,
+            "agent": options.agent,
+            "claude_account": options.claude_account or None,
+            "marker": marker,
+            "created_at": now,
+            "exit": exit_watch.watching(now),
+        }
+        try:
+            exit_watch.register(self.babysit_home, watch)
+        except OSError as exc:
+            raise WtError(
+                f"wt: could not record the exit watch in {self.babysit_home}: {exc}"
+            ) from None
+        return watch["id"]
 
     def session_tmux(self, options: Options, directory: str, name: str) -> None:
         session = sanitize_session_name(name)
@@ -1285,8 +1375,38 @@ class Tool:
         self.git_action(directory, "config", f"branch.{local_branch}.merge", f"refs/heads/{branch}")
         self.open_session(options, directory, local_branch, repo_path)
 
+    def check_exit_when_done(self, options: Options, command: str) -> None:
+        """Refuse ``--exit-when-done`` before anything is made when it cannot work."""
+        if not options.prompt:
+            raise UsageError(command, f"{command}: --exit-when-done needs a prompt (-p or -F)")
+        import exit_watch
+
+        mux = self.multiplexer()
+        if mux != "herdr" or not self.runner.which("herdr"):
+            chosen = self.env.get("WT_MULTIPLEXER") or "auto"
+            reason = (
+                "herdr is not on PATH"
+                if mux == "herdr"
+                else f"WT_MULTIPLEXER={chosen} chose {mux}"
+                if chosen == "auto"
+                else f"WT_MULTIPLEXER is {chosen}"
+            )
+            raise WtError(
+                f"{command}: --exit-when-done needs herdr ({reason}): "
+                "the dashboard finds, exits and closes the agent through its herdr pane"
+            )
+        try:
+            with exit_watch.connect(self.babysit_home):
+                pass
+        except OSError as exc:
+            raise WtError(
+                f"{command}: --exit-when-done cannot record its watch in {self.babysit_home}: {exc}"
+            ) from None
+
     def run(self, command: str, argv: Sequence[str]) -> None:
         options = parse_args(command, argv)
+        if options.exit_when_done:
+            self.check_exit_when_done(options, command)
         options.also = [self.also_clone(value, command) for value in options.also]
         getattr(self, f"run_{command}")(options)
 
