@@ -124,6 +124,9 @@ activity first, and a group heading collapses its rows:
   a pull request whose review was requested from you or from a team you are on, or a
   workspace agent that returned to its prompt and has not been looked at yet (herdr's
   **done**; an agent merely sitting idle needs nobody).
+  Pull requests where you were **mentioned** also appear here, including merged or
+  closed PRs whose discussion may still need a response. This marks a mention, not
+  a verified unanswered question; use **Wait for activity** to set it aside.
 - **Unblock**: your pull request with failing CI and no live watch (a watch repairs
   it itself; a paused one does not), changes requested or unresolved review threads
   on your pull request, a workspace launch that failed in the last day or needs
@@ -215,8 +218,8 @@ activity, register a repair watch, or create a workspace.
 
 Pins are saved in this browser and dashboard origin, separately for each GitHub
 account and item kind, under `babysit-pr:pins-prs:v1:<login>` and
-`babysit-pr:pins-issues:v1:<login>`, using GitHub node IDs. Closed, deleted, or
-otherwise absent items stay out of the overview; their pins remain saved in case
+`babysit-pr:pins-issues:v1:<login>`, using GitHub node IDs. Items absent from discovery
+stay out of the overview; their pins remain saved in case
 they reappear. If browser storage is unavailable, pins work for the current tab
 and a notice explains that they cannot persist. Pin controls support Enter and
 Space, retain keyboard focus when rows move, and have touch-sized targets on mobile.
@@ -227,6 +230,11 @@ involved in reviewing (including team requests and completed reviews), or are
 requested** marks the PRs still waiting on a review from you or one of your teams.
 It uses the active `gh` account on github.com. No registration is needed. These PRs are a
 read-only discovery results. Workspace actions require an explicit click and never register repair watches.
+The **Mentioned** search also includes merged and closed PRs updated in the last 30 days,
+so follow-up discussion after merging remains visible without scanning years of history.
+Those rows show **Merged** or **Closed**, have matching
+review-status filters, and do not appear as ready for review or needing changes.
+The other role searches remain limited to open PRs.
 
 Mention searches are on by default for both PRs and issues. To turn them off, write
 `{"mentions": false}` to `overview-config.json` in the watcher state directory
@@ -1118,8 +1126,8 @@ while the PR tab is visible. Opening the Watcher tab alone does not mark PRs as
 seen. Failed or in-progress syncs do not overwrite the last saved snapshot, and an
 older tab cannot replace a newer snapshot. If browser storage is unavailable,
 comparisons still work during the current visit. This uses the existing overview
-data and adds no server storage or GitHub requests. Closed PRs leave the open-PR
-overview.
+data and adds no server storage or GitHub requests. Closed PRs leave the overview
+unless they are included by the **Mentioned** search.
 
 An opt-in [workspace overview experiment](references/workspaces.md) adds a separate dashboard tab listing your local worktrees and herdr workspaces, the pull request or issue each one belongs to, whether that item is still open or already closed or merged, and the agents running in it. Selected workspaces can be cleaned up in batches: idle agents are asked to exit, the herdr workspace is closed, the worktree is removed, and the local branch is deleted when no commit can be lost. Uncommitted changes, commits only that branch has, and working agents are shown as blockers and skipped unless you override them per row in the confirmation dialog; a checkout an unfinished watch is using is never removed at all (watches marked `closed` or `stopped` no longer protect it), and a clone's own checkout only ever has its herdr workspace closed. Enable it with `{"enabled": true}` in `experiments/workspaces/config.json` under the dashboard state directory, then restart the dashboard; delete that configuration or set `enabled` to `false` to disable it. It has isolated scanning, cache, and errors, and everything is revalidated immediately before removal.
 

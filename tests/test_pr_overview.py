@@ -3,6 +3,7 @@
 import json
 import subprocess
 import threading
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
 import owned_process
@@ -51,6 +52,7 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
             page([pr(updated="2026-09-11T11:00:00Z"), pr("three", ci="PENDING")]),
             page([pr(updated="2026-09-11T10:00:00Z")]),
             page([pr(updated="2026-09-11T09:00:00Z")]),
+            page(),
         ]
     )
     monkeypatch.setattr(overview, "github_page", fetch)
@@ -70,10 +72,46 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
     assert result["prs"][1]["ci"] == "NONE"
     assert result["prs"][1]["author"] is None
     assert fetch.call_args_list[1].args[1] == "next"
-    assert "review-involves:@me" in fetch.call_args_list[-3].args[0]
-    assert "review-requested:@me" in fetch.call_args_list[-2].args[0]
-    assert fetch.call_args_list[-1].args[0] == "is:pr is:open mentions:@me sort:updated-desc"
+    assert "review-involves:@me" in fetch.call_args_list[-4].args[0]
+    assert "review-requested:@me" in fetch.call_args_list[-3].args[0]
+    assert fetch.call_args_list[-2].args[0] == "is:pr is:open mentions:@me sort:updated-desc"
+    since = (datetime.now(UTC) - timedelta(days=30)).date().isoformat()
+    assert fetch.call_args_list[-1].args[0] == (
+        f"is:pr is:closed mentions:@me updated:>={since} sort:updated-desc"
+    )
     assert result["login"] == "alice" and not result["warnings"]
+
+
+def test_mentions_discover_merged_and_closed_prs_without_broadening_other_roles(monkeypatch):
+    merged = pr("merged", state="MERGED")
+    closed = pr("closed", state="CLOSED")
+    fetch = Mock(
+        side_effect=[page([merged, closed])] * 4
+        + [page([pr("open")])]
+        + [page([merged], "next"), page([closed, pr("open"), pr("invalid", state="UNKNOWN")])]
+    )
+    monkeypatch.setattr(overview, "github_page", fetch)
+    result = overview.collect()
+    assert {item["id"]: item["state"] for item in result["prs"]} == {
+        "merged": "MERGED",
+        "closed": "CLOSED",
+        "open": "OPEN",
+    }
+    assert all(item["roles"] == ["mentioned"] for item in result["prs"])
+    assert all("is:open" in call.args[0] for call in fetch.call_args_list[:5])
+    assert all("is:closed" in call.args[0] for call in fetch.call_args_list[5:])
+    assert fetch.call_args_list[-1].args[1] == "next"
+
+
+def test_mention_search_keeps_the_latest_state_when_a_pr_merges_during_refresh(monkeypatch):
+    fetch = Mock(
+        side_effect=[page([pr()]), page(), page(), page(), page()]
+        + [page([pr(updated="2026-09-11T13:00:00Z", state="MERGED")])]
+    )
+    monkeypatch.setattr(overview, "github_page", fetch)
+    [found] = overview.collect()["prs"]
+    assert found["state"] == "MERGED"
+    assert found["roles"] == ["author", "mentioned"]
 
 
 def test_mentions_can_be_left_out(monkeypatch):
@@ -154,11 +192,11 @@ def test_empty_search_still_lists_the_searched_roles(monkeypatch):
 
 def test_search_limit_is_visible(monkeypatch):
     pages = overview.SEARCH_LIMIT // overview.PAGE_SIZE
-    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(pages)] + [page()] * 4)
+    fetch = Mock(side_effect=[page([], str(i), 1001) for i in range(pages)] + [page()] * 5)
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect()
     assert result["warnings"] == ["Only the most recently updated 1,000 author PRs are shown."]
-    assert fetch.call_count == pages + 4
+    assert fetch.call_count == pages + 5
 
 
 def timed_out(status):
@@ -168,7 +206,7 @@ def timed_out(status):
 def test_a_page_github_timed_out_on_is_asked_again_in_smaller_pages(monkeypatch):
     fetch = Mock(
         side_effect=[page([pr()], "next"), timed_out(504), timed_out(502), page([pr("two")])]
-        + [page()] * 4
+        + [page()] * 5
     )
     monkeypatch.setattr(overview, "github_page", fetch)
     result = overview.collect()

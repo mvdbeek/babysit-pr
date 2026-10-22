@@ -902,7 +902,7 @@ def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site
         ),
     )
     page.get_by_role("button", name="Refresh", exact=True).click()
-    expect(page.locator("#pr-empty")).to_have_text("No open pull requests for your roles.")
+    expect(page.locator("#pr-empty")).to_have_text("No pull requests for your roles.")
     expect(page.locator("#pr-alert")).to_be_hidden()
 
 
@@ -2162,7 +2162,7 @@ def test_issue_overview_columns_filters_linked_prs_and_safe_titles(
     expect(rows.last.locator(".pr-assignees")).to_have_text("Unassigned")
     expect(page.locator("#issue-sync")).to_contain_text("@fixture")
     expect(page.locator("#issue-sync")).to_contain_text("Open issues")
-    expect(page.locator("#pr-sync")).to_contain_text("Open PRs")
+    expect(page.locator("#pr-sync")).to_contain_text("Pull requests")
     choose_option(
         page.get_by_role("combobox", name="Filter issues by role", exact=True), "assignee"
     )

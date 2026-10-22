@@ -206,6 +206,39 @@ def test_groups_order_items_and_a_merged_item_takes_its_first_group():
     assert [g["count"] for g in feed["groups"]] == [1, 1, 1, 0, 0, 0]
 
 
+@pytest.mark.parametrize("state", ["OPEN", "MERGED", "CLOSED"])
+def test_mentions_need_attention_in_every_pr_state(state):
+    snapshot = {"login": "me", "prs": [pr(state=state, roles=["mentioned"])]}
+    feed = attention.collect(prs=snapshot, now=NOW)
+    [item] = feed["items"]
+    assert codes(item) == ["mentioned"]
+    assert item["reasons"][0]["text"] == "You were mentioned"
+    assert item["group"] == "review"
+    assert item["pages"] == ["prs"]
+    assert feed["pages"]["prs"] == 1
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("roles", [["author", "mentioned"], ["requested", "mentioned"]])
+@pytest.mark.parametrize("decision", ["APPROVED", "CHANGES_REQUESTED"])
+def test_finished_prs_need_a_response_not_ci_repairs_reviews_or_merging(state, roles, decision):
+    snapshot = {
+        "login": "me",
+        "prs": [
+            pr(
+                state=state,
+                roles=roles,
+                ci="SUCCESS" if decision == "APPROVED" else "FAILURE",
+                review_decision=decision,
+                unresolved_threads=0 if decision == "APPROVED" else 2,
+                review_requests=["me", "team:core"],
+            )
+        ],
+    }
+    [item] = attention.collect(prs=snapshot, now=NOW)["items"]
+    assert codes(item) == ["mentioned"]
+
+
 def test_watch_reasons_cover_feedback_release_and_cleanup():
     jobs = [
         watch(id="fb", url="u/fb", pending_reviews=2),

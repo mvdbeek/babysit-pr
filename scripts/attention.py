@@ -258,8 +258,11 @@ class Feed:
     def prs(self, snapshot, targets, watched):
         for pr in (snapshot or {}).get("prs") or []:
             roles = pr.get("roles") or []
-            mine = "author" in roles
+            is_open = pr.get("state", "OPEN") == "OPEN"
+            mine = is_open and "author" in roles
             reasons = []
+            if "mentioned" in roles:
+                reasons.append(reason("mentioned", "review", "You were mentioned"))
             watch = watched.get(subject_key(pr.get("url")))
             if mine and pr.get("ci") in {"FAILURE", "ERROR"} and watch is None:
                 # A live watch repairs failing CI itself; only unwatched failures need the user.
@@ -290,9 +293,9 @@ class Feed:
                 )
             requests = pr.get("review_requests") or []
             teams = [who.removeprefix("team:") for who in requests if who.startswith("team:")]
-            if not mine and self.login and self.login in requests:
+            if is_open and not mine and self.login and self.login in requests:
                 reasons.append(reason("review_requested", "review", "Your review is requested"))
-            elif not mine and "requested" in roles and teams:
+            elif is_open and not mine and "requested" in roles and teams:
                 # The search knows the team is yours; the live request list confirms it is
                 # still open, since the search index lags behind a submitted review.
                 text = f"Your team's review is requested ({', '.join(teams)})"
