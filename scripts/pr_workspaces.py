@@ -993,6 +993,7 @@ class Workspaces:
             "retry",
             "prefilled",
             "docker",
+            "exit_when_done",
             "start_at",
         }
         if (
@@ -1010,12 +1011,19 @@ class Workspaces:
             }
         ):
             raise ValueError("Invalid workspace action parameters")
-        for field in allowed - {"retry", "prefilled", "docker", "start_at"}:
+        flags = ("retry", "prefilled", "docker", "exit_when_done")
+        for field in allowed - {*flags, "start_at"}:
             if field in request and not isinstance(request[field], str):
                 raise ValueError(f"Expected text for {field}")
-        for field in ("retry", "prefilled", "docker"):
+        for field in flags:
             if field in request and not isinstance(request[field], bool):
                 raise ValueError(f"Expected a {field} flag")
+        if request.get("exit_when_done") and request["action"] not in {
+            "create",
+            "clone-and-create",
+            "handle",
+        }:
+            raise ValueError("Only tasks that start an agent can quit it when done")
         scheduling = "start_at" in request
         if scheduling:
             start = request["start_at"]
@@ -1159,6 +1167,9 @@ class Workspaces:
             "claude_account": None if action == "reopen" else request.get("claude_account") or None,
             # Opens the Docker socket in the agent's Safehouse sandbox (`wt --docker`).
             "docker": action != "reopen" and request.get("docker", False),
+            # `wt --exit-when-done`: once done and idle, the agent is exited and its pane
+            # closed. A scheduled launch is exited through its own marker instead.
+            "exit_when_done": not scheduled and request.get("exit_when_done", False),
             "message": "Queued",
             "log": "",
             "created_at": time.time(),
@@ -1259,15 +1270,15 @@ class Workspaces:
             # Attached files, for the agent only: an issue's body is the task alone.
             "task_files",
             "docker",
+            "exit_when_done",
             "also",
         }
+        flags = {"docker", "exit_when_done"}
         also = request.get("also", [])
         if (
             set(request) - allowed
-            or any(
-                not isinstance(v, str) for k, v in request.items() if k not in {"docker", "also"}
-            )
-            or not isinstance(request.get("docker", False), bool)
+            or any(not isinstance(v, str) for k, v in request.items() if k not in {*flags, "also"})
+            or any(not isinstance(request.get(flag, False), bool) for flag in flags)
             or not isinstance(also, list)
             or any(not isinstance(path, str) for path in also)
         ):
@@ -1326,6 +1337,7 @@ class Workspaces:
             "effort": request.get("effort") or None,
             "claude_account": request.get("claude_account") or None,
             "docker": request.get("docker", False),
+            "exit_when_done": request.get("exit_when_done", False),
             "also": also,
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
             "message": "Queued",
@@ -2179,6 +2191,7 @@ class Workspaces:
                         f"--{op['agent']}",
                         *overrides,
                         *(["--docker"] if op.get("docker") else []),
+                        *(["--exit-when-done"] if op.get("exit_when_done") else []),
                         *(word for c, _ in also for word in ("--with", str(c))),
                         "--no-focus",
                         "--name",
@@ -2213,7 +2226,12 @@ class Workspaces:
                         *args,
                         timeout=600,
                         pass_fds=(lock.fileno(),),
-                        env={**os.environ, "WT_MULTIPLEXER": "herdr"},
+                        # Exit watches go to this dashboard's own state home.
+                        env={
+                            **os.environ,
+                            "WT_MULTIPLEXER": "herdr",
+                            "BABYSIT_HOME": str(self.home),
+                        },
                     )
                     self.save_operation(op, message="Verifying checkout and agent startup")
                     item = checkout(op["path"])

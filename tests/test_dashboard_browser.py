@@ -2625,6 +2625,10 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
     if settings == "claude":
         docker.check()
         dialog.get_by_label("Claude account", exact=True).select_option("work")
+    quit_when_done = dialog.get_by_label("Quit the agent when it is done")
+    expect(quit_when_done).not_to_be_checked()
+    if settings == "codex":
+        quit_when_done.check()
     dialog.get_by_label("Task", exact=True).fill("Fix this")
     if kind == "pr" and not clone and settings == "codex":
         page.screenshot(path="reports/workspace-model-effort-desktop.png")
@@ -2638,6 +2642,7 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
     body = requests[-1]
     assert body["action"] == ("clone-and-create" if clone else "create")
     assert body.get("docker") is (True if settings == "claude" else None)
+    assert body.get("exit_when_done") is (True if settings == "codex" else None)
     assert body.get("claude_account") == ("work" if settings == "claude" else None)
     if settings == "default":
         assert "model" not in body and "effort" not in body
@@ -2989,8 +2994,12 @@ def test_handle_can_start_later_at_a_chosen_time(page, dashboard_site, workspace
     dialog = page.locator("#workspace-dialog")
     start = dialog.get_by_label("Start at")
     expect(start).to_be_hidden()
+    quit_when_done = dialog.get_by_label("Quit the agent when it is done")
+    quit_when_done.check()
     dialog.get_by_label("Start later").check()
     expect(start).to_be_visible()
+    # A scheduled task's agent always quits when done; the choice is not offered.
+    expect(quit_when_done).to_be_hidden()
     assert start.input_value()  # Prefilled about an hour ahead.
     expect(dialog.get_by_role("button", name="Schedule", exact=True)).to_be_visible()
     # A time in the past is refused in the browser and never sent.
@@ -3013,6 +3022,7 @@ def test_handle_can_start_later_at_a_chosen_time(page, dashboard_site, workspace
     expect(page.locator("#workspace-progress")).to_contain_text("Scheduled for")
     assert requests[-1]["action"] == "handle"
     assert requests[-1]["start_at"] == chosen[1]
+    assert "exit_when_done" not in requests[-1]
     assert requests[-1]["task"].startswith("Investigate and fix the failing tests")
     expect(dialog.get_by_role("button", name="Schedule", exact=True)).to_be_disabled()
     # A launch in progress blocks starting another now, but not scheduling one.
@@ -4852,6 +4862,7 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
     assert len(sent) == 1
     dialog.get_by_label("Issue title").fill("Crash on start")
     dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
+    dialog.get_by_label("Quit the agent when it is done").check()
     page.screenshot(path="reports/new-task.png")
     dialog.get_by_role("button", name="Start task").click()
     expect(page.locator("#workspace-progress")).to_contain_text("running")
@@ -4861,6 +4872,7 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
         "issue_title": "Crash on start",
         "agent": "codex",
         "docker": True,
+        "exit_when_done": True,
         "task": "It crashes on start",
     }
     # The dialog follows the operation; once ready it opens the workspace and its viewer,
