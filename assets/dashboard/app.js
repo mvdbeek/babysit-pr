@@ -2657,7 +2657,7 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
   quit.type = "checkbox";
   const quitLabel = el("label", undefined, "workspace-later");
   quitLabel.title =
-    "Once its task is done and it has been idle for 20 seconds, the agent is exited and its herdr pane closed. The checkout stays, so the session can be resumed.";
+    "Once its task is done and it has been idle for 20 seconds, the agent is exited and its herdr pane closed (its workspace, when that was the only pane). The checkout stays, so the session can be resumed.";
   quitLabel.append(quit, " Quit the agent when it is done");
   return {
     agent,

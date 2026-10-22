@@ -403,7 +403,7 @@ terminal only delays the exit and restarts the 20 seconds. The Scheduled tab sho
 the result under **Agent:**. A task started immediately is exited only when **Quit
 the agent when it is done** was ticked (see below). Sessions
 started with `wt --exit-when-done` (see [Worktree helper](#worktree-helper)) are
-followed the same way and listed under their own heading on the Scheduled tab.
+followed the same way and listed under **Quit when done** on the Scheduled tab.
 
 ### Handling several issues
 
@@ -543,6 +543,22 @@ exited sessions resume using the shell's normal defaults. A busy agent, blocked 
 unsent terminal draft, unknown launch option, changed session, or watcher-owned session
 prevents the restart. Unknown access is shown as unavailable, never as disabled.
 Inspection requires macOS Seatbelt. This controls socket access; it does not start Docker.
+
+**Quit the agent when it is done**, beside the agent picker in the follow-up composer,
+works for every message, whether it goes to a running agent or resumes an exited
+session. It suits a closing instruction such as "approve and merge". The message gets
+a line asking the agent to end its answer with a marker, and the dashboard records an
+exit watch (the request field is `exit_when_done: true`; the answer carries
+`exit_watch`). The watch follows the turn whose prompt carries the marker, in the pane
+herdr showed the agent in, and finds the transcript by the session id herdr reported.
+That turn must end with the marker. The agent must then stay idle, unchanged and
+untouched for 20 seconds before it is exited and its pane closed, as for `wt
+--exit-when-done`. A message sent while the agent works joins its running turn (a
+Codex steer, a Claude queued command), and that turn is followed. A question, any later
+turn, or anything else you write to it after the message leaves it open. The checkbox
+clears after each send and whenever the composer opens on another agent. When the agent's pane cannot be identified after delivery, the message
+still stands and the status says the agent will not quit by itself. The Scheduled tab
+lists these watches under **Quit when done** as `Message: <first line>`.
 
 Codex choices come from picker-visible entries and supported reasoning levels in
 `$CODEX_HOME/models_cache.json` (normally `~/.codex/models_cache.json`). This is a

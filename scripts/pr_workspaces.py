@@ -404,10 +404,13 @@ def launched_operation(watch, now):
 
     wt returns once it has typed the agent command, so the launch counts as finished
     when the agent shows up in its workspace, or after a while without it, when the
-    watch then leaves it.
+    watch then leaves it. A message's watch (``follow_up``) names an agent already
+    running: its pane, and its session when herdr knew it.
     """
+    follow_up = watch.get("follow_up", False)
     started = (
-        "target" in watch["exit"]
+        follow_up
+        or "target" in watch["exit"]
         or now - watch["created_at"] > LAUNCH_START_SECONDS
         or agent_in(watch["workspace_id"], watch["path"], watch["agent"])
     )
@@ -420,6 +423,11 @@ def launched_operation(watch, now):
         "claude_account": watch.get("claude_account"),
         "created_at": watch["created_at"],
         "updated_at": watch["created_at"],
+        **(
+            {"follow_up": True, "pane_id": watch["pane_id"], "session_id": watch.get("session_id")}
+            if follow_up
+            else {}
+        ),
     }
 
 

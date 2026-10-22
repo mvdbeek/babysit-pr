@@ -53,6 +53,12 @@ def capture(op):
         if a.get("workspace_id") == op["result"]["workspace_id"]
         and a.get("agent") == op["agent"]
         and Path(a.get("cwd") or "/missing").resolve() == path
+        # A message names the pane it was typed into, and the session running there then.
+        and a["pane_id"] == op.get("pane_id", a["pane_id"])
+        and (
+            not op.get("session_id")
+            or (a.get("agent_session") or {}).get("value") in {None, op["session_id"]}
+        )
     ]
     if len(panes) != 1:
         raise Leave("Could not identify the agent's pane; left open")
@@ -172,6 +178,89 @@ def locate(target, since):
     return {"rollout": str(path.resolve()), "session_id": session_id}
 
 
+def known_session(target, session_id):
+    """The transcript of a session herdr named, wherever and whenever it began.
+
+    A message goes to a session that may have started days ago, outside the date folders
+    and launch time ``locate`` searches.
+    """
+    if target["agent"] == "claude":
+        homes = (
+            [claude_accounts.account_home(target["claude_account"])]
+            if target.get("claude_account")
+            else claude_accounts.homes()
+        )
+        found = [
+            path for home in homes for path in (home / "projects").glob(f"*/{session_id}.jsonl")
+        ]
+    else:
+        sessions = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+        found = list(sessions.glob(f"*/*/*/rollout-*-{session_id}.jsonl"))
+    if len(found) > 1:
+        raise Leave("Several transcripts carry this session's ID; left open")
+    if not found:
+        raise Wait("Waiting for the agent's session transcript")
+    return {"rollout": str(found[0].resolve()), "session_id": session_id}
+
+
+def message_turn(rollout, agent, marker):
+    """The turn that took the marked message, and whether more input followed it.
+
+    A message sent while the agent is idle starts a turn. One sent while it works joins
+    the running turn: Codex records a steer there, and Claude a queued command. Either
+    way that turn is followed, and any input after the message means the user is
+    talking to the agent again.
+    """
+    turn = mine = None
+    later = False
+    with Path(rollout).open() as stream:
+        for line in stream:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = item.get("payload") or {}
+            text = None
+            if agent != "claude":
+                kind = (item.get("type"), payload.get("type"))
+                if kind == ("event_msg", "task_started"):
+                    turn = payload.get("turn_id")
+                # Codex records a prompt as a user message item, and some versions also
+                # as a user_message event; both carry the marker, so neither is "more".
+                elif kind == ("event_msg", "user_message"):
+                    text = payload.get("message") or ""
+                elif kind == ("response_item", "message") and payload.get("role") == "user":
+                    text = blocks_text(payload.get("content"))
+            elif not item.get("isSidechain"):
+                # The same prompt test as latest_claude_turn; a pasted prompt may be plain.
+                content = (item.get("message") or {}).get("content")
+                attachment = item.get("attachment") or {}
+                if item.get("type") == "user" and not item.get("isMeta"):
+                    if isinstance(content, str) or not any(
+                        b.get("type") == "tool_result" for b in content or []
+                    ):
+                        turn, text = item.get("uuid"), blocks_text(content)
+                elif (
+                    item.get("type") == "attachment" and attachment.get("type") == "queued_command"
+                ):
+                    text = blocks_text(attachment.get("prompt"))
+            if text is None:
+                continue
+            if mine is None:
+                if marker in text:
+                    mine = turn
+            elif marker not in text:
+                later = True
+    return mine, later
+
+
+def blocks_text(content):
+    """A prompt's text, whether a plain string or a list of content blocks."""
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text") or "" for b in content or [] if isinstance(b, dict))
+
+
 def first_turn(rollout, agent):
     """The transcript's first prompt turn, which is the scheduled brief."""
     with Path(rollout).open() as stream:
@@ -216,7 +305,11 @@ def advance(record, op, persist, now):
     target = record["target"]
     if "session_id" not in target:
         try:
-            target.update(locate(target, op.get("created_at", record["since"])))
+            target.update(
+                known_session(target, op["session_id"])
+                if op.get("session_id")
+                else locate(target, op.get("created_at", record["since"]))
+            )
         except Wait:
             # Measured from when the launch finished: a long clone is not the agent's fault.
             if now - op.get("updated_at", record["since"]) > LOCATE_LIMIT:
@@ -227,14 +320,27 @@ def advance(record, op, persist, now):
         handoff.verify_identity(target, info, procs)
     except RuntimeError as exc:
         raise Leave(f"The agent exited or changed ({exc}); nothing was sent") from exc
+    if op.get("follow_up"):
+        # Read before the turn: a marked prompt landing between the reads then waits.
+        mine, later = message_turn(target["rollout"], target["agent"], target["marker"])
+        if mine is None:
+            if now - record["since"] > LOCATE_LIMIT:
+                raise Leave("The agent never took the message; left open")
+            raise Wait("Waiting for the agent to take the message")
     try:
         turn, complete = handoff.latest_turn(
             target["rollout"], target["session_id"], target["agent"]
         )
     except RuntimeError as exc:
         raise Wait(str(exc)) from exc
+    if op.get("follow_up"):
+        if later:
+            raise Leave("You wrote to the agent again after the message; left open")
+        # A message's turn is the one that took it; a later one is the user's again.
+        if turn != mine:
+            raise Leave("The session moved on to another turn; left open")
     # Only the transcript's first turn is the scheduled task; any later one is the user's.
-    if turn != first_turn(target["rollout"], target["agent"]):
+    elif turn != first_turn(target["rollout"], target["agent"]):
         raise Leave("The session moved on to another turn; left open")
     if complete is None:
         raise Wait("The agent is working")

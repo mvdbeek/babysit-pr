@@ -5,6 +5,7 @@ import json
 import os
 import time
 
+import exit_watch
 import herdr_handoff as handoff
 import pytest
 import workspace_exit as we
@@ -446,3 +447,178 @@ def test_missing_transcript_waits(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     with pytest.raises(we.Wait):
         we.locate({"agent": "codex", "cwd": str(tmp_path)}, time.time())
+
+
+MESSAGE = "Approve and merge" + exit_watch.follow_up(MARKER)
+
+
+def follow_up(op):
+    """A message's watch: the agent already runs in a known pane."""
+    op.update(follow_up=True, pane_id="w1:p1", session_id=None)
+
+
+def test_a_message_s_turn_is_followed_and_its_agent_exited(rig):
+    op, record, state, step, turns = rig
+    follow_up(op)
+    # Earlier turns end without the marker; only the message's own turn counts.
+    turns(("Review this PR", "Looks good to me."), (MESSAGE, DONE))
+    step()
+    assert record["state"] == "watching" and not state["sent"]
+    step()
+    assert state["sent"] == ["w1:p1"] and record["state"] == "exited"
+
+
+def test_a_message_not_taken_yet_is_waited_for_but_not_forever(rig):
+    op, record, state, step, turns = rig
+    follow_up(op)
+    turns(("Review this PR", "Looks good to me."))
+    step()
+    assert record["state"] == "watching" and "take the message" in record["message"]
+    step(advance=we.LOCATE_LIMIT)
+    assert record["state"] == "left_open" and "never took the message" in record["message"]
+    assert not state["sent"]
+
+
+def test_a_turn_after_the_message_is_never_exited(rig):
+    op, record, state, step, turns = rig
+    follow_up(op)
+    turns(("Review this PR", "Done."), (MESSAGE, "Which branch?"), ("main, please", DONE))
+    step()
+    step()
+    assert record["state"] == "left_open" and "wrote to the agent again" in record["message"]
+    assert not state["sent"]
+
+
+def test_a_message_s_agent_is_found_in_its_own_pane(rig):
+    op, record, state, step, turns = rig
+    follow_up(op)
+    turns(("Review this PR", "Done."), (MESSAGE, DONE))
+    # A second agent of the same kind in the same checkout no longer makes it ambiguous.
+    state["agents"].append({**state["agents"][0], "pane_id": "w1:p2"})
+    step()
+    assert record["target"]["pane_id"] == "w1:p1"
+
+
+@pytest.mark.parametrize("agent", ["codex", "claude"])
+def test_the_message_turn_is_found_in_either_prompt_form(tmp_path, agent):
+    path = tmp_path / "rollout.jsonl"
+    if agent == "codex":
+        write_jsonl(
+            path,
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+            codex_input("Review"),
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t2"}},
+            codex_input(MESSAGE),
+            # Some versions record the same prompt as an event too: not further input.
+            {"type": "event_msg", "payload": {"type": "user_message", "message": MESSAGE}},
+        )
+        expected = "t2"
+    else:
+        write_jsonl(
+            path,
+            {"type": "user", "uuid": "u1", "message": {"content": "Review"}},
+            {
+                "type": "user",
+                "uuid": "u2",
+                "message": {"content": [{"type": "tool_result", "content": MESSAGE}]},
+            },
+            {
+                "type": "user",
+                "uuid": "u3",
+                "message": {"content": [{"type": "text", "text": MESSAGE}]},
+            },
+        )
+        expected = "u3"  # A tool result quoting the marker is not the prompt.
+    assert we.message_turn(path, agent, MARKER) == (expected, False)
+    assert we.message_turn(path, agent, "[babysit-done:ffffffffffffffff]") == (None, False)
+
+
+def codex_input(text):
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    }
+
+
+def working_turn(agent, *inputs, final=DONE):
+    """One turn that took further inputs while it ran: Codex steers, Claude queued commands."""
+    if agent == "codex":
+        return [
+            {"type": "session_meta", "payload": {"id": SID}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+            codex_input("Review this PR"),
+            *(codex_input(text) for text in inputs),
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "t1", "last_agent_message": final},
+            },
+        ]
+    return [
+        {"type": "user", "uuid": "u1", "sessionId": SID, "message": {"content": "Review this PR"}},
+        *(
+            {
+                "type": "attachment",
+                "sessionId": SID,
+                "attachment": {"type": "queued_command", "prompt": text},
+            }
+            for text in inputs
+        ),
+        {
+            "type": "assistant",
+            "sessionId": SID,
+            "message": {"content": [{"type": "text", "text": final}]},
+        },
+        {"type": "system", "subtype": "turn_duration"},
+    ]
+
+
+def test_a_message_sent_while_the_agent_works_joins_its_turn(rig, tmp_path):
+    op, record, state, step, _ = rig
+    follow_up(op)
+    write_jsonl(tmp_path / "rollout.jsonl", *working_turn(op["agent"], MESSAGE))
+    step()
+    step()
+    assert state["sent"] == ["w1:p1"] and record["state"] == "exited"
+
+
+def test_writing_to_the_agent_after_the_message_keeps_it_open(rig, tmp_path):
+    op, record, state, step, _ = rig
+    follow_up(op)
+    write_jsonl(
+        tmp_path / "rollout.jsonl", *working_turn(op["agent"], MESSAGE, "Wait for me first")
+    )
+    step()
+    assert record["state"] == "left_open" and "wrote to the agent again" in record["message"]
+    assert not state["sent"]
+
+
+def test_a_pane_now_running_another_session_is_left_open(rig):
+    op, record, state, step, turns = rig
+    follow_up(op)
+    op["session_id"] = SID
+    turns(("Review this PR", "Done."), (MESSAGE, DONE))
+    state["agents"][0]["agent_session"] = {"value": "another-session"}
+    step()
+    assert record["state"] == "left_open" and "identify the agent's pane" in record["message"]
+    assert not state["sent"]
+
+
+def test_a_known_session_is_found_by_its_id_wherever_it_began(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    rollout = tmp_path / f"codex/sessions/2026/09/01/rollout-2026-09-01T10-00-00-{SID}.jsonl"
+    write_jsonl(rollout, {"type": "session_meta", "payload": {"id": SID}})
+    assert we.known_session({"agent": "codex"}, SID) == {
+        "rollout": str(rollout.resolve()),
+        "session_id": SID,
+    }
+    home = tmp_path / "claude"
+    monkeypatch.setattr(we.claude_accounts, "homes", lambda: [home])
+    transcript_path = home / "projects/-some-checkout" / f"{SID}.jsonl"
+    with pytest.raises(we.Wait):
+        we.known_session({"agent": "claude"}, SID)
+    write_jsonl(transcript_path, {"type": "user", "sessionId": SID})
+    assert we.known_session({"agent": "claude"}, SID)["rollout"] == str(transcript_path.resolve())

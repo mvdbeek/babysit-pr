@@ -1023,6 +1023,8 @@
   new ResizeObserver(fitMessage).observe(byId("ws-message"));
   function openComposer(entry) {
     const form = byId("ws-message");
+    // Never carried over: a box ticked for one agent must not quit another.
+    byId("ws-message-quit").checked = false;
     byId("ws-agent-interaction").replaceChildren();
     delete byId("ws-agent-interaction").dataset.state;
     byId("ws-message-status").textContent = "";
@@ -1789,6 +1791,7 @@
       ...(stopWatch ? { stop_watch: stopWatch } : {}),
       text,
       ...(attachments.length ? { attachments } : {}),
+      ...(byId("ws-message-quit").checked ? { exit_when_done: true } : {}),
     };
     sending = true;
     watchQuestion = null;
@@ -1820,13 +1823,16 @@
         return;
       }
       clearSent(entry, comments, message, attachments);
+      // Each message asks anew whether its agent should quit once it is done.
+      byId("ws-message-quit").checked = false;
       if (viewer?.entry !== entry) return;
+      const quits = value.exit_watch ? " It quits once it marks the task done." : "";
       tell(
         status,
         value.warning ||
           (value.resumed
-            ? `${stopWatch ? `Cancelled babysit watch ${stopWatch}, resumed` : "Resumed"} the session in ${value.pane} and sent the message.`
-            : `Sent to the agent in ${value.pane}.`),
+            ? `${stopWatch ? `Cancelled babysit watch ${stopWatch}, resumed` : "Resumed"} the session in ${value.pane} and sent the message.${quits}`
+            : `Sent to the agent in ${value.pane}.${quits}`),
       );
       // The transcript shows the new turn soon after; load just its tail, like the poll, so
       // expanded tool calls and the scroll position stay as they are. A load still running

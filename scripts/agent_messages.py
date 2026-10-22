@@ -33,6 +33,7 @@ from pathlib import Path
 import agent_docker
 import claude_accounts
 import claude_runner
+import exit_watch
 import herdr_handoff
 import workspace_viewer
 import wt
@@ -45,6 +46,7 @@ MAX_MESSAGE = 32000
 # tabs survive.
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 UNCERTAIN = "check it in Collie before resending"
+QUIT_UNWATCHED = "The agent will not quit by itself: its quit watch could not be set up."
 RESUME_WAIT = 20
 # Codex resumes in-process: on the shared background server a session whose feature
 # settings differ opens a dialog whose default, Cancel, a typed message then selects.
@@ -182,9 +184,14 @@ def send(request, home=None, *, expected_session=None, checkout=None):
 
     With a checkout instead of a workspace (a Workspaces-tab row listed while none was
     open), only a resume can be sent: it reopens a workspace there if none is open.
+    With ``exit_when_done`` the agent is asked to mark the end of its answer, and the
+    dashboard exits it and closes its pane once it has (`wt --exit-when-done`).
     """
-    if set(request) - {"workspace", "pane", "text", "resume", "stop_watch"}:
+    if set(request) - {"workspace", "pane", "text", "resume", "stop_watch", "exit_when_done"}:
         raise ValueError("Invalid message parameters")
+    quit_when_done = request.get("exit_when_done", False)
+    if not isinstance(quit_when_done, bool):
+        raise ValueError("Expected an exit_when_done flag")
     stop_watch = request.get("stop_watch")
     if stop_watch is not None and (
         not isinstance(stop_watch, str) or not stop_watch or request.get("resume") is None
@@ -199,10 +206,17 @@ def send(request, home=None, *, expected_session=None, checkout=None):
         raise ValueError(f"Write a message of 1–{MAX_MESSAGE:,} characters")
     if checkout is not None and (request.get("workspace") is not None or not request.get("resume")):
         raise ValueError("Without a herdr workspace, only a recorded session can be resumed")
+    if quit_when_done and not text:
+        raise ValueError("Write a message for the agent to finish before it quits")
+    if quit_when_done and home is None:
+        raise ValueError("Quitting when done needs the dashboard's state directory")
+    marker = exit_watch.new_marker() if quit_when_done else None
+    if marker:
+        text += exit_watch.follow_up(marker)
     if request.get("resume") is not None:
         if request.get("pane") is not None:
             raise ValueError("Resume a session or message a running agent, not both")
-        return resume(
+        result = resume(
             request.get("workspace"),
             request["resume"],
             text,
@@ -210,6 +224,7 @@ def send(request, home=None, *, expected_session=None, checkout=None):
             root=checkout,
             stop_watch=stop_watch,
         )
+        return watch_until_done(result, home, marker, request["text"]) if marker else result
     pane = request.get("pane")
     if pane is not None and not isinstance(pane, str):
         raise ValueError("Choose an agent")
@@ -225,7 +240,60 @@ def send(request, home=None, *, expected_session=None, checkout=None):
         raise ValueError("That agent is no longer running; refresh")
     if expected_session is not None and target.get("session") != expected_session:
         raise ValueError("The agent session changed; reload the agent list")
-    return prompt(target, text)
+    result = prompt(target, text)
+    return watch_until_done(result, home, marker, request["text"]) if marker else result
+
+
+def watch_until_done(result, home, marker, message):
+    """Record the exit watch for the agent that took a message asking it to mark its end.
+
+    The pane herdr shows the agent in names its checkout and session. The message is
+    already typed: a watch that cannot be recorded leaves the agent open and says so.
+    """
+
+    def unwatched():
+        return {
+            **result,
+            "warning": " ".join(filter(None, [result.get("warning"), QUIT_UNWATCHED])),
+        }
+
+    pane = result.get("pane")
+    try:
+        found = next(
+            (a for a in herdr("agent", "list")["agents"] if pane and a.get("pane_id") == pane),
+            None,
+        )
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
+        return unwatched()
+    if (
+        not found
+        or found.get("agent") not in RESUME
+        or not isinstance(found.get("cwd"), str)
+        or not isinstance(found.get("workspace_id"), str)
+    ):
+        return unwatched()
+    now = time.time()
+    first = next((line.strip() for line in message.splitlines() if line.strip()), "")
+    watch = {
+        "id": uuid.uuid4().hex,
+        "label": f"Message: {first[:80]}",
+        "path": os.path.realpath(found["cwd"]),
+        "workspace_id": found["workspace_id"],
+        "pane_id": pane,
+        "agent": found["agent"],
+        "claude_account": None,
+        # A resume names the session it confirmed; herdr's reading may lag behind it.
+        "session_id": result.get("resumed") or (found.get("agent_session") or {}).get("value"),
+        "marker": marker,
+        "created_at": now,
+        "follow_up": True,
+        "exit": exit_watch.watching(now),
+    }
+    try:
+        exit_watch.register(home, watch)
+    except OSError:
+        return unwatched()
+    return {**result, "exit_watch": watch["id"]}
 
 
 def docker_status(workspace_id, live=_UNSET):

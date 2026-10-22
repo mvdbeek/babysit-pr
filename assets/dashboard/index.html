@@ -423,9 +423,7 @@
         </p>
         <h3 class="scheduled-heading" id="scheduled-history-heading" hidden>Recent</h3>
         <ol id="scheduled-history" class="scheduled-list"></ol>
-        <h3 class="scheduled-heading" id="launched-heading" hidden>
-          Started with <code>wt --exit-when-done</code>
-        </h3>
+        <h3 class="scheduled-heading" id="launched-heading" hidden>Quit when done</h3>
         <ol id="launched-list" class="scheduled-list"></ol>
       </section>
       <section
@@ -1246,6 +1244,11 @@
         </div>
         <div class="ws-message-actions">
           <div id="ws-message-agent"></div>
+          <label
+            id="ws-message-quit-label"
+            title="The agent is asked to mark the end of its answer. Once it has and stays idle for 20 seconds, it is exited and its herdr pane closed (its workspace, when that was the only pane); the checkout stays, so the session can be resumed."
+            ><input id="ws-message-quit" type="checkbox" /> Quit the agent when it is done</label
+          >
           <button id="ws-message-reopen" type="button" hidden>Reopen in Collie</button>
         </div>
         <p id="ws-message-status" role="status"></p>
