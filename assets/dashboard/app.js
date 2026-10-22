@@ -2651,6 +2651,14 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
   docker.type = "checkbox";
   const dockerLabel = el("label", undefined, "workspace-later");
   dockerLabel.append(docker, " Allow Docker in the agent’s sandbox");
+  // `wt --exit-when-done`, for a launch that starts now; scheduled ones always quit.
+  const quit = el("input");
+  quit.id = "workspace-quit";
+  quit.type = "checkbox";
+  const quitLabel = el("label", undefined, "workspace-later");
+  quitLabel.title =
+    "Once its task is done and it has been idle for 20 seconds, the agent is exited and its herdr pane closed. The checkout stays, so the session can be resumed.";
+  quitLabel.append(quit, " Quit the agent when it is done");
   return {
     agent,
     model,
@@ -2660,6 +2668,8 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
     usageNote,
     docker,
     dockerLabel,
+    quit,
+    quitLabel,
     effortDefaults,
     setRepo,
   };
@@ -2795,6 +2805,8 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
         usageNote,
         docker,
         dockerLabel,
+        quit,
+        quitLabel,
         effortDefaults,
       } = agentFields({ repo: item.repo, preferred });
       const task = el("textarea");
@@ -2824,7 +2836,7 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
       field("Model (optional)", model);
       field("Reasoning effort (optional)", effort);
       field("Claude account", account);
-      form.append(usageNote, settingsNote, effortDefaults, dockerLabel);
+      form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel);
       field("Task", task);
       form.append(promptHistory(task));
       const files = attachmentField(form, task);
@@ -2845,6 +2857,8 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
       later.addEventListener("change", () => {
         submit.textContent = later.checked ? "Schedule" : label;
         submit.dataset.later = String(later.checked);
+        // A scheduled task's agent always quits once it is done.
+        quitLabel.hidden = later.checked;
         updateWorkspaceOperation();
       });
       form.onsubmit = async (event) => {
@@ -2872,6 +2886,7 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
                 ? { claude_account: account.value }
                 : {}),
               ...(docker.checked ? { docker: true } : {}),
+              ...(quit.checked && !start ? { exit_when_done: true } : {}),
               task: task.value.replaceAll(BATCH_URL, item.url || BATCH_URL),
               ...(handling && task.value === handling ? { prefilled: true } : {}),
               ...(info.clones.length ? { clone: clone.value } : { destination: info.destination }),
@@ -3117,6 +3132,8 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       usageNote,
       docker,
       dockerLabel,
+      quit,
+      quitLabel,
       effortDefaults,
       setRepo,
     } = agentFields({ repo: repos[Number(repo.value)]?.repo });
@@ -3125,7 +3142,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    form.append(usageNote, settingsNote, effortDefaults, dockerLabel);
+    form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel);
     const task = el("textarea");
     task.id = "workspace-task";
     task.required = true;
@@ -3166,6 +3183,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
             ...(effort.value ? { effort: effort.value } : {}),
             ...(agent.value === "claude" && account.value ? { claude_account: account.value } : {}),
             ...(docker.checked ? { docker: true } : {}),
+            ...(quit.checked ? { exit_when_done: true } : {}),
             ...(also.size ? { also: [...also] } : {}),
             task: task.value,
             ...attached(files),

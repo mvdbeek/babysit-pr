@@ -262,11 +262,25 @@ def test_new_task_can_let_the_agent_use_docker(local):  # noqa: F811
     assert off["docker"] is False and "--docker" not in calls[1]
 
 
-@pytest.mark.parametrize("docker", ["true", 1, None])
-def test_new_task_docker_must_be_a_flag(local, docker):  # noqa: F811
+@pytest.mark.parametrize("flag", ["docker", "exit_when_done"])
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_new_task_options_must_be_flags(local, flag, value):  # noqa: F811
     manager, _, _, _, _ = local
     with pytest.raises(ValueError, match="Invalid new task"):
-        manager.new_task(request(manager, name="containers", docker=docker))
+        manager.new_task(request(manager, name="containers", **{flag: value}))
+
+
+def test_new_task_can_quit_its_agent_when_done(local):  # noqa: F811
+    manager, _, _, _, _ = local
+    calls = helper_calls(manager)
+    value = manager.new_task(request(manager, name="quits", exit_when_done=True))
+    op = finish(manager, value["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert op["exit_when_done"] is True and "--exit-when-done" in calls[0]
+    with manager.db() as db:
+        assert db.execute("SELECT count(*) FROM exit_watches").fetchone() == (1,)
+    off = finish(manager, manager.new_task(request(manager, name="stays"))["operation"]["pr"])
+    assert off["exit_when_done"] is False and "--exit-when-done" not in calls[1]
 
 
 def other_clone(manager, git, name="other"):

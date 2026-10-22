@@ -400,7 +400,8 @@ handoff does. The pane, its shell and the worktree stay. A turn that ends any ot
 way (for example with a question), any later turn, or a changed agent process
 leaves the agent open and stops watching. A draft in the input box or a scrolled
 terminal only delays the exit and restarts the 20 seconds. The Scheduled tab shows
-the result under **Agent:**. Tasks started immediately are never exited. Sessions
+the result under **Agent:**. A task started immediately is exited only when **Quit
+the agent when it is done** was ticked (see below). Sessions
 started with `wt --exit-when-done` (see [Worktree helper](#worktree-helper)) are
 followed the same way and listed under their own heading on the Scheduled tab.
 
@@ -509,6 +510,17 @@ batch Handle all offer it, and scheduled launches keep it). The helper types
 that to Safehouse's `--enable` list, which opens the Docker daemon socket to that one
 agent. Agents started without it keep Safehouse's default deny on container sockets.
 The operation records `docker` (false for reopen).
+
+**Quit the agent when it is done**, off by default, passes `--exit-when-done` to the
+helper (the request field is `exit_when_done: true`). New task, Handle and Create
+workspace offer it for a launch that starts now. It is hidden under **Start later**,
+because a scheduled task's agent always quits when done, and batch Handle schedules
+every item. The agent is asked to end its answer with a marker. After it has stayed idle
+for 20 seconds, the dashboard exits it and closes its herdr pane, or the workspace if
+that was its only pane. The checkout stays, so the session can be resumed. The helper
+records the watch in the dashboard's own state directory (`BABYSIT_HOME`), and the
+Scheduled tab lists it with the sessions started by `wt --exit-when-done`. The
+operation records `exit_when_done`.
 
 **Also work in other repositories**, in New task, lists the other local clones (those
 the repository picker offers). Each one chosen is passed to the helper as

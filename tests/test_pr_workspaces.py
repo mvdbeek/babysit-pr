@@ -2020,3 +2020,46 @@ def test_batch_refuses_a_second_repository_cloning_into_the_same_destination(syn
     first, second = value["results"]
     assert "scheduled" in first
     assert second["error"].startswith(f"base/repo also clones into {destination}")
+
+
+def exit_watches(manager):
+    with manager.db() as db:
+        return [json.loads(data) for (data,) in db.execute("SELECT data FROM exit_watches")]
+
+
+def test_a_launch_can_quit_its_agent_when_done(local):
+    manager, _, _, state, _ = local
+    calls = helper_calls(manager)
+    request = {"id": "I_one", "action": "create", "agent": "claude", "task": "Fix"}
+    manager.action({**request, "exit_when_done": True})
+    op = finish(manager, "I_one")
+    assert op["status"] == "complete", op
+    assert op["exit_when_done"] is True and "exit_marker" not in op
+    assert "--exit-when-done" in calls[0]
+    # wt recorded the watch in this dashboard's home and asked the agent for its marker.
+    (watch,) = exit_watches(manager)
+    assert watch["marker"] in json.loads(state.read_text())["agents"][0]["task"]
+
+
+def test_a_scheduled_launch_quits_through_its_own_marker_rather_than_wt(local):
+    manager, *_ = local
+    calls = helper_calls(manager)
+    request = {"id": "I_one", "action": "create", "task": "Fix", "exit_when_done": True}
+    manager.action(request, scheduled=True)
+    op = finish(manager, "I_one")
+    assert op["status"] == "complete", op
+    assert op["exit_when_done"] is False and op["exit_marker"]
+    assert "--exit-when-done" not in calls[0] and exit_watches(manager) == []
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"exit_when_done": "yes"}, "Expected a exit_when_done flag"),
+        ({"action": "open", "exit_when_done": True}, "Only tasks that start an agent"),
+    ],
+)
+def test_quitting_when_done_needs_a_flag_and_a_launch(local, change, message):
+    manager, *_ = local
+    with pytest.raises(ValueError, match=message):
+        manager.action({"id": "I_one", "action": "create", "task": "Fix", **change})
