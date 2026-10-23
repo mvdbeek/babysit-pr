@@ -16,7 +16,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import github_cli
-from latest_activity import activity_fragment, latest_activity, notification_activity
+from latest_activity import (
+    activity_fragment,
+    latest_activity,
+    notification_activity,
+    timeline_activity,
+)
 
 POLL_SECONDS = 300
 # GitHub search exposes at most this many results per query.
@@ -39,7 +44,7 @@ ROLES = {
 SETTINGS = "overview-config.json"
 PR_FRAGMENT = (
     """... on PullRequest {
-      id number title url createdAt updatedAt state isDraft reviewDecision
+      id number title url createdAt updatedAt closedAt state isDraft reviewDecision
       repository { nameWithOwner }
       headRepository { nameWithOwner }
       headRefName headRefOid
@@ -63,6 +68,27 @@ query($query: String!, $cursor: String, $first: Int!) {
   }
 }
 """
+
+
+# What someone says, as opposed to what they do: a branch deletion is not a reply.
+DISCUSSION = {"IssueComment", "PullRequestReview", "ContentEdited"}
+
+
+def discussed_after_close(node, login):
+    """Whether someone else commented or reviewed after this PR closed or merged.
+
+    Deleting a head branch or relabelling bumps `updatedAt` on every PR it touches,
+    which brings back years of finished PRs that merely mention the user.
+    """
+    closed = node.get("closedAt")
+    if not closed:
+        return False
+    for event in (node.get("timelineItems") or {}).get("nodes") or []:
+        found = timeline_activity(event) if event else None
+        if found and found["type"] in DISCUSSION and found["actor"] != login:
+            if found["at"] > closed:
+                return True
+    return False
 
 
 def pr_record(node, roles):
@@ -211,8 +237,13 @@ def collect(kind: Kind = PRS, mentions=True):
                 if not node or node.get("state") not in states:
                     continue
                 key = node["id"]
+                # Only discussion after closure makes a finished PR a mention again; the
+                # search still refreshes the state of a PR that merged during this refresh.
+                counts = "OPEN" in states or discussed_after_close(node, login)
+                if not counts and key not in items:
+                    continue
                 roles = items[key]["roles"] if key in items else []
-                if role not in roles:
+                if counts and role not in roles:
                     roles.append(role)
                 if key in items and items[key]["updated_at"] > node["updatedAt"]:
                     continue

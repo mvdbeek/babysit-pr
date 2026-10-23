@@ -32,6 +32,23 @@ def pr(key="one", updated="2026-09-11T12:00:00Z", ci="SUCCESS", **extra):
     }
 
 
+def event(kind, who, at):
+    stamp = "submittedAt" if kind == "PullRequestReview" else "createdAt"
+    person = "actor" if kind.endswith("Event") else "author"
+    return {"__typename": kind, stamp: at, person: {"login": who, "__typename": "User"}}
+
+
+def finished(key, state="MERGED", *events):
+    """A finished PR someone else discussed after it closed, unless events say otherwise."""
+    events = events or (event("IssueComment", "bob", "2026-09-11T11:00:00Z"),)
+    return pr(
+        key,
+        state=state,
+        closedAt="2026-09-10T12:00:00Z",
+        timelineItems={"nodes": list(events)},
+    )
+
+
 def page(nodes=(), next_cursor=None, count=1, login="alice"):
     return {
         "viewer": {"login": login},
@@ -83,8 +100,8 @@ def test_discovers_all_roles_paginates_deduplicates_and_sorts(monkeypatch):
 
 
 def test_mentions_discover_merged_and_closed_prs_without_broadening_other_roles(monkeypatch):
-    merged = pr("merged", state="MERGED")
-    closed = pr("closed", state="CLOSED")
+    merged = finished("merged")
+    closed = finished("closed", "CLOSED")
     fetch = Mock(
         side_effect=[page([merged, closed])] * 4
         + [page([pr("open")])]
@@ -106,12 +123,43 @@ def test_mentions_discover_merged_and_closed_prs_without_broadening_other_roles(
 def test_mention_search_keeps_the_latest_state_when_a_pr_merges_during_refresh(monkeypatch):
     fetch = Mock(
         side_effect=[page([pr()]), page(), page(), page(), page()]
-        + [page([pr(updated="2026-09-11T13:00:00Z", state="MERGED")])]
+        + [page([{**finished("one"), "updatedAt": "2026-09-11T13:00:00Z"}])]
     )
     monkeypatch.setattr(overview, "github_page", fetch)
     [found] = overview.collect()["prs"]
     assert found["state"] == "MERGED"
     assert found["roles"] == ["author", "mentioned"]
+
+
+def test_a_pr_merged_during_refresh_takes_its_state_without_a_mention(monkeypatch):
+    quiet = finished("one", "MERGED", event("MergedEvent", "bob", "2026-09-10T12:00:00Z"))
+    fetch = Mock(
+        side_effect=[page([pr()]), page(), page(), page(), page()]
+        + [page([{**quiet, "updatedAt": "2026-09-11T13:00:00Z"}])]
+    )
+    monkeypatch.setattr(overview, "github_page", fetch)
+    [found] = overview.collect()["prs"]
+    assert found["state"] == "MERGED"
+    assert found["roles"] == ["author"]
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        # Batch-deleting old fork branches bumps every PR they headed.
+        [event("HeadRefDeletedEvent", "alice", "2026-09-11T11:00:00Z")],
+        [event("LabeledEvent", "bob", "2026-09-11T11:00:00Z")],
+        [event("IssueComment", "alice", "2026-09-11T11:00:00Z")],
+        [event("PullRequestReview", "bob", "2026-09-09T11:00:00Z")],
+        [],
+    ],
+)
+def test_finished_prs_without_later_discussion_are_not_mentions(monkeypatch, events):
+    quiet = pr("quiet", state="MERGED", closedAt="2026-09-10T12:00:00Z")
+    quiet["timelineItems"] = {"nodes": events}
+    fetch = Mock(side_effect=[page()] * 5 + [page([quiet, finished("talked", "CLOSED")])])
+    monkeypatch.setattr(overview, "github_page", fetch)
+    assert [item["id"] for item in overview.collect()["prs"]] == ["talked"]
 
 
 def test_mentions_can_be_left_out(monkeypatch):
