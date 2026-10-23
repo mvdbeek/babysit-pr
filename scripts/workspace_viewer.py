@@ -23,7 +23,9 @@ import owned_process
 from pr_workspaces import herdr
 
 # Branch names a topic branch is cut from, on the remotes pull requests target.
-BASE_BRANCH = re.compile(r"^(main|master|dev|develop|trunk|next|release[_-].+|\d+\.\d+)$")
+BASE_BRANCH = re.compile(
+    r"^(main|master|dev|develop|trunk|next|release[_-]v?\d+(\.\d+)*|\d+\.\d+)$"
+)
 BASE_PATTERNS = (
     "main",
     "master",
