@@ -392,6 +392,18 @@ def test_renamed_checkout_does_not_link_its_base_branch(base_branch):
     assert wso.candidates(item, BASE, "fork") == [("head", "fork:review-pr-9")]
 
 
+def test_renamed_checkout_links_release_prefixed_topic_branch():
+    item = {
+        "path": "/w/review-pr-9",
+        "branch": "review-pr-9",
+        "upstream": ["contributor/repo", "release_26.0_vtk_download"],
+    }
+    assert wso.candidates(item, BASE, "fork")[0] == (
+        "head",
+        "contributor:release_26.0_vtk_download",
+    )
+
+
 @pytest.mark.parametrize("head_repo", [BASE, "contributor/repo"])
 def test_review_checkout_links_renamed_tracking_branch_after_cached_miss(site, head_repo):
     plugin, fake, _, worktrees, _, git = site

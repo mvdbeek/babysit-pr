@@ -56,7 +56,9 @@ CLOSED = {"closed", "merged"}
 ISSUE_NAME = re.compile(r"^issue-(\d+)(?:-|$)")
 PR_NAME = re.compile(r"^pr-([A-Za-z0-9][A-Za-z0-9-]*?)-(\d+)(?:-\d+)?$")
 BRANCH_NAME = re.compile(r"^[^\s:^~?*\\[]{1,255}$")
-BASE_BRANCH = re.compile(r"^(main|master|dev|develop|trunk|next|release[_-].+|\d+\.\d+)$")
+BASE_BRANCH = re.compile(
+    r"^(main|master|dev|develop|trunk|next|release[_-]v?\d+(\.\d+)*|\d+\.\d+)$"
+)
 
 
 def git(path, *args, timeout=60, strip=True):
