@@ -75,19 +75,22 @@ DISCUSSION = {"IssueComment", "PullRequestReview", "ContentEdited"}
 
 
 def discussed_after_close(node, login):
-    """Whether someone else commented or reviewed after this PR closed or merged.
+    """Whether another person commented or reviewed after this PR closed or merged.
 
     Deleting a head branch or relabelling bumps `updatedAt` on every PR it touches,
-    which brings back years of finished PRs that merely mention the user.
+    which brings back years of finished PRs that merely mention the user. Bots
+    comment on merged PRs routinely, so they do not count either.
     """
     closed = node.get("closedAt")
     if not closed:
         return False
     for event in (node.get("timelineItems") or {}).get("nodes") or []:
         found = timeline_activity(event) if event else None
-        if found and found["type"] in DISCUSSION and found["actor"] != login:
-            if found["at"] > closed:
-                return True
+        if not found or found["type"] not in DISCUSSION or found["at"] <= closed:
+            continue
+        actor = found["actor"] or ""
+        if actor and actor != login and not actor.endswith("[bot]"):
+            return True
     return False
 
 

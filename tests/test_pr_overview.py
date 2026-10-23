@@ -32,10 +32,10 @@ def pr(key="one", updated="2026-09-11T12:00:00Z", ci="SUCCESS", **extra):
     }
 
 
-def event(kind, who, at):
+def event(kind, who, at, typename="User"):
     stamp = "submittedAt" if kind == "PullRequestReview" else "createdAt"
     person = "actor" if kind.endswith("Event") else "author"
-    return {"__typename": kind, stamp: at, person: {"login": who, "__typename": "User"}}
+    return {"__typename": kind, stamp: at, person: {"login": who, "__typename": typename}}
 
 
 def finished(key, state="MERGED", *events):
@@ -151,6 +151,9 @@ def test_a_pr_merged_during_refresh_takes_its_state_without_a_mention(monkeypatc
         [event("LabeledEvent", "bob", "2026-09-11T11:00:00Z")],
         [event("IssueComment", "alice", "2026-09-11T11:00:00Z")],
         [event("PullRequestReview", "bob", "2026-09-09T11:00:00Z")],
+        # Release-note and backport bots comment on merged PRs as a matter of course.
+        [event("IssueComment", "github-actions", "2026-09-11T11:00:00Z", "Bot")],
+        [event("IssueComment", "dependabot[bot]", "2026-09-11T11:00:00Z")],
         [],
     ],
 )
