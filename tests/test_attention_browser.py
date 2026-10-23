@@ -11,8 +11,8 @@ from playwright.sync_api import Page, expect
 from test_dashboard_browser import choose_option
 from test_dashboard_browser import dashboard_site as dashboard_site  # noqa: F401 - fixture
 from test_dashboard_browser import workspace_routes as workspace_routes  # noqa: F401 - fixture
+from test_pr_overview import finished
 from test_pr_overview import page as search_page
-from test_pr_overview import pr as search_pr
 from test_workspace_overview_browser import link as overview_link
 from test_workspace_overview_browser import row as overview_row
 
@@ -137,13 +137,12 @@ def test_show_in_tab_reveals_the_item_on_its_overview(page: Page, dashboard_site
 @pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
 def test_a_mention_on_a_finished_pr_appears_in_both_tabs(page, dashboard_site, monkeypatch, state):
     url, _ = dashboard_site
-    mentioned = search_pr(
-        "mentioned",
-        number=1764,
-        title="Update PhysiCell Studio",
-        state=state,
-        reviewDecision="APPROVED",
-    )
+    mentioned = {
+        **finished("mentioned", state),
+        "number": 1764,
+        "title": "Update PhysiCell Studio",
+        "reviewDecision": "APPROVED",
+    }
     monkeypatch.setattr(
         pr_overview,
         "github_page",
