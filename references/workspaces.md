@@ -44,7 +44,7 @@ Requests name a herdr workspace or a listed row, never a path. For a herdr works
 
 A checkout is matched to the pull request and issue it belongs to, from evidence the repository agrees with (a name-derived pull request and a branch-derived one can both appear when they differ):
 
-- The branch pushed to a fork: `head=<owner>:<branch>` against the base repository. Tracking configuration usually names the **base** branch a topic branch was cut from, so an upstream only counts as a head when it tracks the same branch name. The fork owner from `origin` is always tried as a head. Branches named like a base or release branch (`main`, `dev`, `release_26.1`, `25.0`) are never matched by head.
+- The branch pushed to a fork: `head=<owner>:<branch>` against the base repository. A tracked upstream branch supplies its own owner and branch name, even when the local branch has been renamed (for example, a review cronjob's `review-pr-24342`). Tracking a base or release branch (`main`, `dev`, `release_26.1`, `25.0`) does not count as a head. The fork owner from `origin` is also tried with the local branch name. Local branches named like a base or release branch are never matched by head.
 - A `wti`-style `issue-<number>` branch or directory name.
 - A `wtpr`-style `pr-<owner>-<number>` directory or branch name, only when `<owner>` owns the resolved base repository.
 

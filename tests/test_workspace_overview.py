@@ -382,6 +382,48 @@ def test_base_tracking_and_foreign_names_never_become_links():
     assert wso.candidates(fork_head, BASE, "fork")[0] == ("head", "other:fix")
 
 
+@pytest.mark.parametrize("base_branch", ["main", "master", "dev", "release_26.1", "25.0"])
+def test_renamed_checkout_does_not_link_its_base_branch(base_branch):
+    item = {
+        "path": "/w/review-pr-9",
+        "branch": "review-pr-9",
+        "upstream": [BASE, base_branch],
+    }
+    assert wso.candidates(item, BASE, "fork") == [("head", "fork:review-pr-9")]
+
+
+@pytest.mark.parametrize("head_repo", [BASE, "contributor/repo"])
+def test_review_checkout_links_renamed_tracking_branch_after_cached_miss(site, head_repo):
+    plugin, fake, _, worktrees, _, git = site
+    branch = "review-pr-9"
+    head_branch = "dependabot/npm_and_yarn/client/markdown-it-14.3.3"
+    git("worktree", "add", "-b", branch, str(worktrees / branch))
+    # A previous scan missed the link by looking up the local name in origin.
+    assert rows(plugin)[branch]["links"] == []
+    assert plugin.links[f"{BASE}#head#fork:{branch}"]["link"]["state"] == "none"
+    fake.calls.clear()
+    git("remote", "add", "wtpr-review", f"https://github.com/{head_repo}.git")
+    git("config", f"branch.{branch}.remote", "wtpr-review")
+    git("config", f"branch.{branch}.merge", f"refs/heads/{head_branch}")
+    fake.heads[f"{head_repo.split('/')[0]}:{head_branch}"] = [fake.pulls["9"]]
+
+    row = rows(plugin)[branch]
+
+    assert row["links"] == [
+        {
+            "kind": "pr",
+            "repo": BASE,
+            "number": 9,
+            "title": "Named pull request",
+            "url": f"https://github.com/{BASE}/pull/9",
+            "state": "open",
+            "draft": True,
+        }
+    ]
+    assert row["status"] == "active" and not row["stale_links"]
+    assert fake.lookups() == [("head", head_branch)]
+
+
 def test_saving_keeps_every_live_link_and_only_the_newest_others(site, monkeypatch):
     plugin, *_ = site
     plugin.collect()
