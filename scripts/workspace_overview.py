@@ -259,16 +259,17 @@ def candidates(item, base, origin_owner):
 
     Names are a hint the repository must agree with: a `pr-<owner>-<number>` directory
     only names a pull request when `<owner>` owns the resolved base repository. Tracking
-    configuration usually names the *base* branch a topic branch was cut from, so only
-    an upstream tracking the same branch name is treated as a pull request head.
+    configuration can name the *base* branch a topic branch was cut from, so base
+    branches are excluded. Other upstreams name the PR head even when a checkout
+    has a different local name (for example, `review-pr-24342`).
     """
     found = []
     branch = item.get("branch") or ""
     directory = Path(item["path"]).name
     upstream = item.get("upstream") or [None, None]
     if branch and not BASE_BRANCH.match(branch):
-        if upstream[0] and upstream[1] == branch:
-            found.append(("head", f"{upstream[0].split('/')[0]}:{branch}"))
+        if upstream[0] and upstream[1] and not BASE_BRANCH.match(upstream[1]):
+            found.append(("head", f"{upstream[0].split('/')[0]}:{upstream[1]}"))
         if origin_owner:
             found.append(("head", f"{origin_owner}:{branch}"))
     # A number past GraphQL's 32-bit Int would fail every lookup batched with it.
