@@ -10,6 +10,8 @@
   // Run once no load is in flight any more (a reload that one could have overtaken).
   let afterLoad = null;
   let opener = null;
+  // The list the opener sits in, where a stepped-to entry's own buttons are found.
+  let openerList = null;
   // The open workspace in Collie, once its agents are read; text that sends the
   // reader to Collie links there.
   let collieUrl = null;
@@ -1078,6 +1080,7 @@
     const form = byId("ws-message");
     // Never carried over: a box ticked for one agent must not quit another.
     byId("ws-message-quit").checked = false;
+    watchQuestion = null;
     byId("ws-agent-interaction").replaceChildren();
     delete byId("ws-agent-interaction").dataset.state;
     byId("ws-message-status").textContent = "";
@@ -1524,7 +1527,12 @@
     idle: ["Idle", "green"],
     done: ["Done", "green"],
   };
-  let stopping = null; // The pane a stop is on its way to.
+  // The pane a stop is on its way to, per viewed entry: stepping to another one leaves
+  // its Stop buttons and polls alone.
+  const stops = new Map();
+  function stopping() {
+    return viewer ? stops.get(viewer.id) : undefined;
+  }
   function agentTitle(agent) {
     return { claude: "Claude", codex: "Codex" }[agent.agent] || agent.agent || "Agent";
   }
@@ -1551,7 +1559,7 @@
     const list = byId("ws-live-agents");
     const key = JSON.stringify([
       shown,
-      stopping,
+      stopping(),
       data.sessions.map((session) => session.id),
       agents.map((agent) => [agent.pane, agent.agent, agent.status, agent.session]),
     ]);
@@ -1576,9 +1584,9 @@
           row.append(show);
         }
         if (agent.status === "working") {
-          const stop = node("button", stopping === agent.pane ? "Stopping…" : "Stop", "ws-stop");
+          const stop = node("button", stopping() === agent.pane ? "Stopping…" : "Stop", "ws-stop");
           stop.type = "button";
-          stop.disabled = Boolean(stopping);
+          stop.disabled = Boolean(stopping());
           stop.setAttribute("aria-label", `Stop ${agentTitle(agent)} in ${agent.pane}`);
           stop.onclick = () => void stopAgent(agent);
           row.append(stop);
@@ -1588,10 +1596,10 @@
     );
   }
   async function stopAgent(agent) {
-    if (!viewer || stopping) return;
-    const entry = viewer.entry;
+    if (!viewer || stopping()) return;
+    const { entry, id } = viewer;
     const status = byId("ws-live-status");
-    stopping = agent.pane;
+    stops.set(id, agent.pane);
     status.textContent = "";
     renderLive();
     let message;
@@ -1610,10 +1618,10 @@
     } catch {
       message = "The stop could not be confirmed; refresh or check Collie.";
     } finally {
-      stopping = null;
+      stops.delete(id);
     }
     if (viewer?.entry !== entry) {
-      renderLive(); // Another viewer's Stop buttons were waiting on this one.
+      renderLive(); // The same entry, opened again, may still show it stopping.
       return;
     }
     tell(status, message);
@@ -2043,12 +2051,23 @@
       // Without storage the choice lasts until the page reloads.
     }
   };
+  // The button that opened the entry last viewed, or its counterpart in a refreshed list.
+  function returnFocus() {
+    const own = (button) => button?.closest(".ws-view-buttons")?.dataset.viewer === viewer.id;
+    if (opener?.isConnected && own(opener)) return opener;
+    const listed = [...(openerList?.querySelectorAll(".ws-view-buttons button") || [])].filter(own);
+    return (
+      listed.find((button) => button.dataset.mode === viewer.mode) ||
+      listed[0] ||
+      (opener?.isConnected ? opener : document.querySelector("dialog[open]"))
+    );
+  }
   byId("ws-viewer").addEventListener("close", () => {
+    const back = viewer && returnFocus();
     viewer = null;
     viewerRequest += 1; // Responses still on their way are dropped.
-    // A refreshed list may have replaced the button that opened the viewer.
-    const back = opener?.isConnected ? opener : document.querySelector("dialog[open]");
     opener = null;
+    openerList = null;
     back?.focus();
   });
   // A live transcript keeps up while it is open and its newest entries are shown, and
@@ -2056,7 +2075,7 @@
   let pollingAgents = false;
   setInterval(() => {
     if (viewer?.mode === "transcript" && messageable(viewer.entry) && !document.hidden) {
-      if (!pollingAgents && !stopping) {
+      if (!pollingAgents && !stopping()) {
         pollingAgents = true;
         void fetchAgents(viewer.entry).finally(() => (pollingAgents = false));
       }
@@ -2076,14 +2095,17 @@
   // The pair is one element, so a narrow cell wraps it together.
   function buttons(target, siblings) {
     const pair = node("span", undefined, "ws-view-buttons");
+    pair.dataset.viewer = identity(target);
     for (const [label, mode] of [
       ["Diff", "diff"],
       ["Transcript", "transcript"],
     ]) {
       const button = node("button", label);
       button.type = "button";
+      button.dataset.mode = mode;
       button.onclick = () => {
         opener = button;
+        openerList = button.closest("[id]");
         openViewer(target, mode, siblings);
       };
       pair.append(button);
