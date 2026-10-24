@@ -468,6 +468,66 @@ def test_diff_and_transcript_viewer(page, site, width):
     expect(dialog).to_be_hidden()
 
 
+def test_the_viewer_steps_through_the_filtered_rows(page, site):
+    url, plugin, _ = site
+    seen = []
+
+    def conversation(route):
+        seen.append(route.request.url)
+        route.fulfill(json=transcript())
+
+    page.route("**/api/workspace-transcript?*", conversation)
+    page.clock.install()
+    page.goto(url + "/#workspaces")
+    # The protected main checkout is filtered out; the rest sort by repository, then name.
+    page.get_by_role("searchbox", name="Search workspaces").fill("-work")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("merged-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    previous = dialog.get_by_role("button", name="Previous workspace")
+    following = dialog.get_by_role("button", name="Next workspace")
+    expect(page.locator("#ws-viewer-title")).to_have_text("merged-work")
+    expect(page.locator("#ws-viewer-position")).to_have_text("2 of 4")
+    expect(previous).to_have_attribute("title", "Previous: dirty-work")
+    expect(following).to_have_attribute("title", "Next: open-work")
+    following.click()
+    expect(page.locator("#ws-viewer-title")).to_have_text("open-work")
+    expect(page.locator("#ws-viewer-position")).to_have_text("3 of 4")
+    expect(dialog.get_by_role("tab", name="Transcript")).to_have_attribute("aria-selected", "true")
+    expect(dialog.get_by_role("link", name="PR #8")).to_be_visible()
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("Claude session s1")
+    assert "key=%2Fsrc%2Fworktrees%2Frepo%2Fopen-work" in seen[-1]
+    following.click()
+    expect(page.locator("#ws-viewer-title")).to_have_text("other-repo-work")
+    expect(page.locator("#ws-viewer-position")).to_have_text("4 of 4")
+    expect(following).to_be_disabled()
+    expect(previous).to_be_focused()
+
+    # A refresh that drops the open row keeps its place in the list.
+    plugin.value["workspaces"] = [
+        entry for entry in WORKSPACES if entry["name"] != "other-repo-work"
+    ]
+    page.clock.fast_forward(5000)
+    expect(page.locator("#ws-viewer-position")).to_have_text("")
+    expect(following).to_be_disabled()
+    previous.click()
+    expect(page.locator("#ws-viewer-title")).to_have_text("open-work")
+    expect(page.locator("#ws-viewer-position")).to_have_text("3 of 3")
+    page.keyboard.press("Escape")
+
+    # One matching row, or a viewer opened from elsewhere, has nothing to step through.
+    page.get_by_role("searchbox", name="Search workspaces").fill("open-work")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Diff", exact=True).click()
+    expect(page.locator("#ws-viewer-nav")).to_be_hidden()
+    page.keyboard.press("Escape")
+    page.evaluate(
+        "window.workspaceViewer.open({key: '/src/worktrees/repo/dirty-work', name: 'x'}, 'diff')"
+    )
+    expect(dialog).to_be_visible()
+    expect(page.locator("#ws-viewer-nav")).to_be_hidden()
+
+
 def test_viewer_reports_errors_and_skips_rows_without_a_checkout(page, site):
     url, plugin, _ = site
     plugin.value["workspaces"] = [

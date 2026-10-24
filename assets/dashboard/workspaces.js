@@ -180,25 +180,8 @@
     button.disabled = opening.has(entry.key) || (!entry.workspace_ids.length && entry.missing);
     button.onclick = () => openWorkspace(entry);
     actions.append(button);
-    // Scanned checkouts are read by their row; a row that is only a herdr workspace is
-    // read through that workspace.
-    const scanned = entry.key === entry.path && !entry.missing;
-    if (scanned || entry.workspace_ids.length) {
-      actions.append(
-        ...window.workspaceViewer.buttons({
-          ...(scanned ? { key: entry.key } : {}),
-          workspace: entry.workspace_ids[0],
-          name: entry.name,
-          links: entry.links
-            .filter((link) => link.number)
-            .map((link) => ({
-              label: `${link.kind === "issue" ? "Issue" : "PR"} #${link.number}`,
-              url: link.url,
-              title: link.title || undefined,
-            })),
-        }),
-      );
-    }
+    const target = viewTarget(entry);
+    if (target) actions.append(...window.workspaceViewer.buttons(target, viewTargets));
     const result = openResults.get(entry.key);
     if (result?.url) actions.append(anchor("Open in Collie", result.url));
     if (result?.error) {
@@ -208,6 +191,29 @@
     }
     line.append(actions);
     return line;
+  }
+  // Scanned checkouts are read by their row; a row that is only a herdr workspace is
+  // read through that workspace.
+  function viewTarget(entry) {
+    const scanned = entry.key === entry.path && !entry.missing;
+    if (!scanned && !entry.workspace_ids.length) return null;
+    return {
+      id: entry.key,
+      ...(scanned ? { key: entry.key } : {}),
+      workspace: entry.workspace_ids[0],
+      name: entry.name,
+      links: entry.links
+        .filter((link) => link.number)
+        .map((link) => ({
+          label: `${link.kind === "issue" ? "Issue" : "PR"} #${link.number}`,
+          url: link.url,
+          title: link.title || undefined,
+        })),
+    };
+  }
+  // What the viewer steps through: the rows shown, in their order, that it can read.
+  function viewTargets() {
+    return visible().map(viewTarget).filter(Boolean);
   }
   async function openWorkspace(entry) {
     const opened = window.open("about:blank", "_blank");
@@ -320,6 +326,7 @@
     byId("ws-selected").textContent =
       `${selected.size - hidden} selected` + (hidden ? ` (${hidden} hidden by filters)` : "");
     byId("ws-cleanup").disabled = selected.size === hidden || Boolean(running());
+    window.workspaceViewer?.listChanged();
     renderDialog();
   }
   function running() {

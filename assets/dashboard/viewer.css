@@ -49,6 +49,20 @@
   gap: 6px;
   margin-left: 12px;
 }
+/* Previous and next step through the list the viewer was opened from. */
+.ws-viewer-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ws-viewer-nav[hidden] {
+  display: none;
+}
+#ws-viewer-position {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
 #ws-viewer-title {
   margin: 0 0 6px;
   overflow-wrap: anywhere;

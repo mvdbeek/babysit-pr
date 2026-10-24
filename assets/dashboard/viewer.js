@@ -314,8 +314,14 @@
         }),
     );
   }
-  function openViewer(entry, mode) {
+  // A viewer opened from a list can step through it. `siblings` returns the list as it
+  // is now, so a filter or refresh changed since is followed.
+  function openViewer(entry, mode, siblings = null) {
+    const last = viewer?.siblings === siblings ? viewer.position : -1;
     viewer = { entry, mode, scope: "branch", base: null, session: null, data: null, nodes: [] };
+    viewer.siblings = siblings;
+    viewer.position = last;
+    viewer.id = identity(entry);
     collieUrl = null;
     byId("ws-viewer-title").textContent = entry.name || "Workspace";
     renderLinks(entry.links);
@@ -323,7 +329,54 @@
     openComposer(entry);
     const dialog = byId("ws-viewer");
     if (!dialog.open) dialog.showModal();
+    renderNav();
     void loadViewer();
+  }
+  // Taken when the entry opens: a reopened agent may give it another workspace since.
+  function identity(target) {
+    return target.id ?? JSON.stringify(where(target));
+  }
+  // The open entry's neighbours. One the list no longer shows keeps its place, so the
+  // next one is still where it was.
+  function neighbours() {
+    if (!viewer?.siblings) return null;
+    const list = viewer.siblings();
+    const index = list.findIndex((entry) => identity(entry) === viewer.id);
+    if (index >= 0) viewer.position = index;
+    const at = Math.min(viewer.position, list.length);
+    return {
+      list,
+      index,
+      previous: index >= 0 ? list[index - 1] : at > 0 ? list[at - 1] : undefined,
+      next: index >= 0 ? list[index + 1] : at >= 0 ? list[at] : undefined,
+    };
+  }
+  function renderNav() {
+    const around = neighbours();
+    byId("ws-viewer-nav").hidden = !around || around.list.length < 2;
+    if (!around) return;
+    byId("ws-viewer-position").textContent =
+      around.index >= 0 ? `${around.index + 1} of ${around.list.length}` : "";
+    for (const [id, entry, label] of [
+      ["ws-viewer-prev", around.previous, "Previous"],
+      ["ws-viewer-next", around.next, "Next"],
+    ]) {
+      const button = byId(id);
+      button.disabled = !entry;
+      button.title = entry ? `${label}: ${entry.name || "Workspace"}` : "";
+    }
+  }
+  function step(direction) {
+    const around = neighbours();
+    const entry = around?.[direction];
+    if (!entry) return;
+    openViewer(entry, viewer.mode, viewer.siblings);
+    byId("ws-viewer").scrollTop = 0;
+    // At either end the button just used is disabled; keep the keyboard on the other.
+    const [used, other] = (direction === "next" ? ["next", "prev"] : ["prev", "next"]).map((name) =>
+      byId(`ws-viewer-${name}`),
+    );
+    if (used.disabled && !other.disabled) other.focus();
   }
   function change(update) {
     update(viewer);
@@ -1967,6 +2020,8 @@
   byId("ws-view-diff").onclick = () => setMode("diff");
   byId("ws-view-transcript").onclick = () => setMode("transcript");
   byId("ws-viewer-close").onclick = () => byId("ws-viewer").close();
+  byId("ws-viewer-prev").onclick = () => step("previous");
+  byId("ws-viewer-next").onclick = () => step("next");
   // Full screen is a per-browser preference, kept across viewers and reloads.
   const FULL_KEY = "ws-viewer-full";
   function setFull(full) {
@@ -2016,9 +2071,10 @@
   }, 10000);
   // Diff and Transcript buttons for a target: {workspace} (a herdr workspace ID) and/or
   // {key} (a Workspaces-tab row), or {watch} (a watch ID), plus a name for the dialog
-  // title and the links it shows.
+  // title and the links it shows. `siblings`, if given, returns the targets the viewer
+  // can step through from this one.
   // The pair is one element, so a narrow cell wraps it together.
-  function buttons(target) {
+  function buttons(target, siblings) {
     const pair = node("span", undefined, "ws-view-buttons");
     for (const [label, mode] of [
       ["Diff", "diff"],
@@ -2028,11 +2084,15 @@
       button.type = "button";
       button.onclick = () => {
         opener = button;
-        openViewer(target, mode);
+        openViewer(target, mode, siblings);
       };
       pair.append(button);
     }
     return [pair];
   }
-  window.workspaceViewer = { open: openViewer, buttons };
+  // The list a viewer steps through changed; its neighbours and position may have too.
+  function listChanged() {
+    if (viewer) renderNav();
+  }
+  window.workspaceViewer = { open: openViewer, buttons, listChanged };
 })();
