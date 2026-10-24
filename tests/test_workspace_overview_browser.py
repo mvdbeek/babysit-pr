@@ -3,6 +3,7 @@
 import copy
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 
 import dashboard
 import pytest
@@ -514,6 +515,9 @@ def test_the_viewer_steps_through_the_filtered_rows(page, site):
     expect(page.locator("#ws-viewer-title")).to_have_text("open-work")
     expect(page.locator("#ws-viewer-position")).to_have_text("3 of 3")
     page.keyboard.press("Escape")
+    # Focus returns to the row last viewed, though a refresh rebuilt the list.
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    expect(line.get_by_role("button", name="Transcript", exact=True)).to_be_focused()
 
     # One matching row, or a viewer opened from elsewhere, has nothing to step through.
     page.get_by_role("searchbox", name="Search workspaces").fill("open-work")
@@ -526,6 +530,49 @@ def test_the_viewer_steps_through_the_filtered_rows(page, site):
     )
     expect(dialog).to_be_visible()
     expect(page.locator("#ws-viewer-nav")).to_be_hidden()
+
+
+def test_a_stop_on_its_way_holds_only_the_row_it_was_sent_from(page, site):
+    url, _, _ = site
+    session = {"id": "s1", "agent": "claude", "title": "Fix the crash", "updated": 1}
+    held = []
+
+    def agents(route):
+        asked = parse_qs(urlsplit(route.request.url).query)
+        if "key" in asked:
+            name = asked["key"][0].rsplit("/", 1)[1]
+        else:
+            # Rows with a workspace, or once the agents name one, are asked for through it.
+            name = {"w1": "merged-work"}.get(asked["workspace"][0]) or asked["workspace"][0][3:]
+        route.fulfill(
+            json={
+                "agents": [
+                    {"pane": f"{name}:p1", "agent": "claude", "status": "working", "session": "s1"}
+                ],
+                "sessions": [session],
+                "workspace": f"ws-{name}",
+            }
+        )
+
+    page.route("**/api/workspace-agents?*", agents)
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    page.route("**/api/workspace-interrupt", lambda route: held.append(route))
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("dirty-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    dialog.get_by_role("button", name="Stop Claude in dirty-work:p1").click()
+    expect(dialog.locator(".ws-stop")).to_have_text("Stopping…")
+    dialog.get_by_role("button", name="Next workspace").click()
+    expect(page.locator("#ws-viewer-title")).to_have_text("merged-work")
+    stop = dialog.get_by_role("button", name="Stop Claude in merged-work:p1")
+    expect(stop).to_have_text("Stop")
+    expect(stop).to_be_enabled()
+    dialog.get_by_role("button", name="Previous workspace").click()
+    expect(dialog.locator(".ws-stop")).to_have_text("Stopping…")
+    held[0].fulfill(json={"stopped": True, "pane": "dirty-work:p1", "warning": None})
+    expect(dialog.locator(".ws-stop")).to_have_text("Stop")
+    assert held[0].request.post_data_json["pane"] == "dirty-work:p1"
 
 
 def test_viewer_reports_errors_and_skips_rows_without_a_checkout(page, site):
