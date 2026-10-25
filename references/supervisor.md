@@ -572,7 +572,13 @@ at a same-named path here: the checkout (probe op `worktree`: its top, branch, h
 changes and Git common dir) and the session (probe op `session_info`, which checks the
 worker's rollout or Claude transcript as `register` checks its own, and records the
 worker's account directory). The PR is named (`--pr URL`, or a number with `--repo`,
-or `--branch`); `--pr auto` would need the worker's checkout. A worker watch's
+or `--branch`); `--pr auto` would need the worker's checkout. The checkout must be a
+clean linked worktree under the worker's `<src>/worktrees` (resolved there), never a
+main clone, whose `.git` other tasks share. Session ids are normalised before they are
+compared. Once the worker's own checks pass, any failure to resolve the PR, a closed PR
+or one whose branch and head the checkout does not match is reported only as "PR not
+found or not watchable from this worker", so registrations cannot probe what this
+machine's GitHub token can see. A worker watch's
 launcher is that worker's own babysit-bwrap (`<babysit_root>/scripts/babysit-bwrap`,
 `~` meaning the worker's home, with `--enable=gpg` when the machine has the `gpg`
 label); `--codex-command`/`--claude-command` are refused, so a registration never
@@ -590,7 +596,11 @@ once), checks the checkout again with that machine's hardened Git, builds the ag
 environment with the worker's own Claude account directory, and runs the agent in its
 own process group inside the worker's babysit-bwrap (`--enable=gpg` with the machine's
 `gpg` label), keeping `~/.local/state/babysit-pr/runs/<attempt>/` (`agent.log`,
-`prompt.txt`, `reply.json`, `result.json`, `pid`) there. Its output streams back into
+`prompt.txt`, `reply.json`, `result.json`, `pid`) there. Codex gets its output schema
+and writes its reply in `~/.cache/babysit-repairs/<attempt>/`, the one extra folder its
+sandbox is given (the run folder lies under the protected state directory, and an agent
+able to write it could forge `result.json` or `pid`); the worker half copies the reply
+out, as a regular file read with a size limit, and removes the folder. Its output streams back into
 the guardian's `agent.log`, so a Claude result is read as for a local repair; a
 Codex `reply.json` is fetched by a separate `_repair_status` call after the run. The
 prompt names the agent's own copy of the skill. The session's lease is the
@@ -603,8 +613,12 @@ that it runs in the bound terminal's foreground, then runs the agent in view, bo
 by the repair timeout, and parses a Claude result itself. The guardian polls
 `_repair_status` every 5 s until the timeout plus 60 s, then copies the last MB of the
 worker's `agent.log`; no result by then leaves the session held as for a lost worker.
-A stop request asks the worker to cancel (`_repair_cancel`), and leaves the session
-held when it cannot confirm the agent stopped.
+A stop request, even one that lands while the line is being typed, asks the worker to
+cancel (`_repair_cancel`), and leaves the session held when it cannot confirm the agent
+stopped. A cancel of a run that has not started takes its run folder (exclusive
+`mkdir`, result "Cancelled before start"), so a line that runs late fails at its own
+exclusive `mkdir` instead of starting a second agent on the session; clearing an
+orphan tombstone for a run that never started cancels it the same way first.
 
 On a worker, `register` forwards to the controller's dashboard instead of keeping a
 watch of its own, which would act where nobody looks. A worker is one with
@@ -612,11 +626,24 @@ watch of its own, which would act where nobody looks. A worker is one with
 with `BABYSIT_WORKER` set. A launch sets it for the `wt` it runs, not for the agent's
 pane, whose shell herdr's server starts; inside babysit-bwrap, where `$HOME` is empty,
 the wrapper sets `BABYSIT_WORKER=1` whenever the host has that file. The worker resolves
-`--pr auto` with its own `gh` in its checkout, then POSTs the registration to
-`<controller>/api/worker/register` with `Authorization: Bearer <token>`, both from
-`worker.json` (`provision_worker.sh --controller`). It follows no redirect and uses no
-proxy from the environment, so the token goes only to that URL. Without a controller
-and token there, `register` refuses. `handoff` on a worker refuses for now: exit the
+`--pr auto` with its own `gh` in its checkout. Outside a sandbox it then POSTs the
+registration to `<controller>/api/worker/register` with `Authorization: Bearer
+<token>`, both from `worker.json` (`provision_worker.sh --controller`); it follows no
+redirect and uses no proxy from the environment, so the token goes only to that URL.
+Without a controller and token there, `register` refuses.
+
+Inside babysit-bwrap the sandbox never sees `worker.json`. For each launch with an
+agent configuration on a worker, the wrapper starts a registration broker
+(`scripts/worker_broker.py`) outside the sandbox, with the gpg proxy's lifecycle (a
+private directory under `$XDG_RUNTIME_DIR`, its own session, gone with bwrap), binds
+its socket in and names it last in `BABYSIT_REGISTER_SOCKET`. `register` inside sends
+the request there. The broker forwards only requests for the launch's agent whose
+`cwd` is one of the launch's granted directories and whose session's transcript lies
+in the launch's own configuration directory (`--claude-config-dir`'s `projects/`,
+`--codex-home`'s `sessions/`); it tells the controller to check exactly that
+transcript and passes no Claude account, so the account is where the transcript lies.
+The wrapper also shows the deployed babysit-pr read-only inside on a worker, so the
+skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on a worker refuses for now: exit the
 original agent and release the watch on the controller (`release_argv` in the answer).
 
 The dashboard's `/api/worker/register` takes only that: the Host must be one the
@@ -626,19 +653,27 @@ body is exactly the registration fields (PR, repo, CI repo or branch, absolute `
 session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
 poll interval, budget and timeout), checked by type, form and length, with no control
 characters (the instructions may span lines). One registration per machine runs at a
-time. `pr_supervisor.py worker-token ID` issues a machine's token: 32 random bytes,
+time, at most 6 a minute (a failed one costs 2 more, so repeated failures back off;
+answered 429), and a worker watch is polled no more often than every 30 s. With a
+machine's optional `tailnet_ip` in `machines.json`, a registration is refused unless
+`X-Forwarded-For` is exactly that address: `tailscale serve` sets it to the address the
+request came from, replacing any the client sent. A process on this machine that
+reaches the dashboard directly could still send that header, but it needs the token
+too. `pr_supervisor.py worker-token ID` issues a machine's token: 32 random bytes,
 printed once into a pipe (never to a terminal), and stored on the controller only as
 its SHA-256 in `--home/worker-tokens.json` (mode 600), not in `machines.json`, which
 may be shared. Issuing again replaces it; `--revoke` removes it; a disabled or
 unregistered machine's token is refused. Tokens are compared in constant time against
 every entry.
 
-Residual: babysit-bwrap shows `worker.json` read-only to every sandboxed agent on the
-worker, so any agent there (or anything else running as the worker user) can register
-watches as that machine: for sessions and checkouts that exist there, with instructions
-of its choosing, which a later release turns into repairs of that session. It cannot
-name another machine, choose a launcher, or reach anything but this endpoint with the
-token. Revoke a lost worker's token with `worker-token ID --revoke`.
+Residual: a sandboxed agent can register watches only for its own sessions in its own
+checkouts, with instructions of its choosing (as it could ask its user to). Anything
+running unsandboxed as the worker user can read `worker.json` and register any linked
+worktree and session there; a later release turns that into repairs of the session, in
+that worktree's sandbox. Neither can name another machine or choose a launcher. A
+worker watch awaiting release shows its machine, worktree and session id in the
+dashboard and its attention item: release only the session you handed off. Revoke a
+lost worker's token with `worker-token ID --revoke`.
 
 Watches record `machine` (null for this machine), and a worktree path is a
 duplicate only on the same machine. The dashboard reads the diff and

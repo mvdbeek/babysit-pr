@@ -19,7 +19,9 @@ tell whether the agent still runs: it leaves an orphan tombstone on the session'
 import json
 import os
 import shlex
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -295,11 +297,12 @@ def run_in_pane(home, worker, job, folder, spec):
             shlex.quote(spec),
         ]
     )
-    # Exactly one submission, never retried: delivery may have happened.
-    herdr_handoff.herdr("pane", "run", pane, sandbox.typed(line), machine=worker)
     deadline = time.monotonic() + job["repair_timeout"] + SSH_SLACK
     record = None
     try:
+        # Exactly one submission, never retried: delivery may have happened. A stop
+        # request from here on cancels, so a line that starts late finds the run taken.
+        herdr_handoff.herdr("pane", "run", pane, sandbox.typed(line), machine=worker)
         while True:
             time.sleep(PANE_POLL)
             try:
@@ -363,6 +366,9 @@ def reconcile(home, machine_id, session_id, attempt):
         return False
     if record["running"]:
         return False
+    # A spec staged or a line typed may still start the run: take its run folder first.
+    if not record["started"] and not cancel(home, worker, attempt):
+        return False
     current = session_locks.orphan_attempt(session_id, machine_id)
     if current == attempt:
         session_locks.clear_orphan(None, session_id, None, machine_id)
@@ -411,6 +417,7 @@ def worker_main(spec_path):
     spec = read_spec(spec_path)
     job, attempt = spec["job"], spec["attempt"]
     folder = run_folder(attempt)
+    codex_out = Path.home() / ".cache" / "babysit-repairs" / attempt
     folder.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     folder.mkdir(mode=0o700)  # Single use: a replayed spec finds it and stops.
     (folder / "pid").write_text(json.dumps({"worker": os.getpid()}))
@@ -462,7 +469,16 @@ def worker_main(spec_path):
         if job["agent"] == "claude":
             local["claude_command"] = sandbox.claude_launcher("bwrap", features)
         else:
-            grants = sandbox.Grants(env_pass=sandbox.REPAIR_ENV, features=("playwright", *features))
+            # Codex writes its reply beside its schema, in a folder of their own that the
+            # sandbox is given: never the run folder, whose result and pid it could forge.
+            codex_out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            codex_out.mkdir(mode=0o700)
+            pr_supervisor.watch.save_state(codex_out / "schema.json", pr_supervisor.RESULT_SCHEMA)
+            grants = sandbox.Grants(
+                add_dirs=(str(codex_out),),
+                env_pass=sandbox.REPAIR_ENV,
+                features=("playwright", *features),
+            )
             local["codex_command"] = sandbox.wrap(["codex"], grants, "bwrap")
         env = os.environ.copy()
         if job["agent"] == "claude" and job.get("claude_config_dir"):
@@ -478,11 +494,15 @@ def worker_main(spec_path):
         env["BABYSIT_PR_REPAIR"] = job["id"]
         env.update(github_cli.NON_INTERACTIVE)
         with prompt_path.open() as prompt, (folder / "agent.log").open("wb") as log:
-            if lost.is_set():
-                raise KeyboardInterrupt()
             with stopping:
+                # Checked under the lock the lifeline stops under: an agent never starts
+                # after its lifeline ended.
+                if lost.is_set():
+                    raise KeyboardInterrupt()
                 proc = subprocess.Popen(
-                    pr_supervisor.command_for(local, folder),
+                    pr_supervisor.command_for(
+                        local, codex_out if job["agent"] == "codex" else folder
+                    ),
                     cwd=job["cwd"],
                     env=env,
                     stdin=prompt,
@@ -512,6 +532,8 @@ def worker_main(spec_path):
             else:
                 output.join(timeout=5)
                 result = {"exit": code, "error": None}
+                if code == 0 and job["agent"] == "codex":
+                    pr_supervisor.watch.save_state(folder / "reply.json", codex_reply(codex_out))
                 if code == 0 and job["agent"] == "claude":
                     import claude_runner
 
@@ -534,10 +556,23 @@ def worker_main(spec_path):
             owned_process.stop_group(proc)
         if output is not None:
             output.join(timeout=5)
+        shutil.rmtree(codex_out, ignore_errors=True)
         pr_supervisor.watch.save_state(folder / "result.json", result)
         if pane:
             print(f"\nBabysitter: {result['error'] or 'agent exited'}\n", flush=True)
     return 0
+
+
+def codex_reply(folder):
+    """The reply Codex wrote in its sandboxed folder: a regular file, read bounded."""
+    descriptor = os.open(folder / "reply.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Codex left no reply file")
+        data = stream.read(MAX_STATUS // 2 + 1)
+    if len(data) > MAX_STATUS // 2:
+        raise ValueError("Codex's reply is too large")
+    return json.loads(data)
 
 
 def _alive(pid, attempt):
@@ -583,12 +618,32 @@ def worker_status(attempt):
 
 
 def worker_cancel(attempt, wait=10):
-    """``_repair_cancel``: stop this attempt's worker half, which stops its agent first."""
+    """``_repair_cancel``: stop this attempt's worker half, which stops its agent first.
+
+    A run not started yet is taken, so a late ``_repair_worker`` (a staged spec, a line
+    typed into a pane) fails at its own exclusive mkdir instead of starting an agent.
+    """
     folder = run_folder(attempt)
+    folder.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        folder.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    else:
+        result = {"exit": None, "error": "Cancelled before start"}
+        (folder / "result.json").write_text(json.dumps(result))
+        return {"stopped": True}
+    deadline = time.monotonic() + wait
+    # The worker half records its pid right after its mkdir; a run that just started
+    # has it a moment later.
     pid = (_read(folder / "pid") or {}).get("worker")
+    while pid is None and not (folder / "result.json").exists():
+        if time.monotonic() >= deadline:
+            return {"stopped": False}
+        time.sleep(0.1)
+        pid = (_read(folder / "pid") or {}).get("worker")
     if isinstance(pid, int) and _alive(pid, attempt):
         os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + wait
     while _alive(pid, attempt) and time.monotonic() < deadline:
         time.sleep(0.2)
     return {"stopped": not _alive(pid, attempt)}

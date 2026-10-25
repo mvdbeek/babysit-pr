@@ -25,11 +25,24 @@ from test_remote_registration import box, claude_transcript, register, registry 
 
 SCRIPTS = Path(supervisor.__file__).resolve().parent
 CHECK_VERSION = remote_repair.check_version
-BWRAP = """#!/bin/sh
-printf '%s\\n' "$*" >> "$HOME/bwrap-calls"
-while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
-shift
-exec "$@"
+BWRAP = f"""#!{sys.executable}
+import os, sys
+args = sys.argv[1:]
+with open(os.path.expanduser("~/bwrap-calls"), "a") as calls:
+    calls.write(" ".join(args) + "\\n")
+granted = []
+while args[0] != "--":
+    word = args.pop(0)
+    if word.startswith("--add-dirs="):
+        granted += word.split("=", 1)[1].split(":")
+args.pop(0)
+# As in the real sandbox, a file the agent is told to read or write must be mounted.
+for flag in ("-o", "--output-schema"):
+    if flag in args:
+        path = os.path.realpath(args[args.index(flag) + 1])
+        if not any(path.startswith(os.path.realpath(d) + "/") for d in granted):
+            sys.exit(f"bwrap: {{path}} is not mounted in the sandbox")
+os.execvp(args[0], args)
 """
 AGENT = f"""#!{sys.executable}
 import json, os, sys, time
@@ -68,6 +81,7 @@ def worker(box, tmp_path, monkeypatch):  # noqa: F811
         SCRIPTS, app / "scripts", ignore=shutil.ignore_patterns("test_*", "__pycache__")
     )
     (app / "scripts" / "babysit-bwrap").write_text(BWRAP)
+    (app / "scripts" / "babysit-bwrap").chmod(0o755)
     registry(box["home"], babysit_root=str(app))
     bin_dir = tmp_path / "agents"
     bin_dir.mkdir()
@@ -135,6 +149,9 @@ def test_a_codex_repair_runs_on_the_worker_and_returns_here(worker, tmp_path):
     assert f"--add-dirs={tree}:{common}" in bwrap and "-- codex exec" in bwrap
     run = remote_run(worker, job)
     assert json.loads((run / "result.json").read_text()) == {"exit": 0, "error": None}
+    # Codex writes its reply in a folder of its own, never into the run folder.
+    assert str(run) not in bwrap
+    assert not (worker["worker"] / ".cache/babysit-repairs" / job["attempt"]).exists()
     assert not session_locks.held("codex", worker["sid"], None, "box")
     # The worker half never keeps a queue.
     assert not (worker["worker"] / ".local/state/babysit-pr/queue.sqlite").exists()
@@ -383,3 +400,56 @@ def test_the_worker_half_of_a_pane_repair_runs_only_in_its_terminal(worker, pane
     recorded = json.loads((remote_run(worker, job) / "result.json").read_text())
     assert "requires its original terminal" in recorded["error"]
     assert not calls(tmp_path)
+
+
+def test_a_run_cancelled_before_it_starts_can_never_start_late(worker, tmp_path):
+    job, folder = dispatch(worker)
+    machine = remote_repair.machines.resolve(worker["home"], "box")
+    staged = worker["worker"] / ".local/state/babysit-pr/repair-specs"
+    staged.mkdir(parents=True)
+    spec = remote_repair.spec_for(machine, job, job["attempt"], "prompt", job["snapshot"]["pr"])
+    (staged / "late.json").write_text(json.dumps(spec))
+    assert remote_repair.cancel(worker["home"], machine, job["attempt"])
+    record = remote_repair.status(worker["home"], machine, job["attempt"])
+    assert record["result"] == {"exit": None, "error": "Cancelled before start"}
+    late = subprocess.run(
+        [
+            sys.executable,
+            str(worker["worker"] / "app/scripts/pr_supervisor.py"),
+            "_repair_worker",
+            str(staged / "late.json"),
+        ],
+        env={**os.environ, "HOME": str(worker["worker"])},
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert late.returncode == 1 and "File exists" in late.stdout
+    assert not calls(tmp_path)
+
+
+def test_reconciling_a_run_that_never_started_takes_it_first(worker, tmp_path):
+    job, _ = dispatch(worker)
+    sid = worker["sid"]
+    session_locks.mark_orphan("codex", sid, None, job["attempt"], "box")
+    assert remote_repair.reconcile(worker["home"], "box", sid, job["attempt"])
+    assert not session_locks.held("codex", sid, None, "box")
+    result = json.loads((remote_run(worker, job) / "result.json").read_text())
+    assert result["error"] == "Cancelled before start"
+
+
+def test_a_stop_while_typing_into_the_pane_cancels_the_run(worker, pane, monkeypatch):
+    job, folder = dispatch(worker, pane="w1:p1", headless=False)
+    real = herdr_handoff.herdr
+
+    def interrupted(*args, machine=None):
+        if args[:2] == ("pane", "run"):
+            raise KeyboardInterrupt()  # A stop request lands while the line is sent.
+        return real(*args, machine=machine)
+
+    monkeypatch.setattr(herdr_handoff, "herdr", interrupted)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert result(folder)["summary"] == "Repair interrupted; inspect before resuming"
+    run = json.loads((remote_run(worker, job) / "result.json").read_text())
+    assert run["error"] == "Cancelled before start"
+    assert not session_locks.held("codex", worker["sid"], None, "box")
