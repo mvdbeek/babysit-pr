@@ -28,6 +28,7 @@ from urllib.parse import quote
 
 import claude_accounts
 import herdr_handoff as handoff
+import machines
 import workspace_agents
 import workspace_exit
 import wt
@@ -229,7 +230,7 @@ def start(job, run_id, home, src):
         "launched_at": time.time(),
     }
     try:
-        run("herdr", "pane", "run", pane, command)
+        run(*machines.herdr_argv(None, "pane", "run", pane, command))
     except subprocess.TimeoutExpired:
         return {**launched, "uncertain": "herdr did not answer while typing the command"}
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -312,7 +313,7 @@ def close_pane(pane):
         procs = handoff.result("pane", "process-info", "--pane", pane)["process_info"]
         if any(p.get("pid") != procs.get("shell_pid") for p in procs["foreground_processes"]):
             return False
-        run("herdr", "pane", "close", pane)
+        run(*machines.herdr_argv(None, "pane", "close", pane))
         return True
     except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError):
         return False

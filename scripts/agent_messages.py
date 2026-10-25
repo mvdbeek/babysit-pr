@@ -35,6 +35,7 @@ import claude_accounts
 import claude_runner
 import exit_watch
 import herdr_handoff
+import machines
 import workspace_viewer
 import wt
 from pr_workspaces import herdr, run
@@ -531,7 +532,7 @@ def paste(pane, text):
     with locked(("pane", pane)):
         if not idle_screen(pane):
             raise ValueError("The agent is waiting on a question or approval; answer it first")
-        run("herdr", "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~")
+        run(*machines.herdr_argv(None, "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~"))
         if not wait_for(pane, lambda screen: pasted(screen, text), read=herdr_handoff.read_screen):
             raise ValueError(f"The text did not appear in the prompt box; {UNCERTAIN}")
         herdr("agent", "send-keys", pane, "enter")
@@ -673,7 +674,7 @@ def live_interaction(target):
     Only a complete, single-choice, single-question Claude dialog can be answered
     from the screen. Other dialogs remain visible without guessing their controls.
     """
-    screen = run("herdr", "agent", "read", target["pane"], "--source", "visible")
+    screen = run(*machines.herdr_argv(None, "agent", "read", target["pane"], "--source", "visible"))
     result = {"screen": screen, "question": None, "choices": None, "idle": False}
     if target["agent"] != "claude" or not target.get("session"):
         return result
@@ -737,7 +738,7 @@ def dialog(pane):
     It starts at the last rule above it, skipping the one that sets off its "Chat about
     this" line, and ends with its key hints (the review tab has none).
     """
-    screen = run("herdr", "agent", "read", pane, "--source", "visible")
+    screen = run(*machines.herdr_argv(None, "agent", "read", pane, "--source", "visible"))
     lines = [unquote(line) for line in screen.splitlines()]
     hints = [i for i, line in enumerate(lines) if "Esc to cancel" in line]
     end = hints[-1] + 1 if hints else len(lines)
@@ -882,7 +883,7 @@ def answer_locked(request):
                     # shows once it has focus.
                     if not wait_for(pane, lambda screen: "ctrl+g to edit" in screen):
                         raise ValueError("the answer field did not open")
-                    run("herdr", "pane", "send-text", pane, value)
+                    run(*machines.herdr_argv(None, "pane", "send-text", pane, value))
                 else:
                     if value == str(len(question["options"]) + 1) and "ctrl+g to edit" in dialog(
                         pane
@@ -947,7 +948,7 @@ def codex_dialog(pane):
     Codex CLI 0.160 renders `Question i/n` and `enter to submit answer/all`.
     Unlike Claude, it has no horizontal rule around the dialog.
     """
-    screen = run("herdr", "agent", "read", pane, "--source", "visible")
+    screen = run(*machines.herdr_argv(None, "agent", "read", pane, "--source", "visible"))
     headings = list(re.finditer(r"(?m)^\s*Question \d+/\d+[^\n]*\n", screen))
     if not headings:
         return ""
@@ -997,7 +998,7 @@ def answer_codex(request, questions, steps):
         typed = True
         _codex_answered.add(identity)
         if kind == "text":
-            run("herdr", "pane", "send-text", pane, value)
+            run(*machines.herdr_argv(None, "pane", "send-text", pane, value))
         else:
             herdr("agent", "send-keys", pane, value)
 
@@ -1340,7 +1341,7 @@ def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, laun
     _recent[session_id] = (pane, time.monotonic())
     try:
         # `pane run` answers with plain text, not herdr's JSON envelope.
-        run("herdr", "pane", "run", pane, command)
+        run(*machines.herdr_argv(None, "pane", "run", pane, command))
     except subprocess.TimeoutExpired:
         return {
             "sent": True,

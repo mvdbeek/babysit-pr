@@ -402,3 +402,33 @@ def test_qualify_split_round_trip(machine_id, wid, qid):
 def test_split_rejects_malformed(qid):
     with pytest.raises(ValueError):
         machines.split(qid)
+
+
+def test_wrappers_drive_herdr_here_and_git_over_ssh(tmp_path, fake_tools, short_tmp):
+    import herdr_handoff
+    import pr_workspaces
+
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    assert pr_workspaces.herdr("workspace", "list") == {"workspaces": []}
+    assert pr_workspaces.herdr("workspace", "list", machine=mini) == {"workspaces": []}
+    assert json.loads(herdr_handoff.herdr("agent", "list", machine=mini)) == {
+        "result": {"agents": []}
+    }
+    state = json.loads(fake_tools.read_text())
+    assert state["calls"] == [
+        ["workspace", "list"],
+        ["--machine", "Mac mini", "workspace", "list"],
+        ["--machine", "Mac mini", "agent", "list"],
+    ]
+    assert "ssh" not in state  # herdr reaches the worker itself
+
+    clone = tmp_path / "hosts" / "mini.tail1234.ts.net" / "src" / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(clone)], check=True)
+    head = pr_workspaces.git(clone, "symbolic-ref", "HEAD", machine=mini, home=home)
+    assert head == "refs/heads/main"
+    [call] = json.loads(fake_tools.read_text())["ssh"]
+    assert call == {
+        "target": "mini.tail1234.ts.net",
+        "command": f"git -C {clone} symbolic-ref HEAD",
+    }

@@ -11,7 +11,7 @@ import time
 import uuid
 from pathlib import Path
 
-import owned_process
+import machines
 import pr_supervisor as supervisor
 
 SCRIPT = Path(__file__).resolve()
@@ -34,8 +34,9 @@ CLAUDE_EXIT_HINT = "Press Ctrl-D again to exit"
 RULE = re.compile(r"^\s*─+\s*$")
 
 
-def herdr(*args):
-    proc = owned_process.run(["herdr", *args], text=True, timeout=15)
+def herdr(*args, machine=None):
+    # herdr reaches a worker's server itself, so the command always runs here.
+    proc = machines.run(None, None, machines.herdr_argv(machine, *args), text=True, timeout=15)
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "herdr failed")
     return proc.stdout

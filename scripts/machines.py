@@ -320,11 +320,13 @@ def _channel(m: Machine):
         return _channels.setdefault(m.ssh, threading.BoundedSemaphore(CHANNELS))
 
 
-def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=None):
+def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=None, **kwargs):
     """owned_process.run on this machine, or over ssh on ``m``.
 
     Remote commands get the worker's own environment: ``env`` is refused rather than
     forwarding controller credentials. ssh exits 255 when the machine is unreachable.
+
+    Other keyword arguments (``text``, ``pass_fds``) go to the local process.
 
     ``timeout`` covers waiting for an ssh channel plus the ssh client; exceeding it
     raises ``subprocess.TimeoutExpired``. Contract for remote callers: a timeout kills
@@ -333,17 +335,17 @@ def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=Non
     """
     if m is None:
         argv = [os.path.expanduser(x) if isinstance(x, RemotePath) else x for x in argv]
-        return owned_process.run(argv, timeout=timeout, input=input, env=env, cwd=cwd)
+        return owned_process.run(argv, timeout=timeout, input=input, env=env, cwd=cwd, **kwargs)
     if env is not None:
         raise ValueError("Remote commands run with the worker's environment")
     started = time.monotonic()
     channel = _channel(m)
-    if not channel.acquire(timeout=-1 if timeout is None else timeout):
+    if not channel.acquire(timeout=timeout):
         raise subprocess.TimeoutExpired(argv, timeout)
     try:
         remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
         return owned_process.run(
-            remote_argv(home, m, argv, cwd=cwd), timeout=remaining, input=input
+            remote_argv(home, m, argv, cwd=cwd), timeout=remaining, input=input, **kwargs
         )
     finally:
         channel.release()

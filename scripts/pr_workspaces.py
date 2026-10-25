@@ -29,7 +29,7 @@ import attachments
 import claude_accounts
 import exit_watch
 import github_cli
-import owned_process
+import machines
 import workspace_agents
 import workspace_exit
 from issue_overview import branch_number
@@ -87,23 +87,25 @@ RECENT_CLONE_SECONDS = 90 * 86400
 REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
-def run(*args, cwd=None, timeout=30, pass_fds=()):
+def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
     argv = list(map(str, args))
     # git may call the gh credential helper; both get the shared token and never prompt.
     if argv[0] == "gh":
         result = github_cli.run(argv, cwd=cwd, text=True, timeout=timeout, pass_fds=pass_fds)
     else:
-        env = github_cli.environment() if argv[0] == "git" else None
-        result = owned_process.run(
-            argv, cwd=cwd, env=env, text=True, timeout=timeout, pass_fds=pass_fds
+        # A worker's git uses its own gh login; the shared token stays on this machine.
+        env = github_cli.environment() if argv[0] == "git" and machine is None else None
+        result = machines.run(
+            home, machine, argv, cwd=cwd, env=env, text=True, timeout=timeout, pass_fds=pass_fds
         )
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Command failed")[-4000:].strip())
     return result.stdout.strip()
 
 
-def herdr(*args):
-    value = json.loads(run("herdr", *args))
+def herdr(*args, machine=None):
+    # herdr reaches a worker's server itself, so the command always runs here.
+    value = json.loads(run(*machines.herdr_argv(machine, *args)))
     if value.get("error"):
         raise ValueError(str(value["error"]))
     return value["result"]
@@ -117,8 +119,8 @@ def remote_slug(value):
     return match[1].lower() if match and SLUG.fullmatch(match[1]) else None
 
 
-def git(path, *args):
-    return run("git", "-C", path, *args, timeout=15)
+def git(path, *args, machine=None, home=None):
+    return run("git", "-C", path, *args, timeout=15, machine=machine, home=home)
 
 
 CONFIG_KEYS = r"^(remote\..*\.url|branch\..*\.(remote|merge))$"
@@ -1100,7 +1102,7 @@ class Workspaces:
             if action == "focus":
                 if not target["workspace_id"]:
                     raise ValueError("Workspace is missing")
-                run("herdr", "workspace", "focus", target["workspace_id"])
+                run(*machines.herdr_argv(None, "workspace", "focus", target["workspace_id"]))
             if action == "copy":
                 args = (
                     ["herdr", "workspace", "focus", target["workspace_id"]]
