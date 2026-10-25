@@ -1513,6 +1513,179 @@ def _host_version(babysit_root):
     return {"head": host_git(root, "rev-parse", "HEAD")}
 
 
+def _host_worktree(path, root):
+    """A watched checkout here: its top, branch (None when detached), head, whether it has
+    changes, its Git common dir when it is a linked worktree (None otherwise), and the
+    real path of ``root``, where this machine's worktrees live."""
+    _arg_paths([root], home=True)
+    real = _host_checkout(path)
+    try:
+        branch = host_git(real, "symbolic-ref", "--short", "HEAD")
+    except ValueError:
+        branch = None
+    try:
+        common = _host_common_dir(real)
+    except ValueError:
+        common = None
+    return {
+        "path": real,
+        "branch": branch,
+        "head": host_git(real, "rev-parse", "HEAD"),
+        "dirty": bool(host_git(real, "status", "--porcelain")),
+        "common": common,
+        "root": os.path.realpath(os.path.expanduser(root)),
+    }
+
+
+def _session_items(stream):
+    for line in transcript_lines(stream):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            yield item
+
+
+def _outside(path, store):
+    return ValueError(f"{path} is not in the launch's configuration directory ({store})")
+
+
+def _codex_session_info(session, cwd, rollout, expected_home=None):
+    """``pr_supervisor.session_info`` for a rollout of this machine; with
+    ``expected_home``, one in that Codex home's ``sessions``."""
+    if rollout is None:
+        store = host_session_root(host_codex_sessions())
+        found = list(store.rglob(f"*{session}*.jsonl")) if store is not None else []
+        if len(found) != 1:
+            raise ValueError("Specify --rollout: could not identify exactly one saved session")
+        rollout = str(found[0])
+    rollout = os.path.realpath(rollout)
+    if expected_home is not None:
+        store = Path(os.path.realpath(expected_home)) / "sessions"
+        if not Path(rollout).is_relative_to(store):
+            raise _outside(rollout, store)
+    meta, context = None, {}
+    # Opened beneath its resolved path: a link swapped in since is refused, not followed.
+    with _host_transcript(rollout) as stream:
+        for item in _session_items(stream):
+            if item.get("type") == "session_meta":
+                meta = item.get("payload")
+            elif item.get("type") == "turn_context" and isinstance(item.get("payload"), dict):
+                context = item["payload"]
+    if not isinstance(meta, dict) or meta.get("id") != session:
+        raise ValueError("Rollout session ID does not match")
+    if os.path.realpath(str(meta.get("cwd") or "")) != os.path.realpath(cwd):
+        raise ValueError("Rollout cwd does not match the worktree")
+    policy = (context.get("sandbox_policy") or {}).get("type")
+    if policy not in {"read-only", "workspace-write", "danger-full-access"}:
+        raise ValueError("Cannot preserve this session's sandbox policy automatically")
+    model = context.get("model")
+    return {
+        "session_id": session,
+        "rollout": rollout,
+        "sandbox": policy,
+        "model": model if isinstance(model, str) else None,
+    }
+
+
+def _claude_session_info(session, cwd, transcript, account, expected_home=None):
+    """``claude_runner.session_info`` for a transcript in one of this machine's Claude homes.
+
+    It reads at most the transcript's first MAX_SCAN bytes, as every probe does.
+    """
+    default = Path(os.path.expanduser("~/.claude")).resolve()
+    selected = None
+    if account == "default":
+        selected = default
+    elif account is not None:
+        if not os.path.isdir(os.path.join(default, "accounts", account)):
+            raise ValueError(f"Unknown Claude account {account} on this machine")
+        selected = (default / "accounts" / account).resolve()
+    if transcript is None:
+        found = [
+            path
+            for home in ([selected] if selected else host_claude_homes())
+            if host_session_root(home / "projects") is not None
+            for path in (home / "projects").glob(f"*/{session}.jsonl")
+        ]
+        if len(found) != 1:
+            raise ValueError("Supply --rollout: could not identify one saved Claude transcript")
+        transcript = str(found[0])
+    real = Path(os.path.realpath(transcript))
+    # Top-level transcripts live directly in HOME/projects/PROJECT/.
+    if real.parent.parent.name != "projects":
+        raise ValueError("Use the original Claude session, not a subagent transcript")
+    home = real.parents[2]
+    if selected and home != selected:
+        raise ValueError("Claude transcript belongs to a different account")
+    # The launch that registered it: its own store, checked on the path opened below.
+    if expected_home is not None and home != Path(os.path.realpath(expected_home)):
+        raise _outside(real, os.path.realpath(expected_home))
+    root = os.path.realpath(cwd)
+    seen, model, permission_mode = False, None, None
+    with _host_transcript(str(real)) as stream:
+        for item in _session_items(stream):
+            if item.get("type") not in {"user", "assistant"}:
+                continue
+            if item.get("isSidechain"):
+                raise ValueError("Use the original Claude session, not a subagent transcript")
+            if item.get("sessionId") != session:
+                raise ValueError("Claude transcript session ID does not match")
+            # A session may cd into a subdirectory of its worktree without changing identity.
+            where = os.path.realpath(str(item.get("cwd") or "/nonexistent"))
+            if not item.get("cwd") or not (where == root or where.startswith(root + os.sep)):
+                raise ValueError("Claude transcript cwd does not match the worktree")
+            seen = True
+            message = item.get("message")
+            candidate = message.get("model") if isinstance(message, dict) else None
+            if isinstance(candidate, str) and candidate and candidate != "<synthetic>":
+                model = candidate
+            if item.get("permissionMode"):
+                permission_mode = item["permissionMode"]
+    if not seen or not model:
+        raise ValueError("Cannot validate the Claude conversation and its model")
+    name = host_accounts().get(home)
+    named = name not in (None, "default")
+    # The literal path a launch types (see _host_claude); on Linux Claude keeps its
+    # credentials in the directory itself.
+    literal = os.path.join(os.path.expanduser("~"), ".claude", "accounts", str(name))
+    return {
+        "session_id": session,
+        "rollout": str(real),
+        "model": model,
+        "claude_permission_mode": "plan" if permission_mode == "plan" else "dontAsk",
+        "claude_config_dir": str(home),
+        "claude_config_env": None if home == default else literal if named else str(home),
+        "claude_account": name,
+        "claude_subscription": account is not None or named,
+    }
+
+
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _host_session_info(agent, session, cwd, rollout, account, expected_home=None):
+    """A watch's session here, checked as ``register`` checks one of the controller's.
+
+    ``expected_home`` is the configuration directory of the sandbox that registered it,
+    which its transcript must lie in."""
+    if not isinstance(session, str) or not UUID.fullmatch(session):
+        raise ValueError("Expected a session UUID")
+    _arg_paths([cwd] if rollout is None else [cwd, rollout])
+    if expected_home is not None:
+        _arg_paths([expected_home])
+    if account is not None and (not isinstance(account, str) or not ACCOUNT.fullmatch(account)):
+        raise ValueError("Expected a Claude account name")
+    if agent == "codex":
+        if account is not None:
+            raise ValueError("A Claude account can only be selected for Claude")
+        return _codex_session_info(session, cwd, rollout, expected_home)
+    if agent == "claude":
+        return _claude_session_info(session, cwd, rollout, account, expected_home)
+    raise ValueError("Expected claude or codex")
+
+
 def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox):
     """Where a dashboard launch's ``wt`` makes its checkout here, before it runs.
 
@@ -1718,6 +1891,8 @@ OPS: dict[str, Callable[..., Any]] = {
     "version": _host_version,
     "wt_prepare": _host_wt_prepare,
     "wt_checkout": _host_wt_checkout,
+    "worktree": _host_worktree,
+    "session_info": _host_session_info,
 }
 
 
@@ -2114,6 +2289,76 @@ def validate_wt_checkout(value):
     return value
 
 
+def _shown_path(value):
+    # Recorded on a watch, and typed into a worker's shell by pane repairs.
+    return _absolute(value) and not CONTROL.search(value)
+
+
+def validate_worktree(value):
+    """A watched checkout's state on a worker: what registration and repairs compare."""
+    _expect(
+        isinstance(value, dict)
+        and set(value) == {"path", "branch", "head", "dirty", "common", "root"},
+        "fields",
+    )
+    _expect(_shown_path(value["path"]), "path")
+    _expect(value["branch"] is None or (_text(value["branch"]) and value["branch"]), "branch")
+    _expect(
+        isinstance(value["head"], str)
+        and re.fullmatch("[0-9a-f]{40}([0-9a-f]{24})?", value["head"]),
+        "head",
+    )
+    _expect(isinstance(value["dirty"], bool), "dirty")
+    _expect(value["common"] is None or _shown_path(value["common"]), "common")
+    _expect(_shown_path(value["root"]), "root")
+    return value
+
+
+CODEX_SESSION = {"session_id", "rollout", "sandbox", "model"}
+CLAUDE_SESSION = {
+    "session_id",
+    "rollout",
+    "model",
+    "claude_permission_mode",
+    "claude_config_dir",
+    "claude_config_env",
+    "claude_account",
+    "claude_subscription",
+}
+
+
+def validate_session_info(value):
+    """A worker's session as a watch records it; its model and paths reach repair argv."""
+    _expect(isinstance(value, dict) and set(value) in (CODEX_SESSION, CLAUDE_SESSION), "fields")
+    _expect(isinstance(value["session_id"], str) and UUID.fullmatch(value["session_id"]), "id")
+    _expect(_shown_path(value["rollout"]) and value["rollout"].endswith(".jsonl"), "rollout")
+    model = value["model"]
+    _expect(
+        model is None or (isinstance(model, str) and 0 < len(model) <= 200 and model.isprintable()),
+        "model",
+    )
+    if set(value) == CODEX_SESSION:
+        _expect(
+            value["sandbox"] in {"read-only", "workspace-write", "danger-full-access"}, "sandbox"
+        )
+        return value
+    _expect(model is not None, "model")
+    _expect(value["claude_permission_mode"] in {"plan", "dontAsk"}, "permission mode")
+    _expect(_shown_path(value["claude_config_dir"]), "config dir")
+    _expect(
+        value["claude_config_env"] is None or _shown_path(value["claude_config_env"]), "config env"
+    )
+    _expect(
+        value["claude_account"] is None
+        or (
+            isinstance(value["claude_account"], str) and ACCOUNT.fullmatch(value["claude_account"])
+        ),
+        "account",
+    )
+    _expect(isinstance(value["claude_subscription"], bool), "subscription")
+    return value
+
+
 VALIDATORS = {
     "inventory": validate_inventory,
     "diff": validate_diff,
@@ -2125,6 +2370,8 @@ VALIDATORS = {
     "version": validate_version,
     "wt_prepare": validate_wt_prepare,
     "wt_checkout": validate_wt_checkout,
+    "worktree": validate_worktree,
+    "session_info": validate_session_info,
 }
 
 

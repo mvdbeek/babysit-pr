@@ -9,6 +9,7 @@ never resolved or expanded on this machine. Pass ones that may start with ``~``
 
 import functools
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -48,6 +49,7 @@ FIELDS = {
     "collie_url",
     "collie_host",
     "enabled",
+    "tailnet_ip",
 }
 REQUIRED = {"id", "label", "ssh", "os"}
 # sshd's MaxSessions defaults to 10; stay well below it on one multiplexed connection.
@@ -70,6 +72,9 @@ class Machine(NamedTuple):
     collie_url: str | None
     enabled: bool
     collie_host: str | None = None
+    # Where its registrations reach the dashboard from (IPv4, IPv6), as `tailscale serve`
+    # reports it.
+    tailnet_ip: tuple[str, ...] | None = None
 
 
 class RemotePath(str):
@@ -96,6 +101,13 @@ def _collie_url(value):
         and bool(parts.hostname)
         and not any(c in value for c in " \"'<>`\\")
     )
+
+
+def _ip(value):
+    try:
+        return isinstance(value, str) and str(ipaddress.ip_address(value)) == value
+    except ValueError:
+        return False
 
 
 def _remote_path(value):
@@ -134,6 +146,7 @@ def _machine(raw):
         collie_url=raw.get("collie_url"),
         enabled=raw.get("enabled", True),
         collie_host=raw.get("collie_host"),
+        tailnet_ip=raw.get("tailnet_ip"),
     )
     name = machine.id if isinstance(machine.id, str) else "?"
     checks = [
@@ -179,11 +192,27 @@ def _machine(raw):
             "collie_host",
         ),
         (isinstance(machine.enabled, bool), "enabled"),
+        (
+            machine.tailnet_ip is None
+            or _ip(machine.tailnet_ip)
+            or (
+                isinstance(machine.tailnet_ip, list)
+                and 0 < len(machine.tailnet_ip) <= 4
+                and all(map(_ip, machine.tailnet_ip))
+            ),
+            "tailnet_ip",
+        ),
     ]
     for ok, field in checks:
         if not ok:
             raise ValueError(f"Invalid {field} for machine {name}")
-    return machine._replace(labels=tuple(machine.labels))
+    addresses = machine.tailnet_ip
+    if isinstance(addresses, str):
+        addresses = [addresses]
+    return machine._replace(
+        labels=tuple(machine.labels),
+        tailnet_ip=None if addresses is None else tuple(addresses),
+    )
 
 
 def _repos(raw, ids):

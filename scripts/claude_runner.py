@@ -98,7 +98,11 @@ def command_for(job, schema):
     mode = job.get("claude_permission_mode", "dontAsk")
     if mode == sandbox.LAUNCHER_PERMISSIONS:
         # Checked before the prefix gets this repair's directories.
-        if job["claude_command"] != sandbox.claude_launcher():
+        # A worker's repair names its backend and features (remote_repair).
+        launcher = sandbox.claude_launcher(
+            job.get("sandbox_backend"), tuple(job.get("sandbox_features", ()))
+        )
+        if job["claude_command"] != launcher:
             raise ValueError("Safehouse permission mode requires the verified Safehouse launcher")
     else:
         cmd += ["--permission-mode", mode]

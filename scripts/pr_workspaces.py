@@ -177,16 +177,12 @@ def validate_account(agent, name, machine=None):
 def worker_refusal(target, machine):
     """Why ``target`` cannot start on ``machine``, or None.
 
-    Until repairs run on workers, only work that never needs them goes there: reviews
-    of pull requests and new tasks. An issue's or Sentry issue's fix can end in a pull
-    request watched for repairs.
+    Pull request work and new tasks start on workers, and a watch they register there is
+    repaired there. Issue and Sentry launches have no worker path yet.
     """
     if target.get("kind") in {"pr", "scratch"}:
         return None
-    return (
-        f"Only pull request reviews and new tasks can start on {machine.label} yet: "
-        "other work can lead to a watched pull request, and its repairs run on this machine"
-    )
+    return f"Only pull request work and new tasks can start on {machine.label} yet"
 
 
 remote_slug = remote_probe.remote_slug

@@ -43,8 +43,8 @@ def herdr(*args, machine: machines.Machine | None = None):
     return proc.stdout
 
 
-def result(*args):
-    data = json.loads(herdr(*args))
+def result(*args, machine: machines.Machine | None = None):
+    data = json.loads(herdr(*args, machine=machine))
     if data.get("error"):
         raise RuntimeError(str(data["error"]))
     return data["result"]

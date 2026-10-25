@@ -27,6 +27,7 @@ import dashboard_settings
 import llm_usage
 import machines
 import service_control
+import worker_api
 import workspace_agents
 import workspace_viewer
 from dashboard_push import check_result
@@ -243,6 +244,8 @@ def present_job(job):
         "last_poll": (job.get("watcher_state") or {}).get("last_snapshot_at"),
         "started_at": job.get("started_at"),
         "cwd": job.get("cwd"),
+        "machine": job.get("machine"),
+        "session_id": job.get("session_id"),
         "attempt": job.get("attempt"),
         "poll_errors": job.get("poll_errors", 0),
         "pause_after_run": job.get("pause_after_run", False),
@@ -597,6 +600,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/extension":
             self.extension_request()
             return
+        if self.path.startswith("/api/worker/"):
+            self.worker_request()
+            return
         host = self.headers.get("Host")
         allowed = {
             f"127.0.0.1:{self.server.server_port}",
@@ -933,6 +939,46 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.fail(503, f"Cannot deliver task: {exc}")
+
+    def worker_request(self):
+        """Registration forwarded by a worker machine; its token names the machine.
+
+        Not a browser's: a request with an Origin or Fetch metadata is refused.
+        """
+        action = self.path.removeprefix("/api/worker/")
+        machine = (
+            worker_api.authenticate(self.server.home, self.headers.get("Authorization"))
+            if self.extension_host()
+            and action in worker_api.ACTIONS
+            and self.headers.get("Origin") is None
+            and self.headers.get("Sec-Fetch-Site") is None
+            else None
+        )
+        # `tailscale serve` sets X-Forwarded-For to the tailnet address a request came
+        # from, replacing any the client sent; a machine's own address, when registered,
+        # must be the only one.
+        if machine is not None and machine.tailnet_ip is not None:
+            forwarded = self.headers.get_all("X-Forwarded-For") or []
+            if len(forwarded) != 1 or forwarded[0] not in machine.tailnet_ip:
+                machine = None
+        if machine is None:
+            self.send_json(403, {"error": "This needs a worker token issued by the controller"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if (
+                not 0 < length <= worker_api.MAX_BODY
+                or self.headers.get("Content-Type") != "application/json"
+            ):
+                raise ValueError("Send one JSON request body")
+            request = json.loads(self.read_body(length, 10))
+            self.send_json(200, worker_api.handle(self.server.home, machine, action, request))
+        except worker_api.RateLimited as exc:
+            self.fail(429, str(exc))
+        except (ValueError, RuntimeError) as exc:
+            self.fail(400, str(exc))
+        except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            self.fail(503, f"Cannot register the watch: {exc}")
 
     def get(self):
         port = self.server.server_port

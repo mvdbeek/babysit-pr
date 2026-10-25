@@ -22,6 +22,14 @@
 #   --sha SHA     full 40-hex babysit-pr commit to deploy in ~/.local/share/babysit-pr/app
 #                 (user step)
 #   --repo URL    babysit-pr clone URL (user step; default $BABYSIT_REPO)
+#   --controller URL
+#                 record the controller's dashboard URL and this worker's registration
+#                 token, read from stdin, in ~/.config/babysit-pr/worker.json (as the
+#                 babysit user, after the user step). The token never appears in argv or
+#                 output. Run the deployed copy, since stdin carries the token:
+#
+#   pr_supervisor.py worker-token <machine id> | ssh babysit@box \
+#     'bash ~/.local/share/babysit-pr/app/scripts/provision_worker.sh --controller URL'
 #
 # Environment (system step):
 #   BABYSIT_USER        worker account (default babysit)
@@ -75,6 +83,7 @@ mode=system
 dry=0
 sha=
 repo=${BABYSIT_REPO:-https://github.com/mvdbeek/babysit-pr.git}
+controller=
 user_name=${BABYSIT_USER:-babysit}
 # Test hook: the root the apt sources are read and written under. Empty on a machine.
 ROOT=${PROVISION_ROOT:-}
@@ -100,6 +109,12 @@ while (($#)); do
     --sha | --repo)
       (($# > 1)) || usage
       [[ $1 == --sha ]] && sha=$2 || repo=$2
+      shift
+      ;;
+    --controller)
+      (($# > 1)) || usage
+      mode=controller
+      controller=$2
       shift
       ;;
     -h | --help) usage ;;
@@ -145,6 +160,31 @@ write_file() {
   chmod "$mode" "$path.tmp.$$"
   mv -f "$path.tmp.$$" "$path"
 }
+
+# Updates worker.json, keeping its other keys: argv[2] is a JSON object of new values,
+# and with argv[3] that key's value is read from stdin, so it never appears in argv.
+# A new file only its owner reads replaces the old one.
+WORKER_JSON='
+import json, os, sys, tempfile
+path, values = sys.argv[1], json.loads(sys.argv[2])
+if len(sys.argv) > 3:
+    values[sys.argv[3]] = sys.stdin.read().strip()
+try:
+    with open(path) as stream:
+        current = json.load(stream)
+except FileNotFoundError:
+    current = {}
+if not isinstance(current, dict):
+    current = {}
+current.update(values)
+folder = os.path.dirname(path)
+os.makedirs(folder, mode=0o700, exist_ok=True)
+descriptor, partial = tempfile.mkstemp(dir=folder, prefix=".worker.json.")
+with os.fdopen(descriptor, "w") as stream:
+    json.dump(current, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+os.replace(partial, path)
+'
 
 finish() {
   echo
@@ -949,8 +989,13 @@ user_step() {
   run "${SAFE_GIT[@]}" -C "$dest" fetch --quiet origin
   run "${SAFE_GIT[@]}" -C "$dest" checkout --quiet --detach "$sha"
   # Marks this machine as a worker: watches are registered on the controller, never here.
-  run mkdir -p "$HOME/.config/babysit-pr"
-  write_file "$HOME/.config/babysit-pr/worker.json" 0600 "{\"version\": 1, \"app\": \"$dest\"}" || true
+  # A rerun keeps the controller URL and token --controller recorded.
+  if ((dry)); then
+    printf '  would write %s (mode 0600)\n' "$HOME/.config/babysit-pr/worker.json"
+  else
+    python3 -c "$WORKER_JSON" "$HOME/.config/babysit-pr/worker.json" \
+      "$(python3 -c 'import json, sys; print(json.dumps({"version": 1, "app": sys.argv[1]}))' "$dest")"
+  fi
 
   say "Directories and PATH"
   run mkdir -p "$HOME/.cache/babysit-sandbox" "$HOME/.npm-global" "$HOME/.local/bin"
@@ -1017,8 +1062,42 @@ EOF
   finish
 }
 
+controller_step() {
+  local token
+  python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = sys.argv[1]
+parts = urlsplit(url)
+ok = (parts.scheme in ("http", "https") and parts.hostname and parts.username is None
+      and not parts.query and not parts.fragment and url.isprintable() and len(url) <= 512)
+sys.exit(0 if ok else 1)' "$controller" 2>/dev/null || {
+    printf 'provision_worker: --controller needs the dashboard URL, http(s)://host[:port]\n' >&2
+    exit 2
+  }
+  if [[ -t 0 ]]; then
+    printf 'provision_worker: pipe the token from `pr_supervisor.py worker-token <id>` into stdin\n' >&2
+    exit 2
+  fi
+  IFS= read -r token || true
+  [[ $token =~ ^[A-Za-z0-9_-]{20,128}$ ]] || {
+    printf 'provision_worker: stdin holds no worker token\n' >&2
+    exit 2
+  }
+  if ((dry)); then
+    printf '  would record the controller %s and its token in %s\n' "$controller" \
+      "$HOME/.config/babysit-pr/worker.json"
+  else
+    printf '%s' "$token" | python3 -c "$WORKER_JSON" "$HOME/.config/babysit-pr/worker.json" \
+      "$(python3 -c 'import json, sys; print(json.dumps({"controller": sys.argv[1].rstrip("/")}))' "$controller")" token
+    ok "controller $controller and its token recorded"
+  fi
+  finish
+}
+
 case $mode in
   user) user_step ;;
+  controller) controller_step ;;
   check)
     # Root inspects the host and other users; the worker user checks its own setup.
     if ((!dry)) && ((EUID != 0)); then
