@@ -53,9 +53,18 @@ MAX_QUESTIONS = 8
 MAX_OPTIONS = 12
 CHUNK = 4 * 1024 * 1024
 # A worker's diff and session listing take one ssh call each, and each transcript read
-# at most this many: CHUNK bytes per call, so a first read of 40 MB takes ten.
+# at most this many: CHUNK bytes per call, so a first read of 40 MB takes ten. A poll
+# reads for at most REMOTE_BUDGET seconds, each call within what is left of it, and the
+# next poll goes on from there; it starts no call with less than REMOTE_MIN_READ left.
 REMOTE_TIMEOUT = 60
 REMOTE_READS = 64
+REMOTE_BUDGET = 60
+REMOTE_MIN_READ = 5
+# A transcript line longer than this is skipped, with a notice, rather than parsed.
+MAX_LINE = 64 * 1024 * 1024
+# Entries a parsed transcript keeps; past it the oldest go, a tenth at a time, and the
+# page indices stay those of the whole transcript.
+MAX_ENTRIES = 20000
 # An open viewer polls every few seconds: session details are kept per file version, and
 # parsed transcripts keep their read position so a growing file is read from where it
 # stopped. One lock guards both, since requests arrive on separate threads.
@@ -288,7 +297,12 @@ def remote_checkout(machine, workspace_id):
     )
     if space is not None:
         root = (space.get("worktree") or {}).get("checkout_path")
-        if not (isinstance(root, str) and root.startswith("/") and "\0" not in root):
+        if not (
+            isinstance(root, str)
+            and len(root) <= remote_probe.MAX_TEXT
+            and root.startswith("/")
+            and "\0" not in root
+        ):
             raise ValueError("That herdr workspace has no checkout to show")
     elif cached:
         root = cached[1]  # Closed since it was last seen.
@@ -570,7 +584,7 @@ def remote_sessions(home, machine, path):
                 "agent": found["agent"],
                 "updated": found["updated"],
                 "size": found["size"],
-                "title": found["title"],
+                "title": remote_probe.display_text(found["title"]),
                 "_file": found["file"],
                 "_cwd": found["cwd"],
                 "_cwd_exists": found["cwd_exists"],
@@ -593,11 +607,21 @@ class Transcript:
     def __init__(self, agent):
         self.agent = agent
         self.lock = threading.Lock()
+        # (first, entries) as of the last complete read, for a request that finds the
+        # parser busy.
+        self.view: tuple[int, list[dict]] | None = None
         self.reset(None)
 
     def reset(self, inode):
         self.inode = inode
         self.offset = 0
+        # The unfinished line after ``offset``, as chunks, and its length; and whether
+        # the read is inside a line too long to parse.
+        self.pending: list[bytes] = []
+        self.held = 0
+        self.skipping = False
+        # The transcript index of ``entries[0]``: older entries are dropped past MAX_ENTRIES.
+        self.first = 0
         self.entries: list[dict] = []
         self.tools: dict[str, dict] = {}
         # Codex versions that record typed prompts as events also echo them as items.
@@ -610,9 +634,9 @@ class Transcript:
     def position(self, inode, size):
         """The offset to read on from, for the file now at ``inode`` with ``size`` bytes."""
         # A replaced or truncated file is read again from the start.
-        if inode != self.inode or size < self.offset:
+        if inode != self.inode or size < self.offset + self.held:
             self.reset(inode)
-        return self.offset
+        return self.offset + self.held
 
     def consume(self, data):
         """Parse the complete lines of ``data``, read from ``offset``; returns bytes used."""
@@ -624,43 +648,99 @@ class Transcript:
             if line.strip():
                 try:
                     item = json.loads(line)
-                except ValueError:
-                    continue
-                self.feed(item)
+                    if isinstance(item, dict):
+                        self.feed(item)
+                except (ValueError, RecursionError):
+                    continue  # Not JSON, or nested too deeply to parse or show.
         self.offset += end + 1
+        self.trim()
         return end + 1
 
+    def absorb(self, data):
+        """Parse what ``data``, read from ``offset + held``, completes.
+
+        An unfinished line is kept, as chunks, for the next read. One longer than
+        MAX_LINE is skipped with a notice and its bytes passed over as they arrive, so
+        reading moves on past it rather than fetching it again.
+        """
+        if self.skipping:
+            end = data.find(b"\n")
+            if end < 0:
+                self.offset += len(data)
+                return
+            self.offset += end + 1
+            self.skipping = False
+            data = data[end + 1 :]
+        end = data.rfind(b"\n")
+        if end < 0:
+            if data:
+                self.pending.append(data)
+                self.held += len(data)
+            if self.held > MAX_LINE:
+                self.offset += self.held
+                self.pending, self.held = [], 0
+                self.skipping = True
+                self.entries.append(
+                    {
+                        "role": "user",
+                        "kind": "notification",
+                        "text": f"Transcript line too long (over {MAX_LINE >> 20} MiB); skipped",
+                        "time": None,
+                    }
+                )
+                self.trim()
+            return
+        self.consume(b"".join([*self.pending, data[: end + 1]]))
+        rest = data[end + 1 :]
+        self.pending, self.held = ([rest], len(rest)) if rest else ([], 0)
+
+    def trim(self):
+        """Drop the oldest entries past MAX_ENTRIES, and the tool calls they held."""
+        excess = len(self.entries) - MAX_ENTRIES
+        if excess <= 0:
+            return
+        excess += MAX_ENTRIES // 10
+        gone = {id(entry) for entry in self.entries[:excess]}
+        del self.entries[:excess]
+        self.first += excess
+        self.tools = {k: tool for k, tool in self.tools.items() if id(tool) not in gone}
+
     def update(self, path):
-        stat = path.stat()
-        with path.open("rb") as stream:
-            stream.seek(self.position(stat.st_ino, stat.st_size))
-            pending = b""
-            while True:
-                chunk = stream.read(CHUNK)
-                if not chunk:
-                    break
-                pending += chunk
-                pending = pending[self.consume(pending) :]
+        with remote_probe.open_transcript(path) as stream:
+            info = os.fstat(stream.fileno())
+            stream.seek(self.position(info.st_ino, info.st_size))
+            while chunk := stream.read(CHUNK):
+                self.absorb(chunk)
 
     def update_remote(self, tail, file):
-        """Read on through a worker's ``tail(file, inode, offset, limit)`` probe op.
+        """Read on through a worker's ``tail(file, inode, offset, limit, timeout)`` probe op.
 
         Each answer ends at a line end, except a full read inside one longer line: those
-        pieces are joined here, as ``update`` joins chunks, until the line ends.
+        pieces are kept, as ``update`` keeps chunks, until the line ends. A poll stops
+        after REMOTE_BUDGET seconds, and the next goes on from there.
         """
-        pending = b""
+        stop = time.monotonic() + REMOTE_BUDGET
         for _ in range(REMOTE_READS):
-            at = self.offset + len(pending)
-            answer = tail(file=file, inode=self.inode, offset=at, limit=CHUNK)
+            left = stop - time.monotonic()
+            if left < REMOTE_MIN_READ:
+                return
+            at = self.offset + self.held
+            answer = tail(
+                file=file,
+                inode=self.inode,
+                offset=at,
+                limit=CHUNK,
+                timeout=max(1, int(min(REMOTE_TIMEOUT, left))),
+            )
             if answer["inode"] != self.inode or answer["offset"] != at:
                 # Replaced or truncated: the worker read from the start, and so does this.
                 if answer["offset"]:
                     raise ValueError("The transcript changed while it was read; refresh")
                 self.reset(answer["inode"])
-                pending = b""
             data = answer["data"]
-            pending += data
-            pending = pending[self.consume(pending) :]
+            if answer["offset"] + len(data) > answer["size"]:
+                raise ValueError("The worker read past the end of the transcript; refresh")
+            self.absorb(data)
             if not data or answer["offset"] + len(data) >= answer["size"]:
                 return
 
@@ -814,7 +894,14 @@ def transcript_page(listed, key_of, read, session, before, after, prefer):
     brought up to date by ``read(parser, file)``."""
     if session is None:
         if not listed:
-            return {"sessions": [], "session": None, "entries": [], "start": 0, "total": 0}
+            return {
+                "sessions": [],
+                "session": None,
+                "entries": [],
+                "start": 0,
+                "first": 0,
+                "total": 0,
+            }
         chosen = next((s for s in listed if s["id"] == prefer), listed[0])
     else:
         if not isinstance(session, str) or not SESSION.match(session):
@@ -828,22 +915,31 @@ def transcript_page(listed, key_of, read, session, before, after, prefer):
         _parsers[key] = parser
         while len(_parsers) > PARSED_FILES:
             _parsers.pop(next(iter(_parsers)), None)
-    # A first parse of a large file takes a while; it holds only this transcript's lock.
-    with parser.lock:
-        read(parser, chosen["_file"])
-        entries = parser.entries
-        total = len(entries)
-        if after is not None and 0 <= after <= total and total - after <= PAGE:
-            start, end = after, total
-        else:
-            end = total if before is None else max(0, min(before, total))
-            start = max(0, end - PAGE)
-        page = [dict(e) for e in entries[start:end]]
+    # A first parse of a large file takes a while; it holds only this transcript's lock,
+    # and a request meanwhile is answered from the last complete read.
+    if parser.lock.acquire(timeout=1):
+        try:
+            read(parser, chosen["_file"])
+            parser.view = (parser.first, list(parser.entries))
+        finally:
+            parser.lock.release()
+    elif parser.view is None:
+        raise ValueError("This transcript is still being read; try again shortly")
+    first, entries = parser.view
+    # Indices count from the transcript's start, the dropped oldest entries included.
+    total = first + len(entries)
+    if after is not None and first <= after <= total and total - after <= PAGE:
+        start, end = after, total
+    else:
+        end = total if before is None else max(first, min(before, total))
+        start = max(first, end - PAGE)
+    page = [dict(e) for e in entries[start - first : end - first]]
     # Underscored fields (the file, and a worker's facts for resuming) stay here.
     return {
         "sessions": [{k: v for k, v in s.items() if not k.startswith("_")} for s in listed],
         "session": {k: v for k, v in chosen.items() if not k.startswith("_")},
         "entries": page,
         "start": start,
+        "first": first,
         "total": total,
     }

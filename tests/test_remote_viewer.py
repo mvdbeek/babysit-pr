@@ -210,6 +210,9 @@ def test_probe_tail_reads_complete_lines_and_refuses_other_files(worker, monkeyp
         {"inode": 1, "size": 2, "offset": 0, "data": "not base64!"},
         {"inode": 1, "size": 2, "offset": -1, "data": ""},
         {"inode": 1, "size": 2, "offset": 0, "data": "", "extra": 1},
+        # More bytes than the file it says it read holds.
+        {"inode": 1, "size": 2, "offset": 0, "data": "YWJj"},
+        {"inode": 1, "size": 4, "offset": 3, "data": "YWI="},
     ],
 )
 def test_malformed_tail_answers_are_refused(answer):
@@ -458,3 +461,193 @@ def test_a_worker_row_opens_its_diff_and_transcript_read_only(page, worker, dash
     expect(notice).to_be_hidden()
     expect(viewer.locator("#ws-message")).to_be_visible()
     assert not errors
+
+
+# Hostile workers and session stores ----------------------------------------------
+
+
+def in_thread(function, *args, wait=10):
+    """``function(*args)`` within ``wait`` seconds, so a blocking open fails the test."""
+    result = {}
+
+    def run():
+        try:
+            result["value"] = function(*args)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(wait)
+    assert not thread.is_alive(), f"{function.__name__} blocked"
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
+def test_session_listings_pass_over_fifos_device_links_and_long_lines(worker, monkeypatch):
+    monkeypatch.setenv("HOME", str(worker.host))
+    folder = worker.claude.parent
+    os.mkfifo(folder / f"{SIBLING_SID}.jsonl")
+    (folder / f"{ELSEWHERE_SID}.jsonl").symlink_to("/dev/zero")
+    day = worker.host / ".codex" / "sessions" / "2026" / "10" / "26"
+    day.mkdir(parents=True)
+    os.mkfifo(day / "rollout-fifo.jsonl")
+    (day / "rollout-zero.jsonl").symlink_to("/dev/zero")
+    listed = in_thread(remote_probe._host_sessions, str(worker.checkout))
+    assert {s["id"] for s in listed} == {CLAUDE_SID, CODEX_SID}
+    files = in_thread(lambda: list(remote_probe.host_session_files(worker.checkout)))
+    cwds = in_thread(lambda: [remote_probe.host_cwd(file, agent) for agent, file in files])
+    assert str(worker.checkout) in cwds
+    # The opener itself: a final symlink, a FIFO and a device are each refused.
+    for path in (folder / f"{ELSEWHERE_SID}.jsonl", folder / f"{SIBLING_SID}.jsonl", "/dev/zero"):
+        with pytest.raises(OSError):
+            in_thread(remote_probe.open_transcript, path)
+    # A line longer than a listing parses is skipped, and the prompt after it names it.
+    short = jsonl(claude_turn("user", worker.checkout, "Short"))
+    monkeypatch.setattr(remote_probe, "MAX_SCAN_LINE", len(short.encode()) + 10)
+    worker.claude.write_text(jsonl(claude_turn("user", worker.checkout, "x" * 500)) + short)
+    assert remote_probe.claude_details(worker.claude)["title"] == "Short"
+    # And a listing reads only so much of each file.
+    monkeypatch.setattr(remote_probe, "MAX_SCAN", 50)
+    assert remote_probe.claude_details(worker.claude) is None
+
+
+def test_session_stores_must_be_real_folders_under_home(worker, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(worker.host))
+    projects = worker.host / ".claude" / "projects"
+    assert projects.resolve() in remote_probe.host_session_roots()
+    # A store that is itself a symlink, even to a folder under HOME, is no store.
+    moved = worker.host / "moved-projects"
+    projects.rename(moved)
+    projects.symlink_to(moved)
+    moved_file = moved / worker.claude.relative_to(projects)
+    assert moved.resolve() not in remote_probe.host_session_roots()
+    assert all(agent == "codex" for agent, _ in remote_probe.host_session_files(worker.checkout))
+    with pytest.raises(ValueError, match="Not a session transcript"):
+        remote_probe._host_tail(str(moved_file), None, 0, 100)
+    # CODEX_HOME outside HOME is refused too.
+    outside = tmp_path / "elsewhere-codex"
+    shutil.copytree(worker.host / ".codex", outside)
+    monkeypatch.setenv("CODEX_HOME", str(outside))
+    assert remote_probe.host_session_roots() == []
+    assert list(remote_probe.host_session_files(worker.checkout)) == []
+    rollout = next((outside / "sessions").glob("*/*/*/rollout-*.jsonl"))
+    with pytest.raises(ValueError, match="Not a session transcript"):
+        remote_probe._host_tail(str(rollout), None, 0, 100)
+
+
+def test_tail_refuses_a_file_swapped_after_its_path_was_checked(worker, monkeypatch):
+    monkeypatch.setenv("HOME", str(worker.host))
+    other = worker.claude.with_name(f"{SIBLING_SID}.jsonl")
+    other.write_text("{}\n")
+    real = remote_probe.open_transcript
+    monkeypatch.setattr(remote_probe, "open_transcript", lambda path: real(other))
+    with pytest.raises(ValueError, match="Not a session transcript"):
+        remote_probe._host_tail(str(worker.claude), None, 0, 100)
+
+
+def test_probe_git_gets_no_github_tokens(worker, monkeypatch):
+    for name in remote_probe.TOKENS:
+        monkeypatch.setenv(name, f"secret-{name}")
+    monkeypatch.setenv("KEPT_VARIABLE", "kept")
+    dump = ("-c", "alias.envdump=!env", "envdump")
+    for output in (
+        remote_probe.host_git(worker.checkout, *dump),
+        remote_probe.host_output(worker.checkout, *dump)[0],
+    ):
+        assert "secret-" not in output
+        assert "KEPT_VARIABLE=kept" in output and "GIT_TERMINAL_PROMPT=0" in output
+
+
+def test_sessions_are_listed_only_for_a_checkout_top(worker, monkeypatch):
+    monkeypatch.setenv("HOME", str(worker.host))
+    (worker.checkout / "deep").mkdir()
+    for root in (str(worker.checkout / "deep"), str(worker.host), "relative"):
+        with pytest.raises(ValueError):
+            remote_probe._host_sessions(root)
+
+
+def tail_through_probe(worker, monkeypatch, calls):
+    monkeypatch.setenv("HOME", str(worker.host))
+
+    def tail(file, inode, offset, limit, timeout):
+        calls.append((offset, timeout))
+        return remote_probe.validate_tail(remote_probe._host_tail(file, inode, offset, limit))
+
+    return tail
+
+
+def test_remote_reads_skip_a_huge_line_and_never_fetch_it_again(worker, monkeypatch):
+    monkeypatch.setattr(wv, "CHUNK", 64)
+    monkeypatch.setattr(wv, "MAX_LINE", 1000)
+    monkeypatch.setattr(wv, "REMOTE_READS", 1000)
+    calls = []
+    tail = tail_through_probe(worker, monkeypatch, calls)
+    with worker.claude.open("a") as stream:
+        stream.write(json.dumps(claude_turn("assistant", worker.checkout, "z" * 5000)) + "\n")
+        stream.write(json.dumps(claude_turn("user", worker.checkout, "After")) + "\n")
+    parser = wv.Transcript("claude")
+    parser.update_remote(tail, str(worker.claude))
+    texts = [e["text"] for e in parser.entries]
+    assert texts[:2] == ["Fix it", "Done"] and "too long" in texts[2] and texts[3] == "After"
+    size = worker.claude.stat().st_size
+    assert parser.offset == size and parser.held == 0
+    calls.clear()
+    parser.update_remote(tail, str(worker.claude))
+    assert [offset for offset, _ in calls] == [size]  # Only a look for anything new.
+
+
+def test_a_remote_poll_stops_at_its_time_budget_and_resumes(worker, monkeypatch):
+    monkeypatch.setattr(wv, "CHUNK", 512)
+    calls = []
+    probe_tail = tail_through_probe(worker, monkeypatch, calls)
+    clock = [1000.0]
+    monkeypatch.setattr(wv.time, "monotonic", lambda: clock[0])
+
+    def slow_tail(**args):
+        clock[0] += 25  # Each read takes 25 of the 60 seconds.
+        return probe_tail(**args)
+
+    with worker.claude.open("a") as stream:
+        for i in range(10):
+            stream.write(json.dumps(claude_turn("user", worker.checkout, f"m{i}")) + "\n")
+    parser = wv.Transcript("claude")
+    parser.update_remote(slow_tail, str(worker.claude))
+    # Reads at 60 and 35 seconds left; 10 left is enough only for one more.
+    assert [timeout for _, timeout in calls] == [60, 35, 10]
+    assert 0 < parser.offset < worker.claude.stat().st_size
+    while parser.offset < worker.claude.stat().st_size:
+        parser.update_remote(slow_tail, str(worker.claude))
+    assert [e["text"] for e in parser.entries][-1] == "m9"
+
+
+def test_a_remote_answer_past_the_files_size_is_refused(monkeypatch):
+    parser = wv.Transcript("claude")
+
+    def lying(**args):
+        return {"inode": 7, "size": 3, "offset": 0, "data": b'{"a": 1}\n'}
+
+    with pytest.raises(ValueError, match="past the end"):
+        parser.update_remote(lying, "/f.jsonl")
+    assert parser.entries == [] and parser.offset == 0
+
+
+def test_worker_text_is_shown_without_control_or_bidi_characters(worker):
+    assert remote_probe.display_text("a‮b⁦c\x1b[31md\te‏") == "abc[31mde"
+    assert remote_probe.display_text(None) is None
+    worker.claude.write_text(jsonl(claude_turn("user", worker.checkout, "Fix ‮ti\x1b[2J it")))
+    listed = wv.remote_sessions(worker.home, worker.machine, str(worker.checkout))
+    assert next(s for s in listed if s["id"] == CLAUDE_SID)["title"] == "Fix ti[2J it"
+    plugin = wso.WorkspaceOverview(worker.home, FakeGitHub())
+    space = plugin.remote_space({"workspace_id": "w1", "label": "fea‮ture\x07"})
+    assert space["label"] == "feature"
+
+
+def test_an_overlong_worker_checkout_path_is_refused(worker):
+    store = read(worker.state)
+    space = store["machines"]["Mac mini"]["workspaces"][0]
+    space["worktree"]["checkout_path"] = "/" + "a" * remote_probe.MAX_TEXT
+    worker.state.write_text(json.dumps(store))
+    with pytest.raises(ValueError, match="no checkout to show"):
+        wv.remote_checkout(worker.machine, "w1")

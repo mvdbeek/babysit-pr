@@ -59,6 +59,11 @@ HOST_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "GCM_INTERACTIVE": "never",
 }
+# Reads need no GitHub token, and a checkout's filters or hooks must not inherit one.
+TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+# A session listing reads at most this much of each transcript, and skips longer lines.
+MAX_SCAN = 32 * 1024 * 1024
+MAX_SCAN_LINE = 4 * 1024 * 1024
 
 
 def remote_slug(value):
@@ -616,19 +621,56 @@ def claude_text(item):
     return block_text(content).strip()
 
 
-def records(stream):
-    for line in stream:
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
+def open_transcript(path):
+    """A session file opened for binary reading, refused unless it is a regular file.
+
+    Not through a symlink of its own, and without blocking on a FIFO planted in a store.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Not a regular file: {path}")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def transcript_lines(stream):
+    """Decoded lines of a binary ``stream``: within MAX_SCAN bytes, none over MAX_SCAN_LINE."""
+    limit, longest = MAX_SCAN, MAX_SCAN_LINE
+    read = 0
+    while read < limit:
+        line = stream.readline(longest + 1)
+        if not line:
+            return
+        read += len(line)
+        if len(line) > longest and not line.endswith(b"\n"):
+            # Too long to parse: read past the rest of it, a bounded piece at a time.
+            while read < limit:
+                rest = stream.readline(longest + 1)
+                read += len(rest)
+                if not rest or rest.endswith(b"\n"):
+                    break
             continue
+        yield line.decode("utf-8", errors="replace")
+
+
+def records(lines):
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(item, dict):
+            yield item
 
 
 def claude_details(path):
     """Session ID, working directory and first prompt of a Claude transcript."""
     cwd = title = command = None
-    with path.open(encoding="utf-8", errors="replace") as stream:
-        for item in records(stream):
+    with open_transcript(path) as stream:
+        for item in records(transcript_lines(stream)):
             if item.get("type") not in {"user", "assistant"} or item.get("isSidechain"):
                 continue
             cwd = cwd or item.get("cwd")
@@ -653,24 +695,29 @@ def claude_details(path):
 
 def codex_details(path):
     """Session ID, working directory and first typed prompt of a Codex rollout."""
-    with path.open(encoding="utf-8", errors="replace") as stream:
-        first = stream.readline()
+    with open_transcript(path) as stream:
+        lines = transcript_lines(stream)
+        first = next(lines, "")
         if not first.endswith("\n"):
             raise BlockingIOError  # Still being written; look again next time.
         try:
             meta = json.loads(first)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(meta, dict):
             return None
         payload = meta.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
         if meta.get("type") != "session_meta" or not payload.get("id") or not payload.get("cwd"):
             return None
         title = None
-        for line in stream:
+        for line in lines:
             if '"user' not in line:  # user_message events and user-role items
                 continue
             try:
                 item = json.loads(line).get("payload") or {}
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError, AttributeError):
                 continue
             if item.get("type") == "user_message":
                 text = str(item.get("message") or "").strip()
@@ -710,11 +757,17 @@ def _within_deadline(timeout):
     return timeout
 
 
+def host_environment():
+    env = {k: v for k, v in os.environ.items() if k not in TOKENS}
+    env.update(HOST_ENV)
+    return env
+
+
 def host_git(path, *args, timeout=60, strip=True):
     """Git in one checkout on the machine this probe runs on, hardened and non-interactive."""
     result = subprocess.run(
         [*HOST_GIT, "-C", str(path), *args],
-        env={**os.environ, **HOST_ENV},
+        env=host_environment(),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -740,7 +793,7 @@ def host_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
     with tempfile.TemporaryFile() as errors:
         proc = subprocess.Popen(
             [*HOST_GIT, "-c", "core.quotePath=false", "-C", str(path), *args],
-            env={**os.environ, **HOST_ENV},
+            env=host_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=errors,
@@ -785,11 +838,36 @@ def host_claude_homes():
     return list(dict.fromkeys(homes))
 
 
+def host_codex_sessions():
+    return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
+
+
+def host_session_root(path):
+    """A session store's real path; None when it is a symlink or lies outside ``$HOME``."""
+    home = Path(os.path.realpath(os.path.expanduser("~")))
+    real = Path(os.path.realpath(path))
+    if os.path.islink(path) or not real.is_relative_to(home):
+        return None
+    return real
+
+
 def host_session_files(root):
-    """This machine's transcript candidates for ``root``, as the controller lists its own."""
+    """This machine's transcript candidates for ``root``, as the controller lists its own.
+
+    Only files that really lie in a session store (``host_session_roots``) are listed:
+    a symlinked folder inside one leads nowhere else.
+    """
+    stores = host_session_roots()
+
+    def stored(path):
+        real = Path(os.path.realpath(path))
+        return any(real.is_relative_to(store) for store in stores)
+
     # Claude names a project folder after its cwd, every other character a dash.
     folder = re.sub(r"[^A-Za-z0-9]", "-", str(root))
     for home in host_claude_homes():
+        if host_session_root(home / "projects") is None:
+            continue
         try:
             folders = [
                 entry
@@ -800,18 +878,23 @@ def host_session_files(root):
             folders = []
         for entry in folders:
             for path in entry.glob("*.jsonl"):
-                yield "claude", path
-    codex = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
+                if stored(path):
+                    yield "claude", path
+    codex = host_codex_sessions()
+    if host_session_root(codex) is None:
+        return
     for path in codex.glob("*/*/*/rollout-*.jsonl"):
-        yield "codex", path
+        if stored(path):
+            yield "codex", path
 
 
 def host_cwd(path, agent):
     """The working directory a session recorded: Claude's first turn, Codex's metadata."""
     try:
-        with path.open(encoding="utf-8", errors="replace") as stream:
+        with open_transcript(path) as stream:
+            lines = transcript_lines(stream)
             if agent == "codex":
-                first = stream.readline()
+                first = next(lines, "")
                 if not first.endswith("\n"):
                     return None  # Still being written.
                 meta = json.loads(first)
@@ -819,19 +902,14 @@ def host_cwd(path, agent):
                 if meta.get("type") == "session_meta" and payload.get("id"):
                     return payload.get("cwd") or None
                 return None
-            for line in stream:
-                try:
-                    item = json.loads(line)
-                except ValueError:
-                    continue
+            for item in records(lines):
                 if (
-                    isinstance(item, dict)
-                    and item.get("type") in {"user", "assistant"}
+                    item.get("type") in {"user", "assistant"}
                     and not item.get("isSidechain")
                     and item.get("cwd")
                 ):
                     return item["cwd"]
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):
         pass
     return None
 
@@ -861,9 +939,12 @@ def _host_inventory(src, roots, repo_roots, opened):
 
 
 def host_session_roots():
-    """Where this machine's transcripts live; ``tail`` reads nothing outside them."""
-    codex = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
-    return [(home / "projects").resolve() for home in host_claude_homes()] + [codex.resolve()]
+    """Where this machine's transcripts live; ``tail`` reads nothing outside them.
+
+    A store that is itself a symlink, or that lies outside ``$HOME``, is no store.
+    """
+    candidates = [home / "projects" for home in host_claude_homes()] + [host_codex_sessions()]
+    return [root for root in map(host_session_root, candidates) if root is not None]
 
 
 def host_accounts():
@@ -901,8 +982,7 @@ def _host_bases(path):
 
 def _host_sessions(root):
     """Sessions recorded in ``root`` or below it, newest first, as the viewer lists them."""
-    _arg_paths([root])
-    root = Path(os.path.realpath(root))
+    root = Path(_host_checkout(root))
     accounts = host_accounts()
     listed = []
     for agent, file in host_session_files(root):
@@ -953,15 +1033,28 @@ def _host_tail(file, inode, offset, limit):
     path = Path(os.path.realpath(file))
     if path.suffix != ".jsonl" or not any(path.is_relative_to(r) for r in host_session_roots()):
         raise ValueError("Not a session transcript of this machine")
-    # Non-blocking, so a FIFO planted in a session store cannot hold the probe open.
-    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    with os.fdopen(descriptor, "rb") as stream:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
+    try:
+        stream = open_transcript(path)
+    except OSError as exc:
+        raise ValueError("Not a session transcript of this machine") from exc
+    with stream:
+        info = os.fstat(stream.fileno())
+        # What was opened must still be the file at the checked path: nothing on the way
+        # there was swapped for a symlink in between.
+        try:
+            now = os.lstat(path)
+        except OSError:
+            now = None
+        if (
+            now is None
+            or (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino)
+            or os.path.realpath(path) != str(path)
+        ):
             raise ValueError("Not a session transcript of this machine")
         start = offset if info.st_ino == inode and info.st_size >= offset else 0
         stream.seek(start)
-        data = stream.read(limit)
+        # No further than the size reported, though the file may grow meanwhile.
+        data = stream.read(min(limit, info.st_size - start))
     end = data.rfind(b"\n")
     if end >= 0:
         data = data[: end + 1]
@@ -1056,6 +1149,15 @@ def _absolute(value):
 def _expect(ok, what):
     if not ok:
         raise ValueError(f"Malformed probe answer: {what}")
+
+
+# Control and bidirectional formatting characters, which could disguise worker text.
+UNSHOWN = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def display_text(value):
+    """A worker's title or label for showing, without characters that reorder or hide text."""
+    return UNSHOWN.sub("", value) if isinstance(value, str) else value
 
 
 def _time(value):
@@ -1269,6 +1371,7 @@ def validate_tail(value):
     except ValueError as exc:
         raise ValueError("Malformed probe answer: data") from exc
     _expect(len(data) <= MAX_TAIL, "data size")
+    _expect(value["offset"] + len(data) <= value["size"], "data beyond the file's size")
     return {**value, "data": data}
 
 

@@ -478,6 +478,7 @@ def test_transcript_refuses_unlisted_sessions(stores, tmp_path):
         "session": None,
         "entries": [],
         "start": 0,
+        "first": 0,
         "total": 0,
     }
 
@@ -699,3 +700,101 @@ def test_question_tools_carry_their_questions_and_claudes_answers(stores):
         }
     ]
     assert wv.question_list({"questions": "no"}) is None and wv.question_list("not json") is None
+
+
+# Bounds on what a transcript can make the parser hold or do ------------------------
+
+
+def prompt_line(text):
+    return (json.dumps({"type": "user", "message": {"content": text}}) + "\n").encode()
+
+
+def test_a_long_transcript_keeps_its_newest_entries_and_whole_transcript_indices(monkeypatch):
+    monkeypatch.setattr(wv, "MAX_ENTRIES", 10)
+    parser = wv.Transcript("claude")
+    tool = {"type": "tool_use", "id": "old", "name": "Bash", "input": {"command": "ls"}}
+    parser.consume(
+        (json.dumps({"type": "assistant", "message": {"content": [tool]}}) + "\n").encode()
+    )
+    parser.consume(b"".join(prompt_line(f"p{i}") for i in range(24)))
+    # 25 entries: past 10, the oldest go with a tenth (one) more, and their tool calls.
+    assert parser.first == 16 and len(parser.entries) == 9 and "old" not in parser.tools
+    assert parser.entries[0]["text"] == "p15"
+
+    def page(**args):
+        return wv.transcript_page(
+            [{"id": SID, "agent": "claude", "_file": "f"}],
+            str,
+            lambda parser, file: None,
+            SID,
+            args.get("before"),
+            args.get("after"),
+            None,
+        )
+
+    monkeypatch.setitem(wv._parsers, "f", parser)
+    newest = page()
+    assert (newest["start"], newest["first"], newest["total"]) == (16, 16, 25)
+    assert [e["text"] for e in newest["entries"]] == [f"p{i}" for i in range(15, 24)]
+    assert page(after=23)["entries"][0]["text"] == "p22" and page(after=23)["start"] == 23
+    # Nothing before the first kept entry: an older position answers from there.
+    assert page(before=5)["entries"] == [] and page(before=5)["start"] == 16
+    assert page(after=3)["start"] == 16
+
+
+def test_lines_that_are_not_objects_or_nest_too_deeply_are_passed_over():
+    parser = wv.Transcript("claude")
+    deep = b"[" * 200000 + b"]" * 200000 + b"\n"
+    used = parser.consume(deep + b"[1, 2]\n" + b'"text"\n' + prompt_line("after"))
+    assert [e["text"] for e in parser.entries] == ["after"]
+    assert used == parser.offset and parser.offset > len(deep)
+    codex = wv.Transcript("codex")
+    codex.consume(b'{"payload": ' * 100000 + b"\n")
+    assert codex.entries == [] and codex.offset > 0
+
+
+def test_a_line_too_long_to_parse_is_skipped_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(wv, "MAX_LINE", 1000)
+    monkeypatch.setattr(wv, "CHUNK", 64)
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(prompt_line("before") + prompt_line("x" * 5000) + prompt_line("after"))
+    parser = wv.Transcript("claude")
+    parser.update(path)
+    texts = [e["text"] for e in parser.entries]
+    assert texts[0] == "before" and texts[2] == "after" and "too long" in texts[1]
+    assert parser.offset == path.stat().st_size and not parser.skipping
+    # Still being written: the long line is passed over as it grows, never held whole.
+    with path.open("ab") as stream:
+        stream.write(b'{"type": "user", "message": {"content": "' + b"y" * 3000)
+    parser.update(path)
+    assert parser.skipping and parser.held == 0 and parser.offset == path.stat().st_size
+    with path.open("ab") as stream:
+        stream.write(b"y" * 3000 + b'"}}\n' + prompt_line("done"))
+    parser.update(path)
+    assert parser.entries[-1]["text"] == "done"
+    assert sum("too long" in e["text"] for e in parser.entries) == 2
+
+
+def test_a_busy_transcript_answers_from_its_last_complete_read(monkeypatch):
+    listed = [{"id": SID, "agent": "claude", "_file": "f"}]
+    reads = []
+
+    def read(parser, file):
+        reads.append(file)
+        parser.consume(prompt_line(f"r{len(reads)}"))
+
+    def page():
+        return wv.transcript_page(listed, str, read, SID, None, None, None)
+
+    parser = wv.Transcript("claude")
+    monkeypatch.setitem(wv._parsers, "f", parser)
+    with parser.lock:
+        with pytest.raises(ValueError, match="still being read"):
+            page()
+    assert reads == []
+    assert [e["text"] for e in page()["entries"]] == ["r1"]
+    with parser.lock:
+        started = time.monotonic()
+        busy = page()
+    assert time.monotonic() - started < 5
+    assert [e["text"] for e in busy["entries"]] == ["r1"] and len(reads) == 1

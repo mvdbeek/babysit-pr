@@ -633,7 +633,11 @@
       `updated ${date(data.session.updated)}.`;
   }
   function earlierButton(data) {
-    const earlier = node("button", `Show earlier entries (${data.start})`, "ws-earlier");
+    const earlier = node(
+      "button",
+      `Show earlier entries (${data.start - (data.first || 0)})`,
+      "ws-earlier",
+    );
     earlier.type = "button";
     earlier.onclick = () => {
       earlier.disabled = true;
@@ -666,7 +670,8 @@
     }
     transcriptMeta(data);
     content.replaceChildren();
-    if (data.start > 0) content.append(earlierButton(data));
+    // Entries before `first` are no longer kept by the server.
+    if (data.start > (data.first || 0)) content.append(earlierButton(data));
     const list = node("div", undefined, "ws-transcript");
     viewer.nodes = data.entries.map((entry) => transcriptEntry(entry, agentName(data)));
     list.append(...viewer.nodes);
@@ -712,6 +717,7 @@
       list.append(item);
     });
     current.total = data.total;
+    current.first = data.first;
     current.session = data.session;
     current.sessions = data.sessions;
     transcriptMeta(current);
@@ -730,10 +736,11 @@
     current.entries = [...added, ...current.entries];
     viewer.nodes = [...items, ...viewer.nodes];
     current.start = data.start;
+    current.first = data.first;
     const content = byId("ws-viewer-content");
     content.querySelector(".ws-earlier")?.remove();
     content.querySelector(".ws-transcript").prepend(...items);
-    if (current.start > 0) content.prepend(earlierButton(current));
+    if (current.start > (current.first || 0)) content.prepend(earlierButton(current));
     // Keep the entry the reader was looking at in place.
     scroller.scrollTop += scroller.scrollHeight - before;
   }

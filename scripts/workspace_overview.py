@@ -858,7 +858,7 @@ class WorkspaceOverview:
         worktree = space.get("worktree")
         return {
             "workspace_id": wid,
-            "label": self.remote_text(space.get("label")),
+            "label": remote_probe.display_text(self.remote_text(space.get("label"))),
             "agent_status": self.remote_text(space.get("agent_status")),
             "worktree": {
                 field: self.remote_text(worktree.get(field))
