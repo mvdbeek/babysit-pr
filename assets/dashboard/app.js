@@ -532,6 +532,15 @@ function renderDetail() {
   head.append(top, title);
   if (job.title) head.append(el("div", `${watchSubject(job)} · ${job.branch}`, "branch"));
   head.append(el("p", job.summary));
+  // A worker's agents can register watches there: check it is the session you handed off.
+  if (job.machine && job.status === "awaiting_release")
+    head.append(
+      el(
+        "p",
+        `Registered from ${machineName(job.machine)} for ${job.cwd}, session ${job.session_id}. Release it only if that is the session you handed off.`,
+        "worker-registration",
+      ),
+    );
   if (job.agent === "claude")
     head.append(el("p", `Claude account: ${job.claude_account || "Default"}`, "branch"));
   head.append(workspaceControls({ ...job, id: `watch:${job.id}`, kind: "watch" }));
@@ -597,6 +606,8 @@ function renderDetail() {
   progress.setAttribute("aria-label", "Repair budget used");
   budget.append(progress);
   facts.append(budget, fact("Watch ID", job.id), fact("Worktree", job.cwd, true));
+  if (job.machine)
+    facts.append(fact("Machine", machineName(job.machine)), fact("Session", job.session_id, true));
   body.append(facts);
   if (job.feedback?.length) {
     const section = el("section", undefined, "feedback-section");

@@ -1513,9 +1513,11 @@ def _host_version(babysit_root):
     return {"head": host_git(root, "rev-parse", "HEAD")}
 
 
-def _host_worktree(path):
+def _host_worktree(path, root):
     """A watched checkout here: its top, branch (None when detached), head, whether it has
-    changes, and its Git common dir when it is a linked worktree (None otherwise)."""
+    changes, its Git common dir when it is a linked worktree (None otherwise), and the
+    real path of ``root``, where this machine's worktrees live."""
+    _arg_paths([root], home=True)
     real = _host_checkout(path)
     try:
         branch = host_git(real, "symbolic-ref", "--short", "HEAD")
@@ -1531,6 +1533,7 @@ def _host_worktree(path):
         "head": host_git(real, "rev-parse", "HEAD"),
         "dirty": bool(host_git(real, "status", "--porcelain")),
         "common": common,
+        "root": os.path.realpath(os.path.expanduser(root)),
     }
 
 
@@ -2275,7 +2278,8 @@ def _shown_path(value):
 def validate_worktree(value):
     """A watched checkout's state on a worker: what registration and repairs compare."""
     _expect(
-        isinstance(value, dict) and set(value) == {"path", "branch", "head", "dirty", "common"},
+        isinstance(value, dict)
+        and set(value) == {"path", "branch", "head", "dirty", "common", "root"},
         "fields",
     )
     _expect(_shown_path(value["path"]), "path")
@@ -2287,6 +2291,7 @@ def validate_worktree(value):
     )
     _expect(isinstance(value["dirty"], bool), "dirty")
     _expect(value["common"] is None or _shown_path(value["common"]), "common")
+    _expect(_shown_path(value["root"]), "root")
     return value
 
 

@@ -109,7 +109,8 @@ def checkout_state(home, machine_id, cwd):
     """A worker checkout's top, branch, head, changes and common dir, read on the worker."""
     worker = machines.resolve(home, machine_id)
     assert worker is not None
-    return remote_probe.call(home, worker, "worktree", PROBE_TIMEOUT, path=cwd)
+    root = f"{worker.src.rstrip('/')}/worktrees"
+    return remote_probe.call(home, worker, "worktree", PROBE_TIMEOUT, path=cwd, root=root)
 
 
 def verify_worktree(job, pr, home=None, state=None):
@@ -1061,7 +1062,8 @@ def forward_from_worker(args):
 
     if args.command == "handoff":
         raise ValueError("Automatic handoff from worker machines isn't supported yet")
-    worker_api.controller()  # Without the controller's URL and token, nothing else matters.
+    if not os.environ.get(worker_api.SOCKET_ENV):
+        worker_api.controller()  # Without the controller's URL and token, nothing else matters.
     return worker_api.forward("register", worker_api.registration(args))
 
 
@@ -1103,12 +1105,21 @@ def register(db, args):
             raise ValueError("Supply the exact --session UUID")  # Never this machine's.
         state = checkout_state(home, machine, args.cwd)
         cwd = state["path"]
+        # A task's own checkout: never a main clone, whose .git other tasks share, nor
+        # anything outside the worker's worktrees.
+        if state["common"] is None or not cwd.startswith(state["root"].rstrip("/") + "/"):
+            raise ValueError(
+                f"A watch on {worker.label} must be a linked worktree under {state['root']}"
+            )
+        if state["dirty"]:
+            raise RuntimeError("Worktree has uncommitted changes; repair was not started")
         sid = args.session
     else:
         cwd = str(Path(args.cwd).resolve())
         sid = args.session or (os.environ.get("CODEX_THREAD_ID") if agent_kind == "codex" else None)
     if not sid:
         raise ValueError("Supply the exact --session UUID")
+    sid = str(uuid.UUID(sid))
     if worker is not None:
         if getattr(args, "claude_account", None) and agent_kind != "claude":
             raise ValueError("A Claude account can only be selected for Claude")
@@ -1118,7 +1129,7 @@ def register(db, args):
             "session_info",
             PROBE_TIMEOUT,
             agent=agent_kind,
-            session=str(uuid.UUID(sid)),
+            session=sid,
             cwd=cwd,
             rollout=args.rollout,
             account=getattr(args, "claude_account", None),
@@ -1143,13 +1154,23 @@ def register(db, args):
     branch = getattr(args, "branch", None)
     if branch and (not args.repo or args.pr != "auto" or getattr(args, "ci_repo", None)):
         raise ValueError("--branch requires --repo and cannot be combined with --pr or --ci-repo")
-    pr = watch.resolve_subject(
-        args.pr, repo_override=args.repo, branch=branch, cwd=None if worker else cwd
-    )
-    ci_repo = watch.resolve_ci_repo(getattr(args, "ci_repo", None), pr)
-    if pr["closed"] or pr["merged"]:
-        raise ValueError("PR is already closed")
-    verify_worktree({"cwd": cwd, "machine": machine}, pr, state=state)
+    if worker is not None:
+        try:
+            pr = watch.resolve_subject(args.pr, repo_override=args.repo, branch=branch)
+            ci_repo = watch.resolve_ci_repo(getattr(args, "ci_repo", None), pr)
+            if pr["closed"] or pr["merged"]:
+                raise ValueError("PR is already closed")
+            verify_worktree({"cwd": cwd, "machine": machine}, pr, state=state)
+        except (ValueError, RuntimeError) as exc:
+            # What this machine's GitHub token can see is no worker's business: no
+            # answer tells a missing or private PR from one that does not match.
+            raise ValueError("PR not found or not watchable from this worker") from exc
+    else:
+        pr = watch.resolve_subject(args.pr, repo_override=args.repo, branch=branch, cwd=cwd)
+        ci_repo = watch.resolve_ci_repo(getattr(args, "ci_repo", None), pr)
+        if pr["closed"] or pr["merged"]:
+            raise ValueError("PR is already closed")
+        verify_worktree({"cwd": cwd}, pr)
     selection = (
         getattr(args, "claude_command", None) if agent_kind == "claude" else args.codex_command
     )

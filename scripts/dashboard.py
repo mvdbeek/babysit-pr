@@ -244,6 +244,8 @@ def present_job(job):
         "last_poll": (job.get("watcher_state") or {}).get("last_snapshot_at"),
         "started_at": job.get("started_at"),
         "cwd": job.get("cwd"),
+        "machine": job.get("machine"),
+        "session_id": job.get("session_id"),
         "attempt": job.get("attempt"),
         "poll_errors": job.get("poll_errors", 0),
         "pause_after_run": job.get("pause_after_run", False),
@@ -952,6 +954,12 @@ class Handler(BaseHTTPRequestHandler):
             and self.headers.get("Sec-Fetch-Site") is None
             else None
         )
+        # `tailscale serve` sets X-Forwarded-For to the tailnet address a request came
+        # from, replacing any the client sent; a machine's own address, when registered,
+        # must be the only one.
+        if machine is not None and machine.tailnet_ip is not None:
+            if self.headers.get_all("X-Forwarded-For") != [machine.tailnet_ip]:
+                machine = None
         if machine is None:
             self.send_json(403, {"error": "This needs a worker token issued by the controller"})
             return
@@ -964,6 +972,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Send one JSON request body")
             request = json.loads(self.read_body(length, 10))
             self.send_json(200, worker_api.handle(self.server.home, machine, action, request))
+        except worker_api.RateLimited as exc:
+            self.fail(429, str(exc))
         except (ValueError, RuntimeError) as exc:
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:

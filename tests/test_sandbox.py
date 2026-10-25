@@ -540,15 +540,36 @@ def test_wrapper_tells_a_workers_agent_it_is_on_a_worker(checkout):
     assert [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_WORKER"] == [""]
     marker = str(home / ".config" / "babysit-pr" / "worker.json")
     assert not any(marker in word for word in argv)
+    assert not any("babysit-pr/" in a and a == b for a, b in pairs(argv, "--ro-bind"))
     (home / ".config" / "babysit-pr").mkdir(parents=True)
     (home / ".config" / "babysit-pr" / "worker.json").write_text("{}")
     argv = printed(worktree, env, "--env-pass=BABYSIT_WORKER", "--", "agent")
-    # Its controller URL and token, read-only, so `register` inside can forward.
-    assert (marker, marker) in pairs(argv, "--ro-bind")
-    assert not any(marker in pair for pair in pairs(argv, "--bind"))
     # Set last, so no passed value can clear it.
     assert [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_WORKER"][-1] == "1"
     assert dict(pairs(argv, "--setenv"))["BABYSIT_WORKER"] == "1"
+    # Never its controller token: without an agent configuration, no registration either.
+    assert not any(marker in word for word in argv)
+    # The deployed babysit-pr it runs from, read-only: its skill and `register`.
+    deployed = str(Path(sandbox.__file__).resolve().parent.parent)
+    assert (deployed, deployed) in pairs(argv, "--ro-bind")
+    assert "BABYSIT_REGISTER_SOCKET" not in dict(pairs(argv, "--setenv"))
+    account = home / "acct"
+    account.mkdir()
+    env = {**env, "BABYSIT_REGISTER_SOCKET": "/elsewhere"}
+    argv = printed(
+        worktree,
+        env,
+        f"--claude-config-dir={account}",
+        f"--add-dirs={worktree}",
+        "--env-pass=BABYSIT_REGISTER_SOCKET",
+        "--",
+        "claude",
+    )
+    assert not any(marker in word for word in argv)
+    # This launch's registration broker, its socket bound in and named last.
+    socket = [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_REGISTER_SOCKET"][-1]
+    assert socket.endswith("/register.sock") and "babysit-register." in socket
+    assert (socket, socket) in pairs(argv, "--bind")
 
 
 def test_wrapper_ignores_the_working_directory_and_its_git_files(checkout):

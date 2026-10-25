@@ -1179,6 +1179,13 @@ button:disabled {
 .cleanup-note strong {
   font-size: 12px;
 }
+.worker-registration {
+  padding: 10px 14px;
+  background: var(--amber-bg);
+  color: var(--amber-fg);
+  border-radius: 7px;
+  overflow-wrap: anywhere;
+}
 
 .pr-overview {
   margin-bottom: 34px;

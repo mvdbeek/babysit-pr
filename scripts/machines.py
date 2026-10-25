@@ -9,6 +9,7 @@ never resolved or expanded on this machine. Pass ones that may start with ``~``
 
 import functools
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -45,6 +46,7 @@ FIELDS = {
     "labels",
     "collie_url",
     "enabled",
+    "tailnet_ip",
 }
 REQUIRED = {"id", "label", "ssh", "os"}
 # sshd's MaxSessions defaults to 10; stay well below it on one multiplexed connection.
@@ -66,6 +68,8 @@ class Machine(NamedTuple):
     labels: tuple[str, ...]
     collie_url: str | None
     enabled: bool
+    # Where its registrations reach the dashboard from, as `tailscale serve` reports it.
+    tailnet_ip: str | None = None
 
 
 class RemotePath(str):
@@ -92,6 +96,13 @@ def _collie_url(value):
         and bool(parts.hostname)
         and not any(c in value for c in " \"'<>`\\")
     )
+
+
+def _ip(value):
+    try:
+        return isinstance(value, str) and str(ipaddress.ip_address(value)) == value
+    except ValueError:
+        return False
 
 
 def _remote_path(value):
@@ -129,6 +140,7 @@ def _machine(raw):
         labels=raw.get("labels", []),
         collie_url=raw.get("collie_url"),
         enabled=raw.get("enabled", True),
+        tailnet_ip=raw.get("tailnet_ip"),
     )
     name = machine.id if isinstance(machine.id, str) else "?"
     checks = [
@@ -167,6 +179,7 @@ def _machine(raw):
         ),
         (machine.collie_url is None or _collie_url(machine.collie_url), "collie_url"),
         (isinstance(machine.enabled, bool), "enabled"),
+        (machine.tailnet_ip is None or _ip(machine.tailnet_ip), "tailnet_ip"),
     ]
     for ok, field in checks:
         if not ok:

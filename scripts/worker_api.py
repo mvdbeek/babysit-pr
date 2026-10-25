@@ -17,8 +17,10 @@ import json
 import os
 import re
 import secrets
+import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from argparse import Namespace
@@ -34,6 +36,8 @@ MAX_ANSWER = 65536
 # Reading the worker's checkout and session, and GitHub, can take a while over ssh.
 FORWARD_TIMEOUT = 300
 ACTIONS = {"register"}
+# Set by babysit-bwrap inside a worker's sandbox: its registration broker's socket.
+SOCKET_ENV = "BABYSIT_REGISTER_SOCKET"
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 PR = re.compile(
     r"[1-9][0-9]{0,9}|https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"
@@ -46,6 +50,30 @@ PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # One registration per machine at a time; a flood waits for nothing.
 _busy: dict[str, threading.Lock] = {}
 _busy_lock = threading.Lock()
+# Per machine, a bucket of RATE registrations refilled over a minute; a failed one
+# costs FAILURE_COST more, so repeated failures back off.
+RATE = 6
+FAILURE_COST = 2
+_buckets: dict[str, tuple[float, float]] = {}
+# Worker watches are polled from this machine's GitHub token; never faster than this.
+MIN_POLL = 30
+
+
+class RateLimited(ValueError):
+    """Too many registrations from one machine; answered 429."""
+
+
+def _take(machine_id, cost=1.0, force=False):
+    """Whether ``cost`` tokens were available; ``force`` takes them regardless."""
+    now = time.monotonic()
+    with _busy_lock:
+        tokens, then = _buckets.get(machine_id, (float(RATE), now))
+        tokens = min(float(RATE), tokens + (now - then) * RATE / 60)
+        if tokens < cost and not force:
+            _buckets[machine_id] = (tokens, now)
+            return False
+        _buckets[machine_id] = (max(-float(RATE), tokens - cost), now)
+        return True
 
 
 def _digest(token):
@@ -188,7 +216,7 @@ def register_args(home, machine, request):
         on_green=_optional(request["on_green"], "continuation", 20000, prompt=True),
         codex_command=None,
         claude_command=None,
-        poll_seconds=_count(request["poll_seconds"], "poll interval", 86400),
+        poll_seconds=max(MIN_POLL, _count(request["poll_seconds"], "poll interval", 86400)),
         max_repairs=_count(request["max_repairs"], "repair budget", 100),
         repair_timeout=_count(request["repair_timeout"], "repair timeout", 86400),
     )
@@ -205,12 +233,18 @@ def handle(home, machine, action, request):
     try:
         if action != "register":
             raise ValueError("Unknown worker action")
-        args = register_args(home, machine, request)
-        db = pr_supervisor.open_db(home)
+        if not _take(machine.id):
+            raise RateLimited(f"Too many registrations from {machine.label}; wait a minute")
         try:
-            job = pr_supervisor.register(db, args)
-        finally:
-            db.close()
+            args = register_args(home, machine, request)
+            db = pr_supervisor.open_db(home)
+            try:
+                job = pr_supervisor.register(db, args)
+            finally:
+                db.close()
+        except Exception:
+            _take(machine.id, FAILURE_COST, force=True)
+            raise
         return {
             "id": job["id"],
             "status": job["status"],
@@ -281,6 +315,33 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def forward(action, payload, timeout=FORWARD_TIMEOUT):
+    """The controller's answer to ``payload``: through this sandbox's registration broker
+    (``worker_broker``) inside babysit-bwrap, else posted with ``worker.json``'s token."""
+    path = os.environ.get(SOCKET_ENV)
+    if not path:
+        return post(action, payload, timeout)
+    try:
+        with socket.socket(socket.AF_UNIX) as broker:
+            broker.settimeout(timeout)
+            broker.connect(path)
+            broker.sendall(json.dumps(payload).encode())
+            broker.shutdown(socket.SHUT_WR)
+            data = b""
+            while chunk := broker.recv(65536):
+                data += chunk
+                if len(data) > MAX_ANSWER:
+                    raise ValueError("The registration broker's answer is too large")
+        answer = json.loads(data)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Cannot reach this sandbox's registration broker: {exc}") from exc
+    if not isinstance(answer, dict):
+        raise RuntimeError("The registration broker answered no JSON object")
+    if "error" in answer:
+        raise ValueError(str(answer["error"])[:2000])
+    return answer
+
+
+def post(action, payload, timeout=FORWARD_TIMEOUT):
     """Send ``payload`` to the controller's ``/api/worker/<action>``; its JSON answer."""
     url, token = controller()
     request = urllib.request.Request(

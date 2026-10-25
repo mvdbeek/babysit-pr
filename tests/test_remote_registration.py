@@ -55,6 +55,11 @@ def claude_transcript(home, cwd, sid, account=None, **changes):
     return path
 
 
+@pytest.fixture(autouse=True)
+def fresh_rate_limits(monkeypatch):
+    monkeypatch.setattr(worker_api, "_buckets", {})
+
+
 @pytest.fixture
 def box(tmp_path, short_tmp, fake_tools, monkeypatch):  # noqa: F811
     """The controller's home and the worker's: a clone with a linked worktree and a session."""
@@ -141,21 +146,23 @@ def register(box, **changes):
 
 def test_a_workers_checkout_is_read_there(box):
     tree = box["tree"]
-    state = remote_probe.validate_worktree(remote_probe._host_worktree(str(tree)))
+    root = str(box["worker"] / "src/worktrees")
+    state = remote_probe.validate_worktree(remote_probe._host_worktree(str(tree), root))
     assert state == {
         "path": str(tree),
         "branch": "feature",
         "head": box["sha"],
         "dirty": False,
         "common": str((box["worker"] / "src/repo/.git").resolve()),
+        "root": str(Path(root).resolve()),
     }
     (tree / "new").write_text("x")
-    assert remote_probe._host_worktree(str(tree))["dirty"] is True
-    main = remote_probe._host_worktree(str(box["worker"] / "src/repo"))
+    assert remote_probe._host_worktree(str(tree), root)["dirty"] is True
+    main = remote_probe._host_worktree(str(box["worker"] / "src/repo"), root)
     assert main["common"] is None and main["branch"] == "main"
     (box["tree"] / "sub").mkdir()
     with pytest.raises(ValueError, match="top of a Git checkout"):
-        remote_probe._host_worktree(str(box["tree"] / "sub"))
+        remote_probe._host_worktree(str(box["tree"] / "sub"), root)
     for bad in ({**state, "path": "/a\x1bb"}, {**state, "extra": 1}, {**state, "head": "x"}):
         with pytest.raises(ValueError, match="Malformed"):
             remote_probe.validate_worktree(bad)
@@ -345,7 +352,10 @@ def request_body(box, **changes):
     return {**body, **changes}
 
 
-def test_the_dashboard_registers_a_workers_watch_on_the_machine_its_token_names(box, served):
+def test_the_dashboard_registers_a_workers_watch_on_the_machine_its_token_names(
+    box, served, monkeypatch
+):
+    monkeypatch.setattr(worker_api, "RATE", 100)  # Many refusals in a row, on purpose.
     token = worker_api.issue(box["home"], "box")
     stored = (box["home"] / worker_api.TOKENS).read_text()
     assert token not in stored and (box["home"] / worker_api.TOKENS).stat().st_mode & 0o777 == 0o600
@@ -506,3 +516,125 @@ def test_a_worker_watch_binds_its_pane_through_that_machines_herdr(box, fake_too
     db.close()
     with pytest.raises(RuntimeError, match="Pane worktree does not match"):
         register(box, pane="w1:p1", headless=False)
+
+
+def test_a_worker_watch_is_only_ever_a_linked_worktree_under_the_workers_root(box, tmp_path):
+    clone = box["worker"] / "src" / "repo"
+    git("checkout", "-q", "--detach", cwd=clone)
+    git("branch", "-q", "-f", "feature-copy", "feature", cwd=clone)
+    with pytest.raises(ValueError, match="must be a linked worktree under"):
+        register(box, cwd=str(clone))
+    elsewhere = box["worker"] / "elsewhere"
+    git("worktree", "add", "-q", str(elsewhere), "feature-copy", cwd=clone)
+    with pytest.raises(ValueError, match="must be a linked worktree under"):
+        register(box, cwd=str(elsewhere))
+    assert supervisor.jobs(supervisor.open_db(box["home"])) == []
+
+
+def test_github_answers_reach_a_worker_only_as_one_generic_refusal(box, monkeypatch):
+    for setup in (
+        lambda: monkeypatch.setenv("FAKE_GH_FAIL", "Could not resolve to a PullRequest"),
+        lambda: monkeypatch.setenv(
+            "FAKE_GH_PR", os.environ["FAKE_GH_PR"].replace('"OPEN"', '"CLOSED"')
+        ),
+        lambda: monkeypatch.setenv(
+            "FAKE_GH_PR", os.environ["FAKE_GH_PR"].replace('"feature"', '"other"')
+        ),
+    ):
+        setup()
+        with pytest.raises(ValueError, match="^PR not found or not watchable from this worker$"):
+            register(box)
+        monkeypatch.delenv("FAKE_GH_FAIL", raising=False)
+
+
+def test_a_worker_session_id_is_normalised_before_it_is_compared(box):
+    job = register(box, session=box["sid"].upper())
+    assert job["session_id"] == box["sid"]
+    with pytest.raises(ValueError, match="already owns"):
+        register(box, session=box["sid"].upper())
+
+
+def test_worker_watches_awaiting_release_name_their_machine_cwd_and_session(box):
+    import attention
+
+    job = register(box)
+    shown = dashboard.present_job(job)
+    assert (shown["machine"], shown["cwd"], shown["session_id"]) == (
+        "box",
+        job["cwd"],
+        box["sid"],
+    )
+    feed = attention.collect(watcher=lambda: {"jobs": [shown]})
+    [item] = [i for i in feed["items"] if i.get("reasons")]
+    [why] = [r["text"] for r in item["reasons"] if r["code"] == "watch_release"]
+    assert why.startswith(f"Registered from box for {job['cwd']}, session {box['sid']}")
+
+
+def test_worker_registrations_are_rate_limited_and_polled_no_faster_than_the_floor(box, served):
+    auth = {"Authorization": f"Bearer {worker_api.issue(box['home'], 'box')}"}
+    status, answer = post(served, "/api/worker/register", request_body(box, poll_seconds=1), auth)
+    assert status == 200, answer
+    [job] = supervisor.jobs(supervisor.open_db(box["home"]))
+    assert job["poll_seconds"] == worker_api.MIN_POLL
+    # Each failure costs more than a registration: the bucket empties quickly.
+    codes = [post(served, "/api/worker/register", request_body(box), auth)[0] for _ in range(4)]
+    assert codes[0] == 400 and codes[-1] == 429
+
+
+class ForwardingProxy(http.server.BaseHTTPRequestHandler):
+    """Like `tailscale serve`: X-Forwarded-For is the client's address, whatever it sent."""
+
+    upstream = 0
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "x-forwarded-for"}
+        headers["X-Forwarded-For"] = self.client_address[0]
+        conn = http.client.HTTPConnection("127.0.0.1", self.upstream, timeout=60)
+        conn.request("POST", self.path, body, headers)
+        response = conn.getresponse()
+        data = response.read()
+        self.send_response(response.status)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_a_machines_tailnet_address_must_be_the_one_the_proxy_reports(box, served):
+    token = worker_api.issue(box["home"], "box")
+    ForwardingProxy.upstream = served.server_port
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ForwardingProxy)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    host = {"Host": f"127.0.0.1:{served.server_port}"}
+
+    def through_proxy(**headers):
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=60)
+        body = json.dumps(request_body(box)).encode()
+        conn.request(
+            "POST",
+            "/api/worker/register",
+            body,
+            {
+                **host,
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                **headers,
+            },
+        )
+        return conn.getresponse().status
+
+    try:
+        registry(box["home"], tailnet_ip="100.64.0.5 ")
+        with pytest.raises(ValueError, match="Invalid tailnet_ip"):
+            supervisor.machines.load(box["home"])
+        registry(box["home"], tailnet_ip="100.64.0.5")
+        # A client's own header never survives the proxy.
+        assert through_proxy(**{"X-Forwarded-For": "100.64.0.5"}) == 403
+        registry(box["home"], tailnet_ip="127.0.0.1")
+        assert through_proxy() == 200
+    finally:
+        proxy.shutdown()
+        proxy.server_close()

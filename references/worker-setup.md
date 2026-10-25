@@ -431,12 +431,16 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    ```
 
    It adds `controller` and `token` to `~/.config/babysit-pr/worker.json` (mode 600);
-   later user steps keep them. Agents there, sandboxed or not, can then run
-   `pr_supervisor.py register` as on the Mac: it forwards to the dashboard, which
-   reads the worktree and session on the worker before recording the watch. Every
-   agent on the worker can read the token, and so register watches on that machine
-   (the supervisor reference's "Watches on workers" has the details). Issue a new
-   token to replace it, or `worker-token ubuntu-1 --revoke`.
+   later user steps keep them. Agents there can then run `pr_supervisor.py register`
+   (inside babysit-bwrap: `<babysit_root>/scripts/pr_supervisor.py`, shown read-only):
+   it forwards to the dashboard, which reads the worktree and session on the worker
+   before recording the watch. Sandboxed agents never see the token; their launch's
+   registration broker forwards only their own sessions in their own worktrees (the
+   supervisor reference's "Watches on workers" has the details). Issue a new token to
+   replace it, or `worker-token ubuntu-1 --revoke`. Optionally add the worker's
+   tailnet address as `"tailnet_ip"` to its `machines.json` entry
+   (`tailscale ip -4 <box>`): registrations then must come through `tailscale serve`
+   from that address.
 
 **Migrating a worker provisioned before the deployed copy** (babysit-pr in
 `~/src/babysit-pr`, for example chonk pinned at `d55bebe`): rerun the user step with
@@ -504,7 +508,7 @@ From the Linux sandbox section of the supervisor reference, restated for operato
 - Installing Playwright's system libraries (`npx playwright install-deps chromium` as
   root, pinned to the repository's Playwright version) is not automated yet. The user
   step writes `~/.config/babysit-pr/worker.json`, which marks the machine as a worker
-  (babysit-bwrap passes it to agents as `BABYSIT_WORKER=1`, and shows them the file
-  read-only for registration). Watches on the worker are repaired there; automatic
+  (babysit-bwrap passes it to agents as `BABYSIT_WORKER=1`, and starts a registration
+  broker for them instead of showing them the file). Watches on the worker are repaired there; automatic
   handoff does not run there yet.
 - The dashboard's Docker toggle is macOS-only (supervisor reference).
