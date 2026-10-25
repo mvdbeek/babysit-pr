@@ -78,11 +78,23 @@ def test_orphan_tombstone_holds_until_cleared(homes):
     session_locks.mark_orphan("claude", SID, None, "a1", "mini")
     tombstone = homes / "home/.local/state/babysit-pr/session-locks/mini" / f"{SID}.orphan"
     assert json.loads(tombstone.read_text()) == {"attempt": "a1", "machine": "mini"}
+    assert not tombstone.with_suffix(".orphan.tmp").exists()
     assert session_locks.held("claude", SID, None, "mini")
     assert not session_locks.held("claude", SID, None, "other")
+    with pytest.raises(BlockingIOError, match="orphaned on mini"):
+        with session_locks.acquire("claude", SID, None, "mini"):
+            pytest.fail("acquired an orphaned session")
     session_locks.clear_orphan("claude", SID, None, "mini")
     assert not session_locks.held("claude", SID, None, "mini")
+    with session_locks.acquire("claude", SID, None, "mini"):
+        pass
     session_locks.clear_orphan("claude", SID, None, "mini")
+
+
+@pytest.mark.parametrize("session_id", ["../x", "a/b", "not-a-uuid", ""])
+def test_session_ids_must_be_uuids(session_id):
+    with pytest.raises(ValueError):
+        session_locks.path("codex", session_id)
 
 
 def test_only_remote_sessions_can_be_orphaned():

@@ -602,7 +602,6 @@ def run_repair(home, job_id, attempt):
         if job.get("agent") == "claude":
             import claude_accounts
             import claude_runner
-        # Per-session locks are shared by every supervisor home on this machine.
         with session_locks.acquire(
             job.get("agent"), job["session_id"], job.get("claude_config_dir"), job.get("machine")
         ):

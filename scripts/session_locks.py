@@ -15,6 +15,7 @@ import contextlib
 import fcntl
 import json
 import os
+import uuid
 from pathlib import Path
 
 import machines
@@ -27,6 +28,8 @@ def _state_home():
 
 def path(agent, session_id, config_dir=None, machine=None):
     """Where this session's lock lives; unchanged from before for local sessions."""
+    # Session ids are UUIDs everywhere; anything else must not shape a path.
+    session_id = str(uuid.UUID(session_id))
     if machine is not None:
         if not isinstance(machine, str) or not machines.ID.fullmatch(machine) or machine == "local":
             raise ValueError(f"Invalid machine id: {machine!r}")
@@ -54,6 +57,9 @@ def acquire(agent, session_id, config_dir=None, machine=None):
     with lock.open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
+            # An orphaned agent may still run on its worker; never start a second one.
+            if machine is not None and _orphan(agent, session_id, config_dir, machine).exists():
+                raise BlockingIOError(f"Session {session_id} is orphaned on {machine}")
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
@@ -80,7 +86,9 @@ def mark_orphan(agent, session_id, config_dir, attempt, machine):
         raise ValueError("Only a session on a worker machine can be orphaned")
     tombstone = _orphan(agent, session_id, config_dir, machine)
     tombstone.parent.mkdir(parents=True, exist_ok=True)
-    tombstone.write_text(json.dumps({"attempt": attempt, "machine": machine}))
+    partial = tombstone.with_suffix(".orphan.tmp")
+    partial.write_text(json.dumps({"attempt": attempt, "machine": machine}))
+    partial.replace(tombstone)
 
 
 def clear_orphan(agent, session_id, config_dir, machine):
