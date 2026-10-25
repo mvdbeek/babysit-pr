@@ -679,6 +679,33 @@ def open_transcript(path):
         raise
 
 
+def open_beneath(path):
+    """``open_transcript`` of an absolute, already resolved ``path``, one folder at a time.
+
+    No folder on the way may be a symlink, even one swapped in after the path was
+    checked, and the file may have no other name: a hard link would let a store name
+    any file of its owner's.
+    """
+    parts = Path(path).parts
+    folder = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[1:-1]:
+            inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
+            os.close(folder)
+            folder = inner
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=folder)
+    finally:
+        os.close(folder)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"Not a regular file with one name: {path}")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def transcript_lines(stream):
     """Decoded lines of a binary ``stream``: within MAX_SCAN bytes, none over MAX_SCAN_LINE."""
     limit, longest = MAX_SCAN, MAX_SCAN_LINE
@@ -833,16 +860,17 @@ def _host_run(argv, timeout):
 _guards: dict[str, list[str]] = {}
 
 
-def host_guard(path, timeout=60):
+def host_guard(path, timeout=60, cache=_guards):
     """``-c`` overrides for the programs ``path``'s own config could name.
 
     Attributes (``.gitattributes``, ``.git/info/attributes``) pick a filter driver by
     name, so blanking every driver the config defines covers them all, git-lfs's
     included: git-lfs, and the extensions and transfer agents it would run, never
     starts. ``core.worktree`` would point Git at another directory and is refused.
+    A long-lived caller passes a fresh ``cache``, since a checkout's config can change.
     """
     key = str(path)
-    if key not in _guards:
+    if key not in cache:
         result = _host_run(
             [*HOST_GIT, "-C", key, "config", "-z", "--get-regexp", r"^filter\.|^core\.worktree$"],
             timeout,
@@ -858,16 +886,16 @@ def host_guard(path, timeout=60):
                 drivers[name[len("filter.") : name.rindex(".")]] = None
         if any("=" in driver for driver in drivers):
             raise ValueError("A filter driver's name cannot be overridden; not read")
-        _guards[key] = [
+        cache[key] = [
             arg
             for driver in drivers
             for setting in ("clean=", "smudge=", "process=", "required=false")
             for arg in ("-c", f"filter.{driver}.{setting}")
         ]
-    return _guards[key]
+    return cache[key]
 
 
-def host_argv(path, args, options=()):
+def host_argv(path, args, options=(), cache=_guards):
     """The hardened Git command line for ``args`` in ``path``, after Git ``options``."""
     command = next((arg for arg in args if not arg.startswith("-")), None)
     # Looking into a submodule's working tree would run Git there, under its own
@@ -875,7 +903,7 @@ def host_argv(path, args, options=()):
     if command in SUBMODULE_READS:
         at = args.index(command) + 1
         args = (*args[:at], "--ignore-submodules=dirty", *args[at:])
-    return [*HOST_GIT, *options, *host_guard(path), "-C", str(path), *args]
+    return [*HOST_GIT, *options, *host_guard(path, cache=cache), "-C", str(path), *args]
 
 
 def host_git(path, *args, timeout=60, strip=True):
@@ -1150,7 +1178,7 @@ def _host_tail(file, inode, offset, limit):
     if path.suffix != ".jsonl" or not any(path.is_relative_to(r) for r in host_session_roots()):
         raise ValueError("Not a session transcript of this machine")
     try:
-        stream = open_transcript(path)
+        stream = open_beneath(path)
     except OSError as exc:
         raise ValueError("Not a session transcript of this machine") from exc
     with stream:

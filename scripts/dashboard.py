@@ -107,7 +107,10 @@ def viewed_workspace(home, value):
         machine_id, workspace_id = machines.split(value)
     except ValueError:
         return None, value  # Not a qualified ID either: refused as an invalid workspace.
-    return machines.resolve(home, machine_id), workspace_id
+    machine = machines.resolve(home, machine_id)
+    if machine is not None and not machine.enabled:
+        raise ValueError(f"{machine.label} is disabled")
+    return machine, workspace_id
 
 
 def watch_checkout(home, watch_id):

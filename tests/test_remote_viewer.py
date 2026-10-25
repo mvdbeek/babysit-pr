@@ -541,8 +541,8 @@ def test_tail_refuses_a_file_swapped_after_its_path_was_checked(worker, monkeypa
     monkeypatch.setenv("HOME", str(worker.host))
     other = worker.claude.with_name(f"{SIBLING_SID}.jsonl")
     other.write_text("{}\n")
-    real = remote_probe.open_transcript
-    monkeypatch.setattr(remote_probe, "open_transcript", lambda path: real(other))
+    real = remote_probe.open_beneath
+    monkeypatch.setattr(remote_probe, "open_beneath", lambda path: real(other))
     with pytest.raises(ValueError, match="Not a session transcript"):
         remote_probe._host_tail(str(worker.claude), None, 0, 100)
 
@@ -651,3 +651,59 @@ def test_an_overlong_worker_checkout_path_is_refused(worker):
     worker.state.write_text(json.dumps(store))
     with pytest.raises(ValueError, match="no checkout to show"):
         wv.remote_checkout(worker.machine, "w1")
+
+
+def test_a_worker_transcript_line_is_parsed_only_up_to_the_scan_cap(worker, monkeypatch):
+    monkeypatch.setattr(wv, "REMOTE_READS", 1000)
+    tail = tail_through_probe(worker, monkeypatch, [])
+    long = "z" * (remote_probe.MAX_SCAN_LINE + 1024)
+    with worker.claude.open("a") as stream:
+        stream.write(json.dumps(claude_turn("assistant", worker.checkout, long)) + "\n")
+        stream.write(json.dumps(claude_turn("user", worker.checkout, "After")) + "\n")
+    parser = wv.Transcript("claude", wv.REMOTE_MAX_LINE)
+    parser.update_remote(tail, str(worker.claude))
+    texts = [e["text"] for e in parser.entries]
+    assert texts[:2] == ["Fix it", "Done"] and "too long" in texts[2] and texts[3] == "After"
+    # This machine's transcripts keep their own, larger limit.
+    local = wv.Transcript("claude")
+    local.update(worker.claude)
+    assert [e["text"] for e in local.entries][2].startswith("z" * 1000)
+
+
+def test_views_of_a_disabled_worker_are_refused(worker):
+    register(worker.home, {**MINI, "enabled": False})
+    with pytest.raises(ValueError, match="Mac mini is disabled"):
+        dashboard.viewed_workspace(worker.home, "mini/w1")
+
+
+def test_tail_refuses_a_hardlink_into_a_session_store(worker, monkeypatch):
+    monkeypatch.setenv("HOME", str(worker.host))
+    secret = worker.host / "secret.txt"
+    secret.write_text('{"not": "a transcript"}\n')
+    planted = worker.claude.with_name(f"{SIBLING_SID}.jsonl")
+    planted.unlink(missing_ok=True)
+    os.link(secret, planted)
+    with pytest.raises(ValueError, match="Not a session transcript"):
+        remote_probe._host_tail(str(planted), None, 0, 100)
+
+
+def test_tail_never_follows_a_folder_swapped_for_a_symlink(worker, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(worker.host))
+    folder = worker.claude.parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / worker.claude.name).write_text('{"elsewhere": true}\n')
+    # The swap lands after the path was resolved and checked, before it is opened.
+    checked = str(worker.claude)
+    real = os.path.realpath
+
+    def racing(path, *args, **kwargs):
+        if str(path) == checked and folder.is_dir() and not folder.is_symlink():
+            shutil.move(str(folder), str(folder) + ".moved")
+            folder.symlink_to(outside)
+            return checked
+        return checked if str(path) == checked else real(path, *args, **kwargs)
+
+    monkeypatch.setattr(remote_probe.os.path, "realpath", racing)
+    with pytest.raises(ValueError, match="Not a session transcript"):
+        remote_probe._host_tail(checked, None, 0, 100)

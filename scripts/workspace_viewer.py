@@ -60,8 +60,11 @@ REMOTE_TIMEOUT = 60
 REMOTE_READS = 64
 REMOTE_BUDGET = 60
 REMOTE_MIN_READ = 5
-# A transcript line longer than this is skipped, with a notice, rather than parsed.
+# A transcript line longer than this is skipped, with a notice, rather than parsed. A
+# worker's transcript is held to the cap its session listing reads at: parsing one line
+# costs many times its size.
 MAX_LINE = 64 * 1024 * 1024
+REMOTE_MAX_LINE = remote_probe.MAX_SCAN_LINE
 # Entries a parsed transcript keeps; past it the oldest go, a tenth at a time, and the
 # page indices stay those of the whole transcript.
 MAX_ENTRIES = 20000
@@ -101,19 +104,10 @@ def local_environment():
 def git_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
     """Run git in a checkout, keeping at most ``limit`` bytes; return (text, truncated)."""
     limit = MAX_DIFF if limit is None else limit
-    # Unquoted paths: diff headers and file lists then carry names as they are.
-    argv = [
-        "git",
-        "-C",
-        str(path),
-        "--no-optional-locks",
-        "-c",
-        "core.quotePath=false",
-        # A checkout's own config must not start an fsmonitor daemon for a read.
-        "-c",
-        "core.fsmonitor=false",
-        *args,
-    ]
+    # Unquoted paths: diff headers and file lists then carry names as they are. A
+    # checkout's own config must not run a program for a read, as on a worker; its
+    # config is read afresh each time.
+    argv = remote_probe.host_argv(path, args, ("-c", "core.quotePath=false"), cache={})
     chunks: list[bytes] = []
     size = 0
     truncated = False
@@ -604,8 +598,9 @@ def remote_sessions(home, machine, path):
 class Transcript:
     """A session's conversation, parsed once and then only as its file grows."""
 
-    def __init__(self, agent):
+    def __init__(self, agent, max_line=None):
         self.agent = agent
+        self.max_line = max_line  # None: MAX_LINE.
         self.lock = threading.Lock()
         # (first, entries) as of the last complete read, for a request that finds the
         # parser busy.
@@ -645,6 +640,12 @@ class Transcript:
             return 0
         # Only complete lines: a line still being written is read next time.
         for line in data[: end + 1].split(b"\n"):
+            # Only an object becomes an entry; anything else is not worth parsing.
+            if not line[:64].lstrip().startswith(b"{"):
+                continue
+            if len(line) > self.limit():
+                self.too_long()
+                continue
             if line.strip():
                 try:
                     item = json.loads(line)
@@ -676,23 +677,29 @@ class Transcript:
             if data:
                 self.pending.append(data)
                 self.held += len(data)
-            if self.held > MAX_LINE:
+            if self.held > self.limit():
                 self.offset += self.held
                 self.pending, self.held = [], 0
                 self.skipping = True
-                self.entries.append(
-                    {
-                        "role": "user",
-                        "kind": "notification",
-                        "text": f"Transcript line too long (over {MAX_LINE >> 20} MiB); skipped",
-                        "time": None,
-                    }
-                )
+                self.too_long()
                 self.trim()
             return
         self.consume(b"".join([*self.pending, data[: end + 1]]))
         rest = data[end + 1 :]
         self.pending, self.held = ([rest], len(rest)) if rest else ([], 0)
+
+    def limit(self):
+        return MAX_LINE if self.max_line is None else self.max_line
+
+    def too_long(self):
+        self.entries.append(
+            {
+                "role": "user",
+                "kind": "notification",
+                "text": f"Transcript line too long (over {self.limit() >> 20} MiB); skipped",
+                "time": None,
+            }
+        )
 
     def trim(self):
         """Drop the oldest entries past MAX_ENTRIES, and the tool calls they held."""
@@ -911,7 +918,10 @@ def transcript_page(listed, key_of, read, session, before, after, prefer):
             raise ValueError("That session is not recorded for this workspace")
     key = key_of(chosen["_file"])
     with _lock:
-        parser = _parsers.pop(key, None) or Transcript(chosen["agent"])
+        # A worker's transcripts are keyed (machine id, file).
+        parser = _parsers.pop(key, None) or Transcript(
+            chosen["agent"], REMOTE_MAX_LINE if isinstance(key, tuple) else None
+        )
         _parsers[key] = parser
         while len(_parsers) > PARSED_FILES:
             _parsers.pop(next(iter(_parsers)), None)

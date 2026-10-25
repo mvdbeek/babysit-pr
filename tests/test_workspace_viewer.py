@@ -798,3 +798,18 @@ def test_a_busy_transcript_answers_from_its_last_complete_read(monkeypatch):
         busy = page()
     assert time.monotonic() - started < 5
     assert [e["text"] for e in busy["entries"]] == ["r1"] and len(reads) == 1
+
+
+def test_only_lines_that_can_be_an_object_are_parsed(monkeypatch):
+    parsed = []
+    loads = wv.json.loads
+
+    def spy(line, *args, **kwargs):
+        parsed.append(line[:1])
+        return loads(line, *args, **kwargs)
+
+    monkeypatch.setattr(wv.json, "loads", spy)
+    parser = wv.Transcript("claude")
+    parser.consume(b"[" * 100000 + b"\n" + b'"text"\n' + b"  " + prompt_line("after"))
+    assert [e["text"] for e in parser.entries] == ["after"]
+    assert parsed == [b" "]
