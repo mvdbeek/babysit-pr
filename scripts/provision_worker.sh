@@ -878,6 +878,46 @@ user_checks() {
     problem "docker info does not report a rootless daemon"
   fi
   gpg_checks
+  claude_account_checks
+}
+
+# A fresh login stops an unattended launch at Claude's first-run screens (theme, the
+# bypass-permissions warning), which babysit-bwrap's read-only settings.json can't save
+# from inside the sandbox. Reads only the flags, never credentials.
+claude_account_checks() {
+  local dir name state
+  for dir in "$HOME"/.claude/accounts/*/; do
+    [[ -d $dir ]] || continue
+    name=$(basename "$dir")
+    state=$(python3 -I - "$dir" 2>/dev/null <<'EOF'
+import json, os, sys
+d = sys.argv[1]
+def load(name):
+    try:
+        with open(os.path.join(d, name)) as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+config, settings = load(".claude.json"), load("settings.json")
+missing = []
+if not isinstance(config.get("oauthAccount"), dict):
+    missing.append("login")
+if config.get("hasCompletedOnboarding") is not True:
+    missing.append("onboarding")
+if settings.get("skipDangerousModePermissionPrompt") is not True:
+    missing.append("permission-prompt")
+print(" ".join(missing))
+EOF
+    ) || state="unreadable"
+    case " $state " in
+      "  ") ok "Claude account $name is signed in and starts unattended" ;;
+      *" login "*) problem "Claude account $name is not signed in; run claude-account login $name" ;;
+      *)
+        problem "Claude account $name would stop at Claude's first-run screens ($state); set hasCompletedOnboarding in its .claude.json and skipDangerousModePermissionPrompt in its settings.json (references/worker-setup.md)"
+        ;;
+    esac
+  done
 }
 
 user_step() {
