@@ -5,6 +5,10 @@ inventory, never a path: the checkout comes from herdr or that row, the diff fro
 it, and transcripts only from the agent session stores (Claude's per-directory project
 folder, Codex's dated session folders) whose recorded working directory is that checkout.
 Output is bounded, and nothing is written.
+
+A checkout on a worker machine is read the same way through ``remote_probe``: the worker
+answers the diff, its session listing and the new bytes of one transcript, and parsing
+stays here.
 """
 
 import json
@@ -20,46 +24,23 @@ from pathlib import Path
 import claude_accounts
 import github_cli
 import owned_process
+import remote_probe
 from pr_workspaces import herdr
 
-# Branch names a topic branch is cut from, on the remotes pull requests target.
-BASE_BRANCH = re.compile(
-    r"^(main|master|dev|develop|trunk|next|release[_-]v?\d+(\.\d+)*|\d+\.\d+)$"
-)
-BASE_PATTERNS = (
-    "main",
-    "master",
-    "dev",
-    "develop",
-    "trunk",
-    "next",
-    "release_*",
-    "release-*",
-    "[0-9]*",
-)
-BASE_REMOTES = ("upstream", "origin")
-MAX_DIFF = 3 * 1024 * 1024
-MAX_FILE_LINES = 4000
-MAX_UNTRACKED = 200
-MAX_COMMITS = 200
+MAX_DIFF = remote_probe.MAX_DIFF
+MAX_FILE_LINES = remote_probe.MAX_FILE_LINES
 GIT_TIMEOUT = 30
 WORKSPACE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.-]{0,63}$")
-SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
-MAX_SESSIONS = 50
+SESSION = remote_probe.SESSION
+MAX_SESSIONS = remote_probe.MAX_SESSIONS
 PAGE = 200
 MAX_TEXT = 20000
 MAX_TOOL = 4000
-# Context Codex injects as user messages ahead of the typed prompt.
-CODEX_CONTEXT = re.compile(r"^\s*(# AGENTS\.md instructions|<[a-z_]+>)")
+CODEX_CONTEXT = remote_probe.CODEX_CONTEXT
 # How a failed Codex tool call reads: the script runner's own verdict, or, in older
 # formats without one, a non-zero exit code.
 CODEX_VERDICT = re.compile(r"^Script (completed|failed|error)")
 CODEX_EXIT = re.compile(r'"exit_code"\s*:\s*[1-9]|exited with code [1-9]')
-# Claude records slash commands, `!` shell runs, their output and background-task
-# notifications as user turns wrapped in tags; reminders it injects ride along inside them.
-CLAUDE_WRAPPED = re.compile(r"<(command-|bash-|local-command-|task-notification>)")
-CLAUDE_TAG = re.compile(r"<([a-z][a-z-]*)>(.*?)</\1>", re.S)
-SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 # The argument a tool call is about, searched in this order.
 TOOL_SUBJECT = ("command", "cmd", "file_path", "path", "pattern", "query", "url", "skill", "prompt")
 # Codex's exec tool runs a script; the shell command it wraps is its first `cmd:` string.
@@ -71,16 +52,44 @@ QUESTION_TOOLS = re.compile(r"^(AskUserQuestion|request_user_input(_async)?)$")
 MAX_QUESTIONS = 8
 MAX_OPTIONS = 12
 CHUNK = 4 * 1024 * 1024
+# A worker's diff and session listing take one ssh call each, and each transcript read
+# at most this many: CHUNK bytes per call, so a first read of 40 MB takes ten. A poll
+# reads for at most REMOTE_BUDGET seconds, each call within what is left of it, and the
+# next poll goes on from there; it starts no call with less than REMOTE_MIN_READ left.
+REMOTE_TIMEOUT = 60
+REMOTE_READS = 64
+REMOTE_BUDGET = 60
+REMOTE_MIN_READ = 5
+# A transcript line longer than this is skipped, with a notice, rather than parsed. A
+# worker's transcript is held to the cap its session listing reads at: parsing one line
+# costs many times its size.
+MAX_LINE = 64 * 1024 * 1024
+REMOTE_MAX_LINE = remote_probe.MAX_SCAN_LINE
+# Entries a parsed transcript keeps; past it the oldest go, a tenth at a time, and the
+# page indices stay those of the whole transcript.
+MAX_ENTRIES = 20000
 # An open viewer polls every few seconds: session details are kept per file version, and
 # parsed transcripts keep their read position so a growing file is read from where it
 # stopped. One lock guards both, since requests arrive on separate threads.
 _lock = threading.Lock()
 _details: dict[str, tuple[tuple, dict | None]] = {}
 DETAIL_FILES = 5000
-_parsers: dict[str, "Transcript"] = {}
-_checkouts: dict[str, tuple[float, str, frozenset[str]]] = {}
+# Keyed by file path here, and by (machine id, path) for a worker's.
+_parsers: dict[str | tuple[str, str], "Transcript"] = {}
+# Keyed by (machine id, workspace ID); this machine's id is None.
+_checkouts: dict[tuple[str | None, str], tuple[float, str, frozenset[str]]] = {}
 CHECKOUT_TTL = 30
 PARSED_FILES = 4
+# A worker's session listing per (machine id, checkout): a listing costs it a read of
+# every session store, and a transcript only ever reads a file listed here.
+_sessions: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+SESSION_TTL = 30
+SESSION_LISTINGS = 50
+block_text = remote_probe.block_text
+claude_prompt = remote_probe.claude_prompt
+claude_text = remote_probe.claude_text
+claude_details = remote_probe.claude_details
+codex_details = remote_probe.codex_details
 
 
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
@@ -95,19 +104,10 @@ def local_environment():
 def git_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
     """Run git in a checkout, keeping at most ``limit`` bytes; return (text, truncated)."""
     limit = MAX_DIFF if limit is None else limit
-    # Unquoted paths: diff headers and file lists then carry names as they are.
-    argv = [
-        "git",
-        "-C",
-        str(path),
-        "--no-optional-locks",
-        "-c",
-        "core.quotePath=false",
-        # A checkout's own config must not start an fsmonitor daemon for a read.
-        "-c",
-        "core.fsmonitor=false",
-        *args,
-    ]
+    # Unquoted paths: diff headers and file lists then carry names as they are. A
+    # checkout's own config must not run a program for a read, as on a worker; its
+    # config is read afresh each time.
+    argv = remote_probe.host_argv(path, args, ("-c", "core.quotePath=false"), cache={})
     chunks: list[bytes] = []
     size = 0
     truncated = False
@@ -165,7 +165,7 @@ def workspace_checkout(workspace_id, recorded_checkout=None):
     if not isinstance(workspace_id, str) or not WORKSPACE_ID.match(workspace_id):
         raise ValueError("Supply a herdr workspace")
     with _lock:
-        cached = _checkouts.get(workspace_id)
+        cached = _checkouts.get((None, workspace_id))
     if cached and time.monotonic() - cached[0] < CHECKOUT_TTL and Path(cached[1]).is_dir():
         return cached[1]
     spaces = herdr("workspace", "list")["workspaces"]
@@ -190,7 +190,7 @@ def remember(workspace_id, root, spaces, *, recovered=False):
     holds several unrelated workspaces.
     """
     with _lock:
-        _, known, others = _checkouts.pop(workspace_id, (0, None, frozenset()))
+        _, known, others = _checkouts.pop((None, workspace_id), (0, None, frozenset()))
         if known != root:
             others = frozenset()
         # After recovery from an operation, we cannot tell whether an existing workspace
@@ -203,7 +203,7 @@ def remember(workspace_id, root, spaces, *, recovered=False):
                 if w.get("workspace_id") != workspace_id and checkout_of(w) == root
             }
         # Re-inserted last, so the newest is evicted last.
-        _checkouts[workspace_id] = (time.monotonic(), root, others)
+        _checkouts[(None, workspace_id)] = (time.monotonic(), root, others)
         while len(_checkouts) > 200:
             _checkouts.pop(next(iter(_checkouts)), None)
 
@@ -247,7 +247,7 @@ def live_workspace(workspace_id):
         remember(workspace_id, root, spaces)
         return workspace_id
     with _lock:
-        others = _checkouts.get(workspace_id, (0, None, frozenset()))[2]
+        others = _checkouts.get((None, workspace_id), (0, None, frozenset()))[2]
     since = [
         w["workspace_id"]
         for w in spaces
@@ -269,166 +269,75 @@ def checkout_workspace(root):
     return found
 
 
-def bases(path):
-    """Remote base branches by how few commits this checkout has beyond each.
+def remote_checkout(machine, workspace_id):
+    """The checkout a worker's herdr workspace was opened on, as that worker spells it.
 
-    One for-each-ref call counts them all (``ahead-behind`` needs Git 2.41): its second
-    number is the commits HEAD has that the ref does not.
+    Remembered like this machine's, so a closed workspace keeps its views. Nothing here
+    looks at the path: the worker's probe resolves it and checks it is a checkout's top.
     """
-    listing = git_text(
-        path,
-        "for-each-ref",
-        "--format=%(refname:short) %(ahead-behind:HEAD)",
-        *[f"refs/remotes/{remote}/{name}" for remote in BASE_REMOTES for name in BASE_PATTERNS],
+    if not isinstance(workspace_id, str) or not WORKSPACE_ID.match(workspace_id):
+        raise ValueError("Supply a herdr workspace")
+    key = (machine.id, workspace_id)
+    with _lock:
+        cached = _checkouts.get(key)
+    if cached and time.monotonic() - cached[0] < CHECKOUT_TTL:
+        return cached[1]
+    try:
+        spaces = herdr("workspace", "list", machine=machine)["workspaces"]
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"{machine.label} did not list its workspaces: {exc}") from exc
+    space = next(
+        (w for w in spaces if isinstance(w, dict) and w.get("workspace_id") == workspace_id), None
     )
-    found = []
-    for line in listing.splitlines():
-        parts = line.split(" ")
-        if (
-            len(parts) != 3
-            or not (parts[1].isdigit() and parts[2].isdigit())
-            or "/" not in parts[0]
+    if space is not None:
+        root = (space.get("worktree") or {}).get("checkout_path")
+        if not (
+            isinstance(root, str)
+            and len(root) <= remote_probe.MAX_TEXT
+            and root.startswith("/")
+            and "\0" not in root
         ):
-            continue
-        remote, name = parts[0].split("/", 1)
-        if remote in BASE_REMOTES and BASE_BRANCH.match(name):
-            # On a tie, the base that moved on least since, then the pull request target.
-            found.append((int(parts[2]), int(parts[1]), BASE_REMOTES.index(remote), parts[0]))
-    found.sort()
-    return [{"ref": ref, "ahead": ahead} for ahead, _, _, ref in found]
+            raise ValueError("That herdr workspace has no checkout to show")
+    elif cached:
+        root = cached[1]  # Closed since it was last seen.
+    else:
+        raise ValueError("That herdr workspace is not open; refresh")
+    with _lock:
+        _checkouts.pop(key, None)
+        _checkouts[key] = (time.monotonic(), root, frozenset())
+        while len(_checkouts) > 200:
+            _checkouts.pop(next(iter(_checkouts)), None)
+    return root
+
+
+def probe(home, machine, op, timeout=REMOTE_TIMEOUT, **args):
+    """One probe op on a worker; every failure, a timeout included, names the worker."""
+    try:
+        return remote_probe.call(home, machine, op, timeout, **args)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"{machine.label} did not answer within {timeout} seconds") from exc
+    except OSError as exc:
+        raise ValueError(f"{machine.label} could not be reached: {exc}") from exc
+
+
+def bases(path):
+    return remote_probe.bases(git_output, path)
 
 
 def split_patch(text, truncated):
-    """One entry per file of a unified diff, each bounded in lines."""
-    files: list[dict] = []
-    for block in re.split(r"(?m)^(?=diff --git )", text):
-        if not block.startswith("diff --git "):
-            continue
-        # Only newlines end a diff line; splitlines would also split on form feeds.
-        lines = block.removesuffix("\n").split("\n")
-        header = lines[0]
-        old = new = None
-        status = "modified"
-        binary = False
-        for line in lines[1:]:
-            if line.startswith("@@"):
-                break
-            if line.startswith(("--- ", "+++ ")):
-                # Git ends a name that contains a space with a tab in these two lines.
-                name = line[4:].removesuffix("\t")
-                name = (
-                    None if name == "/dev/null" else name[2:] if name[:2] in {"a/", "b/"} else name
-                )
-                if line.startswith("---"):
-                    old = name
-                else:
-                    new = name
-            elif line.startswith("new file mode"):
-                status = "added"
-            elif line.startswith("deleted file mode"):
-                status = "deleted"
-            elif line.startswith("rename from "):
-                status, old = "renamed", line[len("rename from ") :]
-            elif line.startswith("rename to "):
-                new = line[len("rename to ") :]
-            elif line.startswith("Binary files "):
-                binary = True
-        if old is None and new is None:
-            # A pure mode change or binary file: take the names from the header.
-            match = re.match(r"diff --git a/(.*) b/(.*)$", header)
-            old = new = match[2] if match else header[len("diff --git ") :]
-        start = next((i for i, line in enumerate(lines) if line.startswith("@@")), len(lines))
-        body = lines[start:]
-        added = sum(1 for line in body if line.startswith("+"))
-        removed = sum(1 for line in body if line.startswith("-"))
-        files.append(
-            {
-                "path": new or old,
-                "old_path": old if status == "renamed" else None,
-                "status": status,
-                "binary": binary,
-                "added": added,
-                "removed": removed,
-                "lines": body[:MAX_FILE_LINES],
-                "truncated": len(body) > MAX_FILE_LINES,
-            }
-        )
-    if truncated and files:
-        files[-1]["truncated"] = True
-    return files
+    return remote_probe.split_patch(text, truncated, MAX_FILE_LINES)
 
 
 def diff(path, scope="branch", base=None):
     """Changes in a checkout: against its base branch (with uncommitted work) or HEAD."""
+    return remote_probe.diff(git_output, path, scope, base, MAX_FILE_LINES)
+
+
+def remote_diff(home, machine, path, scope="branch", base=None):
+    """``diff`` of a worker's checkout, run there with the same limits."""
     if scope not in {"branch", "uncommitted"}:
         raise ValueError("Choose the branch or uncommitted changes")
-    found = bases(path) if scope == "branch" else []
-    commits: list[dict] = []
-    note = None
-    if scope == "branch" and not found and base is None:
-        scope = "uncommitted"
-        note = "No base branch on the upstream or origin remote; showing uncommitted changes."
-    if scope == "branch":
-        if base is None:
-            base = found[0]["ref"]
-        elif base not in {b["ref"] for b in found}:
-            raise ValueError("Choose one of the listed base branches")
-        since = git_text(path, "merge-base", base, "HEAD")
-        log = git_text(
-            path,
-            "log",
-            "-z",
-            f"--max-count={MAX_COMMITS}",
-            "--format=%H%x00%an%x00%at%x00%s%x00%b",
-            f"{since}..HEAD",
-        )
-        # NUL-delimited fields keep multiline bodies separate from other commits.
-        fields = log.split("\0")
-        for offset in range(0, len(fields) - 4, 5):
-            sha, author, when, subject, body = fields[offset : offset + 5]
-            commits.append(
-                {
-                    "sha": sha[:12],
-                    "author": author,
-                    "time": int(when or 0),
-                    "subject": subject,
-                    "body": body.rstrip("\n"),
-                }
-            )
-    else:
-        since = "HEAD"
-    # The working tree against the starting point: committed and uncommitted together.
-    text, truncated = git_output(
-        path,
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--find-renames",
-        # Fixed prefixes, whatever diff.noprefix or diff.mnemonicPrefix say.
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        since,
-        "--",
-    )
-    # An untracked directory is listed once, not file by file.
-    untracked = git_text(
-        path, "ls-files", "--others", "--exclude-standard", "--directory", "--no-empty-directory"
-    ).splitlines()
-    files = split_patch(text, truncated)
-    return {
-        "scope": scope,
-        "note": note,
-        "base": base,
-        "bases": found[:10],
-        "commits": commits,
-        "files": files,
-        "untracked": untracked[:MAX_UNTRACKED],
-        "untracked_more": max(0, len(untracked) - MAX_UNTRACKED),
-        "added": sum(f["added"] for f in files),
-        "removed": sum(f["removed"] for f in files),
-        "truncated": truncated,
-    }
+    return probe(home, machine, "diff", path=path, scope=scope, base=base)
 
 
 # Transcripts -------------------------------------------------------------------
@@ -450,49 +359,6 @@ def clip(text, limit):
     return (
         text if len(text) <= limit else text[:limit] + f"\n… ({len(text) - limit} more characters)"
     )
-
-
-def block_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            b.get("text", "") if isinstance(b, dict) else str(b)
-            for b in content
-            if not isinstance(b, dict) or b.get("type") in {"text", "input_text", "output_text"}
-        )
-    return ""
-
-
-def claude_prompt(text):
-    """How a Claude user turn reads, as (kind, text), or None when it shows nothing.
-
-    Kinds: "prompt" as typed, "command" for a slash command or `!` shell run, "output"
-    for what one printed, and "notification" for a background task's report.
-    """
-    text = SYSTEM_REMINDER.sub("", text).strip()
-    # Tags are parsed only in Claude's own wrappers: in a long typed prompt, unclosed
-    # tags would each be searched for to its end.
-    if not CLAUDE_WRAPPED.match(text):
-        return ("prompt", text) if text else None
-    tags = {m.group(1): m.group(2).strip() for m in CLAUDE_TAG.finditer(text)}
-    if "command-name" in tags:
-        return "command", " ".join(filter(None, (tags["command-name"], tags.get("command-args"))))
-    if "bash-input" in tags:
-        return "command", f"! {tags['bash-input']}"
-    printed = [tags.get(k) for k in ("local-command-stdout", "bash-stdout", "bash-stderr")]
-    if any(k in tags for k in ("local-command-stdout", "bash-stdout", "bash-stderr")):
-        return ("output", "\n".join(filter(None, printed))) if any(printed) else None
-    if "local-command-caveat" in tags:
-        return None
-    if "task-notification" in tags:
-        inner = {
-            m.group(1): m.group(2).strip() for m in CLAUDE_TAG.finditer(tags["task-notification"])
-        }
-        return "notification", inner.get(
-            "summary"
-        ) or f"Background task {inner.get('status', 'ended')}"
-    return "prompt", text
 
 
 def first_line(text):
@@ -605,89 +471,6 @@ def question_pending(tool):
     return False
 
 
-def claude_text(item):
-    content = (item.get("message") or {}).get("content")
-    if isinstance(content, list) and any(
-        isinstance(b, dict) and b.get("type") == "tool_result" for b in content
-    ):
-        return ""
-    return block_text(content).strip()
-
-
-def records(stream):
-    for line in stream:
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-
-def claude_details(path):
-    """Session ID, working directory and first prompt of a Claude transcript."""
-    cwd = title = command = None
-    with path.open(encoding="utf-8", errors="replace") as stream:
-        for item in records(stream):
-            if item.get("type") not in {"user", "assistant"} or item.get("isSidechain"):
-                continue
-            cwd = cwd or item.get("cwd")
-            if item.get("type") == "user" and not item.get("isMeta"):
-                view = claude_prompt(claude_text(item))
-                if view and not item.get("isCompactSummary"):
-                    # A typed prompt names the session; failing one, its first command.
-                    if view[0] == "prompt":
-                        title = view[1]
-                        break
-                    if view[0] == "command":
-                        command = command or view[1]
-    if not cwd:
-        return None
-    return {
-        "agent": "claude",
-        "id": path.stem,
-        "cwd": str(Path(cwd).resolve()),
-        "title": title or command,
-    }
-
-
-def codex_details(path):
-    """Session ID, working directory and first typed prompt of a Codex rollout."""
-    with path.open(encoding="utf-8", errors="replace") as stream:
-        first = stream.readline()
-        if not first.endswith("\n"):
-            raise BlockingIOError  # Still being written; look again next time.
-        try:
-            meta = json.loads(first)
-        except json.JSONDecodeError:
-            return None
-        payload = meta.get("payload") or {}
-        if meta.get("type") != "session_meta" or not payload.get("id") or not payload.get("cwd"):
-            return None
-        title = None
-        for line in stream:
-            if '"user' not in line:  # user_message events and user-role items
-                continue
-            try:
-                item = json.loads(line).get("payload") or {}
-            except json.JSONDecodeError:
-                continue
-            if item.get("type") == "user_message":
-                text = str(item.get("message") or "").strip()
-            elif item.get("type") == "message" and item.get("role") == "user":
-                text = block_text(item.get("content")).strip()
-                text = "" if CODEX_CONTEXT.match(text) else text
-            else:
-                continue
-            if text:
-                title = text
-                break
-    return {
-        "agent": "codex",
-        "id": str(payload["id"]),
-        "cwd": str(Path(payload["cwd"]).resolve()),
-        "title": title,
-    }
-
-
 def details(path, agent):
     """A session file's details, read again only when the file changes."""
     try:
@@ -775,48 +558,198 @@ def sessions(path):
     return listed[:MAX_SESSIONS]
 
 
+def remote_sessions(home, machine, path):
+    """A worker's sessions recorded in its checkout or below it, as ``sessions`` lists.
+
+    Kept for SESSION_TTL per (machine, checkout). ``_file`` is the worker's own path: a
+    transcript is read only from a file listed here, and the worker refuses any other.
+    The worker's working directory check and Claude home ride along for resuming.
+    """
+    key = (machine.id, path)
+    with _lock:
+        cached = _sessions.get(key)
+    if cached and time.monotonic() - cached[0] < SESSION_TTL:
+        return cached[1]
+    listed = []
+    for found in probe(home, machine, "sessions", root=path):
+        listed.append(
+            {
+                "id": found["id"],
+                "agent": found["agent"],
+                "updated": found["updated"],
+                "size": found["size"],
+                "title": remote_probe.display_text(found["title"]),
+                "_file": found["file"],
+                "_cwd": found["cwd"],
+                "_cwd_exists": found["cwd_exists"],
+                "_home": found["home"],
+            }
+        )
+        if found["account"] is not None:
+            listed[-1]["claude_account"] = found["account"]
+    with _lock:
+        _sessions.pop(key, None)
+        _sessions[key] = (time.monotonic(), listed)
+        while len(_sessions) > SESSION_LISTINGS:
+            _sessions.pop(next(iter(_sessions)), None)
+    return listed
+
+
 class Transcript:
     """A session's conversation, parsed once and then only as its file grows."""
 
-    def __init__(self, agent):
+    def __init__(self, agent, max_line=None):
         self.agent = agent
+        self.max_line = max_line  # None: MAX_LINE.
         self.lock = threading.Lock()
+        # (first, entries) as of the last complete read, for a request that finds the
+        # parser busy.
+        self.view: tuple[int, list[dict]] | None = None
         self.reset(None)
 
     def reset(self, inode):
         self.inode = inode
         self.offset = 0
+        # The unfinished line after ``offset``, as chunks, and its length; and whether
+        # the read is inside a line too long to parse.
+        self.pending: list[bytes] = []
+        self.held = 0
+        self.skipping = False
+        # The transcript index of ``entries[0]``: older entries are dropped past MAX_ENTRIES.
+        self.first = 0
         self.entries: list[dict] = []
         self.tools: dict[str, dict] = {}
         # Codex versions that record typed prompts as events also echo them as items.
         self.prompts: dict[str, set[str]] = {"event": set(), "item": set()}
 
-    def update(self, path):
-        stat = path.stat()
+    # Reading is split so the bytes can come from anywhere: ``position`` says where to read
+    # from for the file as it is now, and ``consume`` parses what was read from there.
+    # This machine reads its own files (``update``); a worker's arrive through its probe.
+
+    def position(self, inode, size):
+        """The offset to read on from, for the file now at ``inode`` with ``size`` bytes."""
         # A replaced or truncated file is read again from the start.
-        if stat.st_ino != self.inode or stat.st_size < self.offset:
-            self.reset(stat.st_ino)
-        with path.open("rb") as stream:
-            stream.seek(self.offset)
-            pending = b""
-            while True:
-                chunk = stream.read(CHUNK)
-                if not chunk:
-                    break
-                pending += chunk
-                end = pending.rfind(b"\n")
-                if end < 0:
-                    continue
-                # Only complete lines: a line still being written is read next time.
-                for line in pending[: end + 1].split(b"\n"):
-                    if line.strip():
-                        try:
-                            item = json.loads(line)
-                        except ValueError:
-                            continue
+        if inode != self.inode or size < self.offset + self.held:
+            self.reset(inode)
+        return self.offset + self.held
+
+    def consume(self, data):
+        """Parse the complete lines of ``data``, read from ``offset``; returns bytes used."""
+        end = data.rfind(b"\n")
+        if end < 0:
+            return 0
+        # Only complete lines: a line still being written is read next time.
+        for line in data[: end + 1].split(b"\n"):
+            # Only an object becomes an entry; anything else is not worth parsing.
+            if not line[:64].lstrip().startswith(b"{"):
+                continue
+            if len(line) > self.limit():
+                self.too_long()
+                continue
+            if line.strip():
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict):
                         self.feed(item)
-                self.offset += end + 1
-                pending = pending[end + 1 :]
+                except (ValueError, RecursionError):
+                    continue  # Not JSON, or nested too deeply to parse or show.
+        self.offset += end + 1
+        self.trim()
+        return end + 1
+
+    def absorb(self, data):
+        """Parse what ``data``, read from ``offset + held``, completes.
+
+        An unfinished line is kept, as chunks, for the next read. One longer than
+        MAX_LINE is skipped with a notice and its bytes passed over as they arrive, so
+        reading moves on past it rather than fetching it again.
+        """
+        if self.skipping:
+            end = data.find(b"\n")
+            if end < 0:
+                self.offset += len(data)
+                return
+            self.offset += end + 1
+            self.skipping = False
+            data = data[end + 1 :]
+        end = data.rfind(b"\n")
+        if end < 0:
+            if data:
+                self.pending.append(data)
+                self.held += len(data)
+            if self.held > self.limit():
+                self.offset += self.held
+                self.pending, self.held = [], 0
+                self.skipping = True
+                self.too_long()
+                self.trim()
+            return
+        self.consume(b"".join([*self.pending, data[: end + 1]]))
+        rest = data[end + 1 :]
+        self.pending, self.held = ([rest], len(rest)) if rest else ([], 0)
+
+    def limit(self):
+        return MAX_LINE if self.max_line is None else self.max_line
+
+    def too_long(self):
+        self.entries.append(
+            {
+                "role": "user",
+                "kind": "notification",
+                "text": f"Transcript line too long (over {self.limit() >> 20} MiB); skipped",
+                "time": None,
+            }
+        )
+
+    def trim(self):
+        """Drop the oldest entries past MAX_ENTRIES, and the tool calls they held."""
+        excess = len(self.entries) - MAX_ENTRIES
+        if excess <= 0:
+            return
+        excess += MAX_ENTRIES // 10
+        gone = {id(entry) for entry in self.entries[:excess]}
+        del self.entries[:excess]
+        self.first += excess
+        self.tools = {k: tool for k, tool in self.tools.items() if id(tool) not in gone}
+
+    def update(self, path):
+        with remote_probe.open_transcript(path) as stream:
+            info = os.fstat(stream.fileno())
+            stream.seek(self.position(info.st_ino, info.st_size))
+            while chunk := stream.read(CHUNK):
+                self.absorb(chunk)
+
+    def update_remote(self, tail, file):
+        """Read on through a worker's ``tail(file, inode, offset, limit, timeout)`` probe op.
+
+        Each answer ends at a line end, except a full read inside one longer line: those
+        pieces are kept, as ``update`` keeps chunks, until the line ends. A poll stops
+        after REMOTE_BUDGET seconds, and the next goes on from there.
+        """
+        stop = time.monotonic() + REMOTE_BUDGET
+        for _ in range(REMOTE_READS):
+            left = stop - time.monotonic()
+            if left < REMOTE_MIN_READ:
+                return
+            at = self.offset + self.held
+            answer = tail(
+                file=file,
+                inode=self.inode,
+                offset=at,
+                limit=CHUNK,
+                timeout=max(1, int(min(REMOTE_TIMEOUT, left))),
+            )
+            if answer["inode"] != self.inode or answer["offset"] != at:
+                # Replaced or truncated: the worker read from the start, and so does this.
+                if answer["offset"]:
+                    raise ValueError("The transcript changed while it was read; refresh")
+                self.reset(answer["inode"])
+            data = answer["data"]
+            if answer["offset"] + len(data) > answer["size"]:
+                raise ValueError("The worker read past the end of the transcript; refresh")
+            self.absorb(data)
+            if not data or answer["offset"] + len(data) >= answer["size"]:
+                return
 
     def feed(self, item):
         if self.agent == "claude":
@@ -935,10 +868,47 @@ def transcript(path, session=None, before=None, after=None, prefer=None):
     returns what follows an index, so an open viewer fetches only what is new. Without
     a ``session``, ``prefer`` is chosen when it is recorded here, else the newest.
     """
-    listed = sessions(path)
+    return transcript_page(
+        sessions(path),
+        str,
+        lambda parser, file: parser.update(file),
+        session,
+        before,
+        after,
+        prefer,
+    )
+
+
+def remote_transcript(home, machine, path, session=None, before=None, after=None, prefer=None):
+    """``transcript`` of a worker's checkout: its listing and new bytes, parsed here."""
+
+    def tail(**args):
+        return probe(home, machine, "tail", **args)
+
+    return transcript_page(
+        remote_sessions(home, machine, path),
+        lambda file: (machine.id, file),
+        lambda parser, file: parser.update_remote(tail, file),
+        session,
+        before,
+        after,
+        prefer,
+    )
+
+
+def transcript_page(listed, key_of, read, session, before, after, prefer):
+    """A page of one ``listed`` session, its parser kept under ``key_of(file)`` and
+    brought up to date by ``read(parser, file)``."""
     if session is None:
         if not listed:
-            return {"sessions": [], "session": None, "entries": [], "start": 0, "total": 0}
+            return {
+                "sessions": [],
+                "session": None,
+                "entries": [],
+                "start": 0,
+                "first": 0,
+                "total": 0,
+            }
         chosen = next((s for s in listed if s["id"] == prefer), listed[0])
     else:
         if not isinstance(session, str) or not SESSION.match(session):
@@ -946,27 +916,40 @@ def transcript(path, session=None, before=None, after=None, prefer=None):
         chosen = next((s for s in listed if s["id"] == session), None)
         if chosen is None:
             raise ValueError("That session is not recorded for this workspace")
-    key = str(chosen["_file"])
+    key = key_of(chosen["_file"])
     with _lock:
-        parser = _parsers.pop(key, None) or Transcript(chosen["agent"])
+        # A worker's transcripts are keyed (machine id, file).
+        parser = _parsers.pop(key, None) or Transcript(
+            chosen["agent"], REMOTE_MAX_LINE if isinstance(key, tuple) else None
+        )
         _parsers[key] = parser
         while len(_parsers) > PARSED_FILES:
             _parsers.pop(next(iter(_parsers)), None)
-    # A first parse of a large file takes a while; it holds only this transcript's lock.
-    with parser.lock:
-        parser.update(chosen["_file"])
-        entries = parser.entries
-        total = len(entries)
-        if after is not None and 0 <= after <= total and total - after <= PAGE:
-            start, end = after, total
-        else:
-            end = total if before is None else max(0, min(before, total))
-            start = max(0, end - PAGE)
-        page = [dict(e) for e in entries[start:end]]
+    # A first parse of a large file takes a while; it holds only this transcript's lock,
+    # and a request meanwhile is answered from the last complete read.
+    if parser.lock.acquire(timeout=1):
+        try:
+            read(parser, chosen["_file"])
+            parser.view = (parser.first, list(parser.entries))
+        finally:
+            parser.lock.release()
+    elif parser.view is None:
+        raise ValueError("This transcript is still being read; try again shortly")
+    first, entries = parser.view
+    # Indices count from the transcript's start, the dropped oldest entries included.
+    total = first + len(entries)
+    if after is not None and first <= after <= total and total - after <= PAGE:
+        start, end = after, total
+    else:
+        end = total if before is None else max(first, min(before, total))
+        start = max(first, end - PAGE)
+    page = [dict(e) for e in entries[start - first : end - first]]
+    # Underscored fields (the file, and a worker's facts for resuming) stay here.
     return {
-        "sessions": [{k: v for k, v in s.items() if k != "_file"} for s in listed],
-        "session": {k: v for k, v in chosen.items() if k != "_file"},
+        "sessions": [{k: v for k, v in s.items() if not k.startswith("_")} for s in listed],
+        "session": {k: v for k, v in chosen.items() if not k.startswith("_")},
         "entries": page,
         "start": start,
+        "first": first,
         "total": total,
     }

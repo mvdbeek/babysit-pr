@@ -17,12 +17,16 @@ import json
 import math
 import os
 import re
+import selectors
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 PROTOCOL = "babysit-probe-1"
 MAX_STDOUT = 8 * 1024 * 1024
@@ -31,6 +35,9 @@ MAX_CHANGES = 1000
 MAX_UNPUSHED = 100
 MAX_TEXT = 4096  # Longest path, branch or config value an answer may carry.
 MAX_DEADLINE = 3600
+GIT_TIMEOUT = 30  # Each Git a viewer op runs on a worker.
+# Bytes of one transcript a single ``tail`` returns; base64 keeps that under MAX_STDOUT.
+MAX_TAIL = 4 * 1024 * 1024
 # Timestamps a worker reports: after 1970 and before 2100, whatever its clock says.
 LATEST_TIME = 4102444800
 EXPIRED = 124  # The probe's exit status once its deadline passed.
@@ -72,6 +79,11 @@ HOST_ENV = {
 }
 # Subcommands that look into a submodule's own repository, whose config is not guarded.
 SUBMODULE_READS = {"status", "diff"}
+# Reads need no GitHub token, and a checkout's filters or hooks must not inherit one.
+TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+# A session listing reads at most this much of each transcript, and skips longer lines.
+MAX_SCAN = 32 * 1024 * 1024
+MAX_SCAN_LINE = 4 * 1024 * 1024
 
 
 def remote_slug(value):
@@ -388,6 +400,413 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
     }
 
 
+# The diff and session details the viewer shows -------------------------------
+#
+# ``output(path, *args, limit=None)`` runs Git in a checkout and returns (text, truncated),
+# keeping at most ``limit`` bytes (MAX_DIFF by default): the controller's own reader
+# locally, ``host_output`` on a worker.
+
+# Branch names a topic branch is cut from, on the remotes pull requests target.
+BASE_BRANCH = re.compile(
+    r"^(main|master|dev|develop|trunk|next|release[_-]v?\d+(\.\d+)*|\d+\.\d+)$"
+)
+BASE_PATTERNS = (
+    "main",
+    "master",
+    "dev",
+    "develop",
+    "trunk",
+    "next",
+    "release_*",
+    "release-*",
+    "[0-9]*",
+)
+BASE_REMOTES = ("upstream", "origin")
+MAX_DIFF = 3 * 1024 * 1024
+MAX_FILE_LINES = 4000
+MAX_UNTRACKED = 200
+MAX_COMMITS = 200
+SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
+MAX_SESSIONS = 50
+
+# Context Codex injects as user messages ahead of the typed prompt.
+CODEX_CONTEXT = re.compile(r"^\s*(# AGENTS\.md instructions|<[a-z_]+>)")
+# Claude records slash commands, `!` shell runs, their output and background-task
+# notifications as user turns wrapped in tags; reminders it injects ride along inside them.
+CLAUDE_WRAPPED = re.compile(r"<(command-|bash-|local-command-|task-notification>)")
+CLAUDE_TAG = re.compile(r"<([a-z][a-z-]*)>(.*?)</\1>", re.S)
+SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def git_text(output, path, *args):
+    return output(path, *args, limit=256 * 1024)[0].strip()
+
+
+def bases(output, path):
+    """Remote base branches by how few commits this checkout has beyond each.
+
+    One for-each-ref call counts them all (``ahead-behind`` needs Git 2.41): its second
+    number is the commits HEAD has that the ref does not.
+    """
+    listing = git_text(
+        output,
+        path,
+        "for-each-ref",
+        "--format=%(refname:short) %(ahead-behind:HEAD)",
+        *[f"refs/remotes/{remote}/{name}" for remote in BASE_REMOTES for name in BASE_PATTERNS],
+    )
+    found = []
+    for line in listing.splitlines():
+        parts = line.split(" ")
+        if (
+            len(parts) != 3
+            or not (parts[1].isdigit() and parts[2].isdigit())
+            or "/" not in parts[0]
+        ):
+            continue
+        remote, name = parts[0].split("/", 1)
+        if remote in BASE_REMOTES and BASE_BRANCH.match(name):
+            # On a tie, the base that moved on least since, then the pull request target.
+            found.append((int(parts[2]), int(parts[1]), BASE_REMOTES.index(remote), parts[0]))
+    found.sort()
+    return [{"ref": ref, "ahead": ahead} for ahead, _, _, ref in found]
+
+
+def split_patch(text, truncated, max_lines=MAX_FILE_LINES):
+    """One entry per file of a unified diff, each bounded in lines."""
+    files: list[dict] = []
+    for block in re.split(r"(?m)^(?=diff --git )", text):
+        if not block.startswith("diff --git "):
+            continue
+        # Only newlines end a diff line; splitlines would also split on form feeds.
+        lines = block.removesuffix("\n").split("\n")
+        header = lines[0]
+        old = new = None
+        status = "modified"
+        binary = False
+        for line in lines[1:]:
+            if line.startswith("@@"):
+                break
+            if line.startswith(("--- ", "+++ ")):
+                # Git ends a name that contains a space with a tab in these two lines.
+                name = line[4:].removesuffix("\t")
+                name = (
+                    None if name == "/dev/null" else name[2:] if name[:2] in {"a/", "b/"} else name
+                )
+                if line.startswith("---"):
+                    old = name
+                else:
+                    new = name
+            elif line.startswith("new file mode"):
+                status = "added"
+            elif line.startswith("deleted file mode"):
+                status = "deleted"
+            elif line.startswith("rename from "):
+                status, old = "renamed", line[len("rename from ") :]
+            elif line.startswith("rename to "):
+                new = line[len("rename to ") :]
+            elif line.startswith("Binary files "):
+                binary = True
+        if old is None and new is None:
+            # A pure mode change or binary file: take the names from the header.
+            match = re.match(r"diff --git a/(.*) b/(.*)$", header)
+            old = new = match[2] if match else header[len("diff --git ") :]
+        start = next((i for i, line in enumerate(lines) if line.startswith("@@")), len(lines))
+        body = lines[start:]
+        added = sum(1 for line in body if line.startswith("+"))
+        removed = sum(1 for line in body if line.startswith("-"))
+        files.append(
+            {
+                "path": new or old,
+                "old_path": old if status == "renamed" else None,
+                "status": status,
+                "binary": binary,
+                "added": added,
+                "removed": removed,
+                "lines": body[:max_lines],
+                "truncated": len(body) > max_lines,
+            }
+        )
+    if truncated and files:
+        files[-1]["truncated"] = True
+    return files
+
+
+def diff(output, path, scope="branch", base=None, max_lines=MAX_FILE_LINES):
+    """Changes in a checkout: against its base branch (with uncommitted work) or HEAD."""
+    if scope not in {"branch", "uncommitted"}:
+        raise ValueError("Choose the branch or uncommitted changes")
+    found = bases(output, path) if scope == "branch" else []
+    commits: list[dict] = []
+    note = None
+    if scope == "branch" and not found and base is None:
+        scope = "uncommitted"
+        note = "No base branch on the upstream or origin remote; showing uncommitted changes."
+    if scope == "branch":
+        if base is None:
+            base = found[0]["ref"]
+        elif base not in {b["ref"] for b in found}:
+            raise ValueError("Choose one of the listed base branches")
+        since = git_text(output, path, "merge-base", base, "HEAD")
+        log = git_text(
+            output,
+            path,
+            "log",
+            "-z",
+            f"--max-count={MAX_COMMITS}",
+            "--format=%H%x00%an%x00%at%x00%s%x00%b",
+            f"{since}..HEAD",
+        )
+        # NUL-delimited fields keep multiline bodies separate from other commits.
+        fields = log.split("\0")
+        for offset in range(0, len(fields) - 4, 5):
+            sha, author, when, subject, body = fields[offset : offset + 5]
+            commits.append(
+                {
+                    "sha": sha[:12],
+                    "author": author,
+                    "time": int(when or 0),
+                    "subject": subject,
+                    "body": body.rstrip("\n"),
+                }
+            )
+    else:
+        since = "HEAD"
+    # The working tree against the starting point: committed and uncommitted together.
+    text, truncated = output(
+        path,
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames",
+        # Fixed prefixes, whatever diff.noprefix or diff.mnemonicPrefix say.
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        since,
+        "--",
+    )
+    # An untracked directory is listed once, not file by file.
+    untracked = git_text(
+        output,
+        path,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "--directory",
+        "--no-empty-directory",
+    ).splitlines()
+    files = split_patch(text, truncated, max_lines)
+    return {
+        "scope": scope,
+        "note": note,
+        "base": base,
+        "bases": found[:10],
+        "commits": commits,
+        "files": files,
+        "untracked": untracked[:MAX_UNTRACKED],
+        "untracked_more": max(0, len(untracked) - MAX_UNTRACKED),
+        "added": sum(f["added"] for f in files),
+        "removed": sum(f["removed"] for f in files),
+        "truncated": truncated,
+    }
+
+
+def block_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in content
+            if not isinstance(b, dict) or b.get("type") in {"text", "input_text", "output_text"}
+        )
+    return ""
+
+
+def claude_prompt(text):
+    """How a Claude user turn reads, as (kind, text), or None when it shows nothing.
+
+    Kinds: "prompt" as typed, "command" for a slash command or `!` shell run, "output"
+    for what one printed, and "notification" for a background task's report.
+    """
+    text = SYSTEM_REMINDER.sub("", text).strip()
+    # Tags are parsed only in Claude's own wrappers: in a long typed prompt, unclosed
+    # tags would each be searched for to its end.
+    if not CLAUDE_WRAPPED.match(text):
+        return ("prompt", text) if text else None
+    tags = {m.group(1): m.group(2).strip() for m in CLAUDE_TAG.finditer(text)}
+    if "command-name" in tags:
+        return "command", " ".join(filter(None, (tags["command-name"], tags.get("command-args"))))
+    if "bash-input" in tags:
+        return "command", f"! {tags['bash-input']}"
+    printed = [tags.get(k) for k in ("local-command-stdout", "bash-stdout", "bash-stderr")]
+    if any(k in tags for k in ("local-command-stdout", "bash-stdout", "bash-stderr")):
+        return ("output", "\n".join(filter(None, printed))) if any(printed) else None
+    if "local-command-caveat" in tags:
+        return None
+    if "task-notification" in tags:
+        inner = {
+            m.group(1): m.group(2).strip() for m in CLAUDE_TAG.finditer(tags["task-notification"])
+        }
+        return "notification", inner.get(
+            "summary"
+        ) or f"Background task {inner.get('status', 'ended')}"
+    return "prompt", text
+
+
+def claude_text(item):
+    content = (item.get("message") or {}).get("content")
+    if isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+    ):
+        return ""
+    return block_text(content).strip()
+
+
+def open_transcript(path):
+    """A session file opened for binary reading, refused unless it is a regular file.
+
+    Not through a symlink of its own, and without blocking on a FIFO planted in a store.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Not a regular file: {path}")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_beneath(path):
+    """``open_transcript`` of an absolute, already resolved ``path``, one folder at a time.
+
+    No folder on the way may be a symlink, even one swapped in after the path was
+    checked, and the file may have no other name: a hard link would let a store name
+    any file of its owner's.
+    """
+    parts = Path(path).parts
+    folder = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[1:-1]:
+            inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
+            os.close(folder)
+            folder = inner
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=folder)
+    finally:
+        os.close(folder)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"Not a regular file with one name: {path}")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def transcript_lines(stream):
+    """Decoded lines of a binary ``stream``: within MAX_SCAN bytes, none over MAX_SCAN_LINE."""
+    limit, longest = MAX_SCAN, MAX_SCAN_LINE
+    read = 0
+    while read < limit:
+        line = stream.readline(longest + 1)
+        if not line:
+            return
+        read += len(line)
+        if len(line) > longest and not line.endswith(b"\n"):
+            # Too long to parse: read past the rest of it, a bounded piece at a time.
+            while read < limit:
+                rest = stream.readline(longest + 1)
+                read += len(rest)
+                if not rest or rest.endswith(b"\n"):
+                    break
+            continue
+        yield line.decode("utf-8", errors="replace")
+
+
+def records(lines):
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(item, dict):
+            yield item
+
+
+def claude_details(path):
+    """Session ID, working directory and first prompt of a Claude transcript."""
+    cwd = title = command = None
+    with open_transcript(path) as stream:
+        for item in records(transcript_lines(stream)):
+            if item.get("type") not in {"user", "assistant"} or item.get("isSidechain"):
+                continue
+            cwd = cwd or item.get("cwd")
+            if item.get("type") == "user" and not item.get("isMeta"):
+                view = claude_prompt(claude_text(item))
+                if view and not item.get("isCompactSummary"):
+                    # A typed prompt names the session; failing one, its first command.
+                    if view[0] == "prompt":
+                        title = view[1]
+                        break
+                    if view[0] == "command":
+                        command = command or view[1]
+    if not cwd:
+        return None
+    return {
+        "agent": "claude",
+        "id": path.stem,
+        "cwd": str(Path(cwd).resolve()),
+        "title": title or command,
+    }
+
+
+def codex_details(path):
+    """Session ID, working directory and first typed prompt of a Codex rollout."""
+    with open_transcript(path) as stream:
+        lines = transcript_lines(stream)
+        first = next(lines, "")
+        if not first.endswith("\n"):
+            raise BlockingIOError  # Still being written; look again next time.
+        try:
+            meta = json.loads(first)
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(meta, dict):
+            return None
+        payload = meta.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        if meta.get("type") != "session_meta" or not payload.get("id") or not payload.get("cwd"):
+            return None
+        title = None
+        for line in lines:
+            if '"user' not in line:  # user_message events and user-role items
+                continue
+            try:
+                item = json.loads(line).get("payload") or {}
+            except (ValueError, RecursionError, AttributeError):
+                continue
+            if item.get("type") == "user_message":
+                text = str(item.get("message") or "").strip()
+            elif item.get("type") == "message" and item.get("role") == "user":
+                text = block_text(item.get("content")).strip()
+                text = "" if CODEX_CONTEXT.match(text) else text
+            else:
+                continue
+            if text:
+                title = text
+                break
+    return {
+        "agent": "codex",
+        "id": str(payload["id"]),
+        "cwd": str(Path(payload["cwd"]).resolve()),
+        "title": title,
+    }
+
+
 # The worker side -------------------------------------------------------------
 
 
@@ -397,26 +816,42 @@ class Expired(Exception):
 
 # Monotonic time after which no further Git starts; None when no deadline was given.
 DEADLINE = None
+# Set once the alarm fired, so expiry is reported even if it lands mid-cleanup.
+EXPIRED_AT_ALARM = False
 
 
-def _host_run(argv, timeout):
+def _within_deadline(timeout):
     if DEADLINE is not None:
         left = DEADLINE - time.monotonic()
         if left <= 0:
             raise Expired("Probe deadline expired")
         timeout = min(timeout, left)
+    return timeout
+
+
+def _past_deadline():
+    # Cut short by the deadline itself, which the alarm may not have reported yet.
+    return DEADLINE is not None and time.monotonic() >= DEADLINE
+
+
+def host_environment():
+    env = {k: v for k, v in os.environ.items() if k not in TOKENS}
+    env.update(HOST_ENV)
+    return env
+
+
+def _host_run(argv, timeout):
     try:
         return subprocess.run(
             argv,
-            env={**os.environ, **HOST_ENV},
+            env=host_environment(),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=_within_deadline(timeout),
         )
     except subprocess.TimeoutExpired as exc:
-        # Cut short by the deadline itself, which the alarm may not have reported yet.
-        if DEADLINE is not None and time.monotonic() >= DEADLINE:
+        if _past_deadline():
             raise Expired("Probe deadline expired") from exc
         raise
 
@@ -425,16 +860,17 @@ def _host_run(argv, timeout):
 _guards: dict[str, list[str]] = {}
 
 
-def host_guard(path, timeout=60):
+def host_guard(path, timeout=60, cache=_guards):
     """``-c`` overrides for the programs ``path``'s own config could name.
 
     Attributes (``.gitattributes``, ``.git/info/attributes``) pick a filter driver by
     name, so blanking every driver the config defines covers them all, git-lfs's
     included: git-lfs, and the extensions and transfer agents it would run, never
     starts. ``core.worktree`` would point Git at another directory and is refused.
+    A long-lived caller passes a fresh ``cache``, since a checkout's config can change.
     """
     key = str(path)
-    if key not in _guards:
+    if key not in cache:
         result = _host_run(
             [*HOST_GIT, "-C", key, "config", "-z", "--get-regexp", r"^filter\.|^core\.worktree$"],
             timeout,
@@ -450,28 +886,88 @@ def host_guard(path, timeout=60):
                 drivers[name[len("filter.") : name.rindex(".")]] = None
         if any("=" in driver for driver in drivers):
             raise ValueError("A filter driver's name cannot be overridden; not read")
-        _guards[key] = [
+        cache[key] = [
             arg
             for driver in drivers
             for setting in ("clean=", "smudge=", "process=", "required=false")
             for arg in ("-c", f"filter.{driver}.{setting}")
         ]
-    return _guards[key]
+    return cache[key]
+
+
+def host_argv(path, args, options=(), cache=_guards):
+    """The hardened Git command line for ``args`` in ``path``, after Git ``options``."""
+    command = next((arg for arg in args if not arg.startswith("-")), None)
+    # Looking into a submodule's working tree would run Git there, under its own
+    # filters; a new commit checked out in it still shows.
+    if command in SUBMODULE_READS:
+        at = args.index(command) + 1
+        args = (*args[:at], "--ignore-submodules=dirty", *args[at:])
+    return [*HOST_GIT, *options, *host_guard(path, cache=cache), "-C", str(path), *args]
 
 
 def host_git(path, *args, timeout=60, strip=True):
     """Git in one checkout on the machine this probe runs on, hardened and non-interactive."""
-    command = next((arg for arg in args if not arg.startswith("-")), None)
-    # Looking into a submodule's working tree would run Git there, under its own
-    # filters; a new commit checked out in it still shows.
-    extra = ["--ignore-submodules=dirty"] if command in SUBMODULE_READS else []
-    if extra:
-        at = args.index(command) + 1
-        args = (*args[:at], *extra, *args[at:])
-    result = _host_run([*HOST_GIT, *host_guard(path), "-C", str(path), *args], timeout)
+    result = _host_run(host_argv(path, args), timeout)
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Git failed")[-4000:].strip())
     return result.stdout.strip() if strip else result.stdout
+
+
+def host_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
+    """``host_git`` keeping at most ``limit`` bytes of its output; returns (text, truncated).
+
+    The viewer's reader on a worker: Git stops once the limit is read, and names come
+    unquoted, as the controller's own reader shows them.
+    """
+    limit = MAX_DIFF if limit is None else limit
+    timeout = _within_deadline(timeout)
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+    size = 0
+    truncated = False
+    with tempfile.TemporaryFile() as errors:
+        proc = subprocess.Popen(
+            host_argv(path, args, ("-c", "core.quotePath=false")),
+            env=host_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+        )
+        assert proc.stdout is not None
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                while not truncated:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        if _past_deadline():
+                            raise Expired("Probe deadline expired")
+                        raise ValueError(f"git {args[0]} took longer than {timeout:.0f} seconds")
+                    if not selector.select(remaining):
+                        continue
+                    data = os.read(proc.stdout.fileno(), 65536)
+                    if not data:
+                        break
+                    chunks.append(data[: limit - size])
+                    size += len(chunks[-1])
+                    truncated = size >= limit
+            try:
+                failed = not truncated and proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                if _past_deadline():
+                    raise Expired("Probe deadline expired") from exc
+                raise
+            if failed:
+                errors.seek(0)
+                detail = errors.read()[-4000:].decode("utf-8", errors="replace").strip()
+                raise ValueError(detail[-400:] or f"git {args[0]} failed")
+        finally:
+            if proc.poll() is None:
+                proc.kill()  # Enough was read, or too slowly.
+            proc.wait()
+            proc.stdout.close()
+    return b"".join(chunks).decode("utf-8", errors="replace"), truncated
 
 
 def host_claude_homes():
@@ -486,11 +982,36 @@ def host_claude_homes():
     return list(dict.fromkeys(homes))
 
 
+def host_codex_sessions():
+    return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
+
+
+def host_session_root(path):
+    """A session store's real path; None when it is a symlink or lies outside ``$HOME``."""
+    home = Path(os.path.realpath(os.path.expanduser("~")))
+    real = Path(os.path.realpath(path))
+    if os.path.islink(path) or not real.is_relative_to(home):
+        return None
+    return real
+
+
 def host_session_files(root):
-    """This machine's transcript candidates for ``root``, as the controller lists its own."""
+    """This machine's transcript candidates for ``root``, as the controller lists its own.
+
+    Only files that really lie in a session store (``host_session_roots``) are listed:
+    a symlinked folder inside one leads nowhere else.
+    """
+    stores = host_session_roots()
+
+    def stored(path):
+        real = Path(os.path.realpath(path))
+        return any(real.is_relative_to(store) for store in stores)
+
     # Claude names a project folder after its cwd, every other character a dash.
     folder = re.sub(r"[^A-Za-z0-9]", "-", str(root))
     for home in host_claude_homes():
+        if host_session_root(home / "projects") is None:
+            continue
         try:
             folders = [
                 entry
@@ -501,18 +1022,23 @@ def host_session_files(root):
             folders = []
         for entry in folders:
             for path in entry.glob("*.jsonl"):
-                yield "claude", path
-    codex = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
+                if stored(path):
+                    yield "claude", path
+    codex = host_codex_sessions()
+    if host_session_root(codex) is None:
+        return
     for path in codex.glob("*/*/*/rollout-*.jsonl"):
-        yield "codex", path
+        if stored(path):
+            yield "codex", path
 
 
 def host_cwd(path, agent):
     """The working directory a session recorded: Claude's first turn, Codex's metadata."""
     try:
-        with path.open(encoding="utf-8", errors="replace") as stream:
+        with open_transcript(path) as stream:
+            lines = transcript_lines(stream)
             if agent == "codex":
-                first = stream.readline()
+                first = next(lines, "")
                 if not first.endswith("\n"):
                     return None  # Still being written.
                 meta = json.loads(first)
@@ -520,19 +1046,14 @@ def host_cwd(path, agent):
                 if meta.get("type") == "session_meta" and payload.get("id"):
                     return payload.get("cwd") or None
                 return None
-            for line in stream:
-                try:
-                    item = json.loads(line)
-                except ValueError:
-                    continue
+            for item in records(lines):
                 if (
-                    isinstance(item, dict)
-                    and item.get("type") in {"user", "assistant"}
+                    item.get("type") in {"user", "assistant"}
                     and not item.get("isSidechain")
                     and item.get("cwd")
                 ):
                     return item["cwd"]
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):
         pass
     return None
 
@@ -561,7 +1082,143 @@ def _host_inventory(src, roots, repo_roots, opened):
     )
 
 
-OPS = {"inventory": _host_inventory}
+def host_session_roots():
+    """Where this machine's transcripts live; ``tail`` reads nothing outside them.
+
+    A store that is itself a symlink, or that lies outside ``$HOME``, is no store.
+    """
+    candidates = [home / "projects" for home in host_claude_homes()] + [host_codex_sessions()]
+    return [root for root in map(host_session_root, candidates) if root is not None]
+
+
+def host_accounts():
+    """Claude homes by their account name, as ``claude-account`` names them."""
+    default = Path(os.path.expanduser("~/.claude")).resolve()
+    names = {default: "default"}
+    try:
+        entries = sorted((default / "accounts").iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.name != "default" and ACCOUNT.fullmatch(entry.name) and entry.is_dir():
+            names.setdefault(entry.resolve(), entry.name)
+    return names
+
+
+def _host_checkout(path):
+    """The real path of a checkout the controller names, which must be a checkout's top."""
+    _arg_paths([path])
+    real = os.path.realpath(path)
+    if os.path.realpath(host_git(real, "rev-parse", "--show-toplevel")) != real:
+        raise ValueError("Not at the top of a Git checkout")
+    return real
+
+
+def _host_diff(path, scope, base):
+    if base is not None and not isinstance(base, str):
+        raise ValueError("Expected a base branch name")
+    return diff(host_output, _host_checkout(path), scope, base)
+
+
+def _host_bases(path):
+    return bases(host_output, _host_checkout(path))
+
+
+def _host_sessions(root):
+    """Sessions recorded in ``root`` or below it, newest first, as the viewer lists them."""
+    root = Path(_host_checkout(root))
+    accounts = host_accounts()
+    listed = []
+    for agent, file in host_session_files(root):
+        try:
+            found = claude_details(file) if agent == "claude" else codex_details(file)
+            info = file.stat()
+        except (OSError, ValueError):
+            continue  # Unreadable, or a rollout still writing its first line.
+        if (
+            not found
+            or not SESSION.match(found["id"])
+            or not Path(found["cwd"]).is_relative_to(root)
+        ):
+            continue
+        title = (found["title"] or "").strip()
+        # A Claude transcript sits in HOME/projects/FOLDER/, under a home already resolved.
+        home = file.parents[2] if agent == "claude" else None
+        listed.append(
+            {
+                "id": found["id"],
+                "agent": agent,
+                "cwd": found["cwd"],
+                "cwd_exists": os.path.isdir(found["cwd"]),
+                "title": title.splitlines()[0][:160] if title else None,
+                "updated": info.st_mtime,
+                "size": info.st_size,
+                "file": str(file),
+                "home": str(home) if home else None,
+                "account": accounts.get(home) if home else None,
+            }
+        )
+    listed.sort(key=lambda s: s["updated"], reverse=True)
+    return listed[:MAX_SESSIONS]
+
+
+def _host_tail(file, inode, offset, limit):
+    """Complete lines of one listed transcript from ``offset``, at most ``limit`` bytes.
+
+    A file replaced since (another ``inode``) or truncated below ``offset`` is read from
+    the start, which the answer's offset says. A full read inside one line longer than
+    ``limit`` is returned as it is, for the controller to join with the next.
+    """
+    _arg_paths([file])
+    if not (inode is None or (type(inode) is int and inode >= 0)):
+        raise ValueError("Expected an inode number")
+    if not (type(offset) is int and offset >= 0 and type(limit) is int and 0 < limit <= MAX_TAIL):
+        raise ValueError("Expected a byte offset and limit")
+    path = Path(os.path.realpath(file))
+    if path.suffix != ".jsonl" or not any(path.is_relative_to(r) for r in host_session_roots()):
+        raise ValueError("Not a session transcript of this machine")
+    try:
+        stream = open_beneath(path)
+    except OSError as exc:
+        raise ValueError("Not a session transcript of this machine") from exc
+    with stream:
+        info = os.fstat(stream.fileno())
+        # What was opened must still be the file at the checked path: nothing on the way
+        # there was swapped for a symlink in between.
+        try:
+            now = os.lstat(path)
+        except OSError:
+            now = None
+        if (
+            now is None
+            or (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino)
+            or os.path.realpath(path) != str(path)
+        ):
+            raise ValueError("Not a session transcript of this machine")
+        start = offset if info.st_ino == inode and info.st_size >= offset else 0
+        stream.seek(start)
+        # No further than the size reported, though the file may grow meanwhile.
+        data = stream.read(min(limit, info.st_size - start))
+    end = data.rfind(b"\n")
+    if end >= 0:
+        data = data[: end + 1]
+    elif len(data) < limit:
+        data = b""  # A line still being written is read next time.
+    return {
+        "inode": info.st_ino,
+        "size": info.st_size,
+        "offset": start,
+        "data": base64.b64encode(data).decode(),
+    }
+
+
+OPS: dict[str, Callable[..., Any]] = {
+    "inventory": _host_inventory,
+    "diff": _host_diff,
+    "bases": _host_bases,
+    "sessions": _host_sessions,
+    "tail": _host_tail,
+}
 
 
 def _stop_group():
@@ -573,6 +1230,8 @@ def _stop_group():
 
 
 def _expire(signum, frame):
+    global EXPIRED_AT_ALARM
+    EXPIRED_AT_ALARM = True
     _stop_group()
     raise Expired("Probe deadline expired")
 
@@ -583,8 +1242,29 @@ def main(argv):
     A killed ssh client leaves the probe running, so it carries its own lifeline: an
     alarm at the deadline, and no Git started after it. Expiry exits with EXPIRED.
     """
-    global DEADLINE
     code = 0
+    try:
+        answer = _answer(argv)
+    except Expired as exc:
+        # The one-shot alarm can land while _answer is already handling an error or
+        # cleaning up, and then escapes it; expiry is still reported as expiry.
+        answer = {"protocol": PROTOCOL, "error": str(exc)}
+    if EXPIRED_AT_ALARM or answer.get("error") == "Probe deadline expired":
+        code = EXPIRED
+        answer = {"protocol": PROTOCOL, "error": "Probe deadline expired"}
+    # UTF-8 rather than \u escapes keeps a diff's answer close to its own size. A lone
+    # surrogate (an undecodable file name) comes out as the escape JSON would have used.
+    sys.stdout.flush()
+    sys.stdout.buffer.write(
+        json.dumps(answer, ensure_ascii=False).encode("utf-8", "backslashreplace")
+    )
+    sys.stdout.flush()
+    return code
+
+
+def _answer(argv):
+    global DEADLINE, EXPIRED_AT_ALARM
+    EXPIRED_AT_ALARM = False
     previous = None
     try:
         if len(argv) != 3 or argv[1] != PROTOCOL:
@@ -607,7 +1287,6 @@ def main(argv):
             signal.setitimer(signal.ITIMER_REAL, deadline)
         answer = {"protocol": PROTOCOL, "result": OPS[request["op"]](**request["args"])}
     except Expired as exc:
-        code = EXPIRED
         answer = {"protocol": PROTOCOL, "error": str(exc)}
         _stop_group()  # Expiry seen first by a Git timeout, before the alarm.
     except Exception as exc:
@@ -617,8 +1296,7 @@ def main(argv):
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
         DEADLINE = None
-    sys.stdout.write(json.dumps(answer))
-    return code
+    return answer
 
 
 # The controller side ---------------------------------------------------------
@@ -635,6 +1313,15 @@ def _absolute(value):
 def _expect(ok, what):
     if not ok:
         raise ValueError(f"Malformed probe answer: {what}")
+
+
+# Control and bidirectional formatting characters, which could disguise worker text.
+UNSHOWN = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def display_text(value):
+    """A worker's title or label for showing, without characters that reorder or hide text."""
+    return UNSHOWN.sub("", value) if isinstance(value, str) else value
 
 
 def _time(value):
@@ -715,7 +1402,150 @@ def validate_inventory(value):
     return value
 
 
-VALIDATORS = {"inventory": validate_inventory}
+def _int(value):
+    return type(value) is int and value >= 0
+
+
+def _optional_text(value):
+    return value is None or _text(value)
+
+
+def validate_bases(value):
+    _expect(isinstance(value, list), "bases")
+    for item in value:
+        _expect(
+            isinstance(item, dict)
+            and set(item) == {"ref", "ahead"}
+            and _text(item["ref"])
+            and _int(item["ahead"]),
+            "base",
+        )
+    return value
+
+
+def validate_diff(value):
+    """Check a worker's diff, field by field, against what ``diff`` returns."""
+    _expect(isinstance(value, dict), "not an object")
+    _expect(
+        set(value)
+        == {
+            "scope",
+            "note",
+            "base",
+            "bases",
+            "commits",
+            "files",
+            "untracked",
+            "untracked_more",
+            "added",
+            "removed",
+            "truncated",
+        },
+        "fields",
+    )
+    _expect(value["scope"] in {"branch", "uncommitted"}, "scope")
+    _expect(_optional_text(value["note"]) and _optional_text(value["base"]), "note or base")
+    _expect(len(validate_bases(value["bases"])) <= 10, "bases")
+    commits = value["commits"]
+    _expect(isinstance(commits, list) and len(commits) <= MAX_COMMITS, "commits")
+    for commit in commits:
+        _expect(
+            isinstance(commit, dict)
+            and set(commit) == {"sha", "author", "time", "subject", "body"}
+            and all(isinstance(commit[k], str) for k in ("sha", "author", "subject", "body"))
+            and _int(commit["time"]),
+            "commit",
+        )
+    _expect(isinstance(value["files"], list), "files")
+    for item in value["files"]:
+        _expect(
+            isinstance(item, dict)
+            and set(item)
+            == {"path", "old_path", "status", "binary", "added", "removed", "lines", "truncated"},
+            "file",
+        )
+        _expect(_text(item["path"]) and _optional_text(item["old_path"]), "file path")
+        _expect(item["status"] in {"modified", "added", "deleted", "renamed"}, "file status")
+        _expect(_int(item["added"]) and _int(item["removed"]), "file counts")
+        _expect(isinstance(item["binary"], bool) and isinstance(item["truncated"], bool), "flags")
+        lines = item["lines"]
+        _expect(
+            isinstance(lines, list)
+            and len(lines) <= MAX_FILE_LINES
+            and all(isinstance(line, str) for line in lines),
+            "file lines",
+        )
+    untracked = value["untracked"]
+    _expect(
+        isinstance(untracked, list)
+        and len(untracked) <= MAX_UNTRACKED
+        and all(map(_text, untracked)),
+        "untracked",
+    )
+    _expect(all(_int(value[k]) for k in ("untracked_more", "added", "removed")), "counts")
+    _expect(isinstance(value["truncated"], bool), "truncated")
+    return value
+
+
+def validate_sessions(value):
+    """Check a worker's session listing; its files are the only ones ``tail`` is asked for."""
+    _expect(isinstance(value, list) and len(value) <= MAX_SESSIONS, "sessions")
+    for item in value:
+        _expect(
+            isinstance(item, dict)
+            and set(item)
+            == {
+                "id",
+                "agent",
+                "cwd",
+                "cwd_exists",
+                "title",
+                "updated",
+                "size",
+                "file",
+                "home",
+                "account",
+            },
+            "session",
+        )
+        _expect(isinstance(item["id"], str) and SESSION.match(item["id"]), "session id")
+        _expect(item["agent"] in {"claude", "codex"}, "session agent")
+        _expect(_absolute(item["cwd"]) and isinstance(item["cwd_exists"], bool), "session cwd")
+        _expect(
+            item["title"] is None or (_text(item["title"]) and len(item["title"]) <= 160), "title"
+        )
+        _expect(_time(item["updated"]) and _int(item["size"]), "session file facts")
+        _expect(_absolute(item["file"]) and item["file"].endswith(".jsonl"), "session file")
+        _expect(item["home"] is None or _absolute(item["home"]), "session home")
+        _expect(
+            item["account"] is None
+            or (isinstance(item["account"], str) and ACCOUNT.fullmatch(item["account"])),
+            "session account",
+        )
+    return value
+
+
+def validate_tail(value):
+    """Check a worker's transcript read; its bytes come back decoded."""
+    _expect(isinstance(value, dict) and set(value) == {"inode", "size", "offset", "data"}, "fields")
+    _expect(all(_int(value[k]) for k in ("inode", "size", "offset")), "positions")
+    _expect(isinstance(value["data"], str), "data")
+    try:
+        data = base64.b64decode(value["data"], validate=True)
+    except ValueError as exc:
+        raise ValueError("Malformed probe answer: data") from exc
+    _expect(len(data) <= MAX_TAIL, "data size")
+    _expect(value["offset"] + len(data) <= value["size"], "data beyond the file's size")
+    return {**value, "data": data}
+
+
+VALIDATORS = {
+    "inventory": validate_inventory,
+    "diff": validate_diff,
+    "bases": validate_bases,
+    "sessions": validate_sessions,
+    "tail": validate_tail,
+}
 
 
 def call(home, machine, op, timeout, **args):

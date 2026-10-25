@@ -233,3 +233,71 @@ def test_a_worktree_config_pointing_git_elsewhere_is_refused(tmp_path):
     git("config", "--worktree", "core.worktree", str(elsewhere), cwd=checkout)
     state = remote_probe.local_state(remote_probe.host_git, str(checkout), "work")
     assert state["changes"] is None and "core.worktree" in state["error"]
+
+
+# The viewer's diff and log, on a worker (``host_output``) and on this machine -------
+
+
+def runners():
+    import workspace_viewer
+
+    return {"worker": remote_probe.host_output, "local": workspace_viewer.git_output}
+
+
+def branch(tmp_path):
+    """A checkout one commit past origin/main, with an uncommitted change to ``f``."""
+    clone = repo(tmp_path / "clone")
+    git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=clone)
+    (clone / "f").write_text("b\n")
+    git("commit", "-q", "-am", "work", cwd=clone)
+    (clone / "f").write_text("c\n")
+    return clone
+
+
+@pytest.mark.parametrize("runner", ["worker", "local"])
+def test_the_viewer_diff_runs_no_filter_driver(tmp_path, evil, runner):
+    script, marker = evil
+    clone = branch(tmp_path)
+    (clone / ".git" / "info" / "attributes").write_text("* filter=x\n")
+    git("config", "filter.x.clean", str(script), cwd=clone)
+    git("config", "filter.x.required", "true", cwd=clone)
+    found = remote_probe.diff(runners()[runner], str(clone), "branch")
+    assert [f["path"] for f in found["files"]] == ["f"] and not marker.exists()
+
+
+@pytest.mark.parametrize("runner", ["worker", "local"])
+def test_the_viewer_log_checks_no_signature(tmp_path, evil, runner):
+    script, marker = evil
+    clone = branch(tmp_path)
+    git("update-ref", "refs/heads/main", signed(clone, "HEAD", ARMOR["gpg.program"]), cwd=clone)
+    git("config", "log.showSignature", "true", cwd=clone)
+    git("config", "gpg.program", str(script), cwd=clone)
+    git("config", "core.pager", str(script), cwd=clone)
+    git("config", "diff.external", str(script), cwd=clone)
+    found = remote_probe.diff(runners()[runner], str(clone), "branch")
+    assert [c["subject"] for c in found["commits"]] == ["work"] and not marker.exists()
+
+
+@pytest.mark.parametrize("runner", ["worker", "local"])
+def test_the_viewer_diff_fetches_no_missing_object(tmp_path, evil, runner):
+    script, marker = evil
+    clone = branch(tmp_path)
+    blob = git("rev-parse", "origin/main:f", cwd=clone)
+    (clone / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    git("config", "core.repositoryformatversion", "1", cwd=clone)
+    git("config", "extensions.partialClone", "origin", cwd=clone)
+    git("config", "remote.origin.url", str(tmp_path / "clone"), cwd=clone)
+    git("config", "remote.origin.promisor", "true", cwd=clone)
+    git("config", "remote.origin.uploadpack", str(script), cwd=clone)
+    with pytest.raises(ValueError):
+        remote_probe.diff(runners()[runner], str(clone), "branch")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("runner", ["worker", "local"])
+def test_the_viewer_refuses_a_checkout_pointing_git_elsewhere(tmp_path, runner):
+    clone = branch(tmp_path)
+    elsewhere = repo(tmp_path / "elsewhere")
+    git("config", "core.worktree", str(elsewhere), cwd=clone)
+    with pytest.raises(ValueError, match="core.worktree"):
+        remote_probe.diff(runners()[runner], str(clone), "uncommitted")

@@ -1333,9 +1333,11 @@ def test_qualified_workspace_ids_name_a_registered_machine(site, tmp_path, monke
             status, value = request(port, "/api/workspace-diff?workspace=w1")
             assert status == 200 and value["base"] == "origin/main"
             for route in ("workspace-diff", "workspace-transcript", "workspace-agents"):
+                # Views read a worker's workspace there; nothing else acts on it yet.
+                remote = "not open" if route != "workspace-agents" else "cannot be opened"
                 for workspace, error in [
                     ("unknown%2Fw1", "Unknown machine unknown"),
-                    ("mini%2Fw1", "on machine mini cannot be opened"),
+                    ("mini%2Fw1", remote),
                 ]:
                     path = f"/api/{route}?workspace={workspace}"
                     status, value = request(port, path)

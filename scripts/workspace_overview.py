@@ -895,7 +895,7 @@ class WorkspaceOverview:
         worktree = space.get("worktree")
         return {
             "workspace_id": wid,
-            "label": self.remote_text(space.get("label")),
+            "label": remote_probe.display_text(self.remote_text(space.get("label"))),
             "agent_status": self.remote_text(space.get("agent_status")),
             "worktree": {
                 field: self.remote_text(worktree.get(field))
@@ -1353,6 +1353,30 @@ class WorkspaceOverview:
         if row is None or row["path"] != key or row["missing"] or not Path(key).is_dir():
             raise ValueError("Unknown workspace; refresh the list")
         return key
+
+    def worker_checkout(self, key):
+        """A worker's listed worktree row as (machine, path), for the read-only views.
+
+        None for a key of this machine. The machine is the registered one the row names,
+        and the path the worker's own, which its probe resolves and checks again.
+        """
+        if not isinstance(key, str) or not 0 < len(key) <= 1024:
+            raise ValueError("Supply a workspace key")
+        if self.worker_label(key) is None:
+            return None
+        with self.lock:
+            if not self.enabled:
+                raise ValueError("The workspace experiment is disabled")
+            listed = self.value["workspaces"] + ((self.partial or {}).get("workspaces") or [])
+            row = next((entry for entry in listed if entry["key"] == key), None)
+        if (
+            row is None
+            or not row.get("machine")
+            or key != f"m:{row['machine']}:{row['path']}"
+            or row["missing"]
+        ):
+            raise ValueError("Unknown workspace; refresh the list")
+        return machines.resolve(self.home, row["machine"]), row["path"]
 
     # Cleanup -------------------------------------------------------------------
 
