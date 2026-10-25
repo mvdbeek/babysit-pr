@@ -56,6 +56,10 @@
   function rows() {
     return (snapshot && snapshot.workspaces) || [];
   }
+  // A worker machine's rows are listed only: nothing acts on them from here yet.
+  function unavailable(entry) {
+    return `Not available for workspaces on ${entry.machine_label} yet`;
+  }
   function matches(row) {
     const term = byId("ws-search").value.trim().toLowerCase();
     const repo = byId("ws-repo").value;
@@ -64,7 +68,14 @@
     if (status === "agents" ? !row.agents.length : status !== "all" && row.status !== status)
       return false;
     if (!term) return true;
-    return [row.name, row.repo, row.branch, row.path, ...row.links.map((l) => `#${l.number}`)]
+    return [
+      row.name,
+      row.repo,
+      row.branch,
+      row.path,
+      row.machine_label,
+      ...row.links.map((l) => `#${l.number}`),
+    ]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(term));
   }
@@ -131,6 +142,7 @@
     box.type = "checkbox";
     box.checked = selected.has(entry.key);
     box.disabled = !entry.removable;
+    if (entry.machine) box.title = unavailable(entry);
     box.setAttribute("aria-label", `Select ${entry.name}`);
     box.onchange = () => {
       if (box.checked) selected.add(entry.key);
@@ -143,6 +155,14 @@
     name.append(
       entry.workspace_url ? anchor(entry.name, entry.workspace_url) : node("span", entry.name),
     );
+    if (entry.machine) {
+      const chip = badge(entry.machine_label, entry.machine_stale ? "amber" : "");
+      chip.classList.add("ws-machine");
+      chip.title = entry.machine_stale
+        ? `${entry.machine_label} did not answer the last scan; showing what it listed before`
+        : `On ${entry.machine_label}`;
+      name.append(" ", chip);
+    }
     if (entry.path) name.append(node("small", entry.path, "pr-meta"));
     name.append(
       node("small", `Updated ${entry.updated_at ? date(entry.updated_at) : "unknown"}`, "pr-meta"),
@@ -167,6 +187,21 @@
     for (const item of entry.blockers) cleanup.append(node("small", item.text, "pr-meta"));
     line.append(cleanup);
     const actions = node("td", undefined, "pr-actions");
+    if (entry.machine) {
+      for (const label of [
+        entry.workspace_ids.length ? "Open workspace" : "Create workspace",
+        "Diff",
+        "Transcript",
+      ]) {
+        const button = node("button", label);
+        button.type = "button";
+        button.disabled = true;
+        button.title = unavailable(entry);
+        actions.append(button);
+      }
+      line.append(actions);
+      return line;
+    }
     const button = node(
       "button",
       opening.has(entry.key)
@@ -195,6 +230,7 @@
   // Scanned checkouts are read by their row; a row that is only a herdr workspace is
   // read through that workspace.
   function viewTarget(entry) {
+    if (entry.machine) return null;
     const scanned = entry.key === entry.path && !entry.missing;
     if (!scanned && !entry.workspace_ids.length) return null;
     return {

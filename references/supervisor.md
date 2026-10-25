@@ -525,4 +525,5 @@ choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`
 previews where Auto would place a launch and which machines can take it;
 `GET /api/machines` lists the machines with their cached loads and placement verdict,
 which the Workspaces badges poll once `/api/status` reports `workers` (absent without
-a registry, so a single machine never asks).
+a registry, so a single machine never asks). The experimental Workspaces tab lists each
+enabled worker's worktrees read-only (see the workspaces reference).
