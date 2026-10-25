@@ -870,10 +870,11 @@ def host_guard(path, timeout=60):
 def host_argv(path, args, options=()):
     """The hardened Git command line for ``args`` in ``path``, after Git ``options``."""
     command = next((arg for arg in args if not arg.startswith("-")), None)
-    # A submodule's status or diff would run Git in it, under its own filters.
+    # Looking into a submodule's working tree would run Git there, under its own
+    # filters; a new commit checked out in it still shows.
     if command in SUBMODULE_READS:
         at = args.index(command) + 1
-        args = (*args[:at], "--ignore-submodules=all", *args[at:])
+        args = (*args[:at], "--ignore-submodules=dirty", *args[at:])
     return [*HOST_GIT, *options, *host_guard(path), "-C", str(path), *args]
 
 
