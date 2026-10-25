@@ -11,6 +11,7 @@ import claude_runner
 import pane_runner
 import pr_supervisor as supervisor
 import pytest
+import sandbox
 from test_pr_supervisor import snapshot
 
 
@@ -268,13 +269,13 @@ def test_display_failure_keeps_draining_large_stream_and_records_result(
 
 def test_safehouse_launcher_owns_permission_mode_and_preserves_session():
     job = {
-        "claude_command": claude_runner.safehouse_command(),
+        "claude_command": sandbox.claude_launcher(),
         "claude_permission_mode": "safehouse",
         "session_id": "original-session",
         "model": "saved-model",
     }
     argv = claude_runner.command_for(job, supervisor.RESULT_SCHEMA)
-    assert argv[:2] == claude_runner.safehouse_command()
+    assert argv[:2] == sandbox.claude_launcher()
     assert argv[argv.index("--resume") + 1] == "original-session"
     assert "--permission-mode" not in argv
     assert "--dangerously-skip-permissions" not in argv  # supplied only inside Safehouse
@@ -297,5 +298,42 @@ def test_default_claude_registration_uses_safehouse(harness, monkeypatch):
     args.codex_command = None
     args.claude_command = None
     job = supervisor.register(h["db"], args)
-    assert job["claude_command"] == claude_runner.safehouse_command()
+    assert job["claude_command"] == sandbox.claude_launcher()
     assert job["claude_permission_mode"] == "safehouse"
+
+
+def test_linux_registration_resumes_through_babysit_bwrap(harness, monkeypatch):
+    # The saved launcher stays the fixed verified prefix; each repair adds its own worktree
+    # and account only after that check.
+    monkeypatch.setattr(sandbox, "DEFAULT", "bwrap")
+    h = harness
+    supervisor.stop_watch(h["db"], h["job"]["id"])
+    sid = str(uuid.uuid4())
+    path = h["home"].parent / "claude-linux.jsonl"
+    transcript(path, sid, h["worktree"])
+    args = h["args"]
+    args.agent = "claude"
+    args.session = sid
+    args.rollout = str(path)
+    args.codex_command = None
+    args.claude_command = None
+    job = supervisor.register(h["db"], args)
+    wrapper = str(Path(sandbox.__file__).with_name("babysit-bwrap"))
+    assert job["claude_command"] == [
+        wrapper,
+        "--env-pass=" + ",".join(sandbox.REPAIR_ENV),
+        "--enable=playwright",
+        "--",
+        "claude",
+        "--dangerously-skip-permissions",
+    ]
+    assert job["claude_permission_mode"] == "safehouse"
+    argv = supervisor.command_for(job, h["home"])
+    assert argv[:3] == [
+        wrapper,
+        f"--claude-config-dir={job['claude_config_dir']}",
+        f"--add-dirs={Path(h['worktree']).resolve()}",
+    ]
+    assert argv[3:8] == job["claude_command"][1:]
+    assert argv[argv.index("--resume") + 1] == sid
+    assert "--permission-mode" not in argv

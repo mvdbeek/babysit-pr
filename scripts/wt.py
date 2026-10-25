@@ -23,6 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol, TextIO
 
 import claude_accounts
+import sandbox
 
 COMMANDS = ("wt", "wti", "wtpr")
 ALIASES = {"wri": "wti", "wtissue": "wti"}
@@ -470,6 +471,8 @@ def agent_command(
     unsandboxed: bool = False,
     also: Sequence[AlsoCheckout] = (),
     directory: str | None = None,
+    worktree: str | None = None,
+    sandbox_config_dir: str | None = None,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -483,6 +486,9 @@ def agent_command(
     ``agent … "$(cat '/path')"`` stays ~60 characters whatever the prompt's size, and
     command-substitution output is not re-scanned, so the content needs no escaping.
     Only the *path* is shell-quoted.
+
+    The sandbox line itself comes from ``sandbox.typed_line``. On macOS it relies on the
+    user's shell functions, which run the agent in Safehouse.
 
     ``docker`` prefixes ``SAFE_ENABLE=docker``: the shell's ``safe`` wrapper around the
     agent adds it to safehouse's ``--enable`` list, opening the Docker daemon socket.
@@ -503,6 +509,11 @@ def agent_command(
     in the configuration that Claude reads, so its folder trust dialog cannot hold up a
     launch nobody is watching. Without a selected account, that is the one this process
     inherited.
+
+    ``worktree`` is the checkout the agent may write under babysit-bwrap on Linux, which
+    is given it explicitly; it defaults to ``directory``. ``sandbox_config_dir`` is the
+    Claude configuration it may write, for callers that set the account up themselves;
+    it defaults to ``claude_config_dir``.
     """
     if unsandboxed and docker:
         raise ValueError("Docker access only applies inside Safehouse")
@@ -512,16 +523,15 @@ def agent_command(
         raise ValueError("A --with checkout path contains ':'")
     added = [word for checkout in also for word in ("--add-dir", checkout.path)]
     extra = [*added, *extra]
-    words = agent_words(agent, model, effort, extra)
-    if unsandboxed:
-        words = ["command", agent, UNSANDBOXED_FLAGS[agent], *words[1:]]
-    command = " ".join(shlex.quote(word) for word in words)
-    if docker:
-        command = f"SAFE_ENABLE=docker {command}"
-    if grants and not unsandboxed:
-        # Staged like the prompt, so the typed line does not grow with every path.
-        listed = shlex.quote(stage(":".join(dict.fromkeys(grants))))
-        command = f"SAFEHOUSE_ADD_DIRS=${{SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}}$(cat {listed}) {command}"
+    command = sandbox.typed_line(
+        agent_words(agent, model, effort, extra),
+        sandbox.Grants(add_dirs=tuple(grants), features=("docker",) if docker else ()),
+        stage,
+        UNSANDBOXED_FLAGS[agent],
+        "none" if unsandboxed else None,
+        worktree or directory,
+        sandbox_config_dir or claude_config_dir,
+    )
     if prompt:
         # `--` stops variadic options from swallowing the prompt.
         separator = " --" if extra else ""

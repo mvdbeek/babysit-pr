@@ -9,6 +9,8 @@ import shlex
 import tempfile
 from pathlib import Path
 
+import sandbox
+
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 # An explicitly selected subscription account must not inherit a different credential.
 AUTH_ENV = (
@@ -188,9 +190,9 @@ def shell_command(command, config_dir, *, subscription=False, config_env=False):
     if config_env is None:
         unset.append("CLAUDE_CONFIG_DIR")
     else:
-        path = shlex.quote(str(config_env))
-        prefix = f"CLAUDE_CONFIG_DIR={path} SAFEHOUSE_ENV_PASS=CLAUDE_CONFIG_DIR${{SAFEHOUSE_ENV_PASS:+,$SAFEHOUSE_ENV_PASS}}"
-        command = f"{prefix} {command}"
+        passed = sandbox.env_pass_prefix(["CLAUDE_CONFIG_DIR"])
+        prefix = f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_env))}"
+        command = f"{prefix} {passed} {command}" if passed else f"{prefix} {command}"
     if unset:
         command = f"(unset {' '.join(unset)}; {command})"
     return command
@@ -215,10 +217,12 @@ def main():
         parser.error(str(exc))
     extra = args.args[1:] if args.args[:1] == ["--"] else args.args
     words = {"login": ["auth", "login", "--claudeai"], "status": ["auth", "status"], "run": []}
-    launcher = Path(__file__).resolve().with_name("claude_safehouse.zsh")
+    # `run` works in the directory the user started it from.
+    worktree = os.getcwd() if args.command == "run" else None
+    launcher = sandbox.bind(sandbox.claude_launcher(), "claude", worktree, str(home))
     os.execvpe(
-        "/bin/zsh",
-        ["/bin/zsh", str(launcher), *words[args.command], *extra],
+        launcher[0],
+        [*launcher, *words[args.command], *extra],
         environment(home, subscription=True),
     )
 

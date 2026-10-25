@@ -1275,9 +1275,17 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
             split = herdr(
                 "pane", "split", anchor, "--direction", "right", "--cwd", cwd, "--no-focus"
             )
-            return launch(workspace_id, chosen, split["pane"]["pane_id"], text, home)
+            return launch(workspace_id, chosen, split["pane"]["pane_id"], text, home, worktree=root)
         # A reopened workspace's shell starts in the checkout, not the session's directory.
-        return launch(workspace_id, chosen, pane, text, home, cwd=None if cwd == root else cwd)
+        return launch(
+            workspace_id,
+            chosen,
+            pane,
+            text,
+            home,
+            cwd=None if cwd == root else cwd,
+            worktree=root,
+        )
 
 
 def reopen(root):
@@ -1305,8 +1313,13 @@ def reopen(root):
     return live, None if opened.get("already_open") else pane
 
 
-def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None):
-    """Resume once into a fresh or verified empty shell pane, optionally with a prompt."""
+def launch(
+    workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None, worktree=None
+):
+    """Resume once into a fresh or verified empty shell pane, optionally with a prompt.
+
+    ``worktree`` is the workspace checkout, which the agent may write.
+    """
     session_id = chosen["id"]
     # The prompt is read back from a private file, as launches do: a typed line has
     # a length ceiling, and command-substitution output needs no escaping.
@@ -1323,6 +1336,8 @@ def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, laun
         text,
         extra=[*options, *RESUME[chosen["agent"]], chosen["id"]],
         stage=lambda _: str(staged),
+        worktree=worktree,
+        sandbox_config_dir=chosen.get("claude_config_dir"),
     )
     if launcher:
         # Direct Safehouse invocation already contains the executable. Its original
