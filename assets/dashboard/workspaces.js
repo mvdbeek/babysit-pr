@@ -56,7 +56,7 @@
   function rows() {
     return (snapshot && snapshot.workspaces) || [];
   }
-  // A worker machine's rows are listed only: nothing acts on them from here yet.
+  // A worker machine's workspaces are opened in its own Collie, not from here yet.
   function unavailable(entry) {
     return `Not available for workspaces on ${entry.machine_label} yet`;
   }
@@ -142,7 +142,6 @@
     box.type = "checkbox";
     box.checked = selected.has(entry.key);
     box.disabled = !entry.removable;
-    if (entry.machine) box.title = unavailable(entry);
     box.setAttribute("aria-label", `Select ${entry.name}`);
     box.onchange = () => {
       if (box.checked) selected.add(entry.key);
@@ -190,7 +189,7 @@
     line.append(cleanup);
     const actions = node("td", undefined, "pr-actions");
     if (entry.machine) {
-      // Its diff and transcripts are read there; opening it waits for later.
+      // Read, messaged and cleaned up there; opening it waits for later.
       const button = node(
         "button",
         entry.workspace_ids.length ? "Open workspace" : "Create workspace",

@@ -55,6 +55,9 @@ REMOTE_TIMEOUT = 120
 MAX_BACKOFF = 16
 REMOTE_GRACE = 5  # Beyond a worker's deadline, for an answer already on its way back.
 HERDR_TIMEOUT = 30
+# A worker's re-read of one clone, and its removal of one worktree with Git's own room.
+RESOLVE_TIMEOUT = 120
+REMOVE_TIMEOUT = 660
 # What one worker may contribute to a scan, and so to the cache shared with this machine.
 MAX_REMOTE_CLONES = 200
 MAX_REMOTE_ITEMS = 1000
@@ -70,7 +73,8 @@ OVERRIDABLE = {"main", "dirty", "unpushed", "agent", "unknown", "detached"}
 CLOSED = {"closed", "merged"}
 ISSUE_NAME = re.compile(r"^issue-(\d+)(?:-|$)")
 PR_NAME = re.compile(r"^pr-([A-Za-z0-9][A-Za-z0-9-]*?)-(\d+)(?:-\d+)?$")
-BRANCH_NAME = re.compile(r"^[^\s:^~?*\\[]{1,255}$")
+# A branch name cleanup deletes; one starting with `-` would read as an option.
+BRANCH_NAME = remote_probe.BRANCH_NAME
 BASE_BRANCH = re.compile(
     r"^(main|master|dev|develop|trunk|next|release[_-]v?\d+(\.\d+)*|\d+\.\d+)$"
 )
@@ -710,14 +714,16 @@ class WorkspaceOverview:
                 links.append(link)
         return links, stale
 
-    def watched_checkouts(self):
-        """Ended watches remain in history but no longer reserve their checkout."""
+    def watched_checkouts(self, machine=None, jobs=None):
+        """Ended watches remain in history but no longer reserve their checkout.
+
+        A worker's watch names its checkout as the worker spells it.
+        """
         return {
-            str(Path(job["cwd"]).resolve())
-            for job in self.jobs()
-            # A worker's path names a checkout there, not one in this inventory.
+            job["cwd"] if machine else str(Path(job["cwd"]).resolve())
+            for job in (self.jobs() if jobs is None else jobs)
             if job.get("cwd")
-            and job.get("machine") is None
+            and job.get("machine") == (machine.id if machine else None)
             and job.get("status") not in {"closed", "stopped"}
         }
 
@@ -965,10 +971,6 @@ class WorkspaceOverview:
             notes.append(f"{machine.label}: herdr listings truncated")
             spaces, agents = spaces[:MAX_REMOTE_ROWS], agents[:MAX_REMOTE_AGENTS]
 
-        def paths(field):
-            values = (space["worktree"][field] for space in spaces if space["worktree"])
-            return sorted({v for v in values if v and v.startswith("/")})
-
         found = remote_probe.call(
             self.home,
             machine,
@@ -976,18 +978,28 @@ class WorkspaceOverview:
             left(),
             src=machine.src,
             roots=[],
-            repo_roots=paths("repo_root"),
-            opened=paths("checkout_path"),
+            repo_roots=self.space_paths(spaces, "repo_root"),
+            opened=self.space_paths(spaces, "checkout_path"),
         )
         found = self.capped(found, notes, machine.label)
+        self.resolved_spaces(spaces, found["paths"])
+        return spaces, agents, found, notes
+
+    @staticmethod
+    def space_paths(spaces, field):
+        """The absolute paths a worker's herdr workspaces name in ``field``, for its probe."""
+        values = (space["worktree"][field] for space in spaces if space["worktree"])
+        return sorted({v for v in values if v and v.startswith("/")})
+
+    @staticmethod
+    def resolved_spaces(spaces, paths):
         # Its paths are the worker's: the checkout herdr names becomes the one the probe
         # resolved there, and nothing about it is looked up on this filesystem.
         for space in spaces:
             if worktree := space["worktree"]:
-                info = found["paths"].get(worktree["checkout_path"])
+                info = paths.get(worktree["checkout_path"])
                 worktree["checkout_path"] = info["path"] if info else None
                 worktree["exists"] = bool(info and info["exists"])
-        return spaces, agents, found, notes
 
     def stale_machine(self, machine, error, rows, statuses, warnings, retry):
         """A worker this scan could not use: its last rows, marked stale, and a warning."""
@@ -1091,14 +1103,7 @@ class WorkspaceOverview:
         """One worker's rows, its link lookups, those that failed and its base cache keys."""
         clones = {clone["main"]["path"]: clone for clone in found["clones"]}
         checkouts = {item["path"]: item for clone in found["clones"] for item in clone["items"]}
-        # A worker's watch names its checkout as the worker spells it.
-        watched = {
-            job["cwd"]
-            for job in jobs
-            if job.get("cwd")
-            and job.get("machine") == machine.id
-            and job.get("status") not in {"closed", "stopped"}
-        }
+        watched = self.watched_checkouts(machine, jobs)
         rows = self.orphan_rows(spaces, agents, checkouts, machine)
         bases: dict = {}
         own: dict[str, tuple] = {}
@@ -1136,7 +1141,7 @@ class WorkspaceOverview:
 
     @staticmethod
     def on_machine(row, machine):
-        """A worker's row: keys and workspace ids naming it, and no actions on it yet."""
+        """A worker's row: keys and workspace ids naming it, and its own Collie."""
         key = row["key"]
         workspace = key.startswith("workspace:")
         row.update(
@@ -1149,7 +1154,6 @@ class WorkspaceOverview:
             workspace_url=collie_url(machine, row["workspace_ids"][0])
             if row["workspace_ids"]
             else None,
-            removable=False,
         )
         return row
 
@@ -1303,6 +1307,9 @@ class WorkspaceOverview:
         key = request.get("key")
         if set(request) != {"key"} or not isinstance(key, str) or not 0 < len(key) <= 1024:
             raise ValueError("Supply a workspace key")
+        # Opening one on a worker waits for later; its Collie is its own.
+        if (label := self.worker_label(key)) is not None:
+            raise ValueError(f"Not available for workspaces on {label} yet")
         with self.lock:
             if not self.enabled:
                 raise ValueError("The workspace experiment is disabled")
@@ -1454,11 +1461,20 @@ class WorkspaceOverview:
             machine = None
         return machine.label if machine else machine_id
 
+    def key_machine(self, key):
+        """The registered, enabled worker a row key names; None for a key of this machine."""
+        if self.worker_label(key) is None:
+            return None
+        machine_id = key.split(":", 2)[1]
+        machine = machines.resolve(self.home, machine_id)
+        if not machine.enabled:
+            raise ValueError(f"{machine.label} is disabled")
+        return machine
+
     def resolve(self, key):
         """Re-read herdr and this one checkout's clone; a stale selection is never acted on."""
-        # Nothing acts on a worker's checkout or workspace from here yet.
-        if (label := self.worker_label(key)) is not None:
-            raise ValueError(f"Not available for workspaces on {label} yet")
+        if (machine := self.key_machine(key)) is not None:
+            return self.resolve_remote(machine, key)
         warnings: list[str] = []
         spaces, agents = self.spaces(warnings), self.agents(warnings)
         if key.startswith("workspace:"):
@@ -1496,9 +1512,70 @@ class WorkspaceOverview:
             key == main["path"],
         )
 
+    def resolve_remote(self, machine, key):
+        """A worker's row re-read there: its herdr listings and one probe of the clone.
+
+        The probe reads only a clone among the worker's own scanned roots. A herdr listing
+        that fails stops here, rather than leave a working agent's workspace unseen.
+        """
+        spaces, agents = (
+            herdr(noun, "list", machine=machine, timeout=HERDR_TIMEOUT)[field]
+            for noun, field in (("workspace", "workspaces"), ("agent", "agents"))
+        )
+        if not isinstance(spaces, list) or not isinstance(agents, list):
+            raise ValueError(f"{machine.label} answered an unreadable herdr listing")
+        spaces = [space for space in map(self.remote_space, spaces) if space]
+        agents = [agent for agent in map(self.remote_agent, agents) if agent]
+        if key.startswith("workspace:"):
+            wid = key.split(":", 2)[2]
+            spaces = [space for space in spaces if space["workspace_id"] == wid]
+            root = ((spaces or [{}])[0].get("worktree") or {}).get("repo_root")
+            if not spaces or not root or not root.startswith("/"):
+                rows = self.orphan_rows(spaces, agents, {}, machine)
+                return rows[0] if rows else None
+            path = None
+        else:
+            path, root = key.split(":", 2)[2], None
+        found = workspace_viewer.probe(
+            self.home,
+            machine,
+            "resolve",
+            RESOLVE_TIMEOUT,
+            src=machine.src,
+            repo_roots=self.space_paths(spaces, "repo_root"),
+            opened=self.space_paths(spaces, "checkout_path"),
+            path=path,
+            root=root,
+        )
+        self.resolved_spaces(spaces, found["paths"])
+        checkouts = {item["path"]: item for clone in found["clones"] for item in clone["items"]}
+        if path is None:
+            rows = self.orphan_rows(spaces, agents, checkouts, machine)
+            return rows[0] if rows else None
+        if found["root"] is None:
+            return None
+        if found["root"] not in found["roots"]:
+            raise ValueError("This checkout is outside the scanned clones; refresh the list")
+        item, state = checkouts.get(path), found["states"].get(path)
+        if not item or not state:
+            return None
+        return self.row(
+            item,
+            state,
+            [],
+            True,
+            spaces,
+            agents,
+            self.watched_checkouts(machine),
+            None,
+            path == found["clones"][0]["main"]["path"],
+            machine,
+        )
+
     def remove(self, job, index, target):
         """Act only on blockers the user actually approved, re-read a moment ago."""
         key, approved = target["key"], set(target["approve"])
+        machine = self.key_machine(key)
         row = self.resolve(key)
         steps: list[str] = []
         if row is None:
@@ -1520,47 +1597,55 @@ class WorkspaceOverview:
                 steps=steps,
             )
             return
-        lock_path = self.lock_file(row["repo_root"] or row["key"])
+        lock_path = self.lock_file(row["repo_root"] or row["key"], machine)
         with lock_path.open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            self.close_workspaces(job, index, row, steps)
-            self.remove_worktree(job, index, row, steps, bool(approved))
-            kept = self.delete_branch(job, index, row, steps, approved)
+            self.close_workspaces(job, index, row, steps, machine)
+            if machine is not None:
+                kept = self.remove_remote(job, index, row, steps, approved, machine)
+            else:
+                self.remove_worktree(job, index, row, steps, bool(approved))
+                kept = self.delete_branch(job, index, row, steps, approved)
         self.record(job, index, status="done", message=kept or "Cleaned up", steps=steps)
 
-    def lock_file(self, clone):
+    def lock_file(self, clone, machine=None):
+        """The lock of one clone; a worker's clone is named with its machine."""
         directory = self.home / "workspace-locks"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return directory / hashlib.sha256(str(clone).encode()).hexdigest()
+        name = str(clone) if machine is None else f"{machine.id}\0{clone}"
+        return directory / hashlib.sha256(name.encode()).hexdigest()
 
     def progress(self, job, index, steps, message):
         steps.append(message)
         self.record(job, index, message=message, steps=list(steps))
 
-    def close_workspaces(self, job, index, row, steps):
+    def close_workspaces(self, job, index, row, steps, machine=None):
         """Ask idle agents to exit, then close the workspaces that own this checkout.
 
         A working agent is never sent keys: approving its removal closes its workspace,
-        which ends the pane. Unsent prompt text in any pane is lost either way.
+        which ends the pane. Unsent prompt text in any pane is lost either way. A worker's
+        agents and workspaces are reached through its herdr.
         """
         idle = [a for a in row["agents"] if a["pane"] and a["status"] not in WORKING]
         for agent in idle:
             self.progress(job, index, steps, f"Exiting {agent['agent']} in {agent['pane']}")
             try:
-                herdr("agent", "send-keys", agent["pane"], "ctrl+d")
+                herdr("agent", "send-keys", agent["pane"], "ctrl+d", machine=machine)
             except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
                 steps.append(f"Graceful exit unavailable for {agent['pane']}: {exc}")
         if idle:
-            self.await_exit({agent["pane"] for agent in idle})
+            self.await_exit({agent["pane"] for agent in idle}, machine)
         for workspace_id in row["workspace_ids"]:
             self.progress(job, index, steps, f"Closing herdr workspace {workspace_id}")
-            herdr("workspace", "close", workspace_id)
+            # A worker's rows name its workspaces qualified, as `mini/w1`.
+            own = machines.split(workspace_id)[1] if machine else workspace_id
+            herdr("workspace", "close", own, machine=machine)
 
-    def await_exit(self, panes):
+    def await_exit(self, panes, machine=None):
         deadline = time.monotonic() + EXIT_WAIT
         while time.monotonic() < deadline:
             try:
-                live = {a.get("pane_id") for a in herdr("agent", "list")["agents"]}
+                live = {a.get("pane_id") for a in herdr("agent", "list", machine=machine)["agents"]}
             except (OSError, ValueError, KeyError, subprocess.SubprocessError):
                 return
             if not panes & live:
@@ -1612,3 +1697,37 @@ class WorkspaceOverview:
             steps[-1] = kept
             self.record(job, index, steps=list(steps))
             return f"Cleaned up. {kept}"
+
+    def remove_remote(self, job, index, row, steps, approved, machine):
+        """``remove_worktree`` and ``delete_branch`` on a worker, in one probe there.
+
+        The worker checks the path again against its clone's own worktree list, and the
+        branch against the one checked out there, before its hardened Git removes either.
+        """
+        if not row["remove_worktree"] or not row["path"] or not row["repo_root"]:
+            return None
+        branch = row.get("branch")
+        branch = branch if branch and BRANCH_NAME.fullmatch(branch) else None
+        self.progress(job, index, steps, f"Removing worktree {row['path']} on {machine.label}")
+        done = workspace_viewer.probe(
+            self.home,
+            machine,
+            "remove",
+            REMOVE_TIMEOUT,
+            root=row["repo_root"],
+            path=row["path"],
+            force=bool(approved),
+            branch=branch,
+            safe=row["unpushed"] == 0 or "unpushed" in approved,
+        )
+        if done["worktree"] == "missing":
+            steps[-1] = "Checkout already removed"
+        if done["branch"] == "deleted":
+            self.progress(job, index, steps, f"Deleted local branch {branch}")
+        elif done["branch"] == "kept":
+            kept = f"Kept local branch {branch}: {done['detail']}"
+            self.progress(job, index, steps, kept)
+            return f"Cleaned up. {kept}"
+        else:
+            self.record(job, index, steps=list(steps))
+        return None
