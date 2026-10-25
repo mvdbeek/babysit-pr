@@ -25,6 +25,7 @@ import attention
 import browser_extension
 import dashboard_settings
 import llm_usage
+import machines
 import service_control
 import workspace_agents
 import workspace_viewer
@@ -81,11 +82,29 @@ def queue_signature(path):
     return tuple(signature)
 
 
+def unsupported_machine(home, machine_id):
+    machines.resolve(home, machine_id)  # An unknown machine is refused as such.
+    return ValueError(f"Workspaces on machine {machine_id} cannot be opened from this dashboard")
+
+
+def local_workspace(home, value):
+    """A workspace ID from a request: ``w1`` as before, ``<machine>/w1`` refused."""
+    if not isinstance(value, str) or "/" not in value:
+        return value
+    try:
+        machine_id, _ = machines.split(value)
+    except ValueError:
+        return value  # Not a qualified ID either: refused as an invalid workspace, as before.
+    raise unsupported_machine(home, machine_id)
+
+
 def watch_checkout(home, watch_id):
     """A watch's registered checkout and the session its repairs resume."""
     job = next((j for j in read_jobs(home) if j.get("id") == watch_id), None)
     if job is None:
         raise ValueError("Unknown watch; refresh")
+    if job.get("machine") is not None:
+        raise unsupported_machine(home, job["machine"])
     return job["cwd"], job.get("session_id")
 
 
@@ -643,6 +662,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON action request")
             # Attached files become paths in the text the agent receives.
             attachments.attach(self.server.attachments, action, request)
+            if action.startswith("workspace-"):
+                for name in ("workspace", "workspace_id"):
+                    if name in request:
+                        request[name] = local_workspace(self.server.home, request[name])
             if action == "notification-silence":
                 if not self.server.push:
                     raise ValueError("Notification preferences are unavailable")
@@ -1019,7 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
                         path = self.server.workspace_overview.checkout(query["key"][0])
                     workspace_id = workspace_viewer.checkout_workspace(path)
                 else:
-                    workspace_id = query["workspace"][0]
+                    workspace_id = local_workspace(self.server.home, query["workspace"][0])
                     self.server.workspace_checkout(workspace_id)
                 if workspace_id is None:
                     # Nobody to message, but a recorded session can be resumed.
@@ -1064,7 +1087,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Read-only views own their failure boundary, like the inventory.
                 try:
                     if "workspace" in single:
-                        path = self.server.workspace_checkout(single.pop("workspace"))
+                        path = self.server.workspace_checkout(
+                            local_workspace(self.server.home, single.pop("workspace"))
+                        )
                     if route.path == "/api/workspace-diff":
                         if set(single) - {"scope", "base"}:
                             raise ValueError("Unknown diff parameter")

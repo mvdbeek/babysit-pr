@@ -24,6 +24,7 @@ from typing import Any
 import gh_pr_watch as watch
 import github_cli
 import llm_usage
+import machines
 import owned_process
 import sentry_llm
 
@@ -888,7 +889,8 @@ def serve(home, max_workers):
                         emit({"id": job["id"], **result})
                 current_jobs = jobs(db)
                 running = [j for j in current_jobs if j["status"] == "running"]
-                busy_cwds = {j["cwd"] for j in running}
+                # The same path on two machines is two checkouts.
+                busy_cwds = {(j.get("machine"), j["cwd"]) for j in running}
                 busy_sessions = {j["session_id"] for j in running}
                 for job in current_jobs:
                     if job["status"] != "watching" or job["id"] in polling:
@@ -906,7 +908,7 @@ def serve(home, max_workers):
                         or job["id"] in polling
                         or not job.get("dispatch_ready")
                         or time.time() - job["updated_at"] > 10
-                        or job["cwd"] in busy_cwds
+                        or (job.get("machine"), job["cwd"]) in busy_cwds
                         or job["session_id"] in busy_sessions
                     ):
                         continue
@@ -921,7 +923,7 @@ def serve(home, max_workers):
                             start_repair(db, home, job)
                         if job["status"] == "running":
                             running.append(job)
-                            busy_cwds.add(job["cwd"])
+                            busy_cwds.add((job.get("machine"), job["cwd"]))
                             busy_sessions.add(job["session_id"])
                 try:
                     sentry_worker.tick()
@@ -978,6 +980,10 @@ def start_daemon(home, max_workers):
 
 def register(db, args):
     cwd = str(Path(args.cwd).resolve())
+    # A registry id; None (the default) is this machine.
+    machine = getattr(args, "machine", None)
+    if machine is not None:
+        machines.resolve(Path(args.home).expanduser(), machine)
     agent_kind = getattr(args, "agent", "codex")
     sid = args.session or (os.environ.get("CODEX_THREAD_ID") if agent_kind == "codex" else None)
     if not sid:
@@ -1033,7 +1039,9 @@ def register(db, args):
         previous: dict[str, Any] = next((old for old in existing if old["id"] == key), {})
         for old in existing:
             if old["status"] not in {"stopped", "closed"} and (
-                old["id"] == key or old["cwd"] == cwd or old["session_id"] == sid
+                old["id"] == key
+                or (old.get("machine"), old["cwd"]) == (machine, cwd)
+                or old["session_id"] == sid
             ):
                 raise ValueError(
                     f"Watch {old['id']} already owns this PR, worktree, or session; pause/release it instead"
@@ -1044,6 +1052,7 @@ def register(db, args):
             "repo": pr["repo"],
             "ci_repo": ci_repo,
             "branch": branch,
+            "machine": machine,
             "cwd": cwd,
             **info,
             "pane": pane,
@@ -1094,6 +1103,9 @@ def main():
     )
     reg.add_argument("--branch", help="Watch a branch without a PR; requires --repo OWNER/REPO")
     reg.add_argument("--cwd", default=os.getcwd())
+    reg.add_argument(
+        "--machine", help="Registered machine id the worktree is on (default: this one)"
+    )
     reg.add_argument("--session")
     reg.add_argument("--agent", choices=["codex", "claude"], default="codex")
     reg.add_argument("--claude-account", help="Named Claude configuration directory (or default)")

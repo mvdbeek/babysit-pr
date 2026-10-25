@@ -314,9 +314,12 @@ Branch-only watches have no PR closure event; register a PR watch when appropria
 ## Worker machines (not yet used)
 
 `--home/machines.json` registers other machines for future remote workspaces.
-Nothing reads it yet: with or without it, every command runs on this machine.
+With or without it, every command still runs on this machine.
 `scripts/machines.py` loads and validates it; a malformed file is an error, a
-missing one means local only.
+missing one means local only. `register --machine ID` records a registered
+machine on the watch (no `--machine` means this machine), and a worktree path is
+a duplicate only on the same machine. The dashboard refuses workspace IDs
+qualified as `ID/w1` and views of watches recorded on another machine.
 
 ```json
 {

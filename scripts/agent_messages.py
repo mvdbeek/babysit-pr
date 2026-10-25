@@ -278,6 +278,7 @@ def watch_until_done(result, home, marker, message):
     watch = {
         "id": uuid.uuid4().hex,
         "label": f"Message: {first[:80]}",
+        "machine": None,
         "path": os.path.realpath(found["cwd"]),
         "workspace_id": found["workspace_id"],
         "pane_id": pane,

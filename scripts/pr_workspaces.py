@@ -1169,6 +1169,8 @@ class Workspaces:
             "pr": pr["id"],
             "action": action,
             "status": "queued",
+            # Registry id of the machine the launch runs on; None is this one.
+            "machine": None,
             "clone": clone,
             "path": target["path"] if action == "reopen" else None,
             "agent": None if action == "reopen" else request.get("agent", "codex"),
@@ -1340,6 +1342,7 @@ class Workspaces:
             "pr": key,
             "action": "new",
             "status": "queued",
+            "machine": None,
             "clone": clone,
             "path": None,
             "agent": agent,
@@ -1490,6 +1493,7 @@ class Workspaces:
         task = {
             "id": str(uuid.uuid4()),
             "target": pr["id"],
+            "machine": None,
             "status": "scheduled",
             "start_at": float(request["start_at"]),
             "created_at": now,

@@ -103,6 +103,8 @@ def validate(request, workspaces, home):
         raise ValueError("The prompt cannot contain NUL characters")
     return {
         "repo": repo,
+        # Registry id of the machine the job runs on; None is this one.
+        "machine": None,
         "clone": clone,
         "branch": branch,
         "base": base,
@@ -222,6 +224,7 @@ def start(job, run_id, home, src):
         "pane"
     ]["pane_id"]
     launched = {
+        "machine": job.get("machine"),
         "workspace_id": workspace,
         "pane": pane,
         "path": str(path),
