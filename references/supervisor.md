@@ -258,8 +258,8 @@ platform (`safehouse` on macOS, `bwrap` on Linux). Nothing in the environment
 selects it, since an agent sets the environment of the launches it starts; the
 tests set `sandbox.DEFAULT`.
 
-On Linux the default Claude launcher is `scripts/babysit-bwrap`, a bubblewrap
-wrapper taking Safehouse's `--add-dirs`, `--env-pass` and `--enable=docker,playwright`
+On Linux the default Claude launcher is `scripts/babysit-bwrap` (bash 4.1 or
+later), a bubblewrap wrapper taking Safehouse's `--add-dirs`, `--env-pass` and `--enable=docker,playwright`
 options, plus `--claude-config-dir` or `--codex-home`, before `--` and the command.
 It mounts the system read-only, gives the agent an empty `$HOME`, and allows
 writes only to `--add-dirs`, the one agent configuration directory it is given

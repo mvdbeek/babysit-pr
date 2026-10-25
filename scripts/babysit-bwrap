@@ -15,7 +15,7 @@
 # are set. The network is shared. Where bwrap has --bind-fd (0.10.0 and later), each
 # writable directory is opened once, checked through its descriptor and bound by it, so
 # a path swapped after the check cannot redirect the bind. --print-argv prints the bwrap
-# argv, NUL-separated, instead of running it.
+# argv, NUL-separated, instead of running it. Needs bash 4.1 or later (`exec {fd}<`).
 set -euo pipefail
 
 die() {

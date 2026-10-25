@@ -390,6 +390,19 @@ WRAPPER = str(SCRIPTS / "babysit-bwrap")
 FAKE_BWRAP = Path(__file__).resolve().parent / "fixtures" / "bwrap"
 
 
+def _bash_version():
+    """The version of the first bash on PATH, which runs the wrapper in these tests."""
+    probe = 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'
+    found = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, check=True)
+    return tuple(int(part) for part in found.stdout.split())
+
+
+# Binding by descriptor opens it with `exec {fd}<`, which needs bash 4.1; macOS ships 3.2.
+fd_bash = pytest.mark.skipif(
+    _bash_version() < (4, 1), reason="babysit-bwrap binds by descriptor only with bash 4.1+"
+)
+
+
 def environment(home, bwrap="path", **extra):
     """The wrapper's environment, with a fake bwrap that binds by ``path`` or ``fd``.
 
@@ -537,6 +550,7 @@ def test_wrapper_gives_each_agent_configuration_its_own_cache(checkout):
     assert "overlaps the protected" in message
 
 
+@fd_bash
 def test_wrapper_binds_checked_directories_by_descriptor_when_bwrap_can(checkout):
     worktree, common, home = checkout
     (home / ".codex").mkdir()
