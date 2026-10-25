@@ -20,11 +20,12 @@ the tests set ``DEFAULT`` instead.
 
 import os
 import shlex
-import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
+
+import safe_git
 
 SCRIPTS = Path(__file__).resolve().parent
 BACKENDS = ("safehouse", "bwrap", "none")
@@ -214,16 +215,9 @@ def git_dirs(worktree: str) -> tuple[str, ...]:
     if not os.path.lexists(dot_git):
         # Not a checkout's top level: git would search the parents, maybe a home repository.
         return (worktree,)
-    found = subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-C", worktree, "rev-parse"]
-        + ["--path-format=absolute", "--git-common-dir"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if found.returncode:
-        return (worktree,)
-    common = os.path.realpath(found.stdout.strip())
+    # From the layout, never a commondir file the agent wrote (see safe_git.common_dir);
+    # one that cannot be verified is refused.
+    common = safe_git.common_dir(worktree)
     registered = {
         # Relative entries (worktree.useRelativePaths) are relative to their own directory.
         os.path.realpath(entry.parent / entry.read_text().strip())

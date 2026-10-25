@@ -443,7 +443,8 @@ switch or that clean check to another directory.
 
 The git common dir granted to an agent (Codex resume `--add-dir`, `wt --with`) and the
 one `wtpr` checks provenance against come from the checkout's layout, never from
-`rev-parse --git-common-dir`, which follows agent-written `commondir` files: a clone's
+`rev-parse --git-common-dir`, which follows agent-written `commondir` files (so does the
+directory babysit-bwrap binds for a Linux launch): a clone's
 own `.git` directory, or the `.git/worktrees/<id>` a worktree's `.git` file names when
 that entry registers the worktree back. A watch records its common dir at registration
 and a resume refuses one that has moved. `wtpr` refuses to write the clone's config
