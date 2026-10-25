@@ -7,6 +7,7 @@ No real agent ever starts; only the Linux-gated tests run bubblewrap, with ``sh`
 
 import hashlib
 import itertools
+import json
 import os
 import pty
 import shutil
@@ -395,6 +396,19 @@ WRAPPER = str(SCRIPTS / "babysit-bwrap")
 FAKE_BWRAP = Path(__file__).resolve().parent / "fixtures" / "bwrap"
 
 
+def _bash_version():
+    """The version of the first bash on PATH, which runs the wrapper in these tests."""
+    probe = 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'
+    found = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, check=True)
+    return tuple(int(part) for part in found.stdout.split())
+
+
+# Binding by descriptor opens it with `exec {fd}<`, which needs bash 4.1; macOS ships 3.2.
+fd_bash = pytest.mark.skipif(
+    _bash_version() < (4, 1), reason="babysit-bwrap binds by descriptor only with bash 4.1+"
+)
+
+
 def environment(home, bwrap="path", **extra):
     """The wrapper's environment, with a fake bwrap that binds by ``path`` or ``fd``.
 
@@ -405,8 +419,9 @@ def environment(home, bwrap="path", **extra):
     return {**base, "USER": "fixture", "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
 
-def sandbox_cache(home, config_var="", config_dir=""):
-    key = hashlib.sha256(f"{config_var}={config_dir}".encode()).hexdigest()[:16]
+def sandbox_cache(home, config_var="", config_dir="", granted=""):
+    enabled = f" enable={granted}" if granted else ""
+    key = hashlib.sha256(f"{config_var}={config_dir}{enabled}".encode()).hexdigest()[:16]
     return str(home / ".cache/babysit-sandbox" / key)
 
 
@@ -479,7 +494,7 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
     assert not pairs(argv, "--bind-try")
     # Every read-only bind comes after every writable one, so none can be shadowed.
     last_writable = max(i for i, word in enumerate(argv) if word == "--bind")
-    assert last_writable < argv.index("--ro-bind-try")
+    assert last_writable < min(i for i, word in enumerate(argv) if word.startswith("--ro-"))
     assert (str(home / ".config/gh"), str(home / ".config/gh")) in pairs(argv, "--ro-bind-try")
     assert ("/usr", "/usr") in pairs(argv, "--ro-bind-try")
     assert not any(target == "/etc" for _, target in pairs(argv, "--ro-bind-try"))
@@ -542,6 +557,147 @@ def test_wrapper_gives_each_agent_configuration_its_own_cache(checkout):
     assert "overlaps the protected" in message
 
 
+@pytest.fixture
+def docker_socket(tmp_path):
+    """A rootless Docker socket in a fresh runtime directory."""
+    # Unix socket paths are short; tmp_path can exceed the limit on macOS.
+    with tempfile.TemporaryDirectory(dir="/tmp") as runtime:
+        server = socket.socket(socket.AF_UNIX)
+        try:
+            server.bind(str(Path(runtime) / "docker.sock"))
+            yield runtime
+        finally:
+            server.close()
+
+
+def test_wrapper_keeps_a_separate_cache_for_each_grant(checkout, docker_socket):
+    worktree, _, home = checkout
+    account = home / "acct"
+    account.mkdir()
+    env = environment(home, XDG_RUNTIME_DIR=docker_socket)
+    config = f"--claude-config-dir={account}"
+    caches = {
+        enable: dict(pairs(printed(worktree, env, config, *enable, "x"), "--setenv"))[
+            "XDG_CACHE_HOME"
+        ]
+        for enable in ((), ("--enable=playwright",), ("--enable=docker",))
+    }
+    # What an agent without Docker leaves in its cache never runs with the socket.
+    assert (
+        caches[()]
+        == caches[("--enable=playwright",)]
+        == sandbox_cache(home, "CLAUDE_CONFIG_DIR", account.resolve())
+    )
+    assert caches[("--enable=docker",)] == sandbox_cache(
+        home, "CLAUDE_CONFIG_DIR", account.resolve(), "docker"
+    )
+    assert caches[()] != caches[("--enable=docker",)]
+
+
+CLAUDE_CODE = (
+    "settings.json CLAUDE.md agents commands hooks output-styles plugins rules session-env "
+    "skills workflows"
+).split()
+CODEX_CODE = "config.toml hooks.json AGENTS.md AGENTS.override.md packages plugins prompts rules skills".split()
+
+
+@pytest.mark.parametrize(
+    ("option", "names", "present"),
+    [
+        ("--claude-config-dir", CLAUDE_CODE, ("settings.json", "skills")),
+        ("--codex-home", CODEX_CODE, ("config.toml", "rules")),
+    ],
+)
+def test_wrapper_binds_what_runs_code_in_the_agent_configuration_read_only(
+    checkout, option, names, present
+):
+    worktree, _, home = checkout
+    config = home / "agent"
+    config.mkdir()
+    for name in present:
+        (config / name).mkdir() if "." not in name else (config / name).write_text("")
+    (config / "projects").mkdir()
+    argv = printed(worktree, environment(home), f"{option}={config}", "agent")
+    assert (str(config),) * 2 in pairs(argv, "--bind")
+    # Every launch, granted or not: one agent cannot leave code for the next to run.
+    read_only = [target for source, target in pairs(argv, "--ro-bind") if source == target]
+    assert sorted(read_only) == sorted(str(config / name) for name in names)
+    assert str(config / "projects") not in argv
+    last_writable = max(i for i, word in enumerate(argv) if word == "--bind")
+    assert last_writable < argv.index("--ro-bind")
+    # A dry run creates nothing; a launch creates empty placeholders first.
+    assert sorted(path.name for path in config.iterdir()) == sorted([*present, "projects"])
+
+
+def test_wrapper_creates_empty_placeholders_before_a_launch(checkout, tmp_path):
+    worktree, _, home = checkout
+    config = home / "agent"
+    config.mkdir()
+    (config / "skills").mkdir()
+    (config / "skills" / "kept").write_text("x")
+    # A bwrap that binds by path and exits at once, so the wrapper really launches.
+    fake = tmp_path / "launching-bwrap"
+    fake.mkdir()
+    (fake / "bwrap").write_text("#!/bin/sh\nexit 0\n")
+    (fake / "bwrap").chmod(0o755)
+    env = environment(home)
+    env["PATH"] = f"{fake}:{os.environ['PATH']}"
+    result = subprocess.run(
+        ["bash", WRAPPER, f"--claude-config-dir={config}", "--", "claude"],
+        cwd=worktree,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert sorted(path.name for path in config.iterdir()) == sorted(CLAUDE_CODE)
+    assert (config / "settings.json").read_text() == "{}\n"
+    assert (config / "CLAUDE.md").read_text() == ""
+    assert (config / "plugins").is_dir() and not any((config / "plugins").iterdir())
+    assert (config / "skills" / "kept").read_text() == "x"
+
+
+def test_wrapper_refuses_links_where_the_agent_configuration_runs_code(checkout, tmp_path):
+    worktree, _, home = checkout
+    config = home / "agent"
+    config.mkdir()
+    # Bound by itself, a link would be followed outside the sandbox, onto any file.
+    (config / "settings.json").symlink_to(home / ".ssh" / "id_ed25519")
+    message = refused(worktree, environment(home), f"--claude-config-dir={config}", "x")
+    assert "settings.json" in message and "a link" in message
+    (config / "settings.json").unlink()
+    os.mkfifo(config / "hooks")
+    message = refused(worktree, environment(home), f"--claude-config-dir={config}", "x")
+    assert "hooks" in message and "neither a file nor a directory" in message
+
+
+def test_wrapper_refuses_mcp_servers_any_agent_could_add_to_a_granted_launch(
+    checkout, docker_socket
+):
+    worktree, _, home = checkout
+    config = home / "agent"
+    config.mkdir()
+    env = environment(home, XDG_RUNTIME_DIR=docker_socket)
+    options = (f"--claude-config-dir={config}", "--enable=docker", "claude")
+    printed(worktree, env, *options)  # no .claude.json yet
+    state = {"numStartups": 3, "projects": {str(worktree): {"mcpServers": {}}}}
+    (config / ".claude.json").write_text(json.dumps(state))
+    printed(worktree, env, *options)
+    for planted in (
+        {**state, "mcpServers": {"x": {"command": "sh"}}},
+        {"projects": {"/elsewhere": {"mcpServers": {"x": {"command": "sh"}}}}},
+    ):
+        (config / ".claude.json").write_text(json.dumps(planted))
+        message = refused(worktree, env, *options)
+        assert ".claude.json" in message and "MCP servers" in message
+        # Without a grant there is nothing more for them to reach.
+        printed(worktree, env, f"--claude-config-dir={config}", "claude")
+    (config / ".claude.json").write_text("{")
+    assert ".claude.json" in refused(worktree, env, *options)
+
+
+@fd_bash
 def test_wrapper_binds_checked_directories_by_descriptor_when_bwrap_can(checkout):
     worktree, common, home = checkout
     (home / ".codex").mkdir()
@@ -558,6 +714,11 @@ def test_wrapper_binds_checked_directories_by_descriptor_when_bwrap_can(checkout
     assert [target for _, target in descriptors] == granted
     assert all(fd.isdigit() and int(fd) > 2 for fd, _ in descriptors)
     assert len({fd for fd, _ in descriptors}) == len(granted)
+    # Existing read-only entries of the configuration go by descriptor as well.
+    (home / ".codex" / "rules").mkdir()
+    by_fd = printed(worktree, environment(home, bwrap="fd"), *options)
+    assert [target for _, target in pairs(by_fd, "--ro-bind-fd")] == [str(home / ".codex/rules")]
+    assert str(home / ".codex/rules") not in [target for _, target in pairs(by_fd, "--ro-bind")]
 
 
 def test_wrapper_refuses_paths_that_expose_home_or_protected_files(checkout, tmp_path):
@@ -610,6 +771,93 @@ def test_wrapper_protects_session_and_git_startup_files(checkout, path):
     (home / path).mkdir(parents=True)
     message = refused(worktree, environment(home), f"--add-dirs={home / path}", "x")
     assert "overlaps the protected" in message
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".config/herdr",  # herdr.sock drives panes outside the sandbox
+        ".local/share/systemd",  # user units
+        ".local/share/dbus-1",  # session bus services
+        ".bash_aliases",  # sourced by Ubuntu's .bashrc
+        ".inputrc",
+        ".tmux.conf",
+        ".config/tmux",
+        ".docker",  # credential helpers and CLI plugins
+        ".local/share/uv",  # toolchains that also run outside
+        ".local/share/claude",
+        ".nvm",
+        ".npm-global",
+        ".claude",  # every Claude account
+        ".claude/accounts/other",
+        ".codex",
+    ],
+)
+def test_wrapper_protects_launchers_sockets_and_agent_homes(checkout, path):
+    worktree, _, home = checkout
+    (home / path).mkdir(parents=True)
+    message = refused(worktree, environment(home), f"--add-dirs={worktree}:{home / path}", "x")
+    assert "overlaps the protected" in message
+
+
+def test_wrapper_binds_an_agent_home_only_as_that_agent_configuration(checkout):
+    worktree, _, home = checkout
+    for path in (".claude/accounts/work", ".codex"):
+        (home / path).mkdir(parents=True)
+    env = environment(home)
+    claude, account, codex = home / ".claude", home / ".claude/accounts/work", home / ".codex"
+    # The default account's directory holds the others, which stay out of reach.
+    argv = printed(worktree, env, f"--claude-config-dir={claude}", "claude")
+    assert (str(claude),) * 2 in pairs(argv, "--bind")
+    assert argv[argv.index("--tmpfs", argv.index(str(claude))) + 1] == str(claude / "accounts")
+    argv = printed(worktree, env, f"--claude-config-dir={account}", "claude")
+    assert (str(account),) * 2 in pairs(argv, "--bind")
+    assert str(claude / "accounts") not in argv
+    assert (str(codex),) * 2 in pairs(
+        printed(worktree, env, f"--codex-home={codex}", "codex"), "--bind"
+    )
+    for option in (
+        f"--codex-home={account}",
+        f"--claude-config-dir={codex}",
+        f"--claude-config-dir={claude / 'projects'}",
+    ):
+        (home / ".claude/projects").mkdir(exist_ok=True)
+        assert "overlaps the protected" in refused(worktree, env, option, "x"), option
+
+
+def test_wrapper_protects_its_own_checkout_and_git_directory(checkout, tmp_path):
+    worktree, common, home = checkout
+    # Deployed copies of the wrapper: in the main checkout and in a linked worktree.
+    main, linked = common.parent, worktree
+    for copy in (main, linked):
+        (copy / "scripts").mkdir()
+        shutil.copy(WRAPPER, copy / "scripts" / "babysit-bwrap")
+    other = tmp_path / "other"
+    other.mkdir()
+    env = environment(home)
+    for copy, paths in (
+        (main, (main, main / "scripts", common)),
+        (linked, (linked, linked / "scripts", common, main)),  # main holds the common dir
+    ):
+        launcher = str(copy / "scripts" / "babysit-bwrap")
+        for path in paths:
+            result = subprocess.run(
+                ["bash", launcher, "--print-argv", f"--add-dirs={other}:{path}", "x"],
+                cwd=other,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 2 and "overlaps the protected" in result.stderr, path
+        result = subprocess.run(
+            ["bash", launcher, "--print-argv", f"--add-dirs={other}", "x"],
+            cwd=other,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 def test_wrapper_protects_missing_paths_under_linked_parents(checkout, tmp_path):
@@ -708,6 +956,7 @@ def gnupg(checkout, tmp_path):
             server.close()
 
 
+@fd_bash
 def test_wrapper_gives_gpg_the_agent_socket_and_public_keyring_only(checkout, gnupg):
     worktree, _, home = checkout
     env, path = gnupg
@@ -847,3 +1096,26 @@ def test_bwrap_shows_gpg_its_throwaway_home_and_the_agent_socket(checkout, gnupg
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+@linux_bwrap
+def test_bwrap_keeps_the_code_in_the_agent_configuration_read_only(checkout):
+    worktree, _, home = checkout
+    config = home / "agent"
+    (config / "projects").mkdir(parents=True)
+    script = (
+        f"! touch {config}/settings.json 2>/dev/null && ! mkdir {config}/skills/x 2>/dev/null "
+        f"&& ! rm -r {config}/hooks 2>/dev/null && touch {config}/projects/t {config}/.claude.json"
+    )
+    result = subprocess.run(
+        ["bash", WRAPPER, f"--claude-config-dir={config}", "--", "sh", "-c", script],
+        cwd=worktree,
+        env=environment(home, bwrap=None),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (config / "settings.json").read_text() == "{}\n"
+    assert not (config / "skills" / "x").exists()
+    assert (config / "projects" / "t").exists()

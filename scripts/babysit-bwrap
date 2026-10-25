@@ -6,9 +6,9 @@
 #
 # Deny by default: a read-only system, an empty $HOME, and writes only to --add-dirs (the
 # caller passes the worktree and its git common directory there), the one agent
-# configuration directory (which must exist) and a cache root that only sandboxed agents
-# of that configuration use. Nothing is
-# discovered from the working directory or its git files, which the agent can rewrite.
+# configuration directory (which must exist; what it runs code from stays read-only) and
+# a cache root that only sandboxed agents of that configuration and grants use. Nothing
+# is discovered from the working directory or its git files, which the agent can rewrite.
 # Every writable path must be absolute and is resolved first; home, its ancestors and
 # protected paths are refused. The environment is cleared except for a small baseline,
 # the agent configuration variable, the cache variables and the --env-pass names that
@@ -16,7 +16,7 @@
 # gpg-agent without exposing ~/.gnupg (see below). Where bwrap has --bind-fd (0.10.0
 # and later), each writable directory is opened once, checked through its descriptor and bound by it, so
 # a path swapped after the check cannot redirect the bind. --print-argv prints the bwrap
-# argv, NUL-separated, instead of running it.
+# argv, NUL-separated, instead of running it. Needs bash 4.1 or later (`exec {fd}<`).
 set -euo pipefail
 
 die() {
@@ -98,13 +98,17 @@ resolve() {
 }
 
 # Never writable, nor any directory holding one: credentials, babysit's own state and
-# launchers, and shell, session and git startup files, all of which run or authorize
-# code outside.
+# launchers, toolchains that also run outside, herdr's socket (which drives unsandboxed
+# panes), the agent homes (each binds only as its own --claude-config-dir or
+# --codex-home, below), and shell, session, service and git startup files, all of
+# which run or authorize code outside.
 protected=()
 for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .local/bin \
-  .cache/babysit-sandbox .bashrc .bashrc.d .bash_profile .bash_login .bash_logout .profile \
-  .zshenv .zprofile .zshrc .zlogin .zlogout .config/fish .pam_environment .config/systemd \
-  .config/autostart .config/environment.d .gitconfig .config/git; do
+  .local/share/uv .local/share/claude .nvm .npm-global .docker .config/herdr .claude .codex \
+  .cache/babysit-sandbox .bashrc .bashrc.d .bash_aliases .bash_profile .bash_login \
+  .bash_logout .profile .inputrc .zshenv .zprofile .zshrc .zlogin .zlogout .config/fish \
+  .tmux.conf .config/tmux .pam_environment .config/systemd .local/share/systemd \
+  .local/share/dbus-1 .config/autostart .config/environment.d .gitconfig .config/git; do
   # A dotfile manager's link protects its target too.
   protected+=("$real_home/$path" "$(resolve "$home/$path")")
   if [[ -L $home/$path && ! -e $home/$path ]]; then
@@ -115,6 +119,27 @@ for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .l
   fi
 done
 
+# This launcher's own directory and, when that is a checkout's scripts/, the checkout
+# and its git common directory: an agent writing either would change what the next
+# launch runs. The common directory comes from the .git layout, without running git
+# in it. Agents therefore never work in clones of the deployed copy, only in others.
+self=$(realpath -- "${BASH_SOURCE[0]}")
+protected+=("${self%/*}")
+deployed=${self%/*/*}
+if [[ -d $deployed/.git ]]; then
+  protected+=("$deployed" "$(resolve "$deployed/.git")")
+elif [[ -f $deployed/.git ]]; then
+  read -r gitdir <"$deployed/.git" || true
+  gitdir=${gitdir#gitdir: }
+  [[ $gitdir == /* ]] || gitdir=$deployed/$gitdir
+  common=$gitdir
+  if [[ -f $gitdir/commondir ]]; then
+    read -r common <"$gitdir/commondir" || true
+    [[ $common == /* ]] || common=$gitdir/$common
+  fi
+  protected+=("$deployed" "$(resolve "$gitdir")" "$(resolve "$common")")
+fi
+
 # Binding by descriptor needs bwrap 0.10.0's --bind-fd; a dry run without bwrap binds paths.
 bind_fd=0
 if command -v bwrap >/dev/null; then
@@ -123,16 +148,24 @@ if command -v bwrap >/dev/null; then
 fi
 
 # Prints the resolved writable directory, nothing for one that does not exist (like
-# --bind-try), and refuses anything that would expose what it must not.
+# --bind-try), and refuses anything that would expose what it must not. An agent
+# configuration names its harness's home, $2: the directory itself, or for Claude one
+# of its named accounts, is allowed there.
 writable() {
-  local path=$1 real guard
+  local path=$1 own=${2:-} real guard linked=
   [[ $path == /* ]] || die "refusing relative path $path"
   [[ -d $path ]] || return 0
   real=$(realpath -- "$path")
   if [[ $real == / || $real_home == "$real" || $real_home == "$real"/* ]]; then
     die "refusing $path, which would expose the home directory"
   fi
+  [[ -z $own ]] || linked=$(resolve "$home/$own")
   for guard in "${protected[@]}"; do
+    if [[ -n $own && ($guard == "$real_home/$own" || $guard == "$linked") ]]; then
+      [[ $real == "$guard" ]] && continue
+      [[ $own == .claude && $real == "$guard"/accounts/* && $real != "$guard"/accounts/*/* ]] &&
+        continue
+    fi
     if [[ $real == "$guard" || $real == "$guard"/* || $guard == "$real"/* ]]; then
       die "refusing $path, which overlaps the protected $guard"
     fi
@@ -140,12 +173,13 @@ writable() {
   printf '%s\n' "$real"
 }
 
-# Adds a writable bind of resolved directory $1. By descriptor when bwrap can: the open
-# follows whatever the path is now, so the descriptor must still name $1 itself, and
-# bwrap then mounts that directory whatever happens to the path. The descriptor stays
-# open into bwrap, which closes it after mounting.
+# Adds a writable bind of resolved directory $1, or a read-only one of resolved file or
+# directory $1 with $2=ro-. By descriptor when bwrap can: the open follows whatever the
+# path is now, so the descriptor must still name $1 itself, and bwrap then mounts that
+# directory whatever happens to the path. The descriptor stays open into bwrap, which
+# closes it after mounting.
 grant() {
-  local real=$1 fd now
+  local real=$1 kind=${2:-} fd now
   if ((bind_fd)); then
     exec {fd}<"$real" || die "cannot open $real"
     if [[ -d /proc/self/fd ]]; then
@@ -154,9 +188,9 @@ grant() {
       now=$real # a dry run off Linux, which has no /proc to ask
     fi
     [[ ${now:-} == "$real" ]] || die "refusing $real, which changed while it was checked"
-    argv+=(--bind-fd "$fd" "$real")
+    argv+=("--${kind}bind-fd" "$fd" "$real")
   else
-    argv+=(--bind "$real" "$real")
+    argv+=("--${kind}bind" "$real" "$real")
   fi
 }
 
@@ -170,17 +204,39 @@ argv=(bwrap --die-with-parent ${session[@]+"${session[@]}"} --unshare-pid --unsh
   --unshare-uts --clearenv --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
 
 if [[ -n $config_var ]]; then
-  real=$(writable "$config_dir")
+  own=.claude
+  [[ $config_var == CLAUDE_CONFIG_DIR ]] || own=.codex
+  real=$(writable "$config_dir" "$own")
   # Exporting a missing one would point the agent at the empty home's tmpfs.
   [[ -n $real ]] || die "the agent configuration directory $config_dir does not exist"
   config_dir=$real
 fi
+# The grants that reach beyond the sandbox, in a fixed order.
+granted=
+((!docker)) || granted+=,docker
+granted=${granted#,}
+# Everything below must keep a launch without these grants from leaving code for a
+# launch with them, of any agent of the same configuration, to run.
+if [[ -n $granted && $config_var == CLAUDE_CONFIG_DIR && -e $config_dir/.claude.json ]]; then
+  # Claude rewrites this file all the time, so it stays writable; its MCP servers start
+  # with the agent. Refused rather than removed, since the agent may still be writing it.
+  python3 -I -c '
+import json, sys
+config = json.load(open(sys.argv[1]))
+projects = config.get("projects") or {}
+servers = [config.get("mcpServers")]
+servers += [p.get("mcpServers") for p in projects.values() if isinstance(p, dict)]
+sys.exit(any(servers))
+' "$config_dir/.claude.json" 2>/dev/null ||
+    die "refusing --enable=$granted: $config_dir/.claude.json declares MCP servers (or cannot be read), which an agent without that grant could have added"
+fi
 # Package caches for sandboxed agents only: nothing outside the sandbox runs code from
 # them, unlike the host caches an agent could otherwise plant code in. One per agent
-# configuration, so agents with different grants never run each other's downloads.
+# configuration and set of grants, so an agent never runs downloads that one with
+# fewer grants could have replaced.
 sha=(sha256sum)
 command -v sha256sum >/dev/null || sha=(shasum -a 256) # macOS dry runs
-key=$(printf '%s=%s' "$config_var" "$config_dir" | "${sha[@]}")
+key=$(printf '%s=%s%s' "$config_var" "$config_dir" "${granted:+ enable=$granted}" | "${sha[@]}")
 cache=$home/.cache/babysit-sandbox/${key:0:16}
 
 # Writable: the sandbox cache, the agent configuration and the explicit grants. They
@@ -192,6 +248,11 @@ for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   real=$(writable "$path")
   [[ -z $real ]] || grant "$real"
 done
+# The default Claude account's directory holds the named accounts: hide them.
+if [[ $config_var == CLAUDE_CONFIG_DIR && -d $config_dir/accounts ]] &&
+  [[ $config_dir == "$real_home/.claude" || $config_dir == "$(resolve "$home/.claude")" ]]; then
+  argv+=(--tmpfs "$config_dir/accounts")
+fi
 
 if ((gpg)); then
   # Signing through this user's gpg-agent, and nothing else of ~/.gnupg (protected, so
@@ -241,6 +302,41 @@ if ((docker)); then
   [[ -S $socket ]] || die "no rootless Docker socket at $socket"
   [[ -O $socket ]] || die "refusing $socket, which belongs to another user"
   argv+=(--bind "$socket" "$socket" --setenv DOCKER_HOST "unix://$socket")
+fi
+
+# What the agent runs from its configuration, read-only on top of its writable bind in
+# every launch: settings and hooks, plugins, skills, commands, agents and instructions.
+# Missing ones become empty placeholders first, or an agent could create them for the
+# next launch to load; a link is refused, since binding it would follow it outside.
+if [[ -n $config_var ]]; then
+  if [[ $config_var == CLAUDE_CONFIG_DIR ]]; then
+    code=(settings.json CLAUDE.md agents commands hooks output-styles plugins rules session-env
+      skills workflows)
+  else
+    code=(config.toml hooks.json AGENTS.md AGENTS.override.md packages plugins prompts rules
+      skills)
+  fi
+  for name in "${code[@]}"; do
+    path=$config_dir/$name
+    if ((!print)) && [[ ! -e $path && ! -L $path ]]; then
+      # Without following or replacing anything another sandbox creates meanwhile.
+      case $name in
+        *.json) (set -C && printf '{}\n' >"$path") ;;
+        *.*) (set -C && : >"$path") ;;
+        *) mkdir -m 0700 "$path" ;;
+      esac 2>/dev/null || true
+    fi
+    if [[ -L $path ]]; then
+      die "refusing $path, a link; make it a file or directory of its own"
+    elif [[ -f $path || -d $path ]]; then
+      grant "$path" ro-
+    elif [[ -e $path ]]; then
+      die "refusing $path, which is neither a file nor a directory"
+    else
+      ((print)) || die "cannot create $path"
+      argv+=(--ro-bind "$path" "$path")
+    fi
+  done
 fi
 
 # Read-only system. Merged-/usr links stay links.
