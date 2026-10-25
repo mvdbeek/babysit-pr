@@ -215,7 +215,7 @@ def test_a_chosen_worker_is_recorded_and_its_launch_goes_there(local):  # noqa: 
     assert "No babysit-pr at" in op["message"]
     assert not calls and not json.loads(state.read_text())["agents"]
     # A new task that files an issue is refused before the issue is filed.
-    with pytest.raises(ValueError, match="Only pull request reviews and new tasks"):
+    with pytest.raises(ValueError, match="Only pull request work and new tasks"):
         manager.new_task(
             {
                 "repo": "base/repo",
@@ -339,7 +339,7 @@ def test_a_batch_records_its_machine_on_every_item(synced):  # noqa: F811
         "mini",
     )
     # Issues may need repairs, which workers cannot run yet.
-    assert issue["error"].startswith("Only pull request reviews and new tasks can start on")
+    assert issue["error"].startswith("Only pull request work and new tasks can start on")
     settle(manager.loads)
 
 
