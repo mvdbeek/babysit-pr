@@ -511,6 +511,42 @@ def test_duplicate_registration_and_wrong_session_refused(harness):
         supervisor.session_info(str(uuid.uuid4()), h["worktree"], h["rollout"])
 
 
+def test_register_records_no_machine_and_refuses_workers(harness):
+    h = harness
+    assert h["job"]["machine"] is None
+    mini = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin"}
+    (h["home"] / "machines.json").write_text(json.dumps({"version": 1, "machines": [mini]}))
+    with h["db"]:
+        h["db"].execute("DELETE FROM jobs WHERE id=?", (h["job"]["id"],))
+    remote = argparse.Namespace(**{**vars(h["args"]), "home": h["home"], "machine": "unknown"})
+    with pytest.raises(ValueError, match="Unknown machine unknown"):
+        supervisor.register(h["db"], remote)
+    remote.machine = "mini"
+    with pytest.raises(ValueError, match="Watches on Mac mini are not supported yet"):
+        supervisor.register(h["db"], remote)
+    assert supervisor.jobs(h["db"]) == []
+
+
+def test_worktree_git_refuses_worker_jobs_and_keeps_local_argv(harness, monkeypatch):
+    cwd = str(harness["worktree"])
+    pr = {"head_branch": "feature", "head_sha": supervisor.git(cwd, "rev-parse", "HEAD")}
+    real = subprocess.run
+    calls = []
+
+    def record(args, **kwargs):
+        calls.append(args)
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(supervisor.subprocess, "run", record)
+    with pytest.raises(RuntimeError, match="Git on worker machine mini is not supported yet"):
+        supervisor.verify_worktree({"cwd": cwd, "machine": "mini"}, pr)
+    with pytest.raises(RuntimeError, match="not supported yet"):
+        supervisor.git(cwd, "status", machine="mini")
+    assert calls == []
+    supervisor.verify_worktree({"cwd": cwd, "machine": None}, pr)
+    assert calls[0] == ["git", "-C", cwd, "symbolic-ref", "--short", "HEAD"]
+
+
 def test_live_session_cannot_release_itself(harness):
     h = harness
     env = os.environ.copy()

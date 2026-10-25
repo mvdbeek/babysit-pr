@@ -577,7 +577,7 @@ def test_switching_kinds_drops_the_other_kinds_settings(setup):
         {"id": saved["id"], "name": "Now a script", "command": "true", "schedule": {"every": 60}}
     )
     assert shell["kind"] == "shell" and shell["command"] == "true"
-    assert not {"prompt", "repo", "agent"} & set(shell)
+    assert not {"prompt", "repo", "agent", "machine"} & set(shell)
     back = jobs.save({**request(manager), "id": saved["id"]})
     assert back["kind"] == "agent" and "command" not in back
 

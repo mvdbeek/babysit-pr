@@ -29,7 +29,7 @@ import attachments
 import claude_accounts
 import exit_watch
 import github_cli
-import owned_process
+import machines
 import workspace_agents
 import workspace_exit
 from issue_overview import branch_number
@@ -87,23 +87,30 @@ RECENT_CLONE_SECONDS = 90 * 86400
 REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
-def run(*args, cwd=None, timeout=30, pass_fds=()):
-    argv = list(map(str, args))
+def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
+    if machine is not None and home is None:
+        raise ValueError("home is required for a remote machine")
+    # RemotePath arguments stay marked so a worker expands their ``~``.
+    argv = [arg if isinstance(arg, str) else str(arg) for arg in args]
     # git may call the gh credential helper; both get the shared token and never prompt.
     if argv[0] == "gh":
+        if machine is not None:
+            raise ValueError("gh runs on this machine only")
         result = github_cli.run(argv, cwd=cwd, text=True, timeout=timeout, pass_fds=pass_fds)
     else:
-        env = github_cli.environment() if argv[0] == "git" else None
-        result = owned_process.run(
-            argv, cwd=cwd, env=env, text=True, timeout=timeout, pass_fds=pass_fds
+        # A worker's git uses its own gh login; the shared token stays on this machine.
+        env = github_cli.environment() if argv[0] == "git" and machine is None else None
+        result = machines.run(
+            home, machine, argv, cwd=cwd, env=env, text=True, timeout=timeout, pass_fds=pass_fds
         )
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Command failed")[-4000:].strip())
     return result.stdout.strip()
 
 
-def herdr(*args):
-    value = json.loads(run("herdr", *args))
+def herdr(*args, machine: machines.Machine | None = None):
+    # herdr reaches a worker's server itself, so the command always runs here.
+    value = json.loads(run(*machines.herdr_argv(machine, *args)))
     if value.get("error"):
         raise ValueError(str(value["error"]))
     return value["result"]
@@ -117,8 +124,8 @@ def remote_slug(value):
     return match[1].lower() if match and SLUG.fullmatch(match[1]) else None
 
 
-def git(path, *args):
-    return run("git", "-C", path, *args, timeout=15)
+def git(path, *args, machine=None, home=None):
+    return run("git", "-C", path, *args, timeout=15, machine=machine, home=home)
 
 
 CONFIG_KEYS = r"^(remote\..*\.url|branch\..*\.(remote|merge))$"
@@ -609,10 +616,11 @@ class Workspaces:
                 found.extend(
                     {**item, "kind": kind} for item in overview.snapshot()[overview.kind.key]
                 )
+        # A watch on a worker names a path there, never a checkout on this machine.
         found.extend(
             {**job, "id": f"watch:{job['id']}", "kind": "watch", "head_repo": job.get("ci_repo")}
             for job in self.jobs()
-            if job.get("id") and job.get("repo") and job.get("cwd")
+            if job.get("id") and job.get("repo") and job.get("cwd") and job.get("machine") is None
         )
         if self.sentry is not None:
             # An experiment failure must never break PR, issue or watch workspaces.
@@ -680,7 +688,7 @@ class Workspaces:
             for path in {
                 str(Path(j["cwd"]).resolve())
                 for j in self.jobs()
-                if j.get("cwd") and os.path.isdir(j["cwd"])
+                if j.get("cwd") and j.get("machine") is None and os.path.isdir(j["cwd"])
             } - items.keys():
                 item = checkout(path)
                 if item:
@@ -751,6 +759,7 @@ class Workspaces:
                     w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"),
                 )
                 for w in watches
+                if w.get("machine") is None
             },
         }
 
@@ -1100,7 +1109,7 @@ class Workspaces:
             if action == "focus":
                 if not target["workspace_id"]:
                     raise ValueError("Workspace is missing")
-                run("herdr", "workspace", "focus", target["workspace_id"])
+                run(*machines.herdr_argv(None, "workspace", "focus", target["workspace_id"]))
             if action == "copy":
                 args = (
                     ["herdr", "workspace", "focus", target["workspace_id"]]
@@ -1167,6 +1176,8 @@ class Workspaces:
             "pr": pr["id"],
             "action": action,
             "status": "queued",
+            # Registry id of the machine the launch runs on; None is this one.
+            "machine": None,
             "clone": clone,
             "path": target["path"] if action == "reopen" else None,
             "agent": None if action == "reopen" else request.get("agent", "codex"),
@@ -1338,6 +1349,7 @@ class Workspaces:
             "pr": key,
             "action": "new",
             "status": "queued",
+            "machine": None,
             "clone": clone,
             "path": None,
             "agent": agent,
@@ -1488,6 +1500,7 @@ class Workspaces:
         task = {
             "id": str(uuid.uuid4()),
             "target": pr["id"],
+            "machine": None,
             "status": "scheduled",
             "start_at": float(request["start_at"]),
             "created_at": now,

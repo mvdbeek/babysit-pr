@@ -24,6 +24,7 @@ from typing import Any
 import gh_pr_watch as watch
 import github_cli
 import llm_usage
+import machines
 import owned_process
 import sandbox
 import sentry_llm
@@ -85,7 +86,10 @@ def locked(path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def git(cwd, *args):
+def git(cwd, *args, machine=None):
+    # Watches on workers are refused at registration; never check a same-named local path.
+    if machine is not None:
+        raise RuntimeError(f"Git on worker machine {machine} is not supported yet")
     proc = subprocess.run(
         ["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=30
     )
@@ -95,13 +99,14 @@ def git(cwd, *args):
 
 
 def verify_worktree(job, pr):
-    if git(job["cwd"], "symbolic-ref", "--short", "HEAD") != pr["head_branch"]:
+    machine = job.get("machine")
+    if git(job["cwd"], "symbolic-ref", "--short", "HEAD", machine=machine) != pr["head_branch"]:
         raise RuntimeError("Worktree branch differs from the watched branch; intervention required")
-    if git(job["cwd"], "rev-parse", "HEAD") != pr["head_sha"]:
+    if git(job["cwd"], "rev-parse", "HEAD", machine=machine) != pr["head_sha"]:
         raise RuntimeError(
             "Local HEAD differs from remote head; sync deliberately before releasing the watch"
         )
-    if git(job["cwd"], "status", "--porcelain"):
+    if git(job["cwd"], "status", "--porcelain", machine=machine):
         raise RuntimeError("Worktree has uncommitted changes; repair was not started")
 
 
@@ -528,7 +533,13 @@ def command_for(job, attempt_dir):
     if policy == "workspace-write":
         cmd += [
             "--add-dir",
-            git(job["cwd"], "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            git(
+                job["cwd"],
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                machine=job.get("machine"),
+            ),
         ]
     return [*cmd, "resume", job["session_id"], "-"]
 
@@ -890,7 +901,8 @@ def serve(home, max_workers):
                         emit({"id": job["id"], **result})
                 current_jobs = jobs(db)
                 running = [j for j in current_jobs if j["status"] == "running"]
-                busy_cwds = {j["cwd"] for j in running}
+                # The same path on two machines is two checkouts.
+                busy_cwds = {(j.get("machine"), j["cwd"]) for j in running}
                 busy_sessions = {j["session_id"] for j in running}
                 for job in current_jobs:
                     if job["status"] != "watching" or job["id"] in polling:
@@ -908,7 +920,7 @@ def serve(home, max_workers):
                         or job["id"] in polling
                         or not job.get("dispatch_ready")
                         or time.time() - job["updated_at"] > 10
-                        or job["cwd"] in busy_cwds
+                        or (job.get("machine"), job["cwd"]) in busy_cwds
                         or job["session_id"] in busy_sessions
                     ):
                         continue
@@ -923,7 +935,7 @@ def serve(home, max_workers):
                             start_repair(db, home, job)
                         if job["status"] == "running":
                             running.append(job)
-                            busy_cwds.add(job["cwd"])
+                            busy_cwds.add((job.get("machine"), job["cwd"]))
                             busy_sessions.add(job["session_id"])
                 try:
                     sentry_worker.tick()
@@ -979,6 +991,14 @@ def start_daemon(home, max_workers):
 
 
 def register(db, args):
+    # A registry id; None (the default) is this machine.
+    machine = getattr(args, "machine", None)
+    if machine is not None:
+        worker = machines.resolve(Path(args.home).expanduser(), machine)
+        assert worker is not None
+        # Validation, repairs and release still run here, so a watch on a worker would
+        # quietly act on a same-named local checkout.
+        raise ValueError(f"Watches on {worker.label} are not supported yet")
     cwd = str(Path(args.cwd).resolve())
     agent_kind = getattr(args, "agent", "codex")
     sid = args.session or (os.environ.get("CODEX_THREAD_ID") if agent_kind == "codex" else None)
@@ -1035,7 +1055,9 @@ def register(db, args):
         previous: dict[str, Any] = next((old for old in existing if old["id"] == key), {})
         for old in existing:
             if old["status"] not in {"stopped", "closed"} and (
-                old["id"] == key or old["cwd"] == cwd or old["session_id"] == sid
+                old["id"] == key
+                or (old.get("machine"), old["cwd"]) == (machine, cwd)
+                or old["session_id"] == sid
             ):
                 raise ValueError(
                     f"Watch {old['id']} already owns this PR, worktree, or session; pause/release it instead"
@@ -1046,6 +1068,7 @@ def register(db, args):
             "repo": pr["repo"],
             "ci_repo": ci_repo,
             "branch": branch,
+            "machine": machine,
             "cwd": cwd,
             **info,
             "pane": pane,
@@ -1096,6 +1119,9 @@ def main():
     )
     reg.add_argument("--branch", help="Watch a branch without a PR; requires --repo OWNER/REPO")
     reg.add_argument("--cwd", default=os.getcwd())
+    reg.add_argument(
+        "--machine", help="Registered machine id the worktree is on (default: this one)"
+    )
     reg.add_argument("--session")
     reg.add_argument("--agent", choices=["codex", "claude"], default="codex")
     reg.add_argument("--claude-account", help="Named Claude configuration directory (or default)")

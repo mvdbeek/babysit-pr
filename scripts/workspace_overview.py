@@ -794,7 +794,10 @@ class WorkspaceOverview:
         return {
             str(Path(job["cwd"]).resolve())
             for job in self.jobs()
-            if job.get("cwd") and job.get("status") not in {"closed", "stopped"}
+            # A worker's path names a checkout there, not one in this inventory.
+            if job.get("cwd")
+            and job.get("machine") is None
+            and job.get("status") not in {"closed", "stopped"}
         }
 
     def collect(self, publish=None):
