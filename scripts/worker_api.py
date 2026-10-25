@@ -1,4 +1,4 @@
-"""Watch registration from worker machines, forwarded to the controller's dashboard.
+"""Watch registration and handoff from worker machines, forwarded to the controller's dashboard.
 
 Each registered machine has one token, issued on the controller (``pr_supervisor.py
 worker-token ID``) and kept on the worker in ``~/.config/babysit-pr/worker.json`` with
@@ -7,9 +7,10 @@ the controller's dashboard URL. The controller stores only the token's SHA-256, 
 shared. The token decides the machine: a request cannot name another one.
 
 What the token allows is registering watches on its own machine, for sessions and
-checkouts the controller then reads there itself (``remote_probe``). Any process on the
-worker that can read ``worker.json``, which babysit-bwrap shows to every sandboxed agent
-there, can do that.
+checkouts the controller then reads there itself (``remote_probe``), and handing off a
+watch registered there: the controller then exits that watch's agent through the
+worker's herdr, as ``herdr_handoff`` does here. Any process on the worker that can read
+``worker.json``, which babysit-bwrap shows to every sandboxed agent there, can do that.
 """
 
 import hashlib
@@ -35,7 +36,7 @@ MAX_BODY = 65536
 MAX_ANSWER = 65536
 # Reading the worker's checkout and session, and GitHub, can take a while over ssh.
 FORWARD_TIMEOUT = 300
-ACTIONS = {"register"}
+ACTIONS = {"register", "handoff"}
 # Set by babysit-bwrap inside a worker's sandbox: its registration broker's socket.
 SOCKET_ENV = "BABYSIT_REGISTER_SOCKET"
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -43,14 +44,15 @@ PR = re.compile(
     r"[1-9][0-9]{0,9}|https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"
 )
 PANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,63}")
+WATCH = re.compile(r"[0-9a-f]{16}")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Text that reaches a repair prompt may span lines; nothing else a terminal acts on.
 PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-# One registration per machine at a time; a flood waits for nothing.
+# One request per machine and worktree at a time; a flood waits for nothing.
 _busy: dict[str, threading.Lock] = {}
 _busy_lock = threading.Lock()
-# Per machine and worktree, a bucket of RATE registrations refilled over a minute; a
+# Per machine and worktree, a bucket of RATE requests refilled over a minute; a
 # failed one costs FAILURE_COST more, so repeated failures back off. At most MAX_KEYS
 # are kept before idle ones are dropped.
 RATE = 6
@@ -59,10 +61,12 @@ _buckets: dict[str, tuple[float, float]] = {}
 MAX_KEYS = 256
 # Worker watches are polled from this machine's GitHub token; never faster than this.
 MIN_POLL = 30
+# How long a handoff from a worker may wait for its agent's final response.
+MAX_HANDOFF_WAIT = 3600
 
 
 class RateLimited(ValueError):
-    """Too many registrations from one machine; answered 429."""
+    """Too many requests from one machine; answered 429."""
 
 
 def _take(key, cost=1.0, force=False):
@@ -235,6 +239,35 @@ def register_args(home, machine, request):
     )
 
 
+HANDOFF = {"id", "pane", "timeout", "agent", "session", "cwd", "config_dir"}
+
+
+def handoff_args(machine, request):
+    """``herdr_handoff.schedule``'s arguments from a worker's request, checked strictly.
+
+    The conversation and worktree that asked, which must be the watch's own.
+    """
+    if not isinstance(request, dict) or set(request) != HANDOFF:
+        raise ValueError("Expected exactly the handoff fields")
+    if request["agent"] not in {"codex", "claude"}:
+        raise ValueError("Invalid agent")
+    return Namespace(
+        id=_text(request["id"], "watch", 16, WATCH),
+        machine=machine,
+        pane=_text(request["pane"], "pane", 64, PANE),
+        timeout=_count(request["timeout"], "timeout", MAX_HANDOFF_WAIT),
+        max_workers=2,
+        agent=request["agent"],
+        session=_text(request["session"], "session", 36, UUID).lower(),
+        cwd=_absolute(request["cwd"], "cwd"),
+        config_dir=(
+            None
+            if request["config_dir"] is None
+            else _absolute(request["config_dir"], "config dir")
+        ),
+    )
+
+
 def handle(home, machine, action, request):
     """Answer one worker request for ``machine``, the one its token names.
 
@@ -250,16 +283,23 @@ def handle(home, machine, action, request):
                 del _busy[name]
         busy = _busy.setdefault(key, threading.Lock())
     if not busy.acquire(blocking=False):
-        raise ValueError(f"Another registration of this worktree on {machine.label} is running")
+        raise ValueError(f"Another request from this worktree on {machine.label} is running")
     try:
-        if action != "register":
+        if action not in ACTIONS:
             raise ValueError("Unknown worker action")
         if not _take(key):
-            raise RateLimited(f"Too many registrations from {machine.label}; wait a minute")
+            raise RateLimited(f"Too many requests from {machine.label}; wait a minute")
         try:
-            args = register_args(home, machine, request)
+            if action == "handoff":
+                args = handoff_args(machine, request)
+            else:
+                args = register_args(home, machine, request)
             db = pr_supervisor.open_db(home)
             try:
+                if action == "handoff":
+                    import herdr_handoff
+
+                    return herdr_handoff.schedule(db, home, args)
                 job = pr_supervisor.register(db, args)
             finally:
                 db.close()
@@ -323,7 +363,7 @@ def controller():
     token = value.get("token") if isinstance(value, dict) else None
     if url is None or not isinstance(token, str) or not TOKEN.fullmatch(token):
         raise ValueError(
-            "Watch registration from this worker needs the controller's URL and token in "
+            "Registering or handing off a watch here needs the controller's URL and token in "
             f"{path} (provision_worker.sh --controller; see references/worker-setup.md)"
         )
     return url, token
@@ -345,7 +385,7 @@ def forward(action, payload, timeout=FORWARD_TIMEOUT):
         with socket.socket(socket.AF_UNIX) as broker:
             broker.settimeout(timeout)
             broker.connect(path)
-            broker.sendall(json.dumps(payload).encode())
+            broker.sendall(json.dumps({**payload, "action": action}).encode())
             broker.shutdown(socket.SHUT_WR)
             data = b""
             while chunk := broker.recv(65536):
@@ -423,6 +463,31 @@ def registration(args):
         "max_repairs": args.max_repairs,
         "repair_timeout": args.repair_timeout,
         # A sandbox's broker names its own; registered from outside one, there is none.
+        "config_dir": None,
+    }
+
+
+def handoff_request(args):
+    """The request a worker's ``handoff`` sends: the conversation and worktree asking.
+
+    The controller compares them with the watch's own; the token decides the machine.
+    """
+    asking = [
+        (agent, os.environ[name])
+        for agent, name in (("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"))
+        if os.environ.get(name)
+    ]
+    if not asking:
+        raise ValueError("Schedule the handoff from the registered Codex or Claude conversation")
+    agent, session = asking[0]
+    return {
+        "id": args.id,
+        "pane": args.pane,
+        "timeout": args.timeout,
+        "agent": agent,
+        "session": session,
+        "cwd": os.path.realpath(os.getcwd()),
+        # A sandbox's broker names its own; asked from outside one, there is none.
         "config_dir": None,
     }
 

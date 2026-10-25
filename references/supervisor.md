@@ -648,17 +648,33 @@ so the account is where the transcript lies. One request is forwarded at a time,
 most one every 20 s per launch, with at most 4 connections open and 30 s to send a
 request.
 The wrapper also shows the deployed babysit-pr read-only inside on a worker, so the
-skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on a worker refuses for now: exit the
-original agent and release the watch on the controller (`release_argv` in the answer).
+skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on
+a worker goes the same way (`action` names it in a broker request, register when
+absent; at most one of each action every 20 s per launch): it sends the watch ID, pane
+and timeout with the asking conversation (`CLAUDE_CODE_SESSION_ID`, else
+`CODEX_THREAD_ID`) and its worktree, which the broker checks like a registration's,
+adding its configuration directory. The controller's `/api/worker/handoff` schedules
+the handoff only for a watch registered on the token's machine with that agent,
+session and worktree, whose transcript lies in that configuration directory, and
+answers every mismatch the same way. It then runs the detached handoff itself, as for
+a local watch: the agent is followed through `herdr --machine`, its transcript's turn
+and fingerprint are read through probe ops, worker paths are compared as strings and
+worker pids only against the worker herdr's own reports. Codex gets its one Ctrl-D;
+Claude gets a typed `/exit` and Enter, since its second Ctrl-D would have to come
+sooner than the checks before it can read the worker. The exit is confirmed once only
+the pane's shell is in its foreground and herdr no longer sees an agent there. A local
+`handoff` refuses a worker's watch, and a worker's refuses a local one.
 
-The dashboard's `/api/worker/register` takes only that: the Host must be one the
+The dashboard's `/api/worker/register` and `/api/worker/handoff` take only that: the Host must be one the
 dashboard accepts (`--allow-host`, for the tailnet name), and a request carrying
 `Origin` or `Sec-Fetch-Site` (a browser) is refused. The token decides the machine; the
 body is exactly the registration fields (PR, repo, CI repo or branch, absolute `cwd`,
 session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
 poll interval, budget and timeout), checked by type, form and length, with no control
-characters (the instructions may span lines). One registration per machine runs at a
-time per worktree, at most 6 a minute per machine and worktree (a failed one costs 2
+characters (the instructions may span lines); a handoff's body is exactly the watch
+ID, pane, timeout (at most an hour), agent, session, absolute `cwd` and configuration
+directory or none. One request per machine runs at a time per worktree, at most 6 a
+minute per machine and worktree (a failed one costs 2
 more, so repeated failures back off; answered 429), so one sandbox cannot hold up the
 others, and a worker watch is polled no more often than every 30 s. With a machine's
 optional `tailnet_ip` in `machines.json` (one address, or a list of up to four, such as

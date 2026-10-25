@@ -455,6 +455,8 @@ MAX_UNTRACKED = 200
 MAX_COMMITS = 200
 SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 MAX_SESSIONS = 50
+# The line a scheduled brief asks its agent to end with once done (``exit_watch``).
+MARKER = re.compile(r"\[babysit-done:[0-9a-f]{16}\]")
 
 # Context Codex injects as user messages ahead of the typed prompt.
 CODEX_CONTEXT = re.compile(r"^\s*(# AGENTS\.md instructions|<[a-z_]+>)")
@@ -811,6 +813,38 @@ def claude_turn(lines, session_id):
     if not seen or not turn:
         raise RuntimeError("Cannot identify the current turn in the registered transcript")
     return turn, complete
+
+
+def first_turn(lines, agent, marker):
+    """A transcript's first prompt turn, a scheduled brief, and whether it names ``marker``.
+
+    Codex may record the prompt on either side of its turn's start; Claude's prompt is
+    its turn.
+    """
+    turn, marked = None, False
+    for item in records(lines):
+        payload = item.get("payload") or {}
+        if agent == "claude":
+            content = (item.get("message") or {}).get("content")
+            blocks = content if isinstance(content, list) else []
+            if (
+                item.get("type") == "user"
+                and not item.get("isSidechain")
+                and not item.get("isMeta")
+                and not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks)
+            ):
+                return item.get("uuid"), marker in block_text(content)
+            continue
+        kind = (item.get("type"), payload.get("type"))
+        if kind == ("event_msg", "task_started"):
+            if turn is not None:
+                break
+            turn = payload.get("turn_id")
+        elif kind == ("event_msg", "user_message"):
+            marked = marked or marker in str(payload.get("message") or "")
+        elif kind == ("response_item", "message") and payload.get("role") == "user":
+            marked = marked or marker in block_text(payload.get("content"))
+    return turn, marked
 
 
 def records(lines):
@@ -1292,6 +1326,24 @@ def _host_turn(file, session, agent):
         "turn": str(turn)[:MAX_TEXT],
         "complete": None if complete is None else str(complete)[:MAX_TURN],
     }
+
+
+def _host_first_turn(file, agent, marker):
+    """The first turn of one of this machine's transcripts, and whether it took ``marker``."""
+    if agent not in {"claude", "codex"}:
+        raise ValueError("Expected claude or codex")
+    if not isinstance(marker, str) or not MARKER.fullmatch(marker):
+        raise ValueError("Expected a completion marker")
+    with _host_transcript(file) as stream:
+        turn, marked = first_turn(transcript_lines(stream), agent, marker)
+    return {"turn": None if turn is None else str(turn)[:MAX_TEXT], "marked": marked}
+
+
+def _host_fingerprint(file):
+    """Which file one of this machine's transcripts is, and how far it was written."""
+    with _host_transcript(file) as stream:
+        info = os.fstat(stream.fileno())
+    return {"inode": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
 
 def _ending_lines(stream):
@@ -1887,6 +1939,8 @@ OPS: dict[str, Callable[..., Any]] = {
     "sessions": _host_sessions,
     "tail": _host_tail,
     "turn": _host_turn,
+    "first_turn": _host_first_turn,
+    "fingerprint": _host_fingerprint,
     "cron_checkout": _host_cron_checkout,
     "version": _host_version,
     "wt_prepare": _host_wt_prepare,
@@ -2223,6 +2277,22 @@ def validate_turn(value):
     return value
 
 
+def validate_first_turn(value):
+    """Check a worker's answer for the first turn of a transcript."""
+    _expect(isinstance(value, dict) and set(value) == {"turn", "marked"}, "fields")
+    _expect(value["turn"] is None or (_text(value["turn"]) and value["turn"]), "turn")
+    _expect(isinstance(value["marked"], bool), "marked")
+    return value
+
+
+def validate_fingerprint(value):
+    """Check a worker's answer for which file a transcript is and how far it was written."""
+    fields = ("inode", "size", "mtime_ns")
+    _expect(isinstance(value, dict) and set(value) == set(fields), "fields")
+    _expect(all(_int(value[k]) for k in fields), "file facts")
+    return value
+
+
 def validate_cron_checkout(value):
     """Check a worker's cron checkout: absolute paths for the launch line, nothing else."""
     fields = {
@@ -2366,6 +2436,8 @@ VALIDATORS = {
     "sessions": validate_sessions,
     "tail": validate_tail,
     "turn": validate_turn,
+    "first_turn": validate_first_turn,
+    "fingerprint": validate_fingerprint,
     "cron_checkout": validate_cron_checkout,
     "version": validate_version,
     "wt_prepare": validate_wt_prepare,
