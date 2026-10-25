@@ -32,7 +32,8 @@ class Placement(NamedTuple):
 
 class Exclusion(NamedTuple):
     why: str
-    capacity: bool  # Only full: an explicit choice may still overfill it.
+    # Full or not yet checked: an explicit choice may still take it; Auto never does.
+    soft: bool
 
 
 def request(fields, repos):
@@ -90,6 +91,9 @@ def exclusions(req, machines, loads, reservations, now):
         elif missing and machine_id != LOCAL:
             # `wt --with` checks every clone out on one host.
             excluded[machine_id] = Exclusion(f"lacks clones of {', '.join(missing)}", False)
+        elif machine_id != LOCAL and load.get("pending"):
+            # No load has come back yet, so its agents are unknown.
+            excluded[machine_id] = Exclusion("checking…", True)
         elif machine_id != LOCAL and used >= machine.max_agents:
             excluded[machine_id] = Exclusion(f"full ({used}/{machine.max_agents})", True)
     return excluded
@@ -108,29 +112,38 @@ def free(machine_id, machines, loads, reservations):
 def choose(req, machines, loads, history, reservations, *, now=None, auto_remote=AUTO_REMOTE):
     """The machine ``req`` runs on, or ValueError naming why each machine could not take it.
 
-    An explicit choice (``override``) wins, then a pin; Auto ranks what is left by
-    stickiness, the repository's preferred machine, load, then this machine first and
-    label, so equal candidates always resolve the same way.
+    An explicit choice (``override``) wins, then a pin, and the two must agree; Auto
+    ranks what is left by stickiness, the repository's preferred machine, load, then
+    this machine first and label, so equal candidates always resolve the same way.
     """
     now = time.time() if now is None else now
     found = exclusions(req, machines, loads, reservations, now)
     excluded = {machine_id: e.why for machine_id, e in found.items()}
 
-    def named(machine_id, reason):
+    def known(machine_id):
         if machine_id != LOCAL and machine_id not in machines:
             raise ValueError(f"Unknown machine {machine_id}")
+
+    def named(machine_id, reason):
+        known(machine_id)
         exclusion = found.get(machine_id)
-        if exclusion and not exclusion.capacity:
+        if exclusion and not exclusion.soft:
             raise ValueError(f"{label(machine_id, machines)}: {exclusion.why}")
         if exclusion:
             reason = f"{reason}; {exclusion.why}"
         return Placement(None if machine_id == LOCAL else machine_id, reason, excluded)
 
     override = req.get("override")
+    pin = req.get("pin")
     if override not in (None, "auto"):
+        known(override)
+        if pin is not None and override != pin:
+            raise ValueError(
+                f"The existing workspace is on {label(pin, machines)}; choose it or Auto"
+            )
         return named(override, "chosen")
-    if req.get("pin") is not None:
-        return named(req["pin"], "existing workspace")
+    if pin is not None:
+        return named(pin, "existing workspace")
     candidates = [
         machine_id
         for machine_id in ({LOCAL, *machines} if auto_remote else {LOCAL})

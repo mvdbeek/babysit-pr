@@ -369,5 +369,9 @@ this machine for now. Choosing a worker by name checks it against the launch
 (disabled, unreachable, missing `labels` such as `docker`, `safehouse`/`bwrap` for
 the sandbox, `claude-account:<name>`, or a repo's `requires`) and records it on the
 operation or scheduled task, but the launch is refused: "Launching on <label> is
-not supported yet". `GET /api/placement?repo=&agent=&account=&docker=1` previews
-where Auto would place a launch and which machines can take it.
+not supported yet". A worker whose load has not come back yet shows "checking…" and
+is left out of Auto. Handle on a verified checkout stays on that checkout's machine;
+choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`
+previews where Auto would place a launch and which machines can take it;
+`GET /api/machines` lists the machines with their cached loads and placement verdict,
+which the Workspaces badges poll.

@@ -2065,6 +2065,7 @@ for (const page of pages) {
     if (url.href !== location.href) history.pushState(null, "", url);
     pageFromURL();
     void refreshWorkspaces();
+    void refreshMachines();
   };
   $(`${page}-tab`).onkeydown = (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -2105,6 +2106,7 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     refresh(true);
     void refreshWorkspaces();
+    void refreshMachines();
     void refreshScheduled();
   }
 });
@@ -2136,12 +2138,13 @@ async function loadWorkspaces() {
 function machineName(id) {
   return workspaceData.machines?.find((entry) => entry.id === id)?.label ?? id;
 }
+// `available` and `reason` are the server's placement verdict, so the badges and the
+// select refuse exactly the machines a launch would be refused on.
 function machineText(entry) {
-  if (!entry.local && !entry.enabled) return `${entry.label} · disabled`;
-  if (!entry.local && entry.error) return `${entry.label} · unreachable`;
-  return entry.local
-    ? `${entry.label} · ${entry.agents} agents`
-    : `${entry.label} · ${entry.agents}/${entry.max_agents} busy`;
+  if (entry.local) return `${entry.label} · ${entry.agents} agents`;
+  if (!entry.available) return `${entry.label} · ${entry.reason}`;
+  if (entry.pending) return `${entry.label} · checking…`;
+  return `${entry.label} · ${entry.agents}/${entry.max_agents} busy`;
 }
 // Health and capacity beside the Workspaces heading.
 function renderMachines() {
@@ -2150,12 +2153,13 @@ function renderMachines() {
   box.hidden = machines.length < 2;
   box.replaceChildren(
     ...(box.hidden ? [] : machines).map((entry) => {
-      const tone =
-        !entry.local && !entry.enabled
+      const tone = entry.local
+        ? "green"
+        : !entry.enabled || (entry.pending && entry.available)
           ? ""
-          : !entry.local && entry.error
+          : !entry.available
             ? "red"
-            : !entry.local && entry.agents >= entry.max_agents
+            : entry.error || entry.agents >= entry.max_agents
               ? "amber"
               : "green";
       const badge = el("span", machineText(entry), `badge ${tone}`.trim());
@@ -2189,10 +2193,7 @@ async function refreshWorkspaces() {
     overviewVisible() ||
     !$("watcher-panel").hidden ||
     !$("attention-panel").hidden ||
-    $("workspace-dialog").open ||
-    // Machine badges follow the snapshot once it lists workers; one machine has none.
-    (!$("workspaces-panel").hidden &&
-      (!workspaceLoadedAt || (workspaceData.machines?.length ?? 0) > 1));
+    $("workspace-dialog").open;
   if (workspaceBusy || document.hidden || !visible) return;
   workspaceBusy = true;
   try {
@@ -2207,6 +2208,24 @@ async function refreshWorkspaces() {
     workspaceData.error = error.message;
   } finally {
     workspaceBusy = false;
+  }
+}
+// Machine badges poll the registry and cached loads alone, never the whole snapshot.
+// A single machine has no badges: after the first attempt, answered or failed, it is
+// asked again only once a snapshot lists workers.
+let machinesAsked = false,
+  machinesBusy = false;
+async function refreshMachines() {
+  if (machinesBusy || document.hidden || $("workspaces-panel").hidden) return;
+  if (machinesAsked && (workspaceData.machines?.length ?? 0) < 2) return;
+  machinesAsked = machinesBusy = true;
+  try {
+    workspaceData.machines = (await get("/api/machines")).machines;
+    renderMachines();
+  } catch {
+    // The badges keep their last state; with workers listed, the next poll tries again.
+  } finally {
+    machinesBusy = false;
   }
 }
 let workspaceDialogItem = null;
@@ -2727,7 +2746,7 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
   for (const entry of machines) {
     const option = el("option", machineText(entry));
     option.value = entry.id;
-    option.disabled = !entry.local && (!entry.enabled || Boolean(entry.error));
+    option.disabled = !entry.local && !entry.available;
     machine.append(option);
   }
   let preview = null,
@@ -2737,9 +2756,11 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
     machineNote.textContent =
       machine.value === "auto"
         ? (preview?.error ?? preview?.reason ?? "")
-        : chosen
-          ? `${chosen.note}. Starting agents on ${chosen.label} is not supported yet.`
-          : "Runs on this machine.";
+        : chosen?.disabled
+          ? `${chosen.label} cannot take this launch: ${chosen.note}.`
+          : chosen
+            ? `${chosen.note}. Starting agents on ${chosen.label} is not supported yet.`
+            : "Runs on this machine.";
   }
   machine.onchange = describeMachine;
   async function updatePlacement() {
@@ -2764,7 +2785,7 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
       option.textContent = `${entry.label} · ${entry.note}`;
       option.disabled = entry.disabled;
     }
-    if (machine.selectedOptions[0]?.disabled) machine.value = "auto";
+    // A choice the preview now refuses stays, with the reason; submitting it is refused.
     describeMachine();
   }
   void updatePlacement();
@@ -3711,8 +3732,12 @@ $("workspace-close").onclick = () => $("workspace-dialog").close();
 $("workspace-dialog").onclose = syncWorkspacePolling;
 closeOnBackdropClick($("workspace-dialog"), { keepTyped: true });
 closeOnBackdropClick($("ws-viewer"));
-setInterval(refreshWorkspaces, 15000);
+setInterval(() => {
+  void refreshWorkspaces();
+  void refreshMachines();
+}, 15000);
 void refreshWorkspaces();
+void refreshMachines();
 
 function localDateTime(date) {
   // The value format of a datetime-local input, in this browser's time zone.

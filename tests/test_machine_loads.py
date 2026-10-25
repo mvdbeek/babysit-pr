@@ -56,6 +56,7 @@ def test_loads_come_from_each_machines_herdr_and_isolate_failures(
     assert set(config["machines"]) == {"mini", "box"}
     # Nothing is known yet; the answer never waited for herdr.
     assert first["mini"]["synced_at"] is None and first["mini"]["agents"] == 0
+    assert first["mini"]["pending"] is True
     assert first["local"] == {
         "workspaces": 3,
         "agents": 2,
@@ -64,12 +65,13 @@ def test_loads_come_from_each_machines_herdr_and_isolate_failures(
         "error": None,
         "unreachable_since": None,
         "synced_at": 123.0,
+        "pending": False,
     }
     settle(loads)
     _, value = loads.snapshot()
     mini, box = value["mini"], value["box"]
     assert (mini["workspaces"], mini["agents"], mini["working"], mini["blocked"]) == (4, 3, 1, 1)
-    assert mini["error"] is None and mini["synced_at"]
+    assert mini["error"] is None and mini["synced_at"] and not mini["pending"]
     assert "cannot reach Linux box" in box["error"] and box["unreachable_since"]
     assert sorted(asked) == [
         ("Linux box", "workspace", "list", pw.LOAD_TIMEOUT),
@@ -121,6 +123,54 @@ def test_a_hung_machine_blocks_neither_requests_nor_other_machines(tmp_path, mon
     settle(loads)
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"workspaces": ["w1"]},
+        {"workspaces": {"w1": {}}},
+        {"workspaces": None},
+        ["w1"],
+    ],
+)
+def test_a_malformed_herdr_answer_is_an_error_and_never_wedges_the_machine(
+    tmp_path, monkeypatch, answer
+):
+    register(tmp_path, MINI)
+    asked = []
+
+    def herdr(*args, machine=None, timeout=30):
+        asked.append(machine.id)
+        return answer
+
+    monkeypatch.setattr(pw, "herdr", herdr)
+    loads = pw.MachineLoads(tmp_path, lambda: INVENTORY)
+    loads.snapshot()
+    settle(loads)
+    mini = loads.snapshot()[1]["mini"]
+    assert mini["error"] == "herdr listed malformed workspaces" and mini["unreachable_since"]
+    assert mini["pending"] is True
+    # The next refresh is still started.
+    loads.snapshot(now=time.time() + pw.placement.LOAD_TTL + 1)
+    settle(loads)
+    assert asked == ["mini", "mini"]
+
+
+def test_an_unforeseen_refresh_failure_is_recorded_and_releases_the_machine(tmp_path, monkeypatch):
+    register(tmp_path, MINI)
+
+    def herdr(*args, machine=None, timeout=30):
+        raise RuntimeError("surprise")
+
+    monkeypatch.setattr(pw, "herdr", herdr)
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)
+    loads = pw.MachineLoads(tmp_path, lambda: INVENTORY)
+    loads.snapshot()
+    settle(loads)
+    mini = loads.snapshot()[1]["mini"]
+    assert mini["error"] == "Load refresh failed" and mini["unreachable_since"]
+    assert not loads.refreshing
+
+
 def test_without_a_registry_nothing_asks_another_machine(local):  # noqa: F811
     manager, pr, _, state, _ = local
     manager.action({"id": pr["id"], "action": "create", "task": "Local task", "machine": "auto"})
@@ -170,6 +220,11 @@ def test_a_chosen_worker_is_recorded_and_its_launch_refused(local):  # noqa: F81
         ("local", "This machine"),
         ("mini", "Mac mini"),
     ]
+    # The fake herdr answers for the worker: chosen by name it may be, Auto skips it.
+    assert [(m["available"], m["reason"], m["pending"]) for m in snapshot["machines"]] == [
+        (True, None, False),
+        (True, None, False),
+    ]
     preview = manager.preview({"repo": "base/repo", "docker": "1"})
     assert preview["machine"] == "local"
     assert preview["options"] == [
@@ -216,6 +271,12 @@ def test_placement_preview_over_http(local):  # noqa: F811
                 conn.close()
                 return response.status, value
 
+            status, value = get("/api/machines")
+            assert status == 200
+            assert [(m["id"], m["available"]) for m in value["machines"]] == [
+                ("local", True),
+                ("mini", True),
+            ]
             status, value = get("/api/placement?repo=base/repo&agent=claude&account=work")
             assert status == 200 and value["machine"] == "local"
             note = "lacks claude-account:work"

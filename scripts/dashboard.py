@@ -1180,6 +1180,10 @@ class Handler(BaseHTTPRequestHandler):
                     if self.server.workspaces
                     else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
                 )
+            elif route.path == "/api/machines":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(200, {"machines": self.server.workspaces.machine_list()})
             elif route.path == "/api/placement":
                 if not self.server.workspaces:
                     raise ValueError("Workspace actions are not enabled")

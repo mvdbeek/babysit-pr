@@ -514,37 +514,49 @@ class MachineLoads:
                 if machine.enabled and stale and machine_id not in self.refreshing:
                     self.refreshing.add(machine_id)
                     threading.Thread(target=self.refresh, args=(machine,), daemon=True).start()
-                loads[machine_id] = {**empty, **(entry or {})}
+                load = {**empty, **(entry or {})}
+                # Until a first refresh answers, its agents are unknown, not zero.
+                loads[machine_id] = {**load, "pending": load["synced_at"] is None}
         inventory = self.local()
         loads[placement.LOCAL] = {
             **empty,
             **load_counts(inventory["workspaces"]),
             "error": inventory["error"],
             "synced_at": inventory["synced_at"],
+            "pending": False,
         }
         return config, loads
 
     def refresh(self, machine):
         attempted = time.time()
         previous = self.entries.get(machine.id, {})
+        error = "Load refresh failed"  # Kept if something unforeseen escapes below.
+        entry = None
         try:
             spaces = herdr("workspace", "list", machine=machine, timeout=LOAD_TIMEOUT)
+            listed = spaces.get("workspaces") if isinstance(spaces, dict) else None
+            if not isinstance(listed, list) or not all(isinstance(w, dict) for w in listed):
+                raise ValueError("herdr listed malformed workspaces")
             entry = {
-                **load_counts(spaces["workspaces"]),
+                **load_counts(listed),
                 "error": None,
                 "unreachable_since": None,
                 "synced_at": time.time(),
             }
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-            # The last counts stay, marked with how long the machine has been unreachable.
-            entry = {
-                **previous,
-                "error": str(exc)[-300:] or type(exc).__name__,
-                "unreachable_since": previous.get("unreachable_since") or attempted,
-            }
-        with self.lock:
-            self.entries[machine.id] = {**entry, "attempted_at": attempted}
-            self.refreshing.discard(machine.id)
+            error = str(exc)[-300:] or type(exc).__name__
+        finally:
+            if entry is None:
+                # The last counts stay, marked with how long the machine has been unreachable.
+                entry = {
+                    **previous,
+                    "error": error,
+                    "unreachable_since": previous.get("unreachable_since") or attempted,
+                }
+            # Always released, or this machine would never be refreshed again.
+            with self.lock:
+                self.entries[machine.id] = {**entry, "attempted_at": attempted}
+                self.refreshing.discard(machine.id)
 
 
 class Workspaces:
@@ -1067,13 +1079,28 @@ class Workspaces:
         }
 
     def machine_list(self):
-        """This machine then the registry's, each with its last known load."""
+        """This machine then the registry's, each with its last known load.
+
+        ``available`` and ``reason`` are placement's verdict for any launch: whether a
+        person may choose the machine, and why not or what holds Auto back.
+        """
         config, loads = self.loads.snapshot()
+        found = placement.exclusions(
+            {"sandboxed": False}, config["machines"], loads, self.reservations(), time.time()
+        )
         listed = [{"id": placement.LOCAL, "label": placement.label(None, {}), "local": True}]
         for m in config["machines"].values():
             fields = ("id", "label", "os", "max_agents", "labels", "enabled")
             listed.append({**{k: getattr(m, k) for k in fields}, "local": False})
-        return [{**loads[m["id"]], **m} for m in listed]
+        return [
+            {
+                **loads[m["id"]],
+                **m,
+                "available": m["id"] not in found or found[m["id"]].soft,
+                "reason": found[m["id"]].why if m["id"] in found else None,
+            }
+            for m in listed
+        ]
 
     def reservations(self):
         """Launches running in this process by machine; herdr may not list them yet."""
@@ -1117,7 +1144,7 @@ class Workspaces:
                 "note": found[machine_id].why
                 if machine_id in found
                 else placement.free(machine_id, config["machines"], loads, reservations),
-                "disabled": machine_id in found and not found[machine_id].capacity,
+                "disabled": machine_id in found and not found[machine_id].soft,
             }
             for machine_id, machine in config["machines"].items()
         ]

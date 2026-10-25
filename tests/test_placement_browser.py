@@ -15,6 +15,9 @@ LOCAL = {
     "agents": 2,
     "working": 1,
     "error": None,
+    "pending": False,
+    "available": True,
+    "reason": None,
 }
 MINI = {
     "id": "mini",
@@ -25,6 +28,9 @@ MINI = {
     "agents": 4,
     "working": 2,
     "error": None,
+    "pending": False,
+    "available": True,
+    "reason": "full (4/4)",
 }
 BOX = {
     "id": "box",
@@ -35,6 +41,9 @@ BOX = {
     "agents": 0,
     "working": 0,
     "error": "ssh: connect to host box port 22: Connection refused",
+    "pending": False,
+    "available": False,
+    "reason": "unreachable 3m",
 }
 
 
@@ -49,7 +58,21 @@ def site(page, dashboard_site):
         "agent_choices": {"codex": {"models": [], "efforts": []}},
         "machines": [LOCAL],
     }
-    page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+    calls = {"workspaces": 0, "machines": 0}
+
+    def workspaces(route):
+        calls["workspaces"] += 1
+        route.fulfill(json=snapshot)
+
+    def machines(route):
+        calls["machines"] += 1
+        if calls.get("machines_down"):
+            route.fulfill(status=500, json={"error": "down"})
+        else:
+            route.fulfill(json={"machines": snapshot["machines"]})
+
+    page.route("**/api/workspaces", workspaces)
+    page.route("**/api/machines", machines)
     page.route(
         "**/api/workspace-repos*",
         lambda route: route.fulfill(
@@ -107,7 +130,7 @@ def site(page, dashboard_site):
             json={"enabled": True, "workspaces": [], "warnings": [], "synced_at": time.time()}
         ),
     )
-    return dashboard_site[0], snapshot, previews, sent
+    return dashboard_site[0], snapshot, previews, sent, calls
 
 
 def open_new_task(page, url):
@@ -119,7 +142,7 @@ def open_new_task(page, url):
 
 
 def test_one_machine_shows_no_select_and_sends_no_machine(page, site):
-    url, _, previews, sent = site
+    url, _, previews, sent, _ = site
     dialog = open_new_task(page, url)
     expect(dialog.locator("#workspace-machine")).to_be_hidden()
     dialog.get_by_label("New branch").fill("try")
@@ -133,7 +156,7 @@ def test_one_machine_shows_no_select_and_sends_no_machine(page, site):
 
 
 def test_machine_select_previews_and_disables_machines_that_cannot_take_it(page, site):
-    url, snapshot, previews, sent = site
+    url, snapshot, previews, sent, _ = site
     snapshot["machines"] = [LOCAL, MINI, BOX]
     dialog = open_new_task(page, url)
     select = dialog.get_by_label("Machine", exact=True)
@@ -170,22 +193,27 @@ def test_machine_select_previews_and_disables_machines_that_cannot_take_it(page,
 
 @pytest.mark.parametrize("width", [1440, 390])
 def test_workspaces_toolbar_shows_machine_health(page, site, width):
-    url, snapshot, _, _ = site
+    url, snapshot, _, _, calls = site
     snapshot["machines"] = [
         LOCAL,
         MINI,
         BOX,
-        {**MINI, "id": "off", "label": "Old", "enabled": False},
+        {**MINI, "id": "off", "label": "Old", "enabled": False}
+        | {"available": False, "reason": "disabled"},
+        {**MINI, "id": "new", "label": "New", "agents": 0, "pending": True, "reason": "checking…"},
     ]
     page.set_viewport_size({"width": width, "height": 900})
+    page.clock.install()
+    page.clock.pause_at(time.time() + 1)
     page.goto(url + "/#workspaces")
     badges = page.locator("#ws-machines .badge")
     expect(badges).to_have_text(
         [
             "This machine · 2 agents",
             "Mac mini · 4/4 busy",
-            "Linux box · unreachable",
+            "Linux box · unreachable 3m",
             "Old · disabled",
+            "New · checking…",
         ]
     )
     expect(badges.nth(0)).to_have_class("badge green")
@@ -193,5 +221,48 @@ def test_workspaces_toolbar_shows_machine_health(page, site, width):
     expect(badges.nth(2)).to_have_class("badge red")
     expect(badges.nth(2)).to_have_attribute("title", BOX["error"])
     expect(badges.nth(3)).to_have_class("badge")
+    expect(badges.nth(4)).to_have_class("badge")
+    # The badges poll the machines alone, never the whole workspace snapshot.
+    asked = calls["machines"]
+    snapshot["machines"] = [LOCAL, {**MINI, "agents": 1, "reason": None}]
+    page.clock.run_for(15000)
+    expect(badges).to_have_text(["This machine · 2 agents", "Mac mini · 1/4 busy"])
+    assert calls["machines"] == asked + 1 and calls["workspaces"] == 0
     assert page.evaluate("document.documentElement.scrollWidth") <= width
     page.screenshot(path=f"reports/placement-badges-{width}.png")
+
+
+@pytest.mark.parametrize("down", [False, True])
+def test_one_machine_asks_for_machines_once(page, site, down):
+    url, _, _, _, calls = site
+    calls["machines_down"] = down
+    page.clock.install()
+    page.clock.pause_at(time.time() + 1)
+    page.goto(url + "/#workspaces")
+    expect(page.locator("#ws-count")).to_have_text("0")
+    page.wait_for_function("() => !machinesBusy && machinesAsked")
+    for _ in range(3):
+        page.clock.run_for(15000)
+    page.wait_for_function("() => !machinesBusy")
+    expect(page.locator("#ws-machines")).to_be_hidden()
+    assert calls["machines"] == 1 and calls["workspaces"] == 0
+
+
+def test_a_refused_choice_stays_with_its_reason(page, site):
+    url, snapshot, _, sent, _ = site
+    snapshot["machines"] = [LOCAL, MINI, BOX]
+    dialog = open_new_task(page, url)
+    select = dialog.get_by_label("Machine", exact=True)
+    note = dialog.locator(".machine-choice")
+    select.select_option("mini")
+    expect(note).to_have_text("full (4/4). Starting agents on Mac mini is not supported yet.")
+    dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
+    expect(select.locator("option").nth(2)).to_be_disabled()
+    expect(select).to_have_value("mini")
+    expect(note).to_have_text("Mac mini cannot take this launch: lacks docker.")
+    dialog.get_by_label("New branch").fill("try")
+    dialog.get_by_label("Task", exact=True).fill("Explore")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("failed:")
+    # The server, not the page, refuses it.
+    assert sent[-1]["machine"] == "mini"

@@ -86,13 +86,20 @@ def test_auto_stays_local_until_remote_auto_is_enabled():
     assert chosen == pl.Placement("mini", "auto: least busy, 4/4 free", {})
 
 
-def test_pins_beat_score_and_overrides_beat_pins():
+def test_pins_beat_score_and_an_override_must_agree_with_a_pin():
     idle = {"mini": load(), "local": load(agents=8)}
     assert choose({"pin": "local"}, loads=idle, auto_remote=True).machine is None
     pinned = choose({"pin": "mini"}, auto_remote=True)
     assert pinned.machine == "mini" and pinned.reason == "existing workspace"
-    chosen = choose({"pin": "local", "override": "box", "sandboxed": False})
-    assert chosen.machine == "box" and chosen.reason == "chosen"
+    # A verified checkout stays where it is; choosing another machine is refused.
+    with pytest.raises(
+        ValueError, match="^The existing workspace is on This machine; choose it or Auto$"
+    ):
+        choose({"pin": "local", "override": "box", "sandboxed": False})
+    with pytest.raises(ValueError, match="existing workspace is on Mac mini"):
+        choose({"pin": "mini", "override": "local"})
+    chosen = choose({"pin": "mini", "override": "mini"})
+    assert chosen.machine == "mini" and chosen.reason == "chosen"
     assert choose({"override": "local"}).machine is None
     assert choose({"override": "auto", "pin": "mini"}).machine == "mini"
     with pytest.raises(ValueError, match="Unknown machine nope"):
@@ -136,6 +143,19 @@ def test_override_bypasses_capacity_not_capability():
     off = {"off": machine("off", "Old box", enabled=False)}
     with pytest.raises(ValueError, match="Old box: disabled"):
         choose({"override": "off"}, off)
+
+
+def test_a_worker_not_yet_checked_is_left_to_explicit_choice():
+    loads = {"mini": load(pending=True), "local": load(agents=8)}
+    found = pl.exclusions({"sandboxed": False}, FLEET, loads, {}, NOW)
+    assert found == {"mini": pl.Exclusion("checking…", True)}
+    chosen = choose({"sandboxed": False}, loads=loads, auto_remote=True)
+    assert chosen.machine == "box"
+    chosen = choose({"override": "mini"}, loads=loads)
+    assert chosen.machine == "mini" and chosen.reason == "chosen; checking…"
+    # A hard reason outranks not knowing the load yet.
+    with pytest.raises(ValueError, match="^Linux box: lacks docker$"):
+        choose({"override": "box", "docker": True}, loads={"box": load(pending=True)})
 
 
 def test_no_fit_lists_every_machine():
