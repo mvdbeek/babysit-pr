@@ -147,7 +147,14 @@ def checkout(job, src):
         # The new worktree's branch and git dir can bring config the clone's listing never
         # sees, so its files are checked out by a reset that lists config inside it.
         git(clone, "worktree", "add", "--no-checkout", *add, timeout=120)
-        git(str(directory), "reset", "--hard", "--quiet", timeout=120)
+        try:
+            git(str(directory), "reset", "--hard", "--quiet", timeout=120)
+        except Exception:
+            # Left behind, the empty checkout would be reused with every file deleted.
+            git(clone, "worktree", "remove", "--force", str(directory), timeout=120)
+            if add[0] == "-b":
+                git(clone, "branch", "-D", job["branch"])
+            raise
     branch = git(str(directory), "rev-parse", "--abbrev-ref", "HEAD")
     if branch != job["branch"]:
         # A run may leave its checkout on another branch, such as one it opened a pull

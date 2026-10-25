@@ -385,6 +385,44 @@ def test_cron_checks_out_new_worktrees_running_nothing_their_config_names(branch
     assert not marker.exists()
 
 
+@pytest.fixture
+def refused_on_branch(planted):
+    """Config only a worktree on ``topic`` or ``feature`` sees, which safe_git refuses."""
+    clone, marker, git = planted
+    include = clone / ".git" / "refused.inc"
+    include.write_text(f"[lfs]\n\tstorage = {marker.parent / 'elsewhere'}\n")
+    for branch in ("topic", "feature"):
+        git("config", f"includeIf.onbranch:{branch}.path", str(include))
+    return planted
+
+
+def assert_no_checkout_left(git, directory, branch, kept):
+    assert not directory.exists()
+    assert str(directory) not in git("worktree", "list", "--porcelain")
+    assert bool(git("branch", "--list", branch)) == kept
+
+
+def test_wt_leaves_no_empty_worktree_when_its_checkout_fails(refused_on_branch, tmp_path):
+    clone, marker, git = refused_on_branch
+    tool = wt.Tool(wt.SubprocessRunner(os.environ), dict(os.environ))
+    for branch, kept in (("topic", False), ("feature", True)):
+        directory = tmp_path / "worktrees" / branch
+        with pytest.raises(wt.WtError, match="lfs.storage"):
+            tool.add_worktree(str(clone), str(directory), branch, "main")
+        assert_no_checkout_left(git, directory, branch, kept)
+    assert not marker.exists()
+
+
+def test_cron_leaves_no_empty_worktree_when_its_checkout_fails(refused_on_branch, tmp_path):
+    clone, marker, git = refused_on_branch
+    for branch, kept in (("topic", False), ("feature", True)):
+        job = {"clone": str(clone), "repo": "base/repo", "branch": branch, "base": "main"}
+        with pytest.raises(ValueError, match="lfs.storage"):
+            cron_agents.checkout(job, tmp_path / "src")
+        assert_no_checkout_left(git, tmp_path / "src" / "worktrees" / "repo" / branch, branch, kept)
+    assert not marker.exists()
+
+
 def test_status_and_diff_never_look_inside_submodules(planted, tmp_path):
     clone, marker, git = planted
     sub = tmp_path / "sub"

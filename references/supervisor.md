@@ -283,7 +283,8 @@ stay trusted.
 
 Config also depends on the worktree (`config.worktree`, `includeIf` on branch or git
 dir), so new worktrees are added with `--no-checkout` and filled by a reset run inside
-them, and the dashboard removes a worktree with `--force` only after its own hardened
+them (when that reset fails, the worktree and any branch just created for it are removed
+again, so no later run reuses an empty checkout), and the dashboard removes a worktree with `--force` only after its own hardened
 status there finds no changes, untracked files or submodules, as Git's check would
 (approved blockers skip that check, as before). `safe_git` refuses either command
 without those flags. Every command in a checkout with its own `.git` gets that checkout

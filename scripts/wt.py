@@ -889,7 +889,14 @@ class Tool:
         """
         create = ["-b", new_branch] if new_branch else []
         self.git_action(repo_path, "worktree", "add", "--no-checkout", *create, directory, commit)
-        self.git_action(directory, "reset", "--hard", "--quiet")
+        try:
+            self.git_action(directory, "reset", "--hard", "--quiet")
+        except Exception:
+            # Left behind, the empty checkout would be reused with every file deleted.
+            self.git_action(repo_path, "worktree", "remove", "--force", directory)
+            if new_branch:
+                self.git_action(repo_path, "branch", "-D", new_branch)
+            raise
 
     def default_branch(self, repo_path: str) -> str:
         """The branch ``origin/HEAD`` names, else ``main``."""
