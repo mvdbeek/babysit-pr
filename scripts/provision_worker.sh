@@ -908,6 +908,9 @@ user_step() {
   fi
   run "${SAFE_GIT[@]}" -C "$dest" fetch --quiet origin
   run "${SAFE_GIT[@]}" -C "$dest" checkout --quiet --detach "$sha"
+  # Marks this machine as a worker: watches are registered on the controller, never here.
+  run mkdir -p "$HOME/.config/babysit-pr"
+  write_file "$HOME/.config/babysit-pr/worker.json" 0600 "{\"version\": 1, \"app\": \"$dest\"}" || true
 
   say "Directories and PATH"
   run mkdir -p "$HOME/.cache/babysit-sandbox" "$HOME/.npm-global" "$HOME/.local/bin"

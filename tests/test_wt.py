@@ -863,6 +863,75 @@ def test_exit_when_done_records_nothing_when_the_agent_is_not_typed(tmp_path):
     assert watches(home) == []
 
 
+@pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
+def test_a_worker_hands_its_exit_watch_back_instead_of_recording_it(command, tmp_path):
+    assert wt.parse_args(command, ["--exit-watch-json", "7"]).exit_watch_json
+    runner = herdr_open({"already_open": False, "root_pane": {"pane_id": "w4:p1"}})
+    home = tmp_path / "state"
+    env = {"HOME": str(tmp_path), "WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)}
+    # The worker's own state home is never opened: the controller records the watch.
+    home.write_text("")
+    t = tool(runner, env)
+    t.check_exit_when_done(options(prompt="Review", exit_watch_json=True), command)
+    (tmp_path / "wt").mkdir()
+    t.open_session(
+        options(agent="codex", prompt="Review", exit_when_done=True, exit_watch_json=True),
+        str(tmp_path / "wt"),
+        "review-pr-7",
+        "/clone",
+    )
+    watch = json.loads(t.stdout.getvalue())
+    assert {k: watch[k] for k in ("label", "path", "workspace_id", "pane_id", "agent")} == {
+        "label": "review-pr-7",
+        "path": str((tmp_path / "wt").resolve()),
+        "workspace_id": "w4",
+        "pane_id": "w4:p1",
+        "agent": "codex",
+    }
+    assert re.fullmatch(r"\[babysit-done:[0-9a-f]{16}\]", watch["marker"])
+    assert watch["exit"]["state"] == "watching"
+    assert runner.calls[-1][0][:4] == ["herdr", "pane", "run", "w4:p1"]
+    # Nothing is handed back for an agent that was never typed.
+    runner = herdr_open({"root_pane": {"pane_id": "w1:p1"}})
+    runner.results.append((["herdr", "pane", "run"], wt.Completed(1, "", "gone")))
+    t = tool(runner, env)
+    with pytest.raises(wt.WtError, match="pane run failed"):
+        t.open_session(
+            options(prompt="Fix", exit_when_done=True, exit_watch_json=True), "/wt/x", "x", "/c"
+        )
+    assert t.stdout.getvalue() == ""
+
+
+@pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
+def test_exit_when_done_on_a_worker_needs_the_controller_to_record_it(command, tmp_path):
+    runner = FakeRunner(executables={"herdr"})
+    env = {"HOME": str(tmp_path), "WT_MULTIPLEXER": "herdr"}
+    argv = ["--exit-when-done", "-p", "go", "7"]
+    with pytest.raises(wt.WtError, match="worker machine needs --exit-watch-json"):
+        tool(runner, {**env, "BABYSIT_WORKER": "box"}).run(command, argv)
+    (tmp_path / ".config" / "babysit-pr").mkdir(parents=True)
+    (tmp_path / ".config" / "babysit-pr" / "worker.json").write_text("{}")
+    with pytest.raises(wt.WtError, match="worker machine needs --exit-watch-json"):
+        tool(runner, env).run(command, argv)
+    with pytest.raises(wt.UsageError, match="--exit-watch-json needs --exit-when-done"):
+        tool(runner, env).run(command, ["--exit-watch-json", "-p", "go", "7"])
+    assert runner.calls == []
+
+
+def test_gpg_lets_a_bwrap_agent_sign(monkeypatch):
+    monkeypatch.setattr(wt.sandbox, "DEFAULT", "bwrap")
+    assert wt.parse_args("wt", ["--gpg", "--name", "n"]).gpg
+    t = tool()
+    line = t.command_for(options(agent="codex", gpg=True), directory="/wt/x")
+    assert " --enable=gpg " in line
+    assert " --enable=gpg " not in t.command_for(options(agent="codex"), directory="/wt/x")
+    # Safehouse has no gpg option: signing there follows the user's own configuration.
+    monkeypatch.setattr(wt.sandbox, "DEFAULT", "safehouse")
+    assert t.command_for(options(agent="codex", gpg=True)) == (
+        "codex -c check_for_update_on_startup=false"
+    )
+
+
 def test_tmux_session_plan_new_session_detached_hint():
     runner = FakeRunner([(["tmux", "has-session"], wt.Completed(1, "", ""))], executables={"tmux"})
     t = tool(runner, {"WT_MULTIPLEXER": "tmux"})

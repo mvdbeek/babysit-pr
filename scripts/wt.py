@@ -90,6 +90,8 @@ DASHBOARD_OPTIONS = frozenset(
         "--github-repo",
         "--worktree-root",
         "--agent-arg",
+        "--gpg",
+        "--exit-watch-json",
     }
 )
 OPTIONS = {
@@ -134,6 +136,9 @@ dashboard options (a new branch from the remote default branch unless <base> is 
   wt --name <branch> [--repo-path <clone>] [--worktree-root <dir>] [--label <label>]
      [--no-focus] [--agent-arg <word>]... [<base>]
   --agent-arg <word>      append one word to the agent command line (repeatable)
+  --gpg                   let the sandboxed agent sign commits (babysit-bwrap --enable=gpg)
+  --exit-watch-json       with --exit-when-done, print the exit watch as JSON instead of
+                          recording it (a worker, for the dashboard that launched it)
 
 The prompt only applies to a session being created; if one is already running for
 the worktree it is reattached and the prompt is ignored (with a warning).
@@ -185,6 +190,9 @@ options:
   --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
                           the GitHub token (others only when typed in a terminal)
   --worktree-root <path>  parent directory for the new checkout
+  --gpg                   let the sandboxed agent sign commits (babysit-bwrap --enable=gpg)
+  --exit-watch-json       with --exit-when-done, print the exit watch as JSON instead of
+                          recording it (a worker, for the dashboard that launched it)
   -h, --help    show this help
 """
 
@@ -217,6 +225,9 @@ options:
   --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
                           the GitHub token (others only when typed in a terminal)
   --worktree-root <path>  parent directory for the new checkout
+  --gpg                   let the sandboxed agent sign commits (babysit-bwrap --enable=gpg)
+  --exit-watch-json       with --exit-when-done, print the exit watch as JSON instead of
+                          recording it (a worker, for the dashboard that launched it)
   -h, --help    show this help
 """
 
@@ -271,6 +282,8 @@ class Options:
         "also",
         "also_checkouts",
         "exit_when_done",
+        "exit_watch_json",
+        "gpg",
         "positional",
     )
 
@@ -294,6 +307,9 @@ class Options:
         self.also: list[str] = []
         self.also_checkouts: list[AlsoCheckout] = []
         self.exit_when_done = False
+        # On a worker: print the exit watch for the controller instead of recording it.
+        self.exit_watch_json = False
+        self.gpg = False
         self.positional: list[str] = []
 
 
@@ -334,6 +350,10 @@ def parse_args(
             options.focus = False
         elif flag == "--exit-when-done":
             options.exit_when_done = True
+        elif flag == "--exit-watch-json":
+            options.exit_watch_json = True
+        elif flag == "--gpg":
+            options.gpg = True
         else:
             if len(args) < 2 or not args[1]:
                 raise WtError(f"{command}: {flag} needs a value")
@@ -1114,6 +1134,7 @@ class Tool:
                 bool(options.claude_account),
                 also=options.also_checkouts,
                 directory=directory,
+                features=("gpg",) if options.gpg else (),
             )
         except ValueError as exc:
             raise WtError(f"wt: {exc}") from exc
@@ -1185,7 +1206,7 @@ class Tool:
             # Last, after any --with note: the brief asks for the marker as the final line.
             options.prompt += exit_watch.brief(marker)
         command = self.command_for(options, directory=directory)
-        if options.exit_when_done:
+        if options.exit_when_done and not options.exit_watch_json:
             # Recorded before the command is typed, so no agent waits on an unsaved watch.
             watch = self.watch_exit(options, directory, name, reply, marker)
         # No spare terminal split here: reviewr's auto_open is off, so the workspace
@@ -1199,6 +1220,13 @@ class Tool:
         if result.returncode:
             self.forget_watch(watch)
             raise WtError(f"wt: herdr pane run failed: {result.stderr.strip()}".rstrip(": "))
+        if options.exit_when_done and options.exit_watch_json:
+            # Only for an agent that was typed: the controller records it once wt returns.
+            print(
+                json.dumps(self.exit_record(options, directory, name, reply, marker)),
+                file=self.stdout,
+                flush=True,
+            )
 
     def forget_watch(self, watch: str | None) -> None:
         if watch:
@@ -1213,13 +1241,27 @@ class Tool:
         self, options: Options, directory: str, name: str, reply: HerdrOpen, marker: str
     ) -> str:
         """Record the exit watch the dashboard follows for the agent about to be typed."""
+        import exit_watch
+
+        watch = self.exit_record(options, directory, name, reply, marker)
+        try:
+            exit_watch.register(self.babysit_home, watch)
+        except OSError as exc:
+            raise WtError(
+                f"wt: could not record the exit watch in {self.babysit_home}: {exc}"
+            ) from None
+        return str(watch["id"])
+
+    def exit_record(
+        self, options: Options, directory: str, name: str, reply: HerdrOpen, marker: str
+    ) -> dict[str, object]:
         import time
         import uuid
 
         import exit_watch
 
         now = time.time()
-        watch = {
+        return {
             "id": uuid.uuid4().hex,
             "label": sanitize_session_name(options.label or name),
             "path": os.path.realpath(directory),
@@ -1231,13 +1273,6 @@ class Tool:
             "created_at": now,
             "exit": exit_watch.watching(now),
         }
-        try:
-            exit_watch.register(self.babysit_home, watch)
-        except OSError as exc:
-            raise WtError(
-                f"wt: could not record the exit watch in {self.babysit_home}: {exc}"
-            ) from None
-        return watch["id"]
 
     def session_tmux(self, options: Options, directory: str, name: str) -> None:
         session = sanitize_session_name(name)
@@ -1562,9 +1597,18 @@ class Tool:
         self.open_session(options, directory, local_branch, repo_path)
 
     def check_exit_when_done(self, options: Options, command: str) -> None:
-        """Refuse ``--exit-when-done`` before anything is made when it cannot work."""
+        """Refuse ``--exit-when-done`` before anything is made when it cannot work.
+
+        A worker machine's own state home has no dashboard following it: there the watch
+        is printed for the controller that launched ``wt`` (``--exit-watch-json``).
+        """
         if not options.prompt:
             raise UsageError(command, f"{command}: --exit-when-done needs a prompt (-p or -F)")
+        if not options.exit_watch_json and self.on_worker():
+            raise WtError(
+                f"{command}: --exit-when-done on a worker machine needs --exit-watch-json: "
+                "the controller's dashboard follows its watch"
+            )
         import exit_watch
 
         mux = self.multiplexer()
@@ -1581,6 +1625,8 @@ class Tool:
                 f"{command}: --exit-when-done needs herdr ({reason}): "
                 "the dashboard finds, exits and closes the agent through its herdr pane"
             )
+        if options.exit_watch_json:
+            return
         try:
             with exit_watch.connect(self.babysit_home):
                 pass
@@ -1589,8 +1635,15 @@ class Tool:
                 f"{command}: --exit-when-done cannot record its watch in {self.babysit_home}: {exc}"
             ) from None
 
+    def on_worker(self) -> bool:
+        """Whether this is a worker machine: provisioning marks it, and launches say so."""
+        marker = os.path.join(self.home, ".config", "babysit-pr", "worker.json")
+        return bool(self.env.get("BABYSIT_WORKER")) or os.path.exists(marker)
+
     def run(self, command: str, argv: Sequence[str]) -> None:
         options = parse_args(command, argv)
+        if options.exit_watch_json and not options.exit_when_done:
+            raise UsageError(command, f"{command}: --exit-watch-json needs --exit-when-done")
         if options.exit_when_done:
             self.check_exit_when_done(options, command)
         options.also = [self.also_clone(value, command) for value in options.also]

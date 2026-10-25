@@ -4,6 +4,7 @@ Every tool the script could change a system or reach the network with is a fake 
 records its call, and the dry runs must leave that record empty.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -162,6 +163,8 @@ def test_user_step_dry_run_pins_the_checkout(run):
     assert re.search(rf"git {SAFE_GIT} -C \S*{app} checkout --quiet --detach {sha}", done.stdout)
     assert "src/babysit-pr" not in done.stdout
     assert ".cache/babysit-sandbox" in done.stdout
+    # The mark that keeps the worker from registering watches of its own.
+    assert re.search(r"would write \S*/\.config/babysit-pr/worker\.json \(mode 0600\)", done.stdout)
     assert "codex login --device-auth" in done.stdout
     assert "claude-account login <name>" in done.stdout
 
@@ -269,6 +272,12 @@ def test_user_step_moves_path_from_the_old_clone_to_the_deployed_copy(tmp_path):
     assert "src/babysit-pr" not in bashrc, done.stdout + done.stderr
     assert "$HOME/.local/share/babysit-pr/app/scripts:$PATH" in bashrc
     assert bashrc.count("# babysit-pr worker PATH") == 1 and "# Ubuntu's own" in bashrc
+    marker = home / ".config/babysit-pr/worker.json"
+    assert json.loads(marker.read_text()) == {
+        "version": 1,
+        "app": str(home / ".local/share/babysit-pr/app"),
+    }
+    assert marker.stat().st_mode & 0o777 == 0o600
     assert all(
         SAFE_GIT in line for line in calls.read_text().splitlines() if line.startswith("git -")
     )
