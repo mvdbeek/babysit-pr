@@ -265,6 +265,11 @@ def test_wrap_gives_each_backend_the_same_grants():
         *argv,
     ]
     assert sandbox.wrap(argv, grants, "none") == argv
+    # Only babysit-bwrap takes gpg; Safehouse launches stay exactly as before.
+    signing = grants._replace(features=("docker", "gpg"))
+    assert sandbox.wrap(argv, signing, "bwrap")[3] == "--enable=docker,gpg"
+    assert sandbox.wrap(argv, signing, "safehouse")[3] == "--enable=docker"
+    assert sandbox.wrap(argv, sandbox.Grants(features=("gpg",)), "safehouse")[1:] == ["--", *argv]
     assert sandbox.wrap(argv, sandbox.Grants(), "bwrap")[1:] == ["--", *argv]
     with pytest.raises(ValueError, match="contains ':'"):
         sandbox.wrap(argv, sandbox.Grants(add_dirs=("/a:b",)), "bwrap")
@@ -671,6 +676,82 @@ def test_wrapper_grants_only_a_rootless_docker_socket(checkout):
         assert message in refused(worktree, env, "--enable=docker", "--", "x")
 
 
+@pytest.fixture
+def gnupg(checkout, tmp_path):
+    """A ~/.gnupg with secrets, a gpg-agent socket and a gpgconf that names it."""
+    _, _, home = checkout
+    gnupghome = home / ".gnupg"
+    (gnupghome / "private-keys-v1.d").mkdir(parents=True)
+    (gnupghome / "private-keys-v1.d" / "GRIP.key").write_text("secret key")
+    for name in ("pubring.kbx", "trustdb.gpg", "signing-subkey.pass", "gpg-agent.conf"):
+        (gnupghome / name).write_text(name)
+    fakes = tmp_path / "gpgconf-bin"
+    fakes.mkdir()
+    # Unix socket paths are short; tmp_path can exceed the limit on macOS.
+    with tempfile.TemporaryDirectory(dir="/tmp") as runtime:
+        sockets = Path(runtime) / "gnupg"
+        sockets.mkdir()
+        path = sockets / "S.gpg-agent"
+        # Answers only for the default home, as babysit-bwrap must ask.
+        (fakes / "gpgconf").write_text(
+            '#!/bin/sh\n[ "$*" = "--list-dirs agent-socket" ] && [ -z "${GNUPGHOME+set}" ] || '
+            f"exit 1\necho {path}\n"
+        )
+        (fakes / "gpgconf").chmod(0o755)
+        server = socket.socket(socket.AF_UNIX)
+        try:
+            server.bind(str(path))
+            env = environment(home, GNUPGHOME="/elsewhere")
+            env["PATH"] = f"{fakes}:{env['PATH']}"
+            yield env, path
+        finally:
+            server.close()
+
+
+def test_wrapper_gives_gpg_the_agent_socket_and_public_keyring_only(checkout, gnupg):
+    worktree, _, home = checkout
+    env, path = gnupg
+    assert "S.gpg-agent" not in " ".join(printed(worktree, env, "agent"))
+    argv = printed(worktree, env, "--env-pass=GNUPGHOME", "--enable=gpg", "agent")
+    gnupghome = str(home / ".gnupg")
+    assert (str(path), str(path)) in pairs(argv, "--bind")
+    # --perms MODE --file FD TARGET and --perms MODE --dir TARGET, in order.
+    made = [tuple(argv[i + 1 : i + 5]) for i, word in enumerate(argv) if word == "--perms"]
+    copies = {words[3]: words[0] for words in made if words[1] == "--file"}
+    names = ("gpg.conf", "pubring.kbx", "trustdb.gpg")
+    assert copies == {f"{gnupghome}/{name}": "0600" for name in names}
+    # Private to the user, or gpg would look for the socket in the home instead.
+    dirs = [(words[2], words[0]) for words in made if words[1] == "--dir"]
+    assert dirs == [(str(p), "0700") for p in (gnupghome, path.parent.parent, path.parent)]
+    # Even a passed-through GNUPGHOME cannot point gpg elsewhere.
+    assert dict(pairs(argv, "--setenv"))["GNUPGHOME"] == gnupghome
+    joined = "\0".join(argv)
+    for secret in ("private-keys-v1.d", "signing-subkey.pass", "gpg-agent.conf", "GRIP.key"):
+        assert secret not in joined
+    for other in ("S.gpg-agent.extra", "S.gpg-agent.browser", "S.gpg-agent.ssh"):
+        assert other not in joined
+
+
+def test_wrapper_refuses_gpg_without_an_agent_socket_or_keyring(checkout, gnupg):
+    worktree, _, home = checkout
+    env, path = gnupg
+    path.unlink()
+    assert f"no gpg-agent socket at {path}" in refused(worktree, env, "--enable=gpg", "x")
+    path.write_text("")  # not a socket either
+    assert "no gpg-agent socket" in refused(worktree, env, "--enable=gpg", "x")
+    path.unlink()
+    server = socket.socket(socket.AF_UNIX)
+    try:
+        server.bind(str(path))
+        (home / ".gnupg/pubring.kbx").unlink()
+        assert "no public keyring" in refused(worktree, env, "--enable=gpg", "x")
+    finally:
+        server.close()
+    env["PATH"] = f"{FAKE_BWRAP / 'path'}:/usr/bin:/bin"
+    if not shutil.which("gpgconf", path=env["PATH"]):
+        assert "gpgconf is not installed" in refused(worktree, env, "--enable=gpg", "x")
+
+
 @pytest.mark.parametrize(
     ("options", "message"),
     [
@@ -743,3 +824,26 @@ def test_bwrap_shows_the_docker_socket_only_when_enabled(checkout):
         finally:
             server.close()
     assert visible == [1, 0]
+
+
+@linux_bwrap
+def test_bwrap_shows_gpg_its_throwaway_home_and_the_agent_socket(checkout, gnupg):
+    worktree, _, home = checkout
+    env, path = gnupg
+    env["PATH"] = env["PATH"].replace(f"{FAKE_BWRAP / 'path'}:", "")
+    script = (
+        'test "$GNUPGHOME" = "$HOME/.gnupg" && test -S ' + str(path) + " && "
+        'test "$(ls "$GNUPGHOME" | tr "\\n" " ")" = "gpg.conf pubring.kbx trustdb.gpg " && '
+        'grep -qx no-autostart "$GNUPGHOME/gpg.conf" && '
+        'test "$(cat "$GNUPGHOME/pubring.kbx")" = pubring.kbx && '
+        f"test ! -e {path.parent}/S.gpg-agent.extra"
+    )
+    result = subprocess.run(
+        ["bash", WRAPPER, f"--add-dirs={worktree}", "--enable=gpg", "--", "sh", "-c", script],
+        cwd=worktree,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

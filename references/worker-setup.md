@@ -9,8 +9,9 @@ user, behind `scripts/babysit-bwrap` (see the Linux sandbox part of
 `scripts/provision_worker.sh` does the machine side in two idempotent steps. Rerun
 either one after changing a pin or fixing a reported problem. It exits 0 when every
 check passed, 1 when it printed a `PROBLEM`, 2 on misuse. `--dry-run` prints the
-planned actions without changing anything or touching the network; `--check` (as
-root) only runs the host checks.
+planned actions without changing anything or touching the network; `--check` only
+runs the checks: the host checks as root, the user step's checks (bwrap, rootless
+Docker, commit signing when set up) as `babysit`.
 
 ## 1. Before you start
 
@@ -180,14 +181,137 @@ The worker's `gh` login is used only by agents and git on the worker; the contro
 keeps polling GitHub with its own. Prefer a fine-grained token or a separate GitHub
 account limited to the repositories babysit works on.
 
-**Commit signing.** There is no 1Password SSH agent on the box, and `~/.ssh` is never
-visible inside the sandbox, so a sandboxed agent cannot sign. Set
-`git config --global commit.gpgsign false` (with `gpgsign true` every sandboxed commit
-fails) and accept unsigned worker commits where branch protection allows. If a
-repository requires signatures, create a worker-only key outside the sandbox
-(`ssh-keygen -t ed25519 -f ~/.ssh/babysit_signing`, `gpg.format ssh`,
-`user.signingkey`, registered on GitHub as a signing key) and re-sign the agent's
-commits from an unsandboxed shell before pushing, or push from the controller.
+**Commit signing.** There is no 1Password SSH agent on the box, and `~/.ssh` and
+`~/.gnupg` are never visible inside the sandbox. Either set
+`git config --global commit.gpgsign false` (with `gpgsign true` and no signing set
+up, every sandboxed commit fails) and accept unsigned worker commits where branch
+protection allows, or give the worker a GPG signing subkey as below.
+
+### Signing with a GPG subkey
+
+The worker holds only a dedicated signing subkey of your key; the primary stays on the
+Mac, so the worker can sign but cannot certify, add or revoke keys. gpg-agent keeps
+the subkey unlocked, and `babysit-bwrap --enable=gpg` lets a sandboxed agent reach that
+agent's socket without seeing `~/.gnupg`.
+
+1. On the Mac, add a signing subkey valid for a year:
+
+   ```sh
+   gpg --list-secret-keys --keyid-format long you@example.com   # PRIMARY: its fingerprint
+   gpg --quick-add-key PRIMARY ed25519 sign 1y
+   gpg --list-keys --with-subkey-fingerprint PRIMARY             # SUB: the new [S] subkey
+   ```
+
+2. Export that subkey's secret alone; the trailing `!` limits the export to exactly
+   `SUB`, and the primary goes along only as a stub (`sec#`). gpg asks for the key's
+   passphrase, and the exported subkey keeps it:
+
+   ```sh
+   gpg --armor --export-secret-subkeys 'SUB!' > worker-subkey.asc
+   scp worker-subkey.asc babysit@<box>: && rm worker-subkey.asc
+   ```
+
+3. Import it in an interactive session: the worker's gpg-agent asks for the passphrase
+   through pinentry to store the key, so it needs a terminal and `GPG_TTY`:
+
+   ```sh
+   ssh -t babysit@<box>
+   export GPG_TTY=$(tty)
+   gpg --import ~/worker-subkey.asc && shred -u ~/worker-subkey.asc
+   gpg -K --with-keygrip     # sec# (stub primary), ssb [S]: note the subkey's Keygrip
+   ```
+
+4. Keep the passphrase and unlock the subkey at startup. Removing it does not work
+   here: `gpg --passwd` (like `passwd` in `gpg --edit-key`) starts with the primary
+   key, whose secret is only a stub on the worker, and fails before reaching the
+   subkey; and the confirmation gpg should show for an empty passphrase never appeared
+   in practice. Instead gpg-agent accepts a preset passphrase. On Ubuntu
+   `/usr/bin/pinentry` points (through alternatives) at `pinentry-gnome3`, which needs a
+   desktop session, so name the curses one; `~/.gnupg/gpg-agent.conf`:
+
+   ```text
+   pinentry-program /usr/bin/pinentry-curses
+   allow-preset-passphrase
+   ```
+
+   Then `gpgconf --reload gpg-agent` (`apt install pinentry-curses` if it is missing).
+   Store the passphrase, mode 600, without echoing it or leaving it in shell history:
+
+   ```sh
+   (umask 077 && read -rs pass && printf '%s\n' "$pass" > ~/.gnupg/signing-subkey.pass)
+   ```
+
+   and add `~/.config/systemd/user/babysit-gpg-preset.service`, with the subkey's
+   keygrip from step 3:
+
+   ```ini
+   [Unit]
+   Description=Unlock the worker signing subkey in gpg-agent
+   Requires=gpg-agent.socket
+   After=gpg-agent.socket
+   ConditionPathExists=%h/.gnupg/signing-subkey.pass
+
+   [Service]
+   Type=oneshot
+   ExecStart=/bin/sh -c "/usr/lib/gnupg/gpg-preset-passphrase --preset KEYGRIP < %h/.gnupg/signing-subkey.pass"
+
+   [Install]
+   WantedBy=default.target
+   ```
+
+   ```sh
+   systemctl --user daemon-reload
+   systemctl --user enable --now babysit-gpg-preset.service
+   ```
+
+   The system step enables lingering, so the unit runs when `babysit`'s user manager
+   starts at boot. A preset passphrase lasts until gpg-agent exits; after
+   `gpgconf --kill gpg-agent` or an agent restart, run
+   `systemctl --user restart babysit-gpg-preset.service`.
+
+5. Point git at the subkey (the `!` again forces exactly that subkey):
+
+   ```sh
+   git config --global user.signingkey 'SUB!'
+   git config --global commit.gpgsign true
+   git config --global tag.gpgsign true
+   git config --global gpg.program gpg
+   ```
+
+6. GitHub verifies signatures against the public key as uploaded, which does not yet
+   contain the new subkey. On the Mac, `gpg --armor --export PRIMARY`, then delete the
+   old key in GitHub's SSH and GPG keys settings and add the new export. Until then the
+   worker's commits show as unverified.
+
+7. Check, as `babysit`:
+   `ssh babysit@<box> 'bash -s -- --check' < scripts/provision_worker.sh`. With
+   `~/.gnupg/signing-subkey.pass` and `user.signingkey` present it verifies that the
+   preset unit is enabled, that gpg signs without a prompt, and that a throwaway commit
+   made inside `babysit-bwrap --enable=gpg` passes `git verify-commit`. It prints no key
+   material.
+
+Sandboxed agents sign only with `--enable=gpg`. babysit-bwrap then mounts a throwaway
+`~/.gnupg` on the sandbox's tmpfs holding copies of `pubring.kbx` and `trustdb.gpg`
+and a `gpg.conf` with `no-autostart`, plus the agent's standard socket (from
+`gpgconf --list-dirs agent-socket`) at the same path, so gpg inside finds it; never the
+private keys, the passphrase file, `gpg-agent.conf` or the extra, browser and ssh
+sockets. `~/.gitconfig` is already mounted read-only, so the signing configuration
+applies inside. In babysit this is the `gpg` feature of a launch's grants
+(`sandbox.Grants(features=("gpg",))`); once the machine registry lands, the worker's
+`gpg` label in `machines.json` turns it on for that machine's launches.
+
+**Renewal.** Before the subkey expires, on the Mac:
+`gpg --quick-set-expire PRIMARY 1y SUB`. The expiry lives in the public key, so
+re-upload `gpg --armor --export PRIMARY` to GitHub as in step 6 and refresh the
+worker's copy: `gpg --export PRIMARY | ssh babysit@<box> gpg --import`. Sandboxes copy
+the public keyring at each launch.
+
+**Revocation.** If the worker is lost or retired, on the Mac run
+`gpg --edit-key PRIMARY`, select the subkey (`key N`), `revkey`, `save`; re-upload the
+public key to GitHub and import it wherever the key is verified. On a worker you still
+control, also `systemctl --user disable --now babysit-gpg-preset.service`,
+`shred -u ~/.gnupg/signing-subkey.pass`, `gpg --delete-secret-keys 'SUB!'` and
+`git config --global --unset user.signingkey`.
 
 **Installers.** herdr's documented `curl -fsSL https://herdr.dev/install.sh | sh` and
 Claude Code's `curl -fsSL https://claude.ai/install.sh | bash` are not used: the
@@ -235,7 +359,8 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    ```
 
    `labels` are the capabilities placement filters on: `bwrap` (the Linux sandbox
-   works), `docker` (rootless Docker is set up and the agent may be given it),
+   works), `docker` (rootless Docker is set up and the agent may be given it), `gpg`
+   (the signing subkey is set up and agents get `--enable=gpg`),
    `claude-account:<name>` for each named Claude login on that machine. Paths are the
    worker's own; never copy `/Users/...` paths into worker records.
 
@@ -262,6 +387,10 @@ From the Linux sandbox section of the supervisor reference, restated for operato
 - **Rootless Docker gives up the filesystem boundary.** With `--enable=docker`,
   `docker run -v $HOME:/h` reaches every file `babysit` owns. Grant Docker only to
   agents you would trust with that, and keep nothing personal in the account.
+- **gpg-agent is a signing oracle.** With `--enable=gpg` an agent can have the agent
+  sign arbitrary data, not only its own commits, for as long as it runs, as on macOS.
+  It never gets the key itself; revoke the subkey (above) if the worker is
+  compromised.
 - **Git directories stay writable**, so hooks an agent leaves in a worktree's git
   directory run when git is later used there outside the sandbox.
 - **bubblewrap 0.9.0** keeps the bind-by-path race unless upgraded (above).

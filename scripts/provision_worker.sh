@@ -12,9 +12,11 @@
 #
 #   ssh babysit@box 'bash -s -- --user-step --sha <controller babysit-pr SHA>' \
 #     < scripts/provision_worker.sh
+#   ssh babysit@box 'bash -s -- --check' < scripts/provision_worker.sh
 #
 # Options:
-#   --check       change nothing; run only the host checks and report
+#   --check       change nothing; run only the host checks (as root) or the user
+#                 checks, including commit signing when set up (as the babysit user)
 #   --dry-run     change nothing and touch no network; print the planned actions
 #   --user-step   run the non-root step as the babysit user (needs --sha)
 #   --sha SHA     full 40-hex babysit-pr commit to check out in ~/src/babysit-pr (user step)
@@ -713,6 +715,64 @@ EOF
 
 # --- user step -------------------------------------------------------------------------
 
+# Commit signing through the worker's signing subkey (references/worker-setup.md), when
+# it is set up: the agent is unlocked at login, signs directly, and signs a commit made
+# inside babysit-bwrap --enable=gpg. Prints no key material and never the passphrase.
+gpg_checks() {
+  local key wrapper tmp result
+  key=$(git config --global user.signingkey 2>/dev/null) || key=
+  if [[ ! -f $HOME/.gnupg/signing-subkey.pass || -z $key ]]; then
+    ok "commit signing not set up (no ~/.gnupg/signing-subkey.pass or user.signingkey)"
+    return 0
+  fi
+  if systemctl --user is-enabled --quiet babysit-gpg-preset.service 2>/dev/null; then
+    ok "babysit-gpg-preset.service is enabled"
+  else
+    problem "babysit-gpg-preset.service is not enabled; the agent stays locked after login"
+  fi
+  if gpg --batch --no-tty --pinentry-mode error --local-user "$key" --detach-sign \
+    </dev/null >/dev/null 2>&1; then
+    ok "gpg signs with user.signingkey"
+  else
+    problem "gpg cannot sign with user.signingkey without a prompt; is the preset unit's passphrase right?"
+  fi
+  wrapper=$(command -v babysit-bwrap) || wrapper=$HOME/src/babysit-pr/scripts/babysit-bwrap
+  tmp=$(mktemp -d)
+  # A cd, since the sandbox starts in the caller's directory.
+  if git init -q "$tmp" && (cd "$tmp" && "$wrapper" --enable=gpg --add-dirs="$tmp" -- \
+    git -c commit.gpgsign=true commit -q --allow-empty -m "babysit signing check") \
+    </dev/null >/dev/null 2>&1; then
+    if git -C "$tmp" verify-commit HEAD >/dev/null 2>&1; then
+      result=ok
+    else
+      result="signs, but git verify-commit rejects the signature"
+    fi
+  else
+    result="cannot commit signed inside $wrapper --enable=gpg"
+  fi
+  rm -rf "$tmp"
+  if [[ $result == ok ]]; then
+    ok "a commit signed inside babysit-bwrap --enable=gpg verifies"
+  else
+    problem "$result"
+  fi
+}
+
+user_checks() {
+  say "Checks"
+  if (cd / && bwrap --ro-bind / / true) >/dev/null 2>&1; then
+    ok "bwrap works"
+  else
+    problem "bwrap --ro-bind / / true fails; rerun the system step"
+  fi
+  if grep -q rootless <<<"$(docker info --format '{{.SecurityOptions}}' 2>/dev/null)"; then
+    ok "docker is rootless"
+  else
+    problem "docker info does not report a rootless daemon"
+  fi
+  gpg_checks
+}
+
 user_step() {
   local dest=$HOME/src/babysit-pr codex=${CODEX_VERSION:-$CODEX_DEFAULT}
   [[ -n $sha ]] || {
@@ -769,19 +829,7 @@ user_step() {
     warn "no git identity; set one (below) before agents commit"
   fi
 
-  if ((!dry)); then
-    say "Checks"
-    if (cd / && bwrap --ro-bind / / true) >/dev/null 2>&1; then
-      ok "bwrap works"
-    else
-      problem "bwrap --ro-bind / / true fails; rerun the system step"
-    fi
-    if grep -q rootless <<<"$(docker info --format '{{.SecurityOptions}}' 2>/dev/null)"; then
-      ok "docker is rootless"
-    else
-      problem "docker info does not report a rootless daemon"
-    fi
-  fi
+  ((dry)) || user_checks
 
   cat <<EOF
 
@@ -789,7 +837,7 @@ Next steps on this machine (interactive; nothing here pipes an installer into a 
   . ~/.bashrc
   git config --global user.name  "Your Name"          # if not set above
   git config --global user.email "you@example.com"
-  git config --global commit.gpgsign false            # no 1Password agent here; or set up a worker key
+  git config --global commit.gpgsign false            # or a signing subkey (worker-setup.md)
   gh auth login --hostname github.com --git-protocol https
   gh auth setup-git
   npm install -g @openai/codex@$codex                 # npm checks the registry's sha512 integrity
@@ -806,11 +854,12 @@ EOF
 case $mode in
   user) user_step ;;
   check)
+    # Root inspects the host and other users; the worker user checks its own setup.
     if ((!dry)) && ((EUID != 0)); then
-      printf 'provision_worker: --check runs as root (it inspects other users)\n' >&2
-      exit 2
+      user_checks
+    else
+      run_checks
     fi
-    run_checks
     finish
     ;;
   *) system_step ;;

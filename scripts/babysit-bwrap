@@ -2,7 +2,7 @@
 # Linux agent sandbox: bubblewrap behind Agent Safehouse's grant options.
 #
 #   babysit-bwrap [--add-dirs=A:B] [--claude-config-dir=D | --codex-home=D]
-#                 [--env-pass=X,Y] [--enable=docker,playwright] [--print-argv] [--] command...
+#                 [--env-pass=X,Y] [--enable=docker,playwright,gpg] [--print-argv] [--] command...
 #
 # Deny by default: a read-only system, an empty $HOME, and writes only to --add-dirs (the
 # caller passes the worktree and its git common directory there), the one agent
@@ -12,8 +12,9 @@
 # Every writable path must be absolute and is resolved first; home, its ancestors and
 # protected paths are refused. The environment is cleared except for a small baseline,
 # the agent configuration variable, the cache variables and the --env-pass names that
-# are set. The network is shared. Where bwrap has --bind-fd (0.10.0 and later), each
-# writable directory is opened once, checked through its descriptor and bound by it, so
+# are set. The network is shared. --enable=gpg lets git sign through this user's
+# gpg-agent without exposing ~/.gnupg (see below). Where bwrap has --bind-fd (0.10.0
+# and later), each writable directory is opened once, checked through its descriptor and bound by it, so
 # a path swapped after the check cannot redirect the bind. --print-argv prints the bwrap
 # argv, NUL-separated, instead of running it.
 set -euo pipefail
@@ -28,6 +29,7 @@ env_pass=()
 config_var=
 config_dir=
 docker=0
+gpg=0
 print=0
 tiocsti=/proc/sys/dev/tty/legacy_tiocsti
 while (($#)); do
@@ -55,6 +57,7 @@ while (($#)); do
       for feature in ${more[@]+"${more[@]}"}; do
         case $feature in
           docker) docker=1 ;;
+          gpg) gpg=1 ;;
           # Accepted like Safehouse's playwright-chrome: Chromium needs nothing beyond
           # the always-present /dev/shm and the sandbox's own browser cache.
           playwright | playwright-chrome) ;;
@@ -190,6 +193,38 @@ for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   [[ -z $real ]] || grant "$real"
 done
 
+if ((gpg)); then
+  # Signing through this user's gpg-agent, and nothing else of ~/.gnupg (protected, so
+  # never bound): a throwaway home on the sandbox's tmpfs holding copies of the public
+  # keyring and trust database and a gpg.conf that never starts an agent inside, plus
+  # the agent's standard socket. Private keys, any passphrase file and the agent's own
+  # configuration stay outside; the agent signs whatever the sandbox asks while it is
+  # unlocked. Copies, so gpg may lock and update them without touching the originals.
+  command -v gpgconf >/dev/null || die "gpgconf is not installed"
+  gnupghome=$home/.gnupg
+  # The default home's socket, whatever GNUPGHOME the caller passes: the sandbox uses
+  # that same home path, so gpg there derives this same socket path.
+  socket=$(env -u GNUPGHOME gpgconf --list-dirs agent-socket) || die "gpgconf cannot name the gpg-agent socket"
+  [[ $socket == /* ]] || die "refusing the relative gpg-agent socket $socket"
+  [[ -S $socket ]] || die "no gpg-agent socket at $socket"
+  [[ -O $socket ]] || die "refusing $socket, which belongs to another user"
+  [[ -f $gnupghome/pubring.kbx ]] || die "no public keyring at $gnupghome/pubring.kbx"
+  exec {gpg_conf}<<<$'no-autostart\nuse-agent' || die "cannot write gpg.conf"
+  exec {pubring}<"$gnupghome/pubring.kbx" || die "cannot open $gnupghome/pubring.kbx"
+  argv+=(--perms 0700 --dir "$gnupghome" --perms 0600 --file "$gpg_conf" "$gnupghome/gpg.conf"
+    --perms 0600 --file "$pubring" "$gnupghome/pubring.kbx")
+  if [[ -f $gnupghome/trustdb.gpg ]]; then
+    exec {trustdb}<"$gnupghome/trustdb.gpg" || die "cannot open $gnupghome/trustdb.gpg"
+    argv+=(--perms 0600 --file "$trustdb" "$gnupghome/trustdb.gpg")
+  fi
+  # gpg uses /run/user/<uid>/gnupg only while it and its parent are private to the user,
+  # else it looks in the home. A socket cannot be opened, so it is bound by path: it
+  # lives in the user's private runtime directory, which no sandbox can write.
+  socket_dir=$(dirname -- "$socket")
+  argv+=(--perms 0700 --dir "$(dirname -- "$socket_dir")" --perms 0700 --dir "$socket_dir"
+    --bind "$socket" "$socket")
+fi
+
 if ((docker)); then
   # The system daemon's socket is root on this machine and is always refused. A rootless
   # daemon still gives up the filesystem boundary: `docker run -v $HOME:/h` reaches every
@@ -239,6 +274,7 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
   --setenv PIP_CACHE_DIR "$cache/pip" --setenv npm_config_cache "$cache/npm"
   --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright")
 [[ -z $config_var ]] || argv+=(--setenv "$config_var" "$config_dir")
+((!gpg)) || argv+=(--setenv GNUPGHOME "$gnupghome")
 
 argv+=(--chdir "$(pwd -P)" -- "$@")
 if ((print)); then

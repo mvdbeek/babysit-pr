@@ -4,6 +4,7 @@ Every tool the script could change a system or reach the network with is a fake 
 records its call, and the dry runs must leave that record empty.
 """
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -149,3 +150,51 @@ def test_misuse_exits_2(run, args):
 
 def test_unknown_architecture_is_refused(run):
     assert run("--dry-run", ARCH="riscv64").returncode == 2
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root --check inspects the host instead")
+@pytest.mark.parametrize("works", [True, False])
+def test_user_check_verifies_signing_without_printing_secrets(tmp_path, works):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    status = 0 if works else 1
+    for tool in ("bwrap", "docker", "gpg", "systemctl", "babysit-bwrap"):
+        (fakes / tool).write_text(f"#!/bin/sh\necho rootless\nexit {status}\n")
+    # git answers the signing key and the identity; every other git call follows `works`.
+    (fakes / "git").write_text(
+        '#!/bin/sh\ncase "$*" in *user.signingkey*) echo KEYID-SECRET!; exit 0 ;; esac\n'
+        f"exit {status}\n"
+    )
+    for fake in fakes.iterdir():
+        fake.chmod(0o755)
+    home = tmp_path / "home"
+    (home / ".gnupg").mkdir(parents=True)
+    (home / ".gnupg/signing-subkey.pass").write_text("PASSPHRASE-SECRET\n")
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--check"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    output = done.stdout + done.stderr
+    assert "SECRET" not in output
+    if works:
+        assert done.returncode == 0, output
+        assert "ok: babysit-gpg-preset.service is enabled" in output
+        assert "ok: gpg signs with user.signingkey" in output
+        assert "ok: a commit signed inside babysit-bwrap --enable=gpg verifies" in output
+    else:
+        assert done.returncode == 1
+        assert "babysit-gpg-preset.service is not enabled" in output
+        assert "gpg cannot sign" in output
+        assert "cannot commit signed inside" in output
+    (home / ".gnupg/signing-subkey.pass").unlink()
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--check"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    assert "commit signing not set up" in done.stdout

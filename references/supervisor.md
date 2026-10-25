@@ -260,7 +260,7 @@ tests set `sandbox.DEFAULT`.
 
 On Linux the default Claude launcher is `scripts/babysit-bwrap`, a bubblewrap
 wrapper taking Safehouse's `--add-dirs`, `--env-pass` and `--enable=docker,playwright`
-options, plus `--claude-config-dir` or `--codex-home`, before `--` and the command.
+options (and `--enable=gpg`, below), plus `--claude-config-dir` or `--codex-home`, before `--` and the command.
 It mounts the system read-only, gives the agent an empty `$HOME`, and allows
 writes only to `--add-dirs`, the one agent configuration directory it is given
 (exported as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Claude always gets an explicit
@@ -327,6 +327,13 @@ Known gaps of the Linux sandbox:
   machine, and binds only `$XDG_RUNTIME_DIR/docker.sock`. Even a rootless daemon
   gives up the filesystem boundary (`docker run -v $HOME:/h` reaches every file
   of the user), so enabling Docker trusts the agent with them.
+- `--enable=gpg` mounts a throwaway `~/.gnupg` (copies of `pubring.kbx` and
+  `trustdb.gpg`, a `gpg.conf` with `no-autostart`) and the user's gpg-agent
+  socket, so git signs through the agent; the private keys, any passphrase file
+  and the agent's configuration stay outside. The agent is a signing oracle: while
+  it runs, the sandboxed agent can have it sign arbitrary data with the unlocked
+  key, not only its own commits, as on macOS. Setup is in
+  [the worker checklist](worker-setup.md#signing-with-a-gpg-subkey).
 - The dashboard's Docker toggle is macOS-only for now: it inspects Seatbelt, and
   its restart looks for the launcher in the agent's parent process, which under
   babysit-bwrap is `bwrap` itself, so a restart fails closed.
