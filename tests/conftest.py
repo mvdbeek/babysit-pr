@@ -172,6 +172,12 @@ def no_claude_trust(monkeypatch):
     monkeypatch.setenv("BABYSIT_CLAUDE_TRUST", "0")
 
 
+@pytest.fixture(autouse=True)
+def safehouse_sandbox(monkeypatch):
+    """Launch lines are Safehouse's on every platform; the bwrap tests name their backend."""
+    monkeypatch.setenv("BABYSIT_SANDBOX", "safehouse")
+
+
 @pytest.fixture
 def fake_tools(tmp_path, monkeypatch):
     """Fake executables first on PATH plus the JSON state file recording their calls."""

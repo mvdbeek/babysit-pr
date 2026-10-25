@@ -11,6 +11,7 @@ import claude_runner
 import pane_runner
 import pr_supervisor as supervisor
 import pytest
+import sandbox
 from test_pr_supervisor import snapshot
 
 
@@ -268,13 +269,13 @@ def test_display_failure_keeps_draining_large_stream_and_records_result(
 
 def test_safehouse_launcher_owns_permission_mode_and_preserves_session():
     job = {
-        "claude_command": claude_runner.safehouse_command(),
+        "claude_command": sandbox.claude_launcher(),
         "claude_permission_mode": "safehouse",
         "session_id": "original-session",
         "model": "saved-model",
     }
     argv = claude_runner.command_for(job, supervisor.RESULT_SCHEMA)
-    assert argv[:2] == claude_runner.safehouse_command()
+    assert argv[:2] == sandbox.claude_launcher()
     assert argv[argv.index("--resume") + 1] == "original-session"
     assert "--permission-mode" not in argv
     assert "--dangerously-skip-permissions" not in argv  # supplied only inside Safehouse
@@ -297,5 +298,5 @@ def test_default_claude_registration_uses_safehouse(harness, monkeypatch):
     args.codex_command = None
     args.claude_command = None
     job = supervisor.register(h["db"], args)
-    assert job["claude_command"] == claude_runner.safehouse_command()
+    assert job["claude_command"] == sandbox.claude_launcher()
     assert job["claude_permission_mode"] == "safehouse"

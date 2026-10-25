@@ -985,7 +985,7 @@ Every `gh` process normally reads its token back from the system keyring, which 
 
 ## Development
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, and zsh (only to syntax-check the Safehouse launcher and as the fake herdr pane shell in tests; the worktree helper itself is plain Python). Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, zsh (only to syntax-check the Safehouse launcher and as the fake herdr pane shell in tests; the worktree helper itself is plain Python), and bash (to check and dry-run the Linux `babysit-bwrap` wrapper). Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.
 
 Run every local check through tox:
 
@@ -1026,7 +1026,7 @@ Browser tests use a real Chromium process and a real HTTP server backed by a tem
 
 Coverage is opt-in and not part of the default run or CI: `uv run --locked tox -e coverage` runs every test under coverage, including Python branches and instrumented child Python processes. It writes a terminal summary, HTML at `reports/coverage/index.html`, and XML at `reports/coverage.xml`. The combined Python line/branch coverage gate is 75%. Reports and browser failure artifacts are ignored by Git. JavaScript behavior is exercised by browser and Node tests; the coverage percentage measures Python only.
 
-The Safehouse launcher matches this user's installed configuration. Tests check its command construction, but do not require Safehouse or claim to test macOS sandbox enforcement on every machine.
+The Safehouse launcher matches this user's installed configuration. Tests check its command construction, but do not require Safehouse or claim to test macOS sandbox enforcement on every machine. The Linux `babysit-bwrap` wrapper is checked through its `--print-argv` dry run everywhere; its enforcement tests run only on Linux with a working `bwrap`.
 
 ## CI details and automatic failure logs
 

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import herdr_handoff as handoff
+import sandbox
 import wt
 
 EXIT_WAIT = 20
@@ -32,7 +33,10 @@ def sandbox_checks(pid, checks):
 
 
 def has_access(pid):
-    """Check the running process's Safehouse socket file grants (macOS Seatbelt)."""
+    """Check the running process's Safehouse socket file grants (macOS Seatbelt).
+
+    ``sandbox.inspect`` reaches this as the safehouse backend's Docker probe.
+    """
     try:
         results = sandbox_checks(
             pid,
@@ -167,12 +171,12 @@ def launcher(procs, proc, enabled=True):
     """Reuse the original Safehouse invocation, avoiding shell-wrapper flag duplication."""
     for parent in procs["foreground_processes"]:
         argv = parent.get("argv", [])
-        # Safehouse is a shell script, so argv can start with its interpreter.
+        # The launcher is a shell script, so argv can start with its interpreter.
         start = next(
             (
                 i
                 for i, word in enumerate(argv[:2])
-                if Path(word).name == "safehouse" and Path(word).is_absolute()
+                if sandbox.launcher_backend(word) and Path(word).is_absolute()
             ),
             None,
         )

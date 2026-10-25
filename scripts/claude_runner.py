@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 import claude_accounts
+import sandbox
 
 
 def config_home():
@@ -76,10 +77,6 @@ def session_info(session_id, cwd, transcript=None, config_dir=None):
     }
 
 
-def safehouse_command():
-    return ["/bin/zsh", str(Path(__file__).resolve().with_name("claude_safehouse.zsh"))]
-
-
 def command_for(job, schema):
     cmd = [
         *job["claude_command"],
@@ -93,8 +90,8 @@ def command_for(job, schema):
         json.dumps(schema),
     ]
     mode = job.get("claude_permission_mode", "dontAsk")
-    if mode == "safehouse":
-        if job["claude_command"] != safehouse_command():
+    if mode == sandbox.LAUNCHER_PERMISSIONS:
+        if job["claude_command"] != sandbox.claude_launcher():
             raise ValueError("Safehouse permission mode requires the verified Safehouse launcher")
     else:
         cmd += ["--permission-mode", mode]

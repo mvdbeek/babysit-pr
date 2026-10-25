@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Linux agent sandbox: bubblewrap behind Agent Safehouse's grant options.
+#
+#   babysit-bwrap [--add-dirs=A:B] [--env-pass=X,Y] [--enable=docker,playwright]
+#                 [--print-argv] [--] command [args...]
+#
+# Deny by default: a read-only system, an empty $HOME, and writes only to the current
+# worktree, its git common directory, the agent configuration directories, package
+# caches and --add-dirs. The environment is cleared except for a small baseline,
+# CLAUDE_CONFIG_DIR/CODEX_HOME and the --env-pass names that are set. The network is
+# shared. --print-argv prints the bwrap argv, NUL-separated, instead of running it.
+set -euo pipefail
+
+die() {
+  printf 'babysit-bwrap: %s\n' "$*" >&2
+  exit 2
+}
+
+add_dirs=()
+env_pass=()
+docker=0
+print=0
+while (($#)); do
+  option=$1
+  case $option in
+    --add-dirs | --env-pass | --enable)
+      (($# > 1)) || die "$option needs a value"
+      shift
+      option="$option=$1"
+      ;;
+  esac
+  case $option in
+    --add-dirs=*) IFS=: read -r -a more <<<"${option#*=}" && add_dirs+=(${more[@]+"${more[@]}"}) ;;
+    --env-pass=*) IFS=, read -r -a more <<<"${option#*=}" && env_pass+=(${more[@]+"${more[@]}"}) ;;
+    --enable=*)
+      IFS=, read -r -a more <<<"${option#*=}"
+      for feature in ${more[@]+"${more[@]}"}; do
+        case $feature in
+          docker) docker=1 ;;
+          # Accepted like Safehouse's playwright-chrome: Chromium needs nothing beyond
+          # the always-present /dev/shm and browser cache.
+          playwright | playwright-chrome) ;;
+          *) die "unknown feature $feature" ;;
+        esac
+      done
+      ;;
+    --print-argv) print=1 ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "unknown option $option" ;;
+    *) break ;;
+  esac
+  shift
+done
+(($#)) || die "no command to run"
+
+home=${HOME:?}
+argv=(bwrap --die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts --clearenv)
+
+# Read-only system. Merged-/usr links stay links.
+for path in /usr /bin /sbin /lib /lib32 /lib64 /libx32 /opt; do
+  if [[ -L $path ]]; then
+    argv+=(--symlink "$(readlink "$path")" "$path")
+  else
+    argv+=(--ro-bind-try "$path" "$path")
+  fi
+done
+for path in alternatives ca-certificates crypto-policies gai.conf gitconfig group host.conf \
+  hosts ld.so.cache ld.so.conf ld.so.conf.d localtime nsswitch.conf os-release passwd pki \
+  resolv.conf ssl; do
+  argv+=(--ro-bind-try "/etc/$path" "/etc/$path")
+done
+argv+=(--proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
+
+# Toolchains and credentials, read-only. gh holds the only GitHub credential.
+for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .gitconfig \
+  .config/git .config/gh; do
+  argv+=(--ro-bind-try "$home/$path" "$home/$path")
+done
+
+# Writable: the agents' own configuration and package caches.
+configs=("${CODEX_HOME:-$home/.codex}")
+if [[ -n ${CLAUDE_CONFIG_DIR:-} ]]; then
+  configs+=("$CLAUDE_CONFIG_DIR")
+else
+  # The default account keeps its global settings beside the directory.
+  configs+=("$home/.claude" "$home/.claude.json")
+fi
+for path in "${configs[@]}" "$home/.cache/uv" "$home/.npm" "$home/.cache/pip" \
+  "$home/.cache/ms-playwright"; do
+  argv+=(--bind-try "$path" "$path")
+done
+
+# Writable: this worktree, the git directory it commits to, and the explicit grants.
+worktree=$(git rev-parse --show-toplevel 2>/dev/null) || worktree=$PWD
+argv+=(--bind "$worktree" "$worktree")
+if common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+  argv+=(--bind "$common" "$common")
+fi
+for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
+  [[ -z $path ]] || argv+=(--bind-try "$path" "$path")
+done
+
+if ((docker)); then
+  # Only rootless Docker: access to the system daemon is root on this machine.
+  socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+  real=$(readlink -f "$socket" 2>/dev/null) || real=$socket
+  for path in "$socket" "$real"; do
+    case $path in
+      /var/run/docker.sock | /run/docker.sock | /private/var/run/docker.sock)
+        die "refusing the system Docker socket $socket"
+        ;;
+    esac
+  done
+  [[ -S $socket ]] || die "no rootless Docker socket at $socket"
+  [[ -O $socket ]] || die "refusing $socket, which belongs to another user"
+  argv+=(--bind "$socket" "$socket" --setenv DOCKER_HOST "unix://$socket")
+fi
+
+for name in PATH HOME TERM LANG USER CLAUDE_CONFIG_DIR CODEX_HOME ${env_pass[@]+"${env_pass[@]}"}; do
+  [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid variable name $name"
+  if [[ -n ${!name+set} ]]; then
+    argv+=(--setenv "$name" "${!name}")
+  fi
+done
+
+argv+=(--chdir "$PWD" -- "$@")
+if ((print)); then
+  printf '%s\0' "${argv[@]}"
+  exit 0
+fi
+command -v bwrap >/dev/null || die "bubblewrap (bwrap) is not installed"
+exec "${argv[@]}"

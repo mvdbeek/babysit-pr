@@ -222,7 +222,9 @@ Workspace-write adds the linked worktree's git common directory for commits.
 A launcher that runs through Agent Safehouse always gets `danger-full-access`:
 Seatbelt profiles cannot nest, so Codex's own sandbox fails every command with
 `sandbox_apply: Operation not permitted`, and Safehouse already contains the
-process, just as the user's `safe codex` shell function does.
+process, just as the user's `safe codex` shell function does. A launcher that
+runs through `scripts/babysit-bwrap` gets the same, for the same reason: the
+external sandbox is the boundary.
 Start the watcher under the same authorized external sandbox as the original
 session. For a verified existing launcher, use a JSON argv prefix:
 
@@ -247,6 +249,28 @@ names, and the non-interactive git/gh settings (`GIT_TERMINAL_PROMPT=0`,
 every repair receives, without widening directory grants. The shared GitHub
 token the supervisor uses for its own polling is not passed to agents. A saved
 plan mode is still preserved.
+
+`scripts/sandbox.py` owns this launcher choice and every other sandbox detail
+(typed launch prefixes, account environment, launcher detection). The sandbox is
+external to the agent harness: agents run with their own permissions off inside
+it, so a new harness only supplies its launch argv. The backend follows the
+platform (`safehouse` on macOS, `bwrap` on Linux); `BABYSIT_SANDBOX` may pin
+`safehouse` or `bwrap`, never `none`, and the tests pin `safehouse`.
+
+On Linux the default Claude launcher is `scripts/babysit-bwrap`, a bubblewrap
+wrapper taking Safehouse's `--add-dirs`, `--env-pass` and `--enable=docker,playwright`
+options before `--` and the command. It mounts the system read-only, gives the
+agent an empty `$HOME`, and allows writes only to the current worktree, its git
+common directory, the agent configuration (`CLAUDE_CONFIG_DIR` or `~/.claude`,
+`CODEX_HOME` or `~/.codex`), the uv/npm/pip/Playwright caches and `--add-dirs`.
+`~/.config/gh` is read-only. It unshares PID, IPC and UTS namespaces, dies with
+its parent, starts a new session, and clears the environment except `PATH`,
+`HOME`, `TERM`, `LANG`, `USER`, the agent configuration variables and the
+`--env-pass` names. The network is shared. `--enable=docker` binds only the
+caller's rootless socket `$XDG_RUNTIME_DIR/docker.sock` and refuses the system
+daemon's. `--print-argv` prints the bwrap argv, NUL-separated, without running it.
+Typed launches on Linux invoke the wrapper directly; there are no shell functions
+there to rely on.
 
 `--claude-command` permits an explicit alternative argv prefix; those jobs keep
 `dontAsk` unless separately configured. The `safehouse` permission setting is

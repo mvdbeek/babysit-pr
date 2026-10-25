@@ -16,3 +16,9 @@ def no_claude_trust(monkeypatch):
     """Launches never mark folders trusted in the user's real Claude config; the trust
     tests turn it back on against a fake home."""
     monkeypatch.setenv("BABYSIT_CLAUDE_TRUST", "0")
+
+
+@pytest.fixture(autouse=True)
+def safehouse_sandbox(monkeypatch):
+    """Launch lines are Safehouse's on every platform; the bwrap tests name their backend."""
+    monkeypatch.setenv("BABYSIT_SANDBOX", "safehouse")
