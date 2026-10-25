@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 import github_cli
 import owned_process
+import safe_git
 import workspace_viewer
 from pr_workspaces import COLLIE_URL, SLUG, clone_worktrees, herdr, remote_slugs, repo_config
 
@@ -62,13 +63,9 @@ BASE_BRANCH = re.compile(
 
 
 def git(path, *args, timeout=60, strip=True):
-    """Git in one checkout. Large repositories need more room than a quick query."""
-    result = owned_process.run(
-        ["git", "-C", str(path), *args],
-        env=github_cli.environment(),
-        text=True,
-        timeout=timeout,
-    )
+    """Hardened Git in one checkout. Large repositories need more room than a quick query."""
+    argv, env = safe_git.prepare(str(path), *args, env=github_cli.environment())
+    result = owned_process.run(argv, env=env, text=True, timeout=timeout)
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Git failed")[-4000:].strip())
     return result.stdout.strip() if strip else result.stdout
@@ -209,7 +206,7 @@ def landed(path, missing, merges):
 def local_state(path, branch=None):
     """Uncommitted changes and commits only this branch has, without touching either."""
     try:
-        status = git(path, "--no-optional-locks", "status", "--porcelain", "-z", strip=False)
+        status = git(path, "status", "--porcelain", "-z", strip=False)
         changes = []
         records = iter(status.split("\0"))
         for record in records:
@@ -226,7 +223,6 @@ def local_state(path, branch=None):
         missing, merges = set(), set()
         for record in git(
             path,
-            "--no-optional-locks",
             "rev-list",
             f"--max-count={MAX_UNPUSHED}",
             "--parents",

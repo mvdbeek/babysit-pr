@@ -20,6 +20,7 @@ from pathlib import Path
 import claude_accounts
 import github_cli
 import owned_process
+import safe_git
 from pr_workspaces import herdr
 
 # Branch names a topic branch is cut from, on the remotes pull requests target.
@@ -83,11 +84,8 @@ CHECKOUT_TTL = 30
 PARSED_FILES = 4
 
 
-TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
-
-
 def local_environment():
-    env = {k: v for k, v in os.environ.items() if k not in TOKENS}
+    env = {k: v for k, v in os.environ.items() if k not in safe_git.TOKENS}
     env.update(github_cli.NON_INTERACTIVE)
     return env
 
@@ -96,18 +94,10 @@ def git_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
     """Run git in a checkout, keeping at most ``limit`` bytes; return (text, truncated)."""
     limit = MAX_DIFF if limit is None else limit
     # Unquoted paths: diff headers and file lists then carry names as they are.
-    argv = [
-        "git",
-        "-C",
-        str(path),
-        "--no-optional-locks",
-        "-c",
-        "core.quotePath=false",
-        # A checkout's own config must not start an fsmonitor daemon for a read.
-        "-c",
-        "core.fsmonitor=false",
-        *args,
-    ]
+    # Local reads need no GitHub token, and nothing the checkout configures may run.
+    argv, env = safe_git.prepare(
+        str(path), "-c", "core.quotePath=false", *args, env=local_environment()
+    )
     chunks: list[bytes] = []
     size = 0
     truncated = False
@@ -117,8 +107,7 @@ def git_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
-        # Local reads need no GitHub token, and filters or hooks must not inherit one.
-        env=local_environment(),
+        env=env,
     ) as proc:
         assert proc.stdout is not None and proc.stderr is not None
         errors: list[bytes] = []

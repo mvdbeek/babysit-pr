@@ -23,6 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol, TextIO
 
 import claude_accounts
+import safe_git
 
 COMMANDS = ("wt", "wti", "wtpr")
 ALIASES = {"wri": "wti", "wtissue": "wti"}
@@ -800,8 +801,23 @@ class Tool:
     def warn(self, message: str) -> None:
         print(message, file=self.stderr, flush=True)
 
+    def git_command(self, cwd: str, *args: str) -> tuple[list[str], dict[str, str]]:
+        """Hardened Git: the clone's config and hooks are writable by its agents."""
+
+        def read(argv: list[str], env: Mapping[str, str]) -> str:
+            result = self.runner.run(argv, env=env)
+            if result.returncode:
+                raise ValueError(result.stderr.strip() or "git config failed")
+            return result.stdout
+
+        try:
+            return safe_git.prepare(cwd, *args, read=read)
+        except ValueError as exc:
+            raise WtError(str(exc)) from exc
+
     def git_query(self, cwd: str, *args: str) -> Completed:
-        return self.runner.run(["git", "-C", cwd, *args])
+        argv, env = self.git_command(cwd, *args)
+        return self.runner.run(argv, env=env)
 
     def git_value(self, cwd: str, *args: str) -> str:
         result = self.git_query(cwd, *args)
@@ -811,7 +827,8 @@ class Tool:
 
     def git_action(self, cwd: str, *args: str) -> None:
         """Mutating git commands keep their own output (progress, hints) on stderr."""
-        result = self.runner.run(["git", "-C", cwd, *args], output="stderr")
+        argv, env = self.git_command(cwd, *args)
+        result = self.runner.run(argv, env=env, output="stderr")
         if result.returncode:
             raise WtError(f"git {args[0]} failed with status {result.returncode}")
 

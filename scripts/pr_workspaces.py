@@ -30,6 +30,7 @@ import claude_accounts
 import exit_watch
 import github_cli
 import owned_process
+import safe_git
 import workspace_agents
 import workspace_exit
 from issue_overview import branch_number
@@ -87,13 +88,11 @@ RECENT_CLONE_SECONDS = 90 * 86400
 REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
-def run(*args, cwd=None, timeout=30, pass_fds=()):
+def run(*args, cwd=None, timeout=30, pass_fds=(), env=None):
     argv = list(map(str, args))
-    # git may call the gh credential helper; both get the shared token and never prompt.
     if argv[0] == "gh":
         result = github_cli.run(argv, cwd=cwd, text=True, timeout=timeout, pass_fds=pass_fds)
     else:
-        env = github_cli.environment() if argv[0] == "git" else None
         result = owned_process.run(
             argv, cwd=cwd, env=env, text=True, timeout=timeout, pass_fds=pass_fds
         )
@@ -117,8 +116,11 @@ def remote_slug(value):
     return match[1].lower() if match and SLUG.fullmatch(match[1]) else None
 
 
-def git(path, *args):
-    return run("git", "-C", path, *args, timeout=15)
+def git(path, *args, timeout=15):
+    """Hardened Git in a checkout an agent may have written; only a fetch gets the token,
+    for the gh credential helper, and nothing prompts."""
+    argv, env = safe_git.prepare(str(path), *map(str, args), env=github_cli.environment())
+    return run(*argv, env=env, timeout=timeout)
 
 
 CONFIG_KEYS = r"^(remote\..*\.url|branch\..*\.(remote|merge))$"

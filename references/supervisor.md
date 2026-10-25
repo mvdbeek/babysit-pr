@@ -260,6 +260,24 @@ task scope in `--instructions`, including authorization for pushes, reruns,
 responses, and rebases. The supervisor only reads GitHub; agents handle authorized
 mutations. No real watch is started merely by installing/updating the skill.
 
+### Host Git in agent checkouts
+
+A sandboxed agent can write its worktree and the clone's git common directory, so the
+repository config, hooks and `info/attributes` are the agent's. Every Git command the
+supervisor, dashboard, cron jobs and `wt` run on the host in such a checkout goes
+through `scripts/safe_git.py`. It disables hooks, fsmonitor, pagers, external diffs and
+textconv, the repository's ssh/askpass/proxy programs and credential helpers, `ext::`
+remotes, submodule recursion, auto gc and lazy fetches. Filter drivers the repository
+itself defines are blanked; a definition from the user's own config, such as Git LFS,
+is kept. Only a fetch gets the GitHub token, through `gh auth git-credential` alone,
+with the repository's `remote.*.uploadpack` replaced, and a fetch is refused when the
+repository's own config changes TLS verification, CAs or proxies. System and global
+config stay trusted.
+
+Still open: config the agent rewrites between the driver listing and the command it
+guards, filter drivers in a submodule's own config, remote helpers installed on PATH,
+and lazy fetches on Git older than 2.44, which ignores `GIT_NO_LAZY_FETCH`.
+
 ## Events and diagnostics
 
 - Default polling: 120 seconds. Five consecutive poll errors block with backoff.

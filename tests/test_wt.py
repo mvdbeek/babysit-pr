@@ -17,6 +17,7 @@ from pathlib import Path
 
 import exit_watch
 import pytest
+import safe_git
 import wt
 
 TOOL = str(Path(wt.__file__).resolve())
@@ -260,7 +261,12 @@ def test_existing_checkout_ignores_missing_directories(tmp_path):
         f"\nworktree {tmp_path / 'gone'}\nHEAD bbb\nbranch refs/heads/stale\n"
     )
     runner = FakeRunner(
-        [(["git", "-C", "/clone", "worktree", "list"], wt.Completed(0, listing, ""))]
+        [
+            (
+                ["git", "-C", "/clone", *safe_git.OPTIONS, "worktree", "list"],
+                wt.Completed(0, listing, ""),
+            )
+        ]
     )
     t = tool(runner)
     assert t.existing_checkout("/clone", "main") == str(live)

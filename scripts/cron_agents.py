@@ -32,6 +32,7 @@ import workspace_agents
 import workspace_exit
 import wt
 from pr_workspaces import BRANCH_NAME, COLLIE_URL, SLUG, herdr, run
+from pr_workspaces import git as workspaces_git
 
 START_WAIT = 30  # Seconds for the agent to show up in its pane after the command is typed.
 RESULT_LIMIT = 20000  # Characters of the agent's final response kept with a run.
@@ -116,7 +117,7 @@ def validate(request, workspaces, home):
 
 
 def git(clone, *args, timeout=30):
-    return run("git", "-C", clone, *args, timeout=timeout)
+    return workspaces_git(clone, *args, timeout=timeout)
 
 
 def checkout(job, src):

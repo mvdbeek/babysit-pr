@@ -25,6 +25,7 @@ import gh_pr_watch as watch
 import github_cli
 import llm_usage
 import owned_process
+import safe_git
 import sentry_llm
 
 SCRIPT = Path(__file__).resolve()
@@ -85,9 +86,11 @@ def locked(path):
 
 
 def git(cwd, *args):
-    proc = subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=30
-    )
+    try:
+        argv, env = safe_git.prepare(str(cwd), *args)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or "Git command failed")
     return proc.stdout.strip()
