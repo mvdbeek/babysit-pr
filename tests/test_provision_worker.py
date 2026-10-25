@@ -209,6 +209,9 @@ def test_user_check_verifies_signing_without_printing_secrets(tmp_path, works):
         fake.chmod(0o755)
     (home / ".gnupg").mkdir(parents=True)
     (home / ".gnupg/signing-subkey.pass").write_text("PASSPHRASE-SECRET\n")
+    # gpg-agent forgets even a preset passphrase after max-cache-ttl, two hours by default.
+    conf = "allow-preset-passphrase\n" + ("max-cache-ttl 31536000\n" if works else "")
+    (home / ".gnupg/gpg-agent.conf").write_text(conf)
     done = subprocess.run(
         ["bash", str(SCRIPT), "--check"],
         capture_output=True,
@@ -221,11 +224,13 @@ def test_user_check_verifies_signing_without_printing_secrets(tmp_path, works):
     if works:
         assert done.returncode == 0, output
         assert "ok: babysit-gpg-preset.service is enabled" in output
+        assert "ok: gpg-agent keeps the preset passphrase" in output
         assert "ok: gpg signs with user.signingkey" in output
         assert "ok: a commit signed inside babysit-bwrap --enable=gpg verifies" in output
     else:
         assert done.returncode == 1
         assert "babysit-gpg-preset.service is not enabled" in output
+        assert "max-cache-ttl" in output
         assert "gpg cannot sign" in output
         assert "cannot commit signed inside" in output
     (home / ".gnupg/signing-subkey.pass").unlink()

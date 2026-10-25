@@ -796,7 +796,7 @@ EOF
 # it is set up: the agent is unlocked at login, signs directly, and signs a commit made
 # inside babysit-bwrap --enable=gpg. Prints no key material and never the passphrase.
 gpg_checks() {
-  local key wrapper tmp result
+  local key wrapper tmp result ttl
   key=$(git config --global user.signingkey 2>/dev/null) || key=
   if [[ ! -f $HOME/.gnupg/signing-subkey.pass || -z $key ]]; then
     ok "commit signing not set up (no ~/.gnupg/signing-subkey.pass or user.signingkey)"
@@ -806,6 +806,15 @@ gpg_checks() {
     ok "babysit-gpg-preset.service is enabled"
   else
     problem "babysit-gpg-preset.service is not enabled; the agent stays locked after login"
+  fi
+  # gpg-agent drops even a preset passphrase once max-cache-ttl (two hours by default)
+  # has passed since it was set, so signing would stop two hours after login.
+  ttl=$(sed -n 's/^[[:space:]]*max-cache-ttl[[:space:]]\{1,\}\([0-9]\{1,\}\).*/\1/p' \
+    "$HOME/.gnupg/gpg-agent.conf" 2>/dev/null | tail -n 1)
+  if [[ -n $ttl ]] && ((10#$ttl >= 86400)); then
+    ok "gpg-agent keeps the preset passphrase (max-cache-ttl $ttl)"
+  else
+    problem "gpg-agent.conf sets no max-cache-ttl of a day or more, so the preset passphrase expires two hours after login (add max-cache-ttl 31536000, then gpgconf --reload gpg-agent)"
   fi
   if gpg --batch --no-tty --pinentry-mode error --local-user "$key" --detach-sign \
     </dev/null >/dev/null 2>&1; then

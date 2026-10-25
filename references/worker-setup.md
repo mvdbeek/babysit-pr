@@ -272,9 +272,12 @@ through a proxy in front of that agent, without seeing `~/.gnupg`.
    ```text
    pinentry-program /usr/bin/pinentry-curses
    allow-preset-passphrase
+   max-cache-ttl 31536000
    ```
 
-   Then `gpgconf --reload gpg-agent` (`apt install pinentry-curses` if it is missing).
+   gpg-agent forgets even a preset passphrase once `max-cache-ttl` (two hours by
+   default) has passed since it was set, so without that line signing stops two hours
+   after login; `--check` reports it. Then `gpgconf --reload gpg-agent` (`apt install pinentry-curses` if it is missing).
    Store the passphrase, mode 600, without echoing it or leaving it in shell history:
 
    ```sh
