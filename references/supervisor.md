@@ -286,7 +286,9 @@ dir), so new worktrees are added with `--no-checkout` and filled by a reset run 
 them, and the dashboard removes a worktree with `--force` only after its own hardened
 status there finds no changes, untracked files or submodules, as Git's check would
 (approved blockers skip that check, as before). `safe_git` refuses either command
-without those flags.
+without those flags. Every command in a checkout with its own `.git` gets that checkout
+as `--work-tree`, so a planted `core.worktree` or `core.bare` cannot send status, reset,
+switch or that clean check to another directory.
 
 The git common dir granted to an agent (Codex resume `--add-dir`, `wt --with`) and the
 one `wtpr` checks provenance against come from the checkout's layout, never from

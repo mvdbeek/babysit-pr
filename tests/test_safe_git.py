@@ -294,6 +294,31 @@ def test_worktree_removal_keeps_unapproved_changes(planted):
     assert not marker.exists()
 
 
+def test_host_git_works_in_the_checkout_whatever_core_worktree_names(planted, tmp_path):
+    clone, marker, git = planted
+    path = linked(planted, "topic")
+    (path / "file.txt").write_text("uncommitted\n")
+    # A clean copy of the branch elsewhere, which the worktree's own config points Git at.
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    (decoy / "file.txt").write_text("aaaa\n")
+    git("config", "extensions.worktreeConfig", "true")
+    admin = clone / ".git" / "worktrees" / "topic"
+    (admin / "config.worktree").write_text(f"[core]\n\tworktree = {decoy}\n")
+    assert quiet(git, "status", "--porcelain", cwd=path) == ""
+    marker.unlink(missing_ok=True)
+    top = workspace_overview.git(path, "rev-parse", "--show-toplevel")
+    assert Path(top).resolve() == path.resolve()
+    row = {"remove_worktree": True, "path": str(path), "repo_root": str(clone)}
+    with pytest.raises(ValueError, match="uncommitted changes"):
+        remove(row, force=False)
+    assert (path / "file.txt").read_text() == "uncommitted\n"
+    # core.bare would make Git refuse the checkout as having no work tree at all.
+    (admin / "config.worktree").write_text("[core]\n\tbare = true\n")
+    assert workspace_overview.local_state(path, "topic")["changes"] == 1
+    assert not marker.exists()
+
+
 def test_worktree_removal_keeps_a_worktree_holding_submodules(planted, tmp_path):
     clone, marker, git = planted
     path = linked(planted, "topic")

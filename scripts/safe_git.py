@@ -25,7 +25,8 @@ conditions on the branch or git dir. So a worktree is checked out by adding it w
 ``--no-checkout`` and resetting inside it, where the listing sees what the reset will,
 and removed with ``--force`` after a hardened status in it, since Git's own clean check
 runs ``git status`` in that worktree with its config. Status and diffs ignore
-submodules, whose own config is never listed.
+submodules, whose own config is never listed. ``core.worktree`` and ``core.bare`` are read
+from config files only, so a checkout's own path is passed as ``--work-tree``.
 
 Left open, and stated in references/supervisor.md: config rewritten between that
 listing and the command itself, drivers in a submodule's own config, helpers for the
@@ -222,6 +223,10 @@ def prepare(
     if name in SUBMODULES:
         flags = [*flags, "--ignore-submodules=all"]
     argv[index + 1 : index + 1] = flags
+    # core.worktree in config the agent writes would point Git at another directory, and
+    # core.bare at none; a checkout with its own .git is its own work tree.
+    if os.path.lexists(os.path.join(path, ".git")):
+        argv[:0] = [f"--work-tree={os.path.abspath(path)}"]
     return ["git", "-C", path, *OPTIONS, *extra, *argv], environment
 
 
