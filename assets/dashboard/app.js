@@ -2518,12 +2518,13 @@ function savedEffort(repo, levels) {
 }
 // `repo` is the project the launch is for; `mixed` launches in several projects.
 // `preferred` preselects an agent the person already chose, as a second review does.
-// `remote` describes a worker that can take the launch; cron jobs run there already.
+// `remote` describes a worker that can take the launch.
 function agentFields({
   repo = null,
   mixed = false,
   preferred = null,
-  remote = (label) => `Starting agents on ${label} is not supported yet.`,
+  remote = (label) =>
+    `The agent starts on ${label}, in its own clone of the repository; only reviews and new tasks can start there yet.`,
 } = {}) {
   const usage = window.dashboardUsage;
   const agent = el("select");
