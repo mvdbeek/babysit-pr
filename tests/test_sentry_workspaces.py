@@ -99,6 +99,8 @@ def test_handle_claude_gets_private_mcp_config_and_sentry_brief(sentry):
             "sentry-repo-GALAXY-MAIN-1",
             "--repo-path",
             str(manager.src / "repo"),
+            "--github-repo",
+            "base/repo",
             "--worktree-root",
             str(manager.src / "worktrees/repo"),
             "--prompt-file",

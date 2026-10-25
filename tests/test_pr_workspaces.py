@@ -738,6 +738,8 @@ def test_issue_creation_uses_wti_with_dashboard_flags_and_allocates_suffixes(loc
             "issue-12-crash-on-start-2",
             "--repo-path",
             str(manager.src / "repo"),
+            "--github-repo",
+            "base/repo",
             "--worktree-root",
             str(manager.src / "worktrees/repo"),
             "--prompt-file",
@@ -2105,3 +2107,12 @@ def test_quitting_when_done_needs_a_flag_and_a_launch(local, change, message):
     manager, *_ = local
     with pytest.raises(ValueError, match=message):
         manager.action({"id": "I_one", "action": "create", "task": "Fix", **change})
+
+
+def test_launches_name_the_github_repository_their_fetches_are_for(local):
+    manager, pr, _, _, _ = local
+    calls = helper_calls(manager)
+    manager.action({"id": pr["id"], "action": "create", "task": "Fix"})
+    assert finish(manager, pr["id"])["status"] == "complete"
+    [args] = calls
+    assert args[args.index("--github-repo") + 1] == "base/repo"

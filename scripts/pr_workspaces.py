@@ -2408,6 +2408,12 @@ class Workspaces:
                         *label,
                         "--repo-path",
                         str(clone),
+                        # The repository this launch is for: its fetches alone get the token.
+                        *(
+                            ["--github-repo", pr["repo"]]
+                            if SLUG.fullmatch(pr.get("repo") or "")
+                            else []
+                        ),
                         "--worktree-root",
                         str(base),
                         "--prompt-file",

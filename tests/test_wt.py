@@ -1664,7 +1664,12 @@ def test_wt_local_branch_worktrees_without_origin(repo, monkeypatch, other_remot
 
 def test_wt_does_not_hide_origin_fetch_failure(repo):
     home, git, _ = repo
-    git("remote", "set-url", "origin", str(home / "missing-remote.git"))
+    # A GitHub repository the user's config sends to a clone that is not there.
+    config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    missing = home / "missing-remote.git"
+    url = "https://github.com/missing/repo.git"
+    config.write_text(config.read_text() + f'[url "{missing}"]\n\tinsteadOf = {url}\n')
+    git("remote", "set-url", "origin", url)
     result = run_tool("wt", "-r", "repo", "main", "fetch-failed", check=False)
     assert result.returncode == 1
     assert "git fetch failed" in result.stderr

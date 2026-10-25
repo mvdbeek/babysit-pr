@@ -1,5 +1,6 @@
 """Host Git never runs what a sandboxed agent planted in a checkout's config or hooks."""
 
+import io
 import os
 import shutil
 import subprocess
@@ -13,6 +14,10 @@ import safe_git
 import workspace_overview
 import workspace_viewer
 import wt
+
+URL = "https://github.com/base/repo.git"
+# A host fetch: its repository named by URL, its refs explicit.
+FETCH = ("fetch", "-q", URL, "+refs/heads/main:refs/remotes/origin/main")
 
 
 @pytest.fixture
@@ -45,7 +50,9 @@ def planted(tmp_path, monkeypatch):
     git("branch", "feature")
     origin = tmp_path / "origin.git"
     git("clone", "--bare", str(clone), str(origin))
-    git("remote", "add", "origin", str(origin))
+    # GitHub, offline: the user's own config sends its URL to a local bare clone.
+    config.write_text(f'[url "{origin}"]\n\tinsteadOf = {URL}\n')
+    git("remote", "add", "origin", URL)
     git("fetch", "-q", "origin")
     # What a sandboxed agent can write: the common dir's config, hooks and attributes.
     hooks = tmp_path / "hooks"
@@ -109,7 +116,7 @@ def test_workspace_git_keeps_the_token_from_local_commands(planted, monkeypatch)
 
     monkeypatch.setattr(pr_workspaces, "run", run)
     assert pr_workspaces.git(clone, "status", "--porcelain") == "M file.txt"
-    pr_workspaces.git(clone, "fetch", "-q", "origin", "main")
+    pr_workspaces.git(clone, *FETCH)
     status, fetch = seen
     assert "GH_TOKEN" not in status[1] and fetch[1]["GH_TOKEN"]
     assert f"{safe_git.GITHUB}=!gh auth git-credential" in fetch[0]
@@ -151,7 +158,7 @@ def test_credentials_are_refused_where_the_repository_weakens_tls(planted):
     git("config", "http.https://github.com.sslVerify", "false")
     safe_git.prepare(str(clone), "status")
     with pytest.raises(ValueError, match="sslverify"):
-        safe_git.prepare(str(clone), "fetch", "origin")
+        safe_git.prepare(str(clone), *FETCH)
 
 
 def test_filters_from_the_users_own_config_are_kept():
@@ -549,13 +556,15 @@ def test_fetch_never_runs_a_remote_helper_the_repository_names(planted, tmp_path
     git("config", "remote.evil.url", "planted::somewhere")
     git("config", "protocol.planted.allow", "always")
     git("config", "url.planted::elsewhere.insteadOf", "https://example.test/")
-    for remote in ("evil", "https://example.test/repo.git"):
-        argv, env = safe_git.prepare(str(clone), "fetch", remote)
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        assert subprocess.run(argv, env=env, capture_output=True).returncode
+    # A rewrite, or a remote named by the very URL fetched, would reach the helper.
+    for key in ("url.planted::elsewhere.insteadOf", f"remote.{URL}.vcs"):
+        if key.startswith("remote."):
+            git("config", key, "planted")
+        with pytest.raises(ValueError, match="Git was not run"):
+            safe_git.prepare(str(clone), *FETCH)
+        git("config", "--unset", key)
+    pr_workspaces.git(clone, *FETCH)
     assert not marker.exists()
-    # Local clones still fetch from a path.
-    pr_workspaces.git(clone, "fetch", "-q", "origin", "main")
 
 
 def test_fetch_never_writes_through_a_planted_fetch_head(planted, tmp_path):
@@ -565,7 +574,7 @@ def test_fetch_never_writes_through_a_planted_fetch_head(planted, tmp_path):
     fetch_head = clone / ".git" / "FETCH_HEAD"
     fetch_head.unlink(missing_ok=True)
     fetch_head.symlink_to(target)
-    pr_workspaces.git(clone, "fetch", "-q", "origin", "main")
+    pr_workspaces.git(clone, *FETCH)
     assert target.read_text() == "kept\n"
 
 
@@ -576,7 +585,7 @@ def test_credentials_are_refused_where_the_repository_reroutes_or_records_http(p
     clone, _, git = planted
     git("config", key, "true" if "save" in key.lower() else "/tmp/x")
     with pytest.raises(ValueError, match="Git was not run"):
-        safe_git.prepare(str(clone), "fetch", "origin")
+        safe_git.prepare(str(clone), *FETCH)
 
 
 def test_config_writes_refuse_a_symlinked_common_config(tmp_path):
@@ -590,3 +599,200 @@ def test_config_writes_refuse_a_symlinked_common_config(tmp_path):
     (common / "config").symlink_to(target)
     with pytest.raises(ValueError, match="symbolic link"):
         safe_git.writable_config(str(common))
+
+
+@pytest.mark.parametrize(
+    "fetch",
+    [
+        ("fetch", "origin", "main"),
+        ("fetch", "-q", "/elsewhere/private.git", "main:main"),
+        ("fetch", "git@github.com:base/repo.git", "main"),
+        ("fetch", URL),
+        ("fetch", "https://github.com/base/..git", "main"),
+    ],
+)
+def test_a_host_fetch_names_its_github_repository_and_refs(fetch):
+    with pytest.raises(ValueError, match="Git was not run"):
+        safe_git.prepare("/x", *fetch)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("url./elsewhere/private.git.insteadOf", URL),
+        ("url.https://github.com/other/secret.git.insteadOf", URL),
+        (f"remote.{URL}.url", "/elsewhere/private.git"),
+    ],
+)
+def test_a_fetch_is_refused_where_the_repository_redirects_its_url(planted, tmp_path, key, value):
+    clone, _, git = planted
+    private = tmp_path / "private.git"
+    subprocess.check_call(["git", "init", "-q", "--bare", str(private)])
+    git("config", key, value.replace("/elsewhere/private.git", str(private)))
+    with pytest.raises(ValueError, match="Git was not run"):
+        safe_git.prepare(str(clone), *FETCH)
+
+
+def test_a_fetch_gets_github_credentials_from_gh_alone(planted, hermetic_helper):
+    clone, _, _ = planted
+    argv, env = safe_git.prepare(str(clone), *FETCH, env={**os.environ, "GH_TOKEN": "t"})
+    assert env["GH_TOKEN"] == "t"
+    assert f"{safe_git.GITHUB}=!gh auth git-credential" in argv
+    assert not [arg for arg in argv if "user-helper" in arg]  # The user's other helpers.
+    argv, env = safe_git.prepare(
+        str(clone), *FETCH, env={**os.environ, "GH_TOKEN": "t"}, credentials=False
+    )
+    assert "GH_TOKEN" not in env and env["GIT_TERMINAL_PROMPT"] == "0"
+    assert not [arg for arg in argv if "gh auth" in arg or "user-helper" in arg]
+
+
+@pytest.fixture
+def hermetic_helper(monkeypatch, tmp_path):
+    """A credential helper in the user's own config, for another host."""
+    config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    config.write_text(
+        config.read_text() + '[credential "https://example.test"]\n\thelper = user-helper\n'
+    )
+
+
+def test_reads_never_reach_a_remote_whatever_the_environment_says(planted, tmp_path, monkeypatch):
+    clone, marker, git = planted
+    helpers = tmp_path / "helpers"
+    helpers.mkdir()
+    (helpers / "git-remote-foo").symlink_to(marker.parent / "planted.sh")
+    monkeypatch.setenv("PATH", f"{helpers}{os.pathsep}{os.environ['PATH']}")
+    blob = git("rev-parse", "HEAD:file.txt")
+    for pack in (clone / ".git" / "objects" / "pack").glob("*.pack"):
+        moved = tmp_path / pack.name
+        pack.rename(moved)
+        pack.with_suffix(".idx").unlink()
+        with moved.open("rb") as stream:
+            subprocess.run(
+                ["git", "-C", str(clone), "unpack-objects", "-q"], stdin=stream, check=True
+            )
+    (clone / ".git" / "objects" / blob[:2] / blob[2:]).unlink(missing_ok=True)
+    git("config", "core.repositoryformatversion", "1")
+    git("config", "extensions.partialClone", "promised")
+    git("config", "remote.promised.url", "foo::somewhere")
+    git("config", "remote.promised.promisor", "true")
+    git("config", "protocol.foo.allow", "always")
+    for command in (["show", "HEAD"], ["log", "-p", "-1"], ["cat-file", "-p", blob]):
+        argv, env = safe_git.prepare(
+            str(clone), *command, env={**os.environ, "GIT_NO_LAZY_FETCH": "0"}
+        )
+        assert env["GIT_NO_LAZY_FETCH"] == "1"
+        subprocess.run(argv, env=env, capture_output=True, timeout=30)
+    assert not marker.exists()
+    # Git before 2.44 ignores the switch: every read then overrides the repository's own
+    # protocol permissions, which the listing finds.
+    monkeypatch.setattr(safe_git, "git_version", lambda: (2, 43))
+    argv, _ = safe_git.prepare(str(clone), "cat-file", "-p", blob)
+    assert "protocol.foo.allow=never" in argv
+    for name in ("file", "git", "ssh", "http", "https", "ftp", "ftps", "ext"):
+        assert f"protocol.{name}.allow=never" in argv
+
+
+@pytest.fixture
+def private(planted, tmp_path):
+    """A repository the agent may not read, with a branch named like the clone's base."""
+    clone, _, git = planted
+    private = tmp_path / "private"
+    subprocess.check_call(["git", "init", "-q", "-b", "main", str(private)])
+    (private / "secret.txt").write_text("secret\n")
+    subprocess.check_call(["git", "-C", str(private), "add", "."])
+    subprocess.check_call(
+        ["git", "-C", str(private), "-c", "user.name=F", "-c", "user.email=f@e.test"]
+        + ["commit", "-q", "-m", "secret"]
+    )
+    secret = subprocess.check_output(["git", "-C", str(private), "rev-parse", "HEAD"], text=True)
+    # Also reachable as another GitHub repository the babysitter's token could read.
+    config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    config.write_text(
+        config.read_text()
+        + f'[url "{private}"]\n\tinsteadOf = https://github.com/other/secret.git\n'
+    )
+    return private, secret.strip()
+
+
+def fetched(git, sha):
+    return not subprocess.run(
+        ["git", "-C", git("rev-parse", "--show-toplevel"), "cat-file", "-e", sha],
+        capture_output=True,
+    ).returncode
+
+
+@pytest.mark.parametrize("planted_url", ["path", "https://github.com/other/secret.git"])
+def test_cron_fetches_the_jobs_repository_whatever_origin_names(
+    planted, private, tmp_path, planted_url
+):
+    clone, marker, git = planted
+    path, secret = private
+    git("config", "remote.origin.url", str(path) if planted_url == "path" else planted_url)
+    git("config", "remote.upstream.url", URL)
+    job = {"clone": str(clone), "repo": "base/repo", "branch": "job", "base": "main"}
+    directory = cron_agents.checkout(job, tmp_path / "src")
+    assert git("symbolic-ref", "--short", "HEAD", cwd=directory) == "job"
+    assert not fetched(git, secret)
+    # The job's repository is upstream now; its base lands where that remote's refs live.
+    assert git("rev-parse", "upstream/main") == git("rev-parse", "job")
+    assert not marker.exists()
+
+
+def test_cron_starts_from_the_local_base_when_no_remote_tracks_the_jobs_repository(
+    planted, private, tmp_path
+):
+    clone, _, git = planted
+    path, secret = private
+    git("config", "remote.origin.url", str(path))
+    job = {"clone": str(clone), "repo": "base/repo", "branch": "job", "base": "main"}
+    directory = cron_agents.checkout(job, tmp_path / "src")
+    assert git("rev-parse", "HEAD", cwd=directory) == git("rev-parse", "main")
+    assert not fetched(git, secret)
+
+
+class Spy(wt.SubprocessRunner):
+    def __init__(self, env):
+        super().__init__(env)
+        self.seen = []
+
+    def run(self, argv, **kwargs):
+        self.seen.append((list(argv), dict(kwargs.get("env") or {})))
+        return super().run(argv, **kwargs)
+
+
+def wt_fetches(spy):
+    return [(argv, env) for argv, env in spy.seen if "fetch" in argv]
+
+
+def test_wt_never_fetches_a_path_origin_names(planted, private, tmp_path):
+    clone, _, git = planted
+    path, secret = private
+    git("config", "remote.origin.url", str(path))
+    spy = Spy({**os.environ, "GH_TOKEN": "t"})
+    stderr = io.StringIO()
+    tool = wt.Tool(spy, {**os.environ, "GH_TOKEN": "t"}, stderr=stderr)
+    directory = str(tmp_path / "worktrees" / "topic")
+    tool.add_worktree(str(clone), directory, "topic", "main")
+    assert not wt_fetches(spy) and not fetched(git, secret)
+    assert "not a GitHub repository" in stderr.getvalue()
+    assert git("rev-parse", "HEAD", cwd=Path(directory)) == git("rev-parse", "main")
+
+
+def test_wt_fetches_another_github_repository_origin_names_only_without_the_token(
+    planted, private, tmp_path
+):
+    clone, _, git = planted
+    git("config", "remote.origin.url", "https://github.com/other/secret.git")
+    spy = Spy({**os.environ, "GH_TOKEN": "t"})
+    tool = wt.Tool(spy, {**os.environ, "GH_TOKEN": "t"})
+    tool.add_worktree(str(clone), str(tmp_path / "worktrees" / "a"), "a", "main")
+    [(argv, env)] = wt_fetches(spy)
+    assert "https://github.com/other/secret.git" in argv
+    assert "GH_TOKEN" not in env and not [arg for arg in argv if "gh auth" in arg]
+    # The repository babysit was asked for gets the token, whatever origin names.
+    spy.seen.clear()
+    git("config", "remote.upstream.url", URL)
+    tool.add_worktree(str(clone), str(tmp_path / "worktrees" / "b"), "b", "main", "base/repo")
+    [(argv, env)] = wt_fetches(spy)
+    assert URL in argv and "+refs/heads/main:refs/remotes/upstream/main" in argv
+    assert env["GH_TOKEN"]

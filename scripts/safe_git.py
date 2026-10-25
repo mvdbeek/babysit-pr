@@ -17,9 +17,12 @@ config (Git LFS, say) and blanking the rest; Git skips an empty filter command. 
 takes its extensions, custom transfer programs and object store from that same config,
 so a repository that sets any of them is refused.
 ``remote.<name>.uploadpack`` is first-wins, so fetches pass ``--upload-pack`` instead.
-Only the https, ssh and file transports are allowed, for a fetch alone, and any
-``protocol.<name>.allow`` the repository adds is overridden, so no ``git-remote-<name>``
-helper is started.
+A fetch names a GitHub URL (:func:`github_url`) and its refs, never a remote whose URL
+the agent rewrote, and is refused while the repository rewrites URLs; only the gh
+helper is asked, and only when the caller vouches for that repository. Only the https,
+ssh and file transports are allowed, for a fetch alone (the user's own rewrites may
+lead there), and any ``protocol.<name>.allow`` the repository adds is overridden, so no
+``git-remote-<name>`` helper is started.
 
 Which config applies depends on the worktree: ``config.worktree`` and ``includeIf``
 conditions on the branch or git dir. So a worktree is checked out by adding it with
@@ -72,33 +75,44 @@ OPTIONS = (
     "status.submoduleSummary=false",
     "-c",
     "diff.submodule=short",
-    # Remote helpers are programs: only https, ssh and local paths are reachable.
+    # Remote helpers are programs: no transport is allowed but those a fetch adds back.
     "-c",
     "protocol.allow=never",
-    "-c",
-    "protocol.https.allow=always",
-    "-c",
-    "protocol.ssh.allow=always",
-    "-c",
-    "protocol.file.allow=always",
     # Auto gc after a fetch would run gc.recentObjectsHook.
     "-c",
     "gc.auto=0",
     "-c",
     "maintenance.auto=false",
 )
-# GIT_NO_LAZY_FETCH stops a partial clone's promisor remote from being fetched on demand.
-# An empty GIT_PROXY_COMMAND takes precedence over core.gitProxy and means no proxy.
-ENVIRONMENT = {"GIT_NO_LAZY_FETCH": "1", "GIT_PROXY_COMMAND": ""}
+# GIT_NO_LAZY_FETCH stops a partial clone's promisor remote from being fetched on demand,
+# whatever the inherited environment says. An empty GIT_PROXY_COMMAND takes precedence
+# over core.gitProxy and means no proxy, unless the user's environment names one.
+FORCED = {"GIT_NO_LAZY_FETCH": "1"}
+ENVIRONMENT = {"GIT_PROXY_COMMAND": ""}
+# Git ignores GIT_NO_LAZY_FETCH before this version.
+LAZY_FETCH_SWITCH = (2, 44)
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 # Subcommands that read working tree files through filters, or run a transport.
 CONTENT = {"diff", "fetch", "reset", "status", "switch"}
 # Their checkout or clean check would run in a worktree whose config was not listed.
 WORKTREE = {"worktree add": "--no-checkout", "worktree remove": "--force"}
+# A fetch names https://github.com, so these are reached only through URL rewrites in the
+# user's own config (to ssh, or a local mirror); the repository's own are refused.
 ALLOWED = {"https", "ssh", "file"}
-# Every other command reaches no remote at all, not even a promisor's missing object
-# where GIT_NO_LAZY_FETCH is unknown (Git before 2.44) or turned off.
-OFFLINE = [arg for name in sorted(ALLOWED) for arg in ("-c", f"protocol.{name}.allow=never")]
+TRANSPORTS = ("file", "git", "ssh", "http", "https", "ftp", "ftps", "ext")
+FETCHING = [arg for name in sorted(ALLOWED) for arg in ("-c", f"protocol.{name}.allow=always")]
+# Every other command reaches no remote at all, not even a promisor's missing object.
+OFFLINE = [arg for name in TRANSPORTS for arg in ("-c", f"protocol.{name}.allow=never")]
+# A host fetch names its repository by this URL, built from a host-side record of which
+# repository is meant, and its refs explicitly: never a remote, whose URL the agent writes.
+GITHUB_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+)\.git")
+GITHUB_REMOTE = re.compile(
+    r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+?)(?:\.git)?/?"
+)
+# Config that would send that URL elsewhere: a rewrite, or a remote named by a URL,
+# whose url, vcs or other settings Git applies to a fetch of that URL.
+REDIRECT = re.compile(r"url\..+\.insteadof|remote\..*://.*")
 # Subcommands that may need credentials; the rest run without the token.
 NETWORK = {"fetch"}
 DIFFS = {"diff", "log", "show"}
@@ -108,7 +122,6 @@ TRUSTED = {"system", "global", "command"}
 LISTING = ("config", "--list", "-z", "--show-scope")
 FILTER = re.compile(r"filter\..+\.(clean|smudge|process|required)")
 PROTOCOL = re.compile(r"protocol\.(.+)\.allow")
-HELPER = re.compile(r"credential\.(.+\.)?helper")
 # Settings that let a proxy, another CA or another address read what is sent to GitHub,
 # or keep its cookies in a file the agent reads.
 TLS = re.compile(
@@ -139,8 +152,52 @@ def entries(listing: str) -> list[tuple[str, str, str]]:
     return found
 
 
-def overrides(config: Sequence[tuple[str, str, str]], credentials: bool) -> list[str]:
-    """``-c`` settings that undo the repository's own drivers and programs."""
+def github_url(slug: str) -> str:
+    """The URL a host fetch of the GitHub repository ``owner/repo`` names."""
+    url = f"https://github.com/{slug}.git"
+    if not GITHUB_URL.fullmatch(url) or slug.split("/")[1] in {".", ".."}:
+        raise ValueError(f"Not a GitHub repository: {slug!r}")
+    return url
+
+
+def github_slug(url: str) -> str | None:
+    """``owner/repo`` of a configured GitHub remote URL, None for anything else.
+
+    The same spellings as ``remote_probe.remote_slug``, which must stay self-contained.
+    """
+    match = GITHUB_REMOTE.fullmatch(url.strip())
+    if not match or match[1].split("/")[1] in {".", ".."}:
+        return None
+    return match[1].lower()
+
+
+_version: list[tuple[int, ...]] = []
+
+
+def git_version() -> tuple[int, ...]:
+    """This machine's Git version, asked once; (0,) when it cannot be read."""
+    if not _version:
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["git", "--version"], capture_output=True, text=True, timeout=15
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        match = re.search(r"(\d+)\.(\d+)", out)
+        _version.append((int(match[1]), int(match[2])) if match else (0,))
+    return _version[0]
+
+
+def overrides(
+    config: Sequence[tuple[str, str, str]], credentials: bool, network: bool | None = None
+) -> list[str]:
+    """``-c`` settings that undo the repository's own drivers and programs.
+
+    ``network`` is a fetch, and ``credentials`` whether it gets GitHub's token.
+    """
+    network = credentials if network is None else network
     trusted = [(key, value) for scope, key, value in config if scope in TRUSTED]
     planted = [key for scope, key, _ in config if scope not in TRUSTED]
     options: list[str] = []
@@ -157,11 +214,14 @@ def overrides(config: Sequence[tuple[str, str, str]], credentials: bool) -> list
         name = key.split(".", 1)[1].rsplit(".", 1)[0]
         if "=" in key:
             raise ValueError(f"Cannot neutralise the repository's {key!r}; Git was not run")
-        allowed = credentials and name in ALLOWED
+        allowed = network and name in ALLOWED
         options += ["-c", f"{key}={'always' if allowed else 'never'}"]
     ssh = [value for name, value in trusted if name == "core.sshcommand"]
     if ssh:
         options += ["-c", f"core.sshCommand={ssh[-1]}"]
+    redirected = [key for key in planted if network and REDIRECT.fullmatch(key)]
+    if redirected:
+        raise ValueError(f"The repository's own {redirected[0]} redirects a fetch; Git was not run")
     if credentials:
         weakened = [key for key in planted if TLS.fullmatch(key)]
         if weakened:
@@ -169,14 +229,8 @@ def overrides(config: Sequence[tuple[str, str, str]], credentials: bool) -> list
                 f"The repository's own {weakened[0]} would expose GitHub credentials; "
                 "Git was not run"
             )
-        # The user's helpers serve other hosts; GitHub gets the gh helper alone, which
-        # hands over the token in GH_TOKEN when the environment carries one.
-        options += [
-            arg
-            for key, value in trusted
-            if HELPER.fullmatch(key) and "=" not in key
-            for arg in ("-c", f"{key}={value}")
-        ]
+        # GitHub gets the gh helper alone, which hands over the token in GH_TOKEN when the
+        # environment carries one; no other helper is asked.
         options += ["-c", f"{GITHUB}=", "-c", f"{GITHUB}=!gh auth git-credential"]
     return options
 
@@ -197,30 +251,50 @@ def prepare(
     *args: str,
     env: Mapping[str, str] | None = None,
     read: Callable[[list[str], Mapping[str, str]], str] = read_config,
+    credentials: bool = True,
 ) -> tuple[list[str], dict[str, str]]:
     """The hardened argv and environment for ``git -C path *args`` on the host.
 
-    ``env`` is the base environment; a GitHub token in it reaches only a fetch.
-    ``read`` runs the config listing for commands that need it.
+    ``env`` is the base environment; a GitHub token in it reaches only a fetch, and only
+    with ``credentials``: a fetch of a repository no host record names goes without.
+    A fetch names ``github_url(slug)`` and its refspecs. ``read`` runs the config
+    listing for commands that need it.
     """
     argv = list(args)
     index = subcommand(argv)
     name = argv[index] if index < len(argv) else ""
-    credentials = name in NETWORK
+    network = name in NETWORK
+    credentials = network and credentials
+    if network:
+        operands = [arg for arg in argv[index + 1 :] if not arg.startswith("-")]
+        if (
+            len(operands) < 2
+            or not GITHUB_URL.fullmatch(operands[0])
+            or not github_slug(operands[0])
+        ):
+            raise ValueError(
+                "A host fetch names a GitHub repository URL and its refs, never a remote or "
+                "another URL; Git was not run"
+            )
     environment = dict(os.environ if env is None else env)
     if not credentials:
         for token in TOKENS:
             environment.pop(token, None)
+        if network:
+            environment.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
     for key, value in ENVIRONMENT.items():
         environment.setdefault(key, value)
+    environment.update(FORCED)
     pair = " ".join(argv[index : index + 2])
     if pair in WORKTREE and WORKTREE[pair] not in argv[index + 2 :]:
         raise ValueError(f"git {pair} needs {WORKTREE[pair]} on the host; Git was not run")
     extra: list[str] = []
-    if name in CONTENT:
+    # Where Git ignores GIT_NO_LAZY_FETCH, any command may fetch a missing object, so the
+    # repository's own protocol permissions are overridden for every one.
+    if name in CONTENT or (not network and git_version() < LAZY_FETCH_SWITCH):
         # Listing config runs nothing: no index, hooks or filters, and no pager here.
         listing = read(["git", "--no-pager", "-C", path, *LISTING], environment)
-        extra = overrides(entries(listing), credentials)
+        extra = overrides(entries(listing), credentials, network)
     flags = {
         # FETCH_HEAD is opened without refusing a planted symlink; nothing here reads it.
         "fetch": ["--upload-pack=git-upload-pack", "--no-write-fetch-head"],
@@ -234,8 +308,8 @@ def prepare(
     # core.bare at none; a checkout with its own .git is its own work tree.
     if os.path.lexists(os.path.join(path, ".git")):
         argv[:0] = [f"--work-tree={os.path.abspath(path)}"]
-    offline = [] if credentials else OFFLINE
-    return ["git", "-C", path, *OPTIONS, *offline, *extra, *argv], environment
+    transports = FETCHING if network else OFFLINE
+    return ["git", "-C", path, *OPTIONS, *transports, *extra, *argv], environment
 
 
 def common_dir(checkout: str) -> str:
