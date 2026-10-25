@@ -156,12 +156,27 @@ ssh babysit@<box> "bash -s -- --user-step --sha $(git rev-parse HEAD)" \
 If the babysit-pr repository is private, run `gh auth login` and `gh auth setup-git`
 as `babysit` first (or pass `--repo` with a URL the box can read).
 
-It clones babysit-pr to `~/src/babysit-pr` and checks out that SHA detached (a
-checkout with local changes is left alone), creates `~/.cache/babysit-sandbox`
-(mode 700), sets npm's prefix to `~/.npm-global` (so Codex updates never need root),
-and prepends `~/.npm-global/bin`, `~/.local/bin` and `~/src/babysit-pr/scripts` to
-`PATH` at the top of `~/.bashrc`, above Ubuntu's early return, so non-interactive
-`ssh box <command>` finds the same tools. With `GIT_USER_NAME` and `GIT_USER_EMAIL`
+It deploys babysit-pr to `~/.local/share/babysit-pr/app` and checks out that SHA
+detached (a checkout with local changes is left alone), creates
+`~/.cache/babysit-sandbox` (mode 700), sets npm's prefix to `~/.npm-global` (so
+Codex updates never need root), and prepends `~/.npm-global/bin`, `~/.local/bin`
+and `~/.local/share/babysit-pr/app/scripts` to `PATH` at the top of `~/.bashrc`,
+above Ubuntu's early return, so non-interactive `ssh box <command>` finds the same
+tools.
+
+The deployed copy is kept apart from `~/src`, where agents work: babysit-bwrap
+refuses to grant `~/.local/share/babysit-pr`, its own checkout and that checkout's
+git directory, so no agent can change the launcher or what git runs in it. Agents
+can still work on babysit-pr itself in a clone under `~/src` and its worktrees.
+git in the deployed copy always runs with `-c core.fsmonitor=false
+-c core.hooksPath=/dev/null -c protocol.ext.allow=never`. Never work in the
+deployed copy or add worktrees to it. The user step's `--check` reports its commit,
+refuses local changes in it, warns when `babysit-bwrap` on `PATH` is not the
+deployed one, and reports a `~/.bashrc` that still puts `~/src/babysit-pr/scripts`
+on `PATH`.
+
+babysit-bwrap needs bash 4.1 or later (Ubuntu ships 5.x) and, for `--enable=gpg`,
+python3; the system step installs python3. With `GIT_USER_NAME` and `GIT_USER_EMAIL`
 it sets git's global identity. It then checks bwrap and rootless Docker and prints the
 interactive steps:
 
@@ -357,7 +372,7 @@ self-updates outside these checks; reinstall via the script with a new pin inste
          "ssh": "<box>",
          "os": "linux",
          "src": "/home/babysit/src",
-         "babysit_root": "/home/babysit/src/babysit-pr",
+         "babysit_root": "/home/babysit/.local/share/babysit-pr/app",
          "python": "/usr/bin/python3",
          "max_agents": 6,
          "labels": ["bwrap", "docker", "claude-account:<name>"],
@@ -375,6 +390,18 @@ self-updates outside these checks; reinstall via the script with a new pin inste
 
 4. Keep the worker's babysit-pr at the controller's SHA: rerun the user step with the
    new `--sha` after updating the controller. A mismatch blocks remote work.
+
+**Migrating a worker provisioned before the deployed copy** (babysit-pr in
+`~/src/babysit-pr`, for example chonk pinned at `d55bebe`): rerun the user step with
+the current SHA. It clones the deployed copy to `~/.local/share/babysit-pr/app` and
+rewrites the `PATH` line under `# babysit-pr worker PATH` in `~/.bashrc`; then
+`. ~/.bashrc` (or log in again), restart herdr panes started with the old `PATH`,
+change `babysit_root` in `machines.json` to `/home/babysit/.local/share/babysit-pr/app`,
+and confirm with `--check`. The old `~/src/babysit-pr` is no longer used by babysit:
+remove it, or keep it as an ordinary clone for agents to work in (babysit-bwrap
+would refuse it only if babysit ran from it). Inspect it before running anything
+from it outside the sandbox: agents working in its worktrees could write its git
+directory.
 
 ## 5. Architecture
 

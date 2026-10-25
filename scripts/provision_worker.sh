@@ -19,7 +19,8 @@
 #                 checks, including commit signing when set up (as the babysit user)
 #   --dry-run     change nothing and touch no network; print the planned actions
 #   --user-step   run the non-root step as the babysit user (needs --sha)
-#   --sha SHA     full 40-hex babysit-pr commit to check out in ~/src/babysit-pr (user step)
+#   --sha SHA     full 40-hex babysit-pr commit to deploy in ~/.local/share/babysit-pr/app
+#                 (user step)
 #   --repo URL    babysit-pr clone URL (user step; default $BABYSIT_REPO)
 #
 # Environment (system step):
@@ -75,6 +76,11 @@ dry=0
 sha=
 repo=${BABYSIT_REPO:-https://github.com/mvdbeek/babysit-pr.git}
 user_name=${BABYSIT_USER:-babysit}
+# The babysit-pr this worker runs, apart from ~/src where agents work on clones: an agent
+# able to write it would change babysit-bwrap itself, which refuses to grant it.
+APP=.local/share/babysit-pr/app
+# git in that checkout runs no hooks, fsmonitor or ext:: transport, whatever it holds.
+SAFE_GIT=(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c protocol.ext.allow=never)
 problems=()
 warnings=()
 
@@ -736,9 +742,9 @@ gpg_checks() {
   else
     problem "gpg cannot sign with user.signingkey without a prompt; is the preset unit's passphrase right?"
   fi
-  wrapper=$(command -v babysit-bwrap) || wrapper=$HOME/src/babysit-pr/scripts/babysit-bwrap
+  wrapper=$HOME/$APP/scripts/babysit-bwrap
   if [[ ! -x $wrapper ]]; then
-    problem "no babysit-bwrap at $wrapper; pin ~/src/babysit-pr to a commit that has it"
+    problem "no babysit-bwrap at $wrapper; rerun the user step with a commit that has it"
     return
   fi
   tmp=$(mktemp -d)
@@ -763,7 +769,22 @@ gpg_checks() {
 }
 
 user_checks() {
+  local app=$HOME/$APP head found
   say "Checks"
+  if [[ -d $app/.git ]] && head=$("${SAFE_GIT[@]}" -C "$app" rev-parse HEAD 2>/dev/null); then
+    ok "babysit-pr deployed at $app ($head)"
+    [[ -z $("${SAFE_GIT[@]}" -C "$app" status --porcelain 2>/dev/null) ]] ||
+      problem "$app has local changes"
+  else
+    problem "no babysit-pr checkout at $app; run the user step"
+  fi
+  found=$(command -v babysit-bwrap 2>/dev/null) || found=
+  if [[ $found != "$app/scripts/babysit-bwrap" ]]; then
+    warn "babysit-bwrap on PATH is ${found:-missing}, not $app/scripts/babysit-bwrap (. ~/.bashrc?)"
+  fi
+  if grep -qF 'src/babysit-pr/scripts' "$HOME/.bashrc" 2>/dev/null; then
+    problem "~/.bashrc still puts ~/src/babysit-pr/scripts on PATH; rerun the user step"
+  fi
   if (cd / && bwrap --ro-bind / / true) >/dev/null 2>&1; then
     ok "bwrap works"
   else
@@ -779,7 +800,7 @@ user_checks() {
 }
 
 user_step() {
-  local dest=$HOME/src/babysit-pr codex=${CODEX_VERSION:-$CODEX_DEFAULT}
+  local dest=$HOME/$APP codex=${CODEX_VERSION:-$CODEX_DEFAULT}
   [[ -n $sha ]] || {
     printf 'provision_worker: --user-step needs --sha <babysit-pr commit>\n' >&2
     exit 2
@@ -794,18 +815,18 @@ user_step() {
   fi
   [[ $(id -un) == "$user_name" ]] || ((dry)) || warn "running as $(id -un), not $user_name"
 
-  say "babysit-pr at $sha"
+  say "babysit-pr at $sha in $dest"
   if ((!dry)) && [[ -d $dest/.git ]]; then
-    [[ -z $(git -C "$dest" status --porcelain) ]] || {
+    [[ -z $("${SAFE_GIT[@]}" -C "$dest" status --porcelain) ]] || {
       problem "$dest has local changes; leaving it alone"
       finish
     }
   else
-    run mkdir -p "$HOME/src"
-    run git clone "$repo" "$dest"
+    run mkdir -p "$(dirname "$dest")"
+    run "${SAFE_GIT[@]}" clone "$repo" "$dest"
   fi
-  run git -C "$dest" fetch --quiet origin
-  run git -C "$dest" checkout --quiet --detach "$sha"
+  run "${SAFE_GIT[@]}" -C "$dest" fetch --quiet origin
+  run "${SAFE_GIT[@]}" -C "$dest" checkout --quiet --detach "$sha"
 
   say "Directories and PATH"
   run mkdir -p "$HOME/.cache/babysit-sandbox" "$HOME/.npm-global" "$HOME/.local/bin"
@@ -816,11 +837,16 @@ user_step() {
   # `ssh box codex ...` and herdr panes find the same tools as a login shell.
   local marker='# babysit-pr worker PATH'
   # shellcheck disable=SC2016
-  local line='export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/src/babysit-pr/scripts:$PATH"'
+  local line="export PATH=\"\$HOME/.npm-global/bin:\$HOME/.local/bin:\$HOME/$APP/scripts:\$PATH\""
   if ((dry)); then
-    printf '  would prepend the npm prefix, ~/.local/bin and babysit-pr/scripts to PATH in ~/.bashrc\n'
+    printf '  would prepend the npm prefix, ~/.local/bin and %s/scripts to PATH in ~/.bashrc\n' "~/$APP"
   elif ! grep -qF "$marker" "$HOME/.bashrc" 2>/dev/null; then
     { printf '%s\n%s\n\n' "$marker" "$line" && cat "$HOME/.bashrc" 2>/dev/null; } >"$HOME/.bashrc.tmp.$$"
+    mv -f "$HOME/.bashrc.tmp.$$" "$HOME/.bashrc"
+  elif ! grep -qxF -- "$line" "$HOME/.bashrc"; then
+    # Earlier runs put ~/src/babysit-pr/scripts, a clone agents may write, first.
+    awk -v marker="$marker" -v line="$line" 'fix { print line; fix = 0; next } { print } $0 == marker { fix = 1 }' \
+      "$HOME/.bashrc" >"$HOME/.bashrc.tmp.$$"
     mv -f "$HOME/.bashrc.tmp.$$" "$HOME/.bashrc"
   fi
   # Without DOCKER_HOST the CLI asks the rootful daemon's socket, which this user

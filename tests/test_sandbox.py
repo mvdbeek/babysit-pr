@@ -809,6 +809,7 @@ def test_wrapper_protects_session_and_git_startup_files(checkout, path):
         ".claude",  # every Claude account
         ".claude/accounts/other",
         ".codex",
+        ".local/share/babysit-pr",  # the deployed babysit-pr on a worker
     ],
 )
 def test_wrapper_protects_launchers_sockets_and_agent_homes(checkout, path):

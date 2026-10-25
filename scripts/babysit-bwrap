@@ -104,6 +104,7 @@ resolve() {
 # which run or authorize code outside.
 protected=()
 for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .local/bin \
+  .local/share/babysit-pr \
   .local/share/uv .local/share/claude .nvm .npm-global .docker .config/herdr .claude .codex \
   .cache/babysit-sandbox .bashrc .bashrc.d .bash_aliases .bash_profile .bash_login \
   .bash_logout .profile .inputrc .zshenv .zprofile .zshrc .zlogin .zlogout .config/fish \

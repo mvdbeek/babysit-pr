@@ -45,6 +45,10 @@ def run(tmp_path):
     return run
 
 
+# git in the deployed copy never runs hooks, an fsmonitor or ext:: transports.
+SAFE_GIT = "-c core.fsmonitor=false -c core.hooksPath=/dev/null -c protocol.ext.allow=never"
+
+
 def test_script_parses():
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
 
@@ -127,8 +131,13 @@ def test_user_step_dry_run_pins_the_checkout(run):
         "--user-step", "--dry-run", "--sha", "0123abc" * 5 + "01234", "--repo", "/fixture/repo"
     )
     assert done.returncode == 0, done.stderr
-    assert "git clone /fixture/repo" in done.stdout
-    assert "checkout --quiet --detach " + "0123abc" * 5 + "01234" in done.stdout
+    # A deployed copy apart from ~/src, where agents work: babysit-bwrap protects it.
+    app = "/.local/share/babysit-pr/app"
+    assert re.search(rf"git {SAFE_GIT} clone /fixture/repo \S*{app}\n", done.stdout)
+    assert re.search(rf"git {SAFE_GIT} -C \S*{app} fetch --quiet origin", done.stdout)
+    sha = "0123abc" * 5 + "01234"
+    assert re.search(rf"git {SAFE_GIT} -C \S*{app} checkout --quiet --detach {sha}", done.stdout)
+    assert "src/babysit-pr" not in done.stdout
     assert ".cache/babysit-sandbox" in done.stdout
     assert "codex login --device-auth" in done.stdout
     assert "claude-account login <name>" in done.stdout
@@ -158,8 +167,14 @@ def test_user_check_verifies_signing_without_printing_secrets(tmp_path, works):
     fakes = tmp_path / "bin"
     fakes.mkdir()
     status = 0 if works else 1
-    for tool in ("bwrap", "docker", "gpg", "systemctl", "babysit-bwrap"):
+    home = tmp_path / "home"
+    app = home / ".local/share/babysit-pr/app"
+    (app / ".git").mkdir(parents=True)
+    (app / "scripts").mkdir()
+    for tool in ("bwrap", "docker", "gpg", "systemctl"):
         (fakes / tool).write_text(f"#!/bin/sh\necho rootless\nexit {status}\n")
+    (app / "scripts" / "babysit-bwrap").write_text(f"#!/bin/sh\nexit {status}\n")
+    (app / "scripts" / "babysit-bwrap").chmod(0o755)
     # git answers the signing key and the identity; every other git call follows `works`.
     (fakes / "git").write_text(
         '#!/bin/sh\ncase "$*" in *user.signingkey*) echo KEYID-SECRET!; exit 0 ;; esac\n'
@@ -167,7 +182,6 @@ def test_user_check_verifies_signing_without_printing_secrets(tmp_path, works):
     )
     for fake in fakes.iterdir():
         fake.chmod(0o755)
-    home = tmp_path / "home"
     (home / ".gnupg").mkdir(parents=True)
     (home / ".gnupg/signing-subkey.pass").write_text("PASSPHRASE-SECRET\n")
     done = subprocess.run(
@@ -198,3 +212,33 @@ def test_user_check_verifies_signing_without_printing_secrets(tmp_path, works):
         timeout=30,
     )
     assert "commit signing not set up" in done.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the user step refuses root")
+def test_user_step_moves_path_from_the_old_clone_to_the_deployed_copy(tmp_path):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    calls = tmp_path / "calls"
+    for tool in ("git", "npm", "bwrap", "docker", "id"):
+        answer = "echo babysit" if tool == "id" else ""
+        (fakes / tool).write_text(f'#!/bin/sh\necho "{tool} $*" >> "{calls}"\n{answer}\n')
+        (fakes / tool).chmod(0o755)
+    home = tmp_path / "home"
+    (home / ".local/share/babysit-pr/app/.git").mkdir(parents=True)
+    # What the first provisioning of a worker wrote.
+    old = 'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/src/babysit-pr/scripts:$PATH"'
+    (home / ".bashrc").write_text(f"# babysit-pr worker PATH\n{old}\n\n# Ubuntu's own\n")
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--user-step", "--sha", "0123abc" * 5 + "01234"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    bashrc = (home / ".bashrc").read_text()
+    assert "src/babysit-pr" not in bashrc, done.stdout + done.stderr
+    assert "$HOME/.local/share/babysit-pr/app/scripts:$PATH" in bashrc
+    assert bashrc.count("# babysit-pr worker PATH") == 1 and "# Ubuntu's own" in bashrc
+    assert all(
+        SAFE_GIT in line for line in calls.read_text().splitlines() if line.startswith("git -")
+    )
