@@ -1,0 +1,281 @@
+"""Repairs of watches on a worker: the guardian here, the agent there, over fake ssh.
+
+The worker's babysit-pr is a copy of these scripts whose babysit-bwrap only records its
+options and runs the command after ``--``; its codex and claude are fakes on PATH.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import pr_supervisor as supervisor
+import pytest
+import remote_repair
+import session_locks
+from test_remote_cron import git, short_tmp  # noqa: F401 (fixture)
+from test_remote_registration import box, claude_transcript, register, registry  # noqa: F401
+
+SCRIPTS = Path(supervisor.__file__).resolve().parent
+CHECK_VERSION = remote_repair.check_version
+BWRAP = """#!/bin/sh
+printf '%s\\n' "$*" >> "$HOME/bwrap-calls"
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+"""
+AGENT = f"""#!{sys.executable}
+import json, os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+record = {{"argv": args, "cwd": os.getcwd(), "pid": os.getpid(), "prompt": prompt,
+          "env": {{k: os.environ.get(k) for k in ("BABYSIT_PR_REPAIR", "GIT_TERMINAL_PROMPT",
+                                                 "CLAUDE_CONFIG_DIR", "CODEX_THREAD_ID")}}}}
+with open(os.environ["FAKE_REPAIR_LOG"], "a") as log:
+    log.write(json.dumps(record) + "\\n")
+mode = os.environ.get("FAKE_REPAIR", "")
+print("working on it", flush=True)
+if mode == "hang":
+    time.sleep(120)
+if mode == "fail":
+    sys.exit(3)
+reply = {{"status": "waiting", "summary": "Fixed on the worker"}}
+if Path(sys.argv[0]).name == "claude":
+    sid = args[args.index("--resume") + 1]
+    print(json.dumps({{"type": "result", "subtype": "success", "session_id": sid,
+                      "structured_output": reply}}), flush=True)
+else:
+    Path(args[args.index("-o") + 1]).write_text(json.dumps(reply))
+"""
+
+
+@pytest.fixture
+def worker(box, tmp_path, monkeypatch):  # noqa: F811
+    """The worker's deployed babysit-pr and fake agents; the controller's own HOME."""
+    monkeypatch.setenv("HOME", str(tmp_path / "me"))  # Leases live under it.
+    # The worker imports its own copy, never this checkout's through the test sitecustomize.
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    app = box["worker"] / "app"
+    shutil.copytree(
+        SCRIPTS, app / "scripts", ignore=shutil.ignore_patterns("test_*", "__pycache__")
+    )
+    (app / "scripts" / "babysit-bwrap").write_text(BWRAP)
+    registry(box["home"], babysit_root=str(app))
+    bin_dir = tmp_path / "agents"
+    bin_dir.mkdir()
+    for name in ("codex", "claude"):
+        (bin_dir / name).write_text(AGENT)
+        (bin_dir / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REPAIR_LOG", str(tmp_path / "agent-calls.jsonl"))
+    # The worker runs this very code; the version handshake has its own test.
+    monkeypatch.setattr(remote_repair, "check_version", lambda home, worker: None)
+    return box
+
+
+def dispatch(box, **changes):  # noqa: F811
+    """A registered watch claimed for one repair, as start_repair leaves it."""
+    job = register(box, **changes)
+    attempt = str(uuid.uuid4())
+    folder = box["home"] / "runs" / attempt
+    folder.mkdir(parents=True)
+    snapshot = {
+        "pr": supervisor.watch.resolve_subject(job["url"], repo_override=job["repo"]),
+        "checks": {"failed_count": 1},
+    }
+    job.update(status="running", attempt=attempt, snapshot=snapshot, dispatched_keys=["k"])
+    db = supervisor.open_db(box["home"])
+    with db:
+        supervisor.save_job(db, job)
+    db.close()
+    return job, folder
+
+
+def calls(tmp_path):
+    path = tmp_path / "agent-calls.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def result(folder):
+    return json.loads((folder / "result.json").read_text())
+
+
+def remote_run(box, job):  # noqa: F811
+    return box["worker"] / ".local/state/babysit-pr/runs" / job["attempt"]
+
+
+def test_a_codex_repair_runs_on_the_worker_and_returns_here(worker, tmp_path):
+    job, folder = dispatch(worker)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert result(folder) == {"status": "waiting", "summary": "Fixed on the worker"}
+    # The worker's stream, copied into this machine's log; its reply fetched apart.
+    assert "working on it" in (folder / "agent.log").read_text()
+    assert json.loads((folder / "reply.json").read_text())["summary"] == "Fixed on the worker"
+    [call] = calls(tmp_path)
+    tree = str(worker["tree"])
+    assert call["cwd"] == tree and "Fix CI only" in call["prompt"]
+    assert "the babysit-pr skill's SKILL.md" in call["prompt"]
+    assert call["env"]["BABYSIT_PR_REPAIR"] == job["id"]
+    assert call["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    argv = call["argv"]
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+    assert argv[-3:] == ["resume", worker["sid"], "-"]
+    # Inside the worker's own babysit-bwrap, given the worktree and its common dir.
+    [bwrap] = (worker["worker"] / "bwrap-calls").read_text().splitlines()
+    common = str((worker["worker"] / "src/repo/.git").resolve())
+    assert f"--codex-home={worker['worker']}/.codex" in bwrap
+    assert f"--add-dirs={tree}:{common}" in bwrap and "-- codex exec" in bwrap
+    run = remote_run(worker, job)
+    assert json.loads((run / "result.json").read_text()) == {"exit": 0, "error": None}
+    assert not session_locks.held("codex", worker["sid"], None, "box")
+    # The worker half never keeps a queue.
+    assert not (worker["worker"] / ".local/state/babysit-pr/queue.sqlite").exists()
+
+
+def test_a_claude_repair_on_the_worker_uses_its_account(worker, tmp_path):
+    sid = str(uuid.uuid4())
+    claude_transcript(worker["worker"], worker["tree"], sid, "oss")
+    job, folder = dispatch(worker, agent="claude", session=sid, claude_account="oss")
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert result(folder) == {"status": "waiting", "summary": "Fixed on the worker"}
+    [call] = calls(tmp_path)
+    assert call["env"]["CLAUDE_CONFIG_DIR"] == str(worker["worker"] / ".claude/accounts/oss")
+    assert call["argv"][:3] == ["--dangerously-skip-permissions", "--print", "--resume"]
+    assert "--permission-mode" not in call["argv"]
+    [bwrap] = (worker["worker"] / "bwrap-calls").read_text().splitlines()
+    assert (
+        "--claude-config-dir=" + str((worker["worker"] / ".claude/accounts/oss").resolve()) in bwrap
+    )
+
+
+def test_a_failing_or_timed_out_repair_blocks_the_watch(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_REPAIR", "fail")
+    job, folder = dispatch(worker)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert result(folder)["status"] == "blocked"
+    assert "codex exited 3 on Box" in result(folder)["summary"]
+    monkeypatch.setenv("FAKE_REPAIR", "hang")
+    db = supervisor.open_db(worker["home"])
+    with db:
+        db.execute("DELETE FROM jobs")
+    db.close()
+    job, folder = dispatch(worker, repair_timeout=2)
+    started = time.monotonic()
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert time.monotonic() - started < 30
+    assert result(folder) == {"status": "blocked", "summary": "Box: Timed out after 2 s"}
+    pid = calls(tmp_path)[-1]["pid"]
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_stopping_the_guardian_stops_the_agent_on_the_worker(worker, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_REPAIR", "hang")
+    job, folder = dispatch(worker)
+
+    def stop_when_started():
+        deadline = time.monotonic() + 30
+        while not calls(tmp_path) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop_when_started, daemon=True).start()
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert result(folder) == {
+        "status": "blocked",
+        "summary": "Repair interrupted; inspect before resuming",
+    }
+    pid = calls(tmp_path)[0]["pid"]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("The worker's agent outlived its guardian")
+    # The worker confirmed it stopped: nothing stays held.
+    assert not session_locks.held("codex", worker["sid"], None, "box")
+    run = remote_run(worker, job)
+    assert (
+        "controller ended its connection" in json.loads((run / "result.json").read_text())["error"]
+    )
+
+
+def test_a_lost_worker_keeps_the_session_held_until_it_shows_the_run_ended(
+    worker, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FAKE_REPAIR", "hang")
+    monkeypatch.setenv("FAKE_SSH_DROP", "box.test:_repair_worker:2")
+    job, folder = dispatch(worker)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    outcome = result(folder)
+    assert outcome["status"] == "blocked"
+    assert outcome["summary"].startswith("Box unreachable mid-repair; remote agent may still be")
+    sid = worker["sid"]
+    assert session_locks.held("codex", sid, None, "box")
+    assert list(session_locks.orphans()) == [("box", sid, job["attempt"])]
+    with pytest.raises(BlockingIOError, match="orphaned"):
+        with session_locks.acquire("codex", sid, None, "box"):
+            pass
+    # The lifeline ended with the guardian, so the worker stops the agent.
+    run = remote_run(worker, job)
+    deadline = time.monotonic() + 30
+    while not (run / "result.json").exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    monkeypatch.setenv("FAKE_SSH_DOWN", "box.test")
+    assert not remote_repair.reconcile(worker["home"], "box", sid, job["attempt"])
+    assert session_locks.held("codex", sid, None, "box")
+    monkeypatch.delenv("FAKE_SSH_DOWN")
+    assert remote_repair.reconcile(worker["home"], "box", sid, job["attempt"])
+    assert not session_locks.held("codex", sid, None, "box")
+
+
+def test_a_worker_running_other_code_blocks_the_repair(worker, monkeypatch):
+    # The real version handshake, against the copy's own commit.
+    monkeypatch.setattr(remote_repair, "check_version", CHECK_VERSION)
+    app = worker["worker"] / "app"
+    git("init", "-q", cwd=app)
+    git("add", "-A", cwd=app)
+    git("commit", "-q", "-m", "other", cwd=app)
+    job, folder = dispatch(worker)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    summary = result(folder)["summary"]
+    assert "update babysit-pr on Box (provision_worker.sh --user-step --sha" in summary
+
+
+def test_the_worker_half_runs_a_spec_once_and_only_a_staged_one(worker, tmp_path):
+    stray = worker["worker"] / "spec.json"
+    stray.write_text("{}")
+    env = {**os.environ, "HOME": str(worker["worker"])}
+    script = str(worker["worker"] / "app/scripts/pr_supervisor.py")
+    done = subprocess.run(
+        [sys.executable, script, "_repair_worker", str(stray)],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert done.returncode == 1 and "staged specs folder" in done.stdout
+    job, folder = dispatch(worker)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    [spec] = (worker["worker"] / ".local/state/babysit-pr/repair-specs").iterdir()
+    before = (remote_run(worker, job) / "result.json").read_text()
+    again = subprocess.run(
+        [sys.executable, script, "_repair_worker", str(spec)],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert again.returncode == 1 and "File exists" in again.stdout
+    assert (remote_run(worker, job) / "result.json").read_text() == before
+    assert len(calls(tmp_path)) == 1

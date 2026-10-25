@@ -170,6 +170,25 @@ does not cover children that deliberately detach into another process group,
 or a guardian killed with SIGKILL. A process parented by launchd is not by itself
 evidence of a leak: terminal prompt plugins can intentionally detach workers.
 
+A repair of a watch on a worker keeps its guardian here and runs only the agent
+there (`scripts/remote_repair.py`). The guardian holds an ssh connection to the
+worker half (`pr_supervisor.py _repair_worker`), whose stdin is its lifeline: when it
+ends, the worker half stops the agent's process group (5 s grace). SIGTERM or SIGHUP
+to the guardian ends the lifeline first, waits up to 15 s for the worker half to
+exit, stops the ssh client and then asks the worker to cancel (`_repair_cancel`); a
+guardian killed with SIGKILL ends the lifeline too. So, unlike a local repair, a
+remote one does not survive a controller restart, reboot or network loss: it is
+killed there, its watch blocked, and a later release retries it; nothing reattaches.
+The worker enforces the repair timeout; the guardian gives ssh 60 s more, and the
+service's own missing-result grace remains the backstop. When ssh fails mid-repair
+(exit 255 or that timeout), the guardian cannot tell whether the agent still runs:
+the watch is blocked as "unreachable mid-repair", and a tombstone beside the
+session's lease keeps the session held (no repair, no dashboard resume) until the
+service, once a minute, finds on the worker (`_repair_status`) that the run has a
+result or its worker half is gone. A worker's sshd with `ClientAliveInterval 15`
+and `ClientAliveCountMax 4` (provisioning sets it) ends a partitioned session's
+lifeline within about a minute.
+
 ## Fork and branch CI
 
 To continue the original task after green CI, add `--on-green 'AUTHORIZED_TASK'`
@@ -557,8 +576,26 @@ or `--branch`); `--pr auto` would need the worker's checkout. A worker watch's
 launcher is that worker's own babysit-bwrap (`<babysit_root>/scripts/babysit-bwrap`,
 `~` meaning the worker's home, with `--enable=gpg` when the machine has the `gpg`
 label); `--codex-command`/`--claude-command` are refused, so a registration never
-chooses what runs outside the sandbox there. Only Linux workers take watches. Repairs
-of worker watches are not supported yet: such a watch is blocked when one is due.
+chooses what runs outside the sandbox there. Only Linux workers take watches.
+
+Repairs run on the worker (see the guardian notes under Controls): the guardian
+checks that the worker deploys this machine's babysit-pr commit (probe op `version`;
+otherwise the watch is blocked with the command to update it), checks the PR and the
+worker checkout as for a local repair, stages a spec (the session, account, timeout,
+expected branch and head, and the prompt) in
+`~/.local/state/babysit-pr/repair-specs/` there with `machines.put_file`, and runs the
+worker half from the worker's deployed copy. That half never opens a queue: it
+refuses a spec from anywhere else and a run folder that already exists (a spec runs
+once), checks the checkout again with that machine's hardened Git, builds the agent's
+environment with the worker's own Claude account directory, and runs the agent in its
+own process group inside the worker's babysit-bwrap (`--enable=gpg` with the machine's
+`gpg` label), keeping `~/.local/state/babysit-pr/runs/<attempt>/` (`agent.log`,
+`prompt.txt`, `reply.json`, `result.json`, `pid`) there. Its output streams back into
+the guardian's `agent.log`, so a Claude result is read as for a local repair; a
+Codex `reply.json` is fetched by a separate `_repair_status` call after the run. The
+prompt names the agent's own copy of the skill. The session's lease is the
+controller's (`session_locks`, keyed by machine). Pane-bound watches on workers are
+not repaired yet (blocked when one is due; register them `--headless`).
 
 On a worker, `register` forwards to the controller's dashboard instead of keeping a
 watch of its own, which would act where nobody looks. A worker is one with

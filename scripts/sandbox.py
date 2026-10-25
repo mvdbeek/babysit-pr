@@ -108,8 +108,11 @@ def wrap(argv: Sequence[str], grants: Grants = NO_GRANTS, name: str | None = Non
     return [launcher, *flags(grants, name), "--", *argv]
 
 
-def claude_launcher(name: str | None = None) -> list[str]:
-    """The headless Claude repair launcher; Claude's own options follow it."""
+def claude_launcher(name: str | None = None, features: Sequence[str] = ()) -> list[str]:
+    """The headless Claude repair launcher; Claude's own options follow it.
+
+    ``features`` are a worker's extra ones (``gpg``), which only babysit-bwrap takes.
+    """
     name = backend(name)
     if name == "safehouse":
         # Equivalent to wrap() with REPAIR_ENV and playwright, plus this user's verified
@@ -118,7 +121,7 @@ def claude_launcher(name: str | None = None) -> list[str]:
     if name == "none":
         raise ValueError("Headless Claude repairs only run inside a sandbox")
     argv = ["claude", "--dangerously-skip-permissions"]
-    return wrap(argv, Grants(env_pass=REPAIR_ENV, features=("playwright",)), name)
+    return wrap(argv, Grants(env_pass=REPAIR_ENV, features=("playwright", *features)), name)
 
 
 def launcher_backend(word: str) -> str | None:
