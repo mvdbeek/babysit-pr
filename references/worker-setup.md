@@ -202,6 +202,21 @@ claude-account login <name>                # a named account; see "Known gaps"
 babysit-bwrap --claude-config-dir="$HOME/.claude/accounts/<name>" -- true
 ```
 
+**Claude accounts.** Name the worker's accounts like the controller's (for example
+`claude-account login oss` and `claude-account login psu`), so a job saved on the
+controller with an account finds the same name on the worker; each lives in
+`~/.claude/accounts/<name>`. On Linux `claude-account login` and `status` run
+`claude auth login --claudeai` / `claude auth status` inside babysit-bwrap with only
+that account directory (no worktree, no permission flag) and without the inherited
+API-key variables; `claude-account run` uses the repair launcher in the current
+directory. Sign in from an interactive `ssh -t` session: Claude prints a URL to open
+on the Mac and reads the code back. Do not link an account's `settings.json` to
+`~/.claude/settings.json` as on the Mac: only the account directory is mounted, and
+babysit-bwrap refuses a link there anyway (it binds `settings.json` read-only by
+itself, and a link would be followed outside the sandbox). Copy the file instead,
+and keep any script a hook or status line runs out of the account directory or in
+its `hooks/`.
+
 The worker's `gh` login is used only by agents and git on the worker; the controller
 keeps polling GitHub with its own. Prefer a fine-grained token or a separate GitHub
 account limited to the repositories babysit works on.

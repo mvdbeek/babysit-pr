@@ -219,7 +219,11 @@ def main():
     words = {"login": ["auth", "login", "--claudeai"], "status": ["auth", "status"], "run": []}
     # `run` works in the directory the user started it from.
     worktree = os.getcwd() if args.command == "run" else None
-    launcher = sandbox.bind(sandbox.claude_launcher(), "claude", worktree, str(home))
+    if worktree is None and sandbox.backend() == "bwrap":
+        # Signing in only talks to Anthropic: the account directory is all it needs.
+        launcher = sandbox.bind(sandbox.wrap(["claude"]), "claude", None, str(home))
+    else:
+        launcher = sandbox.bind(sandbox.claude_launcher(), "claude", worktree, str(home))
     os.execvpe(
         launcher[0],
         [*launcher, *words[args.command], *extra],

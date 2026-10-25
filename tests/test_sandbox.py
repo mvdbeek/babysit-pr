@@ -1235,3 +1235,56 @@ def test_bwrap_keeps_the_code_in_the_agent_configuration_read_only(checkout):
     assert (config / "settings.json").read_text() == "{}\n"
     assert not (config / "skills" / "x").exists()
     assert (config / "projects" / "t").exists()
+
+
+def test_linux_account_login_and_status_run_claude_auth_in_the_account_alone(
+    default_home, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(sandbox, "DEFAULT", "bwrap")
+    calls = []
+    monkeypatch.setattr("os.execvpe", lambda *args: calls.append(args))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-account")
+    monkeypatch.setattr(sys, "argv", ["claude-account", "login", "oss", "--email", "a@b.invalid"])
+    claude_accounts.main()
+    account = default_home / "accounts" / "oss"
+    binary, argv, env = calls.pop()
+    # Signing in only talks to Anthropic: no permission flag, repair names or worktree.
+    assert binary == argv[0] == str(SCRIPTS / "babysit-bwrap")
+    assert argv[1:] == [
+        f"--claude-config-dir={account.resolve()}",
+        "--",
+        "claude",
+        "auth",
+        "login",
+        "--claudeai",
+        "--email",
+        "a@b.invalid",
+    ]
+    assert "ANTHROPIC_API_KEY" not in env
+    # Through the real wrapper, with a bwrap that runs the command as it is given.
+    fakes = tmp_path / "fakes"
+    fakes.mkdir()
+    (fakes / "bwrap").write_text(
+        '#!/bin/sh\n[ "$1" = --help ] && exit 0\n'
+        'while [ "$1" != -- ]; do\n'
+        '  [ "$1" = --setenv ] && export "$2=$3"\n'
+        '  shift\ndone\nshift\nexec "$@"\n'
+    )
+    (fakes / "claude").write_text(
+        '#!/bin/sh\necho "$CLAUDE_CONFIG_DIR|${ANTHROPIC_API_KEY-unset}|$*"\n'
+    )
+    for fake in fakes.iterdir():
+        fake.chmod(0o755)
+    env = {**env, "PATH": f"{fakes}:{os.environ['PATH']}", "HOME": str(tmp_path)}
+    monkeypatch.setattr(sys, "argv", ["claude-account", "status", "oss"])
+    claude_accounts.main()
+    _, argv, _ = calls.pop()
+    done = subprocess.run(["bash", *argv], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert done.stdout == f"{account.resolve()}|unset|auth status\n", done.stderr
+    # `run` keeps the repair launcher, with the directory it was started from.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["claude-account", "run", "oss", "--", "-p", "x"])
+    claude_accounts.main()
+    _, argv, _ = calls.pop()
+    assert argv[-4:] == ["claude", "--dangerously-skip-permissions", "-p", "x"]
+    assert f"--add-dirs={tmp_path.resolve()}" in argv
