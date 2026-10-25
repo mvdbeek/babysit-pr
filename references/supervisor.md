@@ -310,3 +310,42 @@ same way; running and actively watched PRs are left to their own observation. Da
 PR monitoring is finished, not that local files have been checked for safe removal.
 No session, pane, branch, worktree, or historical watch is automatically deleted.
 Branch-only watches have no PR closure event; register a PR watch when appropriate.
+
+## Worker machines (not yet used)
+
+`--home/machines.json` registers other machines for future remote workspaces.
+Nothing reads it yet: with or without it, every command runs on this machine.
+`scripts/machines.py` loads and validates it; a malformed file is an error, a
+missing one means local only.
+
+```json
+{
+  "version": 1,
+  "machines": [
+    {
+      "id": "mini",
+      "label": "Mac mini",
+      "ssh": "mini.tail1234.ts.net",
+      "os": "darwin",
+      "src": "~/src",
+      "babysit_root": "~/src/babysit-pr",
+      "python": "python3",
+      "max_agents": 4,
+      "labels": ["docker"],
+      "enabled": true
+    }
+  ],
+  "repos": { "owner/repo": { "requires": ["docker"], "prefer": "mini" } }
+}
+```
+
+`id` (lowercase, at most 24 characters, not `local`) is the stable key; `label`
+is the herdr machine label passed to `herdr --machine`. `id`, `label`, `ssh` and
+`os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
+`max_agents` is 1–64, `collie_url` is optional, and unknown keys are rejected.
+Disabled machines stay valid for records already pinned to them.
+
+Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, and a shared
+master connection whose socket lives in `--home/ssh/` (or a short temporary
+directory when that path is too long), with at most four concurrent commands
+per machine. They run with the worker's own environment and credentials.

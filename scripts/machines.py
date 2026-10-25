@@ -1,0 +1,321 @@
+"""Registry of worker machines and the one place that builds herdr and ssh argv for them.
+
+``<home>/machines.json`` lists the machines other than this one. No registry, or a
+``None`` machine, means local: every helper then behaves exactly as the direct call
+it replaces. Remote paths (``src``, ``cwd``) are strings for the remote shell and are
+never resolved or expanded on this machine.
+"""
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import stat
+import tempfile
+import threading
+from pathlib import Path
+from typing import NamedTuple
+
+import owned_process
+
+ID = re.compile(r"[a-z][a-z0-9-]{0,23}")
+# A leading letter or digit keeps the target from ever being read as an ssh option.
+SSH_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,254}")
+WORKSPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
+CAPABILITY = re.compile(r"[a-z0-9][a-z0-9:._-]{0,63}")
+COMMAND = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
+OSES = {"darwin", "linux"}
+FIELDS = {
+    "id",
+    "label",
+    "ssh",
+    "os",
+    "src",
+    "babysit_root",
+    "python",
+    "max_agents",
+    "labels",
+    "collie_url",
+    "enabled",
+}
+REQUIRED = {"id", "label", "ssh", "os"}
+# sshd's MaxSessions defaults to 10; stay well below it on one multiplexed connection.
+CHANNELS = 4
+# macOS sun_path is 104 bytes including the NUL; ssh hashes %C to 40 hex characters
+# and appends a 17-character random suffix while it creates the master socket.
+SOCKET_LIMIT = 103 - 1 - 40 - 17
+
+
+class Machine(NamedTuple):
+    id: str
+    label: str
+    ssh: str
+    os: str
+    src: str
+    babysit_root: str
+    python: str
+    max_agents: int
+    labels: tuple[str, ...]
+    collie_url: str | None
+    enabled: bool
+
+
+_channels: dict[str, threading.BoundedSemaphore] = {}
+_channels_lock = threading.Lock()
+
+
+def _remote_path(value):
+    return (
+        isinstance(value, str)
+        and (value == "~" or value.startswith(("/", "~/")))
+        and not any(c in value for c in "\0\n\r")
+        and len(value) <= 1024
+    )
+
+
+def _machine(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("Each machine must be a JSON object")
+    if unknown := set(raw) - FIELDS:
+        raise ValueError(f"Unknown machine keys: {', '.join(sorted(unknown))}")
+    if missing := REQUIRED - set(raw):
+        raise ValueError(f"Machine is missing {', '.join(sorted(missing))}")
+    machine = Machine(
+        id=raw["id"],
+        label=raw["label"],
+        ssh=raw["ssh"],
+        os=raw["os"],
+        src=raw.get("src", "~/src"),
+        babysit_root=raw.get("babysit_root", "~/src/babysit-pr"),
+        python=raw.get("python", "python3"),
+        max_agents=raw.get("max_agents", 4),
+        labels=raw.get("labels", []),
+        collie_url=raw.get("collie_url"),
+        enabled=raw.get("enabled", True),
+    )
+    name = machine.id if isinstance(machine.id, str) else "?"
+    checks = [
+        (isinstance(machine.id, str) and ID.fullmatch(machine.id), "id"),
+        (machine.id != "local", "id (local is reserved)"),
+        (
+            isinstance(machine.label, str)
+            and 0 < len(machine.label) <= 64
+            and machine.label.isprintable(),
+            "label",
+        ),
+        (isinstance(machine.ssh, str) and SSH_TARGET.fullmatch(machine.ssh), "ssh"),
+        (machine.os in OSES, "os"),
+        (_remote_path(machine.src), "src"),
+        (_remote_path(machine.babysit_root), "babysit_root"),
+        (
+            isinstance(machine.python, str)
+            and (COMMAND.fullmatch(machine.python) or _remote_path(machine.python)),
+            "python",
+        ),
+        (
+            type(machine.max_agents) is int and 1 <= machine.max_agents <= 64,
+            "max_agents",
+        ),
+        (
+            isinstance(machine.labels, list)
+            and len(machine.labels) <= 32
+            and all(isinstance(x, str) and CAPABILITY.fullmatch(x) for x in machine.labels),
+            "labels",
+        ),
+        (
+            machine.collie_url is None
+            or (
+                isinstance(machine.collie_url, str)
+                and machine.collie_url.startswith(("http://", "https://"))
+                and len(machine.collie_url) <= 512
+                and machine.collie_url.isprintable()
+                and " " not in machine.collie_url
+            ),
+            "collie_url",
+        ),
+        (isinstance(machine.enabled, bool), "enabled"),
+    ]
+    for ok, field in checks:
+        if not ok:
+            raise ValueError(f"Invalid {field} for machine {name}")
+    return machine._replace(labels=tuple(machine.labels))
+
+
+def _repos(raw, ids):
+    if not isinstance(raw, dict) or len(raw) > 500:
+        raise ValueError("Configure repos as {owner/repo: {requires, prefer}}")
+    repos = {}
+    for slug, rule in raw.items():
+        if not REPO.fullmatch(slug) or not isinstance(rule, dict):
+            raise ValueError(f"Invalid repos entry {slug}")
+        if unknown := set(rule) - {"requires", "prefer"}:
+            raise ValueError(f"Unknown keys for {slug}: {', '.join(sorted(unknown))}")
+        requires = rule.get("requires", [])
+        if not isinstance(requires, list) or not all(
+            isinstance(x, str) and CAPABILITY.fullmatch(x) for x in requires
+        ):
+            raise ValueError(f"Invalid requires for {slug}")
+        prefer = rule.get("prefer")
+        if prefer is not None and prefer not in ids:
+            raise ValueError(f"{slug} prefers unknown machine {prefer}")
+        repos[slug] = {"requires": requires, "prefer": prefer}
+    return repos
+
+
+def load_config(home):
+    """Validated registry, None when absent. Raises ValueError when malformed."""
+    path = Path(home) / "machines.json"
+    if not path.exists():
+        return None
+    if path.stat().st_size > 65536:
+        raise ValueError("Machine registry exceeds size limit")
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("Machine registry must be a JSON object")
+    if unknown := set(raw) - {"version", "machines", "repos"}:
+        raise ValueError(f"Unknown registry keys: {', '.join(sorted(unknown))}")
+    if raw.get("version") != 1:
+        raise ValueError("Machine registry version must be 1")
+    entries = raw.get("machines", [])
+    if not isinstance(entries, list) or len(entries) > 64:
+        raise ValueError("Configure machines as a list of at most 64 entries")
+    machines: dict[str, Machine] = {}
+    labels = set()
+    for entry in entries:
+        machine = _machine(entry)
+        if machine.id in machines:
+            raise ValueError(f"Duplicate machine id {machine.id}")
+        if machine.label in labels:
+            raise ValueError(f"Duplicate machine label {machine.label}")
+        machines[machine.id] = machine
+        labels.add(machine.label)
+    return {"machines": machines, "repos": _repos(raw.get("repos", {}), machines)}
+
+
+def load(home) -> dict[str, Machine]:
+    """Registered machines by id; empty without a registry."""
+    config = load_config(home)
+    return config["machines"] if config else {}
+
+
+def resolve(home, machine_id: str | None, *, placing=False) -> Machine | None:
+    """The machine a record names; None for local.
+
+    Disabled machines still resolve so pinned records keep working, but are refused
+    for new placements.
+    """
+    if machine_id is None:
+        return None
+    machine = load(home).get(machine_id)
+    if machine is None:
+        raise ValueError(f"Unknown machine {machine_id}")
+    if placing and not machine.enabled:
+        raise ValueError(f"Machine {machine_id} is disabled")
+    return machine
+
+
+def herdr_argv(m: Machine | None, *args) -> list[str]:
+    # herdr addresses saved machines by their label, not our id.
+    return ["herdr", *args] if m is None else ["herdr", "--machine", m.label, *args]
+
+
+def _private_dir(path: Path) -> Path:
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise ValueError(f"{path} must be a private directory owned by this user")
+    return path
+
+
+def control_dir(home) -> Path:
+    """Directory for ssh master sockets, short enough for macOS's socket path limit."""
+    home = Path(home)
+    candidates = [home / "ssh"]
+    # Deep homes fall back to the temporary directory; macOS's $TMPDIR is itself
+    # long, so /tmp is the last resort. The digest keeps separate homes apart.
+    name = f"babysit-ssh-{os.getuid()}-{hashlib.sha256(str(home).encode()).hexdigest()[:8]}"
+    candidates += [Path(tempfile.gettempdir()) / name, Path("/tmp") / name]
+    for path in candidates:
+        if len(os.fsencode(path)) <= SOCKET_LIMIT:
+            if path == home / "ssh":
+                home.mkdir(parents=True, exist_ok=True)
+            return _private_dir(path)
+    raise ValueError("No ssh control socket directory fits the socket path limit")
+
+
+def ssh_options(home) -> list[str]:
+    options = {
+        "BatchMode": "yes",
+        "ConnectTimeout": "5",
+        "ServerAliveInterval": "10",
+        "ControlMaster": "auto",
+        "ControlPersist": "300",
+        "ControlPath": f"{control_dir(home)}/%C",
+    }
+    return [arg for key, value in options.items() for arg in ("-o", f"{key}={value}")]
+
+
+def _quote_path(path):
+    # "$HOME" rather than ~ so a quoted remainder still lands in the remote home.
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def remote_argv(home, m: Machine, argv, *, cwd=None) -> list[str]:
+    """ssh argv running ``argv`` on ``m``; the remote shell sees one quoted command."""
+    command = shlex.join(argv)
+    if cwd is not None:
+        if not _remote_path(cwd):
+            raise ValueError("Remote working directory must be absolute or start with ~")
+        command = f"cd -- {_quote_path(cwd)} && {command}"
+    return ["ssh", *ssh_options(home), m.ssh, "--", command]
+
+
+def _channel(m: Machine):
+    with _channels_lock:
+        return _channels.setdefault(m.id, threading.BoundedSemaphore(CHANNELS))
+
+
+def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=None):
+    """owned_process.run on this machine, or over ssh on ``m``.
+
+    Remote commands get the worker's own environment: ``env`` is refused rather than
+    forwarding controller credentials. ssh exits 255 when the machine is unreachable.
+    """
+    if m is None:
+        return owned_process.run(argv, timeout=timeout, input=input, env=env, cwd=cwd)
+    if env is not None:
+        raise ValueError("Remote commands run with the worker's environment")
+    with _channel(m):
+        return owned_process.run(remote_argv(home, m, argv, cwd=cwd), timeout=timeout, input=input)
+
+
+def qualify(machine_id: str | None, wid: str) -> str:
+    """API/DOM workspace id: ``w111`` locally, ``mini/w111`` on a worker."""
+    if not WORKSPACE.fullmatch(wid):
+        raise ValueError(f"Invalid workspace id {wid!r}")
+    if machine_id is None:
+        return wid
+    if not ID.fullmatch(machine_id) or machine_id == "local":
+        raise ValueError(f"Invalid machine id {machine_id!r}")
+    return f"{machine_id}/{wid}"
+
+
+def split(qid: str) -> tuple[str | None, str]:
+    if "/" not in qid:
+        return None, qualify(None, qid)
+    machine_id, _, wid = qid.rpartition("/")
+    qualify(machine_id, wid)
+    return machine_id, wid

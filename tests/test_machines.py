@@ -1,0 +1,356 @@
+"""Machine registry validation and the herdr/ssh argv every remote call goes through."""
+
+import json
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import machines
+import owned_process
+import pytest
+
+MINI = {
+    "id": "mini",
+    "label": "Mac mini",
+    "ssh": "mini.tail1234.ts.net",
+    "os": "darwin",
+    "src": "~/src",
+    "babysit_root": "~/src/babysit-pr",
+    "python": "python3",
+    "max_agents": 4,
+    "labels": ["docker", "safehouse", "claude-account:work"],
+    "enabled": True,
+}
+
+
+@pytest.fixture(autouse=True)
+def short_tmp(tmp_path, monkeypatch):
+    """pytest's tmp_path is too deep for an ssh socket, so control sockets fall back to
+    the temporary directory; point that at a fresh short one instead of the real /tmp.
+    Requesting tmp_path first keeps pytest's own base directory where it was."""
+    path = tempfile.mkdtemp(prefix="bs", dir="/tmp")
+    monkeypatch.setattr(tempfile, "tempdir", path)
+    yield Path(path)
+    shutil.rmtree(path)
+
+
+def write(home, *entries, **top):
+    home.mkdir(parents=True, exist_ok=True)
+    config = {"version": 1, "machines": list(entries), **top}
+    (home / "machines.json").write_text(json.dumps(config))
+    return home
+
+
+def test_missing_registry_is_none_and_local_only(tmp_path):
+    assert machines.load_config(tmp_path) is None
+    assert machines.load(tmp_path) == {}
+    assert machines.resolve(tmp_path, None) is None
+    with pytest.raises(ValueError, match="Unknown machine mini"):
+        machines.resolve(tmp_path, "mini")
+
+
+def test_valid_registry_with_defaults_and_repos(tmp_path):
+    write(
+        tmp_path,
+        MINI,
+        {"id": "box", "label": "Linux box", "ssh": "babysit@box", "os": "linux"},
+        repos={"galaxyproject/galaxy": {"requires": ["docker"], "prefer": "mini"}},
+    )
+    config = machines.load_config(tmp_path)
+    assert config["repos"] == {"galaxyproject/galaxy": {"requires": ["docker"], "prefer": "mini"}}
+    loaded = machines.load(tmp_path)
+    assert loaded["mini"].labels == ("docker", "safehouse", "claude-account:work")
+    assert loaded["box"] == machines.Machine(
+        id="box",
+        label="Linux box",
+        ssh="babysit@box",
+        os="linux",
+        src="~/src",
+        babysit_root="~/src/babysit-pr",
+        python="python3",
+        max_agents=4,
+        labels=(),
+        collie_url=None,
+        enabled=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"id": "Mini"}, "Invalid id"),
+        ({"id": "1mini"}, "Invalid id"),
+        ({"id": "m" * 25}, "Invalid id"),
+        ({"id": "local"}, "local is reserved"),
+        ({"ssh": "-oProxyCommand=x"}, "Invalid ssh"),
+        ({"ssh": "mini host"}, "Invalid ssh"),
+        ({"ssh": "mini;id"}, "Invalid ssh"),
+        ({"os": "windows"}, "Invalid os"),
+        ({"src": "src"}, "Invalid src"),
+        ({"babysit_root": "~other/babysit-pr"}, "Invalid babysit_root"),
+        ({"python": "python3 -c x"}, "Invalid python"),
+        ({"max_agents": 0}, "Invalid max_agents"),
+        ({"max_agents": 65}, "Invalid max_agents"),
+        ({"max_agents": True}, "Invalid max_agents"),
+        ({"labels": ["Docker"]}, "Invalid labels"),
+        ({"label": ""}, "Invalid label"),
+        ({"label": "Mac\nmini"}, "Invalid label"),
+        ({"collie_url": "javascript:alert(1)"}, "Invalid collie_url"),
+        ({"enabled": "yes"}, "Invalid enabled"),
+        ({"hostname": "mini"}, "Unknown machine keys: hostname"),
+    ],
+)
+def test_invalid_machine_fields(tmp_path, change, message):
+    write(tmp_path, {**MINI, **change})
+    with pytest.raises(ValueError, match=message):
+        machines.load(tmp_path)
+
+
+def test_missing_required_field(tmp_path):
+    write(tmp_path, {k: v for k, v in MINI.items() if k != "ssh"})
+    with pytest.raises(ValueError, match="missing ssh"):
+        machines.load(tmp_path)
+
+
+def test_duplicate_ids_and_labels(tmp_path):
+    write(tmp_path, MINI, {**MINI, "label": "Other"})
+    with pytest.raises(ValueError, match="Duplicate machine id mini"):
+        machines.load(tmp_path)
+    write(tmp_path, MINI, {**MINI, "id": "other"})
+    with pytest.raises(ValueError, match="Duplicate machine label Mac mini"):
+        machines.load(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("top", "message"),
+    [
+        ({"version": 2}, "version must be 1"),
+        ({"extra": True}, "Unknown registry keys: extra"),
+        ({"machines": {"mini": MINI}}, "list of at most 64"),
+        ({"repos": {"not-a-slug": {}}}, "Invalid repos entry"),
+        ({"repos": {"a/b": {"prefer": "nowhere"}}}, "prefers unknown machine nowhere"),
+        ({"repos": {"a/b": {"requires": "docker"}}}, "Invalid requires"),
+        ({"repos": {"a/b": {"pin": "mini"}}}, "Unknown keys for a/b: pin"),
+    ],
+)
+def test_invalid_registry(tmp_path, top, message):
+    write(tmp_path, MINI, **top)
+    with pytest.raises(ValueError, match=message):
+        machines.load_config(tmp_path)
+
+
+def test_malformed_and_oversize_files(tmp_path):
+    path = tmp_path / "machines.json"
+    path.write_text("[]")
+    with pytest.raises(ValueError, match="JSON object"):
+        machines.load(tmp_path)
+    path.write_text("{")
+    with pytest.raises(ValueError):
+        machines.load(tmp_path)
+    path.write_text(json.dumps({"version": 1, "machines": [], "pad": " " * 65536}))
+    with pytest.raises(ValueError, match="size limit"):
+        machines.load(tmp_path)
+
+
+def test_resolve_disabled_only_refused_for_placement(tmp_path):
+    write(tmp_path, {**MINI, "enabled": False})
+    assert machines.resolve(tmp_path, "mini").label == "Mac mini"
+    with pytest.raises(ValueError, match="disabled"):
+        machines.resolve(tmp_path, "mini", placing=True)
+    with pytest.raises(ValueError, match="Unknown machine local"):
+        machines.resolve(tmp_path, "local")
+
+
+def test_herdr_argv_local_is_unchanged_and_remote_uses_label(tmp_path):
+    write(tmp_path, MINI)
+    mini = machines.resolve(tmp_path, "mini")
+    assert machines.herdr_argv(None, "workspace", "list") == ["herdr", "workspace", "list"]
+    assert machines.herdr_argv(mini, "workspace", "list") == [
+        "herdr",
+        "--machine",
+        "Mac mini",
+        "workspace",
+        "list",
+    ]
+
+
+def test_remote_argv_quotes_hostile_arguments_and_paths(tmp_path, short_tmp):
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    argv = machines.remote_argv(
+        home, mini, ["git", "log", "--format=%H", "a b; rm -rf /"], cwd="/w/it's $(id)"
+    )
+    assert argv == [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=300",
+        "-o",
+        f"ControlPath={home}/ssh/%C",
+        "mini.tail1234.ts.net",
+        "--",
+        "cd -- '/w/it'\"'\"'s $(id)' && git log --format=%H 'a b; rm -rf /'",
+    ]
+    assert machines.remote_argv(home, mini, ["ls"], cwd="~/src/my repo")[-1] == (
+        "cd -- \"$HOME\"/'src/my repo' && ls"
+    )
+    with pytest.raises(ValueError, match="absolute"):
+        machines.remote_argv(home, mini, ["ls"], cwd="src")
+
+
+def test_control_path_directory_is_private_and_falls_back_when_too_long(tmp_path, short_tmp):
+    short = short_tmp / "home"
+    assert machines.control_dir(short) == short / "ssh"
+    assert stat.S_IMODE((short / "ssh").stat().st_mode) == 0o700
+
+    deep = tmp_path / ("d" * 60)
+    fallback = machines.control_dir(deep)
+    assert fallback.parent == short_tmp
+    assert fallback.name.startswith(f"babysit-ssh-{os.getuid()}-")
+    assert len(os.fsencode(fallback)) <= machines.SOCKET_LIMIT
+    assert not deep.exists()
+    assert machines.control_dir(deep) == fallback
+    assert machines.control_dir(tmp_path / ("e" * 60)) != fallback
+
+    fallback.chmod(0o755)
+    with pytest.raises(ValueError, match="private directory"):
+        machines.control_dir(deep)
+
+
+def test_run_local_delegates_to_owned_process(tmp_path, monkeypatch):
+    calls = []
+    real = owned_process.run
+
+    def record(args, **kwargs):
+        calls.append((args, kwargs))
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(owned_process, "run", record)
+    result = machines.run(tmp_path, None, ["cat"], timeout=5, input=b"hi")
+    assert (result.returncode, result.stdout) == (0, b"hi")
+    assert calls == [(["cat"], {"timeout": 5, "input": b"hi", "env": None, "cwd": None})]
+    assert not (tmp_path / "ssh").exists()
+
+
+def test_run_remote_executes_in_fake_host_home(tmp_path, fake_tools, short_tmp):
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    host = tmp_path / "hosts" / "mini.tail1234.ts.net"
+    hostile = host / "src" / "it's $(touch pwned)"
+    hostile.mkdir(parents=True)
+
+    result = machines.run(
+        home, mini, ["sh", "-c", 'pwd; echo "$HOME"; cat'], timeout=10, input=b"stdin"
+    )
+    lines = result.stdout.decode().splitlines()
+    assert result.returncode == 0
+    assert [os.path.realpath(x) for x in lines[:2]] == [str(host.resolve())] * 2
+    assert lines[2] == "stdin"
+
+    result = machines.run(home, mini, ["pwd"], timeout=10, cwd="~/src/it's $(touch pwned)")
+    assert os.path.realpath(result.stdout.decode().strip()) == str(hostile.resolve())
+    assert not list(tmp_path.rglob("pwned"))
+    recorded = json.loads(fake_tools.read_text())["ssh"]
+    assert recorded[-1] == {
+        "target": "mini.tail1234.ts.net",
+        "command": "cd -- \"$HOME\"/'src/it'\"'\"'s $(touch pwned)' && pwd",
+    }
+
+    with pytest.raises(ValueError, match="worker's environment"):
+        machines.run(home, mini, ["env"], timeout=10, env={"GH_TOKEN": "secret"})
+
+
+def test_run_remote_unreachable_surfaces_ssh_failure(fake_tools, short_tmp, monkeypatch):
+    home = write(short_tmp / "home", MINI)
+    monkeypatch.setenv("FAKE_SSH_DOWN", "mini.tail1234.ts.net")
+    result = machines.run(home, machines.resolve(home, "mini"), ["true"], timeout=10)
+    assert result.returncode == 255
+    assert b"Connection refused" in result.stderr
+
+
+def test_fake_herdr_keeps_separate_state_per_machine(tmp_path, fake_tools):
+    write(tmp_path, MINI, {**MINI, "id": "box", "label": "Linux box", "ssh": "box"})
+    opened = []
+    for machine in (None, *machines.load(tmp_path).values()):
+        argv = machines.herdr_argv(
+            machine, "worktree", "open", "--cwd", "/repo", "--path", "/repo/wt"
+        )
+        output = subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+        opened.append(json.loads(output)["result"]["root_pane"]["pane_id"])
+    assert opened == ["w1:p1", "w1:p1", "w1:p1"]
+
+    state = json.loads(fake_tools.read_text())
+    assert [w["workspace_id"] for w in state["workspaces"]] == ["w1"]
+    assert sorted(state["machines"]) == ["Linux box", "Mac mini"]
+    assert state["machines"]["Mac mini"]["calls"] == [
+        ["worktree", "open", "--cwd", "/repo", "--path", "/repo/wt"]
+    ]
+    assert state["calls"][0] == ["worktree", "open", "--cwd", "/repo", "--path", "/repo/wt"]
+    assert state["calls"][1][:3] == ["--machine", "Mac mini", "worktree"]
+
+
+def test_remote_channels_are_limited_per_machine(tmp_path, short_tmp, monkeypatch):
+    home = write(short_tmp / "home", MINI, {**MINI, "id": "box", "label": "Box", "ssh": "box"})
+    loaded = machines.load(home)
+    monkeypatch.setattr(machines, "_channels", {})
+    release = threading.Event()
+    lock = threading.Lock()
+    active: dict[str, int] = {"mini.tail1234.ts.net": 0, "box": 0}
+    peak = dict(active)
+
+    def blocking(args, **kwargs):
+        target = args[-3]
+        with lock:
+            active[target] += 1
+            peak[target] = max(peak[target], active[target])
+        release.wait(10)
+        with lock:
+            active[target] -= 1
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(owned_process, "run", blocking)
+    threads = [
+        threading.Thread(
+            target=machines.run, args=(home, loaded[m], ["true"]), kwargs={"timeout": 5}
+        )
+        for m in ["mini"] * 6 + ["box"]
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 5
+    while sum(active.values()) < 5 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    assert active == {"mini.tail1234.ts.net": machines.CHANNELS, "box": 1}
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    assert peak == {"mini.tail1234.ts.net": machines.CHANNELS, "box": 1}
+
+
+@pytest.mark.parametrize(
+    ("machine_id", "wid", "qid"), [(None, "w111", "w111"), ("mini", "w1", "mini/w1")]
+)
+def test_qualify_split_round_trip(machine_id, wid, qid):
+    assert machines.qualify(machine_id, wid) == qid
+    assert machines.split(qid) == (machine_id, wid)
+
+
+@pytest.mark.parametrize(
+    "qid", ["", "/w1", "mini/", "local/w1", "Mini/w1", "a/b/w1", "w1:p1", "-w1"]
+)
+def test_split_rejects_malformed(qid):
+    with pytest.raises(ValueError):
+        machines.split(qid)
