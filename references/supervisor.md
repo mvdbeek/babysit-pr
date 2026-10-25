@@ -417,9 +417,11 @@ repository config, hooks and `info/attributes` are the agent's. Every Git comman
 supervisor, dashboard, cron jobs and `wt` run on the host in such a checkout goes
 through `scripts/safe_git.py`. It disables hooks, fsmonitor, pagers, external diffs and
 textconv, the repository's ssh/askpass/proxy programs and credential helpers, every
-transport but https, ssh and local paths (so no `git-remote-*` helper starts, whatever
-`protocol.*.allow` the repository sets), submodule recursion and status/diff looks into
-submodules, auto gc and lazy fetches. Filter drivers the repository itself defines are
+transport but https, ssh and local paths, and those too outside a fetch (so no
+`git-remote-*` helper starts, whatever `protocol.*.allow` the repository sets, and no
+command but a fetch reaches a remote), submodule recursion and status/diff looks into
+submodules' working trees (a new commit checked out in one still counts), auto gc and
+lazy fetches. Filter drivers the repository itself defines are
 blanked; a definition from the user's own config, such as Git LFS, is kept. Commands
 that read files are refused when the repository sets Git LFS's extensions, custom transfer
 agents or object store (`lfs.extension.*`, `lfs.customtransfer.*`,
@@ -452,8 +454,8 @@ when `.git/config` is a symbolic link.
 
 Still open: config the agent rewrites between the driver listing and the command it
 guards, filter drivers in a submodule's own config for commands that do recurse,
-remote helpers for the allowed transports installed on PATH (`git-remote-https`),
-and lazy fetches on Git older than 2.44, which ignores `GIT_NO_LAZY_FETCH`. Fetches
+and remote helpers for the allowed transports installed on PATH (`git-remote-https`)
+during a fetch. Fetches
 skip `FETCH_HEAD`, which Git would otherwise write through a planted symbolic link.
 
 ## Events and diagnostics

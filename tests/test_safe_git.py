@@ -222,7 +222,7 @@ def test_diff_commands_never_run_external_programs():
         "show",
         "--no-ext-diff",
         "--no-textconv",
-        "--ignore-submodules=all",
+        "--ignore-submodules=dirty",
         "HEAD",
     ]
     assert env["GIT_NO_LAZY_FETCH"] == "1"
@@ -451,6 +451,42 @@ def test_status_and_diff_never_look_inside_submodules(planted, tmp_path):
     with pytest.raises(RuntimeError, match="uncommitted changes"):
         pr_supervisor.verify_worktree({"cwd": str(clone)}, pr)
     assert not marker.exists()
+    # A new commit checked out in the submodule is still a change of the clone's.
+    subprocess.check_call(
+        ["git", "-C", str(clone / "sub"), "-c", "user.name=F", "-c", "user.email=f@e.test"]
+        + ["-c", "core.hooksPath=/dev/null", "-c", "filter.inner.clean="]
+        + ["commit", "-q", "--allow-empty", "-m", "moved"]
+    )
+    os.utime(clone / "sub" / "inner.txt", (1, 1))
+    assert workspace_overview.local_state(clone, "main")["changes"] == 2
+    assert "sub" in workspace_viewer.git_text(clone, "status", "--porcelain")
+    assert not marker.exists()
+
+
+def test_a_read_fetches_no_missing_object_even_without_the_lazy_fetch_switch(planted, tmp_path):
+    """GIT_NO_LAZY_FETCH needs Git 2.44 and can be turned off: no transport is allowed."""
+    clone, marker, git = planted
+    blob = git("rev-parse", "HEAD:file.txt")
+    for pack in (clone / ".git" / "objects" / "pack").glob("*.pack"):
+        moved = tmp_path / pack.name
+        pack.rename(moved)
+        pack.with_suffix(".idx").unlink()
+        with moved.open("rb") as stream:
+            subprocess.run(
+                ["git", "-C", str(clone), "unpack-objects", "-q"], stdin=stream, check=True
+            )
+    loose = clone / ".git" / "objects" / blob[:2] / blob[2:]
+    if loose.exists():
+        loose.unlink()
+    git("config", "core.repositoryformatversion", "1")
+    git("config", "extensions.partialClone", "origin")
+    git("config", "remote.origin.promisor", "true")
+    for command in (["show", "HEAD"], ["diff", "HEAD"]):
+        argv, env = safe_git.prepare(
+            str(clone), *command, env={**os.environ, "GIT_NO_LAZY_FETCH": "0"}
+        )
+        subprocess.run(argv, env=env, capture_output=True, timeout=30)
+    assert "upload-pack" not in (marker.read_text() if marker.exists() else "")
 
 
 def test_common_dir_comes_from_the_layout_not_from_commondir_files(planted, tmp_path):

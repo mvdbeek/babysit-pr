@@ -17,20 +17,22 @@ config (Git LFS, say) and blanking the rest; Git skips an empty filter command. 
 takes its extensions, custom transfer programs and object store from that same config,
 so a repository that sets any of them is refused.
 ``remote.<name>.uploadpack`` is first-wins, so fetches pass ``--upload-pack`` instead.
-Only the https, ssh and file transports are allowed, and any ``protocol.<name>.allow``
-the repository adds is overridden, so no ``git-remote-<name>`` helper is started.
+Only the https, ssh and file transports are allowed, for a fetch alone, and any
+``protocol.<name>.allow`` the repository adds is overridden, so no ``git-remote-<name>``
+helper is started.
 
 Which config applies depends on the worktree: ``config.worktree`` and ``includeIf``
 conditions on the branch or git dir. So a worktree is checked out by adding it with
 ``--no-checkout`` and resetting inside it, where the listing sees what the reset will,
 and removed with ``--force`` after a hardened status in it, since Git's own clean check
-runs ``git status`` in that worktree with its config. Status and diffs ignore
-submodules, whose own config is never listed. ``core.worktree`` and ``core.bare`` are read
-from config files only, so a checkout's own path is passed as ``--work-tree``.
+runs ``git status`` in that worktree with its config. Status and diffs never look
+into a submodule's working tree, since its own config is never listed.
+``core.worktree`` and ``core.bare`` are read from config files only, so a checkout's own
+path is passed as ``--work-tree``.
 
 Left open, and stated in references/supervisor.md: config rewritten between that
-listing and the command itself, drivers in a submodule's own config, helpers for the
-allowed transports already on PATH, and lazy fetches on Git older than 2.44.
+listing and the command itself, drivers in a submodule's own config, and helpers for the
+allowed transports already on PATH during a fetch.
 
 The system and global config are trusted and still apply: the sandbox cannot write
 them. Only the standard library is used, since ``wt`` imports this too.
@@ -94,6 +96,9 @@ CONTENT = {"diff", "fetch", "reset", "status", "switch"}
 # Their checkout or clean check would run in a worktree whose config was not listed.
 WORKTREE = {"worktree add": "--no-checkout", "worktree remove": "--force"}
 ALLOWED = {"https", "ssh", "file"}
+# Every other command reaches no remote at all, not even a promisor's missing object
+# where GIT_NO_LAZY_FETCH is unknown (Git before 2.44) or turned off.
+OFFLINE = [arg for name in sorted(ALLOWED) for arg in ("-c", f"protocol.{name}.allow=never")]
 # Subcommands that may need credentials; the rest run without the token.
 NETWORK = {"fetch"}
 DIFFS = {"diff", "log", "show"}
@@ -152,7 +157,8 @@ def overrides(config: Sequence[tuple[str, str, str]], credentials: bool) -> list
         name = key.split(".", 1)[1].rsplit(".", 1)[0]
         if "=" in key:
             raise ValueError(f"Cannot neutralise the repository's {key!r}; Git was not run")
-        options += ["-c", f"{key}={'always' if name in ALLOWED else 'never'}"]
+        allowed = credentials and name in ALLOWED
+        options += ["-c", f"{key}={'always' if allowed else 'never'}"]
     ssh = [value for name, value in trusted if name == "core.sshcommand"]
     if ssh:
         options += ["-c", f"core.sshCommand={ssh[-1]}"]
@@ -221,13 +227,15 @@ def prepare(
         **{diff: ["--no-ext-diff", "--no-textconv"] for diff in DIFFS},
     }.get(name, [])
     if name in SUBMODULES:
-        flags = [*flags, "--ignore-submodules=all"]
+        # Never their working trees; a new commit checked out in one still shows.
+        flags = [*flags, "--ignore-submodules=dirty"]
     argv[index + 1 : index + 1] = flags
     # core.worktree in config the agent writes would point Git at another directory, and
     # core.bare at none; a checkout with its own .git is its own work tree.
     if os.path.lexists(os.path.join(path, ".git")):
         argv[:0] = [f"--work-tree={os.path.abspath(path)}"]
-    return ["git", "-C", path, *OPTIONS, *extra, *argv], environment
+    offline = [] if credentials else OFFLINE
+    return ["git", "-C", path, *OPTIONS, *offline, *extra, *argv], environment
 
 
 def common_dir(checkout: str) -> str:

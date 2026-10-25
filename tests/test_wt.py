@@ -263,7 +263,7 @@ def test_existing_checkout_ignores_missing_directories(tmp_path):
     runner = FakeRunner(
         [
             (
-                ["git", "-C", "/clone", *safe_git.OPTIONS, "worktree", "list"],
+                ["git", "-C", "/clone", *safe_git.OPTIONS, *safe_git.OFFLINE, "worktree", "list"],
                 wt.Completed(0, listing, ""),
             )
         ]
