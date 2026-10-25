@@ -27,6 +27,7 @@ import llm_usage
 import machines
 import owned_process
 import sentry_llm
+import session_locks
 
 SCRIPT = Path(__file__).resolve()
 SKILL = SCRIPT.parent.parent
@@ -598,20 +599,13 @@ def run_repair(home, job_id, attempt):
             pane_runner.verify_runner(job)
 
             print(f"\nBabysitter: resuming {job['session_id']} for {job['summary']}\n", flush=True)
-        # Per-session locks are shared by every supervisor home on this machine.
         if job.get("agent") == "claude":
             import claude_accounts
             import claude_runner
-
-            lock_home = (
-                Path(job.get("claude_config_dir") or claude_runner.config_home())
-                / "babysit-pr-locks"
-            )
-        else:
-            lock_home = (
-                Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "babysit-pr-locks"
-            )
-        with locked(lock_home / (job["session_id"] + ".lock")):
+        # Per-session locks are shared by every supervisor home on this machine.
+        with session_locks.acquire(
+            job.get("agent"), job["session_id"], job.get("claude_config_dir"), job.get("machine")
+        ):
             current = current_subject(job)
             if current["closed"] or current["merged"]:
                 raise RuntimeError("PR closed before repair started")

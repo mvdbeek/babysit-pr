@@ -41,7 +41,11 @@ Otherwise, exit the original CLI with Ctrl-D and run the returned `release_argv`
 command. A headless caller may release after its original agent process exits.
 Release transfers session/worktree ownership to the service. Service locks protect
 its workers; they cannot lock a manually launched TUI. Never manually release a
-live conversation.
+live conversation. Each repair holds a per-session flock (`scripts/session_locks.py`)
+that every supervisor home shares: a local session's lock lives in
+`CLAUDE_CONFIG_DIR`/`CODEX_HOME` under `babysit-pr-locks/`, a worker machine's in
+`~/.local/state/babysit-pr/session-locks/<machine>/` on the controller. A
+`<session>.orphan` file beside a worker session's lock keeps it held until cleared.
 
 For Codex, the guardian runs `codex exec ... resume SESSION_UUID -` for each repair and exits.
 With `--pane PANE`, herdr submits the bounded runner in the original shell and

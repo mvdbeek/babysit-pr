@@ -18,7 +18,6 @@ without a message, leaving the session waiting for the reader in Collie.
 """
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -32,10 +31,10 @@ from pathlib import Path
 
 import agent_docker
 import claude_accounts
-import claude_runner
 import exit_watch
 import herdr_handoff
 import machines
+import session_locks
 import workspace_viewer
 import wt
 from pr_workspaces import herdr, run
@@ -1071,24 +1070,6 @@ class Refused(ValueError):
         self.details = {"code": code, **details}
 
 
-def repair_running(session_id, agent, config_dir=None):
-    """Whether a babysit repair holds this session's lock right now, from any home."""
-    lock_home = (
-        Path(config_dir or claude_runner.config_home())
-        if agent == "claude"
-        else Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-    ) / "babysit-pr-locks"
-    lock = lock_home / f"{session_id}.lock"
-    if lock.exists():
-        with lock.open("a") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(handle, fcntl.LOCK_UN)
-    return False
-
-
 def owning_watch(session_id, home):
     """The babysit watch, not yet ended, that resumes this session itself."""
     return next(
@@ -1126,7 +1107,7 @@ def watch_owner(session_id, agent, home, config_dir=None):
     A watch resumes its registered session headless for repairs, under a per-session
     lock; an interactive copy alongside would make two writers on one conversation.
     """
-    if repair_running(session_id, agent, config_dir):
+    if session_locks.held(agent, session_id, config_dir):
         return REPAIR_RUNNING
     job = owning_watch(session_id, home)
     return owned_message(job) if job else None
@@ -1151,7 +1132,7 @@ def claim_from_watch(session_id, agent, home, config_dir=None, stop_watch=None):
                 "watch_finishing_repair",
                 watch=watch_summary(stopped),
             )
-    if repair_running(session_id, agent, config_dir):
+    if session_locks.held(agent, session_id, config_dir):
         raise Refused(f"Not resumed: {REPAIR_RUNNING}", "repair_running")
     job = owning_watch(session_id, home)
     if job:
