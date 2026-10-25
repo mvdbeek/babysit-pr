@@ -517,7 +517,9 @@ batch Handle all offer it, and scheduled launches keep it). The helper types
 `SAFE_ENABLE=docker <agent> …` into the pane, and the user's `safe` shell wrapper adds
 that to Safehouse's `--enable` list, which opens the Docker daemon socket to that one
 agent. Agents started without it keep Safehouse's default deny on container sockets.
-The operation records `docker` (false for reopen).
+Docker access gives up the sandbox's filesystem boundary, rootless Docker included: the
+agent can run `docker run -v $HOME:/h` and reach every file of yours. The operation
+records `docker` (false for reopen).
 
 **Quit the agent when it is done**, off by default, passes `--exit-when-done` to the
 helper (the request field is `exit_when_done: true`). New task, Handle and Create
@@ -550,7 +552,8 @@ options without sending a message. Sending messages does not change Docker acces
 exited sessions resume using the shell's normal defaults. A busy agent, blocked dialog,
 unsent terminal draft, unknown launch option, changed session, or watcher-owned session
 prevents the restart. Unknown access is shown as unavailable, never as disabled.
-Inspection requires macOS Seatbelt. This controls socket access; it does not start Docker.
+Inspection requires macOS Seatbelt, so the toggle is macOS-only for now. This controls
+socket access; it does not start Docker.
 
 **Quit the agent when it is done**, beside the agent picker in the follow-up composer,
 works for every message, whether it goes to a running agent or resumes an exited
@@ -985,7 +988,7 @@ Every `gh` process normally reads its token back from the system keyring, which 
 
 ## Development
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, and zsh (only to syntax-check the Safehouse launcher and as the fake herdr pane shell in tests; the worktree helper itself is plain Python). Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), Node.js 22.13+, npm, Git, zsh (only to syntax-check the Safehouse launcher and as the fake herdr pane shell in tests; the worktree helper itself is plain Python), and bash (to check and dry-run the Linux `babysit-bwrap` wrapper). Python and Node dependencies are pinned in `pyproject.toml`/`uv.lock` and `package.json`/`package-lock.json`. No agent credentials or running herdr server are needed for tests.
 
 Run every local check through tox:
 
@@ -1026,7 +1029,7 @@ Browser tests use a real Chromium process and a real HTTP server backed by a tem
 
 Coverage is opt-in and not part of the default run or CI: `uv run --locked tox -e coverage` runs every test under coverage, including Python branches and instrumented child Python processes. It writes a terminal summary, HTML at `reports/coverage/index.html`, and XML at `reports/coverage.xml`. The combined Python line/branch coverage gate is 75%. Reports and browser failure artifacts are ignored by Git. JavaScript behavior is exercised by browser and Node tests; the coverage percentage measures Python only.
 
-The Safehouse launcher matches this user's installed configuration. Tests check its command construction, but do not require Safehouse or claim to test macOS sandbox enforcement on every machine.
+The Safehouse launcher matches this user's installed configuration. Tests check its command construction, but do not require Safehouse or claim to test macOS sandbox enforcement on every machine. The Linux `babysit-bwrap` wrapper is checked through its `--print-argv` dry run everywhere; its enforcement tests run only on Linux with a working `bwrap`.
 
 ## CI details and automatic failure logs
 

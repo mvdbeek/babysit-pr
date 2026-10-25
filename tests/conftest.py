@@ -1,4 +1,4 @@
-"""Fake gh/herdr/tmux/cmux/agent executables shared by the process integration tests.
+"""Fake gh/herdr/ssh/tmux/cmux/agent executables shared by the process integration tests.
 
 Every fake records its argv in the JSON state file named by ``$FAKE_HERDR`` so tests
 can assert on the exact commands issued. Nothing here touches a live herdr, tmux or
@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import sandbox
 
 GH = """import json,os,sys,subprocess
 from pathlib import Path
@@ -31,15 +32,26 @@ else:
 
 HERDR = """import json,os,sys,subprocess
 from pathlib import Path
-p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text()); a=sys.argv[1:]
-data['calls'].append(a)
+p=Path(os.environ['FAKE_HERDR']); store=json.loads(p.read_text()); a=sys.argv[1:]
+def save():
+ # Replaced whole, so a concurrent call (one machine's load beside another's) never
+ # reads half a file.
+ t=p.with_name(f'{p.name}.{os.getpid()}'); t.write_text(json.dumps(store)); os.replace(t,p)
+store['calls'].append(a); data=store
+if a[:1] and a[0].startswith('--machine='):
+ # Each saved machine keeps its own workspaces and agents, so two hosts can both hand out w1.
+ label=a[0].split('=',1)[1]
+ data=store.setdefault('machines',{}).setdefault(label,{'workspaces':[],'agents':[],'calls':[]})
+ a=a[1:]; data['calls'].append(a)
+ if label in os.environ.get('FAKE_HERDR_DOWN','').split(','):
+  save(); print(json.dumps({'error':{'message':f'cannot reach {label}'}})); sys.exit(1)
 result={}
 if a[:2] == ['status','server']: result={'running':os.environ.get('FAKE_HERDR_RUNNING','true')=='true'}
 elif a[:2] == ['workspace','list']: result={'workspaces':data['workspaces']}
 elif a[:2] == ['agent','list']: result={'agents':data['agents']}
 elif a[:2] == ['worktree','open']:
  if os.environ.get('FAKE_HERDR_OPEN_ERROR'):
-  p.write_text(json.dumps(data)); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_OPEN_ERROR']}})); sys.exit(1)
+  save(); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_OPEN_ERROR']}})); sys.exit(1)
  path=a[a.index('--path')+1]; root=a[a.index('--cwd')+1]
  existing=next((w for w in data['workspaces'] if w['worktree']['checkout_path']==path),None)
  if existing: wid=existing['workspace_id']
@@ -54,10 +66,10 @@ elif a[:2] == ['workspace','close']:
  data['workspaces']=[w for w in data['workspaces'] if w['workspace_id']!=a[2]]
  data['agents']=[g for g in data['agents'] if g.get('workspace_id')!=a[2]]
  if os.environ.get('FAKE_HERDR_CLOSE_ERROR'):
-  p.write_text(json.dumps(data)); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_CLOSE_ERROR']}})); sys.exit(1)
+  save(); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_CLOSE_ERROR']}})); sys.exit(1)
 elif a[:2] == ['agent','prompt']:
  if os.environ.get('FAKE_HERDR_PROMPT_ERROR'):
-  p.write_text(json.dumps(data)); print(json.dumps({'error':{'code':os.environ['FAKE_HERDR_PROMPT_ERROR'],'message':'refused'}})); sys.exit(1)
+  save(); print(json.dumps({'error':{'code':os.environ['FAKE_HERDR_PROMPT_ERROR'],'message':'refused'}})); sys.exit(1)
  data.setdefault('prompts',[]).append(a[2:4])
 elif a[:2] == ['pane','send-text']:
  data.setdefault('typed_text',[]).append([a[2], ' '.join(a[3:])])
@@ -68,7 +80,7 @@ elif a[:2] == ['agent','read']:
  # A scripted dialog: each key or text sent to the pane advances to its next screen.
  sent=[c for c in data['calls'] if c[:2] in (['agent','send-keys'],['pane','send-text']) and c[2]==a[2]]
  screens=data.get('screens',{}).get(a[2]) or ['']
- p.write_text(json.dumps(data)); print(screens[min(len(sent),len(screens)-1)]); sys.exit(0)
+ save(); print(screens[min(len(sent),len(screens)-1)]); sys.exit(0)
 elif a[:2] == ['pane','list']:
  wid=a[a.index('--workspace')+1] if '--workspace' in a else None
  result={'panes':[x for x in data.get('panes',[]) if wid is None or x['workspace_id']==wid]}
@@ -89,11 +101,11 @@ elif a[:2] == ['pane','split']:
 elif a[:2] == ['pane','run']:
  w=next(w for w in data['workspaces'] if a[2].startswith(w['workspace_id']+':'))
  data.setdefault('runs',[]).append(a[2:])
- p.write_text(json.dumps(data))
+ save()
  env={**os.environ,'FAKE_WORKSPACE':w['workspace_id'],'FAKE_PANE':a[2]}
  subprocess.check_call(['/bin/zsh','-fc',a[3]],cwd=w['worktree']['checkout_path'],env=env)
  sys.exit(0)
-p.write_text(json.dumps(data)); print(json.dumps({'result':result}))
+save(); print(json.dumps({'result':result}))
 """
 
 AGENT = """import json,os,sys
@@ -138,7 +150,32 @@ elif a[:1] == ['new-workspace']:
 p.write_text(json.dumps(data))
 """
 
-FAKES = {"gh": GH, "herdr": HERDR, "tmux": TMUX, "cmux": CMUX, "codex": AGENT, "claude": AGENT}
+SSH = """import json,os,subprocess,sys
+from pathlib import Path
+p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text()); a=sys.argv[1:]
+while a and a[0].startswith('-') and a[0] != '--':
+ a=a[2:] if a[0] in ('-o','-p','-l','-i','-F','-S','-J') else a[1:]
+target=a[0]; a=a[2:] if a[1:2] == ['--'] else a[1:]
+command=' '.join(a)
+data.setdefault('ssh',[]).append({'target':target,'command':command})
+# Replaced whole, like herdr's state, so a herdr call beside it never reads half a file.
+t=p.with_name(f'{p.name}.{os.getpid()}'); t.write_text(json.dumps(data)); os.replace(t,p)
+if os.environ.get('FAKE_SSH_DOWN') == target:
+ print(f'ssh: connect to host {target} port 22: Connection refused',file=sys.stderr); sys.exit(255)
+# The remote side: the command line through a shell, from a per-host home.
+home=p.parent/'hosts'/target; home.mkdir(parents=True,exist_ok=True)
+sys.exit(subprocess.call(['/bin/sh','-c',command],cwd=home,env={**os.environ,'HOME':str(home)}))
+"""
+
+FAKES = {
+    "gh": GH,
+    "herdr": HERDR,
+    "ssh": SSH,
+    "tmux": TMUX,
+    "cmux": CMUX,
+    "codex": AGENT,
+    "claude": AGENT,
+}
 
 
 def install_fakes(bin_dir: Path) -> None:
@@ -172,6 +209,25 @@ def no_claude_trust(monkeypatch):
     monkeypatch.setenv("BABYSIT_CLAUDE_TRUST", "0")
 
 
+@pytest.fixture(autouse=True)
+def safehouse_sandbox(monkeypatch, tmp_path_factory):
+    """Launch lines are Safehouse's on every platform; the bwrap tests name their backend.
+
+    Child Python processes (``wt``, cron and dashboard helpers) get the same default from
+    a test-only ``sitecustomize``, since no production setting selects a sandbox.
+    """
+    monkeypatch.setattr(sandbox, "DEFAULT", "safehouse")
+    site = tmp_path_factory.getbasetemp() / "sandbox-site"
+    if not (site / "sitecustomize.py").exists():
+        site.mkdir(exist_ok=True)
+        (site / "sitecustomize.py").write_text(
+            f"import sys\nsys.path.append({str(Path(sandbox.__file__).parent)!r})\n"
+            "import sandbox\nsandbox.DEFAULT = 'safehouse'\n"
+        )
+    paths = [str(site), *filter(None, [os.environ.get("PYTHONPATH")])]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(paths))
+
+
 @pytest.fixture
 def fake_tools(tmp_path, monkeypatch):
     """Fake executables first on PATH plus the JSON state file recording their calls."""
@@ -190,7 +246,7 @@ def fresh_viewer_caches(monkeypatch):
     """Viewer caches are per process; each test starts with none."""
     import workspace_viewer
 
-    for name in ("_checkouts", "_details", "_parsers"):
+    for name in ("_checkouts", "_details", "_parsers", "_sessions"):
         monkeypatch.setattr(workspace_viewer, name, {})
     import agent_docker
     import agent_messages

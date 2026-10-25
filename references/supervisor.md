@@ -41,7 +41,13 @@ Otherwise, exit the original CLI with Ctrl-D and run the returned `release_argv`
 command. A headless caller may release after its original agent process exits.
 Release transfers session/worktree ownership to the service. Service locks protect
 its workers; they cannot lock a manually launched TUI. Never manually release a
-live conversation.
+live conversation. Each repair holds a flock (`scripts/session_locks.py`), one lease
+per machine and session owned by the controller, which every supervisor home there
+contends for: a local session's lock lives in `CLAUDE_CONFIG_DIR`/`CODEX_HOME` under
+`babysit-pr-locks/`, a worker machine's in
+`~/.local/state/babysit-pr/session-locks/<machine>/` on the controller. The same
+session id on two machines takes two leases. A `<session>.orphan` file beside a
+worker session's lock keeps it held until cleared.
 
 For Codex, the guardian runs `codex exec ... resume SESSION_UUID -` for each repair and exits.
 With `--pane PANE`, herdr submits the bounded runner in the original shell and
@@ -222,7 +228,9 @@ Workspace-write adds the linked worktree's git common directory for commits.
 A launcher that runs through Agent Safehouse always gets `danger-full-access`:
 Seatbelt profiles cannot nest, so Codex's own sandbox fails every command with
 `sandbox_apply: Operation not permitted`, and Safehouse already contains the
-process, just as the user's `safe codex` shell function does.
+process, just as the user's `safe codex` shell function does. A launcher that
+runs through `scripts/babysit-bwrap` gets the same, for the same reason: the
+external sandbox is the boundary.
 Start the watcher under the same authorized external sandbox as the original
 session. For a verified existing launcher, use a JSON argv prefix:
 
@@ -247,6 +255,148 @@ names, and the non-interactive git/gh settings (`GIT_TERMINAL_PROMPT=0`,
 every repair receives, without widening directory grants. The shared GitHub
 token the supervisor uses for its own polling is not passed to agents. A saved
 plan mode is still preserved.
+
+`scripts/sandbox.py` owns this launcher choice and every other sandbox detail
+(typed launch prefixes, account environment, launcher detection). The sandbox is
+external to the agent harness: agents run with their own permissions off inside
+it, so a new harness only supplies its launch argv. The backend follows the
+platform (`safehouse` on macOS, `bwrap` on Linux). Nothing in the environment
+selects it, since an agent sets the environment of the launches it starts; the
+tests set `sandbox.DEFAULT`.
+
+On Linux the default Claude launcher is `scripts/babysit-bwrap` (bash 4.1 or
+later), a bubblewrap wrapper taking Safehouse's `--add-dirs`, `--env-pass` and `--enable=docker,playwright`
+options (and `--enable=gpg`, below), plus `--claude-config-dir` or `--codex-home`, before `--` and the command.
+It mounts the system read-only, gives the agent an empty `$HOME`, and allows
+writes only to `--add-dirs`, the one agent configuration directory it is given
+(exported as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Claude always gets an explicit
+one, so its `.claude.json` lives inside it; a missing one is refused rather than
+exported into the empty home) and `~/.cache/babysit-sandbox/<hash of that
+configuration directory and the enabled grants>`, a cache used only by sandboxed
+agents of that configuration (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
+`npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). Each set of grants that reaches
+beyond the sandbox (`--enable=docker`) gets its own, so a launch with Docker never
+runs downloads that a launch without it could have replaced. Host caches are
+never writable: code planted there would run outside the sandbox.
+
+What a harness runs from its configuration directory is bound read-only on top of
+it in every launch, granted or not, so no agent leaves code there for the next
+launch of the same account: for Claude `settings.json` (hooks, status line, helper
+commands), `CLAUDE.md`, `agents`, `commands`, `hooks`, `output-styles`, `plugins`,
+`rules`, `session-env` (scripts Claude sources before Bash commands), `skills` and
+`workflows`; for Codex `config.toml`, `hooks.json`, `AGENTS.md`,
+`AGENTS.override.md`, `packages`, `plugins`, `prompts`, `rules` and `skills`. A
+missing one is first created empty (`{}` for JSON), since an agent could otherwise
+create it for the next launch; a link there is refused, since binding it would
+follow it outside the sandbox (copy a shared `settings.json` into each account
+instead of linking it). Install plugins and skills, and change these settings,
+outside the sandbox. Claude's `.claude.json` stays writable, since Claude rewrites
+it constantly, and any agent of the account can add MCP servers to it: a launch
+with `--enable=docker` and a Claude configuration must run `claude` itself, which
+babysit-bwrap gives `--strict-mcp-config`, so it starts no MCP servers at all.
+Each sandbox gets its own empty shell snapshot directory (Claude's
+`shell-snapshots`, Codex's `shell_snapshots`, sourced before every command), an
+`--add-dirs` grant that holds, equals or lies inside the configuration directory
+is refused (it could move the directory, read-only entries and all), and a link
+at the default account's `accounts` is refused. The wrapper
+discovers nothing from its working directory or git, whose files the agent can
+rewrite; babysit passes the worktree and its git common directory in `--add-dirs`
+from its own records (the worktree `wt` created, the job `cwd` that the repair
+just verified), and takes that common directory only when it registers the
+worktree back. A main checkout whose `.git` is also the common directory of
+other registered worktrees is refused (use a linked worktree): its agent could
+swap that directory for a link just before another worktree's sandbox binds it.
+Every writable path must be absolute and is resolved first; `/`, `$HOME` and its
+ancestors, and anything equal to, inside or holding `~/.ssh`, `~/.gnupg`,
+`~/.config/gh`, `~/.config/babysit-pr`, `~/.local/state/babysit-pr`,
+`~/.local/bin`, the toolchains that also run outside (`~/.local/share/uv`,
+`~/.local/share/claude`, `~/.nvm`, `~/.npm-global`), `~/.docker` (credential
+helpers and CLI plugins), `~/.config/herdr` (its socket drives panes outside the
+sandbox), the whole sandbox cache root, a shell or session startup file
+(`.bashrc`, `.bashrc.d`, `.bash_aliases`, `.profile`, `.bash_profile`,
+`.bash_login`, `.inputrc`, the zsh files, `~/.config/fish`, tmux's configuration,
+`.pam_environment`, `~/.config/autostart`, `~/.config/environment.d`), a user
+service definition (`~/.config/systemd`, `~/.local/share/systemd`,
+`~/.local/share/dbus-1`) or git's user configuration (`.gitconfig`,
+`~/.config/git`) are refused, as are newlines. The agent homes `~/.claude` and
+`~/.codex` are refused too, except as the matching configuration directory:
+`--claude-config-dir` may be `~/.claude` itself or one of its
+`accounts/<name>`, and `--codex-home` may be `~/.codex`. When the default
+account `~/.claude` is bound, its `accounts` directory is always covered by an
+empty tmpfs, so that agent never reaches the named accounts nor plants a link
+where they will be. babysit-bwrap also
+refuses its own directory and, when it runs from a checkout's `scripts/`, that
+checkout and its git common directory (read from the `.git` file or directory,
+without running git there), since an agent writing either would change what the
+next launch runs. Run babysit from a deployed checkout that agents never work in;
+they can still work on babysit-pr in any other clone and its worktrees. Protected entries
+are resolved whether or not they exist, through linked parents and dangling
+dotfile links. Where bwrap has `--bind-fd` (bubblewrap 0.10.0 and later, detected
+from `bwrap --help`), each writable directory is opened once after it is checked,
+its descriptor must still resolve to the checked path, and bwrap binds that
+descriptor, so a path swapped after the check cannot redirect the bind. Read-only binds (system, toolchains, `~/.config/gh`) follow the
+writable ones, so none can be shadowed. It unshares PID, IPC and UTS
+namespaces, dies with its parent, and clears the environment except `PATH`,
+`HOME`, `TERM`, `LANG`, `USER`, the variables above and the `--env-pass` names.
+It starts a new session (which blocks `TIOCSTI` terminal injection) unless stdin
+is a terminal and `/proc/sys/dev/tty/legacy_tiocsti` reads `0`, so interactive
+agents keep job control only where the kernel already blocks injection.
+`--print-argv` prints the bwrap argv, NUL-separated, without running it. Typed
+launches on Linux invoke the wrapper directly; there are no shell functions there
+to rely on.
+
+Provisioning a Linux worker (bubblewrap under AppArmor, rootless Docker, accounts)
+is in [the worker setup checklist](worker-setup.md).
+
+Known gaps of the Linux sandbox:
+
+- The worktree's git directory, including its hooks and config, stays writable
+  so the agent can commit. git run outside the sandbox in that checkout later
+  (by you or by babysit) can execute what the agent left there.
+- The network namespace is the host's: the agent reaches services on localhost
+  and abstract Unix sockets, including an X11 display and a D-Bus session bus
+  that listen on them, which can start programs outside the sandbox. Accepted
+  for now; run the worker headless, without a desktop session for its user.
+  Egress isolation is a later step.
+- The rest of the agent configuration directory stays writable: `.claude.json`
+  (MCP servers, which a granted launch ignores but an unsandboxed one starts),
+  transcripts and auto-memory under `projects/`, and any script there that a
+  read-only hook or status line command names. Hooks and commands must name
+  files the sandbox cannot write (inside `hooks/`, or outside the account).
+  Accepted: keep accounts used sandboxed separate from accounts used unsandboxed.
+  Agents of one account can also write each other's transcripts and memory, so a
+  launch with a grant trusts every agent of its account not to steer it through
+  them.
+- The git common directory of a repository is writable by every agent working in
+  one of its worktrees, and its `config` and `hooks` run code in whichever
+  sandbox runs git next (`core.hooksPath`, `core.fsmonitor`, filters, aliases,
+  `gpg.program`). Enabling Docker for one worktree therefore trusts every agent
+  sharing that clone. Making `hooks` read-only would not help: `config` must stay
+  writable for `git branch`, `git push -u` and `git worktree add`, and alone can
+  run anything, while read-only hooks would break `pre-commit install`. Give
+  workspaces that need Docker a clone of their own.
+- With a bwrap older than 0.10.0 writable directories are bound by path, so a
+  process that can write a bound directory's parent could swap it for a link
+  between the check and the bind. Refusing shared main checkouts closes the
+  case babysit creates itself; extra `--add-dirs` grants whose parents another
+  sandbox can write keep that race. Prefer bubblewrap 0.10.0 or later.
+- `--enable=docker` refuses the system daemon's socket, which is root on the
+  machine, and binds only `$XDG_RUNTIME_DIR/docker.sock`. Even a rootless daemon
+  gives up the filesystem boundary (`docker run -v $HOME:/h` reaches every file
+  of the user), so enabling Docker trusts the agent with them.
+- `--enable=gpg` mounts a throwaway `~/.gnupg` (copies of `pubring.kbx` and
+  `trustdb.gpg`, a `gpg.conf` with `no-autostart`) and, at the gpg-agent socket
+  path, a per-launch proxy (`scripts/gpg_agent_proxy.py`) that passes on only the
+  commands gpg signs with, so git signs through the agent; the private keys, any
+  passphrase file, the agent's configuration and its real socket stay outside. The
+  agent is still a signing oracle: while it runs, the sandboxed agent can have it
+  sign arbitrary data with the unlocked key, not only its own commits, as on
+  macOS. Signing is a grant: it keys its own sandbox cache, and a granted Claude
+  gets `--strict-mcp-config`. Setup is in
+  [the worker checklist](worker-setup.md#signing-with-a-gpg-subkey).
+- The dashboard's Docker toggle is macOS-only for now: it inspects Seatbelt, and
+  its restart looks for the launcher in the agent's parent process, which under
+  babysit-bwrap is `bwrap` itself, so a restart fails closed.
 
 `--claude-command` permits an explicit alternative argv prefix; those jobs keep
 `dontAsk` unless separately configured. The `safehouse` permission setting is
@@ -355,3 +505,72 @@ same way; running and actively watched PRs are left to their own observation. Da
 PR monitoring is finished, not that local files have been checked for safe removal.
 No session, pane, branch, worktree, or historical watch is automatically deleted.
 Branch-only watches have no PR closure event; register a PR watch when appropriate.
+
+## Worker machines (not yet used)
+
+`--home/machines.json` registers other machines for future remote workspaces.
+With or without it, every command still runs on this machine.
+`scripts/machines.py` loads and validates it; a malformed file is an error, a
+missing one means local only. `register --machine ID` checks the ID against the
+registry and then refuses: watches on other machines are not supported yet.
+Watches record `machine` (null for this machine), and a worktree path is a
+duplicate only on the same machine. The dashboard reads the diff and
+transcripts of a workspace ID qualified as `ID/w1` on that machine (see the
+workspaces reference), refuses every other action on it, and refuses views of
+watches recorded on another machine.
+
+```json
+{
+  "version": 1,
+  "machines": [
+    {
+      "id": "mini",
+      "label": "Mac mini",
+      "ssh": "mini.tail1234.ts.net",
+      "os": "darwin",
+      "src": "~/src",
+      "babysit_root": "~/src/babysit-pr",
+      "python": "python3",
+      "max_agents": 4,
+      "labels": ["docker"],
+      "enabled": true
+    }
+  ],
+  "repos": { "owner/repo": { "requires": ["docker"], "prefer": "mini" } }
+}
+```
+
+`id` (lowercase, at most 24 characters, not `local`) is the stable key; `label`
+is the herdr machine label passed as `herdr --machine=<label>` (labels cannot start with `-`). `id`, `label`, `ssh` and
+`os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
+`max_agents` is 1–64, `collie_url` is optional, and unknown keys are rejected.
+Ids, labels and `ssh` targets must be unique, though two spellings of one host
+(`user@host` and `host`) are not detected.
+Disabled machines stay valid for records already pinned to them.
+
+Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, and a shared
+master connection whose socket lives in `--home/ssh/` (or a short temporary
+directory when that path is too long), with at most four concurrent commands
+per ssh target in one process. They run with the worker's own environment and
+credentials, under `sh -c`, so the worker's login shell need not be POSIX: it
+sees only octal escapes that `sh` decodes, and no controller stdin.
+A timeout kills only the local ssh client; the remote process may keep running,
+so long-running remote work needs its own lifeline.
+
+With a registry, the dashboard's launch dialogs (Handle, Create, New task, batch
+review) offer a Machine select, and the Workspaces heading shows each machine's
+health and load from `herdr --machine=<label> workspace list`, cached for 15 s and
+refreshed in the background so no request waits on a worker. Auto always places on
+this machine for now. Choosing a worker by name checks it against the launch
+(disabled, unreachable, missing `labels` such as `docker`, `safehouse`/`bwrap` for
+the sandbox, `claude-account:<name>`, or a repo's `requires`) and records it on the
+operation or scheduled task, but the launch is refused: "Launching on <label> is
+not supported yet". A worker whose load has not come back yet, or whose refresh has
+not finished for 30 s, shows "checking…" and is left out of Auto. Worker clones are
+not inventoried yet, so a launch with other clones (`--with`) is not refused for them. Handle on a verified checkout stays on that checkout's machine;
+choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`
+previews where Auto would place a launch and which machines can take it;
+`GET /api/machines` lists the machines with their cached loads and placement verdict,
+which the Workspaces badges poll once `/api/status` reports `workers` (absent without
+a registry, so a single machine never asks). The experimental Workspaces tab lists each
+enabled worker's worktrees read-only (see the workspaces reference).

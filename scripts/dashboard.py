@@ -25,6 +25,7 @@ import attention
 import browser_extension
 import dashboard_settings
 import llm_usage
+import machines
 import service_control
 import workspace_agents
 import workspace_viewer
@@ -81,11 +82,44 @@ def queue_signature(path):
     return tuple(signature)
 
 
+def unsupported_machine(home, machine_id):
+    machines.resolve(home, machine_id)  # An unknown machine is refused as such.
+    return ValueError(f"Workspaces on machine {machine_id} cannot be opened from this dashboard")
+
+
+def local_workspace(home, value):
+    """A workspace ID from a request: ``w1`` as before, ``<machine>/w1`` refused."""
+    if not isinstance(value, str) or "/" not in value:
+        return value
+    try:
+        machine_id, _ = machines.split(value)
+    except ValueError:
+        return value  # Not a qualified ID either: refused as an invalid workspace, as before.
+    raise unsupported_machine(home, machine_id)
+
+
+def viewed_workspace(home, value):
+    """A workspace ID from a view request as (machine, ID): ``w1`` on this machine, or
+    ``<machine>/w1`` on a registered worker, whose checkout its views read there."""
+    if not isinstance(value, str) or "/" not in value:
+        return None, value
+    try:
+        machine_id, workspace_id = machines.split(value)
+    except ValueError:
+        return None, value  # Not a qualified ID either: refused as an invalid workspace.
+    machine = machines.resolve(home, machine_id)
+    if machine is not None and not machine.enabled:
+        raise ValueError(f"{machine.label} is disabled")
+    return machine, workspace_id
+
+
 def watch_checkout(home, watch_id):
     """A watch's registered checkout and the session its repairs resume."""
     job = next((j for j in read_jobs(home) if j.get("id") == watch_id), None)
     if job is None:
         raise ValueError("Unknown watch; refresh")
+    if job.get("machine") is not None:
+        raise unsupported_machine(home, job["machine"])
     return job["cwd"], job.get("session_id")
 
 
@@ -255,6 +289,13 @@ def status(home):
         result["daemon"] = daemon_health(home, now)
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
         result["error"] = f"Cannot read watcher state: {exc}"
+    # Only with workers registered does the page poll their loads (/api/machines).
+    try:
+        workers = len(machines.load(home))
+    except (OSError, ValueError):
+        workers = 0
+    if workers:
+        result["workers"] = workers
     return result
 
 
@@ -643,6 +684,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON action request")
             # Attached files become paths in the text the agent receives.
             attachments.attach(self.server.attachments, action, request)
+            if action.startswith("workspace-"):
+                for name in ("workspace", "workspace_id"):
+                    if name in request:
+                        request[name] = local_workspace(self.server.home, request[name])
             if action == "notification-silence":
                 if not self.server.push:
                     raise ValueError("Notification preferences are unavailable")
@@ -1019,7 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
                         path = self.server.workspace_overview.checkout(query["key"][0])
                     workspace_id = workspace_viewer.checkout_workspace(path)
                 else:
-                    workspace_id = query["workspace"][0]
+                    workspace_id = local_workspace(self.server.home, query["workspace"][0])
                     self.server.workspace_checkout(workspace_id)
                 if workspace_id is None:
                     # Nobody to message, but a recorded session can be resumed.
@@ -1054,22 +1099,41 @@ class Handler(BaseHTTPRequestHandler):
                 if len({"workspace", "key", "watch"} & set(single)) != 1:
                     raise ValueError("Supply a workspace, a workspace key or a watch")
                 prefer = None
+                # A worker machine's row or workspace is read there, through its probe;
+                # the machine comes from the inventory or the registry, never the client.
+                machine = path = workspace_id = None
                 if "key" in single:
                     if not self.server.workspace_overview:
                         raise ValueError("The workspace experiment is disabled")
-                    path = self.server.workspace_overview.checkout(single.pop("key"))
+                    key = single.pop("key")
+                    worker = self.server.workspace_overview.worker_checkout(key)
+                    if worker:
+                        machine, path = worker
+                    else:
+                        path = self.server.workspace_overview.checkout(key)
                 if "watch" in single:
                     # The session its repairs resume opens first.
                     path, prefer = watch_checkout(self.server.home, single.pop("watch"))
+                if "workspace" in single:
+                    machine, workspace_id = viewed_workspace(
+                        self.server.home, single.pop("workspace")
+                    )
                 # Read-only views own their failure boundary, like the inventory.
                 try:
-                    if "workspace" in single:
-                        path = self.server.workspace_checkout(single.pop("workspace"))
+                    if machine is not None and path is None:
+                        path = workspace_viewer.remote_checkout(machine, workspace_id)
+                    elif path is None:
+                        path = self.server.workspace_checkout(workspace_id)
                     if route.path == "/api/workspace-diff":
                         if set(single) - {"scope", "base"}:
                             raise ValueError("Unknown diff parameter")
-                        value = workspace_viewer.diff(
-                            path, single.get("scope", "branch"), single.get("base")
+                        scope, base = single.get("scope", "branch"), single.get("base")
+                        value = (
+                            workspace_viewer.diff(path, scope, base)
+                            if machine is None
+                            else workspace_viewer.remote_diff(
+                                self.server.home, machine, path, scope, base
+                            )
                         )
                     else:
                         if set(single) - {"session", "before", "after"}:
@@ -1080,8 +1144,14 @@ class Handler(BaseHTTPRequestHandler):
                                 if not single[name].isdigit():
                                     raise ValueError("Expected a numeric page position")
                                 positions[name] = int(single[name])
-                        value = workspace_viewer.transcript(
-                            path, single.get("session"), prefer=prefer, **positions
+                        value = (
+                            workspace_viewer.transcript(
+                                path, single.get("session"), prefer=prefer, **positions
+                            )
+                            if machine is None
+                            else workspace_viewer.remote_transcript(
+                                self.server.home, machine, path, single.get("session"), **positions
+                            )
                         )
                 except ValueError:
                     raise
@@ -1155,6 +1225,15 @@ class Handler(BaseHTTPRequestHandler):
                     if self.server.workspaces
                     else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
                 )
+            elif route.path == "/api/machines":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(200, {"machines": self.server.workspaces.machine_list()})
+            elif route.path == "/api/placement":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                params = {k: v[0] for k, v in parse_qs(route.query).items()}
+                self.send_json(200, self.server.workspaces.preview(params))
             elif route.path == "/api/workspace-repos":
                 everything = parse_qs(route.query).get("all", [""])[0] == "1"
                 self.send_json(

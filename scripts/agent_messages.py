@@ -18,7 +18,6 @@ without a message, leaving the session waiting for the reader in Collie.
 """
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -32,9 +31,10 @@ from pathlib import Path
 
 import agent_docker
 import claude_accounts
-import claude_runner
 import exit_watch
 import herdr_handoff
+import machines
+import session_locks
 import workspace_viewer
 import wt
 from pr_workspaces import herdr, run
@@ -277,6 +277,7 @@ def watch_until_done(result, home, marker, message):
     watch = {
         "id": uuid.uuid4().hex,
         "label": f"Message: {first[:80]}",
+        "machine": None,
         "path": os.path.realpath(found["cwd"]),
         "workspace_id": found["workspace_id"],
         "pane_id": pane,
@@ -531,7 +532,7 @@ def paste(pane, text):
     with locked(("pane", pane)):
         if not idle_screen(pane):
             raise ValueError("The agent is waiting on a question or approval; answer it first")
-        run("herdr", "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~")
+        run(*machines.herdr_argv(None, "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~"))
         if not wait_for(pane, lambda screen: pasted(screen, text), read=herdr_handoff.read_screen):
             raise ValueError(f"The text did not appear in the prompt box; {UNCERTAIN}")
         herdr("agent", "send-keys", pane, "enter")
@@ -673,7 +674,7 @@ def live_interaction(target):
     Only a complete, single-choice, single-question Claude dialog can be answered
     from the screen. Other dialogs remain visible without guessing their controls.
     """
-    screen = run("herdr", "agent", "read", target["pane"], "--source", "visible")
+    screen = run(*machines.herdr_argv(None, "agent", "read", target["pane"], "--source", "visible"))
     result = {"screen": screen, "question": None, "choices": None, "idle": False}
     if target["agent"] != "claude" or not target.get("session"):
         return result
@@ -737,7 +738,7 @@ def dialog(pane):
     It starts at the last rule above it, skipping the one that sets off its "Chat about
     this" line, and ends with its key hints (the review tab has none).
     """
-    screen = run("herdr", "agent", "read", pane, "--source", "visible")
+    screen = run(*machines.herdr_argv(None, "agent", "read", pane, "--source", "visible"))
     lines = [unquote(line) for line in screen.splitlines()]
     hints = [i for i, line in enumerate(lines) if "Esc to cancel" in line]
     end = hints[-1] + 1 if hints else len(lines)
@@ -882,7 +883,7 @@ def answer_locked(request):
                     # shows once it has focus.
                     if not wait_for(pane, lambda screen: "ctrl+g to edit" in screen):
                         raise ValueError("the answer field did not open")
-                    run("herdr", "pane", "send-text", pane, value)
+                    run(*machines.herdr_argv(None, "pane", "send-text", pane, value))
                 else:
                     if value == str(len(question["options"]) + 1) and "ctrl+g to edit" in dialog(
                         pane
@@ -947,7 +948,7 @@ def codex_dialog(pane):
     Codex CLI 0.160 renders `Question i/n` and `enter to submit answer/all`.
     Unlike Claude, it has no horizontal rule around the dialog.
     """
-    screen = run("herdr", "agent", "read", pane, "--source", "visible")
+    screen = run(*machines.herdr_argv(None, "agent", "read", pane, "--source", "visible"))
     headings = list(re.finditer(r"(?m)^\s*Question \d+/\d+[^\n]*\n", screen))
     if not headings:
         return ""
@@ -997,7 +998,7 @@ def answer_codex(request, questions, steps):
         typed = True
         _codex_answered.add(identity)
         if kind == "text":
-            run("herdr", "pane", "send-text", pane, value)
+            run(*machines.herdr_argv(None, "pane", "send-text", pane, value))
         else:
             herdr("agent", "send-keys", pane, value)
 
@@ -1069,24 +1070,6 @@ class Refused(ValueError):
         self.details = {"code": code, **details}
 
 
-def repair_running(session_id, agent, config_dir=None):
-    """Whether a babysit repair holds this session's lock right now, from any home."""
-    lock_home = (
-        Path(config_dir or claude_runner.config_home())
-        if agent == "claude"
-        else Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-    ) / "babysit-pr-locks"
-    lock = lock_home / f"{session_id}.lock"
-    if lock.exists():
-        with lock.open("a") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(handle, fcntl.LOCK_UN)
-    return False
-
-
 def owning_watch(session_id, home):
     """The babysit watch, not yet ended, that resumes this session itself."""
     return next(
@@ -1124,7 +1107,7 @@ def watch_owner(session_id, agent, home, config_dir=None):
     A watch resumes its registered session headless for repairs, under a per-session
     lock; an interactive copy alongside would make two writers on one conversation.
     """
-    if repair_running(session_id, agent, config_dir):
+    if session_locks.held(agent, session_id, config_dir):
         return REPAIR_RUNNING
     job = owning_watch(session_id, home)
     return owned_message(job) if job else None
@@ -1149,7 +1132,7 @@ def claim_from_watch(session_id, agent, home, config_dir=None, stop_watch=None):
                 "watch_finishing_repair",
                 watch=watch_summary(stopped),
             )
-    if repair_running(session_id, agent, config_dir):
+    if session_locks.held(agent, session_id, config_dir):
         raise Refused(f"Not resumed: {REPAIR_RUNNING}", "repair_running")
     job = owning_watch(session_id, home)
     if job:
@@ -1275,9 +1258,17 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
             split = herdr(
                 "pane", "split", anchor, "--direction", "right", "--cwd", cwd, "--no-focus"
             )
-            return launch(workspace_id, chosen, split["pane"]["pane_id"], text, home)
+            return launch(workspace_id, chosen, split["pane"]["pane_id"], text, home, worktree=root)
         # A reopened workspace's shell starts in the checkout, not the session's directory.
-        return launch(workspace_id, chosen, pane, text, home, cwd=None if cwd == root else cwd)
+        return launch(
+            workspace_id,
+            chosen,
+            pane,
+            text,
+            home,
+            cwd=None if cwd == root else cwd,
+            worktree=root,
+        )
 
 
 def reopen(root):
@@ -1305,8 +1296,13 @@ def reopen(root):
     return live, None if opened.get("already_open") else pane
 
 
-def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None):
-    """Resume once into a fresh or verified empty shell pane, optionally with a prompt."""
+def launch(
+    workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None, worktree=None
+):
+    """Resume once into a fresh or verified empty shell pane, optionally with a prompt.
+
+    ``worktree`` is the workspace checkout, which the agent may write.
+    """
     session_id = chosen["id"]
     # The prompt is read back from a private file, as launches do: a typed line has
     # a length ceiling, and command-substitution output needs no escaping.
@@ -1323,6 +1319,8 @@ def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, laun
         text,
         extra=[*options, *RESUME[chosen["agent"]], chosen["id"]],
         stage=lambda _: str(staged),
+        worktree=worktree,
+        sandbox_config_dir=chosen.get("claude_config_dir"),
     )
     if launcher:
         # Direct Safehouse invocation already contains the executable. Its original
@@ -1340,7 +1338,7 @@ def launch(workspace_id, chosen, pane, text, home, *, options=(), cwd=None, laun
     _recent[session_id] = (pane, time.monotonic())
     try:
         # `pane run` answers with plain text, not herdr's JSON envelope.
-        run("herdr", "pane", "run", pane, command)
+        run(*machines.herdr_argv(None, "pane", "run", pane, command))
     except subprocess.TimeoutExpired:
         return {
             "sent": True,

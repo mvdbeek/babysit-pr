@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 import claude_accounts
+import sandbox
 
 
 def config_home():
@@ -76,13 +77,15 @@ def session_info(session_id, cwd, transcript=None, config_dir=None):
     }
 
 
-def safehouse_command():
-    return ["/bin/zsh", str(Path(__file__).resolve().with_name("claude_safehouse.zsh"))]
-
-
 def command_for(job, schema):
+    """The repair argv; ``job["cwd"]`` must be the verified worktree."""
     cmd = [
-        *job["claude_command"],
+        *sandbox.bind(
+            job["claude_command"],
+            "claude",
+            job.get("cwd"),
+            job.get("claude_config_dir") or str(config_home()),
+        ),
         "--print",
         "--resume",
         job["session_id"],
@@ -93,8 +96,9 @@ def command_for(job, schema):
         json.dumps(schema),
     ]
     mode = job.get("claude_permission_mode", "dontAsk")
-    if mode == "safehouse":
-        if job["claude_command"] != safehouse_command():
+    if mode == sandbox.LAUNCHER_PERMISSIONS:
+        # Checked before the prefix gets this repair's directories.
+        if job["claude_command"] != sandbox.claude_launcher():
             raise ValueError("Safehouse permission mode requires the verified Safehouse launcher")
     else:
         cmd += ["--permission-mode", mode]

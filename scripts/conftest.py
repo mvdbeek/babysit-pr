@@ -1,6 +1,7 @@
 """Shared integration fixtures, explicitly re-exported for pytest discovery."""
 
 import pytest
+import sandbox
 from test_dashboard_cancel import server as server
 from test_pr_supervisor import harness as harness
 
@@ -16,3 +17,10 @@ def no_claude_trust(monkeypatch):
     """Launches never mark folders trusted in the user's real Claude config; the trust
     tests turn it back on against a fake home."""
     monkeypatch.setenv("BABYSIT_CLAUDE_TRUST", "0")
+
+
+@pytest.fixture(autouse=True)
+def safehouse_sandbox(monkeypatch):
+    """In-process launch lines are Safehouse's on every platform; the bwrap tests name
+    their backend. Child processes follow their platform."""
+    monkeypatch.setattr(sandbox, "DEFAULT", "safehouse")

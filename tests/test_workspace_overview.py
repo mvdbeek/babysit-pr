@@ -968,7 +968,7 @@ def test_restart_shows_inventory_while_one_background_refresh_runs(site, monkeyp
     finished = threading.Event()
     scans = []
 
-    def collect(publish=None):
+    def collect(publish=None, local_done=None):
         scans.append(True)
         assert gate.wait(timeout=10)
         return {"workspaces": [], "warnings": []}
@@ -1307,6 +1307,48 @@ def test_views_of_a_herdr_workspace_need_no_experiment(site, tmp_path, monkeypat
             ]:
                 status, value = request(port, path)
                 assert status == 400 and error in value["error"], path
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_qualified_workspace_ids_name_a_registered_machine(site, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    home = tmp_path / "plain"
+    home.mkdir()
+    mini = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin"}
+    (home / "machines.json").write_text(json.dumps({"version": 1, "machines": [mini]}))
+    queue = sqlite3.connect(home / "queue.sqlite")
+    queue.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+    job = {"id": "abc123", "machine": "mini", "cwd": str(site[3] / "dirty-work")}
+    queue.execute("INSERT INTO jobs VALUES ('abc123', ?)", (json.dumps(job),))
+    queue.commit()
+    queue.close()
+    with dashboard.DashboardServer(home, 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            status, value = request(port, "/api/workspace-diff?workspace=w1")
+            assert status == 200 and value["base"] == "origin/main"
+            for route in ("workspace-diff", "workspace-transcript", "workspace-agents"):
+                # Views read a worker's workspace there; nothing else acts on it yet.
+                remote = "not open" if route != "workspace-agents" else "cannot be opened"
+                for workspace, error in [
+                    ("unknown%2Fw1", "Unknown machine unknown"),
+                    ("mini%2Fw1", remote),
+                ]:
+                    path = f"/api/{route}?workspace={workspace}"
+                    status, value = request(port, path)
+                    assert status == 400 and error in value["error"], path
+            # The same path here is another checkout than the watch's on mini.
+            status, value = request(port, "/api/workspace-diff?watch=abc123")
+            assert status == 400 and "on machine mini" in value["error"]
+            body = {"workspace": "unknown/w1", "pane": "w1:p1", "message": "hi"}
+            status, value = request(port, "/api/workspace-message", body, "workspace-message")
+            assert status == 400 and "Unknown machine unknown" in value["error"]
+            assert not calls(site[4], ["agent", "prompt"])
         finally:
             httpd.shutdown()
             thread.join(5)
