@@ -131,6 +131,8 @@ def typed_line(
     name: str | None = None,
     worktree: str | None = None,
     claude_config_dir: str | None = None,
+    launcher: str | None = None,
+    confined: Sequence[str] | None = None,
 ) -> str:
     """The shell line a multiplexer types to start agent ``words`` in the sandbox.
 
@@ -140,6 +142,10 @@ def typed_line(
     itself; babysit-bwrap is given ``worktree`` and the agent's configuration, typed
     (see ``confinement``), since callers that stage the prompt themselves return its
     path for every ``stage`` call.
+
+    A line typed on another machine names that machine's babysit-bwrap (``launcher``)
+    and its own options for the checkout and configuration there (``confined``), which
+    nothing here can look up.
     """
     name = backend(name)
     if name == "none":
@@ -157,10 +163,12 @@ def typed_line(
             command = f"SAFEHOUSE_ADD_DIRS=${{SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}}$(cat {listed}) {command}"
         return command
     options = flags(grants._replace(add_dirs=()), name)
-    options += [shlex.quote(word) for word in confinement(words[0], worktree, claude_config_dir)]
+    if confined is None:
+        confined = confinement(words[0], worktree, claude_config_dir)
+    options += [shlex.quote(word) for word in confined]
     if dirs:
         options.append(f'"--add-dirs=$(cat {shlex.quote(stage(":".join(dirs)))})"')
-    launch = [shlex.quote(str(SCRIPTS / "babysit-bwrap")), *options, "--"]
+    launch = [shlex.quote(launcher or str(SCRIPTS / "babysit-bwrap")), *options, "--"]
     return " ".join([*launch, shlex.join([words[0], skip_permissions, *words[1:]])])
 
 

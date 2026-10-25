@@ -5,15 +5,22 @@ HOME; its herdr state lives in the fake herdr's per-label store.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
+import claude_accounts
+import cron_agents
 import machines
 import pytest
 import remote_probe
+import workspace_exit
+from cron_jobs import CronJobs
+from test_pr_workspaces import local  # noqa: F401 (fixture)
 
 WORKER = {"id": "mini", "label": "Mac mini", "ssh": "mini.test", "os": "darwin"}
 URL = "https://github.com/base/repo.git"
@@ -192,3 +199,252 @@ def test_the_latest_turn_of_a_workers_transcript(host, tmp_path):
         remote_probe._host_turn(str(outside), sid, "claude")
     with pytest.raises(RuntimeError, match="session ID does not match"):
         remote_probe._host_turn(str(path), str(uuid.uuid4()), "claude")
+
+
+# A job on the worker, run by the dashboard's cron runner ----------------------------
+
+
+@pytest.fixture
+def remote(local, short_tmp, monkeypatch):  # noqa: F811
+    """The dashboard's cron runner, and the worker Mac mini with its own clone of base/repo."""
+    manager, _, git_local, state, _ = local
+    (manager.home / "machines.json").write_text(
+        json.dumps({"version": 1, "machines": [{**WORKER, "labels": ["safehouse"]}]})
+    )
+    host = state.parent / "hosts" / "mini.test"
+    clone = host / "src" / "repo"
+    subprocess.check_call(["git", "clone", "-q", os.environ["FAKE_HEAD"], str(clone)])
+    git("remote", "set-url", "origin", URL, cwd=clone)
+    # The fake ssh passes this environment through: its Codex home must be the worker's.
+    shutil.copytree(os.environ["CODEX_HOME"], host / ".codex")
+    monkeypatch.setenv("CODEX_HOME", str(host / ".codex"))
+    monkeypatch.setattr(cron_agents, "REMOTE_WATCH", 0)
+    jobs = CronJobs(manager.home, shell=["/bin/sh", "-c"], workspaces=manager)
+    yield jobs, manager, git_local, state, host
+    jobs.close()
+
+
+def job_request(manager, **changes):
+    return {
+        "kind": "agent",
+        "name": "Nightly triage",
+        "repo": "base/repo",
+        "clone": str((manager.src / "repo").resolve()),
+        "branch": "nightly",
+        "base": "feature",
+        "agent": "codex",
+        "prompt": "Triage new issues",
+        "schedule": {"cron": "0 6 * * *"},
+        "timeout": 7200,
+        "machine": "mini",
+        **changes,
+    }
+
+
+def settled(jobs, statuses=("starting",)):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        run = jobs.snapshot()["jobs"][0]["runs"][0]
+        if run["status"] not in statuses:
+            return run
+        time.sleep(0.05)
+    raise AssertionError("The run did not settle")
+
+
+def store(state):
+    return json.loads(Path(state).read_text())
+
+
+def test_a_job_on_a_worker_starts_its_agent_there(remote):
+    jobs, manager, git_local, state, host = remote
+    saved = jobs.save(job_request(manager))
+    assert saved["machine"] == "mini" and saved["clone"] == "~/src/repo"
+    jobs.run_now(saved["id"])
+    run = settled(jobs)
+    assert run["status"] == "running", run
+    launched = run["agent_run"]
+    path = (host / "src/worktrees/repo/nightly").resolve()
+    assert launched["path"] == str(path)
+    assert (launched["machine"], launched["machine_label"]) == ("mini", "Mac mini")
+    assert launched["workspace_id"] == "mini/w1" and launched["url"] is None
+    feature = subprocess.check_output(
+        ["git", "-C", os.environ["FAKE_HEAD"], "rev-parse", "feature"], text=True
+    ).strip()
+    assert git("rev-parse", "HEAD", cwd=path) == feature
+    data = store(state)
+    # Every herdr call went to the worker's server; nothing was opened here.
+    assert all(call[0] == "--machine=Mac mini" for call in data["calls"])
+    assert not data["workspaces"] and not data["agents"]
+    worker = data["machines"]["Mac mini"]
+    [opened] = [c for c in worker["calls"] if c[:2] == ["worktree", "open"]]
+    assert opened[opened.index("--cwd") + 1] == str((host / "src/repo").resolve())
+    assert opened[opened.index("--path") + 1] == str(path)
+    [typed] = worker["runs"]
+    assert typed[0] == launched["pane"] and typed[1].startswith("codex ")
+    [staged] = (host / ".cache/babysit/cron-prompts").iterdir()
+    assert f'"$(cat {staged})"' in typed[1]
+    assert staged.read_text() == "Triage new issues\n" + workspace_exit.brief(
+        launched["exit_marker"]
+    )
+    [agent] = worker["agents"]
+    assert agent["pane_id"] == launched["pane"] and agent["cwd"] == str(path)
+    # The worker's agent keeps the job busy, as a local one does.
+    jobs.tick()
+    with pytest.raises(ValueError, match="already running"):
+        jobs.run_now(saved["id"])
+
+
+def rollout(host, cwd, sid, *events):
+    day = host / ".codex" / "sessions" / "2026" / "10" / "25"
+    day.mkdir(parents=True, exist_ok=True)
+    path = day / f"rollout-2026-10-25T10-00-00-{sid}.jsonl"
+    records = [{"type": "session_meta", "payload": {"id": sid, "cwd": str(cwd)}}, *events]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    return path
+
+
+def test_a_workers_run_keeps_the_agents_answer_once_it_confirms(remote):
+    jobs, manager, _, state, host = remote
+    saved = jobs.save(job_request(manager))
+    jobs.run_now(saved["id"])
+    run = settled(jobs)
+    launched = run["agent_run"]
+    sid = str(uuid.uuid4())
+    started = [
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Triage"}},
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+    ]
+    path = rollout(host, launched["path"], sid, *started)
+    jobs.watch()
+    run = jobs.snapshot()["jobs"][0]["runs"][0]
+    assert run["status"] == "running" and "Mac mini" in run["message"]
+    done = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "t1",
+            "last_agent_message": f"Triaged 3 issues.\n{launched['exit_marker']}",
+        },
+    }
+    with path.open("a") as stream:
+        stream.write(json.dumps(done) + "\n")
+    jobs.watch()
+    run = jobs.snapshot()["jobs"][0]["runs"][0]
+    assert run["status"] == "attention", run["message"]
+    assert run["message"].startswith("Finished on Mac mini") and "still open" in run["message"]
+    assert "Triaged 3 issues." in jobs.log(run["id"])["text"]
+    assert launched["exit_marker"] not in jobs.log(run["id"])["text"]
+
+
+def test_a_workers_agent_that_leaves_without_confirming_needs_attention(remote):
+    jobs, manager, _, state, host = remote
+    saved = jobs.save(job_request(manager))
+    jobs.run_now(saved["id"])
+    settled(jobs)
+    data = store(state)
+    data["machines"]["Mac mini"]["agents"] = []
+    Path(state).write_text(json.dumps(data))
+    jobs.watch()
+    run = jobs.snapshot()["jobs"][0]["runs"][0]
+    assert run["status"] == "attention" and "left its pane on Mac mini" in run["message"]
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"machine": "box"}, "Unknown machine box"),
+        ({"unsandboxed": True}, "always run in their sandbox"),
+        ({"machine": 3}, "Choose a machine"),
+    ],
+)
+def test_jobs_a_worker_cannot_run_are_refused(remote, changes, message):
+    jobs, manager, *_ = remote
+    with pytest.raises(ValueError, match=message):
+        jobs.save(job_request(manager, **changes))
+
+
+def test_shell_jobs_and_disabled_workers_stay_off_workers(remote):
+    jobs, manager, *_ = remote
+    with pytest.raises(ValueError, match="Only agent jobs"):
+        jobs.save({"name": "x", "command": "true", "schedule": {"every": 60}, "machine": "mini"})
+    (manager.home / "machines.json").write_text(
+        json.dumps({"version": 1, "machines": [{**WORKER, "enabled": False}]})
+    )
+    with pytest.raises(ValueError, match="disabled"):
+        jobs.save(job_request(manager))
+
+
+def test_auto_is_resolved_once_at_save(remote):
+    jobs, manager, *_ = remote
+    saved = jobs.save(job_request(manager, machine="auto"))
+    # Auto never picks a worker yet: the job is pinned here.
+    assert saved["machine"] is None and saved["clone"] == str((manager.src / "repo").resolve())
+    local_job = jobs.save(job_request(manager, name="Here", branch="here", machine="local"))
+    assert local_job["machine"] is None
+
+
+def test_a_linux_workers_launch_line_runs_its_babysit_bwrap():
+    worker = machines.Machine(
+        "box", "Box", "box", "linux", "~/src", "~/b", "python3", 4, ("bwrap", "gpg"), None, True
+    )
+    found = {
+        "path": "/home/b/src/worktrees/repo/n",
+        "common": "/home/b/src/repo/.git",
+        "home": "/home/b",
+        "clone": "/home/b/src/repo",
+        "claude_home": "/home/b/.claude/accounts/work",
+        "codex_home": "/home/b/.codex",
+        "launcher": "/home/b/b/scripts/babysit-bwrap",
+    }
+    job = {
+        "agent": "claude",
+        "prompt": "Go",
+        "model": "",
+        "effort": "",
+        "docker": True,
+        "claude_account": "work",
+    }
+    line = cron_agents.remote_command(job, worker, found, "/home/b/.cache/p", "")
+    unset = " ".join(claude_accounts.AUTH_ENV)
+    assert line == (
+        f"(unset {unset}; CLAUDE_CONFIG_DIR=/home/b/.claude/accounts/work "
+        "/home/b/b/scripts/babysit-bwrap --enable=docker,gpg "
+        "--claude-config-dir=/home/b/.claude/accounts/work "
+        "--add-dirs=/home/b/src/worktrees/repo/n:/home/b/src/repo/.git -- "
+        'claude --dangerously-skip-permissions "$(cat /home/b/.cache/p)")'
+    )
+    # A Mac worker's line relies on its own shell functions, as this machine's does.
+    mac = worker._replace(os="darwin", labels=("safehouse",))
+    codex = {**job, "agent": "codex", "claude_account": ""}
+    assert cron_agents.remote_command(codex, mac, found, "/p", "") == (
+        'SAFE_ENABLE=docker codex -c check_for_update_on_startup=false "$(cat /p)"'
+    )
+    with pytest.raises(ValueError, match="babysit-bwrap is not installed under ~/b"):
+        cron_agents.remote_command(job, worker, {**found, "launcher": None}, "/p", "")
+
+
+def test_without_a_registry_a_job_runs_here_as_before(local, short_tmp):  # noqa: F811
+    manager, _, _, state, _ = local
+    jobs = CronJobs(manager.home, shell=["/bin/sh", "-c"], workspaces=manager)
+    try:
+        request = job_request(manager)
+        del request["machine"]
+        saved = jobs.save(request)
+        assert saved["machine"] is None and saved["clone"] == request["clone"]
+        jobs.run_now(saved["id"])
+        run = settled(jobs)
+        assert run["status"] == "running", run
+        assert list(run["agent_run"]) == [
+            "machine",
+            "workspace_id",
+            "pane",
+            "path",
+            "url",
+            "exit_marker",
+            "launched_at",
+        ]
+        data = store(state)
+        assert "ssh" not in data and "machines" not in data
+        assert not any(call[0].startswith("--machine") for call in data["calls"])
+    finally:
+        jobs.close()

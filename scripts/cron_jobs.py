@@ -207,6 +207,8 @@ def validate(request, workspaces=None, home=None):
     if kind == "agent":
         task = cron_agents.validate(request, workspaces, home)
     elif kind == "shell":
+        if request.get("machine") not in (None, "local", "auto"):
+            raise ValueError("Only agent jobs run on worker machines")
         task = shell_task(request)
     else:
         raise ValueError("Choose a shell command or an agent task")
@@ -457,8 +459,9 @@ class CronJobs:
                     if (
                         other["id"] != job["id"]
                         and other.get("kind") == "agent"
-                        and (other["clone"], other["branch"])
-                        == (definition["clone"], definition["branch"])
+                        # The same clone path on two machines is two clones.
+                        and (other.get("machine"), other["clone"], other["branch"])
+                        == (definition["machine"], definition["clone"], definition["branch"])
                     ):
                         raise ValueError(
                             f"“{other['name']}” already works on {definition['branch']}; "
@@ -678,16 +681,26 @@ class CronJobs:
                     finished_at=now(),
                     message=f"{launched['uncertain']}; check the job's workspace in Collie",
                 )
+            elif launched.get("machine"):
+                label = launched["machine_label"]
+                result.update(
+                    status="running", message=f"Waiting for the agent on {label} to finish"
+                )
             else:
                 result.update(
                     status="running",
                     exit=workspace_exit.watching(now()),
                     message="Waiting for the agent to finish",
                 )
+            where = launched["url"]
+            if launched.get("machine"):
+                label = launched["machine_label"]
+                where = f"{where or launched['workspace_id']} on {label}" + (
+                    "" if launched["url"] else f" (Collie unavailable for {label})"
+                )
             self.append_log(
                 run,
-                f"{job['agent'].capitalize()} started in {launched['path']}\n"
-                f"Workspace: {launched['url']}\n",
+                f"{job['agent'].capitalize()} started in {launched['path']}\nWorkspace: {where}\n",
             )
         with self.lock:
             try:
@@ -732,6 +745,8 @@ class CronJobs:
     def watch_one(self, run):
         now = self.clock()
         launched = run["agent_run"]
+        if launched.get("machine"):
+            return self.watch_remote(run, now)
         op = cron_agents.operation(run, launched)
 
         def persist(record):
@@ -778,6 +793,38 @@ class CronJobs:
         else:
             changes = {"status": "attention", "message": record["message"]}
         self.update_run(run, exit=record, finished_at=now, result=bool(text), **changes)
+        self.prune(run["job"])
+
+    def watch_remote(self, run, now):
+        """A worker's run, until its agent confirms the task, leaves its pane or times out.
+
+        Each look costs the worker ssh calls, so it is looked at every REMOTE_WATCH seconds.
+        """
+        if now - run.get("remote_checked_at", 0) < cron_agents.REMOTE_WATCH:
+            return
+        launched = run["agent_run"]
+        label = launched["machine_label"]
+        try:
+            seen = cron_agents.remote_progress(self.home, run, launched)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            seen = {"state": "watching", "message": f"Cannot check the agent on {label}: {exc}"}
+        if seen["state"] == "watching" and now - run["started_at"] > run["timeout"]:
+            limit = f"the {run['timeout'] // 60} min time limit"
+            seen = {
+                "state": "left_open",
+                "message": f"Still working at {limit}; left open on {label}",
+            }
+        if not self.current(run):
+            return
+        if seen["state"] == "watching":
+            self.update_run(run, remote_checked_at=now, message=seen["message"])
+            return
+        text = seen.get("text")
+        if text:
+            self.append_log(run, f"\nFinal response:\n{text}\n")
+        self.update_run(
+            run, status="attention", message=seen["message"], finished_at=now, result=bool(text)
+        )
         self.prune(run["job"])
 
     def skip(self, db, job, trigger, due_at, now, reason="The previous run was still going"):

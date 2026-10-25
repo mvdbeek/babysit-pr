@@ -1514,6 +1514,7 @@ def _host_cron_checkout(clone, repo, branch, base, directory, agent, account, ba
     launcher = os.path.join(root, "scripts", "babysit-bwrap")
     return {
         "path": path,
+        "clone": clone,
         "common": common,
         "home": home,
         "claude_home": claude_home,
@@ -1910,9 +1911,9 @@ def validate_turn(value):
 
 def validate_cron_checkout(value):
     """Check a worker's cron checkout: absolute paths for the launch line, nothing else."""
-    fields = {"path", "common", "home", "claude_home", "codex_home", "launcher"}
+    fields = {"path", "clone", "common", "home", "claude_home", "codex_home", "launcher"}
     _expect(isinstance(value, dict) and set(value) == fields, "fields")
-    for key in ("path", "common", "home", "codex_home"):
+    for key in ("path", "clone", "common", "home", "codex_home"):
         _expect(_absolute(value[key]) and "\n" not in value[key], key)
     for key in ("claude_home", "launcher"):
         _expect(value[key] is None or (_absolute(value[key]) and "\n" not in value[key]), key)
