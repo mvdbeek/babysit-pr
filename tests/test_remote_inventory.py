@@ -480,8 +480,8 @@ def test_call_bounds_and_checks_the_worker_answer(
         remote_probe.call(tmp_path, machines.resolve(tmp_path, "mini"), "inventory", 5, src="~/s")
     assert len(str(error.value)) < remote_probe.MAX_STDERR + 200
     [(argv, kwargs)] = sent
-    assert argv[:4] == ["python3", "-I", "-", remote_probe.PROTOCOL]
-    assert json.loads(base64.b64decode(argv[4])) == {
+    assert argv[:5] == ["python3", "-I", "-S", "-", remote_probe.PROTOCOL]
+    assert json.loads(base64.b64decode(argv[5])) == {
         "op": "inventory",
         "args": {"src": "~/s"},
         "deadline": 5,
@@ -776,11 +776,11 @@ def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
     request = {
         "op": "inventory",
         "args": {"src": str(tmp_path / "src"), "roots": [], "repo_roots": [], "opened": []},
-        "deadline": 1,
+        "deadline": 3,
     }
     started = time.monotonic()
     result = subprocess.run(
-        [sys.executable, "-I", "-", remote_probe.PROTOCOL, encoded(request)],
+        [sys.executable, "-I", "-S", "-", remote_probe.PROTOCOL, encoded(request)],
         input=Path(remote_probe.__file__).read_bytes(),
         capture_output=True,
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
@@ -798,3 +798,148 @@ def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
                 break
             assert time.monotonic() < deadline, "the probe's Git survived its deadline"
             time.sleep(0.05)
+
+
+def test_a_git_timeout_at_the_deadline_is_reported_as_expiry(tmp_path, monkeypatch):
+    """subprocess's own timeout can fire before the alarm does; it is the same expiry."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "git").write_text("#!/bin/sh\nexec sleep 60\n")
+    (bin_dir / "git").chmod(0o700)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setattr(remote_probe, "DEADLINE", time.monotonic() + 0.3)
+    started = time.monotonic()
+    with pytest.raises(remote_probe.Expired):
+        remote_probe.host_git(tmp_path, "status")
+    assert time.monotonic() - started < 5
+
+
+def fifo_reflog(clone):
+    log = clone / ".git" / "logs" / "HEAD"
+    log.unlink()
+    os.mkfifo(log)
+
+
+def test_a_fifo_reflog_never_holds_a_scan(tmp_path):
+    clone = tmp_path / "src" / "repo"
+    make_clone(clone, [])
+    fifo_reflog(clone)
+    done = []
+    thread = threading.Thread(target=lambda: done.append(remote_probe.checkout_times(clone)))
+    thread.daemon = True
+    thread.start()
+    thread.join(5)
+    assert done and done[0]["updated_at"]
+    # A worker's probe answers within its deadline, not when the FIFO is written.
+    request = {
+        "op": "inventory",
+        "args": {
+            "src": str(tmp_path / "src"),
+            "roots": [],
+            "repo_roots": [],
+            "opened": [str(clone)],
+        },
+        "deadline": 20,
+    }
+    started = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", remote_probe.PROTOCOL, encoded(request)],
+        input=Path(remote_probe.__file__).read_bytes(),
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert time.monotonic() - started < 15
+    assert json.loads(result.stdout)["result"]["states"][str(clone.resolve())]["error"] is None
+
+
+def test_a_reflog_without_newlines_is_read_only_in_part(tmp_path):
+    import tracemalloc
+
+    clone = tmp_path / "repo"
+    make_clone(clone, [])
+    (clone / ".git" / "logs" / "HEAD").write_bytes(b"x" * (32 * 1024 * 1024))
+    tracemalloc.start()
+    try:
+        times = remote_probe.checkout_times(clone)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert times["updated_at"] and peak < 4 * 1024 * 1024
+
+
+def test_a_stuck_thread_never_keeps_the_probe_alive(tmp_path):
+    wrapper = (
+        "import runpy, sys, threading, time\n"
+        "threading.Thread(target=time.sleep, args=(600,)).start()\n"
+        "sys.argv = ['-', *sys.argv[1:]]\n"
+        f"runpy.run_path({remote_probe.__file__!r}, run_name='__main__')\n"
+    )
+    started = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", wrapper, "babysit-probe-0", "e30="],
+        capture_output=True,
+        timeout=30,
+    )
+    assert time.monotonic() - started < 15
+    assert "protocol mismatch" in json.loads(result.stdout)["error"]
+
+
+def test_the_workers_python_never_runs_site_packages_hooks(fleet, tmp_path):
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    marker = tmp_path / "site-ran"
+    [site] = venv.glob("lib/python*/site-packages")
+    (site / "planted.pth").write_text(f"import os; open({str(marker)!r}, 'w').close()\n")
+    register(fleet["home"], {**MINI, "python": str(venv / "bin" / "python")})
+    machine = machines.resolve(fleet["home"], "mini")
+    found = remote_probe.call(
+        fleet["home"], machine, "inventory", 30, src="~/src", roots=[], repo_roots=[], opened=[]
+    )
+    assert found["clones"] and not marker.exists()
+
+
+def test_this_machines_rows_are_published_before_a_slow_worker_answers(fleet, monkeypatch):
+    register(fleet["home"], MINI)
+    release = threading.Event()
+
+    def slow(self, machine, deadline=None):
+        release.wait(10)
+        raise ValueError("worker gone")
+
+    monkeypatch.setattr(wso.WorkspaceOverview, "scan_machine", slow)
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    plugin.loading = True
+    thread = threading.Thread(target=plugin._refresh, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 8
+        while not plugin.value.get("synced_at") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert str(fleet["local"] / "local-work") in by_key(plugin.value)
+        assert plugin.loading
+    finally:
+        release.set()
+        thread.join(10)
+    assert plugin.value["machines"]["mini"]["status"] == "unreachable"
+    assert not plugin.loading
+
+
+def test_a_failing_worker_backs_off_longer_each_time(fleet, monkeypatch):
+    register(fleet["home"], MINI)
+    monkeypatch.setenv("FAKE_SSH_DOWN", "mini.test")
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    waits = []
+    for _ in range(3):
+        plugin.retry["mini"] = 0  # Due again, as once its back-off has passed.
+        before = time.time()
+        plugin.value = plugin.collect()
+        waits.append(plugin.retry["mini"] - before)
+    assert wso.INTERVAL < waits[0] < waits[1] < waits[2]
+    monkeypatch.delenv("FAKE_SSH_DOWN")
+    plugin.retry["mini"] = 0
+    plugin.value = plugin.collect()
+    assert "mini" not in plugin.retry and plugin.value["machines"]["mini"]["status"] == "ok"
+    monkeypatch.setenv("FAKE_SSH_DOWN", "mini.test")
+    plugin.value = plugin.collect()
+    assert plugin.retry["mini"] - time.time() == pytest.approx(waits[0], abs=5)
