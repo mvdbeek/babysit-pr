@@ -35,6 +35,7 @@ def short_tmp(tmp_path, monkeypatch):
     Requesting tmp_path first keeps pytest's own base directory where it was."""
     path = tempfile.mkdtemp(prefix="bs", dir="/tmp")
     monkeypatch.setattr(tempfile, "tempdir", path)
+    machines.control_dir.cache_clear()
     yield Path(path)
     shutil.rmtree(path)
 
@@ -99,6 +100,7 @@ def test_valid_registry_with_defaults_and_repos(tmp_path):
         ({"max_agents": True}, "Invalid max_agents"),
         ({"labels": ["Docker"]}, "Invalid labels"),
         ({"label": ""}, "Invalid label"),
+        ({"label": "-Mac"}, "Invalid label"),
         ({"label": "Mac\nmini"}, "Invalid label"),
         ({"collie_url": "javascript:alert(1)"}, "Invalid collie_url"),
         ({"enabled": "yes"}, "Invalid enabled"),
@@ -172,8 +174,7 @@ def test_herdr_argv_local_is_unchanged_and_remote_uses_label(tmp_path):
     assert machines.herdr_argv(None, "workspace", "list") == ["herdr", "workspace", "list"]
     assert machines.herdr_argv(mini, "workspace", "list") == [
         "herdr",
-        "--machine",
-        "Mac mini",
+        "--machine=Mac mini",
         "workspace",
         "list",
     ]
@@ -201,11 +202,17 @@ def test_remote_argv_quotes_hostile_arguments_and_paths(tmp_path, short_tmp):
         f"ControlPath={home}/ssh/%C",
         "mini.tail1234.ts.net",
         "--",
-        "cd -- '/w/it'\"'\"'s $(id)' && git log --format=%H 'a b; rm -rf /'",
+        "sh -c 'cd -- '\"'\"'/w/it'\"'\"'\"'\"'\"'\"'\"'\"'s $(id)'\"'\"' && "
+        "git log --format=%H '\"'\"'a b; rm -rf /'\"'\"''",
     ]
     assert machines.remote_argv(home, mini, ["ls"], cwd="~/src/my repo")[-1] == (
-        "cd -- \"$HOME\"/'src/my repo' && ls"
+        "sh -c 'cd -- \"$HOME\"/'\"'\"'src/my repo'\"'\"' && ls'"
     )
+    assert machines.remote_argv(home, mini, [machines.remote_path("~/b in/x"), "~/y"])[-1] == (
+        "sh -c '\"$HOME\"/'\"'\"'b in/x'\"'\"' '\"'\"'~/y'\"'\"''"
+    )
+    with pytest.raises(ValueError, match="Remote path"):
+        machines.remote_path("rel/x")
     with pytest.raises(ValueError, match="absolute"):
         machines.remote_argv(home, mini, ["ls"], cwd="src")
 
@@ -225,6 +232,8 @@ def test_control_path_directory_is_private_and_falls_back_when_too_long(tmp_path
     assert machines.control_dir(tmp_path / ("e" * 60)) != fallback
 
     fallback.chmod(0o755)
+    assert machines.control_dir(deep) == fallback  # checked once per process
+    machines.control_dir.cache_clear()
     with pytest.raises(ValueError, match="private directory"):
         machines.control_dir(deep)
 
@@ -265,11 +274,30 @@ def test_run_remote_executes_in_fake_host_home(tmp_path, fake_tools, short_tmp):
     recorded = json.loads(fake_tools.read_text())["ssh"]
     assert recorded[-1] == {
         "target": "mini.tail1234.ts.net",
-        "command": "cd -- \"$HOME\"/'src/it'\"'\"'s $(touch pwned)' && pwd",
+        "command": "sh -c 'cd -- \"$HOME\"/'\"'\"'src/it'\"'\"'\"'\"'\"'\"'\"'\"'s $(touch pwned)'\"'\"' && pwd'",
     }
 
     with pytest.raises(ValueError, match="worker's environment"):
         machines.run(home, mini, ["env"], timeout=10, env={"GH_TOKEN": "secret"})
+
+
+def test_run_expands_remote_paths_on_the_host_or_locally(
+    tmp_path, fake_tools, short_tmp, monkeypatch
+):
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    script = "#!/bin/sh\necho ran-$1\n"
+    local_home = tmp_path / "me"
+    host = tmp_path / "hosts" / "mini.tail1234.ts.net"
+    for base in (local_home, host):
+        (base / "my bin").mkdir(parents=True)
+        tool = base / "my bin" / "x"
+        tool.write_text(script)
+        tool.chmod(0o755)
+    monkeypatch.setenv("HOME", str(local_home))
+    tool = machines.remote_path("~/my bin/x")
+    assert machines.run(home, mini, [tool, "r"], timeout=10).stdout == b"ran-r\n"
+    assert machines.run(home, None, [tool, "l"], timeout=10).stdout == b"ran-l\n"
 
 
 def test_run_remote_unreachable_surfaces_ssh_failure(fake_tools, short_tmp, monkeypatch):
@@ -298,10 +326,10 @@ def test_fake_herdr_keeps_separate_state_per_machine(tmp_path, fake_tools):
         ["worktree", "open", "--cwd", "/repo", "--path", "/repo/wt"]
     ]
     assert state["calls"][0] == ["worktree", "open", "--cwd", "/repo", "--path", "/repo/wt"]
-    assert state["calls"][1][:3] == ["--machine", "Mac mini", "worktree"]
+    assert state["calls"][1][:2] == ["--machine=Mac mini", "worktree"]
 
 
-def test_remote_channels_are_limited_per_machine(tmp_path, short_tmp, monkeypatch):
+def test_remote_channels_are_limited_per_ssh_target(tmp_path, short_tmp, monkeypatch):
     home = write(short_tmp / "home", MINI, {**MINI, "id": "box", "label": "Box", "ssh": "box"})
     loaded = machines.load(home)
     monkeypatch.setattr(machines, "_channels", {})
@@ -338,6 +366,26 @@ def test_remote_channels_are_limited_per_machine(tmp_path, short_tmp, monkeypatc
     for thread in threads:
         thread.join(5)
     assert peak == {"mini.tail1234.ts.net": machines.CHANNELS, "box": 1}
+
+
+def test_remote_channel_wait_respects_timeout(short_tmp, monkeypatch):
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    monkeypatch.setattr(machines, "_channels", {})
+    semaphore = machines._channel(mini)
+    for _ in range(machines.CHANNELS):
+        semaphore.acquire()
+    monkeypatch.setattr(owned_process, "run", lambda *a, **k: pytest.fail("ran without a channel"))
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        machines.run(home, mini, ["true"], timeout=0.2)
+    assert time.monotonic() - started < 5
+
+    semaphore.release()
+    seen = []
+    monkeypatch.setattr(owned_process, "run", lambda args, **kw: seen.append(kw["timeout"]) or "ok")
+    assert machines.run(home, mini, ["true"], timeout=30) == "ok"
+    assert 0 < seen[0] <= 30
 
 
 @pytest.mark.parametrize(

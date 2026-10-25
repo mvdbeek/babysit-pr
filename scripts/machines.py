@@ -3,17 +3,21 @@
 ``<home>/machines.json`` lists the machines other than this one. No registry, or a
 ``None`` machine, means local: every helper then behaves exactly as the direct call
 it replaces. Remote paths (``src``, ``cwd``) are strings for the remote shell and are
-never resolved or expanded on this machine.
+never resolved or expanded on this machine. Pass ones that may start with ``~``
+(``python``, ``src``, ``babysit_root``) as argv elements through ``remote_path``.
 """
 
+import functools
 import hashlib
 import json
 import os
 import re
 import shlex
 import stat
+import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -62,6 +66,12 @@ class Machine(NamedTuple):
     enabled: bool
 
 
+class RemotePath(str):
+    """A path for the remote machine: ``~`` expands to the remote home, not this one."""
+
+
+# Keyed by ssh target (ControlPath multiplexes per target, not per machine id). The
+# limit is per process; several supervisor processes each get their own.
 _channels: dict[str, threading.BoundedSemaphore] = {}
 _channels_lock = threading.Lock()
 
@@ -73,6 +83,13 @@ def _remote_path(value):
         and not any(c in value for c in "\0\n\r")
         and len(value) <= 1024
     )
+
+
+def remote_path(path) -> RemotePath:
+    """Mark ``path`` (absolute or ``~``-relative) as a remote path for ``remote_argv``/``run``."""
+    if not _remote_path(path):
+        raise ValueError("Remote path must be absolute or start with ~")
+    return RemotePath(path)
 
 
 def _machine(raw):
@@ -102,7 +119,8 @@ def _machine(raw):
         (
             isinstance(machine.label, str)
             and 0 < len(machine.label) <= 64
-            and machine.label.isprintable(),
+            and machine.label.isprintable()
+            and not machine.label.startswith("-"),
             "label",
         ),
         (isinstance(machine.ssh, str) and SSH_TARGET.fullmatch(machine.ssh), "ssh"),
@@ -218,7 +236,8 @@ def resolve(home, machine_id: str | None, *, placing=False) -> Machine | None:
 
 def herdr_argv(m: Machine | None, *args) -> list[str]:
     # herdr addresses saved machines by their label, not our id.
-    return ["herdr", *args] if m is None else ["herdr", "--machine", m.label, *args]
+    # The = form (labels never start with -) keeps the label from reading as an option.
+    return ["herdr", *args] if m is None else ["herdr", f"--machine={m.label}", *args]
 
 
 def _private_dir(path: Path) -> Path:
@@ -236,9 +255,8 @@ def _private_dir(path: Path) -> Path:
     return path
 
 
-def control_dir(home) -> Path:
-    """Directory for ssh master sockets, short enough for macOS's socket path limit."""
-    home = Path(home)
+@functools.cache
+def _control_dir(home: Path) -> Path:
     candidates = [home / "ssh"]
     # Deep homes fall back to the temporary directory; macOS's $TMPDIR is itself
     # long, so /tmp is the last resort. The digest keeps separate homes apart.
@@ -247,9 +265,20 @@ def control_dir(home) -> Path:
     for path in candidates:
         if len(os.fsencode(path)) <= SOCKET_LIMIT:
             if path == home / "ssh":
-                home.mkdir(parents=True, exist_ok=True)
+                home.mkdir(mode=0o700, parents=True, exist_ok=True)
             return _private_dir(path)
     raise ValueError("No ssh control socket directory fits the socket path limit")
+
+
+def control_dir(home) -> Path:
+    """Directory for ssh master sockets, short enough for macOS's socket path limit.
+
+    Checked once per home and process; ``control_dir.cache_clear()`` forces a recheck.
+    """
+    return _control_dir(Path(home))
+
+
+control_dir.cache_clear = _control_dir.cache_clear  # type: ignore[attr-defined]
 
 
 def ssh_options(home) -> list[str]:
@@ -274,18 +303,21 @@ def _quote_path(path):
 
 
 def remote_argv(home, m: Machine, argv, *, cwd=None) -> list[str]:
-    """ssh argv running ``argv`` on ``m``; the remote shell sees one quoted command."""
-    command = shlex.join(argv)
+    """ssh argv running ``argv`` on ``m`` under ``sh -c``; ``RemotePath`` elements expand ``~`` remotely."""
+    command = " ".join(
+        _quote_path(x) if isinstance(x, RemotePath) else shlex.quote(x) for x in argv
+    )
     if cwd is not None:
         if not _remote_path(cwd):
             raise ValueError("Remote working directory must be absolute or start with ~")
         command = f"cd -- {_quote_path(cwd)} && {command}"
-    return ["ssh", *ssh_options(home), m.ssh, "--", command]
+    # sh -c: the login shell (fish, tcsh) only ever sees one quoted word, never our quoting.
+    return ["ssh", *ssh_options(home), m.ssh, "--", f"sh -c {shlex.quote(command)}"]
 
 
 def _channel(m: Machine):
     with _channels_lock:
-        return _channels.setdefault(m.id, threading.BoundedSemaphore(CHANNELS))
+        return _channels.setdefault(m.ssh, threading.BoundedSemaphore(CHANNELS))
 
 
 def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=None):
@@ -293,13 +325,28 @@ def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=Non
 
     Remote commands get the worker's own environment: ``env`` is refused rather than
     forwarding controller credentials. ssh exits 255 when the machine is unreachable.
+
+    ``timeout`` covers waiting for an ssh channel plus the ssh client; exceeding it
+    raises ``subprocess.TimeoutExpired``. Contract for remote callers: a timeout kills
+    only the local ssh client. The remote process may keep running (there is no remote
+    ``timeout`` dependency), so long-running remote work must carry its own lifeline.
     """
     if m is None:
+        argv = [os.path.expanduser(x) if isinstance(x, RemotePath) else x for x in argv]
         return owned_process.run(argv, timeout=timeout, input=input, env=env, cwd=cwd)
     if env is not None:
         raise ValueError("Remote commands run with the worker's environment")
-    with _channel(m):
-        return owned_process.run(remote_argv(home, m, argv, cwd=cwd), timeout=timeout, input=input)
+    started = time.monotonic()
+    channel = _channel(m)
+    if not channel.acquire(timeout=-1 if timeout is None else timeout):
+        raise subprocess.TimeoutExpired(argv, timeout)
+    try:
+        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
+        return owned_process.run(
+            remote_argv(home, m, argv, cwd=cwd), timeout=remaining, input=input
+        )
+    finally:
+        channel.release()
 
 
 def qualify(machine_id: str | None, wid: str) -> str:

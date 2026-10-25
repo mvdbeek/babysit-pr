@@ -340,7 +340,7 @@ missing one means local only.
 ```
 
 `id` (lowercase, at most 24 characters, not `local`) is the stable key; `label`
-is the herdr machine label passed to `herdr --machine`. `id`, `label`, `ssh` and
+is the herdr machine label passed as `herdr --machine=<label>` (labels cannot start with `-`). `id`, `label`, `ssh` and
 `os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
 `max_agents` is 1–64, `collie_url` is optional, and unknown keys are rejected.
 Disabled machines stay valid for records already pinned to them.
@@ -348,4 +348,7 @@ Disabled machines stay valid for records already pinned to them.
 Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, and a shared
 master connection whose socket lives in `--home/ssh/` (or a short temporary
 directory when that path is too long), with at most four concurrent commands
-per machine. They run with the worker's own environment and credentials.
+per ssh target in one process. They run with the worker's own environment and
+credentials, under `sh -c`, so the worker's login shell need not be POSIX.
+A timeout kills only the local ssh client; the remote process may keep running,
+so long-running remote work needs its own lifeline.

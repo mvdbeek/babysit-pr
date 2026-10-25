@@ -33,10 +33,10 @@ HERDR = """import json,os,sys,subprocess
 from pathlib import Path
 p=Path(os.environ['FAKE_HERDR']); store=json.loads(p.read_text()); a=sys.argv[1:]
 store['calls'].append(a); data=store
-if a[:1] == ['--machine']:
+if a[:1] and a[0].startswith('--machine='):
  # Each saved machine keeps its own workspaces and agents, so two hosts can both hand out w1.
- data=store.setdefault('machines',{}).setdefault(a[1],{'workspaces':[],'agents':[],'calls':[]})
- a=a[2:]; data['calls'].append(a)
+ data=store.setdefault('machines',{}).setdefault(a[0].split('=',1)[1],{'workspaces':[],'agents':[],'calls':[]})
+ a=a[1:]; data['calls'].append(a)
 result={}
 if a[:2] == ['status','server']: result={'running':os.environ.get('FAKE_HERDR_RUNNING','true')=='true'}
 elif a[:2] == ['workspace','list']: result={'workspaces':data['workspaces']}
@@ -145,7 +145,7 @@ p.write_text(json.dumps(data))
 SSH = """import json,os,subprocess,sys
 from pathlib import Path
 p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text()); a=sys.argv[1:]
-while a[0].startswith('-') and a[0] != '--':
+while a and a[0].startswith('-') and a[0] != '--':
  a=a[2:] if a[0] in ('-o','-p','-l','-i','-F','-S','-J') else a[1:]
 target=a[0]; a=a[2:] if a[1:2] == ['--'] else a[1:]
 command=' '.join(a)
