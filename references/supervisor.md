@@ -780,10 +780,18 @@ when the machine has the `gpg` label, and `--exit-watch-json` for **Quit the age
 it is done**: it prints the exit watch instead of recording it, and the dashboard
 records it with the machine. Clone locks hash the machine with the clone. The checkout
 and agent are verified through probe ops and `herdr --machine`. Exit watches on workers
-are looked at there every minute but never exited: the watch says when the agent
-finished, or left without confirming, and leaves it open. It also stops after a week,
-once the worker leaves the registry, or after 30 failed looks in a row. Their records
-name the workspace qualified (`<id>/w1`), so no dashboard takes it for one of its own.
+(these, scheduled launches there, and worker cron runs) are followed every minute, in
+the background, the way local ones are (`workspace_exit`), through the worker's herdr:
+the agent's own pane is pinned, worker paths are compared as strings, and the
+transcript is read there through probe ops (`sessions`, `first_turn`, `turn`,
+`fingerprint`). Its session is the one in the checkout, among the newest five of the
+agent's kind, whose first prompt carries the brief's marker; the worker's clock is
+never compared with this one's. Once it confirms and stays idle the agent is exited
+there (Codex with Ctrl-D, Claude with a typed `/exit` and Enter), and an exited `wt`
+agent's pane or workspace is closed as here. A watch stops after a week, once the
+worker leaves the registry, or after 30 looks in a row the worker did not answer.
+Their records name the workspace qualified (`<id>/w1`), so no dashboard takes it for
+one of its own.
 
 Handle on a verified checkout stays on that checkout's machine;
 choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`

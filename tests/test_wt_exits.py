@@ -78,7 +78,7 @@ def test_a_wt_launch_is_exited_and_its_workspace_closed(local, monkeypatch):  # 
     )
     seen = []
 
-    def step(record, op, persist, now=None):
+    def step(record, op, persist, now=None, *_):
         # What wt recorded is enough to find the agent's pane and process.
         record["target"] = workspace_exit.capture(op)
         seen.append(op)
@@ -112,7 +112,7 @@ def test_a_watch_waits_for_its_agent_to_show_up(local, monkeypatch):  # noqa: F8
     watch = register(manager, path, created_at=1000)
     statuses = []
 
-    def step(record, op, persist, now=None):
+    def step(record, op, persist, now=None, *_):
         statuses.append(op["status"])
         return record
 
@@ -178,12 +178,12 @@ def test_nothing_is_closed_unless_the_exit_is_confirmed(local, monkeypatch):  # 
     unconfirmed = register(manager, manager.src / "repo")
     failing = register(manager, manager.src / "repo")
 
-    def by_watch(record, op, persist, now=None):
+    def by_watch(record, op, persist, now=None, *_):
         if op["exit_marker"] == unconfirmed["marker"]:
             return {**record, "state": "unconfirmed", "message": "Exit unconfirmed"}
         return {**record, "state": "exited", "message": "Exited", "target": {"pane_id": "w1:p1"}}
 
-    def broken(watch, record):
+    def broken(watch, record, machine=None):
         raise TypeError("odd herdr reply")
 
     monkeypatch.setattr(pw.workspace_exit, "step", by_watch)
@@ -229,7 +229,7 @@ def test_a_claim_fails_when_another_dashboard_changed_the_watch(local, monkeypat
     watch = register(manager, manager.src / "repo")
     claims = []
 
-    def step(record, op, persist, now=None):
+    def step(record, op, persist, now=None, *_):
         row = watch_row(manager, watch["id"])
         row["exit"]["message"] = "Other dashboard"
         with manager.db() as db:
@@ -251,7 +251,7 @@ def test_a_restart_never_repeats_an_exit_it_may_have_begun(local, monkeypatch): 
     manager, _, _, state, jobs = local
     watch = register(manager, manager.src / "repo")
 
-    def step(record, op, persist, now=None):
+    def step(record, op, persist, now=None, *_):
         persist({**record, "state": "exiting"})
         raise SystemExit  # The dashboard stops once "exiting" is durable.
 
@@ -301,7 +301,7 @@ def test_a_message_s_watch_follows_its_running_agent_at_once(local, monkeypatch)
     plain = register(manager, path, created_at=1000)
     seen = {}
 
-    def step(record, op, persist, now=None):
+    def step(record, op, persist, now=None, *_):
         seen[op["created_at"], op.get("follow_up")] = op
         return record
 

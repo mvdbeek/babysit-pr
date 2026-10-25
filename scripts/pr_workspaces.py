@@ -121,8 +121,6 @@ PROMPT_KEEP = 86400
 PREPARE_TIMEOUT = 60
 # Seconds between looks at a worker agent's exit watch: each costs the worker ssh calls.
 REMOTE_WATCH = 60
-# Failed looks in a row after which a worker agent's exit watch is left.
-REMOTE_FAILURES = 30
 # What a worker's wt hands back about the exit watch of the agent it typed.
 WATCH_ID = re.compile(r"[0-9a-f]{32}")
 WATCH_MARKER = re.compile(r"\[babysit-done:[0-9a-f]{16}\]")
@@ -400,37 +398,47 @@ def verified_head(pr, item):
     return contained
 
 
-def agent_in(workspace_id, path, agent):
+def agent_in(workspace_id, path, agent, machine=None):
     """Whether herdr shows this kind of agent in the workspace, working in the checkout."""
-    path = Path(path).resolve()
+    if machine is None:
+        path = Path(path).resolve()
     return any(
         a.get("workspace_id") == workspace_id
         and a.get("agent") == agent
-        and Path(a.get("cwd") or "/missing").resolve() == path
-        for a in herdr("agent", "list")["agents"]
+        and (
+            Path(a.get("cwd") or "/missing").resolve() == path
+            if machine is None
+            # A worker's paths are compared as they are, never resolved here.
+            else a.get("cwd") == path
+        )
+        for a in herdr("agent", "list", machine=machine)["agents"]
     )
 
 
-def launched_operation(watch, now):
+def launched_operation(watch, now, machine=None):
     """What ``workspace_exit`` reads about a ``wt --exit-when-done`` launch.
 
     wt returns once it has typed the agent command, so the launch counts as finished
     when the agent shows up in its workspace, or after a while without it, when the
     watch then leaves it. A message's watch (``follow_up``) names an agent already
-    running: its pane, and its session when herdr knew it.
+    running: its pane, and its session when herdr knew it. A watch on ``machine``, a
+    worker, names its workspace qualified and its agent's pane, which is followed.
     """
     follow_up = watch.get("follow_up", False)
+    workspace = watch["workspace_id"]
+    if machine is not None:
+        workspace = machines.split(workspace)[1]
     started = (
         follow_up
         or "target" in watch["exit"]
         or now - watch["created_at"] > LAUNCH_START_SECONDS
-        or agent_in(watch["workspace_id"], watch["path"], watch["agent"])
+        or agent_in(workspace, watch["path"], watch["agent"], machine)
     )
     return {
         "status": "complete" if started else "running",
         "exit_marker": watch["marker"],
         "path": watch["path"],
-        "result": {"workspace_id": watch["workspace_id"]},
+        "result": {"workspace_id": workspace},
         "agent": watch["agent"],
         "claude_account": watch.get("claude_account"),
         "created_at": watch["created_at"],
@@ -438,12 +446,27 @@ def launched_operation(watch, now):
         **(
             {"follow_up": True, "pane_id": watch["pane_id"], "session_id": watch.get("session_id")}
             if follow_up
+            else {"pane_id": watch["pane_id"]}
+            if machine is not None
             else {}
         ),
     }
 
 
-def close_launched(watch, record):
+def worker_operation(op):
+    """A worker launch's ``op`` as ``workspace_exit`` follows it: its workspace as that
+    worker's herdr names it, and its agent's own pane."""
+    if op.get("status") != "complete":
+        return op
+    result = op["result"]
+    return {
+        **op,
+        "result": {**result, "workspace_id": machines.split(result["workspace_id"])[1]},
+        "pane_id": result.get("pane_id"),
+    }
+
+
+def close_launched(watch, record, machine=None):
     """Close what an exited ``wt`` agent leaves: its workspace when the agent's pane was
     all it held, else the pane alone; only once nothing but the shell runs there.
 
@@ -455,17 +478,20 @@ def close_launched(watch, record):
     if pane != watch["pane_id"]:
         return "; its pane is still open"
     try:
-        procs = herdr("pane", "process-info", "--pane", pane)["process_info"]
+        workspace = watch["workspace_id"]
+        if machine is not None:
+            workspace = machines.split(workspace)[1]
+        procs = herdr("pane", "process-info", "--pane", pane, machine=machine)["process_info"]
         # The same shell the agent ran in, so a pane id reused since then is left alone.
         if procs.get("shell_pid") != target.get("shell_pid") or any(
             p.get("pid") != procs["shell_pid"] for p in procs.get("foreground_processes") or []
         ):
             return "; its pane is still open"
-        panes = herdr("pane", "list", "--workspace", watch["workspace_id"])["panes"]
+        panes = herdr("pane", "list", "--workspace", workspace, machine=machine)["panes"]
         if [p.get("pane_id") for p in panes] == [pane]:
-            herdr("workspace", "close", watch["workspace_id"])
+            herdr("workspace", "close", workspace, machine=machine)
             return "; its workspace was closed"
-        herdr("pane", "close", pane)
+        herdr("pane", "close", pane, machine=machine)
         return "; its pane was closed"
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         return "; its pane is still open"
@@ -2066,8 +2092,11 @@ class Workspaces:
     def exit_one(self, task, now=None):
         self.follow_exit("scheduled", task, self.operation_record(task.get("operation_id")), now)
 
-    def follow_exit(self, table, row, op, now=None, exited=None):
-        """Advance the exit watch kept in ``row["exit"]``; ``exited`` tidies up after an exit."""
+    def follow_exit(self, table, row, op, now=None, exited=None, machine=None):
+        """Advance the exit watch kept in ``row["exit"]``; ``exited`` tidies up after an exit.
+
+        ``machine``, a worker, runs the agent; each look there is recorded as checked.
+        """
         saved = [json.dumps(row["exit"], sort_keys=True)]
 
         def persist(record):
@@ -2086,7 +2115,9 @@ class Workspaces:
                 )
             saved[0] = json.dumps(record, sort_keys=True)
 
-        record = workspace_exit.step(row["exit"], op, persist, now)
+        record = workspace_exit.step(row["exit"], op, persist, now, machine, self.home)
+        if machine is not None:
+            record["checked_at"] = time.time() if now is None else now
         if exited and record["state"] == "exited":
             exited(record)
         if json.dumps(record, sort_keys=True) != saved[0]:
@@ -2111,57 +2142,18 @@ class Workspaces:
                 continue  # One watch must not stop the others; the next pass retries it.
 
     def remote_exit(self, table, row, op=None, now=None):
-        """Look at a worker agent's exit watch in the background, every REMOTE_WATCH.
+        """Follow a worker agent's exit watch in the background, every REMOTE_WATCH.
 
-        ``row`` is a ``wt`` exit watch, or a scheduled task with its launch ``op``.
-        Exiting agents on workers comes with exit-watch forwarding; until then the watch
-        only says when the agent finished, or left without confirming, and leaves it open.
-        A watch also ends after a week, once its worker leaves the registry, or after
-        REMOTE_FAILURES failed looks in a row.
+        ``row`` is a ``wt`` exit watch, or a scheduled task with its launch ``op``. The
+        agent is followed and exited through the worker's herdr and probe as one here is
+        (``workspace_exit``); a watch also ends once its worker leaves the registry.
         """
         now = time.time() if now is None else now
-        if now - row["exit"].get("since", now) > workspace_exit.WATCH_LIMIT:
-            self.swap_exit(
-                table,
-                row,
-                {
-                    **row["exit"],
-                    "state": "left_open",
-                    "message": "Still not finished after a week; stopped watching",
-                },
-            )
-            return
         if now - row["exit"].get("checked_at", 0) < REMOTE_WATCH:
             return
-        if op is None:
-            machine_id = row["machine"]
-            launched = {
-                "pane": row["pane_id"],
-                "path": row["path"],
-                "exit_marker": row["marker"],
-                "agent": row["agent"],
-            }
-        else:
-            machine_id = op["machine"]
-            if op.get("status") in {"queued", "running"}:
-                return
-            if op.get("status") != "complete":
-                self.swap_exit(
-                    table,
-                    row,
-                    {
-                        **row["exit"],
-                        "state": "left_open",
-                        "message": "The launch did not finish, so its agent is not watched",
-                    },
-                )
-                return
-            launched = {
-                "pane": op["result"].get("pane_id"),
-                "path": op["result"]["path"],
-                "exit_marker": op["exit_marker"],
-                "agent": op["agent"],
-            }
+        if op is not None and op.get("status") in {"queued", "running"}:
+            return
+        machine_id = row["machine"] if op is None else op["machine"]
         machine = machines.load(self.home).get(machine_id)
         if machine is None:
             self.swap_exit(
@@ -2174,37 +2166,27 @@ class Workspaces:
                 },
             )
             return
-        launched.update(machine=machine_id, machine_label=machine.label)
         key = f"{table}:{row['id']}"
         with self.lock:
             if key in self.remote_looks or self.stopping.is_set():
                 return
             self.remote_looks.add(key)
         threading.Thread(
-            target=self.remote_look, args=(table, row, launched, key), daemon=True
+            target=self.remote_look, args=(table, row, op, machine, key), daemon=True
         ).start()
 
-    def remote_look(self, table, row, launched, key):
-        import cron_agents
-
+    def remote_look(self, table, row, op, machine, key):
         try:
-            record = {**row["exit"], "checked_at": time.time()}
+            if op is not None:
+                self.follow_exit(table, row, worker_operation(op), machine=machine)
+                return
             try:
-                seen = cron_agents.remote_progress(
-                    self.home, {"agent": launched["agent"]}, launched
-                )
-                record.pop("failures", None)
-            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-                failures = record["failures"] = record.get("failures", 0) + 1
-                seen = {
-                    "state": "watching" if failures < REMOTE_FAILURES else "unreachable",
-                    "message": f"Could not look at the agent on {launched['machine_label']}: {exc}"
-                    + ("" if failures < REMOTE_FAILURES else f"; stopped after {failures} tries"),
-                }
-            record["message"] = seen["message"]
-            if seen["state"] != "watching":
-                record["state"] = "left_open"
-            self.swap_exit(table, row, record)
+                op = launched_operation(row, time.time(), machine)
+            except workspace_exit.UNREACHABLE:
+                op = {"status": "running"}  # Looked at again on the next pass.
+            self.follow_exit(table, row, op, exited=self.closer(row, machine), machine=machine)
+        except Exception:
+            pass  # The next pass looks again.
         finally:
             with self.lock:
                 self.remote_looks.discard(key)
@@ -2223,15 +2205,22 @@ class Workspaces:
 
     def exit_launch(self, watch, now=None):
         now = time.time() if now is None else now
+        self.follow_exit(
+            "exit_watches", watch, launched_operation(watch, now), now, self.closer(watch)
+        )
+
+    @staticmethod
+    def closer(watch, machine=None):
+        """What tidies up once ``watch``'s agent exited."""
 
         def exited(record):
             try:
-                record["message"] += close_launched(watch, record)
+                record["message"] += close_launched(watch, record, machine)
             except Exception as exc:
                 # The agent is gone either way; the watch must still record that.
                 record["message"] += f"; its pane is still open ({exc})"
 
-        self.follow_exit("exit_watches", watch, launched_operation(watch, now), now, exited)
+        return exited
 
     def launched_exits(self):
         """``wt --exit-when-done`` watches, newest first, as the Scheduled tab lists them."""

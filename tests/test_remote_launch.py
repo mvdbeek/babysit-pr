@@ -140,36 +140,96 @@ def test_a_review_on_a_worker_starts_there(remote):
     assert manager.scheduled_tasks()["launched"][0]["url"] == "https://collie.mini.test/space/w1"
 
 
-def test_a_workers_exit_watch_is_looked_at_there_and_never_exited(remote):
+EMPTY = "› \x1b[2mAsk Codex to do anything\x1b[0m"
+
+
+def idle_agent(state, path, screen=None):
+    """The worker's agent at rest in its pane, with its shell and process there."""
+    data = store(state)
+    mini = data["machines"]["Mac mini"]
+    [agent] = mini["agents"]
+    agent["agent_status"] = "idle"
+    foreground = [{"pid": 4242, "argv0": "codex", "argv": agent["argv"], "cwd": str(path)}]
+    mini.setdefault("process_info", {})[agent["pane_id"]] = {
+        "shell_pid": 100,
+        "foreground_processes": [{"pid": 100}, *foreground],
+    }
+    if screen is not None:
+        mini.setdefault("screens", {})[agent["pane_id"]] = [screen]
+    Path(state).write_text(json.dumps(data))
+    return agent
+
+
+def finished(worker, path, marker, answer="Looks good."):
+    """A Codex session of the worker's checkout that took the brief and confirmed it."""
+    sid = str(uuid.uuid4())
+    events = [
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": f"Do it\n{marker}"}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "t1",
+                "last_agent_message": f"{answer}\n{marker}",
+            },
+        },
+    ]
+    return rollout(worker, path, sid, *events)
+
+
+def test_a_workers_exit_watch_exits_its_agent_there_once_it_confirms(remote, monkeypatch):
     manager, pr, state, worker = remote
+    monkeypatch.setattr(workspace_exit, "SETTLE_SECONDS", 0)
     request = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
     manager.action({**request, "exit_when_done": True})
     op = finish(manager, pr["id"])
     [watch] = watches(manager.home)
+    agent = idle_agent(state, op["path"])
     before = len(store(state)["calls"])
     manager.exit_launched()
     looked(manager)
     [watch] = watches(manager.home)
     assert watch["exit"]["state"] == "watching"
-    assert watch["exit"]["message"] == "Waiting for the agent on Mac mini to finish"
-    # Every herdr call went to the worker's server: nothing here is followed or exited.
+    assert watch["exit"]["message"] == "Waiting for the agent's session transcript"
+    # Every herdr call went to the worker's server.
     assert all(c[0] == "--machine=Mac mini" for c in store(state)["calls"][before:])
-    sid = str(uuid.uuid4())
-    done = {
-        "type": "event_msg",
-        "payload": {
-            "type": "task_complete",
-            "turn_id": "t1",
-            "last_agent_message": f"Looks good.\n{watch['marker']}",
-        },
-    }
-    started = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}}
-    rollout(worker, op["path"], sid, started, done)
+    # An older session of a reused checkout is not the launch's.
+    rollout(worker, op["path"], str(uuid.uuid4()))
+    finished(worker, op["path"], watch["marker"])
+    idle_agent(state, op["path"], f"Looks good.\n{watch['marker']}\n{EMPTY}")
+    manager.exit_launched()
+    looked(manager)
+    [watch] = watches(manager.home)
+    assert watch["exit"]["message"] == "Finished; exiting once the agent stays idle"
+    manager.exit_launched()
+    looked(manager)
+    [watch] = watches(manager.home)
+    assert watch["exit"]["state"] == "exited", watch["exit"]
+    assert watch["exit"]["message"].endswith("; its pane was closed")
+    assert watch["exit"]["target"]["machine"] == "mini"
+    mini = store(state)["machines"]["Mac mini"]
+    pane = agent["pane_id"]
+    keys = [c for c in mini["calls"] if c[:2] == ["agent", "send-keys"]]
+    assert keys == [["agent", "send-keys", pane, "ctrl+d"]]
+    assert ["pane", "close", pane] in mini["calls"]
+    assert all(c[0] == "--machine=Mac mini" for c in store(state)["calls"][before:])
+
+
+def test_two_sessions_that_took_one_brief_leave_the_agent_open(remote):
+    manager, pr, state, worker = remote
+    request = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
+    manager.action({**request, "exit_when_done": True})
+    op = finish(manager, pr["id"])
+    [watch] = watches(manager.home)
+    idle_agent(state, op["path"])
+    finished(worker, op["path"], watch["marker"])
+    finished(worker, op["path"], watch["marker"])
     manager.exit_launched()
     looked(manager)
     [watch] = watches(manager.home)
     assert watch["exit"]["state"] == "left_open"
-    assert watch["exit"]["message"].startswith("Finished on Mac mini")
+    assert watch["exit"]["message"] == "Several sessions ran in this worktree; left open"
     assert store(state)["machines"]["Mac mini"]["agents"]  # Still open there.
 
 
@@ -253,15 +313,16 @@ def test_a_scheduled_review_starts_on_its_worker(remote):
     assert listed["id"] == task["id"] and listed["status"] == "started"
     [agent] = store(state)["machines"]["Mac mini"]["agents"]
     assert op["exit_marker"] in agent["task"]
-    # Its exit watch is looked at on the worker, never followed here.
+    # Its exit watch follows the agent on the worker, never here.
+    idle_agent(state, op["path"])
     before = len(store(state)["calls"])
     manager.exit_finished()
     looked(manager)
     [listed] = manager.scheduled_tasks()["tasks"]
-    assert listed["exit"] == {
-        "state": "watching",
-        "message": "Waiting for the agent on Mac mini to finish",
-    }
+    assert (listed["exit"]["state"], listed["exit"]["message"]) == (
+        "watching",
+        "Waiting for the agent's session transcript",
+    )
     assert all(c[0] == "--machine=Mac mini" for c in store(state)["calls"][before:])
 
 
@@ -471,8 +532,9 @@ def test_a_workers_exit_watch_ends_when_it_cannot_be_looked_at(remote, monkeypat
     assert "box is no longer registered" in found["exit"]["message"]
     # An unreachable worker is given a few looks, then left.
     monkeypatch.setenv("FAKE_HERDR_DOWN", "Mac mini")
-    monkeypatch.setattr(pw, "REMOTE_FAILURES", 2)
-    down = worker_watch(manager.home)
+    monkeypatch.setattr(workspace_exit, "REMOTE_FAILURES", 2)
+    started = time.time() - pw.LAUNCH_START_SECONDS - 1
+    down = worker_watch(manager.home, created_at=started)
     for state in ("watching", "left_open"):
         manager.exit_launched()
         looked(manager)

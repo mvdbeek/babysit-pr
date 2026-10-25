@@ -15,7 +15,8 @@ agent to end with a marker line once the task is finished, as scheduled launches
 ``workspace_exit`` then follows the session and exits the agent once it confirms and
 stays idle. The run keeps the agent's final response and closes its pane. An agent that
 stops to ask a question, or is still working at the job's time limit, is left open in
-Collie and the run needs attention.
+Collie and the run needs attention. A job on a worker is followed and exited the same
+way through that worker's herdr and probe.
 """
 
 import os
@@ -504,8 +505,9 @@ def stage(home, run_id, text):
 
 
 def operation(job, launched):
-    """What ``workspace_exit`` reads about a launch."""
-    return {
+    """What ``workspace_exit`` reads about a launch; on a worker, the workspace as its herdr
+    names it, and the agent's own pane."""
+    op = {
         "status": "complete",
         "exit_marker": launched["exit_marker"],
         "path": launched["path"],
@@ -515,16 +517,20 @@ def operation(job, launched):
         "created_at": launched["launched_at"],
         "updated_at": launched["launched_at"],
     }
+    if launched.get("machine"):
+        op["result"]["workspace_id"] = machines.split(launched["workspace_id"])[1]
+        op["pane_id"] = launched["pane"]
+    return op
 
 
-def final_response(record, agent, marker):
+def final_response(record, agent, marker, machine=None, home=None):
     """The agent's last answer in the session the watch followed, without the marker."""
     target = (record or {}).get("target") or {}
     if not target.get("rollout") or not target.get("session_id"):
         return None
     try:
-        _, text = handoff.latest_turn(target["rollout"], target["session_id"], agent)
-    except (OSError, RuntimeError, ValueError):
+        _, text = handoff.latest_turn(target["rollout"], target["session_id"], agent, machine, home)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return None
     if not text:
         return None
@@ -543,62 +549,6 @@ def without_marker(text, marker):
             end -= 1
         return "\n".join(lines[:end]).rstrip()[:RESULT_LIMIT]
     return text.rstrip()[:RESULT_LIMIT]
-
-
-def remote_response(home, machine, run, launched):
-    """The worker agent's answer once a session of this run confirms the task, else None.
-
-    Its transcripts are found and read there, through the probe: the newest sessions
-    recorded in the checkout.
-    """
-    listed = probe(home, machine, "sessions", 30, root=launched["path"])
-    # The run's own marker tells its session apart; the worker's clock is not compared.
-    recent = [session for session in listed if session["agent"] == run["agent"]]
-    for session in recent[:3]:
-        try:
-            turn = probe(
-                home,
-                machine,
-                "turn",
-                20,
-                file=session["file"],
-                session=session["id"],
-                agent=run["agent"],
-            )
-        except ValueError:
-            continue  # Not a turn yet, or not this run's session.
-        text = turn["complete"]
-        if text and workspace_exit.confirms(text, launched["exit_marker"]):
-            return without_marker(text, launched["exit_marker"])
-    return None
-
-
-def remote_progress(home, run, launched):
-    """Where a run on a worker stands: watching, finished (with its answer) or gone.
-
-    Exiting the agent there, as ``workspace_exit`` does here, comes with exit-watch
-    forwarding; until then a finished agent stays open on the worker.
-    """
-    machine = machines.resolve(home, launched["machine"])
-    label = launched["machine_label"]
-    present = any(
-        agent.get("pane_id") == launched["pane"]
-        for agent in herdr("agent", "list", machine=machine, timeout=15)["agents"]
-    )
-    text = remote_response(home, machine, run, launched)
-    if text is not None:
-        return {
-            "state": "finished",
-            "text": text,
-            "message": f"Finished on {label}; its agent is still open there "
-            "(exiting agents on workers is not supported yet)",
-        }
-    if not present:
-        return {
-            "state": "gone",
-            "message": f"The agent left its pane on {label} without confirming the task was done",
-        }
-    return {"state": "watching", "message": f"Waiting for the agent on {label} to finish"}
 
 
 def close_pane(pane, machine=None):
