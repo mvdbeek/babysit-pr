@@ -415,8 +415,7 @@ def environment(home, bwrap="path", **extra):
 
 
 def sandbox_cache(home, config_var="", config_dir="", granted=""):
-    enabled = f" enable={granted}" if granted else ""
-    key = hashlib.sha256(f"{config_var}={config_dir}{enabled}".encode()).hexdigest()[:16]
+    key = hashlib.sha256(f"{config_var}\0{config_dir}\0{granted}".encode()).hexdigest()[:16]
     return str(home / ".cache/babysit-sandbox" / key)
 
 
@@ -572,7 +571,7 @@ def test_wrapper_keeps_a_separate_cache_for_each_grant(checkout, docker_socket):
     env = environment(home, XDG_RUNTIME_DIR=docker_socket)
     config = f"--claude-config-dir={account}"
     caches = {
-        enable: dict(pairs(printed(worktree, env, config, *enable, "x"), "--setenv"))[
+        enable: dict(pairs(printed(worktree, env, config, *enable, "claude"), "--setenv"))[
             "XDG_CACHE_HOME"
         ]
         for enable in ((), ("--enable=playwright",), ("--enable=docker",))
@@ -653,6 +652,29 @@ def test_wrapper_creates_empty_placeholders_before_a_launch(checkout, tmp_path):
     assert (config / "skills" / "kept").read_text() == "x"
 
 
+def test_wrapper_keeps_shell_snapshots_and_the_configuration_to_each_sandbox(checkout, tmp_path):
+    worktree, _, home = checkout
+    config = home / "agent"
+    config.mkdir()
+    env = environment(home)
+    # Claude sources its snapshot before every command; a neighbour could rewrite it.
+    for option, snapshots in (
+        ("--claude-config-dir", "shell-snapshots"),
+        ("--codex-home", "shell_snapshots"),
+    ):
+        argv = printed(worktree, env, f"{option}={config}", "agent")
+        assert argv[argv.index("--tmpfs", argv.index(str(config))) + 1] == str(config / snapshots)
+    # A grant holding the configuration could move it, read-only entries and all.
+    outside = tmp_path / "accounts"
+    (outside / "a").mkdir(parents=True)
+    for grant in (outside, outside / "a", outside / "a" / "projects"):
+        grant.mkdir(exist_ok=True)
+        message = refused(
+            worktree, env, f"--claude-config-dir={outside / 'a'}", f"--add-dirs={grant}", "x"
+        )
+        assert "overlaps the agent configuration" in message, grant
+
+
 def test_wrapper_refuses_links_where_the_agent_configuration_runs_code(checkout, tmp_path):
     worktree, _, home = checkout
     config = home / "agent"
@@ -667,29 +689,22 @@ def test_wrapper_refuses_links_where_the_agent_configuration_runs_code(checkout,
     assert "hooks" in message and "neither a file nor a directory" in message
 
 
-def test_wrapper_refuses_mcp_servers_any_agent_could_add_to_a_granted_launch(
-    checkout, docker_socket
-):
+def test_wrapper_starts_a_granted_claude_without_mcp_servers(checkout, docker_socket):
     worktree, _, home = checkout
     config = home / "agent"
     config.mkdir()
+    # Any agent of the account can add MCP servers to .claude.json, which stays writable.
+    (config / ".claude.json").write_text(json.dumps({"mcpServers": {"x": {"command": "sh"}}}))
     env = environment(home, XDG_RUNTIME_DIR=docker_socket)
-    options = (f"--claude-config-dir={config}", "--enable=docker", "claude")
-    printed(worktree, env, *options)  # no .claude.json yet
-    state = {"numStartups": 3, "projects": {str(worktree): {"mcpServers": {}}}}
-    (config / ".claude.json").write_text(json.dumps(state))
-    printed(worktree, env, *options)
-    for planted in (
-        {**state, "mcpServers": {"x": {"command": "sh"}}},
-        {"projects": {"/elsewhere": {"mcpServers": {"x": {"command": "sh"}}}}},
-    ):
-        (config / ".claude.json").write_text(json.dumps(planted))
-        message = refused(worktree, env, *options)
-        assert ".claude.json" in message and "MCP servers" in message
-        # Without a grant there is nothing more for them to reach.
-        printed(worktree, env, f"--claude-config-dir={config}", "claude")
-    (config / ".claude.json").write_text("{")
-    assert ".claude.json" in refused(worktree, env, *options)
+    claude = f"--claude-config-dir={config}"
+    argv = printed(worktree, env, claude, "--enable=docker", "--", "/usr/bin/claude", "-p", "x")
+    assert argv[-4:] == ["/usr/bin/claude", "--strict-mcp-config", "-p", "x"]
+    # Without a grant there is nothing more for them to reach.
+    assert printed(worktree, env, claude, "claude", "-p")[-2:] == ["claude", "-p"]
+    message = refused(worktree, env, claude, "--enable=docker", "sh", "-c", "claude")
+    assert "run claude itself" in message
+    argv = printed(worktree, env, f"--codex-home={config}", "--enable=docker", "codex")
+    assert argv[-1] == "codex"
 
 
 @fd_bash
@@ -808,6 +823,14 @@ def test_wrapper_binds_an_agent_home_only_as_that_agent_configuration(checkout):
     argv = printed(worktree, env, f"--claude-config-dir={account}", "claude")
     assert (str(account),) * 2 in pairs(argv, "--bind")
     assert str(claude / "accounts") not in argv
+    # Hidden even before any named account exists, so the agent cannot plant a link there.
+    shutil.rmtree(claude / "accounts")
+    argv = printed(worktree, env, f"--claude-config-dir={claude}", "claude")
+    assert ("--tmpfs", str(claude / "accounts")) in zip(argv, argv[1:], strict=False)
+    (claude / "accounts").symlink_to(worktree)
+    assert "a link" in refused(worktree, env, f"--claude-config-dir={claude}", "claude")
+    (claude / "accounts").unlink()
+    account.mkdir(parents=True)
     assert (str(codex),) * 2 in pairs(
         printed(worktree, env, f"--codex-home={codex}", "codex"), "--bind"
     )
@@ -853,6 +876,20 @@ def test_wrapper_protects_its_own_checkout_and_git_directory(checkout, tmp_path)
             capture_output=True,
         )
         assert result.returncode == 0, result.stderr
+    # Installed outside a scripts/ directory, only that directory is its own.
+    (main / "bin").mkdir()
+    shutil.copy(WRAPPER, main / "bin" / "babysit-bwrap")
+    (main / "work").mkdir()
+    launcher = str(main / "bin" / "babysit-bwrap")
+    for path, allowed in ((main / "work", True), (main / "bin", False)):
+        result = subprocess.run(
+            ["bash", launcher, "--print-argv", f"--add-dirs={path}", "x"],
+            cwd=other,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        )
+        assert (result.returncode == 0) is allowed, result.stderr
 
 
 def test_wrapper_protects_missing_paths_under_linked_parents(checkout, tmp_path):
@@ -1000,10 +1037,13 @@ def test_bwrap_keeps_the_code_in_the_agent_configuration_read_only(checkout):
     (config / "projects").mkdir(parents=True)
     script = (
         f"! touch {config}/settings.json 2>/dev/null && ! mkdir {config}/skills/x 2>/dev/null "
-        f"&& ! rm -r {config}/hooks 2>/dev/null && touch {config}/projects/t {config}/.claude.json"
+        f"&& ! mv {config}/hooks {config}/h 2>/dev/null && ! mv {config}/settings.json "
+        f"{config}/s 2>/dev/null && ! mv {config} {config}.moved 2>/dev/null "
+        f"&& touch {config}/projects/t {config}/.claude.json"
     )
     result = subprocess.run(
-        ["bash", WRAPPER, f"--claude-config-dir={config}", "--", "sh", "-c", script],
+        ["bash", WRAPPER, f"--add-dirs={worktree}", f"--claude-config-dir={config}", "--"]
+        + ["sh", "-c", script],
         cwd=worktree,
         env=environment(home, bwrap=None),
         stdin=subprocess.DEVNULL,
