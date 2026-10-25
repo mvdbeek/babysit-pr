@@ -254,23 +254,53 @@ plan mode is still preserved.
 (typed launch prefixes, account environment, launcher detection). The sandbox is
 external to the agent harness: agents run with their own permissions off inside
 it, so a new harness only supplies its launch argv. The backend follows the
-platform (`safehouse` on macOS, `bwrap` on Linux); `BABYSIT_SANDBOX` may pin
-`safehouse` or `bwrap`, never `none`, and the tests pin `safehouse`.
+platform (`safehouse` on macOS, `bwrap` on Linux). Nothing in the environment
+selects it, since an agent sets the environment of the launches it starts; the
+tests set `sandbox.DEFAULT`.
 
 On Linux the default Claude launcher is `scripts/babysit-bwrap`, a bubblewrap
 wrapper taking Safehouse's `--add-dirs`, `--env-pass` and `--enable=docker,playwright`
-options before `--` and the command. It mounts the system read-only, gives the
-agent an empty `$HOME`, and allows writes only to the current worktree, its git
-common directory, the agent configuration (`CLAUDE_CONFIG_DIR` or `~/.claude`,
-`CODEX_HOME` or `~/.codex`), the uv/npm/pip/Playwright caches and `--add-dirs`.
-`~/.config/gh` is read-only. It unshares PID, IPC and UTS namespaces, dies with
-its parent, starts a new session, and clears the environment except `PATH`,
-`HOME`, `TERM`, `LANG`, `USER`, the agent configuration variables and the
-`--env-pass` names. The network is shared. `--enable=docker` binds only the
-caller's rootless socket `$XDG_RUNTIME_DIR/docker.sock` and refuses the system
-daemon's. `--print-argv` prints the bwrap argv, NUL-separated, without running it.
-Typed launches on Linux invoke the wrapper directly; there are no shell functions
-there to rely on.
+options, plus `--claude-config-dir` or `--codex-home`, before `--` and the command.
+It mounts the system read-only, gives the agent an empty `$HOME`, and allows
+writes only to `--add-dirs`, the one agent configuration directory it is given
+(exported as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Claude always gets an explicit
+one, so its `.claude.json` lives inside it) and `~/.cache/babysit-sandbox`, a
+cache root used only by sandboxed agents (`XDG_CACHE_HOME`, `UV_CACHE_DIR`,
+`PIP_CACHE_DIR`, `npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). Host caches are
+never writable: code planted there would run outside the sandbox. The wrapper
+discovers nothing from its working directory or git, whose files the agent can
+rewrite; babysit passes the worktree and its git common directory in `--add-dirs`
+from its own records (the worktree `wt` created, the job `cwd` that the repair
+just verified), and takes that common directory only when it registers the
+worktree back. Every writable path must be absolute and is resolved first; `/`,
+`$HOME` and its ancestors, and anything equal to, inside or holding `~/.ssh`,
+`~/.gnupg`, `~/.config/gh`, `~/.config/babysit-pr`, `~/.local/state/babysit-pr`,
+`~/.local/bin`, the sandbox cache root or a shell startup file are refused, as
+are newlines. Read-only binds (system, toolchains, `~/.config/gh`) follow the
+writable ones, so none can be shadowed. It unshares PID, IPC and UTS
+namespaces, dies with its parent, and clears the environment except `PATH`,
+`HOME`, `TERM`, `LANG`, `USER`, the variables above and the `--env-pass` names.
+It starts a new session (which blocks `TIOCSTI` terminal injection) unless stdin
+is a terminal and `/proc/sys/dev/tty/legacy_tiocsti` reads `0`, so interactive
+agents keep job control only where the kernel already blocks injection.
+`--print-argv` prints the bwrap argv, NUL-separated, without running it. Typed
+launches on Linux invoke the wrapper directly; there are no shell functions there
+to rely on.
+
+Known gaps of the Linux sandbox:
+
+- The worktree's git directory, including its hooks and config, stays writable
+  so the agent can commit. git run outside the sandbox in that checkout later
+  (by you or by babysit) can execute what the agent left there.
+- The network namespace is the host's: the agent reaches services on localhost
+  and abstract Unix sockets. Egress isolation is a later step.
+- `--enable=docker` refuses the system daemon's socket, which is root on the
+  machine, and binds only `$XDG_RUNTIME_DIR/docker.sock`. Even a rootless daemon
+  gives up the filesystem boundary (`docker run -v $HOME:/h` reaches every file
+  of the user), so enabling Docker trusts the agent with them.
+- The dashboard's Docker toggle is macOS-only for now: it inspects Seatbelt, and
+  its restart looks for the launcher in the agent's parent process, which under
+  babysit-bwrap is `bwrap` itself, so a restart fails closed.
 
 `--claude-command` permits an explicit alternative argv prefix; those jobs keep
 `dontAsk` unless separately configured. The `safehouse` permission setting is

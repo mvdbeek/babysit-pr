@@ -217,7 +217,9 @@ def main():
         parser.error(str(exc))
     extra = args.args[1:] if args.args[:1] == ["--"] else args.args
     words = {"login": ["auth", "login", "--claudeai"], "status": ["auth", "status"], "run": []}
-    launcher = sandbox.claude_launcher()
+    # `run` works in the directory the user started it from.
+    worktree = os.getcwd() if args.command == "run" else None
+    launcher = sandbox.bind(sandbox.claude_launcher(), "claude", worktree, str(home))
     os.execvpe(
         launcher[0],
         [*launcher, *words[args.command], *extra],

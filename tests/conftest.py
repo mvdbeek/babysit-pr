@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import sandbox
 
 GH = """import json,os,sys,subprocess
 from pathlib import Path
@@ -173,9 +174,22 @@ def no_claude_trust(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def safehouse_sandbox(monkeypatch):
-    """Launch lines are Safehouse's on every platform; the bwrap tests name their backend."""
-    monkeypatch.setenv("BABYSIT_SANDBOX", "safehouse")
+def safehouse_sandbox(monkeypatch, tmp_path_factory):
+    """Launch lines are Safehouse's on every platform; the bwrap tests name their backend.
+
+    Child Python processes (``wt``, cron and dashboard helpers) get the same default from
+    a test-only ``sitecustomize``, since no production setting selects a sandbox.
+    """
+    monkeypatch.setattr(sandbox, "DEFAULT", "safehouse")
+    site = tmp_path_factory.getbasetemp() / "sandbox-site"
+    if not (site / "sitecustomize.py").exists():
+        site.mkdir(exist_ok=True)
+        (site / "sitecustomize.py").write_text(
+            f"import sys\nsys.path.append({str(Path(sandbox.__file__).parent)!r})\n"
+            "import sandbox\nsandbox.DEFAULT = 'safehouse'\n"
+        )
+    paths = [str(site), *filter(None, [os.environ.get("PYTHONPATH")])]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(paths))
 
 
 @pytest.fixture

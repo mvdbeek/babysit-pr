@@ -471,6 +471,8 @@ def agent_command(
     unsandboxed: bool = False,
     also: Sequence[AlsoCheckout] = (),
     directory: str | None = None,
+    worktree: str | None = None,
+    sandbox_config_dir: str | None = None,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -507,6 +509,11 @@ def agent_command(
     in the configuration that Claude reads, so its folder trust dialog cannot hold up a
     launch nobody is watching. Without a selected account, that is the one this process
     inherited.
+
+    ``worktree`` is the checkout the agent may write under babysit-bwrap on Linux, which
+    is given it explicitly; it defaults to ``directory``. ``sandbox_config_dir`` is the
+    Claude configuration it may write, for callers that set the account up themselves;
+    it defaults to ``claude_config_dir``.
     """
     if unsandboxed and docker:
         raise ValueError("Docker access only applies inside Safehouse")
@@ -522,6 +529,8 @@ def agent_command(
         stage,
         UNSANDBOXED_FLAGS[agent],
         "none" if unsandboxed else None,
+        worktree or directory,
+        sandbox_config_dir or claude_config_dir,
     )
     if prompt:
         # `--` stops variadic options from swallowing the prompt.

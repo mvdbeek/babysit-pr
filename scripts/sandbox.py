@@ -9,16 +9,18 @@ starts, so supporting another harness only takes its launch argv. Backends:
   ``safe``/``claude()``/``codex()`` shell functions, which read ``SAFE_ENABLE``,
   ``SAFEHOUSE_ADD_DIRS`` and ``SAFEHOUSE_ENV_PASS``; babysit only sets those.
 - ``bwrap`` (Linux): ``babysit-bwrap``, a bubblewrap wrapper taking Safehouse's flags.
+  It discovers nothing itself: babysit passes the worktree, its git directory and the
+  agent's configuration directory explicitly.
 - ``none``: no sandbox, only for launches that explicitly opt out.
 
-A caller may name the backend; otherwise ``$BABYSIT_SANDBOX`` may pin ``safehouse`` or
-``bwrap`` (the tests pin Safehouse on every platform), and failing that it follows
-``sys.platform``. The environment can never select ``none``: an agent sets the
-environment of the launches it starts.
+A caller may name the backend; otherwise it follows ``sys.platform``. Nothing in the
+environment selects one, since an agent sets the environment of the launches it starts;
+the tests set ``DEFAULT`` instead.
 """
 
 import os
 import shlex
+import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -51,14 +53,13 @@ class Grants(NamedTuple):
     features: tuple[str, ...] = ()  # docker, playwright
 
 
+# The backend when a caller names none; None follows the platform. Only tests set it.
+DEFAULT: str | None = None
+
+
 def backend(name: str | None = None) -> str:
     if name is None:
-        pinned = os.environ.get("BABYSIT_SANDBOX")
-        if pinned:
-            if pinned not in ("safehouse", "bwrap"):
-                raise ValueError(f"BABYSIT_SANDBOX must be safehouse or bwrap, not {pinned!r}")
-            return pinned
-        name = {"darwin": "safehouse", "linux": "bwrap"}.get(sys.platform)
+        name = DEFAULT or {"darwin": "safehouse", "linux": "bwrap"}.get(sys.platform)
         if name is None:
             raise ValueError(f"No agent sandbox for {sys.platform}")
     elif name not in BACKENDS:
@@ -125,12 +126,17 @@ def typed_line(
     stage: Callable[[str], str],
     skip_permissions: str,
     name: str | None = None,
+    worktree: str | None = None,
+    claude_config_dir: str | None = None,
 ) -> str:
     """The shell line a multiplexer types to start agent ``words`` in the sandbox.
 
     ``skip_permissions`` is the agent's flag that turns its own permissions off. The
-    directory list is staged through ``stage``, like the prompt, so the typed line does
-    not grow with every path.
+    granted directory list is staged through ``stage``, like the prompt, so the typed
+    line does not grow with every path. Safehouse grants the shell's working directory
+    itself; babysit-bwrap is given ``worktree`` and the agent's configuration, typed
+    (see ``confinement``), since callers that stage the prompt themselves return its
+    path for every ``stage`` call.
     """
     name = backend(name)
     if name == "none":
@@ -148,6 +154,7 @@ def typed_line(
             command = f"SAFEHOUSE_ADD_DIRS=${{SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}}$(cat {listed}) {command}"
         return command
     options = flags(grants._replace(add_dirs=()), name)
+    options += [shlex.quote(word) for word in confinement(words[0], worktree, claude_config_dir)]
     if dirs:
         options.append(f'"--add-dirs=$(cat {shlex.quote(stage(":".join(dirs)))})"')
     launch = [shlex.quote(str(SCRIPTS / "babysit-bwrap")), *options, "--"]
@@ -157,8 +164,8 @@ def typed_line(
 def env_pass_prefix(names: Sequence[str], name: str | None = None) -> str | None:
     """A typed-line assignment that passes ``names`` into the sandbox, if one is needed.
 
-    Safehouse's shell function forwards ``SAFEHOUSE_ENV_PASS``; babysit-bwrap already
-    passes the agent configuration variables, and ``none`` keeps the whole environment.
+    Safehouse's shell function forwards ``SAFEHOUSE_ENV_PASS``; babysit-bwrap is given
+    the agent configuration as an option, and ``none`` keeps the whole environment.
     """
     if backend(name) != "safehouse":
         return None
@@ -166,28 +173,73 @@ def env_pass_prefix(names: Sequence[str], name: str | None = None) -> str | None
     return f"SAFEHOUSE_ENV_PASS={listed}${{SAFEHOUSE_ENV_PASS:+,$SAFEHOUSE_ENV_PASS}}"
 
 
-def docker_socket() -> Path:
-    """The rootless Docker socket babysit-bwrap binds for ``--enable=docker``."""
-    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "docker.sock"
+def confinement(
+    agent: str, worktree: str | None = None, claude_config_dir: str | None = None
+) -> list[str]:
+    """babysit-bwrap's options for what one launch of ``agent`` may write.
+
+    That is ``worktree`` with its git directory, and the one configuration directory of
+    the harness: ``claude_config_dir`` or the inherited account for Claude, which always
+    gets an explicit directory so that its ``.claude.json`` lives inside it, and
+    ``CODEX_HOME`` or ``~/.codex`` for Codex.
+    """
+    words = flags(Grants(add_dirs=git_dirs(worktree) if worktree else ()), "bwrap")
+    agent = Path(agent).name
+    if agent == "claude":
+        import claude_accounts
+
+        config = claude_config_dir or claude_accounts.current_home()
+        words.insert(0, f"--claude-config-dir={config}")
+    elif agent == "codex":
+        words.insert(0, f"--codex-home={os.environ.get('CODEX_HOME') or Path.home() / '.codex'}")
+    return words
 
 
-def inspect(pid: int, name: str | None = None) -> dict[str, bool | None]:
-    """What a running agent can use, for example ``{"docker": True}``; None is unknown."""
-    name = backend(name)
-    if name == "safehouse":
-        import agent_docker
+def git_dirs(worktree: str) -> tuple[str, ...]:
+    """A worktree and, when it lies outside, the git common directory its commits write.
 
-        try:
-            return {"docker": agent_docker.has_access(pid)}
-        except ValueError:
-            return {"docker": None}
-    if name == "bwrap":
-        # The agent's mount namespace holds the socket only when it was granted.
-        try:
-            os.stat(Path(f"/proc/{pid}/root") / docker_socket().relative_to("/"))
-        except FileNotFoundError:
-            return {"docker": False}
-        except OSError:
-            return {"docker": None}
-        return {"docker": True}
-    return {"docker": None}
+    The agent can rewrite the checkout's git files to point anywhere, so a common
+    directory counts only when it registers this worktree back; only directories the
+    agent can already write could fake that. babysit-bwrap refuses home, its ancestors
+    and protected paths whatever it is given.
+    """
+    worktree = os.path.realpath(worktree)
+    dot_git = os.path.join(worktree, ".git")
+    if not os.path.lexists(dot_git):
+        # Not a checkout's top level: git would search the parents, maybe a home repository.
+        return (worktree,)
+    found = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if found.returncode:
+        return (worktree,)
+    common = os.path.realpath(found.stdout.strip())
+    if common == dot_git:
+        return (worktree,)
+    registered = {
+        os.path.realpath(entry.read_text().strip())
+        for entry in Path(common).glob("worktrees/*/gitdir")
+        if entry.is_file()
+    }
+    if dot_git not in registered or Path(worktree).is_relative_to(common):
+        raise ValueError(f"The git directory {common} does not register the worktree {worktree}")
+    return (worktree, common)
+
+
+def bind(
+    command: Sequence[str],
+    agent: str,
+    worktree: str | None = None,
+    claude_config_dir: str | None = None,
+) -> list[str]:
+    """``command`` given the state its agent may write, when babysit-bwrap launches it.
+
+    Other launchers are returned unchanged: Safehouse grants its working directory and
+    the agent configuration itself.
+    """
+    if launcher_backend(command[0]) != "bwrap":
+        return list(command)
+    return [command[0], *confinement(agent, worktree, claude_config_dir), *command[1:]]

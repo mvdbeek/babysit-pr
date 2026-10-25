@@ -510,12 +510,12 @@ def command_for(job, attempt_dir):
         import claude_runner
 
         return claude_runner.command_for(job, RESULT_SCHEMA)
-    sandbox = codex_sandbox(job)
+    policy = codex_sandbox(job)
     cmd = [
-        *job["codex_command"],
+        *sandbox.bind(job["codex_command"], "codex", job["cwd"]),
         "exec",
         "--sandbox",
-        sandbox,
+        policy,
         "-c",
         'approval_policy="never"',
         "--output-schema",
@@ -525,7 +525,7 @@ def command_for(job, attempt_dir):
     ]
     if job.get("model"):
         cmd += ["--model", job["model"]]
-    if sandbox == "workspace-write":
+    if policy == "workspace-write":
         cmd += [
             "--add-dir",
             git(job["cwd"], "rev-parse", "--path-format=absolute", "--git-common-dir"),

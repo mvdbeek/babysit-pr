@@ -517,7 +517,9 @@ batch Handle all offer it, and scheduled launches keep it). The helper types
 `SAFE_ENABLE=docker <agent> …` into the pane, and the user's `safe` shell wrapper adds
 that to Safehouse's `--enable` list, which opens the Docker daemon socket to that one
 agent. Agents started without it keep Safehouse's default deny on container sockets.
-The operation records `docker` (false for reopen).
+Docker access gives up the sandbox's filesystem boundary, rootless Docker included: the
+agent can run `docker run -v $HOME:/h` and reach every file of yours. The operation
+records `docker` (false for reopen).
 
 **Quit the agent when it is done**, off by default, passes `--exit-when-done` to the
 helper (the request field is `exit_when_done: true`). New task, Handle and Create
@@ -550,7 +552,8 @@ options without sending a message. Sending messages does not change Docker acces
 exited sessions resume using the shell's normal defaults. A busy agent, blocked dialog,
 unsent terminal draft, unknown launch option, changed session, or watcher-owned session
 prevents the restart. Unknown access is shown as unavailable, never as disabled.
-Inspection requires macOS Seatbelt. This controls socket access; it does not start Docker.
+Inspection requires macOS Seatbelt, so the toggle is macOS-only for now. This controls
+socket access; it does not start Docker.
 
 **Quit the agent when it is done**, beside the agent picker in the follow-up composer,
 works for every message, whether it goes to a running agent or resumes an exited

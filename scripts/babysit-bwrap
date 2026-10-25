@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Linux agent sandbox: bubblewrap behind Agent Safehouse's grant options.
 #
-#   babysit-bwrap [--add-dirs=A:B] [--env-pass=X,Y] [--enable=docker,playwright]
-#                 [--print-argv] [--] command [args...]
+#   babysit-bwrap [--add-dirs=A:B] [--claude-config-dir=D | --codex-home=D]
+#                 [--env-pass=X,Y] [--enable=docker,playwright] [--print-argv] [--] command...
 #
-# Deny by default: a read-only system, an empty $HOME, and writes only to the current
-# worktree, its git common directory, the agent configuration directories, package
-# caches and --add-dirs. The environment is cleared except for a small baseline,
-# CLAUDE_CONFIG_DIR/CODEX_HOME and the --env-pass names that are set. The network is
-# shared. --print-argv prints the bwrap argv, NUL-separated, instead of running it.
+# Deny by default: a read-only system, an empty $HOME, and writes only to --add-dirs (the
+# caller passes the worktree and its git common directory there), the one agent
+# configuration directory and a cache root that only sandboxed agents use. Nothing is
+# discovered from the working directory or its git files, which the agent can rewrite.
+# Every writable path must be absolute and is resolved first; home, its ancestors and
+# protected paths are refused. The environment is cleared except for a small baseline,
+# the agent configuration variable, the cache variables and the --env-pass names that
+# are set. The network is shared. --print-argv prints the bwrap argv, NUL-separated,
+# instead of running it.
 set -euo pipefail
 
 die() {
@@ -18,33 +22,46 @@ die() {
 
 add_dirs=()
 env_pass=()
+config_var=
+config_dir=
 docker=0
 print=0
+tiocsti=/proc/sys/dev/tty/legacy_tiocsti
 while (($#)); do
   option=$1
   case $option in
-    --add-dirs | --env-pass | --enable)
+    --add-dirs | --env-pass | --enable | --claude-config-dir | --codex-home)
       (($# > 1)) || die "$option needs a value"
       shift
       option="$option=$1"
       ;;
   esac
+  # `read` stops at a newline, which would silently drop the rest of a list.
+  [[ $option != *$'\n'* ]] || die "refusing an option containing a newline"
   case $option in
     --add-dirs=*) IFS=: read -r -a more <<<"${option#*=}" && add_dirs+=(${more[@]+"${more[@]}"}) ;;
     --env-pass=*) IFS=, read -r -a more <<<"${option#*=}" && env_pass+=(${more[@]+"${more[@]}"}) ;;
+    --claude-config-dir=* | --codex-home=*)
+      [[ -z $config_var ]] || die "only one agent configuration directory is allowed"
+      config_var=CLAUDE_CONFIG_DIR
+      [[ $option == --claude-config-dir=* ]] || config_var=CODEX_HOME
+      config_dir=${option#*=}
+      ;;
     --enable=*)
       IFS=, read -r -a more <<<"${option#*=}"
       for feature in ${more[@]+"${more[@]}"}; do
         case $feature in
           docker) docker=1 ;;
           # Accepted like Safehouse's playwright-chrome: Chromium needs nothing beyond
-          # the always-present /dev/shm and browser cache.
+          # the always-present /dev/shm and the sandbox's own browser cache.
           playwright | playwright-chrome) ;;
           *) die "unknown feature $feature" ;;
         esac
       done
       ;;
     --print-argv) print=1 ;;
+    # Test hook for the TIOCSTI check below; honoured only by a dry run.
+    --tiocsti-sysctl=*) tiocsti=${option#*=} && fake_tiocsti=1 ;;
     --)
       shift
       break
@@ -55,56 +72,75 @@ while (($#)); do
   shift
 done
 (($#)) || die "no command to run"
+[[ -z ${fake_tiocsti:-} ]] || ((print)) || die "--tiocsti-sysctl only applies with --print-argv"
 
 home=${HOME:?}
-argv=(bwrap --die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts --clearenv)
+[[ $home == /* ]] || die "HOME must be absolute"
+real_home=$(realpath -- "$home" 2>/dev/null) || real_home=$home
+# Package caches for sandboxed agents only: nothing outside the sandbox runs code from
+# them, unlike the host caches an agent could otherwise plant code in.
+cache=$home/.cache/babysit-sandbox
 
-# Read-only system. Merged-/usr links stay links.
-for path in /usr /bin /sbin /lib /lib32 /lib64 /libx32 /opt; do
-  if [[ -L $path ]]; then
-    argv+=(--symlink "$(readlink "$path")" "$path")
-  else
-    argv+=(--ro-bind-try "$path" "$path")
+# Never writable, nor any directory holding one: credentials, babysit's own state and
+# launchers, and shell startup files, all of which run or authorize code outside.
+protected=()
+for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .local/bin \
+  .cache/babysit-sandbox .bashrc .bash_profile .bash_login .bash_logout .profile .zshenv \
+  .zprofile .zshrc .zlogin .zlogout; do
+  protected+=("$real_home/$path")
+  # A dotfile manager's link protects its target too.
+  if [[ -e $home/$path ]]; then
+    protected+=("$(realpath -- "$home/$path")")
   fi
 done
-for path in alternatives ca-certificates crypto-policies gai.conf gitconfig group host.conf \
-  hosts ld.so.cache ld.so.conf ld.so.conf.d localtime nsswitch.conf os-release passwd pki \
-  resolv.conf ssl; do
-  argv+=(--ro-bind-try "/etc/$path" "/etc/$path")
-done
-argv+=(--proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
 
-# Toolchains and credentials, read-only. gh holds the only GitHub credential.
-for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .gitconfig \
-  .config/git .config/gh; do
-  argv+=(--ro-bind-try "$home/$path" "$home/$path")
-done
+# Prints the resolved writable directory, nothing for one that does not exist (like
+# --bind-try), and refuses anything that would expose what it must not.
+writable() {
+  local path=$1 real guard
+  [[ $path == /* ]] || die "refusing relative path $path"
+  [[ -d $path ]] || return 0
+  real=$(realpath -- "$path")
+  if [[ $real == / || $real_home == "$real" || $real_home == "$real"/* ]]; then
+    die "refusing $path, which would expose the home directory"
+  fi
+  for guard in "${protected[@]}"; do
+    if [[ $real == "$guard" || $real == "$guard"/* || $guard == "$real"/* ]]; then
+      die "refusing $path, which overlaps the protected $guard"
+    fi
+  done
+  printf '%s\n' "$real"
+}
 
-# Writable: the agents' own configuration and package caches.
-configs=("${CODEX_HOME:-$home/.codex}")
-if [[ -n ${CLAUDE_CONFIG_DIR:-} ]]; then
-  configs+=("$CLAUDE_CONFIG_DIR")
-else
-  # The default account keeps its global settings beside the directory.
-  configs+=("$home/.claude" "$home/.claude.json")
+# setsid stops the agent pushing input into the terminal (TIOCSTI), but an interactive
+# agent needs its terminal's job control: drop it only when the kernel disables TIOCSTI.
+session=(--new-session)
+if [[ -t 0 ]] && read -r legacy 2>/dev/null <"$tiocsti" && [[ $legacy == 0 ]]; then
+  session=()
 fi
-for path in "${configs[@]}" "$home/.cache/uv" "$home/.npm" "$home/.cache/pip" \
-  "$home/.cache/ms-playwright"; do
-  argv+=(--bind-try "$path" "$path")
-done
+argv=(bwrap --die-with-parent ${session[@]+"${session[@]}"} --unshare-pid --unshare-ipc
+  --unshare-uts --clearenv --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
 
-# Writable: this worktree, the git directory it commits to, and the explicit grants.
-worktree=$(git rev-parse --show-toplevel 2>/dev/null) || worktree=$PWD
-argv+=(--bind "$worktree" "$worktree")
-if common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
-  argv+=(--bind "$common" "$common")
+# Writable: the sandbox cache, the agent configuration and the explicit grants. They
+# come before every read-only bind, so none of them can shadow one.
+argv+=(--bind "$cache" "$cache")
+if [[ -n $config_var ]]; then
+  real=$(writable "$config_dir")
+  if [[ -n $real ]]; then
+    argv+=(--bind "$real" "$real")
+    config_dir=$real
+  fi
 fi
 for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
-  [[ -z $path ]] || argv+=(--bind-try "$path" "$path")
+  [[ -n $path ]] || continue
+  real=$(writable "$path")
+  [[ -z $real ]] || argv+=(--bind "$real" "$real")
 done
 
 if ((docker)); then
-  # Only rootless Docker: access to the system daemon is root on this machine.
+  # The system daemon's socket is root on this machine and is always refused. A rootless
+  # daemon still gives up the filesystem boundary: `docker run -v $HOME:/h` reaches every
+  # file of this user. Enabling Docker trusts the agent with them.
   socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
   real=$(readlink -f "$socket" 2>/dev/null) || real=$socket
   for path in "$socket" "$real"; do
@@ -119,17 +155,43 @@ if ((docker)); then
   argv+=(--bind "$socket" "$socket" --setenv DOCKER_HOST "unix://$socket")
 fi
 
-for name in PATH HOME TERM LANG USER CLAUDE_CONFIG_DIR CODEX_HOME ${env_pass[@]+"${env_pass[@]}"}; do
+# Read-only system. Merged-/usr links stay links.
+for path in /usr /bin /sbin /lib /lib32 /lib64 /libx32 /opt; do
+  if [[ -L $path ]]; then
+    argv+=(--symlink "$(readlink "$path")" "$path")
+  else
+    argv+=(--ro-bind-try "$path" "$path")
+  fi
+done
+for path in alternatives ca-certificates crypto-policies gai.conf gitconfig group host.conf \
+  hosts ld.so.cache ld.so.conf ld.so.conf.d localtime nsswitch.conf os-release passwd pki \
+  resolv.conf ssl; do
+  argv+=(--ro-bind-try "/etc/$path" "/etc/$path")
+done
+
+# Toolchains and credentials, read-only. gh holds the only GitHub credential.
+for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .gitconfig \
+  .config/git .config/gh; do
+  argv+=(--ro-bind-try "$home/$path" "$home/$path")
+done
+
+for name in PATH HOME TERM LANG USER ${env_pass[@]+"${env_pass[@]}"}; do
   [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid variable name $name"
   if [[ -n ${!name+set} ]]; then
     argv+=(--setenv "$name" "${!name}")
   fi
 done
+# Last, so no --env-pass name can point an agent at host caches or another configuration.
+argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
+  --setenv PIP_CACHE_DIR "$cache/pip" --setenv npm_config_cache "$cache/npm"
+  --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright")
+[[ -z $config_var ]] || argv+=(--setenv "$config_var" "$config_dir")
 
-argv+=(--chdir "$PWD" -- "$@")
+argv+=(--chdir "$(pwd -P)" -- "$@")
 if ((print)); then
   printf '%s\0' "${argv[@]}"
   exit 0
 fi
 command -v bwrap >/dev/null || die "bubblewrap (bwrap) is not installed"
+mkdir -p "$cache"
 exec "${argv[@]}"

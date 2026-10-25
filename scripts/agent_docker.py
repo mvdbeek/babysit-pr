@@ -33,10 +33,7 @@ def sandbox_checks(pid, checks):
 
 
 def has_access(pid):
-    """Check the running process's Safehouse socket file grants (macOS Seatbelt).
-
-    ``sandbox.inspect`` reaches this as the safehouse backend's Docker probe.
-    """
+    """Check the running process's Safehouse socket file grants (macOS Seatbelt)."""
     try:
         results = sandbox_checks(
             pid,
@@ -171,7 +168,9 @@ def launcher(procs, proc, enabled=True):
     """Reuse the original Safehouse invocation, avoiding shell-wrapper flag duplication."""
     for parent in procs["foreground_processes"]:
         argv = parent.get("argv", [])
-        # The launcher is a shell script, so argv can start with its interpreter.
+        # The launcher is a shell script, so argv can start with its interpreter. An agent
+        # under babysit-bwrap has bwrap itself as its parent, which matches no launcher, so
+        # a Docker restart on Linux fails closed.
         start = next(
             (
                 i
