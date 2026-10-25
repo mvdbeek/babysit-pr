@@ -455,6 +455,13 @@ From the Linux sandbox section of the supervisor reference, restated for operato
   outside the sandbox can. Revoke the subkey (above) if the worker is compromised.
 - **Git directories stay writable**, so hooks an agent leaves in a worktree's git
   directory run when git is later used there outside the sandbox.
+- **Grants trust neighbours.** `--enable=docker` or `--enable=gpg` for one worktree
+  trusts every agent sharing its clone (the common git directory's `config` and
+  `hooks` run in whichever sandbox uses git next) and, through transcripts and
+  memory, every agent of its Claude account. Give workspaces that need a grant a
+  clone of their own. What a harness runs from its account directory (settings,
+  hooks, plugins, skills and the like) is read-only in every sandbox, a granted
+  Claude starts no MCP servers, and each set of grants has its own package cache.
 - **bubblewrap 0.9.0** keeps the bind-by-path race unless upgraded (above).
 - **Egress is unrestricted**; network isolation is a later step.
 
