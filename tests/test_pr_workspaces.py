@@ -54,6 +54,12 @@ def test_collie_url_names_the_machine_a_workspace_is_on():
     assert pw.collie_url(worker, "w1") is None
     there = worker._replace(collie_url="https://mini.example.ts.net:8787/")
     assert pw.collie_url(there, "w/1") == "https://mini.example.ts.net:8787/space/w%2F1"
+    # A Collie crew member's spaces open through the lead, this machine's Collie,
+    # addressed to that member.
+    member = worker._replace(collie_host="mini")
+    assert pw.collie_url(member, "w1") == f"{pw.COLLIE_URL}/space/w1?h=mini"
+    lead = member._replace(collie_url="https://lead.example.ts.net")
+    assert pw.collie_url(lead, "w 1") == "https://lead.example.ts.net/space/w%201?h=mini"
 
 
 @pytest.fixture
