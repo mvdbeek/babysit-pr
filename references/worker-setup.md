@@ -482,7 +482,8 @@ From the Linux sandbox section of the supervisor reference, restated for operato
   `global_config` follow the explicit `CLAUDE_CONFIG_DIR` babysit passes for the
   default account on Linux, or have babysit-bwrap give the default account a
   dedicated directory.
-- Writing a `worker.json` (plan D6.6) and installing Playwright's system libraries
-  (`npx playwright install-deps chromium` as root, pinned to the repository's
-  Playwright version) are not automated yet.
+- Installing Playwright's system libraries (`npx playwright install-deps chromium` as
+  root, pinned to the repository's Playwright version) is not automated yet. The user
+  step writes `~/.config/babysit-pr/worker.json`, which marks the machine as a worker
+  (babysit-bwrap passes it to agents as `BABYSIT_WORKER=1`).
 - The dashboard's Docker toggle is macOS-only (supervisor reference).

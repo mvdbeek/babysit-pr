@@ -16,7 +16,6 @@ from test_pr_workspaces import (  # noqa: F401 (fixture)
     local,
     make_checkout,
     scheduled_task,
-    second_issue,
     synced,
 )
 
@@ -202,7 +201,7 @@ def test_without_a_registry_nothing_asks_another_machine(local):  # noqa: F811
         manager.action({"id": pr["id"], "action": "handle", "task": "x", "machine": "mini"})
 
 
-def test_a_chosen_worker_is_recorded_and_its_launch_refused(local):  # noqa: F811
+def test_a_chosen_worker_is_recorded_and_its_launch_goes_there(local):  # noqa: F811
     manager, pr, _, state, _ = local
     register(manager.home, MINI)
     calls = helper_calls(manager)
@@ -211,21 +210,21 @@ def test_a_chosen_worker_is_recorded_and_its_launch_refused(local):  # noqa: F81
         manager.action({**request, "docker": True})
     manager.action(request)
     op = finish(manager, pr["id"])
+    # This worker has no babysit-pr deployed (test_remote_launch has one that does).
     assert op["machine"] == "mini" and op["status"] == "failed"
-    assert op["message"] == "Launching on Mac mini is not supported yet"
+    assert "No babysit-pr at" in op["message"]
     assert not calls and not json.loads(state.read_text())["agents"]
-    # A new task is refused before its issue is filed.
-    value = manager.new_task(
-        {
-            "repo": "base/repo",
-            "clone": str((manager.src / "repo").resolve()),
-            "issue_title": "Remote issue",
-            "task": "Explore",
-            "machine": "mini",
-        }
-    )
-    op = finish(manager, value["operation"]["pr"])
-    assert op["machine"] == "mini" and op["message"] == "Launching on Mac mini is not supported yet"
+    # A new task that files an issue is refused before the issue is filed.
+    with pytest.raises(ValueError, match="Only pull request reviews and new tasks"):
+        manager.new_task(
+            {
+                "repo": "base/repo",
+                "clone": str((manager.src / "repo").resolve()),
+                "issue_title": "Remote issue",
+                "task": "Explore",
+                "machine": "mini",
+            }
+        )
     assert not json.loads(state.read_text()).get("gh")
     settle(manager.loads)
     snapshot = manager.snapshot()
@@ -249,7 +248,7 @@ def test_a_chosen_worker_is_recorded_and_its_launch_refused(local):  # noqa: F81
         manager.action({"id": pr["id"], "action": "focus", "machine": "mini"})
 
 
-def test_a_scheduled_launch_on_a_worker_is_recorded_then_not_started(synced):  # noqa: F811
+def test_a_scheduled_launch_keeps_its_worker(synced):  # noqa: F811
     manager, pr, _, state, _ = synced
     register(manager.home, MINI)
     start = time.time() + 3600
@@ -260,24 +259,20 @@ def test_a_scheduled_launch_on_a_worker_is_recorded_then_not_started(synced):  #
     assert local_task["scheduled"]["machine"] is None
     manager.run_due(now=start)
     listed = {t["id"]: t for t in manager.scheduled_tasks()["tasks"]}
-    assert listed[task["id"]]["status"] == "failed"
-    assert (
-        listed[task["id"]]["message"] == "Not started: Launching on Mac mini is not supported yet"
-    )
-    assert manager.operation(pr["id"]) is None
+    assert listed[task["id"]]["status"] == "started"
+    op = finish(manager, pr["id"])
+    assert op["id"] == listed[task["id"]]["operation_id"] and op["machine"] == "mini"
     settle(manager.loads)
 
 
-def test_a_new_task_with_other_clones_is_recorded_then_refused_on_a_worker(local):  # noqa: F811
+def test_a_new_task_with_other_clones_is_refused_on_a_worker(local):  # noqa: F811
     manager, _, git, state, _ = local
     register(manager.home, MINI)
     manager.loads.snapshot()
     settle(manager.loads)
     other = other_clone(manager, git)
-    value = manager.new_task(new_request(manager, name="remote", also=[str(other)], machine="mini"))
-    op = finish(manager, value["operation"]["pr"])
-    assert op["machine"] == "mini" and op["status"] == "failed"
-    assert op["message"] == "Launching on Mac mini is not supported yet"
+    with pytest.raises(ValueError, match="Other repositories cannot join a task on Mac mini"):
+        manager.new_task(new_request(manager, name="remote", also=[str(other)], machine="mini"))
     assert not json.loads(state.read_text())["agents"]
 
 
@@ -333,14 +328,18 @@ def test_disabled_and_unreachable_workers_are_refused(local):  # noqa: F811
 
 
 def test_a_batch_records_its_machine_on_every_item(synced):  # noqa: F811
-    manager, *_ = synced
+    manager, pr, *_ = synced
     register(manager.home, MINI)
-    second_issue(manager)
     value = manager.batch(
-        {"items": [{"id": "I_one"}, {"id": "I_two"}], "task": "Fix {url}", "machine": "mini"}
+        {"items": [{"id": pr["id"]}, {"id": "I_one"}], "task": "Review {url}", "machine": "mini"}
     )
-    tasks = [r["scheduled"] for r in value["results"]]
-    assert [(t["machine"], t["request"]["machine"]) for t in tasks] == [("mini", "mini")] * 2
+    review, issue = value["results"]
+    assert (review["scheduled"]["machine"], review["scheduled"]["request"]["machine"]) == (
+        "mini",
+        "mini",
+    )
+    # Issues may need repairs, which workers cannot run yet.
+    assert issue["error"].startswith("Only pull request reviews and new tasks can start on")
     settle(manager.loads)
 
 

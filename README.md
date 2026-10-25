@@ -842,7 +842,9 @@ prompt gets the same closing instruction scheduled tasks use, asking for a
 `[babysit-done:…]` last line. Before typing the agent command, `wt` records a watch
 (workspace, pane, checkout, agent, marker and start time) in the `exit_watches` table
 of the dashboard's `pr-workspaces.sqlite`, under `$BABYSIT_HOME` or
-`~/.local/state/babysit-pr`; Safehouse already lets agents write there. The
+`~/.local/state/babysit-pr`; Safehouse already lets agents write there. On a worker
+machine the dashboard passes `--exit-watch-json` as well: `wt` prints the watch as JSON
+instead, for the dashboard to record, and `--exit-when-done` without it is refused. The
 dashboard follows it like a scheduled task's agent: once the first turn ends with
 the marker and the agent stays idle for 20 seconds, it presses Ctrl-D. It then closes
 the herdr workspace if the agent's pane was its only pane, or only the pane

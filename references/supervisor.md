@@ -544,7 +544,14 @@ the job's clone, outside its `.git`, so an agent cannot point the paths its sand
 given at a repository of its own.
 `scripts/machines.py` loads and validates it; a malformed file is an error, a
 missing one means local only. `register --machine ID` checks the ID against the
-registry and then refuses: watches on other machines are not supported yet.
+registry and then refuses: watches on other machines are not supported yet. On a
+worker `register` and `handoff` refuse: watch registration from worker machines isn't
+supported yet. A worker is one with `~/.config/babysit-pr/worker.json` (written by
+`provision_worker.sh --user-step`) or with `BABYSIT_WORKER` set. A launch sets it for
+the `wt` it runs, not for the agent's pane, whose shell herdr's server starts; inside
+babysit-bwrap, where `$HOME` is empty, the wrapper sets `BABYSIT_WORKER=1` whenever the
+host has that file. This is a guard against mistakes, not a boundary: an agent outside
+babysit-bwrap, or one that unsets the variable, is not stopped by it.
 Watches record `machine` (null for this machine), and a worktree path is a
 duplicate only on the same machine. The dashboard reads the diff and
 transcripts of a workspace ID qualified as `ID/w1` on that machine (see the
@@ -583,7 +590,8 @@ Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (`user@host` and `host`) are not detected.
 Disabled machines stay valid for records already pinned to them.
 
-Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, and a shared
+Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, agent and port
+forwarding off whatever the ssh config says, and a shared
 master connection whose socket lives in `--home/ssh/` (or a short temporary
 directory when that path is too long), with at most four concurrent commands
 per ssh target in one process. They run with the worker's own environment and
@@ -599,10 +607,31 @@ refreshed in the background so no request waits on a worker. Auto always places 
 this machine for now. Choosing a worker by name checks it against the launch
 (disabled, unreachable, missing `labels` such as `docker`, `safehouse`/`bwrap` for
 the sandbox, `claude-account:<name>`, or a repo's `requires`) and records it on the
-operation or scheduled task, but the launch is refused: "Launching on <label> is
-not supported yet". A worker whose load has not come back yet, or whose refresh has
-not finished for 30 s, shows "checking…" and is left out of Auto. Worker clones are
-not inventoried yet, so a launch with other clones (`--with`) is not refused for them. Handle on a verified checkout stays on that checkout's machine;
+operation or scheduled task. A worker whose load has not come back yet, or whose refresh has
+not finished for 30 s, shows "checking…" and is left out of Auto.
+
+A launch placed on a worker (Handle or Create on a pull request, a new task, batch
+review, a scheduled launch) starts there. Until repairs run on workers, only work that
+never needs them goes there: pull request reviews and new tasks on a branch. Issues,
+Sentry issues, new tasks that file an issue and new tasks with other clones (`--with`)
+are refused with the reason. The launch first compares the worker's deployed
+babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
+refuses a mismatch, naming the `provision_worker.sh --user-step --sha <sha>` that fixes
+it. It works in the worker's clone `<src>/<repo name>`, which must name the repository
+in a remote; nothing clones on a worker, so a missing clone is refused. A probe op names
+the new checkout under `<src>/worktrees/<repo name>` and trusts it for Claude in the
+config its sandbox reads; the brief is staged in `~/.local/state/babysit-pr/workspace-prompts`
+there. The worker's own `wt.py` then runs over ssh with `BABYSIT_WORKER=<id>`, `--gpg`
+when the machine has the `gpg` label, and `--exit-watch-json` for **Quit the agent when
+it is done**: it prints the exit watch instead of recording it, and the dashboard
+records it with the machine. Clone locks hash the machine with the clone. The checkout
+and agent are verified through probe ops and `herdr --machine`. Exit watches on workers
+are looked at there every minute but never exited: the watch says when the agent
+finished, or left without confirming, and leaves it open. It also stops after a week,
+once the worker leaves the registry, or after 30 failed looks in a row. Their records
+name the workspace qualified (`<id>/w1`), so no dashboard takes it for one of its own.
+
+Handle on a verified checkout stays on that checkout's machine;
 choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`
 previews where Auto would place a launch and which machines can take it;
 `GET /api/machines` lists the machines with their cached loads and placement verdict,

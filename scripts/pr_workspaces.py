@@ -9,6 +9,7 @@ import concurrent.futures
 import contextlib
 import copy
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -35,6 +36,7 @@ import remote_probe
 import safe_git
 import workspace_agents
 import workspace_exit
+import wt
 from issue_overview import branch_number
 
 # Collie's own setting for the URL it is reached at; unset means its loopback default.
@@ -99,6 +101,22 @@ HISTORY_PRUNE_SECONDS = 3600
 # A new task lists clones whose HEAD moved this recently, unless asked for all of them.
 RECENT_CLONE_SECONDS = 90 * 86400
 REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
+# The babysit-pr checkout this process runs from: a worker must run the same commit.
+APP_ROOT = Path(__file__).resolve().parent.parent
+# A worker's staged briefs, in a folder babysit-bwrap never grants an agent; wt reads
+# each once at startup, so older ones are removed.
+REMOTE_PROMPTS = "~/.local/state/babysit-pr/workspace-prompts"
+PROMPT_KEEP = 86400
+# How long a worker may take to check its clone and name a launch's checkout.
+PREPARE_TIMEOUT = 60
+# Seconds between looks at a worker agent's exit watch: each costs the worker ssh calls.
+REMOTE_WATCH = 60
+# Failed looks in a row after which a worker agent's exit watch is left.
+REMOTE_FAILURES = 30
+# What a worker's wt hands back about the exit watch of the agent it typed.
+WATCH_ID = re.compile(r"[0-9a-f]{32}")
+WATCH_MARKER = re.compile(r"\[babysit-done:[0-9a-f]{16}\]")
+PANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_-]{0,127}")
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=(), env=None, machine=None, home=None):
@@ -125,6 +143,40 @@ def herdr(*args, machine: machines.Machine | None = None, timeout=30):
     if value.get("error"):
         raise ValueError(str(value["error"]))
     return value["result"]
+
+
+@functools.cache
+def app_head():
+    """The babysit-pr commit this process runs; launches on a worker need the same."""
+    return git(APP_ROOT, "rev-parse", "HEAD")
+
+
+def validate_account(agent, name, machine=None):
+    """A Claude account here; for a worker only its name, as its logins are checked there."""
+    if machine is None:
+        claude_accounts.validate(agent, name)
+    elif name:
+        if agent != "claude":
+            raise ValueError("A Claude account can only be selected for Claude")
+        if not claude_accounts.NAME.fullmatch(name):
+            raise ValueError(
+                "Use an account name containing letters, digits, underscores or hyphens"
+            )
+
+
+def worker_refusal(target, machine):
+    """Why ``target`` cannot start on ``machine``, or None.
+
+    Until repairs run on workers, only work that never needs them goes there: reviews
+    of pull requests and new tasks. An issue's or Sentry issue's fix can end in a pull
+    request watched for repairs.
+    """
+    if target.get("kind") in {"pr", "scratch"}:
+        return None
+    return (
+        f"Only pull request reviews and new tasks can start on {machine.label} yet: "
+        "other work can lead to a watched pull request, and its repairs run on this machine"
+    )
 
 
 remote_slug = remote_probe.remote_slug
@@ -587,6 +639,8 @@ class Workspaces:
         self.scheduler: threading.Thread | None = None
         self.wake = threading.Event()
         self.stopping = threading.Event()
+        # Exit watches of worker agents being looked at in the background.
+        self.remote_looks: set[str] = set()
 
     @contextlib.contextmanager
     def db(self):
@@ -915,9 +969,11 @@ class Workspaces:
         if state is None:
             state = self.state()
         op = state["operations"].get(pr["id"])
+        # A worker's launch names its paths there: no local checkout or workspace is it.
+        remote = op is not None and op.get("machine") is not None
         # Recover the durable resource reservation even if the server exited before
         # recording its association. Name alone is never sufficient provenance.
-        if op and op.get("path") and op.get("branch") and op.get("common"):
+        if op and not remote and op.get("path") and op.get("branch") and op.get("common"):
             found = (state.get("index") or checkout_index(inventory))["path"].get(op["path"])
             item = inventory["checkouts"][found[0]] if found else None
             if (
@@ -938,9 +994,12 @@ class Workspaces:
             and op["status"] in {"queued", "running", "uncertain"}
             and pr["id"] not in self.workers
         ):
-            result = next(
-                (m for m in matches if m["path"] == op.get("path") and m["workspace_id"]), None
-            )
+            result = None
+            if not remote:
+                result = next(
+                    (m for m in matches if m["path"] == op.get("path") and m["workspace_id"]),
+                    None,
+                )
             if result and self.agent_started(result, op.get("agent")):
                 self.save_operation(
                     op, status="complete", result=result, message="Recovered existing workspace"
@@ -1117,14 +1176,6 @@ class Workspaces:
             "options": options,
         }
 
-    def unsupported_launch(self, machine_id):
-        """Launching on a worker lands later; a launch placed there is refused, never moved."""
-        try:
-            machine = machines.load(self.home).get(machine_id)
-        except (OSError, ValueError):
-            machine = None
-        return f"Launching on {machine.label if machine else machine_id} is not supported yet"
-
     def agent_started(self, target, agent):
         return not agent or agent_in(target["workspace_id"], target["path"], agent)
 
@@ -1291,7 +1342,6 @@ class Workspaces:
                 request.get("effort", ""),
                 self.home,
             )
-            claude_accounts.validate(request.get("agent", "codex"), request.get("claude_account"))
             # A verified checkout pins Handle to its machine; every checkout is here so far.
             machine = self.place(
                 request,
@@ -1304,6 +1354,10 @@ class Workspaces:
                 },
                 {placement.LOCAL: 2 if info["matches"] else 1 if info["clones"] else 0},
             )
+            remote = machines.resolve(self.home, machine) if machine else None
+            validate_account(request.get("agent", "codex"), request.get("claude_account"), remote)
+            if remote is not None and (refusal := worker_refusal(pr, remote)):
+                raise ValueError(refusal)
             if (
                 not request.get("task", "").strip()
                 or len(request["task"]) > 32000
@@ -1316,7 +1370,10 @@ class Workspaces:
                 and not (pr.get("head_repo") and pr.get("head_branch") and pr.get("head_sha"))
             ):
                 raise ValueError("Refresh GitHub metadata before creating a workspace")
-            if action == "create" or (action == "handle" and info["clones"]):
+            if remote is not None:
+                # The worker's own clone, checked there; nothing clones on a worker.
+                clone = f"{remote.src.rstrip('/')}/{pr['repo'].split('/')[1]}"
+            elif action == "create" or (action == "handle" and info["clones"]):
                 chosen = True
                 clone = request.get("clone") or info["preferred_clone"]
                 if not clone and len(info["clones"]) == 1:
@@ -1468,7 +1525,27 @@ class Workspaces:
             raise ValueError("Choose a repository")
         clone = request.get("clone", "")
         listed = self.local_repositories(everything=True)["repos"]
-        if not any(r["repo"] == repo and r["clone"] == clone for r in listed):
+        machine = self.place(
+            request,
+            {
+                "repo": repo,
+                "agent": request.get("agent", "codex"),
+                "claude_account": request.get("claude_account"),
+                "docker": request.get("docker", False),
+                "also": [r["repo"] for r in listed if r["clone"] in also],
+            },
+            {placement.LOCAL: 1},
+        )
+        remote = machines.resolve(self.home, machine) if machine else None
+        if remote is not None:
+            if request.get("issue_title", "").strip():
+                # Refused before an issue is filed for a launch that cannot start.
+                raise ValueError(worker_refusal({"kind": "issue"}, remote))
+            if also:
+                raise ValueError(f"Other repositories cannot join a task on {remote.label} yet")
+            # The worker's own clone, checked there; nothing clones on a worker.
+            clone = f"{remote.src.rstrip('/')}/{repo.split('/')[1]}"
+        elif not any(r["repo"] == repo and r["clone"] == clone for r in listed):
             raise ValueError(f"Choose a local clone of {repo}")
         if len(also) > ALSO_LIMIT:
             raise ValueError(f"Choose at most {ALSO_LIMIT} other repositories")
@@ -1485,7 +1562,7 @@ class Workspaces:
         workspace_agents.validate(
             agent, request.get("model", ""), request.get("effort", ""), self.home
         )
-        claude_accounts.validate(agent, request.get("claude_account"))
+        validate_account(agent, request.get("claude_account"), remote)
         task = request.get("task", "")
         if not task.strip() or len(task) > 32000 or "\0" in task:
             raise ValueError("Supply a task of 1–32,000 characters")
@@ -1497,23 +1574,19 @@ class Workspaces:
         else:
             name = request.get("name", "").strip()
             base = request.get("base", "").strip()
-            if not BRANCH_NAME.fullmatch(name) or not self.valid_branch(clone, name):
+
+            def valid(branch):
+                # A worker's clone is checked there; its wt checks the name again.
+                if remote is not None:
+                    return remote_probe.BRANCH.fullmatch(branch) and ".." not in branch
+                return self.valid_branch(clone, branch)
+
+            if not BRANCH_NAME.fullmatch(name) or not valid(name):
                 raise ValueError("Name the new branch: letters, digits, '.', '_' and '-'")
             # wt fetches the base from origin, so it must name a branch, not a revision.
-            if base and (base.startswith("-") or "@" in base or not self.valid_branch(clone, base)):
+            if base and (base.startswith("-") or "@" in base or not valid(base)):
                 raise ValueError("The base branch is not a valid branch name")
             target = {"kind": "scratch", "repo": repo, "branch": name, "base": base or None}
-        machine = self.place(
-            request,
-            {
-                "repo": repo,
-                "agent": agent,
-                "claude_account": request.get("claude_account"),
-                "docker": request.get("docker", False),
-                "also": [r["repo"] for r in listed if r["clone"] in also],
-            },
-            {placement.LOCAL: 1},
-        )
         key = f"{NEW_PREFIX}{uuid.uuid4()}"
         target["id"] = key
         op = {
@@ -1559,12 +1632,6 @@ class Workspaces:
 
     def perform_new(self, target, op, task, files=""):
         try:
-            if op.get("machine") is not None:
-                # Refused before an issue is filed for a launch that cannot start.
-                self.save_operation(
-                    op, status="failed", message=self.unsupported_launch(op["machine"])
-                )
-                return
             if is_issue(target):
                 try:
                     self.save_operation(
@@ -1928,14 +1995,6 @@ class Workspaces:
                     # A batch can hold several items whose repository had no clone; the first
                     # clones it, and the rest start in that clone once it is there.
                     continue
-                if task.get("machine") is not None:
-                    self.save_scheduled(
-                        db,
-                        task,
-                        status="failed",
-                        message=f"Not started: {self.unsupported_launch(task['machine'])}",
-                    )
-                    continue
                 self.save_scheduled(db, task, status="starting", message="Starting")
             try:
                 if not any(t["id"] == task["target"] for t in self.targets()):
@@ -1989,7 +2048,12 @@ class Workspaces:
             ]
         for task in tasks:
             try:
-                self.exit_one(task, now)
+                # The machine the launch ran on: Auto places a scheduled task again.
+                op = self.operation_record(task.get("operation_id"))
+                if op and op.get("machine") is not None:
+                    self.remote_exit("scheduled", task, op, now)
+                else:
+                    self.exit_one(task, now)
             except Exception:
                 continue  # One watch must not stop the others; the next pass retries it.
 
@@ -2033,9 +2097,123 @@ class Workspaces:
             ]
         for watch in watches:
             try:
-                self.exit_launch(watch, now)
+                if watch.get("machine") is not None:
+                    self.remote_exit("exit_watches", watch, None, now)
+                else:
+                    self.exit_launch(watch, now)
             except Exception:
                 continue  # One watch must not stop the others; the next pass retries it.
+
+    def remote_exit(self, table, row, op=None, now=None):
+        """Look at a worker agent's exit watch in the background, every REMOTE_WATCH.
+
+        ``row`` is a ``wt`` exit watch, or a scheduled task with its launch ``op``.
+        Exiting agents on workers comes with exit-watch forwarding; until then the watch
+        only says when the agent finished, or left without confirming, and leaves it open.
+        A watch also ends after a week, once its worker leaves the registry, or after
+        REMOTE_FAILURES failed looks in a row.
+        """
+        now = time.time() if now is None else now
+        if now - row["exit"].get("since", now) > workspace_exit.WATCH_LIMIT:
+            self.swap_exit(
+                table,
+                row,
+                {
+                    **row["exit"],
+                    "state": "left_open",
+                    "message": "Still not finished after a week; stopped watching",
+                },
+            )
+            return
+        if now - row["exit"].get("checked_at", 0) < REMOTE_WATCH:
+            return
+        if op is None:
+            machine_id = row["machine"]
+            launched = {
+                "pane": row["pane_id"],
+                "path": row["path"],
+                "exit_marker": row["marker"],
+                "agent": row["agent"],
+            }
+        else:
+            machine_id = op["machine"]
+            if op.get("status") in {"queued", "running"}:
+                return
+            if op.get("status") != "complete":
+                self.swap_exit(
+                    table,
+                    row,
+                    {
+                        **row["exit"],
+                        "state": "left_open",
+                        "message": "The launch did not finish, so its agent is not watched",
+                    },
+                )
+                return
+            launched = {
+                "pane": op["result"].get("pane_id"),
+                "path": op["result"]["path"],
+                "exit_marker": op["exit_marker"],
+                "agent": op["agent"],
+            }
+        machine = machines.load(self.home).get(machine_id)
+        if machine is None:
+            self.swap_exit(
+                table,
+                row,
+                {
+                    **row["exit"],
+                    "state": "left_open",
+                    "message": f"Stopped watching: {machine_id} is no longer registered",
+                },
+            )
+            return
+        launched.update(machine=machine_id, machine_label=machine.label)
+        key = f"{table}:{row['id']}"
+        with self.lock:
+            if key in self.remote_looks or self.stopping.is_set():
+                return
+            self.remote_looks.add(key)
+        threading.Thread(
+            target=self.remote_look, args=(table, row, launched, key), daemon=True
+        ).start()
+
+    def remote_look(self, table, row, launched, key):
+        import cron_agents
+
+        try:
+            record = {**row["exit"], "checked_at": time.time()}
+            try:
+                seen = cron_agents.remote_progress(
+                    self.home, {"agent": launched["agent"]}, launched
+                )
+                record.pop("failures", None)
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+                failures = record["failures"] = record.get("failures", 0) + 1
+                seen = {
+                    "state": "watching" if failures < REMOTE_FAILURES else "unreachable",
+                    "message": f"Could not look at the agent on {launched['machine_label']}: {exc}"
+                    + ("" if failures < REMOTE_FAILURES else f"; stopped after {failures} tries"),
+                }
+            record["message"] = seen["message"]
+            if seen["state"] != "watching":
+                record["state"] = "left_open"
+            self.swap_exit(table, row, record)
+        finally:
+            with self.lock:
+                self.remote_looks.discard(key)
+
+    def swap_exit(self, table, row, record):
+        """Save ``record`` as ``row``'s exit watch unless it changed elsewhere meanwhile."""
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            found = db.execute(f"SELECT data FROM {table} WHERE id=?", (row["id"],)).fetchone()
+            current = json.loads(found[0]) if found else None
+            if current and current.get("exit") == row["exit"]:
+                current["exit"] = record
+                db.execute(
+                    f"UPDATE {table} SET data=? WHERE id=?", (json.dumps(current), row["id"])
+                )
 
     def exit_launch(self, watch, now=None):
         now = time.time() if now is None else now
@@ -2066,12 +2244,20 @@ class Workspaces:
                         "created_at": float(w["created_at"]),
                         "state": w["exit"]["state"],
                         "message": w["exit"]["message"],
-                        "url": collie_url(None, w["workspace_id"]),
+                        "url": self.watch_url(w),
                     }
                 )
             except (KeyError, TypeError, ValueError):
                 continue  # A row this version cannot read must not hide the others.
         return sorted(listed, key=lambda w: w["created_at"], reverse=True)
+
+    def watch_url(self, watch):
+        """Collie's page for a watch's workspace; a worker's only from its registry entry."""
+        if watch.get("machine") is None:
+            return collie_url(None, watch["workspace_id"])
+        machine = machines.load(self.home).get(watch["machine"])
+        _, wid = machines.split(watch["workspace_id"])
+        return collie_url(machine, wid) if machine else None
 
     def operation_status(self, key):
         """The current operation with this ID, as a snapshot shows it, or None.
@@ -2169,7 +2355,10 @@ class Workspaces:
                 if (
                     op.get("status") in {"complete", "failed"}
                     and (op.get("updated_at") or op.get("created_at") or 0) < cutoff
-                    and not (op.get("path") and os.path.lexists(op["path"]))
+                    # A worker's path names nothing on this machine.
+                    and not (
+                        op.get("machine") is None and op.get("path") and os.path.lexists(op["path"])
+                    )
                 ):
                     db.execute("DELETE FROM operations WHERE pr=? AND data=?", (key, data))
             # Finished `wt --exit-when-done` watches: the most recent ones from the last month.
@@ -2281,10 +2470,11 @@ class Workspaces:
                 raise ValueError(op["log"][-4000:] or f"Command exited with status {code}")
 
     def perform(self, pr, op, task):
+        if op.get("machine") is not None:
+            self.perform_remote(pr, op, task)
+            return
         launching = False
         try:
-            if op.get("machine") is not None:
-                raise ValueError(self.unsupported_launch(op["machine"]))
             lock_dir = self.home / "workspace-locks"
             lock_dir.mkdir(mode=0o700, exist_ok=True)
             key = hashlib.sha256(op["clone"].encode()).hexdigest()
@@ -2530,6 +2720,263 @@ class Workspaces:
             with self.lock:
                 self.workers.pop(pr["id"], None)
                 self.next_poll = 0
+
+    def perform_remote(self, pr, op, task):
+        """A launch on a worker: its own clone, its deployed wt and its herdr, over ssh.
+
+        The worker's clone is checked, and the checkout named, by a probe op there, which
+        also trusts the checkout for Claude; the brief is staged in a private folder there.
+        wt runs in the worker's own environment, marked as a worker's, and hands back the
+        exit watch of the agent it typed, which is recorded here with the machine. The
+        checkout and agent are verified through probe ops and the worker's herdr: nothing
+        on this machine reads a worker's paths.
+        """
+        import cron_agents
+
+        launching = typed = False
+        try:
+            machine = machines.resolve(self.home, op["machine"], placing=True)
+            assert machine is not None
+            lock_dir = self.home / "workspace-locks"
+            lock_dir.mkdir(mode=0o700, exist_ok=True)
+            # The worker's clone, never a same-named one here.
+            key = hashlib.sha256(f"{machine.id}\0{op['clone']}".encode()).hexdigest()
+            with (lock_dir / key).open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.save_operation(
+                    op, status="running", message=f"Checking babysit-pr on {machine.label}"
+                )
+                deployed = cron_agents.probe(
+                    self.home, machine, "version", 30, babysit_root=machine.babysit_root
+                )["head"]
+                if deployed != app_head():
+                    raise ValueError(
+                        f"{machine.label} runs babysit-pr {deployed[:12]}, this machine "
+                        f"{app_head()[:12]}: update babysit-pr on {machine.label} "
+                        f"(provision_worker.sh --user-step --sha {app_head()})"
+                    )
+                owner, repo = pr["repo"].split("/")
+                scratch = is_scratch(pr)
+                if scratch:
+                    helper, subject, prefix = "wt", None, pr["branch"]
+                else:
+                    helper, subject, prefix = "wtpr", "Pull request", f"pr-{owner}-{pr['number']}"
+                self.save_operation(op, message=f"Checking {op['clone']} on {machine.label}")
+                found = cron_agents.probe(
+                    self.home,
+                    machine,
+                    "wt_prepare",
+                    PREPARE_TIMEOUT,
+                    clone=op["clone"],
+                    repo=pr["repo"],
+                    root=f"{machine.src.rstrip('/')}/worktrees/{repo}",
+                    prefix=prefix,
+                    agent=op["agent"],
+                    account=op.get("claude_account"),
+                    sandbox=cron_agents.BACKENDS[machine.os],
+                )
+                name = found["name"]
+                label = (
+                    []
+                    if scratch
+                    else ["--label", f"pr-{repo}-{pr['head_branch']}{name[len(prefix) :]}"]
+                )
+                self.save_operation(
+                    op,
+                    path=found["path"],
+                    branch=name,
+                    message=f"Fetching {subject.lower()} and starting the selected agent on {machine.label}"
+                    if subject
+                    else f"Branching {name} and starting the selected agent on {machine.label}",
+                )
+                if not op.get("effort"):
+                    # Left on Default: the repository's or global saved default, if any.
+                    default = workspace_agents.default_effort(
+                        self.home, pr["repo"], op["agent"], op.get("model") or ""
+                    )
+                    if default:
+                        self.save_operation(op, effort=default)
+                overrides = []
+                for option in ("model", "effort"):
+                    if op.get(option):
+                        overrides.extend([f"--{option}", op[option]])
+                if op.get("claude_account"):
+                    overrides.extend(["--claude-account", op["claude_account"]])
+                brief = f"{task}\n" if scratch else f"{task}\n\n{subject}: {canonical(pr)}\n"
+                if op.get("exit_marker"):
+                    brief += workspace_exit.brief(op["exit_marker"])
+                staged = machines.put_file(
+                    self.home,
+                    machine,
+                    machines.remote_path(REMOTE_PROMPTS),
+                    op["id"],
+                    brief.encode(),
+                    keep=PROMPT_KEEP,
+                )
+                python = machine.python
+                if python.startswith(("/", "~")):
+                    python = machines.remote_path(python)
+                argv = [
+                    # The agent's pane gets neither: herdr's server starts its shell.
+                    "env",
+                    f"BABYSIT_WORKER={machine.id}",
+                    "WT_MULTIPLEXER=herdr",
+                    python,
+                    machines.remote_path(f"{machine.babysit_root.rstrip('/')}/scripts/wt.py"),
+                    helper,
+                    f"--{op['agent']}",
+                    *overrides,
+                    *(["--docker"] if op.get("docker") else []),
+                    *(["--gpg"] if "gpg" in machine.labels else []),
+                    *(
+                        ["--exit-when-done", "--exit-watch-json"]
+                        if op.get("exit_when_done")
+                        else []
+                    ),
+                    "--no-focus",
+                    "--name",
+                    name,
+                    *label,
+                    "--repo-path",
+                    found["clone"],
+                    "--github-repo",
+                    pr["repo"],
+                    "--worktree-root",
+                    found["root"],
+                    "--prompt-file",
+                    staged,
+                    *(([pr["base"]] if pr.get("base") else []) if scratch else [canonical(pr)]),
+                ]
+                launching = True
+                done = machines.run(self.home, machine, argv, timeout=600, text=True)
+                self.save_operation(op, log=(op["log"] + done.stderr + done.stdout)[-16000:])
+                if done.returncode:
+                    reason = "unreachable" if done.returncode == 255 else "failed"
+                    raise ValueError(
+                        f"wt on {machine.label} {reason}: "
+                        + ((done.stderr or done.stdout).strip()[-4000:] or "no output")
+                    )
+                # From here the agent is typed: trouble makes the launch uncertain.
+                typed = True
+                if op.get("exit_when_done"):
+                    # The label wt gives the workspace, as long as the branch it names.
+                    expected = wt.sanitize_session_name(label[1] if label else name)
+                    self.record_remote_watch(machine, op, found["path"], expected, done.stdout)
+                self.save_operation(op, message="Verifying checkout and agent startup")
+                made = cron_agents.probe(
+                    self.home, machine, "wt_checkout", 30, clone=found["clone"], path=found["path"]
+                )
+                if made["path"] != found["path"] or made["branch"] != name:
+                    raise ValueError(
+                        "Resulting checkout did not match the recorded repository and branch"
+                    )
+                if not scratch and made["upstream"] != self.expected_upstream(pr):
+                    raise ValueError("Resulting checkout has unexpected PR head provenance")
+                for _ in range(30):
+                    space = next(
+                        (
+                            w
+                            for w in herdr("workspace", "list", machine=machine)["workspaces"]
+                            # A worker's path, as its probe resolved it there.
+                            if (w.get("worktree") or {}).get("checkout_path") == found["path"]
+                        ),
+                        None,
+                    )
+                    agent = None
+                    if space is not None:
+                        agent = next(
+                            (
+                                a
+                                for a in herdr("agent", "list", machine=machine)["agents"]
+                                if a.get("workspace_id") == space["workspace_id"]
+                                and a.get("agent") == op["agent"]
+                                and a.get("cwd") == found["path"]
+                            ),
+                            None,
+                        )
+                    if space is not None and agent is not None:
+                        url = collie_url(machine, space["workspace_id"])
+                        self.save_operation(
+                            op,
+                            status="complete",
+                            result={
+                                "path": found["path"],
+                                "branch": name,
+                                "workspace_id": machines.qualify(machine.id, space["workspace_id"]),
+                                "name": space.get("label") or name,
+                                "agent_status": space.get("agent_status", "unknown"),
+                                "url": url,
+                                "pane_id": agent.get("pane_id"),
+                                "machine": machine.id,
+                                "machine_label": machine.label,
+                            },
+                            message=f"Workspace ready on {machine.label}"
+                            + (" — Open in Collie" if url else ""),
+                        )
+                        return
+                    time.sleep(1)
+                raise ValueError(
+                    f"Could not verify the selected agent on {machine.label}; "
+                    "inspect the workspace before retrying"
+                )
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            # A typed agent may be running; a timeout may have typed one. Never resubmit.
+            uncertain = typed or (launching and isinstance(exc, subprocess.TimeoutExpired))
+            self.save_operation(
+                op,
+                status="uncertain" if uncertain else "failed",
+                message=str(exc),
+                log=(op["log"] + "\n" + str(exc))[-16000:],
+            )
+        finally:
+            with self.lock:
+                self.workers.pop(pr["id"], None)
+                self.next_poll = 0
+
+    def record_remote_watch(self, machine, op, path, label, output):
+        """Record the exit watch a worker's wt printed, with the machine it is on.
+
+        Only what herdr and the transcript reader there need is kept, each checked: the
+        rest comes from the launch itself.
+        """
+        lines = output.strip().splitlines()
+        try:
+            watch = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            watch = None
+        if not (
+            isinstance(watch, dict)
+            and isinstance(watch.get("id"), str)
+            and WATCH_ID.fullmatch(watch["id"])
+            and watch.get("path") == path
+            and isinstance(watch.get("workspace_id"), str)
+            and machines.WORKSPACE.fullmatch(watch["workspace_id"])
+            and isinstance(watch.get("pane_id"), str)
+            and PANE.fullmatch(watch["pane_id"])
+            and isinstance(watch.get("marker"), str)
+            and WATCH_MARKER.fullmatch(watch["marker"])
+            and watch.get("label") == label
+        ):
+            raise ValueError(f"wt on {machine.label} did not hand back the agent's exit watch")
+        now = time.time()
+        exit_watch.register(
+            self.home,
+            {
+                "id": watch["id"],
+                "label": label,
+                "path": path,
+                # Qualified: no dashboard takes it for a workspace of its own herdr.
+                "workspace_id": machines.qualify(machine.id, watch["workspace_id"]),
+                "pane_id": watch["pane_id"],
+                "agent": op["agent"],
+                "claude_account": op.get("claude_account"),
+                "marker": watch["marker"],
+                "created_at": now,
+                "exit": exit_watch.watching(now),
+                # Not followed here: workspace_exit reads this machine's herdr and files.
+                "machine": machine.id,
+            },
+        )
 
     def sentry_state(self):
         """Handle progress per Sentry target, without scanning checkouts.

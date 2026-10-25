@@ -1440,6 +1440,127 @@ def _branch(value, what):
     return value
 
 
+def _repo(value):
+    if (
+        not isinstance(value, str)
+        or not SLUG.fullmatch(value)
+        or value.split("/")[1] in {".", ".."}
+    ):
+        raise ValueError("Expected an owner/repo")
+    return value
+
+
+def _host_claude(agent, account, sandbox):
+    """The agent's configuration here: Claude's home (real, for the sandbox), the
+    ``CLAUDE_CONFIG_DIR`` to type (literal, as Claude names its Keychain item after it;
+    None for the default login under Safehouse) and the config its trust goes in.
+
+    babysit-bwrap (``sandbox``) always sets ``CLAUDE_CONFIG_DIR``, so there the default
+    login reads ``~/.claude/.claude.json``. Codex has none of these.
+    """
+    if agent not in {"claude", "codex"}:
+        raise ValueError("Expected claude or codex")
+    if account is not None and (not isinstance(account, str) or not ACCOUNT.fullmatch(account)):
+        raise ValueError("Expected a Claude account name")
+    if sandbox not in {"safehouse", "bwrap"}:
+        raise ValueError("Expected safehouse or bwrap")
+    if agent != "claude":
+        return None, None, None
+    literal_home = os.path.expanduser("~")
+    named = account not in (None, "default")
+    default = os.path.join(literal_home, ".claude")
+    literal = os.path.join(default, "accounts", str(account)) if named else default
+    if named and not os.path.isdir(literal):
+        raise ValueError(f"Unknown Claude account {account} on this machine")
+    claude_home = os.path.realpath(literal)
+    claude_env = literal if named or sandbox == "bwrap" else None
+    config = (
+        os.path.join(claude_home, ".claude.json")
+        if claude_env
+        else os.path.join(os.path.realpath(literal_home), ".claude.json")
+    )
+    return claude_home, claude_env, config
+
+
+def _host_clone(clone, repo):
+    """``clone``'s real path, its remotes that name ``repo`` and its own ``.git``.
+
+    Nothing clones a repository on a worker: a missing clone is refused.
+    """
+    clone = os.path.realpath(os.path.expanduser(clone))
+    if not os.path.isdir(clone):
+        raise ValueError(f"No clone of {repo} at {clone}; clone it on this machine first")
+    remotes = remote_slugs(repo_config(host_git, clone))
+    tracking = [
+        name
+        for name in ("origin", "upstream", *sorted(remotes))
+        if remotes.get(name) == repo.lower()
+    ]
+    if not tracking:
+        raise ValueError(f"{clone} is not a clone of {repo}: none of its remotes names it")
+    common = os.path.join(clone, ".git")
+    if os.path.islink(common) or not os.path.isdir(common):
+        raise ValueError(f"{clone} has no .git directory of its own")
+    return clone, tracking, os.path.realpath(common)
+
+
+def _host_version(babysit_root):
+    """The babysit-pr commit deployed here; launches need the controller's own."""
+    _arg_paths([babysit_root], home=True)
+    root = os.path.realpath(os.path.expanduser(babysit_root))
+    if not os.path.isdir(root):
+        raise ValueError(f"No babysit-pr at {root}; deploy it (provision_worker.sh --user-step)")
+    return {"head": host_git(root, "rev-parse", "HEAD")}
+
+
+def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox):
+    """Where a dashboard launch's ``wt`` makes its checkout here, before it runs.
+
+    ``clone`` must be a clone of ``repo``, as for a cron job. The checkout is named
+    ``prefix``, or ``prefix-<n>`` while a directory or branch of that name exists, and
+    Claude is trusted for it in the config its sandbox reads.
+    """
+    _arg_paths([clone, root], home=True)
+    _repo(repo)
+    _branch(prefix, "checkout")
+    if "/" in prefix:
+        raise ValueError("Expected a checkout name without '/'")
+    _, _, config = _host_claude(agent, account, sandbox)
+    clone, _, common = _host_clone(clone, repo)
+    root = os.path.realpath(os.path.expanduser(root))
+    if root == common or root.startswith(common + os.sep):
+        raise ValueError(f"{root} lies inside {clone}'s .git")
+    name, n = prefix, 1
+    while os.path.lexists(os.path.join(root, name)) or _host_branch_exists(clone, name):
+        n += 1
+        name = f"{prefix}-{n}"
+    path = os.path.join(root, name)
+    if config is not None:
+        _host_trust(config, path)
+    return {"clone": clone, "root": root, "name": name, "path": path}
+
+
+def _host_branch_exists(clone, branch):
+    try:
+        host_git(clone, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    except ValueError:
+        return False
+    return True
+
+
+def _host_wt_checkout(clone, path):
+    """What ``wt`` made at ``path``: a worktree of ``clone``, its branch and upstream."""
+    _arg_paths([clone, path])
+    path = os.path.realpath(path)
+    common = _host_common_dir(path)
+    if common != os.path.realpath(os.path.join(clone, ".git")):
+        raise ValueError(f"{path} is not a worktree of {clone}")
+    branch = host_git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    config = repo_config(host_git, path)
+    found = provenance(path, common, branch, None, config, remote_slugs(config))
+    return {"path": path, "branch": branch, "upstream": found["upstream"]}
+
+
 def _host_cron_checkout(
     clone, repo, branch, base, directory, agent, account, babysit_root, sandbox
 ):
@@ -1460,46 +1581,13 @@ def _host_cron_checkout(
     sets ``CLAUDE_CONFIG_DIR``, so the default login reads ``~/.claude/.claude.json``.
     """
     _arg_paths([clone, directory, babysit_root], home=True)
-    if not isinstance(repo, str) or not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
-        raise ValueError("Expected an owner/repo")
+    _repo(repo)
     _branch(branch, "job")
     if base:
         _branch(base, "base")
-    if agent not in {"claude", "codex"}:
-        raise ValueError("Expected claude or codex")
-    if account is not None and (not isinstance(account, str) or not ACCOUNT.fullmatch(account)):
-        raise ValueError("Expected a Claude account name")
-    if sandbox not in {"safehouse", "bwrap"}:
-        raise ValueError("Expected safehouse or bwrap")
-    literal_home = os.path.expanduser("~")
-    home = os.path.realpath(literal_home)
-    claude_home = claude_env = config = None
-    if agent == "claude":
-        named = account not in (None, "default")
-        default = os.path.join(literal_home, ".claude")
-        literal = os.path.join(default, "accounts", str(account)) if named else default
-        if named and not os.path.isdir(literal):
-            raise ValueError(f"Unknown Claude account {account} on this machine")
-        claude_home = os.path.realpath(literal)
-        claude_env = literal if named or sandbox == "bwrap" else None
-        config = (
-            os.path.join(claude_home, ".claude.json")
-            if claude_env
-            else os.path.join(home, ".claude.json")
-        )
-    clone = os.path.realpath(os.path.expanduser(clone))
-    remotes = remote_slugs(repo_config(host_git, clone))
-    tracking = [
-        name
-        for name in ("origin", "upstream", *sorted(remotes))
-        if remotes.get(name) == repo.lower()
-    ]
-    if not tracking:
-        raise ValueError(f"{clone} is not a clone of {repo}: none of its remotes names it")
-    common_expected = os.path.join(clone, ".git")
-    if os.path.islink(common_expected) or not os.path.isdir(common_expected):
-        raise ValueError(f"{clone} has no .git directory of its own")
-    common_expected = os.path.realpath(common_expected)
+    home = os.path.realpath(os.path.expanduser("~"))
+    claude_home, claude_env, config = _host_claude(agent, account, sandbox)
+    clone, tracking, common_expected = _host_clone(clone, repo)
     directory = os.path.expanduser(directory)
     if os.path.isdir(directory):
         path = os.path.realpath(directory)
@@ -1627,6 +1715,9 @@ OPS: dict[str, Callable[..., Any]] = {
     "tail": _host_tail,
     "turn": _host_turn,
     "cron_checkout": _host_cron_checkout,
+    "version": _host_version,
+    "wt_prepare": _host_wt_prepare,
+    "wt_checkout": _host_wt_checkout,
 }
 
 
@@ -1981,6 +2072,48 @@ def validate_cron_checkout(value):
     return value
 
 
+def validate_version(value):
+    _expect(isinstance(value, dict) and set(value) == {"head"}, "fields")
+    _expect(
+        isinstance(value["head"], str)
+        and re.fullmatch("[0-9a-f]{40}([0-9a-f]{24})?", value["head"]),
+        "head",
+    )
+    return value
+
+
+def validate_wt_prepare(value):
+    """The paths and name a worker's ``wt`` gets on its command line, nothing else."""
+    _expect(isinstance(value, dict) and set(value) == {"clone", "root", "name", "path"}, "fields")
+    for key in ("clone", "root", "path"):
+        _expect(_absolute(value[key]) and not CONTROL.search(value[key]), key)
+    _expect(
+        isinstance(value["name"], str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", value["name"])
+        and value["path"] == f"{value['root'].rstrip('/')}/{value['name']}",
+        "name",
+    )
+    return value
+
+
+def validate_wt_checkout(value):
+    _expect(isinstance(value, dict) and set(value) == {"path", "branch", "upstream"}, "fields")
+    _expect(_absolute(value["path"]), "path")
+    _expect(_text(value["branch"]), "branch")
+    upstream = value["upstream"]
+    _expect(
+        upstream is None
+        or (
+            isinstance(upstream, list)
+            and len(upstream) == 2
+            and (upstream[0] is None or _text(upstream[0]))
+            and _text(upstream[1])
+        ),
+        "upstream",
+    )
+    return value
+
+
 VALIDATORS = {
     "inventory": validate_inventory,
     "diff": validate_diff,
@@ -1989,6 +2122,9 @@ VALIDATORS = {
     "tail": validate_tail,
     "turn": validate_turn,
     "cron_checkout": validate_cron_checkout,
+    "version": validate_version,
+    "wt_prepare": validate_wt_prepare,
+    "wt_checkout": validate_wt_checkout,
 }
 
 

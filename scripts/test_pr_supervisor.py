@@ -547,6 +547,35 @@ def test_worktree_git_refuses_worker_jobs_and_keeps_local_argv(harness, monkeypa
     assert calls[0] == supervisor.safe_git.prepare(cwd, "symbolic-ref", "--short", "HEAD")[0]
 
 
+@pytest.mark.parametrize(
+    "command",
+    [["register", "--headless", "--instructions", "x"], ["handoff", "w1", "--pane", "p1"]],
+)
+@pytest.mark.parametrize("marked", ["file", "environment"])
+def test_a_worker_never_registers_watches_of_its_own(tmp_path, command, marked):
+    # A worker's own supervisor would act on the watch where nobody looks.
+    home = tmp_path / "home"
+    env = {**os.environ, "HOME": str(home)}
+    env.pop("BABYSIT_WORKER", None)
+    if marked == "file":
+        (home / ".config" / "babysit-pr").mkdir(parents=True)
+        (home / ".config" / "babysit-pr" / "worker.json").write_text("{}")
+    else:
+        env["BABYSIT_WORKER"] = "box"
+    state = tmp_path / "state"
+    result = subprocess.run(
+        [sys.executable, str(supervisor.SCRIPT), "--home", str(state), *command],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1
+    assert json.loads(result.stdout) == {
+        "error": "Watch registration from worker machines isn't supported yet"
+    }
+    assert supervisor.jobs(supervisor.open_db(state)) == []
+
+
 def test_live_session_cannot_release_itself(harness):
     h = harness
     env = os.environ.copy()

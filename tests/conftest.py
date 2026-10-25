@@ -40,9 +40,12 @@ def save():
 store['calls'].append(a); data=store; label=None
 if a[:1] and a[0].startswith('--machine='):
  # Each saved machine keeps its own workspaces and agents, so two hosts can both hand out w1.
- label=a[0].split('=',1)[1]
+ label=a[0].split('=',1)[1]; a=a[1:]
+elif os.environ.get('FAKE_HERDR_LOCAL'):
+ label=os.environ['FAKE_HERDR_LOCAL']  # Run on that machine (over the fake ssh): its own server.
+if label:
  data=store.setdefault('machines',{}).setdefault(label,{'workspaces':[],'agents':[],'calls':[]})
- a=a[1:]; data['calls'].append(a)
+ data['calls'].append(a)
  if label in os.environ.get('FAKE_HERDR_DOWN','').split(','):
   save(); print(json.dumps({'error':{'message':f'cannot reach {label}'}})); sys.exit(1)
 result={}
@@ -167,7 +170,11 @@ if os.environ.get('FAKE_SSH_DOWN') == target:
  print(f'ssh: connect to host {target} port 22: Connection refused',file=sys.stderr); sys.exit(255)
 # The remote side: the command line through a shell, from a per-host home.
 home=p.parent/'hosts'/target; home.mkdir(parents=True,exist_ok=True)
-sys.exit(subprocess.call(['/bin/sh','-c',command],cwd=home,env={**os.environ,'HOME':str(home)}))
+env={**os.environ,'HOME':str(home)}
+# herdr run there reaches that machine's server, which the controller names by its label.
+label=json.loads(os.environ.get('FAKE_HOST_LABELS','{}')).get(target)
+if label: env['FAKE_HERDR_LOCAL']=label
+sys.exit(subprocess.call(['/bin/sh','-c',command],cwd=home,env=env))
 """
 
 FAKES = {

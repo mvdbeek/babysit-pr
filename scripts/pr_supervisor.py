@@ -990,6 +990,17 @@ def start_daemon(home, max_workers):
     raise RuntimeError("Supervisor startup is unconfirmed; inspect status")
 
 
+def refuse_worker_registration():
+    """Watches live on the controller, whose supervisor repairs them; a worker's own would
+    act where nobody looks. Provisioning marks a worker, and launches there say so.
+
+    Registration forwarded to the controller's dashboard will replace this refusal.
+    """
+    marker = Path.home() / ".config" / "babysit-pr" / "worker.json"
+    if os.environ.get("BABYSIT_WORKER") or marker.exists():
+        raise ValueError("Watch registration from worker machines isn't supported yet")
+
+
 def register(db, args):
     # A registry id; None (the default) is this machine.
     machine = getattr(args, "machine", None)
@@ -1223,6 +1234,8 @@ def main():
             return 1
     db = open_db(home)
     try:
+        if args.command in {"register", "handoff"}:
+            refuse_worker_registration()
         if args.command == "register":
             job = register(db, args)
             emit(

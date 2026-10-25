@@ -187,7 +187,10 @@ def test_machine_select_previews_and_disables_machines_that_cannot_take_it(page,
     dialog.get_by_label("Allow Docker in the agent’s sandbox").uncheck()
     expect(options.nth(2)).to_be_enabled()
     select.select_option("mini")
-    expect(note).to_have_text("full (4/4). Starting agents on Mac mini is not supported yet.")
+    expect(note).to_have_text(
+        "full (4/4). The agent starts on Mac mini, in its own clone of the repository; "
+        "only reviews and new tasks can start there yet."
+    )
     dialog.get_by_label("New branch").fill("try")
     dialog.get_by_label("Task", exact=True).fill("Explore")
     dialog.get_by_role("button", name="Start task").click()
@@ -279,7 +282,10 @@ def test_a_refused_choice_stays_with_its_reason(page, site):
     select = dialog.get_by_label("Machine", exact=True)
     note = dialog.locator(".machine-choice")
     select.select_option("mini")
-    expect(note).to_have_text("full (4/4). Starting agents on Mac mini is not supported yet.")
+    expect(note).to_have_text(
+        "full (4/4). The agent starts on Mac mini, in its own clone of the repository; "
+        "only reviews and new tasks can start there yet."
+    )
     dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
     expect(select.locator("option").nth(2)).to_be_disabled()
     expect(select).to_have_value("mini")

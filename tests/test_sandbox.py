@@ -532,6 +532,20 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
     assert not any("docker" in word for word in argv)
 
 
+def test_wrapper_tells_a_workers_agent_it_is_on_a_worker(checkout):
+    worktree, _, home = checkout
+    # Its $HOME is empty inside, so the provisioning mark reaches it as BABYSIT_WORKER.
+    env = environment(home, BABYSIT_WORKER="")
+    argv = printed(worktree, env, "--env-pass=BABYSIT_WORKER", "--", "agent")
+    assert [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_WORKER"] == [""]
+    (home / ".config" / "babysit-pr").mkdir(parents=True)
+    (home / ".config" / "babysit-pr" / "worker.json").write_text("{}")
+    argv = printed(worktree, env, "--env-pass=BABYSIT_WORKER", "--", "agent")
+    # Set last, so no passed value can clear it.
+    assert [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_WORKER"][-1] == "1"
+    assert dict(pairs(argv, "--setenv"))["BABYSIT_WORKER"] == "1"
+
+
 def test_wrapper_ignores_the_working_directory_and_its_git_files(checkout):
     worktree, common, home = checkout
     # What an agent could leave for the next launch: git pointing outside its checkout.
