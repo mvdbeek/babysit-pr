@@ -378,3 +378,45 @@ def test_checks_flag_root_equivalent_groups(tmp_path, group):
     assert f"PROBLEM: babysit is in the {group} group" in done.stderr
     # Device access rather than root, but still more than an agent account needs.
     assert "WARNING: babysit is in the kvm group" in done.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root --check inspects the host instead")
+def test_user_check_reports_claude_accounts_that_would_not_start_unattended(tmp_path):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    for tool in ("bwrap", "docker", "gpg", "systemctl", "git"):
+        (fakes / tool).write_text("#!/bin/sh\necho rootless\nexit 0\n")
+    (fakes / "id").write_text('#!/bin/sh\ncase "$1" in -u) echo 1000 ;; *) echo babysit ;; esac\n')
+    for fake in fakes.iterdir():
+        fake.chmod(0o755)
+    home = tmp_path / "home"
+    accounts = home / ".claude/accounts"
+    login = {"oauthAccount": {"accountUuid": "SECRET-UUID", "emailAddress": "a@example.com"}}
+    for name, config, settings in [
+        (
+            "ready",
+            {**login, "hasCompletedOnboarding": True},
+            {"skipDangerousModePermissionPrompt": True},
+        ),
+        ("fresh", login, {}),
+        ("signedout", {}, {}),
+    ]:
+        (accounts / name).mkdir(parents=True)
+        (accounts / name / ".claude.json").write_text(json.dumps(config))
+        (accounts / name / "settings.json").write_text(json.dumps(settings))
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--check"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    output = done.stdout + done.stderr
+    assert "SECRET" not in output
+    assert "ok: Claude account ready is signed in and starts unattended" in output
+    assert re.search(
+        r"Claude account fresh would stop at Claude's first-run screens \(onboarding permission-prompt\)",
+        output,
+    )
+    assert "Claude account signedout is not signed in; run claude-account login signedout" in output
+    assert done.returncode == 1
