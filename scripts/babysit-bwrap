@@ -6,13 +6,16 @@
 #
 # Deny by default: a read-only system, an empty $HOME, and writes only to --add-dirs (the
 # caller passes the worktree and its git common directory there), the one agent
-# configuration directory and a cache root that only sandboxed agents use. Nothing is
+# configuration directory (which must exist) and a cache root that only sandboxed agents
+# of that configuration use. Nothing is
 # discovered from the working directory or its git files, which the agent can rewrite.
 # Every writable path must be absolute and is resolved first; home, its ancestors and
 # protected paths are refused. The environment is cleared except for a small baseline,
 # the agent configuration variable, the cache variables and the --env-pass names that
-# are set. The network is shared. --print-argv prints the bwrap argv, NUL-separated,
-# instead of running it.
+# are set. The network is shared. Where bwrap has --bind-fd (0.10.0 and later), each
+# writable directory is opened once, checked through its descriptor and bound by it, so
+# a path swapped after the check cannot redirect the bind. --print-argv prints the bwrap
+# argv, NUL-separated, instead of running it.
 set -euo pipefail
 
 die() {
@@ -77,22 +80,44 @@ done
 home=${HOME:?}
 [[ $home == /* ]] || die "HOME must be absolute"
 real_home=$(realpath -- "$home" 2>/dev/null) || real_home=$home
-# Package caches for sandboxed agents only: nothing outside the sandbox runs code from
-# them, unlike the host caches an agent could otherwise plant code in.
-cache=$home/.cache/babysit-sandbox
+
+# Like GNU `realpath -m`, which macOS lacks: resolves the longest existing ancestor of
+# an absolute path and appends the rest, so a symlinked parent cannot hide an entry.
+resolve() {
+  local path=$1 rest=
+  while [[ ! -e $path ]]; do
+    rest=/${path##*/}$rest
+    path=${path%/*}
+    path=${path:-/}
+  done
+  path=$(realpath -- "$path")
+  printf '%s\n' "${path%/}$rest"
+}
 
 # Never writable, nor any directory holding one: credentials, babysit's own state and
-# launchers, and shell startup files, all of which run or authorize code outside.
+# launchers, and shell, session and git startup files, all of which run or authorize
+# code outside.
 protected=()
 for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .local/bin \
-  .cache/babysit-sandbox .bashrc .bash_profile .bash_login .bash_logout .profile .zshenv \
-  .zprofile .zshrc .zlogin .zlogout; do
-  protected+=("$real_home/$path")
+  .cache/babysit-sandbox .bashrc .bashrc.d .bash_profile .bash_login .bash_logout .profile \
+  .zshenv .zprofile .zshrc .zlogin .zlogout .config/fish .pam_environment .config/systemd \
+  .config/autostart .config/environment.d .gitconfig .config/git; do
   # A dotfile manager's link protects its target too.
-  if [[ -e $home/$path ]]; then
-    protected+=("$(realpath -- "$home/$path")")
+  protected+=("$real_home/$path" "$(resolve "$home/$path")")
+  if [[ -L $home/$path && ! -e $home/$path ]]; then
+    # A dangling link: whoever creates its target writes this file.
+    target=$(readlink -- "$home/$path")
+    [[ $target == /* ]] || target=$(dirname -- "$home/$path")/$target
+    protected+=("$(resolve "$target")")
   fi
 done
+
+# Binding by descriptor needs bwrap 0.10.0's --bind-fd; a dry run without bwrap binds paths.
+bind_fd=0
+if command -v bwrap >/dev/null; then
+  help=$(bwrap --help 2>&1) || true
+  [[ $help != *--bind-fd* ]] || bind_fd=1
+fi
 
 # Prints the resolved writable directory, nothing for one that does not exist (like
 # --bind-try), and refuses anything that would expose what it must not.
@@ -112,6 +137,26 @@ writable() {
   printf '%s\n' "$real"
 }
 
+# Adds a writable bind of resolved directory $1. By descriptor when bwrap can: the open
+# follows whatever the path is now, so the descriptor must still name $1 itself, and
+# bwrap then mounts that directory whatever happens to the path. The descriptor stays
+# open into bwrap, which closes it after mounting.
+grant() {
+  local real=$1 fd now
+  if ((bind_fd)); then
+    exec {fd}<"$real" || die "cannot open $real"
+    if [[ -d /proc/self/fd ]]; then
+      now=$(readlink "/proc/self/fd/$fd") || now=
+    elif ((print)); then
+      now=$real # a dry run off Linux, which has no /proc to ask
+    fi
+    [[ ${now:-} == "$real" ]] || die "refusing $real, which changed while it was checked"
+    argv+=(--bind-fd "$fd" "$real")
+  else
+    argv+=(--bind "$real" "$real")
+  fi
+}
+
 # setsid stops the agent pushing input into the terminal (TIOCSTI), but an interactive
 # agent needs its terminal's job control: drop it only when the kernel disables TIOCSTI.
 session=(--new-session)
@@ -121,20 +166,28 @@ fi
 argv=(bwrap --die-with-parent ${session[@]+"${session[@]}"} --unshare-pid --unshare-ipc
   --unshare-uts --clearenv --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
 
+if [[ -n $config_var ]]; then
+  real=$(writable "$config_dir")
+  # Exporting a missing one would point the agent at the empty home's tmpfs.
+  [[ -n $real ]] || die "the agent configuration directory $config_dir does not exist"
+  config_dir=$real
+fi
+# Package caches for sandboxed agents only: nothing outside the sandbox runs code from
+# them, unlike the host caches an agent could otherwise plant code in. One per agent
+# configuration, so agents with different grants never run each other's downloads.
+sha=(sha256sum)
+command -v sha256sum >/dev/null || sha=(shasum -a 256) # macOS dry runs
+key=$(printf '%s=%s' "$config_var" "$config_dir" | "${sha[@]}")
+cache=$home/.cache/babysit-sandbox/${key:0:16}
+
 # Writable: the sandbox cache, the agent configuration and the explicit grants. They
 # come before every read-only bind, so none of them can shadow one.
 argv+=(--bind "$cache" "$cache")
-if [[ -n $config_var ]]; then
-  real=$(writable "$config_dir")
-  if [[ -n $real ]]; then
-    argv+=(--bind "$real" "$real")
-    config_dir=$real
-  fi
-fi
+[[ -z $config_var ]] || grant "$config_dir"
 for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   [[ -n $path ]] || continue
   real=$(writable "$path")
-  [[ -z $real ]] || argv+=(--bind "$real" "$real")
+  [[ -z $real ]] || grant "$real"
 done
 
 if ((docker)); then

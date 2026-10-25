@@ -264,19 +264,33 @@ options, plus `--claude-config-dir` or `--codex-home`, before `--` and the comma
 It mounts the system read-only, gives the agent an empty `$HOME`, and allows
 writes only to `--add-dirs`, the one agent configuration directory it is given
 (exported as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Claude always gets an explicit
-one, so its `.claude.json` lives inside it) and `~/.cache/babysit-sandbox`, a
-cache root used only by sandboxed agents (`XDG_CACHE_HOME`, `UV_CACHE_DIR`,
-`PIP_CACHE_DIR`, `npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). Host caches are
-never writable: code planted there would run outside the sandbox. The wrapper
+one, so its `.claude.json` lives inside it; a missing one is refused rather than
+exported into the empty home) and `~/.cache/babysit-sandbox/<hash of that
+configuration directory>`, a cache used only by sandboxed agents of that
+configuration (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
+`npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`), so agents with different grants
+never run each other's downloads. Host caches are never writable: code planted
+there would run outside the sandbox. The wrapper
 discovers nothing from its working directory or git, whose files the agent can
 rewrite; babysit passes the worktree and its git common directory in `--add-dirs`
 from its own records (the worktree `wt` created, the job `cwd` that the repair
 just verified), and takes that common directory only when it registers the
-worktree back. Every writable path must be absolute and is resolved first; `/`,
-`$HOME` and its ancestors, and anything equal to, inside or holding `~/.ssh`,
-`~/.gnupg`, `~/.config/gh`, `~/.config/babysit-pr`, `~/.local/state/babysit-pr`,
-`~/.local/bin`, the sandbox cache root or a shell startup file are refused, as
-are newlines. Read-only binds (system, toolchains, `~/.config/gh`) follow the
+worktree back. A main checkout whose `.git` is also the common directory of
+other registered worktrees is refused (use a linked worktree): its agent could
+swap that directory for a link just before another worktree's sandbox binds it.
+Every writable path must be absolute and is resolved first; `/`, `$HOME` and its
+ancestors, and anything equal to, inside or holding `~/.ssh`, `~/.gnupg`,
+`~/.config/gh`, `~/.config/babysit-pr`, `~/.local/state/babysit-pr`,
+`~/.local/bin`, the whole sandbox cache root, a shell or session startup file
+(`.bashrc`, `.bashrc.d`, `.profile`, `.bash_profile`, `.bash_login`, the zsh
+files, `~/.config/fish`, `.pam_environment`, `~/.config/systemd`,
+`~/.config/autostart`, `~/.config/environment.d`) or git's user configuration
+(`.gitconfig`, `~/.config/git`) are refused, as are newlines. Protected entries
+are resolved whether or not they exist, through linked parents and dangling
+dotfile links. Where bwrap has `--bind-fd` (bubblewrap 0.10.0 and later, detected
+from `bwrap --help`), each writable directory is opened once after it is checked,
+its descriptor must still resolve to the checked path, and bwrap binds that
+descriptor, so a path swapped after the check cannot redirect the bind. Read-only binds (system, toolchains, `~/.config/gh`) follow the
 writable ones, so none can be shadowed. It unshares PID, IPC and UTS
 namespaces, dies with its parent, and clears the environment except `PATH`,
 `HOME`, `TERM`, `LANG`, `USER`, the variables above and the `--env-pass` names.
@@ -293,7 +307,19 @@ Known gaps of the Linux sandbox:
   so the agent can commit. git run outside the sandbox in that checkout later
   (by you or by babysit) can execute what the agent left there.
 - The network namespace is the host's: the agent reaches services on localhost
-  and abstract Unix sockets. Egress isolation is a later step.
+  and abstract Unix sockets, including an X11 display and a D-Bus session bus
+  that listen on them, which can start programs outside the sandbox. Accepted
+  for now; run the worker headless, without a desktop session for its user.
+  Egress isolation is a later step.
+- The writable agent configuration directory lets the agent plant hooks, MCP
+  servers or notify commands there, which run unsandboxed whenever the same
+  account is used outside the sandbox. Accepted: keep accounts used sandboxed
+  separate from accounts used unsandboxed.
+- With a bwrap older than 0.10.0 writable directories are bound by path, so a
+  process that can write a bound directory's parent could swap it for a link
+  between the check and the bind. Refusing shared main checkouts closes the
+  case babysit creates itself; extra `--add-dirs` grants whose parents another
+  sandbox can write keep that race. Prefer bubblewrap 0.10.0 or later.
 - `--enable=docker` refuses the system daemon's socket, which is root on the
   machine, and binds only `$XDG_RUNTIME_DIR/docker.sock`. Even a rootless daemon
   gives up the filesystem boundary (`docker run -v $HOME:/h` reaches every file

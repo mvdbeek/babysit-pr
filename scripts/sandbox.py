@@ -202,6 +202,10 @@ def git_dirs(worktree: str) -> tuple[str, ...]:
     directory counts only when it registers this worktree back; only directories the
     agent can already write could fake that. babysit-bwrap refuses home, its ancestors
     and protected paths whatever it is given.
+
+    A main checkout whose ``.git`` is also other worktrees' common directory is refused:
+    its agent could swap that directory for a link just before another worktree's
+    sandbox binds it, and not every bwrap can bind the directory it checked.
     """
     worktree = os.path.realpath(worktree)
     dot_git = os.path.join(worktree, ".git")
@@ -209,7 +213,8 @@ def git_dirs(worktree: str) -> tuple[str, ...]:
         # Not a checkout's top level: git would search the parents, maybe a home repository.
         return (worktree,)
     found = subprocess.run(
-        ["git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ["git", "-c", "core.fsmonitor=false", "-C", worktree, "rev-parse"]
+        + ["--path-format=absolute", "--git-common-dir"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -217,13 +222,19 @@ def git_dirs(worktree: str) -> tuple[str, ...]:
     if found.returncode:
         return (worktree,)
     common = os.path.realpath(found.stdout.strip())
-    if common == dot_git:
-        return (worktree,)
     registered = {
-        os.path.realpath(entry.read_text().strip())
+        # Relative entries (worktree.useRelativePaths) are relative to their own directory.
+        os.path.realpath(entry.parent / entry.read_text().strip())
         for entry in Path(common).glob("worktrees/*/gitdir")
         if entry.is_file()
     }
+    if common == dot_git:
+        if registered:
+            raise ValueError(
+                f"Refusing to sandbox the main checkout {worktree}, whose git directory "
+                "other worktrees share; use a linked worktree"
+            )
+        return (worktree,)
     if dot_git not in registered or Path(worktree).is_relative_to(common):
         raise ValueError(f"The git directory {common} does not register the worktree {worktree}")
     return (worktree, common)

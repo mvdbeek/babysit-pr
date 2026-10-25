@@ -5,6 +5,7 @@ produced before ``sandbox.py`` existed, so the refactor stays byte-identical on 
 No real agent ever starts; only the Linux-gated tests run bubblewrap, with ``sh``.
 """
 
+import hashlib
 import itertools
 import os
 import pty
@@ -315,10 +316,13 @@ def checkout(tmp_path):
 def test_git_dirs_trust_only_a_common_directory_that_registers_the_worktree(checkout, tmp_path):
     worktree, common, home = checkout
     assert sandbox.git_dirs(str(worktree)) == (str(worktree), str(common))
-    assert sandbox.git_dirs(str(common.parent)) == (str(common.parent),)
     assert sandbox.git_dirs(str(home)) == (str(home),)  # no repository: nothing more
     (common.parent / "sub").mkdir()
     assert sandbox.git_dirs(str(common.parent / "sub")) == (str(common.parent / "sub"),)
+    # Git may record a worktree relative to its entry's directory, never to ours.
+    entry = next(common.glob("worktrees/*/gitdir"))
+    entry.write_text(os.path.relpath(worktree / ".git", entry.parent) + "\n")
+    assert sandbox.git_dirs(str(worktree)) == (str(worktree), str(common))
     # An agent redirecting its checkout's git files at a directory it wants next time.
     (home / "HEAD").write_text("ref: refs/heads/main\n")
     for name in ("objects", "refs"):
@@ -326,6 +330,16 @@ def test_git_dirs_trust_only_a_common_directory_that_registers_the_worktree(chec
     (worktree / ".git").write_text(f"gitdir: {home}\n")
     with pytest.raises(ValueError, match="does not register the worktree"):
         sandbox.git_dirs(str(worktree))
+
+
+def test_git_dirs_refuse_a_main_checkout_whose_git_directory_is_shared(checkout, tmp_path):
+    _, common, _ = checkout
+    # Its agent could swap .git for a link just before the linked worktree's sandbox binds it.
+    with pytest.raises(ValueError, match="Refusing to sandbox the main checkout"):
+        sandbox.git_dirs(str(common.parent))
+    alone = tmp_path / "alone"
+    subprocess.run(["git", "init", "-q", str(alone)], check=True)
+    assert sandbox.git_dirs(str(alone)) == (str(alone.resolve()),)
 
 
 def test_linux_typed_lines_invoke_the_wrapper_explicitly(checkout, monkeypatch):
@@ -373,11 +387,22 @@ def test_linux_codex_repairs_get_their_worktree_and_codex_home(checkout, monkeyp
 # --- babysit-bwrap -----------------------------------------------------------------------
 
 WRAPPER = str(SCRIPTS / "babysit-bwrap")
+FAKE_BWRAP = Path(__file__).resolve().parent / "fixtures" / "bwrap"
 
 
-def environment(home, **extra):
-    base = {"PATH": os.environ["PATH"], "HOME": str(home), "TERM": "dumb", "LANG": "C"}
+def environment(home, bwrap="path", **extra):
+    """The wrapper's environment, with a fake bwrap that binds by ``path`` or ``fd``.
+
+    ``bwrap=None`` leaves the host's bwrap, for the tests that run it.
+    """
+    path = os.environ["PATH"] if bwrap is None else f"{FAKE_BWRAP / bwrap}:{os.environ['PATH']}"
+    base = {"PATH": path, "HOME": str(home), "TERM": "dumb", "LANG": "C"}
     return {**base, "USER": "fixture", "GIT_CONFIG_NOSYSTEM": "1", **extra}
+
+
+def sandbox_cache(home, config_var="", config_dir=""):
+    key = hashlib.sha256(f"{config_var}={config_dir}".encode()).hexdigest()[:16]
+    return str(home / ".cache/babysit-sandbox" / key)
 
 
 def run_wrapper(cwd, env, *options, stdin=subprocess.DEVNULL):
@@ -437,7 +462,7 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
     ]
     assert argv[-5:] == ["--chdir", str(worktree), "--", "agent", "--flag"]
     assert ("--tmpfs", str(home)) in [tuple(argv[i : i + 2]) for i in range(len(argv))]
-    cache = str(home / ".cache/babysit-sandbox")
+    cache = sandbox_cache(home, "CLAUDE_CONFIG_DIR", account.resolve())
     writable = pairs(argv, "--bind")
     assert {source for source, target in writable if source == target} == {
         cache,
@@ -475,7 +500,7 @@ def test_wrapper_ignores_the_working_directory_and_its_git_files(checkout):
     # What an agent could leave for the next launch: git pointing outside its checkout.
     subprocess.run(["git", "-C", str(worktree), "config", "core.worktree", str(home)], check=True)
     argv = printed(worktree, environment(home), "--", "agent")
-    assert {source for source, _ in pairs(argv, "--bind")} == {str(home / ".cache/babysit-sandbox")}
+    assert {source for source, _ in pairs(argv, "--bind")} == {sandbox_cache(home)}
     # And from inside home itself, nothing of home becomes writable either.
     assert pairs(printed(home, environment(home), "agent"), "--bind") == pairs(argv, "--bind")
 
@@ -489,6 +514,45 @@ def test_wrapper_binds_one_agent_configuration_only(checkout):
     assert not any(word.startswith(str(home / ".claude")) for word in argv)
     message = refused(worktree, environment(home), "--codex-home=/a", "--claude-config-dir=/b", "x")
     assert "only one agent configuration directory" in message
+    # A missing one would leave the agent configured inside the empty home's tmpfs.
+    message = refused(worktree, environment(home), f"--claude-config-dir={home / 'gone'}", "x")
+    assert "configuration directory" in message and "does not exist" in message
+
+
+def test_wrapper_gives_each_agent_configuration_its_own_cache(checkout):
+    worktree, _, home = checkout
+    caches = set()
+    for option in ("--claude-config-dir=a", "--claude-config-dir=b", "--codex-home=a"):
+        (home / option[-1]).mkdir(exist_ok=True)
+        config = option.split("=")[0] + f"={home / option[-1]}"
+        argv = printed(worktree, environment(home), config, "agent")
+        cache = pairs(argv, "--bind")[0][0]
+        assert ("XDG_CACHE_HOME", cache) in pairs(argv, "--setenv")
+        caches.add(cache)
+    assert len(caches) == 3
+    assert all(Path(cache).parent == home / ".cache/babysit-sandbox" for cache in caches)
+    # The cache root stays protected as a whole: no grant reaches another agent's cache.
+    Path(next(iter(caches))).mkdir(parents=True)
+    message = refused(worktree, environment(home), f"--add-dirs={next(iter(caches))}", "x")
+    assert "overlaps the protected" in message
+
+
+def test_wrapper_binds_checked_directories_by_descriptor_when_bwrap_can(checkout):
+    worktree, common, home = checkout
+    (home / ".codex").mkdir()
+    options = (f"--codex-home={home / '.codex'}", f"--add-dirs={worktree}:{common}", "codex")
+    by_path = printed(worktree, environment(home, bwrap="path"), *options)
+    by_fd = printed(worktree, environment(home, bwrap="fd"), *options)
+    granted = [str(home / ".codex"), str(worktree), str(common)]
+    cache = sandbox_cache(home, "CODEX_HOME", (home / ".codex").resolve())
+    assert pairs(by_path, "--bind") == [(cache, cache)] + [(path, path) for path in granted]
+    assert not pairs(by_path, "--bind-fd")
+    # The cache root is babysit's own; only checked grants go by descriptor.
+    assert pairs(by_fd, "--bind") == [(cache, cache)]
+    descriptors = pairs(by_fd, "--bind-fd")
+    assert [target for _, target in descriptors] == granted
+    assert all(fd.isdigit() and int(fd) > 2 for fd, _ in descriptors)
+    assert len({fd for fd, _ in descriptors}) == len(granted)
 
 
 def test_wrapper_refuses_paths_that_expose_home_or_protected_files(checkout, tmp_path):
@@ -516,6 +580,44 @@ def test_wrapper_refuses_paths_that_expose_home_or_protected_files(checkout, tmp
         assert message in refused(worktree, env, f"--add-dirs={worktree}:{path}", "x"), path
         assert message in refused(worktree, env, f"--claude-config-dir={path}", "claude"), path
     assert "containing a newline" in refused(worktree, env, f"--add-dirs={worktree}\n/", "x")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".config/systemd",
+        ".config/autostart",
+        ".config/environment.d",
+        ".config/fish",
+        ".config/git",
+        ".bashrc.d",
+        ".pam_environment",
+        ".gitconfig",
+        ".profile",
+        ".zprofile",
+        ".zshenv",
+        ".bash_profile",
+        ".bash_login",
+    ],
+)
+def test_wrapper_protects_session_and_git_startup_files(checkout, path):
+    worktree, _, home = checkout
+    (home / path).mkdir(parents=True)
+    message = refused(worktree, environment(home), f"--add-dirs={home / path}", "x")
+    assert "overlaps the protected" in message
+
+
+def test_wrapper_protects_missing_paths_under_linked_parents(checkout, tmp_path):
+    worktree, _, home = checkout
+    # ~/.config links elsewhere, and none of the protected entries in it exist yet.
+    (tmp_path / "xdg").mkdir()
+    (home / ".config").symlink_to(tmp_path / "xdg")
+    # A dangling dotfile link: whoever creates its target writes ~/.bashrc.
+    (tmp_path / "dots").mkdir()
+    (home / ".bashrc").symlink_to(tmp_path / "dots" / "bashrc")
+    for path in (tmp_path / "xdg", tmp_path / "dots"):
+        message = refused(worktree, environment(home), f"--add-dirs={path}", "x")
+        assert "overlaps the protected" in message, path
 
 
 def tty_launch(worktree, home, *options):
@@ -608,7 +710,7 @@ def test_bwrap_contains_writes_and_hides_home(checkout, tmp_path):
     result = subprocess.run(
         ["bash", WRAPPER, f"--add-dirs={worktree}", "--", "sh", "-c", script],
         cwd=worktree,
-        env=environment(home, SECRET="x"),
+        env=environment(home, bwrap=None, SECRET="x"),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -626,7 +728,7 @@ def test_bwrap_shows_the_docker_socket_only_when_enabled(checkout):
         server = socket.socket(socket.AF_UNIX)
         try:
             server.bind(str(path))
-            env = environment(home, XDG_RUNTIME_DIR=runtime)
+            env = environment(home, bwrap=None, XDG_RUNTIME_DIR=runtime)
             visible = [
                 subprocess.run(
                     ["bash", WRAPPER, f"--add-dirs={worktree}", *enable, "--"]

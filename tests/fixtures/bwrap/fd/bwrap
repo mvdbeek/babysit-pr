@@ -1,0 +1,7 @@
+#!/bin/sh
+# A bubblewrap 0.10.0 or later, which binds by descriptor; it never runs anything.
+[ "$1" = --help ] || exit 1
+echo "usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]"
+echo "    --bind SRC DEST              Bind mount the host path SRC on DEST"
+echo "    --bind-fd FD DEST            Bind open directory or path fd on DEST"
+echo "    --ro-bind-fd FD DEST         Bind open directory or path fd read-only on DEST"
