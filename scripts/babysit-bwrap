@@ -116,6 +116,27 @@ for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .l
   fi
 done
 
+# This launcher's own directory and, when that is a checkout's scripts/, the checkout
+# and its git common directory: an agent writing either would change what the next
+# launch runs. The common directory comes from the .git layout, without running git
+# in it. Agents therefore never work in clones of the deployed copy, only in others.
+self=$(realpath -- "${BASH_SOURCE[0]}")
+protected+=("${self%/*}")
+deployed=${self%/*/*}
+if [[ -d $deployed/.git ]]; then
+  protected+=("$deployed" "$(resolve "$deployed/.git")")
+elif [[ -f $deployed/.git ]]; then
+  read -r gitdir <"$deployed/.git" || true
+  gitdir=${gitdir#gitdir: }
+  [[ $gitdir == /* ]] || gitdir=$deployed/$gitdir
+  common=$gitdir
+  if [[ -f $gitdir/commondir ]]; then
+    read -r common <"$gitdir/commondir" || true
+    [[ $common == /* ]] || common=$gitdir/$common
+  fi
+  protected+=("$deployed" "$(resolve "$gitdir")" "$(resolve "$common")")
+fi
+
 # Binding by descriptor needs bwrap 0.10.0's --bind-fd; a dry run without bwrap binds paths.
 bind_fd=0
 if command -v bwrap >/dev/null; then

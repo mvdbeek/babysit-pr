@@ -671,6 +671,41 @@ def test_wrapper_binds_an_agent_home_only_as_that_agent_configuration(checkout):
         assert "overlaps the protected" in refused(worktree, env, option, "x"), option
 
 
+def test_wrapper_protects_its_own_checkout_and_git_directory(checkout, tmp_path):
+    worktree, common, home = checkout
+    # Deployed copies of the wrapper: in the main checkout and in a linked worktree.
+    main, linked = common.parent, worktree
+    for copy in (main, linked):
+        (copy / "scripts").mkdir()
+        shutil.copy(WRAPPER, copy / "scripts" / "babysit-bwrap")
+    other = tmp_path / "other"
+    other.mkdir()
+    env = environment(home)
+    for copy, paths in (
+        (main, (main, main / "scripts", common)),
+        (linked, (linked, linked / "scripts", common, main)),  # main holds the common dir
+    ):
+        launcher = str(copy / "scripts" / "babysit-bwrap")
+        for path in paths:
+            result = subprocess.run(
+                ["bash", launcher, "--print-argv", f"--add-dirs={other}:{path}", "x"],
+                cwd=other,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 2 and "overlaps the protected" in result.stderr, path
+        result = subprocess.run(
+            ["bash", launcher, "--print-argv", f"--add-dirs={other}", "x"],
+            cwd=other,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+
 def test_wrapper_protects_missing_paths_under_linked_parents(checkout, tmp_path):
     worktree, _, home = checkout
     # ~/.config links elsewhere, and none of the protected entries in it exist yet.

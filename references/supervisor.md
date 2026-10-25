@@ -295,7 +295,12 @@ service definition (`~/.config/systemd`, `~/.local/share/systemd`,
 `--claude-config-dir` may be `~/.claude` itself or one of its
 `accounts/<name>`, and `--codex-home` may be `~/.codex`. When the default
 account `~/.claude` is bound, its `accounts` directory is covered by an empty
-tmpfs, so that agent never reaches the named accounts. Protected entries
+tmpfs, so that agent never reaches the named accounts. babysit-bwrap also
+refuses its own directory and, when it runs from a checkout's `scripts/`, that
+checkout and its git common directory (read from the `.git` file or directory,
+without running git there), since an agent writing either would change what the
+next launch runs. Run babysit from a deployed checkout that agents never work in;
+they can still work on babysit-pr in any other clone and its worktrees. Protected entries
 are resolved whether or not they exist, through linked parents and dangling
 dotfile links. Where bwrap has `--bind-fd` (bubblewrap 0.10.0 and later, detected
 from `bwrap --help`), each writable directory is opened once after it is checked,
