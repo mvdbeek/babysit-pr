@@ -35,13 +35,18 @@ ssh <admin>@<box> "sudo BABYSIT_SSH_KEY='$(cat ~/.ssh/id_ed25519.pub)' bash -s" 
 It:
 
 1. Creates the `babysit` user (bash, own group, non-overlapping `/etc/subuid` and
-   `/etc/subgid` ranges) and adds `BABYSIT_SSH_KEY` to its `authorized_keys`.
+   `/etc/subgid` ranges) and adds `BABYSIT_SSH_KEY` to its `authorized_keys`. The key file is written as `babysit` (umask 077, via `runuser`) and
+   refused if `~/.ssh` or `authorized_keys` is a symlink.
 2. Installs git, bubblewrap, socat, build-essential, curl, jq, uidmap,
    dbus-user-session, slirp4netns, python3 (3.12 on 24.04), python3-venv, AppArmor
    tools and `apparmor-profiles`.
-3. Adds three apt repositories, each trusted only after the signing key's primary
-   fingerprint matches the one pinned in the script: GitHub CLI (`gh`), Docker
-   (`docker-ce`, `docker-ce-rootless-extras`, buildx) and Claude Code (Anthropic's
+3. Adds apt repositories, each keyed only by the one pinned primary fingerprint: the
+   key is imported into a scratch GNUPGHOME, must be exactly that key, and only it is
+   exported (binary) to `/etc/apt/keyrings/<name>.gpg` for `signed-by`; an older `.asc`
+   keyring from earlier runs is removed. Repositories: GitHub CLI (`gh`; skipped when
+   the distro's `gh` is installed), Docker (`docker-ce`, `docker-ce-rootless-extras`,
+   buildx; skipped when Ubuntu's `docker.io` is installed, `DOCKER_SOURCE` overrides)
+   and Claude Code (Anthropic's
    signed repository, `stable` channel; `CLAUDE_CHANNEL=latest` or `INSTALL_CLAUDE=0`).
    apt-installed Claude does not auto-update; upgrade with `apt upgrade claude-code`.
    It lives in `/usr`, which the sandbox mounts read-only, so an agent cannot replace it.
@@ -49,16 +54,23 @@ It:
    Node.js LTS (official tarball, checksum from `SHASUMS256.txt`) into `/opt` with
    links in `/usr/local/bin`; uv and uvx into `/usr/local/bin`; herdr (GitHub release
    asset digest) into `/usr/local/bin`. Override with `NODE_VERSION`/`NODE_SHA256`,
-   `UV_VERSION`/`UV_SHA256`, `HERDR_VERSION`/`HERDR_SHA256`. To refresh a pin, take the
+   `UV_VERSION`/`UV_SHA256`, `HERDR_VERSION`/`HERDR_SHA256`. Archives are extracted with
+   `--no-same-owner --no-same-permissions` and installed `root:root`, so an archive's
+   uid (often `babysit`'s) never survives. Each verified install leaves a root-owned
+   marker `/usr/local/share/babysit-provision/<tool>-<version>-<arch>.sha256`; reruns
+   re-check the installed files against it (and root ownership, no group/world write)
+   and reinstall on any difference, never executing the binaries as root. Earlier
+   agent-owned installs are chowned back to root first. To refresh a pin, take the
    digest from the vendor (`gh release view <tag> -R herdrdev/herdr --json assets`,
    `https://nodejs.org/dist/<v>/SHASUMS256.txt`), never from the download itself.
 5. Writes `/etc/ssh/sshd_config.d/60-babysit-worker.conf` with
    `ClientAliveInterval 15` and `ClientAliveCountMax 4`, validates with `sshd -t` and
-   reloads ssh, so a vanished controller's sessions (and their remote repairs) end
+   reloads ssh (`systemctl try-reload-or-restart`; a drop-in `sshd -t` rejects is removed), so a vanished controller's sessions (and their remote repairs) end
    within about a minute.
 6. Makes bubblewrap work under AppArmor (below).
-7. Disables the system Docker daemon (its socket is root on the machine; babysit-bwrap
-   refuses it anyway), adds the rootlesskit AppArmor profile Docker documents for
+7. Leaves the machine's rootful Docker and containerd running (the operator may use
+   them; babysit-bwrap refuses their socket and the host checks verify `babysit` cannot
+   write it), adds the rootlesskit AppArmor profile Docker documents for
    Ubuntu 24.04 when none exists, enables lingering for `babysit` and runs
    `dockerd-rootless-setuptool.sh install` as that user. `babysit` is never added to
    the `docker` group.
@@ -81,10 +93,15 @@ a profile, chosen by `BWRAP_APPARMOR`:
   `apparmor` package once enabled this profile and then dropped it (LP #2072811,
   Flatpak breakage), so on 24.04 it may or may not be present in `extra-profiles`;
   if it is missing the script reports a problem instead of guessing.
-- `unconfined`: writes `/etc/apparmor.d/bwrap`, a minimal
-  `profile bwrap /usr/bin/bwrap flags=(unconfined) { userns, }`. Simpler, but any
-  local user can then use bwrap to get a user namespace with capabilities, which is
-  the attack surface the restriction removes.
+- `unconfined`: writes `/etc/apparmor.d/bwrap`,
+  `profile bwrap /usr/bin/bwrap flags=(unconfined) { userns, }`. bwrap and everything
+  it starts then run unconfined, so any local user can use bwrap to get a fully capable
+  user namespace, which is the attack surface the restriction removes. The script
+  refuses it unless `BWRAP_APPARMOR_I_UNDERSTAND=1` is also set.
+
+On Ubuntu 26.04 bwrap already works and AppArmor ships `bwrap-userns-restrict`
+enforced (the sysctl may not exist at all); nothing is installed and absence of the
+sysctl is not a failure. The script targets 24.04 and 26.04.
 
 Consequence of `restrict`: programs inside the sandbox cannot create their own user
 namespaces. Chromium's sandbox (Playwright) and nested bwrap (Claude Code's or
@@ -124,8 +141,9 @@ unless `BWRAP_ACCEPT_OLD=1`. Options:
   abstract socket exists. The sandbox shares the host network namespace, so abstract
   Unix sockets (X11, a D-Bus session bus) are reachable from it and can start
   programs outside it. Keep the worker headless.
-- Rootless Docker socket at `/run/user/<uid>/docker.sock`, `babysit` not in the
-  `docker` group, Tailscale up, `/etc/subuid` entry, sshd keepalive.
+- Rootless Docker socket at `/run/user/<uid>/docker.sock`; `babysit` in none of
+  `sudo`, `admin`, `lxd`, `disk`, `adm`, `docker`, with no sudoers entry
+  (`sudo -l -U babysit`), and unable to write `/var/run/docker.sock`; Tailscale up, `/etc/subuid` entry, sshd keepalive.
 
 ## 3. User step (as `babysit`)
 
@@ -193,6 +211,7 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    ```
 
    Always address the machine by label (`--machine=<label>`), as babysit does.
+
 3. Add the worker to `machines.json` in the dashboard's `--home` (the registry from
    the multi-machine plan; until it lands this entry is inert):
 
@@ -219,6 +238,7 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    works), `docker` (rootless Docker is set up and the agent may be given it),
    `claude-account:<name>` for each named Claude login on that machine. Paths are the
    worker's own; never copy `/Users/...` paths into worker records.
+
 4. Keep the worker's babysit-pr at the controller's SHA: rerun the user step with the
    new `--sha` after updating the controller. A mismatch blocks remote work.
 

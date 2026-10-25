@@ -13,7 +13,7 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "provision_worker.sh"
 TOOLS = (
     "apt-get apparmor_parser curl dockerd-rootless-setuptool.sh git gpg install ln "
-    "loginctl npm sshd sudo systemctl tar useradd usermod"
+    "loginctl npm runuser sshd sudo systemctl tar useradd usermod"
 ).split()
 
 
@@ -64,11 +64,51 @@ def test_system_dry_run_plans_every_step_without_changing_anything(run):
     assert re.search(r"uv-x86_64-unknown-linux-gnu\.tar\.gz and verify sha256 [0-9a-f]{64}", out)
     assert re.search(r"herdr-linux-x86_64 and verify sha256 [0-9a-f]{64}", out)
     assert "60-babysit-worker.conf" in out
-    assert "systemctl disable --now docker.service docker.socket" in out
+    # The machine's rootful docker is left alone.
+    assert "docker.service" not in out
+    assert "containerd.service" not in out
     assert "dockerd-rootless-setuptool.sh install" in out
     assert "bubblewrap >= 0.10.0" in out
+    # Archives never keep their uid: extracted unprivileged-style, installed as root.
+    assert re.search(r"tar -xJf .*--no-same-owner --no-same-permissions", out)
+    assert re.search(r"tar -xzf .*--no-same-owner --no-same-permissions", out)
+    assert (
+        "install -o root -g root -m 0755 /tmp/provision-worker.XXXXXX/uv/uv /usr/local/bin/uv"
+        in out
+    )
+    assert "would record /usr/local/share/babysit-provision/uv-" in out
+    assert "systemctl try-reload-or-restart ssh.service" in out
+    assert "would run: sshd -t" in out
+    # Apt keys: only the pinned fingerprint is exported, to a binary keyring.
+    assert out.count("gpg --export only that key to /etc/apt/keyrings/") == 3
+    assert "/etc/apt/keyrings/docker.gpg" in out
+    assert "/etc/apt/keyrings/claude-code.asc" not in out
     # Nothing is piped from the network into a shell.
     assert not re.search(r"\|\s*(sudo\s+)?(ba)?sh\b", SCRIPT.read_text())
+
+
+def test_authorized_keys_are_written_as_the_user(run):
+    done = run("--dry-run", BABYSIT_SSH_KEY="ssh-ed25519 AAAA test")
+    assert done.returncode == 0, done.stderr
+    assert "runuser -u babysit -- sh -c" in done.stdout
+    text = SCRIPT.read_text()
+    assert "umask 077" in text
+    assert '[ -L "$p" ]' in text
+    assert '--export "$fpr"' in text
+
+
+def test_docker_source_selection(run):
+    done = run("--dry-run", DOCKER_SOURCE="docker.io")
+    assert done.returncode == 0, done.stderr
+    assert re.search(r"apt-get install .*\bdocker\.io rootlesskit\b", done.stdout)
+    assert "download.docker.com" not in done.stdout
+    assert run("--dry-run", DOCKER_SOURCE="podman").returncode == 2
+
+
+def test_unconfined_bwrap_needs_explicit_acknowledgement(run):
+    assert run("--dry-run", BWRAP_APPARMOR="unconfined").returncode == 2
+    done = run("--dry-run", BWRAP_APPARMOR="unconfined", BWRAP_APPARMOR_I_UNDERSTAND="1")
+    assert done.returncode == 0, done.stderr
 
 
 def test_system_dry_run_follows_architecture_and_options(run):
@@ -82,10 +122,12 @@ def test_system_dry_run_follows_architecture_and_options(run):
 
 
 def test_user_step_dry_run_pins_the_checkout(run):
-    done = run("--user-step", "--dry-run", "--sha", "0123abc", "--repo", "/fixture/repo")
+    done = run(
+        "--user-step", "--dry-run", "--sha", "0123abc" * 5 + "01234", "--repo", "/fixture/repo"
+    )
     assert done.returncode == 0, done.stderr
     assert "git clone /fixture/repo" in done.stdout
-    assert "checkout --quiet --detach 0123abc" in done.stdout
+    assert "checkout --quiet --detach " + "0123abc" * 5 + "01234" in done.stdout
     assert ".cache/babysit-sandbox" in done.stdout
     assert "codex login --device-auth" in done.stdout
     assert "claude-account login <name>" in done.stdout
@@ -96,6 +138,7 @@ def test_user_step_dry_run_pins_the_checkout(run):
     [
         ["--user-step", "--dry-run"],
         ["--user-step", "--dry-run", "--sha", "main; rm -rf ~"],
+        ["--user-step", "--dry-run", "--sha", "0123abc"],
         ["--frobnicate"],
         ["--dry-run", "--sha"],
     ],

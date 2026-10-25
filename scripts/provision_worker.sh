@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision an Ubuntu 24.04 machine as a babysit-pr worker. Idempotent; rerun after
+# Provision an Ubuntu 24.04 or 26.04 machine as a babysit-pr worker. Idempotent; rerun after
 # changing a pin or fixing a reported problem. See references/worker-setup.md.
 #
 # System step, as root over ssh (from a babysit-pr checkout on the controller):
@@ -17,7 +17,7 @@
 #   --check       change nothing; run only the host checks and report
 #   --dry-run     change nothing and touch no network; print the planned actions
 #   --user-step   run the non-root step as the babysit user (needs --sha)
-#   --sha SHA     babysit-pr commit to check out in ~/src/babysit-pr (user step)
+#   --sha SHA     full 40-hex babysit-pr commit to check out in ~/src/babysit-pr (user step)
 #   --repo URL    babysit-pr clone URL (user step; default $BABYSIT_REPO)
 #
 # Environment (system step):
@@ -28,8 +28,14 @@
 #   CLAUDE_CHANNEL      stable (default) or latest
 #   BWRAP_APPARMOR      restrict (default): Ubuntu's packaged bwrap-userns-restrict
 #                       profile, whose children keep no capabilities in their user
-#                       namespace; unconfined: a minimal profile granting bwrap
-#                       `userns` only. Used only if bwrap does not already work.
+#                       namespace; unconfined: leaves bwrap AND everything it starts
+#                       unconfined, so any local user can get a fully capable user
+#                       namespace through bwrap. Needs BWRAP_APPARMOR_I_UNDERSTAND=1.
+#                       Used only if bwrap does not already work.
+#   DOCKER_SOURCE       auto (default): keep Docker's docker-ce repository if this script
+#                       added it earlier, else use the distro's docker.io when it is
+#                       already installed, else docker-ce; or force docker-ce / docker.io.
+#                       The machine's rootful docker is never stopped or masked.
 #   BWRAP_ACCEPT_OLD    1 accepts a bubblewrap older than 0.10.0 (no --bind-fd)
 #   NODE_VERSION, NODE_SHA256, UV_VERSION, UV_SHA256, HERDR_VERSION, HERDR_SHA256
 #                       override the pinned downloads below (the SHA256 must match
@@ -153,7 +159,7 @@ fetch_verified() {
     printf '  would download %s and verify sha256 %s\n' "$url" "$want"
     return 0
   fi
-  tmp=$(mktemp -d)
+  tmp=$(mktemp -d -p "$work")
   curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp/download" "$url"
   if ! printf '%s  %s\n' "$want" "$tmp/download" | sha256sum -c --status; then
     rm -rf "$tmp"
@@ -164,31 +170,81 @@ fetch_verified() {
   rm -rf "$tmp"
 }
 
-# apt_repo NAME KEY_URL FINGERPRINT DEB_LINE: trust a signing key only after its primary
-# fingerprint matches, then register the repository with that key alone.
+# apt_repo NAME KEY_URL FINGERPRINT DEB_LINE: import the downloaded key into a scratch
+# GNUPGHOME, require exactly one key whose primary fingerprint is the pinned one, and
+# export only that key (binary) as the repository's signed-by keyring.
 apt_repo() {
-  local name=$1 key_url=$2 fpr=$3 line=$4 ext tmp got
-  ext=${key_url##*.}
-  [[ $ext == asc || $ext == gpg ]] || ext=asc
-  local keyring=/etc/apt/keyrings/$name.$ext
+  local name=$1 key_url=$2 fpr=$3 line=$4 tmp got
+  local keyring=/etc/apt/keyrings/$name.gpg
   line=${line//@KEYRING@/$keyring}
   if ((dry)); then
-    printf '  would trust %s (fingerprint %s) and add: %s\n' "$key_url" "$fpr" "$line"
+    printf '  would trust %s (fingerprint %s), gpg --export only that key to %s and add: %s\n' \
+      "$key_url" "$fpr" "$keyring" "$line"
     return 0
   fi
   install -d -m 0755 /etc/apt/keyrings
-  tmp=$(mktemp -d)
+  tmp=$(mktemp -d -p "$work")
+  mkdir -m 0700 "$tmp/gnupg"
   curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp/key" "$key_url"
-  got=$(GNUPGHOME=$tmp gpg --batch --show-keys --with-colons "$tmp/key" 2>/dev/null |
-    awk -F: '$1 == "fpr" { print $10; exit }')
+  gpg --batch --homedir "$tmp/gnupg" --import "$tmp/key" >/dev/null 2>&1 || true
+  got=$(gpg --batch --homedir "$tmp/gnupg" --list-keys --with-colons 2>/dev/null |
+    awk -F: '$1 == "pub" { p = 1 } $1 == "fpr" && p { print $10; p = 0 }')
   if [[ $got != "$fpr" ]]; then
     rm -rf "$tmp"
-    printf 'provision_worker: %s has fingerprint %s, expected %s\n' "$key_url" "${got:-none}" "$fpr" >&2
+    printf 'provision_worker: %s has primary fingerprint(s) %s, expected exactly %s\n' \
+      "$key_url" "$(tr '\n' ' ' <<<"${got:-none}")" "$fpr" >&2
     exit 1
   fi
-  install -m 0644 "$tmp/key" "$keyring"
+  gpg --batch --homedir "$tmp/gnupg" --export "$fpr" >"$tmp/keyring.gpg"
+  install -m 0644 -o root -g root "$tmp/keyring.gpg" "$keyring"
   rm -rf "$tmp"
   write_file "/etc/apt/sources.list.d/$name.list" 0644 "$line" || true
+  # Earlier versions of this script wrote the key as .asc (or unexported as-is).
+  rm -f "/etc/apt/keyrings/$name.asc"
+}
+
+# --- root-owned install markers ----------------------------------------------------------
+
+STATE_DIR=/usr/local/share/babysit-provision
+
+# tree_digest PATH...: one digest over the names and contents of every file and link.
+tree_digest() {
+  find "$@" \( -type f -o -type l \) -print0 | sort -z | xargs -0 sha256sum | sha256sum |
+    cut -d' ' -f1
+}
+
+# locked_down PATH...: true when everything is root-owned and nothing is group/world
+# writable (symlinks only need root ownership).
+locked_down() {
+  [[ -z $(find "$@" \( -type l ! -user root \) -o \
+    \( ! -type l \( ! -user root -o -perm /022 \) \) -print -quit) ]]
+}
+
+# install_ok NAME ARCHIVE_SHA PATH...: the marker written at install time still matches
+# the pinned checksum and the installed files, which are still root's alone. Nothing
+# installed is executed to find out.
+install_ok() {
+  local marker=$STATE_DIR/$1.sha256 want=$2
+  shift 2
+  local path
+  for path in "$@"; do
+    [[ -e $path ]] || return 1
+  done
+  [[ -f $marker && ! -L $marker ]] || return 1
+  locked_down "$@" || return 1
+  [[ $(cat "$marker") == "$want $(tree_digest "$@")" ]]
+}
+
+# record_install NAME ARCHIVE_SHA PATH...
+record_install() {
+  local name=$1 want=$2
+  shift 2
+  if ((dry)); then
+    printf '  would record %s/%s.sha256 (verified checksum and install digest)\n' "$STATE_DIR" "$name"
+    return 0
+  fi
+  install -d -m 0755 -o root -g root "$STATE_DIR"
+  write_file "$STATE_DIR/$name.sha256" 0644 "$want $(tree_digest "$@")" || true
 }
 
 # --- checks ----------------------------------------------------------------------------
@@ -268,11 +324,20 @@ check_docker_rootless() {
   else
     problem "no rootless docker socket at $sock"
   fi
-  if id -nG "$user_name" | tr ' ' '\n' | grep -qx docker; then
-    problem "$user_name is in the docker group, which is root on this machine"
+  local group
+  for group in sudo admin lxd disk adm docker; do
+    if id -nG "$user_name" | tr ' ' '\n' | grep -qx "$group"; then
+      problem "$user_name is in the $group group, which is (or leads to) root on this machine"
+    fi
+  done
+  if sudo -n -l -U "$user_name" 2>/dev/null | grep -q 'may run the following commands'; then
+    problem "sudoers grants $user_name commands (sudo -l -U $user_name)"
   fi
-  if systemctl is-active --quiet docker.service 2>/dev/null; then
-    warn "the system docker daemon is running; babysit-bwrap refuses its socket, but nothing here needs it"
+  if [[ -S /var/run/docker.sock ]] &&
+    sudo -u "$user_name" -H test -w /var/run/docker.sock >/dev/null 2>&1; then
+    problem "$user_name can write the rootful docker socket /var/run/docker.sock (root on this machine)"
+  else
+    ok "$user_name cannot reach the rootful docker socket"
   fi
 }
 
@@ -342,11 +407,17 @@ ensure_bwrap_profile() {
       load_profile /etc/apparmor.d/bwrap-userns-restrict
       ;;
     unconfined)
-      say "Installing a minimal bwrap AppArmor profile (userns only)"
+      if [[ ${BWRAP_APPARMOR_I_UNDERSTAND:-0} != 1 ]]; then
+        problem "BWRAP_APPARMOR=unconfined needs BWRAP_APPARMOR_I_UNDERSTAND=1: it leaves bwrap and its children unconfined"
+        return 0
+      fi
+      say "Installing a bwrap AppArmor profile that leaves bwrap and its children unconfined"
       write_file /etc/apparmor.d/bwrap 0644 "$(
         cat <<'EOF'
 # babysit-pr worker: lets /usr/bin/bwrap create user namespaces under
 # kernel.apparmor_restrict_unprivileged_userns=1. Written by provision_worker.sh.
+# WARNING: bwrap and everything it starts run unconfined, so any local user can get a
+# fully capable user namespace through bwrap.
 abi <abi/4.0>,
 include <tunables/global>
 
@@ -375,7 +446,7 @@ ensure_rootlesskit_profile() {
   fi
   [[ -r $restrict ]] && [[ $(cat "$restrict") == 1 ]] || return 0
   grep -rqs '/usr/bin/rootlesskit' /etc/apparmor.d/ && return 0
-  # Docker's documented profile for rootlesskit on Ubuntu 24.04, for the packaged path.
+  # Docker's documented profile for rootlesskit on Ubuntu, for the packaged path.
   write_file "$profile" 0644 "$(
     cat <<'EOF'
 # babysit-pr worker: rootless docker under kernel.apparmor_restrict_unprivileged_userns=1.
@@ -401,8 +472,8 @@ system_step() {
     }
     # shellcheck disable=SC1091
     . /etc/os-release
-    [[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 24.04 ]] ||
-      warn "written for Ubuntu 24.04, found ${PRETTY_NAME:-unknown}"
+    [[ ${ID:-} == ubuntu && ( ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ) ]] ||
+      warn "written for Ubuntu 24.04 and 26.04, found ${PRETTY_NAME:-unknown}"
     codename=${VERSION_CODENAME:-noble}
     arch=${ARCH:-$(dpkg --print-architecture)}
     cd /
@@ -418,6 +489,10 @@ system_step() {
       exit 2
       ;;
   esac
+  if [[ ${BWRAP_APPARMOR:-restrict} == unconfined && ${BWRAP_APPARMOR_I_UNDERSTAND:-0} != 1 ]]; then
+    printf 'provision_worker: BWRAP_APPARMOR=unconfined leaves bwrap and its children unconfined (any local user gets a fully capable user namespace); set BWRAP_APPARMOR_I_UNDERSTAND=1 to accept\n' >&2
+    exit 2
+  fi
   local node_version=${NODE_VERSION:-$NODE_DEFAULT}
   local node_sha_var=NODE_SHA256_$node_arch uv_sha_var=UV_SHA256_$tool_arch
   local herdr_sha_var=HERDR_SHA256_$tool_arch
@@ -448,17 +523,26 @@ system_step() {
   fi
   if [[ -n ${BABYSIT_SSH_KEY:-} ]]; then
     if ((dry)); then
-      printf '  would add BABYSIT_SSH_KEY to ~%s/.ssh/authorized_keys\n' "$user_name"
+      printf '  would run: runuser -u %s -- sh -c <umask 077; refuse symlinked ~/.ssh or authorized_keys; append keys> (keys on stdin)\n' "$user_name"
     else
       home=$(getent passwd "$user_name" | cut -d: -f6)
-      install -d -m 0700 -o "$user_name" -g "$user_name" "$home/.ssh"
-      touch "$home/.ssh/authorized_keys"
-      while IFS= read -r key; do
-        [[ -z $key ]] || grep -qxF "$key" "$home/.ssh/authorized_keys" ||
-          printf '%s\n' "$key" >>"$home/.ssh/authorized_keys"
-      done <<<"$BABYSIT_SSH_KEY"
-      chown "$user_name:$user_name" "$home/.ssh/authorized_keys"
-      chmod 0600 "$home/.ssh/authorized_keys"
+      # As the user, so a symlink planted in its home cannot redirect root's writes.
+      runuser -u "$user_name" -- sh -c '
+        set -eu
+        umask 077
+        ssh=$1/.ssh
+        keys=$ssh/authorized_keys
+        for p in "$ssh" "$keys"; do
+          if [ -L "$p" ]; then echo "provision_worker: $p is a symlink" >&2; exit 1; fi
+        done
+        [ -d "$ssh" ] || mkdir -m 0700 "$ssh"
+        chmod 0700 "$ssh"
+        touch "$keys"
+        while IFS= read -r key; do
+          [ -z "$key" ] || grep -qxF -- "$key" "$keys" || printf "%s\n" "$key" >>"$keys"
+        done
+        chmod 0600 "$keys"
+      ' sh "$home" <<<"$BABYSIT_SSH_KEY"
     fi
   fi
 
@@ -469,11 +553,36 @@ system_step() {
     python3-venv xz-utils apparmor apparmor-utils apparmor-profiles iproute2
 
   say "Signed apt repositories"
-  apt_repo githubcli https://cli.github.com/packages/githubcli-archive-keyring.gpg "$GH_KEY_FPR" \
-    "deb [arch=$arch signed-by=@KEYRING@] https://cli.github.com/packages stable main"
-  apt_repo docker https://download.docker.com/linux/ubuntu/gpg "$DOCKER_KEY_FPR" \
-    "deb [arch=$arch signed-by=@KEYRING@] https://download.docker.com/linux/ubuntu $codename stable"
-  local packages=(gh docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras docker-buildx-plugin)
+  # Keep a distro-packaged gh and docker.io rather than adding a conflicting repository.
+  local packages=() docker_src=${DOCKER_SOURCE:-auto} setuptool=dockerd-rootless-setuptool.sh
+  if [[ $docker_src == auto ]]; then
+    docker_src=docker-ce
+    if ((!dry)) && [[ ! -e /etc/apt/sources.list.d/docker.list ]] &&
+      dpkg-query -W -f='${Status}' docker.io 2>/dev/null | grep -q 'ok installed'; then
+      docker_src=docker.io
+    fi
+  fi
+  case $docker_src in docker-ce | docker.io) ;; *)
+    printf 'provision_worker: DOCKER_SOURCE must be auto, docker-ce or docker.io\n' >&2
+    exit 2
+    ;;
+  esac
+  if ((dry)) || { [[ -e /etc/apt/sources.list.d/githubcli.list ]] ||
+    ! dpkg-query -W -f='${Status}' gh 2>/dev/null | grep -q 'ok installed'; }; then
+    apt_repo githubcli https://cli.github.com/packages/githubcli-archive-keyring.gpg "$GH_KEY_FPR" \
+      "deb [arch=$arch signed-by=@KEYRING@] https://cli.github.com/packages stable main"
+    packages+=(gh)
+  else
+    ok "gh is installed from the distro; not adding the GitHub CLI repository"
+  fi
+  if [[ $docker_src == docker-ce ]]; then
+    apt_repo docker https://download.docker.com/linux/ubuntu/gpg "$DOCKER_KEY_FPR" \
+      "deb [arch=$arch signed-by=@KEYRING@] https://download.docker.com/linux/ubuntu $codename stable"
+    packages+=(docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras docker-buildx-plugin)
+  else
+    ok "using the distro's docker.io; not adding Docker's repository"
+    packages+=(docker.io rootlesskit)
+  fi
   if [[ ${INSTALL_CLAUDE:-1} == 1 ]]; then
     local channel=${CLAUDE_CHANNEL:-stable}
     apt_repo claude-code https://downloads.claude.ai/keys/claude-code.asc "$CLAUDE_KEY_FPR" \
@@ -483,53 +592,82 @@ system_step() {
   run apt-get update -q
   run apt-get install -y -q --no-install-recommends "${packages[@]}"
 
+  # Repair what an earlier version of this script left agent-owned (tar kept the
+  # archive's uid), then trust nothing but the root-owned markers.
+  if ((!dry)); then
+    find /opt -maxdepth 1 -name 'node-*' -exec chown -hR root:root {} + -exec chmod -R go-w {} +
+    for f in /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/herdr; do
+      [[ ! -e $f && ! -L $f ]] || chown -h root:root "$f"
+      [[ ! -f $f || -L $f ]] || chmod go-w "$f"
+    done
+  fi
+
   say "Node.js $node_version (official tarball, pinned sha256)"
   local node_dir=/opt/node-$node_version-linux-$node_arch
-  if ((!dry)) && [[ -x $node_dir/bin/node ]]; then
-    ok "$node_dir exists"
+  if ((!dry)) && install_ok "node-$node_version-$node_arch" "$node_sha" "$node_dir"; then
+    ok "$node_dir matches its verified checksum marker"
   else
     fetch_verified "https://nodejs.org/dist/$node_version/node-$node_version-linux-$node_arch.tar.xz" \
       "$node_sha" "$work/node.tar.xz"
-    run tar -xJf "$work/node.tar.xz" -C /opt
+    run mkdir "$work/node"
+    run tar -xJf "$work/node.tar.xz" -C "$work/node" --no-same-owner --no-same-permissions
+    run chown -R root:root "$work/node"
+    run chmod -R go-w "$work/node"
+    run rm -rf "$node_dir"
+    run mv "$work/node/node-$node_version-linux-$node_arch" "$node_dir"
+    record_install "node-$node_version-$node_arch" "$node_sha" "$node_dir"
   fi
   for tool in node npm npx corepack; do
     run ln -sfn "$node_dir/bin/$tool" "/usr/local/bin/$tool"
   done
 
   say "uv $uv_version (pinned sha256)"
-  if ((!dry)) && [[ $(/usr/local/bin/uv --version 2>/dev/null) == "uv $uv_version"* ]]; then
-    ok "uv $uv_version installed"
+  if ((!dry)) && install_ok "uv-$uv_version-$tool_arch" "$uv_sha" /usr/local/bin/uv /usr/local/bin/uvx; then
+    ok "uv $uv_version matches its verified checksum marker"
   else
     fetch_verified "https://github.com/astral-sh/uv/releases/download/$uv_version/uv-$tool_arch-unknown-linux-gnu.tar.gz" \
       "$uv_sha" "$work/uv.tar.gz"
-    run tar -xzf "$work/uv.tar.gz" -C /usr/local/bin --strip-components=1 \
-      "uv-$tool_arch-unknown-linux-gnu/uv" "uv-$tool_arch-unknown-linux-gnu/uvx"
+    run mkdir "$work/uv"
+    run tar -xzf "$work/uv.tar.gz" -C "$work/uv" --strip-components=1 --no-same-owner \
+      --no-same-permissions "uv-$tool_arch-unknown-linux-gnu/uv" "uv-$tool_arch-unknown-linux-gnu/uvx"
+    run install -o root -g root -m 0755 "$work/uv/uv" /usr/local/bin/uv
+    run install -o root -g root -m 0755 "$work/uv/uvx" /usr/local/bin/uvx
+    record_install "uv-$uv_version-$tool_arch" "$uv_sha" /usr/local/bin/uv /usr/local/bin/uvx
   fi
 
   say "herdr $herdr_version (pinned sha256)"
-  if ((!dry)) && [[ $(/usr/local/bin/herdr --version 2>/dev/null) == *"${herdr_version#v}"* ]]; then
-    ok "herdr $herdr_version installed"
+  if ((!dry)) && install_ok "herdr-$herdr_version-$tool_arch" "$herdr_sha" /usr/local/bin/herdr; then
+    ok "herdr $herdr_version matches its verified checksum marker"
   else
     fetch_verified "https://github.com/herdrdev/herdr/releases/download/$herdr_version/herdr-linux-$tool_arch" \
       "$herdr_sha" "$work/herdr"
-    run install -m 0755 "$work/herdr" /usr/local/bin/herdr
+    run install -o root -g root -m 0755 "$work/herdr" /usr/local/bin/herdr
+    record_install "herdr-$herdr_version-$tool_arch" "$herdr_sha" /usr/local/bin/herdr
   fi
 
   say "sshd keepalive"
-  if write_file /etc/ssh/sshd_config.d/60-babysit-worker.conf 0644 "$(
+  local dropin=/etc/ssh/sshd_config.d/60-babysit-worker.conf
+  if write_file "$dropin" 0644 "$(
     printf '%s\n' '# babysit-pr worker: drop dead controller connections within a minute.' \
       'ClientAliveInterval 15' 'ClientAliveCountMax 4'
   )"; then
-    run sshd -t
-    run systemctl reload ssh.service
+    if ((dry)); then
+      run sshd -t
+      run systemctl try-reload-or-restart ssh.service
+    elif ! sshd -t; then
+      rm -f "$dropin"
+      problem "sshd -t rejected $dropin; removed it"
+    else
+      systemctl try-reload-or-restart ssh.service
+    fi
   fi
 
   say "AppArmor and bubblewrap"
   ensure_bwrap_profile
 
   say "Rootless docker for $user_name"
-  # Rootful docker is root-equivalent; babysit uses only its own rootless daemon.
-  run systemctl disable --now docker.service docker.socket
+  # The machine's rootful docker stays as it is (the operator may use it); babysit is kept
+  # out of the docker group and uses only its own rootless daemon.
   ensure_rootlesskit_profile
   run loginctl enable-linger "$user_name"
   if ((dry)); then
@@ -541,12 +679,16 @@ system_step() {
       sleep 0.5
     done
   fi
+  if ((!dry)) && ! command -v "$setuptool" >/dev/null &&
+    [[ -x /usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh ]]; then
+    setuptool=/usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh
+  fi
   if ((!dry)) && [[ -f $(getent passwd "$user_name" | cut -d: -f6)/.config/systemd/user/docker.service ]]; then
     ok "rootless docker service exists"
   else
     run sudo -u "$user_name" -H env XDG_RUNTIME_DIR="/run/user/$uid" \
       DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-      dockerd-rootless-setuptool.sh install
+      "$setuptool" install
   fi
 
   run_checks
@@ -566,8 +708,8 @@ user_step() {
     printf 'provision_worker: --user-step needs --sha <babysit-pr commit>\n' >&2
     exit 2
   }
-  [[ $sha =~ ^[0-9a-f]{7,40}$ ]] || {
-    printf 'provision_worker: --sha must be a hexadecimal commit id\n' >&2
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] || {
+    printf 'provision_worker: --sha must be a full 40-character hexadecimal commit id\n' >&2
     exit 2
   }
   if ((!dry)) && ((EUID == 0)); then
