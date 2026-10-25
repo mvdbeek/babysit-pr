@@ -438,9 +438,9 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    registration broker forwards only their own sessions in their own worktrees (the
    supervisor reference's "Watches on workers" has the details). Issue a new token to
    replace it, or `worker-token ubuntu-1 --revoke`. Optionally add the worker's
-   tailnet address as `"tailnet_ip"` to its `machines.json` entry
-   (`tailscale ip -4 <box>`): registrations then must come through `tailscale serve`
-   from that address.
+   tailnet addresses as `"tailnet_ip"` to its `machines.json` entry (one address or a
+   list, from `tailscale ip <box>`): registrations then must come through
+   `tailscale serve` from one of them.
 
 **Migrating a worker provisioned before the deployed copy** (babysit-pr in
 `~/src/babysit-pr`, for example chonk pinned at `d55bebe`): rerun the user step with

@@ -68,8 +68,9 @@ class Machine(NamedTuple):
     labels: tuple[str, ...]
     collie_url: str | None
     enabled: bool
-    # Where its registrations reach the dashboard from, as `tailscale serve` reports it.
-    tailnet_ip: str | None = None
+    # Where its registrations reach the dashboard from (IPv4, IPv6), as `tailscale serve`
+    # reports it.
+    tailnet_ip: tuple[str, ...] | None = None
 
 
 class RemotePath(str):
@@ -179,12 +180,27 @@ def _machine(raw):
         ),
         (machine.collie_url is None or _collie_url(machine.collie_url), "collie_url"),
         (isinstance(machine.enabled, bool), "enabled"),
-        (machine.tailnet_ip is None or _ip(machine.tailnet_ip), "tailnet_ip"),
+        (
+            machine.tailnet_ip is None
+            or _ip(machine.tailnet_ip)
+            or (
+                isinstance(machine.tailnet_ip, list)
+                and 0 < len(machine.tailnet_ip) <= 4
+                and all(map(_ip, machine.tailnet_ip))
+            ),
+            "tailnet_ip",
+        ),
     ]
     for ok, field in checks:
         if not ok:
             raise ValueError(f"Invalid {field} for machine {name}")
-    return machine._replace(labels=tuple(machine.labels))
+    addresses = machine.tailnet_ip
+    if isinstance(addresses, str):
+        addresses = [addresses]
+    return machine._replace(
+        labels=tuple(machine.labels),
+        tailnet_ip=None if addresses is None else tuple(addresses),
+    )
 
 
 def _repos(raw, ids):

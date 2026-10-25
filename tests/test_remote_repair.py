@@ -66,7 +66,10 @@ if Path(sys.argv[0]).name == "claude":
     print(json.dumps({{"type": "result", "subtype": "success", "session_id": sid,
                       "structured_output": reply}}), flush=True)
 else:
-    Path(args[args.index("-o") + 1]).write_text(json.dumps(reply))
+    out = Path(args[args.index("-o") + 1])
+    out.write_text(json.dumps(reply))
+    if mode == "plant":
+        (out.parent / "escape").symlink_to(os.environ["FAKE_PLANT"])
 """
 
 
@@ -453,3 +456,29 @@ def test_a_stop_while_typing_into_the_pane_cancels_the_run(worker, pane, monkeyp
     run = json.loads((remote_run(worker, job) / "result.json").read_text())
     assert run["error"] == "Cancelled before start"
     assert not session_locks.held("codex", worker["sid"], None, "box")
+
+
+def test_a_codex_reply_is_read_only_as_a_regular_file(tmp_path):
+    folder = tmp_path / "out"
+    folder.mkdir()
+    (tmp_path / "target.json").write_text('{"status": "waiting", "summary": "x"}')
+    (folder / "reply.json").symlink_to(tmp_path / "target.json")
+    with pytest.raises(OSError):
+        remote_repair.codex_reply(folder)
+    (folder / "reply.json").unlink()
+    os.mkfifo(folder / "reply.json")
+    with pytest.raises(ValueError, match="no reply file"):
+        remote_repair.codex_reply(folder)  # Without blocking on the FIFO.
+
+
+def test_cleaning_up_codex_output_never_follows_a_link_out(worker, tmp_path, monkeypatch):
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    (kept / "file").write_text("x")
+    monkeypatch.setenv("FAKE_REPAIR", "plant")
+    monkeypatch.setenv("FAKE_PLANT", str(kept))
+    job, folder = dispatch(worker)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert result(folder)["status"] == "waiting"
+    assert (kept / "file").read_text() == "x"
+    assert not (worker["worker"] / ".cache/babysit-repairs" / job["attempt"]).exists()

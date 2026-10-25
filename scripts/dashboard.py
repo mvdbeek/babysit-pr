@@ -958,7 +958,8 @@ class Handler(BaseHTTPRequestHandler):
         # from, replacing any the client sent; a machine's own address, when registered,
         # must be the only one.
         if machine is not None and machine.tailnet_ip is not None:
-            if self.headers.get_all("X-Forwarded-For") != [machine.tailnet_ip]:
+            forwarded = self.headers.get_all("X-Forwarded-For") or []
+            if len(forwarded) != 1 or forwarded[0] not in machine.tailnet_ip:
                 machine = None
         if machine is None:
             self.send_json(403, {"error": "This needs a worker token issued by the controller"})
