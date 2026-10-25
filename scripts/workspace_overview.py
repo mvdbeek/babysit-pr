@@ -49,6 +49,14 @@ MAX_RESPONSE = 4 * 1024 * 1024
 MAX_UNPUSHED = remote_probe.MAX_UNPUSHED
 # One worker's whole scan, herdr listings and probe together; slower ones are left stale.
 REMOTE_TIMEOUT = 120
+REMOTE_GRACE = 5  # Beyond a worker's deadline, for an answer already on its way back.
+HERDR_TIMEOUT = 30
+# What one worker may contribute to a scan, and so to the cache shared with this machine.
+MAX_REMOTE_CLONES = 200
+MAX_REMOTE_ITEMS = 1000
+MAX_REMOTE_ROWS = 300  # Checkout rows, and separately workspace rows.
+MAX_REMOTE_AGENTS = 1000
+MAX_REMOTE_TEXT = 4096
 EXIT_WAIT = 5
 CACHE_VERSION = 1
 WORKING = {"working", "blocked"}
@@ -493,15 +501,19 @@ class WorkspaceOverview:
                 for path, value in self.bases.items()
                 if value.get("checked_at", 0) >= cutoff
             }
-            payload = json.dumps(
-                {
-                    "version": CACHE_VERSION,
-                    "links": self.links,
-                    "bases": self.bases,
-                    "scope": self.inventory_scope(),
-                    "value": self.value,
-                }
-            )
+            cache = {
+                "version": CACHE_VERSION,
+                "links": self.links,
+                "bases": self.bases,
+                "scope": self.inventory_scope(),
+                "value": self.value,
+            }
+            payload = json.dumps(cache)
+            if len(payload.encode()) > MAX_STATE:
+                # Workers' rows are the part no local limit bounds; they are left out
+                # rather than let them stop this machine's inventory from being saved.
+                rows = [row for row in self.value["workspaces"] if row.get("machine") is None]
+                payload = json.dumps({**cache, "value": {**self.value, "workspaces": rows}})
         if len(payload.encode()) > MAX_STATE:
             with self.lock:
                 self.error = "Workspace cache exceeded its size limit; it was not saved"
@@ -520,17 +532,17 @@ class WorkspaceOverview:
             finally:
                 temporary.unlink(missing_ok=True)
 
-    def spaces(self, warnings, machine=None):
+    def spaces(self, warnings, machine=None, timeout=HERDR_TIMEOUT):
         try:
-            return herdr("workspace", "list", machine=machine)["workspaces"]
+            return herdr("workspace", "list", machine=machine, timeout=timeout)["workspaces"]
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             where = f"{machine.label}: " if machine else ""
             warnings.append(f"{where}herdr workspaces unavailable: {exc}")
             return []
 
-    def agents(self, warnings, machine=None):
+    def agents(self, warnings, machine=None, timeout=HERDR_TIMEOUT):
         try:
-            return herdr("agent", "list", machine=machine)["agents"]
+            return herdr("agent", "list", machine=machine, timeout=timeout)["agents"]
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             where = f"{machine.label}: " if machine else ""
             warnings.append(f"{where}herdr agents unavailable: {exc}")
@@ -809,168 +821,270 @@ class WorkspaceOverview:
     # Worker machines --------------------------------------------------------------
 
     def start_scans(self, workers):
-        """One thread per worker; None for one still backing off after a failed scan."""
+        """One thread per worker with its deadline; None for one still backing off.
+
+        The deadline starts with the thread, and the worker's whole scan (herdr listings
+        and probe) runs within it, so the wait for it is never shorter than its work.
+        """
         scans: dict = {}
         for machine in workers:
             if time.time() < self.retry.get(machine.id, 0):
                 scans[machine] = None
                 continue
             future: concurrent.futures.Future = concurrent.futures.Future()
+            deadline = time.monotonic() + REMOTE_TIMEOUT
 
-            def scan(machine=machine, future=future):
+            def scan(machine=machine, future=future, deadline=deadline):
                 try:
-                    future.set_result(self.scan_machine(machine))
+                    future.set_result(self.scan_machine(machine, deadline))
                 except BaseException as exc:  # Everything a worker raises stays its own.
                     future.set_exception(exc)
 
             threading.Thread(target=scan, daemon=True).start()
-            scans[machine] = future
+            scans[machine] = (future, deadline)
         return scans
 
-    def scan_machine(self, machine):
-        """A worker's herdr listings and its one probe call; raises when it is unreachable."""
+    @staticmethod
+    def remote_text(value):
+        return value if isinstance(value, str) and len(value) <= MAX_REMOTE_TEXT else None
+
+    def remote_space(self, space):
+        """A worker's herdr workspace rebuilt from typed fields; None when unusable."""
+        if not isinstance(space, dict):
+            return None
+        wid = space.get("workspace_id")
+        if not isinstance(wid, str) or not machines.WORKSPACE.fullmatch(wid):
+            return None
+        worktree = space.get("worktree")
+        return {
+            "workspace_id": wid,
+            "label": self.remote_text(space.get("label")),
+            "agent_status": self.remote_text(space.get("agent_status")),
+            "worktree": {
+                field: self.remote_text(worktree.get(field))
+                for field in ("repo_root", "checkout_path", "repo_name")
+            }
+            if isinstance(worktree, dict)
+            else None,
+        }
+
+    def remote_agent(self, agent):
+        if not isinstance(agent, dict):
+            return None
+        return {
+            field: self.remote_text(agent.get(field))
+            for field in ("workspace_id", "agent", "agent_status", "pane_id")
+        }
+
+    @staticmethod
+    def capped(found, notes, label):
+        """A worker's inventory within MAX_REMOTE_*, saying so when it was cut."""
+        clones, kept = [], 0
+        for clone in found["clones"][:MAX_REMOTE_CLONES]:
+            room = MAX_REMOTE_ITEMS - kept
+            if room <= 0:
+                break
+            main = clone["main"]
+            others = [item for item in clone["items"] if item["path"] != main["path"]]
+            items = [main, *others[: room - 1]]
+            kept += len(items)
+            clones.append({**clone, "items": items})
+        listed = {item["path"] for clone in clones for item in clone["items"]}
+        states = dict(
+            [(path, state) for path, state in found["states"].items() if path in listed][
+                :MAX_REMOTE_ROWS
+            ]
+        )
+        if len(listed) < sum(len(clone["items"]) for clone in found["clones"]) or len(states) < len(
+            found["states"]
+        ):
+            notes.append(f"{label}: inventory truncated to its first {len(states)} checkouts")
+        return {
+            **found,
+            "clones": clones,
+            "states": states,
+            "updates": {path: when for path, when in found["updates"].items() if path in states},
+        }
+
+    def scan_machine(self, machine, deadline=None):
+        """A worker's herdr listings and its one probe call; raises when it is unreachable.
+
+        Everything herdr says about a worker is rebuilt from type-checked fields, as the
+        probe's answer is validated, before any of it reaches a row.
+        """
+        deadline = time.monotonic() + REMOTE_TIMEOUT if deadline is None else deadline
+
+        def left():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("scan", REMOTE_TIMEOUT)
+            return remaining
+
         notes: list[str] = []
-        spaces = [
-            space
-            for space in self.spaces(notes, machine)
-            if isinstance(space, dict)
-            and isinstance(space.get("workspace_id"), str)
-            and machines.WORKSPACE.fullmatch(space["workspace_id"])
-        ]
-        agents = [agent for agent in self.agents(notes, machine) if isinstance(agent, dict)]
+        raw = self.spaces(notes, machine, min(HERDR_TIMEOUT, left()))
+        raw = raw if isinstance(raw, list) else []
+        spaces = [space for space in map(self.remote_space, raw) if space]
+        raw = self.agents(notes, machine, min(HERDR_TIMEOUT, left()))
+        raw = raw if isinstance(raw, list) else []
+        agents = [agent for agent in map(self.remote_agent, raw) if agent]
+        if len(spaces) > MAX_REMOTE_ROWS or len(agents) > MAX_REMOTE_AGENTS:
+            notes.append(f"{machine.label}: herdr listings truncated")
+            spaces, agents = spaces[:MAX_REMOTE_ROWS], agents[:MAX_REMOTE_AGENTS]
 
         def paths(field):
-            values = (
-                (space.get("worktree") or {}).get(field)
-                for space in spaces
-                if isinstance(space.get("worktree"), dict)
-            )
-            return sorted({v for v in values if isinstance(v, str) and v.startswith("/")})
+            values = (space["worktree"][field] for space in spaces if space["worktree"])
+            return sorted({v for v in values if v and v.startswith("/")})
 
         found = remote_probe.call(
             self.home,
             machine,
             "inventory",
-            REMOTE_TIMEOUT,
+            left(),
             src=machine.src,
             roots=[],
             repo_roots=paths("repo_root"),
             opened=paths("checkout_path"),
         )
+        found = self.capped(found, notes, machine.label)
         # Its paths are the worker's: the checkout herdr names becomes the one the probe
         # resolved there, and nothing about it is looked up on this filesystem.
-        for index, space in enumerate(spaces):
-            worktree = space.get("worktree")
-            if isinstance(worktree, dict):
-                info = found["paths"].get(worktree.get("checkout_path"))
-                spaces[index] = {
-                    **space,
-                    "worktree": {
-                        **worktree,
-                        "checkout_path": info["path"] if info else None,
-                        "exists": bool(info and info["exists"]),
-                    },
-                }
+        for space in spaces:
+            if worktree := space["worktree"]:
+                info = found["paths"].get(worktree["checkout_path"])
+                worktree["checkout_path"] = info["path"] if info else None
+                worktree["exists"] = bool(info and info["exists"])
         return spaces, agents, found, notes
+
+    def stale_machine(self, machine, error, rows, statuses, warnings, retry):
+        """A worker this scan could not use: its last rows, marked stale, and a warning."""
+        last = (self.value.get("machines") or {}).get(machine.id) or {}
+        if retry:
+            self.retry[machine.id] = time.time() + INTERVAL
+        kept = [
+            {**row, "machine_stale": True}
+            for row in self.value["workspaces"]
+            if row.get("machine") == machine.id
+        ]
+        rows.extend(kept)
+        statuses[machine.id] = {
+            "label": machine.label,
+            "status": "stale" if kept else "unreachable",
+            "error": error,
+            "synced_at": last.get("synced_at"),
+        }
+        shown = "; showing its last scanned workspaces" if kept else ""
+        warnings.append(f"{machine.label} unavailable: {error}{shown}")
 
     def collect_remote(self, scans, budget, warnings, wanted, failed, publish):
         """Every worker's rows: from this scan's probe, or its last rows marked stale.
 
-        Their GitHub lookups share the scan's budget after this machine's, and add to
-        ``wanted`` and ``failed``. Returns the rows and each worker's status.
+        Each worker's GitHub lookups get an equal share of what this machine left of the
+        scan's budget, a share one worker leaves unspent passing to the next, and add to
+        ``wanted`` and ``failed``. Whatever goes wrong building one worker's rows leaves
+        it stale and the other rows alone. Returns the rows and each worker's status.
         """
-        started = time.monotonic()
-        previous = self.value.get("machines") or {}
         rows: list[dict] = []
         statuses: dict[str, dict] = {}
         scanned = []
-        for machine, future in scans.items():
-            last = previous.get(machine.id) or {}
+        for machine, scan in scans.items():
+            last = (self.value.get("machines") or {}).get(machine.id) or {}
             try:
-                if future is None:
+                if scan is None:
                     raise ValueError(last.get("error") or "Waiting before the next attempt")
-                left = max(0.0, REMOTE_TIMEOUT - (time.monotonic() - started))
-                spaces, agents, found, notes = future.result(timeout=left)
+                future, deadline = scan
+                left = max(0.0, deadline - time.monotonic()) + REMOTE_GRACE
+                scanned.append((machine, *future.result(timeout=left)))
             except Exception as exc:
                 if isinstance(exc, concurrent.futures.TimeoutError):
                     error = f"No answer within {REMOTE_TIMEOUT} seconds"
                 else:
                     error = (str(exc) or type(exc).__name__)[-400:]
-                if future is not None:
-                    self.retry[machine.id] = time.time() + INTERVAL
-                kept = [
-                    {**row, "machine_stale": True}
-                    for row in self.value["workspaces"]
-                    if row.get("machine") == machine.id
-                ]
-                rows.extend(kept)
-                statuses[machine.id] = {
-                    "label": machine.label,
-                    "status": "stale" if kept else "unreachable",
-                    "error": error,
-                    "synced_at": last.get("synced_at"),
-                }
-                shown = "; showing its last scanned workspaces" if kept else ""
-                warnings.append(f"{machine.label} unavailable: {error}{shown}")
+                self.stale_machine(machine, error, rows, statuses, warnings, scan is not None)
+        jobs = self.jobs()
+        seen = set()
+        for index, (machine, spaces, agents, found, notes) in enumerate(scanned):
+            share = Budget(
+                self.fetch, max(0, budget.limit - budget.calls) // (len(scanned) - index)
+            )
+            notes = list(notes)
+            try:
+                built, own, missed, bases = self.machine_rows(
+                    machine, spaces, agents, found, jobs, share, notes
+                )
+            except Exception as exc:
+                error = f"Unusable inventory: {(str(exc) or type(exc).__name__)[-400:]}"
+                self.stale_machine(machine, error, rows, statuses, warnings, True)
                 continue
+            finally:
+                budget.calls += share.calls
             self.retry.pop(machine.id, None)
+            seen |= bases
             warnings.extend(notes)
+            with self.lock:
+                self.live |= set(own)
+            wanted.update(own)
+            failed.update(missed)
             statuses[machine.id] = {
                 "label": machine.label,
                 "status": "ok",
                 "error": None,
                 "synced_at": time.time(),
             }
-            scanned.append((machine, spaces, agents, found))
-        pending = []
-        own: dict[str, tuple] = {}
-        jobs = self.jobs()
-        for machine, spaces, agents, found in scanned:
-            clones = {clone["main"]["path"]: clone for clone in found["clones"]}
-            checkouts = {item["path"]: item for clone in found["clones"] for item in clone["items"]}
-            # A worker's watch names its checkout as the worker spells it.
-            watched = {
-                job["cwd"]
-                for job in jobs
-                if job.get("cwd")
-                and job.get("machine") == machine.id
-                and job.get("status") not in {"closed", "stopped"}
-            }
-            for row in self.orphan_rows(spaces, agents, checkouts, machine):
-                rows.append(row)
+            rows.extend(built)
+            for row in built:
                 if publish:
                     publish(row)
-            bases = {}
-            for path, state in found["states"].items():
-                item = checkouts[path]
-                root = str(Path(item["common"]).parent)
-                clone = clones.get(root)
-                if root not in bases:
-                    bases[root] = (
-                        self.base_repo(
-                            clone["main"],
-                            budget,
-                            warnings,
-                            config=clone["config"],
-                            key=f"m:{machine.id}:{root}",
-                        )
-                        if clone
-                        else (None, None)
-                    )
-                base, owner = bases[root]
-                main = path in clones
-                if base and not main:
-                    for kind, key in candidates(item, base, owner):
-                        own[f"{base}#{kind}#{key}"] = (base, kind, key)
-                update = found["updates"].get(path)
-                pending.append(
-                    (machine, item, state, base, owner, main, spaces, agents, watched, update)
-                )
+        # A worker's base repositories last as long as its clones do: a worker gone from
+        # the registry, or a clone its latest answer no longer lists, takes them along.
+        current = {machine.id for machine in scans}
+        answered = {machine.id for machine, *_ in scanned if statuses[machine.id]["status"] == "ok"}
         with self.lock:
-            self.live |= set(own)
-        wanted.update(own)
-        failed.update(self.refresh_links(self.due_links(own), budget))
-        for machine, item, state, base, owner, main, spaces, agents, watched, update in pending:
+            self.bases = {
+                key: value
+                for key, value in self.bases.items()
+                if not key.startswith("m:")
+                or (
+                    key.split(":", 2)[1] in current
+                    and (key.split(":", 2)[1] not in answered or key in seen)
+                )
+            }
+        return rows, statuses
+
+    def machine_rows(self, machine, spaces, agents, found, jobs, budget, warnings):
+        """One worker's rows, its link lookups, those that failed and its base cache keys."""
+        clones = {clone["main"]["path"]: clone for clone in found["clones"]}
+        checkouts = {item["path"]: item for clone in found["clones"] for item in clone["items"]}
+        # A worker's watch names its checkout as the worker spells it.
+        watched = {
+            job["cwd"]
+            for job in jobs
+            if job.get("cwd")
+            and job.get("machine") == machine.id
+            and job.get("status") not in {"closed", "stopped"}
+        }
+        rows = self.orphan_rows(spaces, agents, checkouts, machine)
+        bases: dict = {}
+        own: dict[str, tuple] = {}
+        pending = []
+        for path, state in found["states"].items():
+            item = checkouts[path]
+            root = str(Path(item["common"]).parent)
+            clone = clones.get(root)
+            key = f"m:{machine.id}:{root}"
+            if key not in bases:
+                bases[key] = (
+                    self.base_repo(clone["main"], budget, warnings, config=clone["config"], key=key)
+                    if clone
+                    else (None, None)
+                )
+            base, owner = bases[key]
+            main = path in clones
+            if base and not main:
+                for kind, lookup in candidates(item, base, owner):
+                    own[f"{base}#{kind}#{lookup}"] = (base, kind, lookup)
+            pending.append((item, state, base, owner, main, found["updates"].get(path)))
+        failed = self.refresh_links(self.due_links(own), budget)
+        for item, state, base, owner, main, update in pending:
             if main:
                 links, stale = [], False
             elif base:
@@ -981,9 +1095,7 @@ class WorkspaceOverview:
             if update:
                 row["updated_at"] = max(row.get("updated_at") or 0, update)
             rows.append(row)
-            if publish:
-                publish(row)
-        return rows, statuses
+        return rows, own, failed, set(bases)
 
     @staticmethod
     def on_machine(row, machine):

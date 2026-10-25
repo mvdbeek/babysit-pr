@@ -126,3 +126,29 @@ def test_cleanup_tolerates_an_exited_but_unreaped_leader():
                 break
             time.sleep(0.01)
     assert proc.returncode == 0
+
+
+def test_bounded_output_stops_a_command_that_never_stops_writing():
+    started = time.monotonic()
+    with pytest.raises(owned_process.OutputLimitExceeded):
+        owned_process.run(["yes", "babysit"], timeout=60, max_output=1024 * 1024)
+    assert time.monotonic() - started < 30
+
+
+def test_bounded_output_feeds_input_and_keeps_the_end_of_stderr():
+    script = (
+        "import sys; data = sys.stdin.buffer.read(); sys.stdout.buffer.write(data[::-1]); "
+        "sys.stderr.write('e' * 200000 + 'reason'); sys.exit(3)"
+    )
+    result = owned_process.run(
+        [sys.executable, "-c", script], timeout=30, input=b"abc" * 50000, max_output=200000
+    )
+    assert result.returncode == 3 and result.stdout == b"cba" * 50000
+    assert len(result.stderr) == owned_process.STDERR_TAIL and result.stderr.endswith(b"reason")
+
+
+def test_bounded_output_still_times_out():
+    with pytest.raises(subprocess.TimeoutExpired):
+        owned_process.run(["sleep", "30"], timeout=0.3, max_output=1024)
+    with pytest.raises(ValueError, match="bytes"):
+        owned_process.run(["true"], timeout=5, max_output=1024, text=True)

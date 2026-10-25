@@ -14,10 +14,13 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import json
+import math
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 PROTOCOL = "babysit-probe-1"
@@ -25,6 +28,11 @@ MAX_STDOUT = 8 * 1024 * 1024
 MAX_STDERR = 4096
 MAX_CHANGES = 1000
 MAX_UNPUSHED = 100
+MAX_TEXT = 4096  # Longest path, branch or config value an answer may carry.
+MAX_DEADLINE = 3600
+# Timestamps a worker reports: after 1970 and before 2100, whatever its clock says.
+LATEST_TIME = 4102444800
+EXPIRED = 124  # The probe's exit status once its deadline passed.
 SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 CONFIG_KEYS = r"^(remote\..*\.url|branch\..*\.(remote|merge))$"
 ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -50,7 +58,9 @@ def remote_slug(value):
         r"(?:https://github.com/|git@github.com:|ssh://git@github.com/)([^/]+/[^/]+?)(?:\.git)?/?",
         value,
     )
-    return match[1].lower() if match and SLUG.fullmatch(match[1]) else None
+    if not match or not SLUG.fullmatch(match[1]) or match[1].split("/")[1] in {".", ".."}:
+        return None
+    return match[1].lower()
 
 
 def remote_slugs(config):
@@ -337,8 +347,21 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
 # The worker side -------------------------------------------------------------
 
 
+class Expired(Exception):
+    """The probe's deadline passed; deliberately none of the errors a scan step absorbs."""
+
+
+# Monotonic time after which no further Git starts; None when no deadline was given.
+DEADLINE = None
+
+
 def host_git(path, *args, timeout=60, strip=True):
     """Git in one checkout on the machine this probe runs on, hardened and non-interactive."""
+    if DEADLINE is not None:
+        left = DEADLINE - time.monotonic()
+        if left <= 0:
+            raise Expired("Probe deadline expired")
+        timeout = min(timeout, left)
     result = subprocess.run(
         [*HOST_GIT, "-C", str(path), *args],
         env={**os.environ, **HOST_ENV},
@@ -442,7 +465,24 @@ def _host_inventory(src, roots, repo_roots, opened):
 OPS = {"inventory": _host_inventory}
 
 
+def _expire(signum, frame):
+    # A probe leading its own process group (see __main__) stops its Git children too;
+    # it ignores the signal it sends them, then unwinds to report and exit.
+    if os.getpgrp() == os.getpid():
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.killpg(0, signal.SIGTERM)
+    raise Expired("Probe deadline expired")
+
+
 def main(argv):
+    """Answer one request; a ``deadline`` in seconds bounds the whole run on this worker.
+
+    A killed ssh client leaves the probe running, so it carries its own lifeline: an
+    alarm at the deadline, and no Git started after it. Expiry exits with EXPIRED.
+    """
+    global DEADLINE
+    code = 0
+    previous = None
     try:
         if len(argv) != 3 or argv[1] != PROTOCOL:
             raise ValueError(f"Probe protocol mismatch; this worker speaks {PROTOCOL}")
@@ -451,18 +491,41 @@ def main(argv):
             raise ValueError("Unknown probe op")
         if not isinstance(request.get("args"), dict):
             raise ValueError("Probe arguments must be an object")
+        deadline = request.get("deadline")
+        if deadline is not None:
+            if not (
+                isinstance(deadline, (int, float))
+                and not isinstance(deadline, bool)
+                and 0 < deadline <= MAX_DEADLINE
+            ):
+                raise ValueError("Probe deadline must be a number of seconds")
+            DEADLINE = time.monotonic() + deadline
+            previous = signal.signal(signal.SIGALRM, _expire)
+            signal.setitimer(signal.ITIMER_REAL, deadline)
         answer = {"protocol": PROTOCOL, "result": OPS[request["op"]](**request["args"])}
+    except Expired as exc:
+        code = EXPIRED
+        answer = {"protocol": PROTOCOL, "error": str(exc)}
     except Exception as exc:
         answer = {"protocol": PROTOCOL, "error": f"{type(exc).__name__}: {exc}"[:400]}
+    finally:
+        if previous is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        DEADLINE = None
     sys.stdout.write(json.dumps(answer))
-    return 0
+    return code
 
 
 # The controller side ---------------------------------------------------------
 
 
+def _text(value):
+    return isinstance(value, str) and len(value) <= MAX_TEXT
+
+
 def _absolute(value):
-    return isinstance(value, str) and value.startswith("/") and "\0" not in value
+    return _text(value) and value.startswith("/") and "\0" not in value
 
 
 def _expect(ok, what):
@@ -470,8 +533,21 @@ def _expect(ok, what):
         raise ValueError(f"Malformed probe answer: {what}")
 
 
-def _number(value):
-    return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
+def _time(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and 0 <= value < LATEST_TIME
+    )
+
+
+def _count(value, limit):
+    return value is None or (type(value) is int and 0 <= value <= limit)
+
+
+def _constant(name):
+    raise ValueError(f"non-finite number {name}")
 
 
 def validate_inventory(value):
@@ -484,47 +560,48 @@ def validate_inventory(value):
         _expect(isinstance(clone, dict) and set(clone) == {"main", "items", "config"}, "clone")
         config = clone["config"]
         _expect(
-            isinstance(config, dict)
-            and all(isinstance(k, str) and isinstance(v, str) for k, v in config.items()),
+            isinstance(config, dict) and all(_text(k) and _text(v) for k, v in config.items()),
             "config",
         )
         _expect(isinstance(clone["items"], list) and clone["main"] in clone["items"], "items")
         for item in clone["items"]:
             _expect(isinstance(item, dict), "item")
             _expect(_absolute(item.get("path")) and _absolute(item.get("common")), "item path")
-            _expect(isinstance(item.get("branch"), str), "branch")
-            _expect(isinstance(item.get("sha"), str), "sha")
+            _expect(_text(item.get("branch")), "branch")
+            _expect(_text(item.get("sha")), "sha")
             remotes = item.get("remotes")
-            _expect(
-                isinstance(remotes, list) and all(isinstance(r, str) for r in remotes), "remotes"
-            )
+            _expect(isinstance(remotes, list) and all(map(_text, remotes)), "remotes")
             upstream = item.get("upstream")
             _expect(
                 upstream is None
                 or (
                     isinstance(upstream, list)
                     and len(upstream) == 2
-                    and all(part is None or isinstance(part, str) for part in upstream)
+                    and all(part is None or _text(part) for part in upstream)
                 ),
                 "upstream",
             )
-    listed = {item["path"] for clone in value["clones"] for item in clone["items"]}
+    paths = [item["path"] for clone in value["clones"] for item in clone["items"]]
+    listed = set(paths)
+    _expect(len(listed) == len(paths), "item listed twice")
     _expect(isinstance(value["states"], dict), "states")
     for path, state in value["states"].items():
         _expect(path in listed and isinstance(state, dict), "state")
         _expect(
-            all(_number(state.get(k)) for k in ("created_at", "updated_at", "changes", "unpushed")),
+            all(state.get(k) is None or _time(state[k]) for k in ("created_at", "updated_at"))
+            and _count(state.get("changes"), MAX_CHANGES)
+            and _count(state.get("unpushed"), MAX_UNPUSHED),
             "state values",
         )
-        _expect(state.get("error") is None or isinstance(state["error"], str), "state error")
+        _expect(state.get("error") is None or _text(state["error"]), "state error")
         _expect({"changes", "unpushed", "error"} <= set(state), "state fields")
     _expect(isinstance(value["updates"], dict), "updates")
     for path, when in value["updates"].items():
-        _expect(path in value["states"] and _number(when) and when is not None, "update")
+        _expect(path in value["states"] and _time(when), "update")
     _expect(isinstance(value["paths"], dict), "paths")
     for path, info in value["paths"].items():
         _expect(
-            isinstance(path, str)
+            _text(path)
             and isinstance(info, dict)
             and set(info) == {"path", "exists"}
             and _absolute(info["path"])
@@ -542,21 +619,28 @@ def call(home, machine, op, timeout, **args):
 
     Raises ValueError with the worker's own words when it is unreachable, the probe
     fails or the answer is oversized or malformed; ``subprocess.TimeoutExpired`` when
-    the worker takes longer than ``timeout``.
+    the worker takes longer than ``timeout``, which is also the probe's own deadline
+    there. Its stdout is read only up to MAX_STDOUT before the ssh client is stopped.
     """
     import machines  # The controller's transport; workers never import it.
+    import owned_process
 
-    payload = base64.b64encode(json.dumps({"op": op, "args": args}).encode()).decode()
+    request = {"op": op, "args": args, "deadline": max(1, min(timeout, MAX_DEADLINE))}
+    payload = base64.b64encode(json.dumps(request).encode()).decode()
     python = machine.python
     if python.startswith(("/", "~")):
         python = machines.remote_path(python)
-    result = machines.run(
-        home,
-        machine,
-        [python, "-I", "-", PROTOCOL, payload],
-        timeout=timeout,
-        input=Path(__file__).read_bytes(),
-    )
+    try:
+        result = machines.run(
+            home,
+            machine,
+            [python, "-I", "-", PROTOCOL, payload],
+            timeout=timeout,
+            input=Path(__file__).read_bytes(),
+            max_output=MAX_STDOUT,
+        )
+    except owned_process.OutputLimitExceeded as exc:
+        raise ValueError(f"{machine.label} probe answer exceeded {MAX_STDOUT} bytes") from exc
     stderr = result.stderr[-MAX_STDERR:].decode(errors="replace").strip()
     if result.returncode:
         reason = "unreachable" if result.returncode == 255 else f"exit {result.returncode}"
@@ -564,7 +648,7 @@ def call(home, machine, op, timeout, **args):
     if len(result.stdout) > MAX_STDOUT:
         raise ValueError(f"{machine.label} probe answer exceeded {MAX_STDOUT} bytes")
     try:
-        answer = json.loads(result.stdout)
+        answer = json.loads(result.stdout, parse_constant=_constant)
     except ValueError as exc:
         raise ValueError(f"{machine.label} probe answered no JSON: {stderr or exc}") from exc
     if not isinstance(answer, dict) or answer.get("protocol") != PROTOCOL:
@@ -575,4 +659,8 @@ def call(home, machine, op, timeout, **args):
 
 
 if __name__ == "__main__":
+    try:
+        os.setpgid(0, 0)  # Its own group, so an expired deadline stops its Git children.
+    except OSError:
+        pass  # Already leading its session, and so its group.
     raise SystemExit(main(sys.argv))

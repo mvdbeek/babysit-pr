@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -269,9 +270,7 @@ def test_a_hung_worker_is_given_up_on_without_delaying_the_scan_past_its_timeout
     register(fleet["home"], MINI)
     release = threading.Event()
     monkeypatch.setattr(wso, "REMOTE_TIMEOUT", 0.2)
-    monkeypatch.setattr(
-        wso.WorkspaceOverview, "scan_machine", lambda self, machine: release.wait(10)
-    )
+    monkeypatch.setattr(wso.WorkspaceOverview, "scan_machine", lambda self, *args: release.wait(10))
     value = wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect()
     release.set()
     assert value["machines"]["mini"]["status"] == "unreachable"
@@ -482,5 +481,320 @@ def test_call_bounds_and_checks_the_worker_answer(
     assert len(str(error.value)) < remote_probe.MAX_STDERR + 200
     [(argv, kwargs)] = sent
     assert argv[:4] == ["python3", "-I", "-", remote_probe.PROTOCOL]
-    assert json.loads(base64.b64decode(argv[4])) == {"op": "inventory", "args": {"src": "~/s"}}
+    assert json.loads(base64.b64decode(argv[4])) == {
+        "op": "inventory",
+        "args": {"src": "~/s"},
+        "deadline": 5,
+    }
+    assert kwargs["max_output"] == remote_probe.MAX_STDOUT
     assert kwargs["input"] == Path(remote_probe.__file__).read_bytes()
+
+
+# A worker that is buggy, version-skewed or compromised -------------------------
+
+
+def test_malformed_worker_herdr_never_stops_this_machines_rows(fleet):
+    register(fleet["home"], MINI)
+    store = read(fleet["state"])
+    store["machines"]["Mac mini"] = {
+        "workspaces": [
+            "not a workspace",
+            {"workspace_id": ["w0"]},
+            {
+                "workspace_id": "w1",
+                "label": 5,
+                "agent_status": ["unhashable"],
+                "worktree": "not a worktree",
+            },
+            {
+                "workspace_id": "w3",
+                "label": {"x": 1},
+                "agent_status": {"working": True},
+                "worktree": {
+                    "repo_root": 7,
+                    "checkout_path": str(fleet["mini"] / "merged-work"),
+                    "repo_name": ["repo"],
+                },
+            },
+        ],
+        "agents": [
+            42,
+            {"workspace_id": "w3", "agent": [1], "agent_status": {}, "pane_id": None},
+        ],
+        "calls": [],
+    }
+    fleet["state"].write_text(json.dumps(store))
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    plugin._refresh()
+    assert plugin.error is None
+    rows = by_key(plugin.value)
+    assert rows[str(fleet["local"] / "local-work")]["changes"] == 0
+    assert plugin.value["machines"]["mini"]["status"] == "ok"
+    detached = rows["workspace:mini:w1"]
+    assert (detached["name"], detached["label"], detached["agent_status"]) == ("w1", None, None)
+    merged = rows[f"m:mini:{fleet['mini'] / 'merged-work'}"]
+    assert merged["workspace_ids"] == ["mini/w3"] and merged["label"] is None
+    assert merged["agents"] == [{"agent": None, "status": None, "pane": None}]
+    assert "workspace:mini:w0" not in rows
+
+
+def test_a_worker_whose_rows_cannot_be_built_is_left_stale_alone(fleet, monkeypatch):
+    register(fleet["home"], MINI, BOX)
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    plugin._refresh()
+    original = wso.WorkspaceOverview.on_machine
+
+    def broken(row, machine):
+        if machine.id == "mini":
+            raise TypeError("unexpected worker data")
+        return original(row, machine)
+
+    monkeypatch.setattr(wso.WorkspaceOverview, "on_machine", staticmethod(broken))
+    (fleet["local"] / "local-work" / "new.txt").write_text("changed")
+    plugin.next_poll = 0
+    plugin._refresh()
+    assert plugin.error is None
+    rows = by_key(plugin.value)
+    assert rows[str(fleet["local"] / "local-work")]["changes"] == 1
+    status = plugin.value["machines"]["mini"]
+    assert status["status"] == "stale" and "unexpected worker data" in status["error"]
+    kept = [row for row in rows.values() if row.get("machine") == "mini"]
+    assert len(kept) == 3 and all(row["machine_stale"] for row in kept)
+    assert plugin.value["machines"]["box"]["status"] == "ok"
+    assert "mini" in plugin.retry
+
+
+def test_a_worker_scan_runs_within_its_deadline(fleet, monkeypatch):
+    register(fleet["home"], MINI)
+    machine = machines.resolve(fleet["home"], "mini")
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    timeouts = []
+    herdr = wso.herdr
+    call = remote_probe.call
+
+    def listed(*args, timeout, **kwargs):
+        timeouts.append(("herdr", timeout))
+        return herdr(*args, timeout=timeout, **kwargs)
+
+    def probe(home, machine, op, timeout, **args):
+        timeouts.append(("probe", timeout))
+        return call(home, machine, op, timeout, **args)
+
+    monkeypatch.setattr(wso, "herdr", listed)
+    monkeypatch.setattr(remote_probe, "call", probe)
+    plugin.scan_machine(machine, time.monotonic() + 50)
+    assert [kind for kind, _ in timeouts] == ["herdr", "herdr", "probe"]
+    assert all(timeout <= 30 for _, timeout in timeouts[:2]) and timeouts[2][1] <= 50
+    timeouts.clear()
+    with pytest.raises(subprocess.TimeoutExpired):
+        plugin.scan_machine(machine, time.monotonic() - 1)
+    assert timeouts == []
+
+
+def test_each_worker_spends_its_share_of_the_github_budget(fleet, monkeypatch):
+    register(fleet["home"], MINI, BOX)
+    monkeypatch.setattr(wso, "CALL_BUDGET", 9)
+    shares = []
+    original = wso.WorkspaceOverview.machine_rows
+
+    def counted(self, machine, spaces, agents, found, jobs, budget, warnings):
+        limit = budget.limit
+        try:
+            return original(self, machine, spaces, agents, found, jobs, budget, warnings)
+        finally:
+            shares.append((machine.id, limit, budget.calls))
+
+    monkeypatch.setattr(wso.WorkspaceOverview, "machine_rows", counted)
+    value = wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect()
+    local = value["calls"] - sum(calls for _, _, calls in shares)
+    (first, first_limit, first_calls), (_, second_limit, _) = shares
+    assert first == "mini" and first_limit == (9 - local) // 2
+    assert second_limit == 9 - local - first_calls
+
+
+def test_worker_inventories_are_capped_and_say_so(monkeypatch):
+    monkeypatch.setattr(wso, "MAX_REMOTE_CLONES", 2)
+    monkeypatch.setattr(wso, "MAX_REMOTE_ITEMS", 3)
+    monkeypatch.setattr(wso, "MAX_REMOTE_ROWS", 1)
+
+    def item(path):
+        return {"path": path, "common": "/c/.git", "branch": "b", "sha": "", "remotes": []}
+
+    clones = [
+        {"main": item(f"/c{n}"), "items": [item(f"/c{n}"), item(f"/c{n}/a"), item(f"/c{n}/b")]}
+        for n in range(3)
+    ]
+    found = {
+        "roots": [],
+        "clones": clones,
+        "states": {"/c0/a": {}, "/c1": {}, "/c2/a": {}},
+        "updates": {"/c0/a": 1.0, "/c2/a": 2.0},
+        "paths": {},
+    }
+    notes = []
+    capped = wso.WorkspaceOverview.capped(found, notes, "Mac mini")
+    assert [[i["path"] for i in clone["items"]] for clone in capped["clones"]] == [
+        ["/c0", "/c0/a", "/c0/b"]
+    ]
+    assert capped["states"] == {"/c0/a": {}} and capped["updates"] == {"/c0/a": 1.0}
+    assert notes == ["Mac mini: inventory truncated to its first 1 checkouts"]
+
+
+def test_an_oversized_worker_never_blocks_saving_this_machines_cache(fleet, monkeypatch):
+    register(fleet["home"], MINI)
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    plugin.value = {**plugin.collect(), "synced_at": time.time()}
+    local = [row for row in plugin.value["workspaces"] if "machine" not in row]
+    worker = {**plugin.value["workspaces"][-1], "machine": "mini", "label": "x" * 100000}
+    plugin.value["workspaces"].append(worker)
+    monkeypatch.setattr(wso, "MAX_STATE", 50000)
+    plugin.save()
+    assert plugin.error is None
+    cache = json.loads((fleet["home"] / "experiments" / "workspaces" / "cache.json").read_text())
+    assert cache["value"]["workspaces"] == local
+
+
+def test_base_repositories_of_gone_workers_and_clones_are_pruned(fleet):
+    register(fleet["home"], MINI)
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    root = str(fleet["hosts"] / "mini.test" / "src" / "repo")
+    entry = {"repo": BASE, "origin_owner": "fork", "checked_at": time.time()}
+    plugin.bases = {"m:ghost:/src/x": entry, "m:mini:/src/gone": entry, "/local/clone": entry}
+    plugin.collect()
+    assert set(plugin.bases) >= {"/local/clone", f"m:mini:{root}"}
+    assert not {"m:ghost:/src/x", "m:mini:/src/gone"} & set(plugin.bases)
+
+
+def test_remote_slugs_never_name_dot_repositories():
+    assert remote_probe.remote_slug("https://github.com/owner/..") is None
+    assert remote_probe.remote_slug("git@github.com:owner/..git") is None
+    assert remote_probe.remote_slug("https://github.com/owner/.") is None
+    assert remote_probe.remote_slug("https://github.com/Owner/.dots.git") == "owner/.dots"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"changes": -1, "unpushed": 0, "error": None},
+        {"changes": 0.5, "unpushed": 0, "error": None},
+        {"changes": 0, "unpushed": remote_probe.MAX_UNPUSHED + 1, "error": None},
+        {"changes": 0, "unpushed": 0, "error": None, "created_at": float("nan")},
+        {"changes": 0, "unpushed": 0, "error": None, "updated_at": float("inf")},
+        {"changes": 0, "unpushed": 0, "error": None, "updated_at": -5},
+        {"changes": 0, "unpushed": 0, "error": None, "updated_at": 1e300},
+        {"changes": 0, "unpushed": 0, "error": "x" * (remote_probe.MAX_TEXT + 1)},
+    ],
+)
+def test_implausible_worker_states_are_rejected(state):
+    item = {"path": "/c", "common": "/c/.git", "branch": "main", "sha": "", "remotes": []}
+    value = {
+        "roots": [],
+        "clones": [{"main": item, "items": [item], "config": {}}],
+        "states": {"/c": state},
+        "updates": {},
+        "paths": {},
+    }
+    with pytest.raises(ValueError, match="Malformed probe answer"):
+        remote_probe.validate_inventory(value)
+
+
+def test_an_item_listed_by_two_clones_is_rejected():
+    item = {"path": "/c", "common": "/c/.git", "branch": "main", "sha": "", "remotes": []}
+    other = {**item, "path": "/d"}
+    value = {
+        "roots": [],
+        "clones": [
+            {"main": item, "items": [item], "config": {}},
+            {"main": other, "items": [other, item], "config": {}},
+        ],
+        "states": {},
+        "updates": {},
+        "paths": {},
+    }
+    with pytest.raises(ValueError, match="item listed twice"):
+        remote_probe.validate_inventory(value)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_numbers_in_an_answer_are_refused(tmp_path, monkeypatch, constant):
+    register(tmp_path, MINI)
+    result = '{"roots": [], "clones": [], "states": {}, "updates": {"/x": %}, "paths": {}}'
+    answer = f'{{"protocol": "{remote_probe.PROTOCOL}", "result": {result}}}'
+    stdout = answer.replace("%", constant).encode()
+    monkeypatch.setattr(
+        machines,
+        "run",
+        lambda home, m, argv, **kw: subprocess.CompletedProcess(argv, 0, stdout, b""),
+    )
+    with pytest.raises(ValueError, match="no JSON.*non-finite"):
+        remote_probe.call(tmp_path, machines.resolve(tmp_path, "mini"), "inventory", 5)
+
+
+def test_a_streaming_worker_is_cut_off_at_the_answer_cap(fleet, monkeypatch):
+    pidfile = fleet["hosts"] / "streamer.pid"
+    streamer = fleet["hosts"] / "streamer"
+    streamer.write_text(f"#!/bin/sh\necho $$ > '{pidfile}'\nexec yes babysit\n")
+    streamer.chmod(0o700)
+    register(fleet["home"], {**MINI, "python": str(streamer)})
+    monkeypatch.setattr(remote_probe, "MAX_STDOUT", 1024 * 1024)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="exceeded 1048576 bytes"):
+        remote_probe.call(fleet["home"], machines.resolve(fleet["home"], "mini"), "inventory", 60)
+    assert time.monotonic() - started < 30
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        assert time.monotonic() < deadline, "the streaming worker command survived"
+        time.sleep(0.05)
+
+
+def test_the_probe_stops_at_its_deadline(capsys, monkeypatch):
+    monkeypatch.setitem(remote_probe.OPS, "inventory", lambda **args: time.sleep(10))
+    request = {"op": "inventory", "args": {}, "deadline": 0.2}
+    started = time.monotonic()
+    code = remote_probe.main(["-", remote_probe.PROTOCOL, encoded(request)])
+    assert code == remote_probe.EXPIRED and time.monotonic() - started < 5
+    assert "deadline expired" in json.loads(capsys.readouterr().out)["error"]
+    assert remote_probe.DEADLINE is None
+    for bad in (0, -1, True, "5", remote_probe.MAX_DEADLINE + 1):
+        answer = run_main(capsys, remote_probe.PROTOCOL, encoded({**request, "deadline": bad}))
+        assert "deadline must be" in answer["error"]
+
+
+def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pids = tmp_path / "git.pids"
+    git_stub = bin_dir / "git"
+    git_stub.write_text(f"#!/bin/sh\necho $$ >> '{pids}'\nexec sleep 60\n")
+    git_stub.chmod(0o700)
+    (tmp_path / "src" / "repo" / ".git").mkdir(parents=True)
+    request = {
+        "op": "inventory",
+        "args": {"src": str(tmp_path / "src"), "roots": [], "repo_roots": [], "opened": []},
+        "deadline": 1,
+    }
+    started = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, "-I", "-", remote_probe.PROTOCOL, encoded(request)],
+        input=Path(remote_probe.__file__).read_bytes(),
+        capture_output=True,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        timeout=30,
+    )
+    assert result.returncode == remote_probe.EXPIRED, result.stderr
+    assert time.monotonic() - started < 15
+    assert "deadline expired" in json.loads(result.stdout)["error"]
+    for pid in map(int, pids.read_text().split()):
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, "the probe's Git survived its deadline"
+            time.sleep(0.05)
