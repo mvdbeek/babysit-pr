@@ -1258,10 +1258,21 @@ class WorkspaceOverview:
             steps.append("Checkout already removed")
             return
         self.progress(job, index, steps, f"Removing worktree {row['path']}")
-        arguments = ["worktree", "remove"]
-        if force:
-            arguments.append("--force")
-        git(row["repo_root"], *arguments, row["path"], timeout=300)
+        if not force:
+            # Git's own clean check runs `git status` in that worktree under config the
+            # clone's listing never saw, so the same check runs hardened here and Git is
+            # told to skip its own. It refuses what Git refuses: tracked changes and
+            # untracked files (ignored ones go), and any submodule.
+            path = row["path"]
+            if git(path, "status", "--porcelain", "-z", "--untracked-files=normal", timeout=300):
+                raise ValueError(f"{path} has uncommitted changes or untracked files; kept")
+            modules = git(path, "rev-parse", "--path-format=absolute", "--git-path", "modules")
+            staged = git(path, "ls-files", "--stage", "-z", timeout=300, strip=False)
+            if Path(modules).is_dir() or any(
+                entry.startswith("160000 ") for entry in staged.split("\0")
+            ):
+                raise ValueError(f"{path} contains submodules; kept")
+        git(row["repo_root"], "worktree", "remove", "--force", row["path"], timeout=300)
 
     def delete_branch(self, job, index, row, steps, approved):
         """Delete the branch only when no commit can be lost, and say so when it is kept.

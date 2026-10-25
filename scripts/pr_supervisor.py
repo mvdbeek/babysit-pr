@@ -527,10 +527,18 @@ def command_for(job, attempt_dir):
     if job.get("model"):
         cmd += ["--model", job["model"]]
     if sandbox == "workspace-write":
-        cmd += [
-            "--add-dir",
-            git(job["cwd"], "rev-parse", "--path-format=absolute", "--git-common-dir"),
-        ]
+        # Granted to Codex: what the checkout's layout shows, never an agent-written
+        # commondir file, and still the common dir the watch was registered with.
+        try:
+            common = safe_git.common_dir(job["cwd"])
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if job.get("git_common_dir", common) != common:
+            raise RuntimeError(
+                f"{job['cwd']} now shares {common}, not the Git common dir registered with "
+                f"this watch ({job['git_common_dir']}); re-register it to grant that"
+            )
+        cmd += ["--add-dir", common]
     return [*cmd, "resume", job["session_id"], "-"]
 
 
@@ -1029,6 +1037,11 @@ def register(db, args):
         or not all(isinstance(v, str) and v for v in command)
     ):
         raise ValueError("Agent launcher must be a nonempty JSON argv array")
+    try:
+        # Recorded so a later grant of the common dir can tell when it moved.
+        recorded = {"git_common_dir": safe_git.common_dir(cwd)}
+    except ValueError:
+        recorded = {}
     key = hashlib.sha256(pr["url"].encode()).hexdigest()[:16]
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -1048,6 +1061,7 @@ def register(db, args):
             "ci_repo": ci_repo,
             "branch": branch,
             "cwd": cwd,
+            **recorded,
             **info,
             "pane": pane,
             "agent": agent_kind,

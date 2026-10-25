@@ -15,10 +15,20 @@ working tree files first list the effective config and neutralise each
 ``filter.<driver>`` the repository defines, keeping a definition from the user's own
 config (Git LFS, say) and blanking the rest; Git skips an empty filter command.
 ``remote.<name>.uploadpack`` is first-wins, so fetches pass ``--upload-pack`` instead.
+Only the https, ssh and file transports are allowed, and any ``protocol.<name>.allow``
+the repository adds is overridden, so no ``git-remote-<name>`` helper is started.
+
+Which config applies depends on the worktree: ``config.worktree`` and ``includeIf``
+conditions on the branch or git dir. So a worktree is checked out by adding it with
+``--no-checkout`` and resetting inside it, where the listing sees what the reset will,
+and removed with ``--force`` after a hardened status in it, since Git's own clean check
+runs ``git status`` in that worktree with its config. Status and diffs ignore
+submodules, whose own config is never listed.
 
 Left open, and stated in references/supervisor.md: config rewritten between that
-listing and the command itself, drivers in a submodule's own config, remote helpers
-already installed on PATH, and lazy fetches on Git older than 2.44.
+listing and the command itself, drivers in a submodule's own config, helpers for the
+allowed transports already on PATH, ``FETCH_HEAD`` written through a symbolic link, and
+lazy fetches on Git older than 2.44.
 
 The system and global config are trusted and still apply: the sandbox cannot write
 them. Only the standard library is used, since ``wt`` imports this too.
@@ -53,6 +63,20 @@ OPTIONS = (
     "submodule.recurse=false",
     "-c",
     "fetch.recurseSubmodules=false",
+    # Both run Git inside a submodule, under the submodule's own config.
+    "-c",
+    "status.submoduleSummary=false",
+    "-c",
+    "diff.submodule=short",
+    # Remote helpers are programs: only https, ssh and local paths are reachable.
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "protocol.https.allow=always",
+    "-c",
+    "protocol.ssh.allow=always",
+    "-c",
+    "protocol.file.allow=always",
     # Auto gc after a fetch would run gc.recentObjectsHook.
     "-c",
     "gc.auto=0",
@@ -64,16 +88,26 @@ OPTIONS = (
 ENVIRONMENT = {"GIT_NO_LAZY_FETCH": "1", "GIT_PROXY_COMMAND": ""}
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 # Subcommands that read working tree files through filters, or run a transport.
-CONTENT = {"diff", "fetch", "status", "switch", "worktree add", "worktree remove"}
+CONTENT = {"diff", "fetch", "reset", "status", "switch"}
+# Their checkout or clean check would run in a worktree whose config was not listed.
+WORKTREE = {"worktree add": "--no-checkout", "worktree remove": "--force"}
+ALLOWED = {"https", "ssh", "file"}
 # Subcommands that may need credentials; the rest run without the token.
 NETWORK = {"fetch"}
 DIFFS = {"diff", "log", "show"}
+# Commands that would otherwise run Git in each submodule to see whether it changed.
+SUBMODULES = {"diff", "log", "show", "status"}
 TRUSTED = {"system", "global", "command"}
 LISTING = ("config", "--list", "-z", "--show-scope")
 FILTER = re.compile(r"filter\..+\.(clean|smudge|process|required)")
+PROTOCOL = re.compile(r"protocol\.(.+)\.allow")
 HELPER = re.compile(r"credential\.(.+\.)?helper")
-# Settings that let a proxy or another CA read what is sent to GitHub.
-TLS = re.compile(r"http\.(.+\.)?(sslverify|sslcainfo|sslcapath|sslbackend|proxy)|remote\..+\.proxy")
+# Settings that let a proxy, another CA or another address read what is sent to GitHub,
+# or keep its cookies in a file the agent reads.
+TLS = re.compile(
+    r"http\.(.+\.)?(sslverify|sslcainfo|sslcapath|sslbackend|proxy|cookiefile|savecookies"
+    r"|curloptresolve)|remote\..+\.proxy"
+)
 GITHUB = "credential.https://github.com.helper"
 
 
@@ -106,6 +140,11 @@ def overrides(config: Sequence[tuple[str, str, str]], credentials: bool) -> list
         values = [value for name, value in trusted if name == key]
         default = "false" if key.endswith(".required") else ""
         options += ["-c", f"{key}={values[-1] if values else default}"]
+    for key in dict.fromkeys(k for k in planted if PROTOCOL.fullmatch(k)):
+        name = key.split(".", 1)[1].rsplit(".", 1)[0]
+        if "=" in key:
+            raise ValueError(f"Cannot neutralise the repository's {key!r}; Git was not run")
+        options += ["-c", f"{key}={'always' if name in ALLOWED else 'never'}"]
     ssh = [value for name, value in trusted if name == "core.sshcommand"]
     if ssh:
         options += ["-c", f"core.sshCommand={ssh[-1]}"]
@@ -160,8 +199,11 @@ def prepare(
             environment.pop(token, None)
     for key, value in ENVIRONMENT.items():
         environment.setdefault(key, value)
+    pair = " ".join(argv[index : index + 2])
+    if pair in WORKTREE and WORKTREE[pair] not in argv[index + 2 :]:
+        raise ValueError(f"git {pair} needs {WORKTREE[pair]} on the host; Git was not run")
     extra: list[str] = []
-    if name in CONTENT or " ".join(argv[index : index + 2]) in CONTENT:
+    if name in CONTENT:
         # Listing config runs nothing: no index, hooks or filters, and no pager here.
         listing = read(["git", "--no-pager", "-C", path, *LISTING], environment)
         extra = overrides(entries(listing), credentials)
@@ -169,5 +211,72 @@ def prepare(
         "fetch": ["--upload-pack=git-upload-pack"],
         **{diff: ["--no-ext-diff", "--no-textconv"] for diff in DIFFS},
     }.get(name, [])
+    if name in SUBMODULES:
+        flags = [*flags, "--ignore-submodules=all"]
     argv[index + 1 : index + 1] = flags
     return ["git", "-C", path, *OPTIONS, *extra, *argv], environment
+
+
+def common_dir(checkout: str) -> str:
+    """The Git common dir of ``checkout``, read from its layout rather than asked of Git.
+
+    ``rev-parse --git-common-dir`` follows ``commondir`` files, which an agent can write
+    in its worktree's admin dir or the clone's own ``.git``, so a host that grants that
+    answer to a sandbox grants whatever directory the agent named. Here a clone's real
+    ``.git`` directory is its own common dir, and a linked worktree's ``.git`` file must
+    point at ``<common>/worktrees/<id>``, whose ``gitdir`` registers this very checkout.
+    """
+    dot = os.path.join(checkout, ".git")
+
+    def refuse(reason: str) -> ValueError:
+        return ValueError(f"The Git common dir of {checkout} cannot be verified: {reason}")
+
+    if os.path.islink(dot):
+        raise refuse(".git is a symbolic link")
+    if os.path.isdir(dot):
+        common = os.path.realpath(dot)
+        if os.path.lexists(os.path.join(common, "commondir")):
+            raise refuse(f"{common}/commondir names another common dir")
+    else:
+        try:
+            with open(dot) as handle:
+                pointer = handle.read(4096)
+        except OSError as exc:
+            raise refuse(f"no .git directory or file ({exc.strerror})") from exc
+        if not pointer.startswith("gitdir: "):
+            raise refuse(".git is not a gitdir file")
+        admin = os.path.realpath(os.path.join(checkout, pointer[len("gitdir: ") :].strip()))
+        worktrees = os.path.dirname(admin)
+        common = os.path.dirname(worktrees)
+        if os.path.basename(worktrees) != "worktrees" or os.path.basename(common) != ".git":
+            raise refuse(f"{admin} is not a worktree of a clone's .git")
+        try:
+            with open(os.path.join(admin, "gitdir")) as handle:
+                registered = handle.read(4096).strip()
+        except OSError as exc:
+            raise refuse(f"{admin} does not register this checkout ({exc.strerror})") from exc
+        if os.path.realpath(os.path.join(admin, registered)) != os.path.realpath(dot):
+            raise refuse(f"{admin} does not register this checkout")
+        try:
+            with open(os.path.join(admin, "commondir")) as handle:
+                named = handle.read(4096).strip()
+        except OSError as exc:
+            raise refuse(f"{admin}/commondir is unreadable ({exc.strerror})") from exc
+        named = os.path.realpath(os.path.join(admin, named))
+        if named != common:
+            raise refuse(f"{admin}/commondir names {named}, not {common}")
+        if os.path.lexists(os.path.join(common, "commondir")):
+            raise refuse(f"{common}/commondir names another common dir")
+    if not os.path.isdir(os.path.join(common, "objects")):
+        raise refuse(f"{common} holds no objects")
+    return common
+
+
+def writable_config(common: str) -> None:
+    """Refuse a config write that would follow a symbolic link out of the common dir.
+
+    Git writes ``config`` through a lock file that follows the link, so a host write
+    would land wherever the agent pointed it.
+    """
+    if os.path.islink(os.path.join(common, "config")):
+        raise ValueError(f"{common}/config is a symbolic link; the host will not write it")

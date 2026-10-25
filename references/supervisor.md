@@ -266,17 +266,36 @@ A sandboxed agent can write its worktree and the clone's git common directory, s
 repository config, hooks and `info/attributes` are the agent's. Every Git command the
 supervisor, dashboard, cron jobs and `wt` run on the host in such a checkout goes
 through `scripts/safe_git.py`. It disables hooks, fsmonitor, pagers, external diffs and
-textconv, the repository's ssh/askpass/proxy programs and credential helpers, `ext::`
-remotes, submodule recursion, auto gc and lazy fetches. Filter drivers the repository
-itself defines are blanked; a definition from the user's own config, such as Git LFS,
-is kept. Only a fetch gets the GitHub token, through `gh auth git-credential` alone,
-with the repository's `remote.*.uploadpack` replaced, and a fetch is refused when the
-repository's own config changes TLS verification, CAs or proxies. System and global
-config stay trusted.
+textconv, the repository's ssh/askpass/proxy programs and credential helpers, every
+transport but https, ssh and local paths (so no `git-remote-*` helper starts, whatever
+`protocol.*.allow` the repository sets), submodule recursion and status/diff looks into
+submodules, auto gc and lazy fetches. Filter drivers the repository itself defines are
+blanked; a definition from the user's own config, such as Git LFS, is kept. Only a fetch
+gets the GitHub token, through `gh auth git-credential` alone, with the repository's
+`remote.*.uploadpack` replaced, and a fetch is refused when the repository's own config
+changes TLS verification, CAs, proxies, name resolution or cookie files. System and
+global config stay trusted.
+
+Config also depends on the worktree (`config.worktree`, `includeIf` on branch or git
+dir), so new worktrees are added with `--no-checkout` and filled by a reset run inside
+them, and the dashboard removes a worktree with `--force` only after its own hardened
+status there finds no changes, untracked files or submodules, as Git's check would
+(approved blockers skip that check, as before). `safe_git` refuses either command
+without those flags.
+
+The git common dir granted to an agent (Codex resume `--add-dir`, `wt --with`) and the
+one `wtpr` checks provenance against come from the checkout's layout, never from
+`rev-parse --git-common-dir`, which follows agent-written `commondir` files: a clone's
+own `.git` directory, or the `.git/worktrees/<id>` a worktree's `.git` file names when
+that entry registers the worktree back. A watch records its common dir at registration
+and a resume refuses one that has moved. `wtpr` refuses to write the clone's config
+when `.git/config` is a symbolic link.
 
 Still open: config the agent rewrites between the driver listing and the command it
-guards, filter drivers in a submodule's own config, remote helpers installed on PATH,
-and lazy fetches on Git older than 2.44, which ignores `GIT_NO_LAZY_FETCH`.
+guards, filter drivers in a submodule's own config for commands that do recurse,
+remote helpers for the allowed transports installed on PATH (`git-remote-https`),
+`FETCH_HEAD` written through a symbolic link, and lazy fetches on Git older than 2.44,
+which ignores `GIT_NO_LAZY_FETCH`.
 
 ## Events and diagnostics
 

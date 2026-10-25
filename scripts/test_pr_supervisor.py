@@ -578,8 +578,13 @@ def test_global_limit_queues_second_repair(harness, tmp_path):
         ["git", "clone", str(h["worktree"]), str(other_worktree)], check=True, capture_output=True
     )
     second = copy.deepcopy(h["job"])
+    # Registration records each checkout's own common dir; a resume checks it.
     second.update(
-        id="second", cwd=str(other_worktree), session_id=str(uuid.uuid4()), status="watching"
+        id="second",
+        cwd=str(other_worktree),
+        git_common_dir=str((other_worktree / ".git").resolve()),
+        session_id=str(uuid.uuid4()),
+        status="watching",
     )
     with h["db"]:
         supervisor.save_job(h["db"], second)

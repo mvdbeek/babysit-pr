@@ -875,9 +875,21 @@ class Tool:
             self.git_action(repo_path, "fetch", "origin", base)
             start_point = f"origin/{base}"
         if self.branch_exists(repo_path, branch):
-            self.git_action(repo_path, "worktree", "add", directory, branch)
+            self.checkout_worktree(repo_path, directory, branch)
         else:
-            self.git_action(repo_path, "worktree", "add", "-b", branch, directory, start_point)
+            self.checkout_worktree(repo_path, directory, start_point, new_branch=branch)
+
+    def checkout_worktree(
+        self, repo_path: str, directory: str, commit: str, new_branch: str = ""
+    ) -> None:
+        """``git worktree add``, with the files checked out from inside the new worktree.
+
+        Its branch and git dir can bring config the clone's own listing never sees, so
+        the files are written by a reset that lists config where it runs.
+        """
+        create = ["-b", new_branch] if new_branch else []
+        self.git_action(repo_path, "worktree", "add", "--no-checkout", *create, directory, commit)
+        self.git_action(directory, "reset", "--hard", "--quiet")
 
     def default_branch(self, repo_path: str) -> str:
         """The branch ``origin/HEAD`` names, else ``main``."""
@@ -927,10 +939,12 @@ class Tool:
                 directory = os.path.join(root, os.path.basename(clone), branch)
                 if os.path.lexists(directory) or directory in (c.path for c, _ in planned):
                     raise WtError(f"wt: {directory} exists but does not have {branch} checked out")
-            common = self.git_value(
-                clone, "rev-parse", "--path-format=absolute", "--git-common-dir"
-            )
-            checkout = AlsoCheckout(clone, directory, os.path.realpath(common))
+            # Granted to the agent: never what an agent-written commondir file names.
+            try:
+                common = safe_git.common_dir(clone)
+            except ValueError as exc:
+                raise WtError(f"wt: --with: {exc}") from exc
+            checkout = AlsoCheckout(clone, directory, common)
             if ":" in checkout.path + checkout.common:
                 raise WtError(f"wt: Safehouse cannot grant a path containing ':': {directory}")
             planned.append((checkout, self.default_branch(clone) if create else ""))
@@ -1352,12 +1366,12 @@ class Tool:
             # Git provenance before opening and never submits a task to an existing agent.
             if options.name:
                 raise WtError(f"wtpr: explicit worktree destination already exists: {directory}")
-            common = self.git_value(
-                directory, "rev-parse", "--path-format=absolute", "--git-common-dir"
-            )
-            expected = self.git_value(
-                repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir"
-            )
+            # From the layout: commondir files in the checkout's git dir are agent-written.
+            try:
+                common = safe_git.common_dir(directory)
+                expected = safe_git.common_dir(repo_path)
+            except ValueError as exc:
+                raise WtError(f"wtpr: {exc}") from exc
             current = self.git_value(directory, "symbolic-ref", "--short", "HEAD")
             if common != expected or current != branch:
                 raise WtError("wtpr: existing directory is not the requested checkout")
@@ -1381,13 +1395,22 @@ class Tool:
         ).stdout.strip()
         if existing and existing != url:
             raise WtError("wtpr: PR remote name belongs to another repository")
+        common = os.path.realpath(os.path.join(repo_path, ".git"))
+        try:
+            safe_git.writable_config(common)
+        except ValueError as exc:
+            raise WtError(f"wtpr: {exc}") from exc
         if not existing:
             self.git_action(repo_path, "remote", "add", remote, url)
         os.makedirs(root, exist_ok=True)
         self.git_action(
             repo_path, "fetch", remote, f"refs/heads/{branch}:refs/heads/{local_branch}"
         )
-        self.git_action(repo_path, "worktree", "add", directory, local_branch)
+        self.checkout_worktree(repo_path, directory, local_branch)
+        try:
+            safe_git.writable_config(common)  # Again: the clone was writable meanwhile.
+        except ValueError as exc:
+            raise WtError(f"wtpr: {exc}") from exc
         self.git_action(directory, "config", f"branch.{local_branch}.remote", remote)
         self.git_action(directory, "config", f"branch.{local_branch}.merge", f"refs/heads/{branch}")
         self.open_session(options, directory, local_branch, repo_path)
