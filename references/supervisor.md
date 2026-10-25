@@ -586,7 +586,8 @@ Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (`user@host` and `host`) are not detected.
 Disabled machines stay valid for records already pinned to them.
 
-Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, and a shared
+Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, agent and port
+forwarding off whatever the ssh config says, and a shared
 master connection whose socket lives in `--home/ssh/` (or a short temporary
 directory when that path is too long), with at most four concurrent commands
 per ssh target in one process. They run with the worker's own environment and

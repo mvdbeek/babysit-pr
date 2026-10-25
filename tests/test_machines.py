@@ -229,6 +229,11 @@ def test_remote_argv_quotes_hostile_arguments_and_paths(tmp_path, short_tmp):
         "ControlPersist=300",
         "-o",
         f"ControlPath={home}/ssh/%C",
+        # A compromised worker never reaches this machine's ssh agent or ports.
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ClearAllForwardings=yes",
         "mini.tail1234.ts.net",
         "--",
     ]

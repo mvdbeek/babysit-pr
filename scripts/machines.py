@@ -312,6 +312,10 @@ def ssh_options(home) -> list[str]:
         "ControlMaster": "auto",
         "ControlPersist": "300",
         "ControlPath": f"{control_dir(home)}/%C",
+        # Whatever the user's ssh config says, a compromised worker never reaches this
+        # machine's ssh agent or ports.
+        "ForwardAgent": "no",
+        "ClearAllForwardings": "yes",
     }
     return [arg for key, value in options.items() for arg in ("-o", f"{key}={value}")]
 
