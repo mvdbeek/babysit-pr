@@ -27,8 +27,7 @@ submodules, whose own config is never listed.
 
 Left open, and stated in references/supervisor.md: config rewritten between that
 listing and the command itself, drivers in a submodule's own config, helpers for the
-allowed transports already on PATH, ``FETCH_HEAD`` written through a symbolic link, and
-lazy fetches on Git older than 2.44.
+allowed transports already on PATH, and lazy fetches on Git older than 2.44.
 
 The system and global config are trusted and still apply: the sandbox cannot write
 them. Only the standard library is used, since ``wt`` imports this too.
@@ -208,7 +207,8 @@ def prepare(
         listing = read(["git", "--no-pager", "-C", path, *LISTING], environment)
         extra = overrides(entries(listing), credentials)
     flags = {
-        "fetch": ["--upload-pack=git-upload-pack"],
+        # FETCH_HEAD is opened without refusing a planted symlink; nothing here reads it.
+        "fetch": ["--upload-pack=git-upload-pack", "--no-write-fetch-head"],
         **{diff: ["--no-ext-diff", "--no-textconv"] for diff in DIFFS},
     }.get(name, [])
     if name in SUBMODULES:

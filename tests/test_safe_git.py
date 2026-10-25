@@ -417,6 +417,17 @@ def test_fetch_never_runs_a_remote_helper_the_repository_names(planted, tmp_path
     pr_workspaces.git(clone, "fetch", "-q", "origin", "main")
 
 
+def test_fetch_never_writes_through_a_planted_fetch_head(planted, tmp_path):
+    clone, marker, git = planted
+    target = tmp_path / "outside"
+    target.write_text("kept\n")
+    fetch_head = clone / ".git" / "FETCH_HEAD"
+    fetch_head.unlink(missing_ok=True)
+    fetch_head.symlink_to(target)
+    pr_workspaces.git(clone, "fetch", "-q", "origin", "main")
+    assert target.read_text() == "kept\n"
+
+
 @pytest.mark.parametrize(
     "key", ["http.cookieFile", "http.https://github.com.saveCookies", "http.curloptResolve"]
 )

@@ -294,8 +294,8 @@ when `.git/config` is a symbolic link.
 Still open: config the agent rewrites between the driver listing and the command it
 guards, filter drivers in a submodule's own config for commands that do recurse,
 remote helpers for the allowed transports installed on PATH (`git-remote-https`),
-`FETCH_HEAD` written through a symbolic link, and lazy fetches on Git older than 2.44,
-which ignores `GIT_NO_LAZY_FETCH`.
+and lazy fetches on Git older than 2.44, which ignores `GIT_NO_LAZY_FETCH`. Fetches
+skip `FETCH_HEAD`, which Git would otherwise write through a planted symbolic link.
 
 ## Events and diagnostics
 
