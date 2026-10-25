@@ -550,3 +550,28 @@ def test_wrappers_drive_herdr_here_and_git_over_ssh(tmp_path, fake_tools, short_
     [call] = json.loads(fake_tools.read_text())["ssh"]
     assert call["target"] == "mini.tail1234.ts.net"
     assert unwrap(call["command"]) == f"git -C {clone} symbolic-ref HEAD"
+
+
+def test_put_file_writes_a_private_file_on_the_worker(tmp_path, fake_tools, short_tmp):
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    host = tmp_path / "hosts" / "mini.tail1234.ts.net"
+    text = "Fix it\n$(touch pwned) `id` 'q' \"d\"\n✓\n"
+    folder = machines.remote_path("~/.cache/babysit/cron-prompts")
+    path = machines.put_file(home, mini, folder, "run-1", text.encode(), keep=86400)
+    written = host / ".cache/babysit/cron-prompts/run-1"
+    assert os.path.realpath(path) == str(written.resolve())
+    assert written.read_bytes() == text.encode()
+    assert stat.S_IMODE(written.stat().st_mode) == 0o600
+    assert stat.S_IMODE(written.parent.stat().st_mode) == 0o700
+    assert not list(tmp_path.rglob("pwned"))
+    # Never over an existing file; and staged files older than ``keep`` are removed.
+    with pytest.raises(ValueError, match="run-1"):
+        machines.put_file(home, mini, folder, "run-1", b"other", keep=86400)
+    assert written.read_bytes() == text.encode()
+    os.utime(written, (1, 1))
+    machines.put_file(home, mini, folder, "run-2", b"next", keep=86400)
+    assert not written.exists() and (written.parent / "run-2").read_bytes() == b"next"
+    for name in ("../x", "a/b", "", "-n", ".hidden"):
+        with pytest.raises(ValueError, match="file name"):
+            machines.put_file(home, mini, folder, name, b"x")

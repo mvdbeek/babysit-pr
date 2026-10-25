@@ -385,6 +385,39 @@ def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=Non
         channel.release()
 
 
+# A staged file's name: no path, no option, no hidden file.
+FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Writes stdin to a new private file and prints its absolute path. With ``keep``, older
+# regular files in the folder are removed first, as local staging does.
+PUT_FILE = (
+    'umask 077 && mkdir -p -- "$1" && cd -- "$1" || exit 1\n'
+    'if [ -n "$3" ]; then find . -maxdepth 1 -type f -mmin "+$3" -exec rm -f {} + ; fi\n'
+    'set -C && cat > "$2" && printf "%s/%s" "$(pwd -P)" "$2"'
+)
+
+
+def put_file(home, m: Machine, directory, name, data: bytes, *, keep=None, timeout=30) -> str:
+    """Write ``data`` to ``directory/name`` on ``m``: a new file only its owner reads.
+
+    ``directory`` is a ``RemotePath`` (it may start with ``~``) and is made if missing.
+    Returns the file's absolute path there; never overwrites one. ``keep`` (seconds)
+    first removes regular files in the folder older than that.
+    """
+    if not isinstance(name, str) or not FILE_NAME.fullmatch(name):
+        raise ValueError(f"Invalid staged file name {name!r}")
+    if not isinstance(directory, RemotePath):
+        directory = remote_path(directory)
+    minutes = "" if keep is None else str(max(1, int(keep) // 60))
+    result = run(
+        home, m, ["sh", "-c", PUT_FILE, "sh", directory, name, minutes], timeout=timeout, input=data
+    )
+    path = result.stdout.decode(errors="replace")
+    if result.returncode or not path.startswith("/") or "\n" in path:
+        detail = result.stderr.decode(errors="replace").strip()[-300:]
+        raise ValueError(f"Could not stage {name} on {m.label}: {detail or 'no path returned'}")
+    return path
+
+
 def qualify(machine_id: str | None, wid: str) -> str:
     """API/DOM workspace id: ``w111`` locally, ``mini/w111`` on a worker."""
     if not WORKSPACE.fullmatch(wid):
