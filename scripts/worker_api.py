@@ -50,11 +50,13 @@ PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # One registration per machine at a time; a flood waits for nothing.
 _busy: dict[str, threading.Lock] = {}
 _busy_lock = threading.Lock()
-# Per machine, a bucket of RATE registrations refilled over a minute; a failed one
-# costs FAILURE_COST more, so repeated failures back off.
+# Per machine and worktree, a bucket of RATE registrations refilled over a minute; a
+# failed one costs FAILURE_COST more, so repeated failures back off. At most MAX_KEYS
+# are kept before idle ones are dropped.
 RATE = 6
 FAILURE_COST = 2
 _buckets: dict[str, tuple[float, float]] = {}
+MAX_KEYS = 256
 # Worker watches are polled from this machine's GitHub token; never faster than this.
 MIN_POLL = 30
 
@@ -63,16 +65,21 @@ class RateLimited(ValueError):
     """Too many registrations from one machine; answered 429."""
 
 
-def _take(machine_id, cost=1.0, force=False):
+def _take(key, cost=1.0, force=False):
     """Whether ``cost`` tokens were available; ``force`` takes them regardless."""
     now = time.monotonic()
     with _busy_lock:
-        tokens, then = _buckets.get(machine_id, (float(RATE), now))
+        if len(_buckets) > MAX_KEYS:
+            # Buckets refilled by now are as good as new ones.
+            for name, (tokens, then) in list(_buckets.items()):
+                if tokens + (now - then) * RATE / 60 >= RATE:
+                    del _buckets[name]
+        tokens, then = _buckets.get(key, (float(RATE), now))
         tokens = min(float(RATE), tokens + (now - then) * RATE / 60)
         if tokens < cost and not force:
-            _buckets[machine_id] = (tokens, now)
+            _buckets[key] = (tokens, now)
             return False
-        _buckets[machine_id] = (max(-float(RATE), tokens - cost), now)
+        _buckets[key] = (max(-float(RATE), tokens - cost), now)
         return True
 
 
@@ -181,6 +188,7 @@ REGISTER = {
     "poll_seconds",
     "max_repairs",
     "repair_timeout",
+    "config_dir",
 }
 
 
@@ -219,21 +227,34 @@ def register_args(home, machine, request):
         poll_seconds=max(MIN_POLL, _count(request["poll_seconds"], "poll interval", 86400)),
         max_repairs=_count(request["max_repairs"], "repair budget", 100),
         repair_timeout=_count(request["repair_timeout"], "repair timeout", 86400),
+        config_dir=(
+            None
+            if request["config_dir"] is None
+            else _absolute(request["config_dir"], "config dir")
+        ),
     )
 
 
 def handle(home, machine, action, request):
-    """Answer one worker request for ``machine``, the one its token names."""
+    """Answer one worker request for ``machine``, the one its token names.
+
+    Limits apply per machine and worktree, so one sandbox cannot hold up the others.
+    """
     import pr_supervisor
 
+    cwd = request.get("cwd") if isinstance(request, dict) else None
+    key = f"{machine.id}\0{cwd if isinstance(cwd, str) and len(cwd) <= 4096 else ''}"
     with _busy_lock:
-        busy = _busy.setdefault(machine.id, threading.Lock())
+        if len(_busy) > MAX_KEYS:
+            for name in [k for k, lock in _busy.items() if not lock.locked()]:
+                del _busy[name]
+        busy = _busy.setdefault(key, threading.Lock())
     if not busy.acquire(blocking=False):
-        raise ValueError(f"Another registration from {machine.label} is in progress")
+        raise ValueError(f"Another registration of this worktree on {machine.label} is running")
     try:
         if action != "register":
             raise ValueError("Unknown worker action")
-        if not _take(machine.id):
+        if not _take(key):
             raise RateLimited(f"Too many registrations from {machine.label}; wait a minute")
         try:
             args = register_args(home, machine, request)
@@ -243,7 +264,7 @@ def handle(home, machine, action, request):
             finally:
                 db.close()
         except Exception:
-            _take(machine.id, FAILURE_COST, force=True)
+            _take(key, FAILURE_COST, force=True)
             raise
         return {
             "id": job["id"],
@@ -401,6 +422,8 @@ def registration(args):
         "poll_seconds": args.poll_seconds,
         "max_repairs": args.max_repairs,
         "repair_timeout": args.repair_timeout,
+        # A sandbox's broker names its own; registered from outside one, there is none.
+        "config_dir": None,
     }
 
 

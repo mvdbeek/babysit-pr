@@ -8,11 +8,21 @@ naming it in ``BABYSIT_REGISTER_SOCKET``; the sandbox never sees ``worker.json``
 token this process holds. A client sends one registration request (``worker_api``'s
 fields) and closes its side; the answer is the controller's, or a refusal. Forwarded
 are only requests for the launch's ``AGENT`` whose ``cwd`` is one of the launch's
-granted WORKTREEs and whose session transcript lies in its CONFIG_DIR (``projects/``
-for Claude, ``sessions/`` for Codex): the transcript found there is what the
-controller is told to check, and no Claude account is passed, so the controller takes
-the account from where that transcript lies. An agent can therefore register only its
-own sessions in its own checkouts, not another task's.
+granted WORKTREEs and whose session transcript lies, resolved, exactly in its
+CONFIG_DIR's store (``projects/<project>/<id>.jsonl`` for Claude, under ``sessions/``
+for Codex). The controller is told to check that transcript, and that CONFIG_DIR, which
+it checks again on the path it opens; no Claude account is passed, so the account is
+where the transcript lies. So an agent never registers another task's checkout, nor a
+session of another account or Codex home.
+
+"Its own sessions" means every session in that configuration directory, which other
+launches of the same Claude account or Codex home share and can write: an agent can
+register such a session (one recorded in its own worktree) or plant one there, so a
+repair may resume a conversation another launch of that account started. That gives
+it no access beyond what the account and its worktree already have.
+
+One registration is forwarded at a time, at most one per MIN_INTERVAL seconds, so one
+sandbox cannot use up its worker's registrations at the controller.
 
 Prints ``ready`` once LISTEN accepts connections, then runs until its parent exits
 (babysit-bwrap execs bwrap, so that is the sandbox), and removes LISTEN and its
@@ -26,6 +36,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -34,7 +45,12 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import worker_api  # noqa: E402
 
-READ_TIMEOUT = 30
+READ_TIMEOUT = 30  # For a whole request, however slowly it arrives.
+MIN_INTERVAL = 20
+CONNECTIONS = 4
+_forwarding = threading.Lock()
+_last = [0.0]
+_slots = threading.BoundedSemaphore(CONNECTIONS)
 
 
 def transcript(agent, config_dir, session):
@@ -45,7 +61,12 @@ def transcript(agent, config_dir, session):
     else:
         found = list((root / "sessions").glob(f"*/*/*/rollout-*{session}.jsonl"))
     found = [Path(os.path.realpath(path)) for path in found]
-    if len(found) != 1 or not found[0].is_relative_to(root):
+    # Resolved, still exactly in the store: no link leads to another account's.
+    if len(found) != 1 or not (
+        found[0].parent.parent == root / "projects"
+        if agent == "claude"
+        else found[0].is_relative_to(root / "sessions")
+    ):
         raise ValueError(f"Session {session} is not one of this sandbox's own")
     return str(found[0])
 
@@ -73,15 +94,20 @@ def check(request, agent, config_dir, worktrees):
         "session": session,
         "rollout": found,
         "claude_account": None,
+        "config_dir": os.path.realpath(config_dir),
     }
 
 
 def answer(client, agent, config_dir, worktrees):
     with client:
         try:
-            client.settimeout(READ_TIMEOUT)
+            deadline = time.monotonic() + READ_TIMEOUT
             data = b""
             while len(data) <= worker_api.MAX_BODY:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise ValueError("The request took too long to arrive")
+                client.settimeout(left)
                 chunk = client.recv(65536)
                 if not chunk:
                     break
@@ -90,11 +116,31 @@ def answer(client, agent, config_dir, worktrees):
                 raise ValueError("Request too large")
             request = check(json.loads(data), agent, config_dir, worktrees)
             client.settimeout(None)
-            result = worker_api.post("register", request)
+            result = forward(request)
         except (ValueError, RuntimeError, OSError) as exc:
             result = {"error": str(exc)}
         with contextlib.suppress(OSError):
             client.sendall(json.dumps(result).encode())
+
+
+def forward(request):
+    if not _forwarding.acquire(blocking=False):
+        raise ValueError("A registration from this sandbox is already running")
+    try:
+        wait = _last[0] + MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            raise ValueError(f"Registered moments ago; wait {wait:.0f} s")
+        _last[0] = time.monotonic()
+        return worker_api.post("register", request)
+    finally:
+        _forwarding.release()
+
+
+def serve(client, agent, config_dir, worktrees):
+    try:
+        answer(client, agent, config_dir, worktrees)
+    finally:
+        _slots.release()
 
 
 def main(argv):
@@ -121,8 +167,14 @@ def main(argv):
                 client, _ = server.accept()
             except TimeoutError:
                 continue
+            except OSError:
+                time.sleep(0.5)  # Out of descriptors, say: the next accept may work.
+                continue
+            if not _slots.acquire(blocking=False):
+                client.close()  # Enough connections already.
+                continue
             threading.Thread(
-                target=answer, args=(client, agent, config_dir, granted), daemon=True
+                target=serve, args=(client, agent, config_dir, granted), daemon=True
             ).start()
     finally:
         server.close()

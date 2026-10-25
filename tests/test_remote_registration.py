@@ -132,6 +132,7 @@ def args(box, **changes):
         poll_seconds=120,
         max_repairs=3,
         repair_timeout=600,
+        config_dir=None,
     )
     return supervisor.argparse.Namespace(**{**values, **changes})
 
@@ -638,3 +639,22 @@ def test_a_machines_tailnet_address_must_be_the_one_the_proxy_reports(box, serve
     finally:
         proxy.shutdown()
         proxy.server_close()
+
+
+def test_a_machine_may_name_several_tailnet_addresses(box):
+    registry(box["home"], tailnet_ip=["100.64.0.5", "fd7a:115c:a1e0::5"])
+    worker = supervisor.machines.load(box["home"])["box"]
+    assert worker.tailnet_ip == ("100.64.0.5", "fd7a:115c:a1e0::5")
+    for bad in ([], ["100.64.0.5", "nope"], ["1.2.3.4"] * 5):
+        registry(box["home"], tailnet_ip=bad)
+        with pytest.raises(ValueError, match="Invalid tailnet_ip"):
+            supervisor.machines.load(box["home"])
+
+
+def test_one_worktrees_registrations_never_use_up_another_worktrees_rate(box, served):
+    auth = {"Authorization": f"Bearer {worker_api.issue(box['home'], 'box')}"}
+    noisy = request_body(box, cwd="/nonexistent/worktree")
+    codes = [post(served, "/api/worker/register", noisy, auth)[0] for _ in range(4)]
+    assert codes[-1] == 429
+    status, answer = post(served, "/api/worker/register", request_body(box), auth)
+    assert status == 200, answer

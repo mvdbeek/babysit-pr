@@ -638,10 +638,15 @@ agent configuration on a worker, the wrapper starts a registration broker
 private directory under `$XDG_RUNTIME_DIR`, its own session, gone with bwrap), binds
 its socket in and names it last in `BABYSIT_REGISTER_SOCKET`. `register` inside sends
 the request there. The broker forwards only requests for the launch's agent whose
-`cwd` is one of the launch's granted directories and whose session's transcript lies
-in the launch's own configuration directory (`--claude-config-dir`'s `projects/`,
-`--codex-home`'s `sessions/`); it tells the controller to check exactly that
-transcript and passes no Claude account, so the account is where the transcript lies.
+`cwd` is one of the launch's granted directories and whose session's transcript, once
+resolved, lies exactly in the launch's own store (`--claude-config-dir`'s
+`projects/<project>/<id>.jsonl`, under `--codex-home`'s `sessions/`), so no link leads
+to another account's. It tells the controller to check exactly that transcript and
+passes the configuration directory, which the controller's probe checks again on the
+path it opens (a link swapped in meanwhile is refused); no Claude account is passed,
+so the account is where the transcript lies. One request is forwarded at a time, at
+most one every 20 s per launch, with at most 4 connections open and 30 s to send a
+request.
 The wrapper also shows the deployed babysit-pr read-only inside on a worker, so the
 skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on a worker refuses for now: exit the
 original agent and release the watch on the controller (`release_argv` in the answer).
@@ -653,10 +658,12 @@ body is exactly the registration fields (PR, repo, CI repo or branch, absolute `
 session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
 poll interval, budget and timeout), checked by type, form and length, with no control
 characters (the instructions may span lines). One registration per machine runs at a
-time, at most 6 a minute (a failed one costs 2 more, so repeated failures back off;
-answered 429), and a worker watch is polled no more often than every 30 s. With a
-machine's optional `tailnet_ip` in `machines.json`, a registration is refused unless
-`X-Forwarded-For` is exactly that address: `tailscale serve` sets it to the address the
+time per worktree, at most 6 a minute per machine and worktree (a failed one costs 2
+more, so repeated failures back off; answered 429), so one sandbox cannot hold up the
+others, and a worker watch is polled no more often than every 30 s. With a machine's
+optional `tailnet_ip` in `machines.json` (one address, or a list of up to four, such as
+its IPv4 and IPv6 ones), a registration is refused unless `X-Forwarded-For` is exactly
+one of them: `tailscale serve` sets it to the address the
 request came from, replacing any the client sent. A process on this machine that
 reaches the dashboard directly could still send that header, but it needs the token
 too. `pr_supervisor.py worker-token ID` issues a machine's token: 32 random bytes,
@@ -666,8 +673,13 @@ may be shared. Issuing again replaces it; `--revoke` removes it; a disabled or
 unregistered machine's token is refused. Tokens are compared in constant time against
 every entry.
 
-Residual: a sandboxed agent can register watches only for its own sessions in its own
-checkouts, with instructions of its choosing (as it could ask its user to). Anything
+Residual: a sandboxed agent can register watches only for sessions in its own
+configuration directory, recorded in its own checkout, with instructions of its
+choosing (as it could ask its user to). Its configuration directory is shared with
+every other launch of the same Claude account or Codex home, which can read and write
+those sessions: an agent can register (squat) a session another launch of that account
+recorded in this worktree, or plant one, and a repair then resumes that conversation
+here. That gives it no access the account and its worktree do not already have. Anything
 running unsandboxed as the worker user can read `worker.json` and register any linked
 worktree and session there; a later release turns that into repairs of the session, in
 that worktree's sandbox. Neither can name another machine or choose a launcher. A

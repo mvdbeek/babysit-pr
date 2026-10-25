@@ -1133,6 +1133,8 @@ def register(db, args):
             cwd=cwd,
             rollout=args.rollout,
             account=getattr(args, "claude_account", None),
+            # From a sandbox's broker: the configuration directory it may register from.
+            expected_home=getattr(args, "config_dir", None),
         )
     elif agent_kind == "claude":
         import claude_accounts

@@ -17,11 +17,13 @@ from pathlib import Path
 
 import pr_supervisor as supervisor
 import pytest
+import remote_probe
 import worker_api
 from test_remote_cron import git, rollout, short_tmp  # noqa: F401 (fixture)
 from test_remote_registration import (  # noqa: F401 (fixtures)
     URL,
     box,
+    claude_transcript,
     fresh_rate_limits,
     request_body,
     served,
@@ -148,3 +150,89 @@ def test_the_broker_exits_with_its_parent_and_removes_its_socket(tmp_path):
                 break
             time.sleep(0.1)
         assert not listen.parent.exists()
+
+
+def test_a_claude_launch_registers_only_transcripts_in_its_own_store(box, broker):  # noqa: F811
+    worker, tree = box["worker"], box["tree"]
+    default = worker / ".claude"
+    folder = str(tree).replace("/", "-")
+    own = str(uuid.uuid4())
+    claude_transcript(worker, tree, own)
+    listen = broker([str(tree)], config=default, agent="claude")
+    # Account B's transcript, reached from the default store through a link the agent
+    # made: dangling inside its sandbox, resolved on the host.
+    other = str(uuid.uuid4())
+    claude_transcript(worker, tree, other, "b")
+    (default / "projects" / "q").symlink_to(Path("..") / "accounts" / "b" / "projects" / folder)
+    refused = ask(listen, request_body(box, agent="claude", session=other))
+    assert "not one of this sandbox's own" in refused["error"]
+    # A transcript that is a link out of the store.
+    linked = str(uuid.uuid4())
+    outside = claude_transcript(worker, tree, linked, "c")
+    (default / "projects" / "p").mkdir()
+    (default / "projects" / "p" / f"{linked}.jsonl").symlink_to(outside)
+    refused = ask(listen, request_body(box, agent="claude", session=linked))
+    assert "not one of this sandbox's own" in refused["error"]
+    # Two transcripts of one session: neither is taken.
+    twice = str(uuid.uuid4())
+    claude_transcript(worker, tree, twice)
+    (default / "projects" / "copy").mkdir()
+    copy = default / "projects" / "copy" / f"{twice}.jsonl"
+    copy.write_text((default / "projects" / folder / f"{twice}.jsonl").read_text())
+    refused = ask(listen, request_body(box, agent="claude", session=twice))
+    assert "not one of this sandbox's own" in refused["error"]
+    assert jobs(box) == []
+    answer = ask(listen, request_body(box, agent="claude", session=own))
+    assert answer.get("session") == own, answer
+    [job] = jobs(box)
+    assert job["claude_config_dir"] == str(default.resolve())
+    assert job["claude_account"] == "default"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"not json", b"[]", b'{"cwd": "/x"}', b"x" * (worker_api.MAX_BODY + 10)],
+)
+def test_the_broker_refuses_malformed_or_oversized_requests(box, broker, body):  # noqa: F811
+    listen = broker([str(box["tree"])])
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(str(listen))
+        try:
+            client.sendall(body)
+            client.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass  # It may stop reading an oversized request.
+        data = b""
+        while chunk := client.recv(65536):
+            data += chunk
+    assert "error" in json.loads(data)
+    assert jobs(box) == []
+
+
+def test_one_sandbox_registers_at_most_once_in_a_while(box, broker):  # noqa: F811
+    listen = broker([str(box["tree"])])
+    assert ask(listen, request_body(box))["machine"] == "box"
+    # Forwarded again at once, it is refused here, not by the controller.
+    assert "wait" in ask(listen, request_body(box))["error"]
+
+
+def test_the_controller_checks_the_transcript_lies_in_the_launchs_store_as_it_reads(box):  # noqa: F811
+    worker, tree = box["worker"], box["tree"]
+    sid = str(uuid.uuid4())
+    path = claude_transcript(worker, tree, sid, "b")
+    os.environ["HOME"], home = str(worker), os.environ["HOME"]
+    try:
+        with pytest.raises(ValueError, match="not in the launch's configuration directory"):
+            remote_probe._host_session_info(
+                "claude", sid, str(tree), str(path), None, str(worker / ".claude")
+            )
+        found = remote_probe._host_session_info(
+            "claude", sid, str(tree), str(path), None, str(worker / ".claude/accounts/b")
+        )
+        assert found["claude_account"] == "b"
+        with pytest.raises(ValueError, match="not in the launch's configuration directory"):
+            remote_probe._host_session_info(
+                "codex", box["sid"], str(tree), None, None, str(worker / "elsewhere")
+            )
+    finally:
+        os.environ["HOME"] = home

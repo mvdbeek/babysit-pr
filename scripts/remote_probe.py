@@ -1547,15 +1547,26 @@ def _session_items(stream):
             yield item
 
 
-def _codex_session_info(session, cwd, rollout):
-    """``pr_supervisor.session_info`` for a rollout of this machine."""
+def _outside(path, store):
+    return ValueError(f"{path} is not in the launch's configuration directory ({store})")
+
+
+def _codex_session_info(session, cwd, rollout, expected_home=None):
+    """``pr_supervisor.session_info`` for a rollout of this machine; with
+    ``expected_home``, one in that Codex home's ``sessions``."""
     if rollout is None:
         store = host_session_root(host_codex_sessions())
         found = list(store.rglob(f"*{session}*.jsonl")) if store is not None else []
         if len(found) != 1:
             raise ValueError("Specify --rollout: could not identify exactly one saved session")
         rollout = str(found[0])
+    rollout = os.path.realpath(rollout)
+    if expected_home is not None:
+        store = Path(os.path.realpath(expected_home)) / "sessions"
+        if not Path(rollout).is_relative_to(store):
+            raise _outside(rollout, store)
     meta, context = None, {}
+    # Opened beneath its resolved path: a link swapped in since is refused, not followed.
     with _host_transcript(rollout) as stream:
         for item in _session_items(stream):
             if item.get("type") == "session_meta":
@@ -1572,13 +1583,13 @@ def _codex_session_info(session, cwd, rollout):
     model = context.get("model")
     return {
         "session_id": session,
-        "rollout": os.path.realpath(rollout),
+        "rollout": rollout,
         "sandbox": policy,
         "model": model if isinstance(model, str) else None,
     }
 
 
-def _claude_session_info(session, cwd, transcript, account):
+def _claude_session_info(session, cwd, transcript, account, expected_home=None):
     """``claude_runner.session_info`` for a transcript in one of this machine's Claude homes.
 
     It reads at most the transcript's first MAX_SCAN bytes, as every probe does.
@@ -1608,6 +1619,9 @@ def _claude_session_info(session, cwd, transcript, account):
     home = real.parents[2]
     if selected and home != selected:
         raise ValueError("Claude transcript belongs to a different account")
+    # The launch that registered it: its own store, checked on the path opened below.
+    if expected_home is not None and home != Path(os.path.realpath(expected_home)):
+        raise _outside(real, os.path.realpath(expected_home))
     root = os.path.realpath(cwd)
     seen, model, permission_mode = False, None, None
     with _host_transcript(str(real)) as stream:
@@ -1651,19 +1665,24 @@ def _claude_session_info(session, cwd, transcript, account):
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
-def _host_session_info(agent, session, cwd, rollout, account):
-    """A watch's session here, checked as ``register`` checks one of the controller's."""
+def _host_session_info(agent, session, cwd, rollout, account, expected_home=None):
+    """A watch's session here, checked as ``register`` checks one of the controller's.
+
+    ``expected_home`` is the configuration directory of the sandbox that registered it,
+    which its transcript must lie in."""
     if not isinstance(session, str) or not UUID.fullmatch(session):
         raise ValueError("Expected a session UUID")
     _arg_paths([cwd] if rollout is None else [cwd, rollout])
+    if expected_home is not None:
+        _arg_paths([expected_home])
     if account is not None and (not isinstance(account, str) or not ACCOUNT.fullmatch(account)):
         raise ValueError("Expected a Claude account name")
     if agent == "codex":
         if account is not None:
             raise ValueError("A Claude account can only be selected for Claude")
-        return _codex_session_info(session, cwd, rollout)
+        return _codex_session_info(session, cwd, rollout, expected_home)
     if agent == "claude":
-        return _claude_session_info(session, cwd, rollout, account)
+        return _claude_session_info(session, cwd, rollout, account, expected_home)
     raise ValueError("Expected claude or codex")
 
 
