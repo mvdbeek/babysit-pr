@@ -944,8 +944,9 @@ never delays other jobs: once a session in the checkout
 confirms the task, its final response is kept, but the agent is not exited on a worker
 yet, so the run **Needs attention** with the agent still open there; one that leaves
 its pane without confirming, or is still working at the time limit, also needs
-attention. **Open in Collie** links the worker's own Collie when its registry entry
-has a `collie_url`; otherwise the run says **Collie unavailable for <label>**.
+attention. **Open in Collie** links the worker's Collie when its registry entry has a
+`collie_url`, or this machine's Collie crew when it has a `collie_host`; otherwise the
+run says **Collie unavailable for <label>**.
 
 **Run outside Safehouse (can write anywhere)**, off by default, is for jobs that
 orchestrate work in other repositories, for example by making worktrees in other

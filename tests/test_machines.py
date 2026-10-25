@@ -80,6 +80,7 @@ def test_valid_registry_with_defaults_and_repos(tmp_path):
         labels=(),
         collie_url=None,
         enabled=True,
+        collie_host=None,
     )
 
 
@@ -116,6 +117,9 @@ def test_valid_registry_with_defaults_and_repos(tmp_path):
         ({"collie_url": 'https://mini/"onmouseover=x'}, "Invalid collie_url"),
         ({"collie_url": "https://mini/<b>"}, "Invalid collie_url"),
         ({"collie_url": "ftp://mini/"}, "Invalid collie_url"),
+        ({"collie_host": "-mini"}, "Invalid collie_host"),
+        ({"collie_host": "mini&h=x"}, "Invalid collie_host"),
+        ({"collie_host": ["mini"]}, "Invalid collie_host"),
         ({"enabled": "yes"}, "Invalid enabled"),
         ({"hostname": "mini"}, "Unknown machine keys: hostname"),
     ],
