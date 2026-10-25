@@ -305,7 +305,7 @@ check_headless() {
   if pgrep -x 'Xorg|Xwayland|gnome-shell|kwin_wayland|sddm|gdm3' >/dev/null 2>&1; then
     found="$found display-server-process"
   fi
-  if ss -xl 2>/dev/null | grep -q '@/tmp/\.X11-unix'; then
+  if grep -q '@/tmp/\.X11-unix' <<<"$(ss -xl 2>/dev/null)"; then
     found="$found X11-abstract-socket"
   fi
   if [[ -n $found ]]; then
@@ -330,7 +330,7 @@ check_docker_rootless() {
       problem "$user_name is in the $group group, which is (or leads to) root on this machine"
     fi
   done
-  if sudo -n -l -U "$user_name" 2>/dev/null | grep -q 'may run the following commands'; then
+  if grep -q 'may run the following commands' <<<"$(sudo -n -l -U "$user_name" 2>/dev/null)"; then
     problem "sudoers grants $user_name commands (sudo -l -U $user_name)"
   fi
   if [[ -S /var/run/docker.sock ]] &&
@@ -352,7 +352,8 @@ check_misc() {
   else
     problem "$user_name has no /etc/subuid entry (rootless docker needs one)"
   fi
-  if sshd -T 2>/dev/null | grep -qx 'clientaliveinterval 15'; then
+  # Read the whole dump first: grep -q stopping early would SIGPIPE sshd under pipefail.
+  if grep -qx 'clientaliveinterval 15' <<<"$(sshd -T 2>/dev/null)"; then
     ok "sshd ClientAliveInterval 15"
   else
     problem "sshd does not report ClientAliveInterval 15"
@@ -679,15 +680,25 @@ system_step() {
       sleep 0.5
     done
   fi
-  if ((!dry)) && ! command -v "$setuptool" >/dev/null &&
-    [[ -x /usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh ]]; then
-    setuptool=/usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh
+  if ! command -v "$setuptool" >/dev/null && [[ -x /usr/share/docker.io/contrib/$setuptool ]]; then
+    # docker.io keeps the rootless scripts in contrib/ without the docker CLI, and the
+    # tool runs $BIN/docker from the dockerd-rootless.sh directory; give it a
+    # root-owned directory holding all three, which docker.service then keeps using.
+    local rootless_bin=/usr/local/lib/babysit-rootless-docker
+    run install -d -o root -g root -m 0755 "$rootless_bin"
+    run ln -sfn "/usr/share/docker.io/contrib/$setuptool" "$rootless_bin/$setuptool"
+    run ln -sfn /usr/share/docker.io/contrib/dockerd-rootless.sh "$rootless_bin/dockerd-rootless.sh"
+    run ln -sfn /usr/bin/docker "$rootless_bin/docker"
+    setuptool=$rootless_bin/$setuptool
   fi
   if ((!dry)) && [[ -f $(getent passwd "$user_name" | cut -d: -f6)/.config/systemd/user/docker.service ]]; then
     ok "rootless docker service exists"
   else
+    # The tool looks dockerd-rootless.sh up on PATH and records that PATH in the
+    # user's docker.service.
     run sudo -u "$user_name" -H env XDG_RUNTIME_DIR="/run/user/$uid" \
       DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+      PATH="$(dirname "$setuptool"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
       "$setuptool" install
   fi
 
@@ -765,7 +776,7 @@ user_step() {
     else
       problem "bwrap --ro-bind / / true fails; rerun the system step"
     fi
-    if docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+    if grep -q rootless <<<"$(docker info --format '{{.SecurityOptions}}' 2>/dev/null)"; then
       ok "docker is rootless"
     else
       problem "docker info does not report a rootless daemon"
