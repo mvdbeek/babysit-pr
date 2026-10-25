@@ -274,6 +274,13 @@ def status(home):
         result["daemon"] = daemon_health(home, now)
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
         result["error"] = f"Cannot read watcher state: {exc}"
+    # Only with workers registered does the page poll their loads (/api/machines).
+    try:
+        workers = len(machines.load(home))
+    except (OSError, ValueError):
+        workers = 0
+    if workers:
+        result["workers"] = workers
     return result
 
 
@@ -1180,6 +1187,15 @@ class Handler(BaseHTTPRequestHandler):
                     if self.server.workspaces
                     else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
                 )
+            elif route.path == "/api/machines":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(200, {"machines": self.server.workspaces.machine_list()})
+            elif route.path == "/api/placement":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                params = {k: v[0] for k, v in parse_qs(route.query).items()}
+                self.send_json(200, self.server.workspaces.preview(params))
             elif route.path == "/api/workspace-repos":
                 everything = parse_qs(route.query).get("all", [""])[0] == "1"
                 self.send_json(

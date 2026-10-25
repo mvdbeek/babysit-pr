@@ -509,3 +509,20 @@ credentials, under `sh -c`, so the worker's login shell need not be POSIX: it
 sees only octal escapes that `sh` decodes, and no controller stdin.
 A timeout kills only the local ssh client; the remote process may keep running,
 so long-running remote work needs its own lifeline.
+
+With a registry, the dashboard's launch dialogs (Handle, Create, New task, batch
+review) offer a Machine select, and the Workspaces heading shows each machine's
+health and load from `herdr --machine=<label> workspace list`, cached for 15 s and
+refreshed in the background so no request waits on a worker. Auto always places on
+this machine for now. Choosing a worker by name checks it against the launch
+(disabled, unreachable, missing `labels` such as `docker`, `safehouse`/`bwrap` for
+the sandbox, `claude-account:<name>`, or a repo's `requires`) and records it on the
+operation or scheduled task, but the launch is refused: "Launching on <label> is
+not supported yet". A worker whose load has not come back yet, or whose refresh has
+not finished for 30 s, shows "checking…" and is left out of Auto. Worker clones are
+not inventoried yet, so a launch with other clones (`--with`) is not refused for them. Handle on a verified checkout stays on that checkout's machine;
+choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`
+previews where Auto would place a launch and which machines can take it;
+`GET /api/machines` lists the machines with their cached loads and placement verdict,
+which the Workspaces badges poll once `/api/status` reports `workers` (absent without
+a registry, so a single machine never asks).

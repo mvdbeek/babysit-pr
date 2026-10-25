@@ -30,6 +30,7 @@ import claude_accounts
 import exit_watch
 import github_cli
 import machines
+import placement
 import workspace_agents
 import workspace_exit
 from issue_overview import branch_number
@@ -108,9 +109,9 @@ def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
     return result.stdout.strip()
 
 
-def herdr(*args, machine: machines.Machine | None = None):
+def herdr(*args, machine: machines.Machine | None = None, timeout=30):
     # herdr reaches a worker's server itself, so the command always runs here.
-    value = json.loads(run(*machines.herdr_argv(machine, *args)))
+    value = json.loads(run(*machines.herdr_argv(machine, *args), timeout=timeout))
     if value.get("error"):
         raise ValueError(str(value["error"]))
     return value["result"]
@@ -466,6 +467,100 @@ def close_launched(watch, record):
         return "; its pane is still open"
 
 
+# herdr's agent states that hold a slot; "unknown" is left out until it is known whether
+# it means no agent or an unclassified one.
+AGENT_STATES = {"working", "blocked", "idle", "done"}
+# How long a worker's herdr may take to list its workspaces.
+LOAD_TIMEOUT = 5
+
+
+def load_counts(spaces):
+    statuses = [w.get("agent_status") for w in spaces]
+    return {
+        "workspaces": len(spaces),
+        "agents": sum(status in AGENT_STATES for status in statuses),
+        "working": statuses.count("working"),
+        "blocked": statuses.count("blocked"),
+    }
+
+
+class MachineLoads:
+    """Agent counts per registered machine from its herdr, cached so requests never wait.
+
+    A request reads the cache; an entry older than ``placement.LOAD_TTL`` is refreshed by
+    its own daemon thread, so one hung machine delays nobody else. This machine's counts
+    come from the workspace inventory ``local`` returns.
+    """
+
+    def __init__(self, home, local):
+        self.home = Path(home)
+        self.local = local
+        self.lock = threading.Lock()
+        self.entries: dict[str, dict] = {}
+        self.refreshing: set[str] = set()
+
+    def snapshot(self, now=None):
+        """The registry's machines and every machine's last known load, by id."""
+        try:
+            config = machines.load_config(self.home)
+        except (OSError, ValueError):
+            config = None  # A malformed registry places everything here, as no registry.
+        config = config or {"machines": {}, "repos": {}}
+        now = time.time() if now is None else now
+        empty = {**load_counts([]), "error": None, "unreachable_since": None, "synced_at": None}
+        loads = {}
+        with self.lock:
+            for machine_id, machine in config["machines"].items():
+                entry = self.entries.get(machine_id)
+                stale = entry is None or now - entry["attempted_at"] >= placement.LOAD_TTL
+                if machine.enabled and stale and machine_id not in self.refreshing:
+                    self.refreshing.add(machine_id)
+                    threading.Thread(target=self.refresh, args=(machine,), daemon=True).start()
+                load = {**empty, **(entry or {})}
+                # Until a first refresh answers, its agents are unknown, not zero.
+                loads[machine_id] = {**load, "pending": load["synced_at"] is None}
+        inventory = self.local()
+        loads[placement.LOCAL] = {
+            **empty,
+            **load_counts(inventory["workspaces"]),
+            "error": inventory["error"],
+            "synced_at": inventory["synced_at"],
+            "pending": False,
+        }
+        return config, loads
+
+    def refresh(self, machine):
+        attempted = time.time()
+        previous = self.entries.get(machine.id, {})
+        error = "Load refresh failed"  # Kept if something unforeseen escapes below.
+        entry = None
+        try:
+            spaces = herdr("workspace", "list", machine=machine, timeout=LOAD_TIMEOUT)
+            listed = spaces.get("workspaces") if isinstance(spaces, dict) else None
+            if not isinstance(listed, list) or not all(isinstance(w, dict) for w in listed):
+                raise ValueError("herdr listed malformed workspaces")
+            entry = {
+                **load_counts(listed),
+                "error": None,
+                "unreachable_since": None,
+                "synced_at": time.time(),
+            }
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            error = str(exc)[-300:] or type(exc).__name__
+        finally:
+            if entry is None:
+                # The last counts stay, marked with how long the machine has been unreachable.
+                entry = {
+                    **previous,
+                    "error": error,
+                    "unreachable_since": previous.get("unreachable_since") or attempted,
+                }
+            # Always released, or this machine would never be refreshed again.
+            with self.lock:
+                self.entries[machine.id] = {**entry, "attempted_at": attempted}
+                self.refreshing.discard(machine.id)
+
+
 class Workspaces:
     def __init__(self, home, overview, jobs, src=None, issues=None, sentry=None):
         self.home = Path(home)
@@ -491,6 +586,7 @@ class Workspaces:
         self.flight: concurrent.futures.Future | None = None
         self.flight_lock = threading.Lock()
         self.compute_lock = threading.Lock()
+        self.loads = MachineLoads(self.home, lambda: self.inventory)
         self.home.mkdir(parents=True, exist_ok=True)
         self.path = self.home / "pr-workspaces.sqlite"
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -980,10 +1076,108 @@ class Workspaces:
             "new": self.new_operations(state),
             "agent_choices": workspace_agents.catalog(self.home),
             "effort_defaults": workspace_agents.effort_defaults(self.home),
+            "machines": self.machine_list(),
             "error": inventory["error"],
             "refreshing": self.refreshing,
             "synced_at": inventory["synced_at"],
         }
+
+    def machine_list(self):
+        """This machine then the registry's, each with its last known load.
+
+        ``available`` and ``reason`` are placement's verdict for any launch: whether a
+        person may choose the machine, and why not or what holds Auto back.
+        """
+        config, loads = self.loads.snapshot()
+        found = placement.exclusions(
+            {"sandboxed": False}, config["machines"], loads, self.reservations(), time.time()
+        )
+        listed = [{"id": placement.LOCAL, "label": placement.label(None, {}), "local": True}]
+        for m in config["machines"].values():
+            fields = ("id", "label", "os", "max_agents", "labels", "enabled")
+            listed.append({**{k: getattr(m, k) for k in fields}, "local": False})
+        return [
+            {
+                **loads[m["id"]],
+                **m,
+                "available": m["id"] not in found or found[m["id"]].soft,
+                "reason": found[m["id"]].why if m["id"] in found else None,
+            }
+            for m in listed
+        ]
+
+    def reservations(self):
+        """Launches running in this process by machine that herdr does not list yet.
+
+        One with a result has its workspace, which herdr already counts.
+        """
+        ops = (self.operation(key) for key in list(self.workers))
+        placed = [
+            op.get("machine") or placement.LOCAL
+            for op in ops
+            if op and op["status"] in {"queued", "running"} and not op.get("result")
+        ]
+        return {machine_id: placed.count(machine_id) for machine_id in set(placed)}
+
+    def place(self, request, fields, history=None):
+        """The registry id a launch runs on, None for this machine.
+
+        A request without ``machine`` runs here, as before workers existed. ``fields`` are
+        the launch's ``placement.request`` fields; an explicit machine that cannot take
+        the launch is refused with the reason.
+        """
+        if "machine" not in request:
+            return None
+        config, loads = self.loads.snapshot()
+        req = placement.request({**fields, "override": request["machine"]}, config["repos"])
+        return placement.choose(
+            req, config["machines"], loads, history or {}, self.reservations()
+        ).machine
+
+    def preview(self, query):
+        """Where Auto would place a launch, and which machines a person may choose."""
+        if set(query) - {"repo", "docker", "agent", "account"}:
+            raise ValueError("Unknown placement parameter")
+        config, loads = self.loads.snapshot()
+        fields = {
+            "repo": query.get("repo", ""),
+            "agent": query.get("agent", "codex"),
+            "claude_account": query.get("account") or None,
+            "docker": query.get("docker") == "1",
+        }
+        req = placement.request(fields, config["repos"])
+        reservations = self.reservations()
+        found = placement.exclusions(req, config["machines"], loads, reservations, time.time())
+        options = [
+            {
+                "id": machine_id,
+                "label": machine.label,
+                "note": found[machine_id].why
+                if machine_id in found
+                else placement.free(machine_id, config["machines"], loads, reservations),
+                "disabled": machine_id in found and not found[machine_id].soft,
+            }
+            for machine_id, machine in config["machines"].items()
+        ]
+        try:
+            chosen = placement.choose(req, config["machines"], loads, {}, reservations)
+        except ValueError as exc:
+            return {"machine": None, "error": str(exc), "options": options}
+        machine_id = chosen.machine or placement.LOCAL
+        return {
+            "machine": machine_id,
+            "label": placement.label(machine_id, config["machines"]),
+            "reason": chosen.reason,
+            "options": options,
+        }
+
+    def unsupported_launch(self, machine_id):
+        """Launching on a worker lands later; a launch placed there is refused, never moved."""
+        try:
+            machine = machines.load(self.home).get(machine_id)
+        except (OSError, ValueError):
+            machine = None
+        return f"Launching on {machine.label if machine else machine_id} is not supported yet"
 
     def agent_started(self, target, agent):
         return not agent or agent_in(target["workspace_id"], target["path"], agent)
@@ -1012,6 +1206,7 @@ class Workspaces:
             "docker",
             "exit_when_done",
             "start_at",
+            "machine",
         }
         if (
             set(request) - allowed
@@ -1057,6 +1252,11 @@ class Workspaces:
         pr = self.target(request["id"])
         action = request["action"]
         chosen = False  # Whether the launch uses an existing local clone.
+        machine = None  # Where a launch runs; reopening stays with its checkout, here.
+        if action not in {"create", "clone-and-create", "handle"} and request.get(
+            "machine", placement.LOCAL
+        ) not in {"auto", placement.LOCAL}:
+            raise ValueError("Only a new workspace can be placed on another machine")
         if pr.get("kind") == "watch" and action in {"create", "clone-and-create", "handle"}:
             raise ValueError("Watch actions can only open or reopen the registered checkout")
         if is_sentry(pr) and action in {"create", "clone-and-create"}:
@@ -1146,6 +1346,18 @@ class Workspaces:
                 self.home,
             )
             claude_accounts.validate(request.get("agent", "codex"), request.get("claude_account"))
+            # A verified checkout pins Handle to its machine; every checkout is here so far.
+            machine = self.place(
+                request,
+                {
+                    "repo": pr.get("repo"),
+                    "agent": request.get("agent", "codex"),
+                    "claude_account": request.get("claude_account"),
+                    "docker": request.get("docker", False),
+                    "pin": placement.LOCAL if info["matches"] else None,
+                },
+                {placement.LOCAL: 2 if info["matches"] else 1 if info["clones"] else 0},
+            )
             if (
                 not request.get("task", "").strip()
                 or len(request["task"]) > 32000
@@ -1170,14 +1382,16 @@ class Workspaces:
                 if info["clones"] or not clone or request.get("destination") != clone:
                     raise ValueError("Clone destination changed; refresh before confirming")
         if scheduling:
-            return {"scheduled": self.schedule(pr, action, request, clone if chosen else None)}
+            return {
+                "scheduled": self.schedule(pr, action, request, clone if chosen else None, machine)
+            }
         op = {
             "id": str(uuid.uuid4()),
             "pr": pr["id"],
             "action": action,
             "status": "queued",
             # Registry id of the machine the launch runs on; None is this one.
-            "machine": None,
+            "machine": machine,
             "clone": clone,
             "path": target["path"] if action == "reopen" else None,
             "agent": None if action == "reopen" else request.get("agent", "codex"),
@@ -1291,6 +1505,7 @@ class Workspaces:
             "docker",
             "exit_when_done",
             "also",
+            "machine",
         }
         flags = {"docker", "exit_when_done"}
         also = request.get("also", [])
@@ -1342,6 +1557,17 @@ class Workspaces:
             if base and (base.startswith("-") or "@" in base or not self.valid_branch(clone, base)):
                 raise ValueError("The base branch is not a valid branch name")
             target = {"kind": "scratch", "repo": repo, "branch": name, "base": base or None}
+        machine = self.place(
+            request,
+            {
+                "repo": repo,
+                "agent": agent,
+                "claude_account": request.get("claude_account"),
+                "docker": request.get("docker", False),
+                "also": [r["repo"] for r in listed if r["clone"] in also],
+            },
+            {placement.LOCAL: 1},
+        )
         key = f"{NEW_PREFIX}{uuid.uuid4()}"
         target["id"] = key
         op = {
@@ -1349,7 +1575,7 @@ class Workspaces:
             "pr": key,
             "action": "new",
             "status": "queued",
-            "machine": None,
+            "machine": machine,
             "clone": clone,
             "path": None,
             "agent": agent,
@@ -1387,6 +1613,12 @@ class Workspaces:
 
     def perform_new(self, target, op, task, files=""):
         try:
+            if op.get("machine") is not None:
+                # Refused before an issue is filed for a launch that cannot start.
+                self.save_operation(
+                    op, status="failed", message=self.unsupported_launch(op["machine"])
+                )
+                return
             if is_issue(target):
                 try:
                     self.save_operation(
@@ -1471,11 +1703,12 @@ class Workspaces:
 
     # -- scheduled launches --
 
-    def schedule(self, pr, action, request, clone=None):
+    def schedule(self, pr, action, request, clone=None, machine=None):
         """Record a validated launch request to start at ``request["start_at"]``.
 
         ``clone`` is the existing clone chosen now; the launch keeps it even if another
-        clone becomes preferred before the task starts.
+        clone becomes preferred before the task starts. ``machine`` is where it was
+        placed now; the request keeps the choice, which is placed again at the start.
         """
         now = time.time()
         saved = {
@@ -1491,6 +1724,7 @@ class Workspaces:
                 "destination",
                 "prefilled",
                 "docker",
+                "machine",
             )
             if request.get(key)
         }
@@ -1500,7 +1734,7 @@ class Workspaces:
         task = {
             "id": str(uuid.uuid4()),
             "target": pr["id"],
-            "machine": None,
+            "machine": machine,
             "status": "scheduled",
             "start_at": float(request["start_at"]),
             "created_at": now,
@@ -1534,7 +1768,16 @@ class Workspaces:
         item is validated like a single scheduled Handle; one that fails is reported and
         the others are still scheduled.
         """
-        shared = {"agent", "model", "effort", "claude_account", "task", "prefilled", "docker"}
+        shared = {
+            "agent",
+            "model",
+            "effort",
+            "claude_account",
+            "task",
+            "prefilled",
+            "docker",
+            "machine",
+        }
         items = request.get("items")
         interval = request.get("interval", 0)
         if (
@@ -1738,6 +1981,14 @@ class Workspaces:
                 if task["request"].get("destination") in cloning:
                     # A batch can hold several items whose repository had no clone; the first
                     # clones it, and the rest start in that clone once it is there.
+                    continue
+                if task.get("machine") is not None:
+                    self.save_scheduled(
+                        db,
+                        task,
+                        status="failed",
+                        message=f"Not started: {self.unsupported_launch(task['machine'])}",
+                    )
                     continue
                 self.save_scheduled(db, task, status="starting", message="Starting")
             try:
@@ -2086,6 +2337,8 @@ class Workspaces:
     def perform(self, pr, op, task):
         launching = False
         try:
+            if op.get("machine") is not None:
+                raise ValueError(self.unsupported_launch(op["machine"]))
             lock_dir = self.home / "workspace-locks"
             lock_dir.mkdir(mode=0o700, exist_ok=True)
             key = hashlib.sha256(op["clone"].encode()).hexdigest()

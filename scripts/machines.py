@@ -116,7 +116,7 @@ def _machine(raw):
     name = machine.id if isinstance(machine.id, str) else "?"
     checks = [
         (isinstance(machine.id, str) and ID.fullmatch(machine.id), "id"),
-        (machine.id != "local", "id (local is reserved)"),
+        (machine.id not in {"local", "auto"}, "id (local and auto are reserved)"),
         (
             isinstance(machine.label, str)
             and 0 < len(machine.label) <= 64
