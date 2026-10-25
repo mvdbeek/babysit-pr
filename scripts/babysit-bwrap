@@ -95,13 +95,17 @@ resolve() {
 }
 
 # Never writable, nor any directory holding one: credentials, babysit's own state and
-# launchers, and shell, session and git startup files, all of which run or authorize
-# code outside.
+# launchers, toolchains that also run outside, herdr's socket (which drives unsandboxed
+# panes), the agent homes (each binds only as its own --claude-config-dir or
+# --codex-home, below), and shell, session, service and git startup files, all of
+# which run or authorize code outside.
 protected=()
 for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .local/bin \
-  .cache/babysit-sandbox .bashrc .bashrc.d .bash_profile .bash_login .bash_logout .profile \
-  .zshenv .zprofile .zshrc .zlogin .zlogout .config/fish .pam_environment .config/systemd \
-  .config/autostart .config/environment.d .gitconfig .config/git; do
+  .local/share/uv .local/share/claude .nvm .npm-global .docker .config/herdr .claude .codex \
+  .cache/babysit-sandbox .bashrc .bashrc.d .bash_aliases .bash_profile .bash_login \
+  .bash_logout .profile .inputrc .zshenv .zprofile .zshrc .zlogin .zlogout .config/fish \
+  .tmux.conf .config/tmux .pam_environment .config/systemd .local/share/systemd \
+  .local/share/dbus-1 .config/autostart .config/environment.d .gitconfig .config/git; do
   # A dotfile manager's link protects its target too.
   protected+=("$real_home/$path" "$(resolve "$home/$path")")
   if [[ -L $home/$path && ! -e $home/$path ]]; then
@@ -120,16 +124,24 @@ if command -v bwrap >/dev/null; then
 fi
 
 # Prints the resolved writable directory, nothing for one that does not exist (like
-# --bind-try), and refuses anything that would expose what it must not.
+# --bind-try), and refuses anything that would expose what it must not. An agent
+# configuration names its harness's home, $2: the directory itself, or for Claude one
+# of its named accounts, is allowed there.
 writable() {
-  local path=$1 real guard
+  local path=$1 own=${2:-} real guard linked=
   [[ $path == /* ]] || die "refusing relative path $path"
   [[ -d $path ]] || return 0
   real=$(realpath -- "$path")
   if [[ $real == / || $real_home == "$real" || $real_home == "$real"/* ]]; then
     die "refusing $path, which would expose the home directory"
   fi
+  [[ -z $own ]] || linked=$(resolve "$home/$own")
   for guard in "${protected[@]}"; do
+    if [[ -n $own && ($guard == "$real_home/$own" || $guard == "$linked") ]]; then
+      [[ $real == "$guard" ]] && continue
+      [[ $own == .claude && $real == "$guard"/accounts/* && $real != "$guard"/accounts/*/* ]] &&
+        continue
+    fi
     if [[ $real == "$guard" || $real == "$guard"/* || $guard == "$real"/* ]]; then
       die "refusing $path, which overlaps the protected $guard"
     fi
@@ -167,7 +179,9 @@ argv=(bwrap --die-with-parent ${session[@]+"${session[@]}"} --unshare-pid --unsh
   --unshare-uts --clearenv --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
 
 if [[ -n $config_var ]]; then
-  real=$(writable "$config_dir")
+  own=.claude
+  [[ $config_var == CLAUDE_CONFIG_DIR ]] || own=.codex
+  real=$(writable "$config_dir" "$own")
   # Exporting a missing one would point the agent at the empty home's tmpfs.
   [[ -n $real ]] || die "the agent configuration directory $config_dir does not exist"
   config_dir=$real
@@ -189,6 +203,11 @@ for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   real=$(writable "$path")
   [[ -z $real ]] || grant "$real"
 done
+# The default Claude account's directory holds the named accounts: hide them.
+if [[ $config_var == CLAUDE_CONFIG_DIR && -d $config_dir/accounts ]] &&
+  [[ $config_dir == "$real_home/.claude" || $config_dir == "$(resolve "$home/.claude")" ]]; then
+  argv+=(--tmpfs "$config_dir/accounts")
+fi
 
 if ((docker)); then
   # The system daemon's socket is root on this machine and is always refused. A rootless

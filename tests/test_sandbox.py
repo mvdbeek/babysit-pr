@@ -621,6 +621,56 @@ def test_wrapper_protects_session_and_git_startup_files(checkout, path):
     assert "overlaps the protected" in message
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".config/herdr",  # herdr.sock drives panes outside the sandbox
+        ".local/share/systemd",  # user units
+        ".local/share/dbus-1",  # session bus services
+        ".bash_aliases",  # sourced by Ubuntu's .bashrc
+        ".inputrc",
+        ".tmux.conf",
+        ".config/tmux",
+        ".docker",  # credential helpers and CLI plugins
+        ".local/share/uv",  # toolchains that also run outside
+        ".local/share/claude",
+        ".nvm",
+        ".npm-global",
+        ".claude",  # every Claude account
+        ".claude/accounts/other",
+        ".codex",
+    ],
+)
+def test_wrapper_protects_launchers_sockets_and_agent_homes(checkout, path):
+    worktree, _, home = checkout
+    (home / path).mkdir(parents=True)
+    message = refused(worktree, environment(home), f"--add-dirs={worktree}:{home / path}", "x")
+    assert "overlaps the protected" in message
+
+
+def test_wrapper_binds_an_agent_home_only_as_that_agent_configuration(checkout):
+    worktree, _, home = checkout
+    for path in (".claude/accounts/work", ".codex"):
+        (home / path).mkdir(parents=True)
+    env = environment(home)
+    claude, account, codex = home / ".claude", home / ".claude/accounts/work", home / ".codex"
+    # The default account's directory holds the others, which stay out of reach.
+    argv = printed(worktree, env, f"--claude-config-dir={claude}", "claude")
+    assert (str(claude),) * 2 in pairs(argv, "--bind")
+    assert argv[argv.index("--tmpfs", argv.index(str(claude))) + 1] == str(claude / "accounts")
+    argv = printed(worktree, env, f"--claude-config-dir={account}", "claude")
+    assert (str(account),) * 2 in pairs(argv, "--bind")
+    assert str(claude / "accounts") not in argv
+    assert (str(codex),) * 2 in pairs(printed(worktree, env, f"--codex-home={codex}", "codex"), "--bind")
+    for option in (
+        f"--codex-home={account}",
+        f"--claude-config-dir={codex}",
+        f"--claude-config-dir={claude / 'projects'}",
+    ):
+        (home / ".claude/projects").mkdir(exist_ok=True)
+        assert "overlaps the protected" in refused(worktree, env, option, "x"), option
+
+
 def test_wrapper_protects_missing_paths_under_linked_parents(checkout, tmp_path):
     worktree, _, home = checkout
     # ~/.config links elsewhere, and none of the protected entries in it exist yet.

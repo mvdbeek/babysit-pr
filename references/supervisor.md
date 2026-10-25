@@ -281,11 +281,21 @@ swap that directory for a link just before another worktree's sandbox binds it.
 Every writable path must be absolute and is resolved first; `/`, `$HOME` and its
 ancestors, and anything equal to, inside or holding `~/.ssh`, `~/.gnupg`,
 `~/.config/gh`, `~/.config/babysit-pr`, `~/.local/state/babysit-pr`,
-`~/.local/bin`, the whole sandbox cache root, a shell or session startup file
-(`.bashrc`, `.bashrc.d`, `.profile`, `.bash_profile`, `.bash_login`, the zsh
-files, `~/.config/fish`, `.pam_environment`, `~/.config/systemd`,
-`~/.config/autostart`, `~/.config/environment.d`) or git's user configuration
-(`.gitconfig`, `~/.config/git`) are refused, as are newlines. Protected entries
+`~/.local/bin`, the toolchains that also run outside (`~/.local/share/uv`,
+`~/.local/share/claude`, `~/.nvm`, `~/.npm-global`), `~/.docker` (credential
+helpers and CLI plugins), `~/.config/herdr` (its socket drives panes outside the
+sandbox), the whole sandbox cache root, a shell or session startup file
+(`.bashrc`, `.bashrc.d`, `.bash_aliases`, `.profile`, `.bash_profile`,
+`.bash_login`, `.inputrc`, the zsh files, `~/.config/fish`, tmux's configuration,
+`.pam_environment`, `~/.config/autostart`, `~/.config/environment.d`), a user
+service definition (`~/.config/systemd`, `~/.local/share/systemd`,
+`~/.local/share/dbus-1`) or git's user configuration (`.gitconfig`,
+`~/.config/git`) are refused, as are newlines. The agent homes `~/.claude` and
+`~/.codex` are refused too, except as the matching configuration directory:
+`--claude-config-dir` may be `~/.claude` itself or one of its
+`accounts/<name>`, and `--codex-home` may be `~/.codex`. When the default
+account `~/.claude` is bound, its `accounts` directory is covered by an empty
+tmpfs, so that agent never reaches the named accounts. Protected entries
 are resolved whether or not they exist, through linked parents and dangling
 dotfile links. Where bwrap has `--bind-fd` (bubblewrap 0.10.0 and later, detected
 from `bwrap --help`), each writable directory is opened once after it is checked,
