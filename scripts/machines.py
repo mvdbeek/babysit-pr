@@ -24,8 +24,9 @@ from typing import NamedTuple
 import owned_process
 
 ID = re.compile(r"[a-z][a-z0-9-]{0,23}")
-# A leading letter or digit keeps the target from ever being read as an ssh option.
-SSH_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,254}")
+# At most one @, and a leading letter or digit on the user and the host, keeps the
+# target from ever being read as an ssh option.
+SSH_TARGET = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._:-]*")
 WORKSPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 CAPABILITY = re.compile(r"[a-z0-9][a-z0-9:._-]{0,63}")
@@ -123,8 +124,13 @@ def _machine(raw):
             and not machine.label.startswith("-"),
             "label",
         ),
-        (isinstance(machine.ssh, str) and SSH_TARGET.fullmatch(machine.ssh), "ssh"),
-        (machine.os in OSES, "os"),
+        (
+            isinstance(machine.ssh, str)
+            and len(machine.ssh) <= 255
+            and SSH_TARGET.fullmatch(machine.ssh),
+            "ssh",
+        ),
+        (isinstance(machine.os, str) and machine.os in OSES, "os"),
         (_remote_path(machine.src), "src"),
         (_remote_path(machine.babysit_root), "babysit_root"),
         (
@@ -176,6 +182,8 @@ def _repos(raw, ids):
         ):
             raise ValueError(f"Invalid requires for {slug}")
         prefer = rule.get("prefer")
+        if prefer is not None and not isinstance(prefer, str):
+            raise ValueError(f"Invalid prefer for {slug}")
         if prefer is not None and prefer not in ids:
             raise ValueError(f"{slug} prefers unknown machine {prefer}")
         repos[slug] = {"requires": requires, "prefer": prefer}
@@ -183,7 +191,11 @@ def _repos(raw, ids):
 
 
 def load_config(home):
-    """Validated registry, None when absent. Raises ValueError when malformed."""
+    """Validated registry, None when absent. Raises ValueError when malformed.
+
+    Ids, labels and ssh targets must be unique; aliases of one host (``user@host``
+    and ``host``, or two names for one address) are not detected.
+    """
     path = Path(home) / "machines.json"
     if not path.exists():
         return None
@@ -194,21 +206,25 @@ def load_config(home):
         raise ValueError("Machine registry must be a JSON object")
     if unknown := set(raw) - {"version", "machines", "repos"}:
         raise ValueError(f"Unknown registry keys: {', '.join(sorted(unknown))}")
-    if raw.get("version") != 1:
+    if type(raw.get("version")) is not int or raw["version"] != 1:
         raise ValueError("Machine registry version must be 1")
     entries = raw.get("machines", [])
     if not isinstance(entries, list) or len(entries) > 64:
         raise ValueError("Configure machines as a list of at most 64 entries")
     machines: dict[str, Machine] = {}
     labels = set()
+    targets = set()
     for entry in entries:
         machine = _machine(entry)
         if machine.id in machines:
             raise ValueError(f"Duplicate machine id {machine.id}")
         if machine.label in labels:
             raise ValueError(f"Duplicate machine label {machine.label}")
+        if machine.ssh in targets:
+            raise ValueError(f"Duplicate machine ssh target {machine.ssh}")
         machines[machine.id] = machine
         labels.add(machine.label)
+        targets.add(machine.ssh)
     return {"machines": machines, "repos": _repos(raw.get("repos", {}), machines)}
 
 
@@ -303,7 +319,13 @@ def _quote_path(path):
 
 
 def remote_argv(home, m: Machine, argv, *, cwd=None) -> list[str]:
-    """ssh argv running ``argv`` on ``m`` under ``sh -c``; ``RemotePath`` elements expand ``~`` remotely."""
+    """ssh argv running ``argv`` on ``m`` under ``sh -c``; ``RemotePath`` elements expand ``~`` remotely.
+
+    sshd runs the command string through the worker's login shell, whose quoting rules
+    differ (tcsh expands ``!`` and rejects newlines inside single quotes; fish treats
+    ``\\'`` there as an escape). So that shell only ever sees a fixed wrapper around
+    octal escapes, which sh's own printf turns back into the command line.
+    """
     command = " ".join(
         _quote_path(x) if isinstance(x, RemotePath) else shlex.quote(x) for x in argv
     )
@@ -311,8 +333,10 @@ def remote_argv(home, m: Machine, argv, *, cwd=None) -> list[str]:
         if not _remote_path(cwd):
             raise ValueError("Remote working directory must be absolute or start with ~")
         command = f"cd -- {_quote_path(cwd)} && {command}"
-    # sh -c: the login shell (fish, tcsh) only ever sees one quoted word, never our quoting.
-    return ["ssh", *ssh_options(home), m.ssh, "--", f"sh -c {shlex.quote(command)}"]
+    if "\0" in command:
+        raise ValueError("Remote commands cannot contain NUL")
+    escaped = "".join(f"\\{byte:03o}" for byte in command.encode())
+    return ["ssh", *ssh_options(home), m.ssh, "--", f'sh -c \'eval "$(printf "{escaped}")"\'']
 
 
 def _channel(m: Machine):
@@ -342,6 +366,9 @@ def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=Non
     channel = _channel(m)
     if not channel.acquire(timeout=timeout):
         raise subprocess.TimeoutExpired(argv, timeout)
+    # Without input, ssh must not read (and swallow) this process's own stdin.
+    if input is None:
+        kwargs.setdefault("stdin", subprocess.DEVNULL)
     try:
         remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
         return owned_process.run(
