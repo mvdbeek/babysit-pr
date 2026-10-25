@@ -106,6 +106,8 @@ TLS = re.compile(
 # A job's branch: what a cron job may name, checked again where it is used.
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 MAX_TURN = 20000  # Characters of an agent's final response a ``turn`` answer carries.
+# What a terminal acts on: never in a path that reaches a typed line.
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # A session listing reads at most this much of each transcript, and skips longer lines.
 MAX_SCAN = 32 * 1024 * 1024
 MAX_SCAN_LINE = 4 * 1024 * 1024
@@ -1284,12 +1286,29 @@ def _host_turn(file, session, agent):
     if agent not in {"claude", "codex"}:
         raise ValueError("Expected claude or codex")
     with _host_transcript(file) as stream:
-        lines = transcript_lines(stream)
+        lines = _ending_lines(stream)
         turn, complete = (claude_turn if agent == "claude" else codex_turn)(lines, session)
     return {
         "turn": str(turn)[:MAX_TEXT],
         "complete": None if complete is None else str(complete)[:MAX_TURN],
     }
+
+
+def _ending_lines(stream):
+    """A transcript's first line and its last MAX_SCAN bytes, from a line start.
+
+    The latest turn is at the end; a Codex rollout names its session in its first line.
+    """
+    size = os.fstat(stream.fileno()).st_size
+    if size <= MAX_SCAN:
+        yield from transcript_lines(stream)
+        return
+    first = stream.readline(MAX_SCAN_LINE + 1)
+    if first.endswith(b"\n"):
+        yield first.decode("utf-8", errors="replace")
+    stream.seek(size - MAX_SCAN)
+    stream.readline()  # The rest of the line the seek landed in.
+    yield from transcript_lines(stream)
 
 
 def _host_fetch_refusals(clone, timeout):
@@ -1421,13 +1440,24 @@ def _branch(value, what):
     return value
 
 
-def _host_cron_checkout(clone, repo, branch, base, directory, agent, account, babysit_root):
+def _host_cron_checkout(
+    clone, repo, branch, base, directory, agent, account, babysit_root, sandbox
+):
     """A cron job's checkout on this machine, made on first use as cron_agents does locally.
 
-    Every Git call is hardened (``host_git``) and its one fetch names the job's GitHub
-    repository (``_host_fetch``). Returns the paths a launch line needs: the checkout,
-    its common dir, this machine's home, the agent's configuration directory (a Claude
-    account's, trusted for the checkout) and babysit-pr's ``babysit-bwrap`` here.
+    ``clone`` must be a clone of ``repo``: one of its remotes names that GitHub
+    repository. Every Git call is hardened (``host_git``), its one fetch names the job's
+    GitHub repository (``_host_fetch``), and the checkout must be a linked worktree of
+    that very clone, outside its ``.git``: an agent can rewrite the checkout's ``.git``
+    file to name any repository it made, but not that.
+
+    Returns the paths a launch line needs: the checkout, the clone, its common dir,
+    this machine's home, the agent's configuration directory (``claude_home``, real, for
+    the sandbox) and the ``CLAUDE_CONFIG_DIR`` to type (``claude_env``: literal, as
+    Claude names its Keychain item after it; None for the default login under
+    Safehouse), and babysit-pr's ``babysit-bwrap`` here. A Claude checkout is trusted in
+    the configuration the sandboxed Claude reads: babysit-bwrap (``sandbox``) always
+    sets ``CLAUDE_CONFIG_DIR``, so the default login reads ``~/.claude/.claude.json``.
     """
     _arg_paths([clone, directory, babysit_root], home=True)
     if not isinstance(repo, str) or not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
@@ -1439,16 +1469,37 @@ def _host_cron_checkout(clone, repo, branch, base, directory, agent, account, ba
         raise ValueError("Expected claude or codex")
     if account is not None and (not isinstance(account, str) or not ACCOUNT.fullmatch(account)):
         raise ValueError("Expected a Claude account name")
-    home = os.path.realpath(os.path.expanduser("~"))
-    claude_home = None
+    if sandbox not in {"safehouse", "bwrap"}:
+        raise ValueError("Expected safehouse or bwrap")
+    literal_home = os.path.expanduser("~")
+    home = os.path.realpath(literal_home)
+    claude_home = claude_env = config = None
     if agent == "claude":
-        default = os.path.realpath(os.path.join(home, ".claude"))
         named = account not in (None, "default")
-        claude_home = os.path.join(default, "accounts", str(account)) if named else default
-        if named and not os.path.isdir(claude_home):
+        default = os.path.join(literal_home, ".claude")
+        literal = os.path.join(default, "accounts", str(account)) if named else default
+        if named and not os.path.isdir(literal):
             raise ValueError(f"Unknown Claude account {account} on this machine")
-        claude_home = os.path.realpath(claude_home)
+        claude_home = os.path.realpath(literal)
+        claude_env = literal if named or sandbox == "bwrap" else None
+        config = (
+            os.path.join(claude_home, ".claude.json")
+            if claude_env
+            else os.path.join(home, ".claude.json")
+        )
     clone = os.path.realpath(os.path.expanduser(clone))
+    remotes = remote_slugs(repo_config(host_git, clone))
+    tracking = [
+        name
+        for name in ("origin", "upstream", *sorted(remotes))
+        if remotes.get(name) == repo.lower()
+    ]
+    if not tracking:
+        raise ValueError(f"{clone} is not a clone of {repo}: none of its remotes names it")
+    common_expected = os.path.join(clone, ".git")
+    if os.path.islink(common_expected) or not os.path.isdir(common_expected):
+        raise ValueError(f"{clone} has no .git directory of its own")
+    common_expected = os.path.realpath(common_expected)
     directory = os.path.expanduser(directory)
     if os.path.isdir(directory):
         path = os.path.realpath(directory)
@@ -1461,22 +1512,19 @@ def _host_cron_checkout(clone, repo, branch, base, directory, agent, account, ba
                 raise ValueError(f"{branch} is checked out in the clone itself")
             path = os.path.realpath(existing)
         else:
+            if os.path.realpath(directory).startswith(common_expected + os.sep):
+                raise ValueError(f"{directory} lies inside {clone}'s .git")
             os.makedirs(os.path.dirname(directory), exist_ok=True)
             try:
                 host_git(clone, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
             except ValueError:
                 start = base or "HEAD"
                 # The job's own repository, never a URL the clone's config names; it lands
-                # in the refs of the remote that tracks it.
-                remotes = remote_slugs(repo_config(host_git, clone))
-                tracking = [
-                    name
-                    for name in ("origin", "upstream", *sorted(remotes))
-                    if remotes.get(name) == repo.lower()
-                ]
-                if base and tracking:
+                # in the refs of the remote that tracks it, named in full so no local
+                # branch or tag called <remote>/<base> wins.
+                if base:
                     _host_fetch(clone, repo, base, tracking[0])
-                    start = f"{tracking[0]}/{base}"
+                    start = f"refs/remotes/{tracking[0]}/{base}"
                 add = ["-b", branch, directory, start]
             else:
                 add = [directory, branch]
@@ -1492,6 +1540,12 @@ def _host_cron_checkout(clone, repo, branch, base, directory, agent, account, ba
                     host_git(clone, "branch", "-D", branch)
                 raise
             path = os.path.realpath(directory)
+    # Whatever route found it, the checkout is a worktree of this clone, outside its .git.
+    common = _host_common_dir(path)
+    if common != common_expected:
+        raise ValueError(f"{path} is not a worktree of {clone}")
+    if path == common or path.startswith(common + os.sep):
+        raise ValueError(f"{path} lies inside {clone}'s .git")
     current = host_git(path, "rev-parse", "--abbrev-ref", "HEAD")
     if current != branch:
         stated = f"{path} has {current} checked out instead of {branch}"
@@ -1501,14 +1555,7 @@ def _host_cron_checkout(clone, repo, branch, base, directory, agent, account, ba
             host_git(path, "switch", "--quiet", branch)
         except ValueError as exc:
             raise ValueError(f"{stated}, and switching back failed: {exc}") from exc
-    common = _host_common_dir(path)
-    if claude_home is not None:
-        default = os.path.join(home, ".claude")
-        config = (
-            os.path.join(home, ".claude.json")
-            if claude_home == os.path.realpath(default)
-            else os.path.join(claude_home, ".claude.json")
-        )
+    if config is not None:
         _host_trust(config, path)
     root = os.path.realpath(os.path.expanduser(babysit_root))
     launcher = os.path.join(root, "scripts", "babysit-bwrap")
@@ -1518,6 +1565,7 @@ def _host_cron_checkout(clone, repo, branch, base, directory, agent, account, ba
         "common": common,
         "home": home,
         "claude_home": claude_home,
+        "claude_env": claude_env,
         "codex_home": os.path.realpath(
             os.environ.get("CODEX_HOME") or os.path.join(home, ".codex")
         ),
@@ -1911,12 +1959,25 @@ def validate_turn(value):
 
 def validate_cron_checkout(value):
     """Check a worker's cron checkout: absolute paths for the launch line, nothing else."""
-    fields = {"path", "clone", "common", "home", "claude_home", "codex_home", "launcher"}
+    fields = {
+        "path",
+        "clone",
+        "common",
+        "home",
+        "claude_home",
+        "claude_env",
+        "codex_home",
+        "launcher",
+    }
     _expect(isinstance(value, dict) and set(value) == fields, "fields")
+    # These end up in a line typed into the worker's shell: a control character there
+    # is a keystroke.
     for key in ("path", "clone", "common", "home", "codex_home"):
-        _expect(_absolute(value[key]) and "\n" not in value[key], key)
-    for key in ("claude_home", "launcher"):
-        _expect(value[key] is None or (_absolute(value[key]) and "\n" not in value[key]), key)
+        _expect(_absolute(value[key]) and not CONTROL.search(value[key]), key)
+    for key in ("claude_home", "claude_env", "launcher"):
+        _expect(
+            value[key] is None or (_absolute(value[key]) and not CONTROL.search(value[key])), key
+        )
     return value
 
 

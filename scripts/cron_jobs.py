@@ -9,6 +9,7 @@ A run that was due while it was stopped starts once when it returns, up to a day
 late. Each run's output is kept in a bounded log file next to its history.
 """
 
+import concurrent.futures
 import contextlib
 import fcntl
 import json
@@ -293,6 +294,10 @@ class CronJobs:
         self.logs.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.running: dict[str, Run] = {}
+        # Runs on workers are looked at in their own threads, one look per run at a time,
+        # so a slow or hung worker never holds up the schedule; made on first use.
+        self.remote_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self.remote_looks: set[str] = set()
         self.wake = threading.Event()
         self.stopping = threading.Event()
         self.scheduler: threading.Thread | None = None
@@ -738,11 +743,36 @@ class CronJobs:
                 )
             ]
         for run in runs:
+            if run["agent_run"].get("machine"):
+                self.watch_elsewhere(run)
+                continue
             try:
                 self.watch_one(run)
             except Exception:
                 continue  # One watch must not stop the others; the next pass retries it.
         return bool(runs)
+
+    def watch_elsewhere(self, run):
+        """Look at a worker's run in the background, unless a look at it is still going."""
+        with self.lock:
+            if run["id"] in self.remote_looks or self.stopping.is_set():
+                return
+            self.remote_looks.add(run["id"])
+            if self.remote_pool is None:
+                self.remote_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="cron-remote"
+                )
+
+        def look():
+            try:
+                self.watch_one(run)
+            except Exception:
+                pass  # The next pass looks again.
+            finally:
+                with self.lock:
+                    self.remote_looks.discard(run["id"])
+
+        self.remote_pool.submit(look)
 
     def current(self, run):
         """The run as stored, or None once it is deleted or no longer followed."""
@@ -1021,6 +1051,8 @@ class CronJobs:
             threads = [run.thread for run in self.running.values() if run.thread]
         for thread in threads:
             thread.join(STOP_GRACE + 5)
+        if self.remote_pool is not None:
+            self.remote_pool.shutdown(wait=False, cancel_futures=True)
         self.owner.close()
 
     def loop(self):

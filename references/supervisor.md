@@ -537,7 +537,11 @@ Branch-only watches have no PR closure event; register a PR watch when appropria
 
 `--home/machines.json` registers other machines. Agent cron jobs placed on a worker run
 there (see the Cron jobs section of the README); every other command still runs on
-this machine.
+this machine. Paths a worker reports are refused if they hold a control character, and
+so is any line a multiplexer is asked to type, here or there: in a terminal those are
+keystrokes, whatever the quoting. A worker's job checkout must be a linked worktree of
+the job's clone, outside its `.git`, so an agent cannot point the paths its sandbox is
+given at a repository of its own.
 `scripts/machines.py` loads and validates it; a malformed file is an error, a
 missing one means local only. `register --machine ID` checks the ID against the
 registry and then refuses: watches on other machines are not supported yet.

@@ -5,6 +5,7 @@ import shlex
 import sys
 from pathlib import Path
 
+import sandbox
 from herdr_handoff import herdr, result
 
 
@@ -85,7 +86,7 @@ def launch(job, home, script):
         [sys.executable, str(script), "--home", str(home), "_repair", job["id"], job["attempt"]]
     )
     # Exactly one atomic text+Enter submission. Never retry ambiguous delivery.
-    herdr("pane", "run", pane, command)  # successful CLI submission has no JSON body
+    herdr("pane", "run", pane, sandbox.typed(command))  # successful CLI submission has no JSON body
 
 
 def verify_runner(job):

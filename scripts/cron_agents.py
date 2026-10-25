@@ -43,8 +43,9 @@ START_WAIT = 30  # Seconds for the agent to show up in its pane after the comman
 RESULT_LIMIT = 20000  # Characters of the agent's final response kept with a run.
 MAX_PROMPT = 32000
 PROMPT_KEEP = 86400  # Staged prompts are read once at startup; older ones are removed.
-# A worker's prompts, staged there; and how long its checkout may take to make.
-REMOTE_PROMPTS = "~/.cache/babysit/cron-prompts"
+# A worker's prompts, in a folder babysit-bwrap never grants an agent.
+REMOTE_PROMPTS = "~/.local/state/babysit-pr/cron-prompts"
+# How long a worker may take to make a job's checkout.
 CHECKOUT_TIMEOUT = 180
 # Seconds between looks at a run on a worker: each costs it ssh calls.
 REMOTE_WATCH = 60
@@ -117,10 +118,14 @@ def validate_settings(request, home, machine=None):
     workspace_agents.validate(agent, settings["model"], settings["effort"], home)
     if machine is None:
         claude_accounts.validate(agent, settings["claude_account"] or None)
-    elif settings["claude_account"] and not claude_accounts.NAME.fullmatch(
-        settings["claude_account"]
-    ):
-        raise ValueError("Use an account name containing letters, digits, underscores or hyphens")
+    elif settings["claude_account"]:
+        # The worker's own logins are checked there; only the name is checked here.
+        if agent != "claude":
+            raise ValueError("A Claude account can only be selected for Claude")
+        if not claude_accounts.NAME.fullmatch(settings["claude_account"]):
+            raise ValueError(
+                "Use an account name containing letters, digits, underscores or hyphens"
+            )
     docker = request.get("docker", False)
     if not isinstance(docker, bool):
         raise ValueError("Expected docker to be true or false")
@@ -233,7 +238,8 @@ def checkout(job, src):
                     f"+refs/heads/{job['base']}:refs/remotes/{tracking[0]}/{job['base']}",
                     timeout=120,
                 )
-                start = f"{tracking[0]}/{job['base']}"
+                # In full, so no local branch or tag named <remote>/<base> wins.
+                start = f"refs/remotes/{tracking[0]}/{job['base']}"
             add = ["-b", job["branch"], str(directory), start]
         else:
             add = [str(directory), job["branch"]]
@@ -301,6 +307,7 @@ def remote_checkout(job, home, machine):
         agent=job["agent"],
         account=job["claude_account"] or None,
         babysit_root=machine.babysit_root,
+        sandbox=BACKENDS[machine.os],
     )
 
 
@@ -327,7 +334,6 @@ def remote_command(job, machine, found, staged, effort):
             *sandbox.flags(sandbox.Grants(add_dirs=(found["path"], found["common"])), backend),
         ]
     home = found["claude_home"] if job["agent"] == "claude" else None
-    default = f"{found['home']}/.claude"
     return wt.agent_command(
         job["agent"],
         job["prompt"],
@@ -337,8 +343,8 @@ def remote_command(job, machine, found, staged, effort):
         docker=job["docker"],
         claude_config_dir=home,
         claude_subscription=bool(job["claude_account"]),
-        # Claude's own default home there needs no CLAUDE_CONFIG_DIR, as here.
-        claude_config_env=None if home in (None, default) else home,
+        # As the worker reported it: the literal path, or None for its default login.
+        claude_config_env=found["claude_env"] if home else None,
         backend=backend,
         features=features,
         launcher=found["launcher"],
@@ -458,7 +464,7 @@ def start(job, run_id, home, src):
             workspace_id=machines.qualify(machine.id, workspace), machine_label=machine.label
         )
     try:
-        run(*machines.herdr_argv(machine, "pane", "run", pane, command))
+        run(*machines.herdr_argv(machine, "pane", "run", pane, sandbox.typed(command)))
     except subprocess.TimeoutExpired:
         return {**launched, "uncertain": "herdr did not answer while typing the command"}
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -542,22 +548,19 @@ def without_marker(text, marker):
 def remote_response(home, machine, run, launched):
     """The worker agent's answer once a session of this run confirms the task, else None.
 
-    Its transcripts are found and read there, through the probe: the sessions recorded in
-    the checkout since the launch, newest first.
+    Its transcripts are found and read there, through the probe: the newest sessions
+    recorded in the checkout.
     """
-    listed = probe(home, machine, "sessions", 60, root=launched["path"])
-    recent = [
-        session
-        for session in listed
-        if session["agent"] == run["agent"] and session["updated"] >= launched["launched_at"] - 5
-    ]
+    listed = probe(home, machine, "sessions", 30, root=launched["path"])
+    # The run's own marker tells its session apart; the worker's clock is not compared.
+    recent = [session for session in listed if session["agent"] == run["agent"]]
     for session in recent[:3]:
         try:
             turn = probe(
                 home,
                 machine,
                 "turn",
-                60,
+                20,
                 file=session["file"],
                 session=session["id"],
                 agent=run["agent"],
@@ -580,7 +583,7 @@ def remote_progress(home, run, launched):
     label = launched["machine_label"]
     present = any(
         agent.get("pane_id") == launched["pane"]
-        for agent in herdr("agent", "list", machine=machine)["agents"]
+        for agent in herdr("agent", "list", machine=machine, timeout=15)["agents"]
     )
     text = remote_response(home, machine, run, launched)
     if text is not None:

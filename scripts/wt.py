@@ -583,6 +583,7 @@ def agent_command(
         )
     if also and len(command.encode()) > TYPED_LIMIT:
         raise ValueError("The agent command is too long to type; use fewer --with clones")
+    sandbox.typed(command)  # The staged paths and account prefix as well.
     if directory and agent == "claude":
         claude_accounts.trust(claude_config_dir or claude_accounts.current_home(), directory)
     return command
@@ -972,7 +973,8 @@ class Tool:
                     f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
                     credentials=token,
                 )
-                start_point = f"{remote}/{base}"
+                # In full, so no local branch or tag named <remote>/<base> wins.
+                start_point = f"refs/remotes/{remote}/{base}"
                 break
         else:
             if "origin" in remotes:
