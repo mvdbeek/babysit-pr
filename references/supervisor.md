@@ -260,7 +260,7 @@ tests set `sandbox.DEFAULT`.
 
 On Linux the default Claude launcher is `scripts/babysit-bwrap` (bash 4.1 or
 later), a bubblewrap wrapper taking Safehouse's `--add-dirs`, `--env-pass` and `--enable=docker,playwright`
-options, plus `--claude-config-dir` or `--codex-home`, before `--` and the command.
+options (and `--enable=gpg`, below), plus `--claude-config-dir` or `--codex-home`, before `--` and the command.
 It mounts the system read-only, gives the agent an empty `$HOME`, and allows
 writes only to `--add-dirs`, the one agent configuration directory it is given
 (exported as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Claude always gets an explicit
@@ -339,6 +339,9 @@ agents keep job control only where the kernel already blocks injection.
 launches on Linux invoke the wrapper directly; there are no shell functions there
 to rely on.
 
+Provisioning a Linux worker (bubblewrap under AppArmor, rootless Docker, accounts)
+is in [the worker setup checklist](worker-setup.md).
+
 Known gaps of the Linux sandbox:
 
 - The worktree's git directory, including its hooks and config, stays writable
@@ -375,6 +378,16 @@ Known gaps of the Linux sandbox:
   machine, and binds only `$XDG_RUNTIME_DIR/docker.sock`. Even a rootless daemon
   gives up the filesystem boundary (`docker run -v $HOME:/h` reaches every file
   of the user), so enabling Docker trusts the agent with them.
+- `--enable=gpg` mounts a throwaway `~/.gnupg` (copies of `pubring.kbx` and
+  `trustdb.gpg`, a `gpg.conf` with `no-autostart`) and, at the gpg-agent socket
+  path, a per-launch proxy (`scripts/gpg_agent_proxy.py`) that passes on only the
+  commands gpg signs with, so git signs through the agent; the private keys, any
+  passphrase file, the agent's configuration and its real socket stay outside. The
+  agent is still a signing oracle: while it runs, the sandboxed agent can have it
+  sign arbitrary data with the unlocked key, not only its own commits, as on
+  macOS. Signing is a grant: it keys its own sandbox cache, and a granted Claude
+  gets `--strict-mcp-config`. Setup is in
+  [the worker checklist](worker-setup.md#signing-with-a-gpg-subkey).
 - The dashboard's Docker toggle is macOS-only for now: it inspects Seatbelt, and
   its restart looks for the launcher in the agent's parent process, which under
   babysit-bwrap is `bwrap` itself, so a restart fails closed.

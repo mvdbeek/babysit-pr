@@ -30,8 +30,10 @@ SCRIPTS = Path(__file__).resolve().parent
 BACKENDS = ("safehouse", "bwrap", "none")
 # Launcher executables by file name, as they appear in a running agent's argv.
 LAUNCHERS = {"safehouse": "safehouse", "babysit-bwrap": "bwrap"}
-# Safehouse's names for the backend-neutral features; babysit-bwrap takes both.
-SAFEHOUSE_FEATURES = {"docker": "docker", "playwright": "playwright-chrome"}
+# Safehouse's names for the backend-neutral features; babysit-bwrap takes both. Safehouse
+# has no gpg option (signing there follows the user's own Safehouse configuration), so
+# that feature only reaches babysit-bwrap.
+SAFEHOUSE_FEATURES = {"docker": "docker", "playwright": "playwright-chrome", "gpg": None}
 # The saved Claude permission mode of a job whose sandbox launcher owns permissions.
 # Existing jobs store this value, so it keeps the name from before other backends.
 LAUNCHER_PERMISSIONS = "safehouse"
@@ -50,7 +52,7 @@ class Grants(NamedTuple):
 
     add_dirs: tuple[str, ...] = ()  # writable directories
     env_pass: tuple[str, ...] = ()  # environment variable names passed through
-    features: tuple[str, ...] = ()  # docker, playwright
+    features: tuple[str, ...] = ()  # docker, playwright, gpg (signing; a machine's gpg label)
 
 
 # The backend when a caller names none; None follows the platform. Only tests set it.
@@ -80,9 +82,9 @@ def flags(grants: Grants, name: str) -> list[str]:
         words.append("--add-dirs=" + ":".join(dict.fromkeys(grants.add_dirs)))
     if grants.env_pass:
         words.append("--env-pass=" + ",".join(grants.env_pass))
-    if grants.features:
-        names = [SAFEHOUSE_FEATURES[f] if name == "safehouse" else f for f in grants.features]
-        words.append("--enable=" + ",".join(names))
+    names = [SAFEHOUSE_FEATURES[f] if name == "safehouse" else f for f in grants.features]
+    if any(names):
+        words.append("--enable=" + ",".join(filter(None, names)))
     return words
 
 
