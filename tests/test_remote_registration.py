@@ -294,13 +294,16 @@ def test_a_dirty_or_moved_worker_checkout_is_refused(box):
         supervisor.verify_worktree(job, pr, box["home"], state)
 
 
-def test_a_worker_watch_bound_to_a_pane_is_not_repaired_yet(box):
+def test_a_worker_watch_whose_pane_is_gone_is_blocked_before_a_repair(box, fake_tools):
     job = register(box)
     db = supervisor.open_db(box["home"])
     try:
-        job.update(status="watching", attempts=0, pane={"pane_id": "w1:p1"})
+        binding = {"pane_id": "w1:p1", "terminal_id": "terminal", "shell_pid": 1}
+        job.update(status="watching", attempts=0, pane=binding)
         supervisor.start_repair(db, box["home"], job)
-        assert job["status"] == "blocked" and "Pane repairs on box" in job["summary"]
+        assert job["status"] == "blocked" and "terminal is missing" in job["summary"]
+        # Looked for on the worker's herdr, never this machine's.
+        assert json.loads(fake_tools.read_text())["calls"][0][0] == "--machine=Box"
         assert not (box["home"] / "runs").exists()
     finally:
         db.close()

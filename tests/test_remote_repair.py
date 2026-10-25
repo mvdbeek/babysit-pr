@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+import herdr_handoff
 import pr_supervisor as supervisor
 import pytest
 import remote_repair
@@ -279,3 +280,106 @@ def test_the_worker_half_runs_a_spec_once_and_only_a_staged_one(worker, tmp_path
     assert again.returncode == 1 and "File exists" in again.stdout
     assert (remote_run(worker, job) / "result.json").read_text() == before
     assert len(calls(tmp_path)) == 1
+
+
+@pytest.fixture
+def pane(worker, fake_tools, monkeypatch):
+    """The watch's shell pane on the worker, as its herdr shows it, polled quickly."""
+    store = json.loads(fake_tools.read_text())
+    store["machines"] = {
+        "Box": {
+            "workspaces": [],
+            "calls": [],
+            "agents": [{"pane_id": "w1:p1", "cwd": str(worker["tree"])}],
+            "panes": [{"pane_id": "w1:p1", "terminal_id": "terminal"}],
+            "process_info": {"w1:p1": {"shell_pid": 1, "foreground_processes": [{"pid": 1}]}},
+        }
+    }
+    fake_tools.write_text(json.dumps(store))
+    monkeypatch.setattr(remote_repair, "PANE_POLL", 0.1)
+    typed = []
+
+    def routed(*args, machine=None):
+        if args[:2] != ("pane", "run"):
+            return real(*args, machine=machine)
+        typed.append((machine.label if machine else None, args))
+        return ""
+
+    real = herdr_handoff.herdr
+
+    monkeypatch.setattr(herdr_handoff, "herdr", routed)
+    return typed
+
+
+def finish_on_worker(box, job, reply, exit=0):  # noqa: F811
+    run = remote_run(box, job)
+    run.mkdir(parents=True)
+    (run / "reply.json").write_text(json.dumps(reply))
+    (run / "agent.log").write_text("shown in the pane\n")
+    (run / "result.json").write_text(json.dumps({"exit": exit, "error": None}))
+
+
+def test_a_pane_repair_is_typed_into_the_workers_pane_and_polled(worker, pane):
+    job, folder = dispatch(worker, pane="w1:p1", headless=False)
+    reply = {"status": "waiting", "summary": "Fixed in view"}
+    original = remote_repair.status
+
+    def status(home, machine, attempt, timeout=30):
+        if not remote_run(worker, job).exists():
+            finish_on_worker(worker, job, reply)  # What the typed line did meanwhile.
+        return original(home, machine, attempt, timeout)
+
+    remote_repair.status = status
+    try:
+        supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    finally:
+        remote_repair.status = original
+    assert result(folder) == reply
+    [(label, args)] = pane
+    app = worker["worker"] / "app"
+    [spec] = (worker["worker"] / ".local/state/babysit-pr/repair-specs").iterdir()
+    assert label == "Box" and args[:3] == ("pane", "run", "w1:p1")
+    assert args[3] == f"{sys.executable} {app}/scripts/pr_supervisor.py _repair_worker {spec}"
+    assert json.loads(spec.read_text())["pane"] == job["pane"]
+    # The end of the worker's log, for the dashboard.
+    assert (folder / "agent.log").read_text() == "shown in the pane\n"
+
+
+def test_a_pane_repair_without_a_result_by_its_deadline_keeps_the_session_held(
+    worker, pane, monkeypatch
+):
+    monkeypatch.setattr(remote_repair, "SSH_SLACK", 0)
+    job, folder = dispatch(worker, pane="w1:p1", headless=False, repair_timeout=1)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert "unreachable mid-repair" in result(folder)["summary"]
+    assert session_locks.held("codex", worker["sid"], None, "box")
+
+
+def test_the_worker_half_of_a_pane_repair_runs_only_in_its_terminal(worker, pane, tmp_path):
+    job, folder = dispatch(worker, pane="w1:p1", headless=False)
+    staged = worker["worker"] / ".local/state/babysit-pr/repair-specs"
+    staged.mkdir(parents=True)
+    spec = remote_repair.spec_for(
+        remote_repair.machines.resolve(worker["home"], "box"),
+        job,
+        job["attempt"],
+        "prompt",
+        job["snapshot"]["pr"],
+    )
+    (staged / "spec.json").write_text(json.dumps(spec))
+    done = subprocess.run(
+        [
+            sys.executable,
+            str(worker["worker"] / "app/scripts/pr_supervisor.py"),
+            "_repair_worker",
+            str(staged / "spec.json"),
+        ],
+        env={**os.environ, "HOME": str(worker["worker"])},
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert done.returncode == 0
+    recorded = json.loads((remote_run(worker, job) / "result.json").read_text())
+    assert "requires its original terminal" in recorded["error"]
+    assert not calls(tmp_path)

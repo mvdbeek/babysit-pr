@@ -594,8 +594,17 @@ own process group inside the worker's babysit-bwrap (`--enable=gpg` with the mac
 the guardian's `agent.log`, so a Claude result is read as for a local repair; a
 Codex `reply.json` is fetched by a separate `_repair_status` call after the run. The
 prompt names the agent's own copy of the skill. The session's lease is the
-controller's (`session_locks`, keyed by machine). Pane-bound watches on workers are
-not repaired yet (blocked when one is due; register them `--headless`).
+controller's (`session_locks`, keyed by machine).
+
+A pane-bound watch on a worker (its pane captured through `herdr --machine`) gets the
+worker half's command line typed into that pane, once, by the guardian here. In the
+pane there is no lifeline: the worker half first checks, with the worker's own herdr,
+that it runs in the bound terminal's foreground, then runs the agent in view, bounded
+by the repair timeout, and parses a Claude result itself. The guardian polls
+`_repair_status` every 5 s until the timeout plus 60 s, then copies the last MB of the
+worker's `agent.log`; no result by then leaves the session held as for a lost worker.
+A stop request asks the worker to cancel (`_repair_cancel`), and leaves the session
+held when it cannot confirm the agent stopped.
 
 On a worker, `register` forwards to the controller's dashboard instead of keeping a
 watch of its own, which would act where nobody looks. A worker is one with

@@ -642,7 +642,7 @@ def run_repair(home, job_id, attempt):
         sig: signal.signal(sig, interrupted) for sig in (signal.SIGHUP, signal.SIGTERM)
     }
     try:
-        if job.get("pane"):
+        if job.get("pane") and job.get("machine") is None:
             import pane_runner
 
             pane_runner.verify_runner(job)
@@ -765,7 +765,7 @@ def run_repair(home, job_id, attempt):
         if live_log is not None:
             live_log.close()
         watch.save_state(folder / "result.json", result)
-        if job.get("pane"):
+        if job.get("pane") and job.get("machine") is None:
             ending = "Agent exited" if proc is not None else "No agent started"
             print(
                 f"\nBabysitter: {result['summary']}\n{ending}; the shared watcher handles CI waiting.\n",
@@ -777,19 +777,16 @@ def run_repair(home, job_id, attempt):
 
 
 def start_repair(db, home, job):
-    if job.get("machine") is not None and job.get("pane"):
-        job.update(
-            status="blocked",
-            summary=f"Pane repairs on {job['machine']} are not supported yet; "
-            "re-register the watch with --headless",
-        )
-        save_job(db, job)
-        return
     if job.get("pane"):
         import pane_runner
 
         try:
-            pane_runner.locate(job["pane"], job["cwd"], require_shell=True)
+            pane_runner.locate(
+                job["pane"],
+                job["cwd"],
+                require_shell=True,
+                machine=machines.resolve(home, job.get("machine")),
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             job.update(status="blocked", summary=str(exc))
             save_job(db, job)
@@ -819,7 +816,8 @@ def start_repair(db, home, job):
     # Persist the claim before launching. Recovery never blindly repeats a
     # repair whose outcome is missing, even if the watcher died before spawn.
     db.commit()
-    if job.get("pane"):
+    # A worker's pane gets its line from this machine's guardian (remote_repair).
+    if job.get("pane") and job.get("machine") is None:
         try:
             pane_runner.launch(job, home, SCRIPT)
         except (OSError, RuntimeError, ValueError) as exc:

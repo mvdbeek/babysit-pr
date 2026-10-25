@@ -18,6 +18,7 @@ tell whether the agent still runs: it leaves an orphan tombstone on the session'
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -37,6 +38,10 @@ SPEC_KEEP = 7 * 86400
 SSH_SLACK = 60
 # After its lifeline ends, the worker half stops its agent (5 s grace) and exits.
 LIFELINE_GRACE = 15
+# How often a pane repair's guardian asks the worker for its result.
+PANE_POLL = 5
+# The end of a pane repair's agent.log copied back for the dashboard.
+MAX_LOG = 1024 * 1024
 STATUS_TIMEOUT = 30
 CANCEL_TIMEOUT = 20
 MAX_STATUS = 1024 * 1024
@@ -102,6 +107,8 @@ def spec_for(worker, job, attempt, prompt, pr):
         "head_branch": pr["head_branch"],
         "head_sha": pr["head_sha"],
         "prompt": prompt,
+        # The worker's own herdr binding: the worker half checks it runs in that pane.
+        "pane": job.get("pane"),
     }
 
 
@@ -153,6 +160,13 @@ def outcome(value):
     return {"status": value["status"], "summary": value["summary"][:MAX_SUMMARY]}
 
 
+def orphaned(job, attempt):
+    """Keep the session held: its agent may still run on the lost worker."""
+    session_locks.mark_orphan(
+        job.get("agent"), job["session_id"], job.get("claude_config_dir"), attempt, job["machine"]
+    )
+
+
 def cancel(home, worker, attempt):
     """Ask the worker half to stop its agent; whether it confirmed it stopped."""
     try:
@@ -176,12 +190,10 @@ def run(home, job, folder, pr, prompt):
     half sees its lifeline end, then asks it to cancel; it is raised again after.
     """
     import claude_runner
-    import gh_pr_watch as watch
 
     worker = machines.resolve(home, job["machine"])
     assert worker is not None
     attempt = folder.name
-    orphan = (job.get("agent"), job["session_id"], job.get("claude_config_dir"))
     check_version(home, worker)
     spec = machines.put_file(
         home,
@@ -191,6 +203,8 @@ def run(home, job, folder, pr, prompt):
         json.dumps(spec_for(worker, job, attempt, prompt, pr)).encode(),
         keep=SPEC_KEEP,
     )
+    if job.get("pane"):
+        return run_in_pane(home, worker, job, folder, spec)
     argv = machines.remote_argv(home, worker, worker_command(worker, "_repair_worker", spec))
     proc = None
     reader = None
@@ -228,7 +242,7 @@ def run(home, job, folder, pr, prompt):
                     pass
                 owned_process.stop_group(proc, grace=5)
             if not cancel(home, worker, attempt):
-                session_locks.mark_orphan(*orphan, attempt, job["machine"])
+                orphaned(job, attempt)
             raise
         finally:
             if proc is not None:
@@ -246,8 +260,80 @@ def run(home, job, folder, pr, prompt):
                 raise Unreachable(unreachable(worker))
             raise RuntimeError(f"The repair on {worker.label} ended without a result")
     except Unreachable:
-        session_locks.mark_orphan(*orphan, attempt, job["machine"])
+        orphaned(job, attempt)
         return {"status": "blocked", "summary": unreachable(worker)}
+    if job.get("agent") == "claude" and reader is not None and reader.is_alive():
+        raise RuntimeError("Claude output stream did not finish")
+    return conclude(worker, job, folder, record, streamed=True)
+
+
+def typed_path(path):
+    # "$HOME" rather than ~, so a quoted remainder still lands in the worker's home.
+    return '"$HOME"/' + shlex.quote(path[2:]) if path.startswith("~/") else shlex.quote(path)
+
+
+def run_in_pane(home, worker, job, folder, spec):
+    """A pane-bound repair: the worker half typed into the watch's pane on the worker.
+
+    There is no lifeline: the agent runs in view, bounded by its own timeout; this
+    guardian polls for the result until that timeout plus SSH_SLACK, and a stop request
+    asks the worker to cancel.
+    """
+    import herdr_handoff
+    import pane_runner
+    import sandbox
+
+    attempt = folder.name
+    pane = pane_runner.locate(job["pane"], job["cwd"], require_shell=True, machine=worker)
+    python = worker.python
+    script = f"{worker.babysit_root.rstrip('/')}/scripts/pr_supervisor.py"
+    line = " ".join(
+        [
+            typed_path(python) if python.startswith(("/", "~")) else shlex.quote(python),
+            typed_path(script),
+            "_repair_worker",
+            shlex.quote(spec),
+        ]
+    )
+    # Exactly one submission, never retried: delivery may have happened.
+    herdr_handoff.herdr("pane", "run", pane, sandbox.typed(line), machine=worker)
+    deadline = time.monotonic() + job["repair_timeout"] + SSH_SLACK
+    record = None
+    try:
+        while True:
+            time.sleep(PANE_POLL)
+            try:
+                record = status(home, worker, attempt)
+            except Unreachable:
+                record = None  # A transient failure: asked again until the deadline.
+            if record is not None and record["result"] is not None:
+                break
+            if time.monotonic() >= deadline:
+                orphaned(job, attempt)
+                return {"status": "blocked", "summary": unreachable(worker)}
+    except KeyboardInterrupt:
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_IGN)
+        if not cancel(home, worker, attempt):
+            orphaned(job, attempt)
+        raise
+    log = machines.remote_path(f"~/.local/state/babysit-pr/runs/{attempt}/agent.log")
+    try:
+        copied = machines.run(
+            home, worker, ["tail", "-c", str(MAX_LOG), log], timeout=STATUS_TIMEOUT
+        )
+        (folder / "agent.log").write_bytes(copied.stdout if copied.returncode == 0 else b"")
+    except (subprocess.SubprocessError, OSError):
+        pass  # The outcome stands without the log.
+    return conclude(worker, job, folder, record, streamed=False)
+
+
+def conclude(worker, job, folder, record, streamed):
+    """The outcome of a run the worker recorded. A Claude result comes from the stream
+    when this guardian copied it, else from the reply the worker half parsed."""
+    import claude_runner
+    import gh_pr_watch as watch
+
     result = record["result"]
     if result["error"]:
         raise RuntimeError(f"{worker.label}: {result['error'][:2000]}")
@@ -256,9 +342,7 @@ def run(home, job, folder, pr, prompt):
             f"{job.get('agent', 'codex')} exited {result['exit']} on {worker.label}; "
             f"inspect {folder / 'agent.log'}"
         )
-    if job.get("agent") == "claude":
-        if reader is not None and reader.is_alive():
-            raise RuntimeError("Claude output stream did not finish")
+    if job.get("agent") == "claude" and streamed:
         reply = claude_runner.read_result(folder / "agent.log", job["session_id"])
     else:
         # Fetched apart from the agent's output, which cannot forge it.
@@ -347,15 +431,25 @@ def worker_main(spec_path):
         lost.set()
         stop()
 
+    pane = spec.get("pane")
+
     def interrupted(signum, frame):
         lost.set()
         raise KeyboardInterrupt()
 
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, interrupted)
-    threading.Thread(target=lifeline, daemon=True).start()
+    if not pane:
+        # In a pane stdin is the terminal: the agent runs in view, bounded by its timeout.
+        threading.Thread(target=lifeline, daemon=True).start()
     output = None
     try:
+        if pane:
+            import pane_runner
+
+            # The worker's own herdr: the binding was captured there.
+            pane_runner.verify_runner({"pane": pane, "cwd": job["cwd"]})
+            print(f"\nBabysitter: resuming {job['session_id']}\n", flush=True)
         pr_supervisor.verify_worktree(
             {"cwd": job["cwd"], "machine": None},
             {"head_branch": spec["head_branch"], "head_sha": spec["head_sha"]},
@@ -397,9 +491,19 @@ def worker_main(spec_path):
                     start_new_session=True,
                 )
             (folder / "pid").write_text(json.dumps({"worker": os.getpid(), "agent": proc.pid}))
-            output = threading.Thread(
-                target=pr_supervisor.tee_output, args=(proc.stdout, log), daemon=True
-            )
+            if job["agent"] == "claude" and pane:
+                import claude_runner
+
+                # Shown readably in the pane; the raw stream stays in agent.log.
+                output = threading.Thread(
+                    target=claude_runner.stream_output,
+                    args=(proc.stdout, log, True),
+                    daemon=True,
+                )
+            else:  # Streamed as it is to the guardian, or into the pane.
+                output = threading.Thread(
+                    target=pr_supervisor.tee_output, args=(proc.stdout, log), daemon=True
+                )
             output.start()
             try:
                 code = proc.wait(timeout=job["repair_timeout"])
@@ -408,6 +512,14 @@ def worker_main(spec_path):
             else:
                 output.join(timeout=5)
                 result = {"exit": code, "error": None}
+                if code == 0 and job["agent"] == "claude":
+                    import claude_runner
+
+                    # For a pane repair's guardian, which never sees the stream.
+                    pr_supervisor.watch.save_state(
+                        folder / "reply.json",
+                        claude_runner.read_result(folder / "agent.log", job["session_id"]),
+                    )
             if lost.is_set():
                 raise KeyboardInterrupt()
     except KeyboardInterrupt:
@@ -423,6 +535,8 @@ def worker_main(spec_path):
         if output is not None:
             output.join(timeout=5)
         pr_supervisor.watch.save_state(folder / "result.json", result)
+        if pane:
+            print(f"\nBabysitter: {result['error'] or 'agent exited'}\n", flush=True)
     return 0
 
 
