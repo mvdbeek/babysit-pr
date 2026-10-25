@@ -26,6 +26,7 @@ import github_cli
 import llm_usage
 import machines
 import owned_process
+import safe_git
 import sandbox
 import sentry_llm
 import session_locks
@@ -91,9 +92,11 @@ def git(cwd, *args, machine=None):
     # Watches on workers are refused at registration; never check a same-named local path.
     if machine is not None:
         raise RuntimeError(f"Git on worker machine {machine} is not supported yet")
-    proc = subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=30
-    )
+    try:
+        argv, env = safe_git.prepare(str(cwd), *args)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or "Git command failed")
     return proc.stdout.strip()
@@ -532,16 +535,20 @@ def command_for(job, attempt_dir):
     if job.get("model"):
         cmd += ["--model", job["model"]]
     if policy == "workspace-write":
-        cmd += [
-            "--add-dir",
-            git(
-                job["cwd"],
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-                machine=job.get("machine"),
-            ),
-        ]
+        if job.get("machine") is not None:
+            raise RuntimeError(f"Git on worker machine {job['machine']} is not supported yet")
+        # Granted to Codex: what the checkout's layout shows, never an agent-written
+        # commondir file, and still the common dir the watch was registered with.
+        try:
+            common = safe_git.common_dir(job["cwd"])
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if job.get("git_common_dir", common) != common:
+            raise RuntimeError(
+                f"{job['cwd']} now shares {common}, not the Git common dir registered with "
+                f"this watch ({job['git_common_dir']}); re-register it to grant that"
+            )
+        cmd += ["--add-dir", common]
     return [*cmd, "resume", job["session_id"], "-"]
 
 
@@ -1041,6 +1048,11 @@ def register(db, args):
         or not all(isinstance(v, str) and v for v in command)
     ):
         raise ValueError("Agent launcher must be a nonempty JSON argv array")
+    try:
+        # Recorded so a later grant of the common dir can tell when it moved.
+        recorded = {"git_common_dir": safe_git.common_dir(cwd)}
+    except ValueError:
+        recorded = {}
     key = hashlib.sha256(pr["url"].encode()).hexdigest()[:16]
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -1063,6 +1075,7 @@ def register(db, args):
             "branch": branch,
             "machine": machine,
             "cwd": cwd,
+            **recorded,
             **info,
             "pane": pane,
             "agent": agent_kind,

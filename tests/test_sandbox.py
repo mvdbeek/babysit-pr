@@ -337,7 +337,22 @@ def test_git_dirs_trust_only_a_common_directory_that_registers_the_worktree(chec
     for name in ("objects", "refs"):
         (home / name).mkdir()
     (worktree / ".git").write_text(f"gitdir: {home}\n")
-    with pytest.raises(ValueError, match="does not register the worktree"):
+    with pytest.raises(ValueError, match="does not register the worktree|cannot be verified"):
+        sandbox.git_dirs(str(worktree))
+
+
+def test_git_dirs_read_the_common_directory_from_the_layout(checkout):
+    worktree, common, home = checkout
+    # A commondir file the agent wrote names a directory it also made register the worktree.
+    admin = next(common.glob("worktrees/*"))
+    forged = home / "forged" / ".git"
+    (forged / "worktrees" / admin.name).mkdir(parents=True)
+    (forged / "objects").mkdir()
+    (forged / "refs").mkdir()
+    (forged / "HEAD").write_text("ref: refs/heads/main\n")
+    (forged / "worktrees" / admin.name / "gitdir").write_text(f"{worktree / '.git'}\n")
+    (admin / "commondir").write_text(f"{forged}\n")
+    with pytest.raises(ValueError, match="cannot be verified"):
         sandbox.git_dirs(str(worktree))
 
 

@@ -410,6 +410,78 @@ task scope in `--instructions`, including authorization for pushes, reruns,
 responses, and rebases. The supervisor only reads GitHub; agents handle authorized
 mutations. No real watch is started merely by installing/updating the skill.
 
+### Host Git in agent checkouts
+
+A sandboxed agent can write its worktree and the clone's git common directory, so the
+repository config, hooks and `info/attributes` are the agent's. Every Git command the
+supervisor, dashboard, cron jobs and `wt` run on the host in such a checkout goes
+through `scripts/safe_git.py`. It disables hooks, fsmonitor, pagers, external diffs and
+textconv, the repository's ssh/askpass/proxy programs and credential helpers, every
+transport but https, ssh and local paths, and those too outside a fetch (so no
+`git-remote-*` helper starts, whatever `protocol.*.allow` the repository sets, and no
+command but a fetch reaches a remote), submodule recursion and status/diff looks into
+submodules' working trees (a new commit checked out in one still counts), auto gc and
+lazy fetches (`GIT_NO_LAZY_FETCH=1` whatever the environment says; on Git before 2.44,
+which ignores it, every command lists the repository's config and overrides each
+`protocol.*.allow` it sets). Filter drivers the repository itself defines are
+blanked; a definition from the user's own config, such as Git LFS, is kept. Commands
+that read files are refused when the repository sets Git LFS's extensions, custom transfer
+agents or object store (`lfs.extension.*`, `lfs.customtransfer.*`,
+`lfs.standalonetransferagent`, `lfs.storage`); its endpoints (`lfs.url`,
+`remote.*.lfsurl`) are left alone, since no token or credential helper reaches them
+outside a fetch, and filters never run in one.
+
+A host fetch never follows a remote's URL, which the agent can rewrite to a private
+local repository, another host or another GitHub repository the token reads: it names
+`https://github.com/<owner>/<repo>.git` and explicit refs, and `safe_git` refuses any
+other fetch, and any fetch while the repository's own config rewrites URLs
+(`url.*.insteadOf`) or configures a remote named by a URL. The repository is a host-side
+record: a cron job's repository, the one a dashboard launch is for (passed to `wt` as
+`--github-repo`), or one a `wti`/`wtpr` URL names. Its base lands in the refs of the
+remote that tracks that repository (`origin/<base>`, or `upstream/<base>` when origin is
+a fork of it). Only those fetches get the GitHub token, through `gh auth git-credential`
+alone (no other credential helper), with the repository's `remote.*.uploadpack`
+replaced; a fetch with the token is refused when the repository's own config changes TLS
+verification, CAs, proxies, name resolution or cookie files. Without such a record (`wt <branch>`,
+`--with` clones, `wtpr <number>` without a URL), `wt` fetches the GitHub repository
+origin's URL names. Typed in a terminal (stdin a TTY, no `--github-repo`, no
+`BABYSIT_HOME`, which dashboard launches always set), that fetch gets the token, so the
+user's own private repositories keep working. That leaves one gap: an agent that
+rewrote origin to another private GitHub repository the token reads has it fetched,
+into the common dir it reads, the next time the user runs `wt` in that clone. Any other
+run (dashboard, cron, agents) fetches it without the token, so a redirected origin
+reaches nothing private there and a private origin fails to fetch. An origin that is no
+GitHub repository is never fetched, and the worktree starts from the local base. The user's own
+URL rewrites still apply (to ssh, or a local mirror), so https, ssh and local paths stay
+allowed during a fetch. System and global config stay trusted.
+
+Config also depends on the worktree (`config.worktree`, `includeIf` on branch or git
+dir), so new worktrees are added with `--no-checkout` and filled by a reset run inside
+them (when that reset fails, the worktree and any branch just created for it are removed
+again, so no later run reuses an empty checkout), and the dashboard removes a worktree with `--force` only after its own hardened
+status there finds no changes, untracked files or submodules, as Git's check would
+(approved blockers skip that check, as before). `safe_git` refuses either command
+without those flags. Every command in a checkout with its own `.git` gets that checkout
+as `--work-tree`, so a planted `core.worktree` or `core.bare` cannot send status, reset,
+switch or that clean check to another directory.
+
+The git common dir granted to an agent (Codex resume `--add-dir`, `wt --with`) and the
+one `wtpr` checks provenance against come from the checkout's layout, never from
+`rev-parse --git-common-dir`, which follows agent-written `commondir` files (so does the
+directory babysit-bwrap binds for a Linux launch): a clone's
+own `.git` directory, or the `.git/worktrees/<id>` a worktree's `.git` file names when
+that entry registers the worktree back. Any other layout is refused, including a
+worktree of a bare repository (`repo.git/worktrees/<id>`) and a `.git` that is a
+symbolic link or whose common dir has its own `commondir` file. A watch records its common dir at registration
+and a resume refuses one that has moved. `wtpr` refuses to write the clone's config
+when `.git/config` is a symbolic link.
+
+Still open: config the agent rewrites between the driver listing and the command it
+guards, filter drivers in a submodule's own config for commands that do recurse,
+and remote helpers for the allowed transports installed on PATH (`git-remote-https`)
+during a fetch. Fetches
+skip `FETCH_HEAD`, which Git would otherwise write through a planted symbolic link.
+
 ## Events and diagnostics
 
 - Default polling: 120 seconds. Five consecutive poll errors block with backoff.

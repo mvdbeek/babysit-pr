@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import herdr_handoff as handoff
+import safe_git
 import sandbox
 import wt
 
@@ -69,13 +70,11 @@ def kept_grants(pid, options):
             continue
         paths.append(value)
         try:
-            common = subprocess.run(
-                ["git", "-C", value, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+            argv, env = safe_git.prepare(
+                value, "rev-parse", "--path-format=absolute", "--git-common-dir"
             )
-        except (OSError, subprocess.SubprocessError):
+            common = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+        except (OSError, ValueError, subprocess.SubprocessError):
             continue
         if not common.returncode and common.stdout.strip():
             paths.append(common.stdout.strip())

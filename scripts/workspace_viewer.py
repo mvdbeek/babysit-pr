@@ -25,6 +25,7 @@ import claude_accounts
 import github_cli
 import owned_process
 import remote_probe
+import safe_git
 from pr_workspaces import herdr
 
 MAX_DIFF = remote_probe.MAX_DIFF
@@ -92,11 +93,8 @@ claude_details = remote_probe.claude_details
 codex_details = remote_probe.codex_details
 
 
-TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
-
-
 def local_environment():
-    env = {k: v for k, v in os.environ.items() if k not in TOKENS}
+    env = {k: v for k, v in os.environ.items() if k not in safe_git.TOKENS}
     env.update(github_cli.NON_INTERACTIVE)
     return env
 
@@ -104,10 +102,11 @@ def local_environment():
 def git_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
     """Run git in a checkout, keeping at most ``limit`` bytes; return (text, truncated)."""
     limit = MAX_DIFF if limit is None else limit
-    # Unquoted paths: diff headers and file lists then carry names as they are. A
-    # checkout's own config must not run a program for a read, as on a worker; its
-    # config is read afresh each time.
-    argv = remote_probe.host_argv(path, args, ("-c", "core.quotePath=false"), cache={})
+    # Unquoted paths: diff headers and file lists then carry names as they are.
+    # Local reads need no GitHub token, and nothing the checkout configures may run.
+    argv, env = safe_git.prepare(
+        str(path), "-c", "core.quotePath=false", *args, env=local_environment()
+    )
     chunks: list[bytes] = []
     size = 0
     truncated = False
@@ -117,8 +116,7 @@ def git_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
-        # Local reads need no GitHub token, and filters or hooks must not inherit one.
-        env=local_environment(),
+        env=env,
     ) as proc:
         assert proc.stdout is not None and proc.stderr is not None
         errors: list[bytes] = []

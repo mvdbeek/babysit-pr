@@ -90,6 +90,8 @@ def test_scratch_task_branches_from_its_base_and_starts_the_agent(local):  # noq
             "try-parser",
             "--repo-path",
             clone,
+            "--github-repo",
+            "base/repo",
             "--worktree-root",
             str(manager.src / "worktrees/repo"),
             "--prompt-file",

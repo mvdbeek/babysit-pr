@@ -32,6 +32,7 @@ import github_cli
 import machines
 import placement
 import remote_probe
+import safe_git
 import workspace_agents
 import workspace_exit
 from issue_overview import branch_number
@@ -89,19 +90,16 @@ RECENT_CLONE_SECONDS = 90 * 86400
 REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
-def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
+def run(*args, cwd=None, timeout=30, pass_fds=(), env=None, machine=None, home=None):
     if machine is not None and home is None:
         raise ValueError("home is required for a remote machine")
     # RemotePath arguments stay marked so a worker expands their ``~``.
     argv = [arg if isinstance(arg, str) else str(arg) for arg in args]
-    # git may call the gh credential helper; both get the shared token and never prompt.
     if argv[0] == "gh":
         if machine is not None:
             raise ValueError("gh runs on this machine only")
         result = github_cli.run(argv, cwd=cwd, text=True, timeout=timeout, pass_fds=pass_fds)
     else:
-        # A worker's git uses its own gh login; the shared token stays on this machine.
-        env = github_cli.environment() if argv[0] == "git" and machine is None else None
         result = machines.run(
             home, machine, argv, cwd=cwd, env=env, text=True, timeout=timeout, pass_fds=pass_fds
         )
@@ -121,8 +119,14 @@ def herdr(*args, machine: machines.Machine | None = None, timeout=30):
 remote_slug = remote_probe.remote_slug
 
 
-def git(path, *args, machine=None, home=None):
-    return run("git", "-C", path, *args, timeout=15, machine=machine, home=home)
+def git(path, *args, timeout=15, machine=None, home=None):
+    """Hardened Git in a checkout an agent may have written; only a fetch gets the token,
+    for the gh credential helper, and nothing prompts. A worker's Git runs there, with
+    its own gh login; the shared token stays on this machine."""
+    if machine is not None:
+        return run("git", "-C", path, *args, timeout=timeout, machine=machine, home=home)
+    argv, env = safe_git.prepare(str(path), *map(str, args), env=github_cli.environment())
+    return run(*argv, env=env, timeout=timeout)
 
 
 def repo_config(path):
@@ -2404,6 +2408,12 @@ class Workspaces:
                         *label,
                         "--repo-path",
                         str(clone),
+                        # The repository this launch is for: its fetches alone get the token.
+                        *(
+                            ["--github-repo", pr["repo"]]
+                            if SLUG.fullmatch(pr.get("repo") or "")
+                            else []
+                        ),
                         "--worktree-root",
                         str(base),
                         "--prompt-file",

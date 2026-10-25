@@ -29,10 +29,14 @@ from urllib.parse import quote
 import claude_accounts
 import herdr_handoff as handoff
 import machines
+import safe_git
 import workspace_agents
 import workspace_exit
 import wt
 from pr_workspaces import BRANCH_NAME, COLLIE_URL, SLUG, herdr, run
+from pr_workspaces import git as workspaces_git
+from pr_workspaces import remote_slugs as workspaces_remote_slugs
+from pr_workspaces import repo_config as workspaces_repo_config
 
 START_WAIT = 30  # Seconds for the agent to show up in its pane after the command is typed.
 RESULT_LIMIT = 20000  # Characters of the agent's final response kept with a run.
@@ -77,7 +81,7 @@ def validate(request, workspaces, home):
     if not isinstance(base, str):
         raise ValueError("The base branch is not a valid branch name")
     base = base.strip()
-    # The base is fetched from origin, so it must name a branch, not a revision.
+    # The base is fetched from the job's repository, so it must name a branch.
     if base and (base.startswith("-") or "@" in base or not workspaces.valid_branch(clone, base)):
         raise ValueError("The base branch is not a valid branch name")
     agent = request.get("agent")
@@ -119,7 +123,7 @@ def validate(request, workspaces, home):
 
 
 def git(clone, *args, timeout=30):
-    return run("git", "-C", clone, *args, timeout=timeout)
+    return workspaces_git(clone, *args, timeout=timeout)
 
 
 def checkout(job, src):
@@ -140,12 +144,37 @@ def checkout(job, src):
             git(clone, "rev-parse", "--verify", "--quiet", f"refs/heads/{job['branch']}")
         except ValueError:
             start = job["base"] or "HEAD"
-            if job["base"] and "origin" in git(clone, "remote").split():
-                git(clone, "fetch", "origin", job["base"], timeout=120)
-                start = f"origin/{job['base']}"
-            git(clone, "worktree", "add", "-b", job["branch"], str(directory), start, timeout=120)
+            # The job's own repository, never a URL its clone's config (which the agent
+            # writes) names; it lands in the refs of the remote that tracks it.
+            remotes = workspaces_remote_slugs(workspaces_repo_config(clone))
+            tracking = [
+                name
+                for name in ("origin", "upstream", *sorted(remotes))
+                if remotes.get(name) == job["repo"].lower()
+            ]
+            if job["base"] and tracking:
+                git(
+                    clone,
+                    "fetch",
+                    safe_git.github_url(job["repo"]),
+                    f"+refs/heads/{job['base']}:refs/remotes/{tracking[0]}/{job['base']}",
+                    timeout=120,
+                )
+                start = f"{tracking[0]}/{job['base']}"
+            add = ["-b", job["branch"], str(directory), start]
         else:
-            git(clone, "worktree", "add", str(directory), job["branch"], timeout=120)
+            add = [str(directory), job["branch"]]
+        # The new worktree's branch and git dir can bring config the clone's listing never
+        # sees, so its files are checked out by a reset that lists config inside it.
+        git(clone, "worktree", "add", "--no-checkout", *add, timeout=120)
+        try:
+            git(str(directory), "reset", "--hard", "--quiet", timeout=120)
+        except Exception:
+            # Left behind, the empty checkout would be reused with every file deleted.
+            git(clone, "worktree", "remove", "--force", str(directory), timeout=120)
+            if add[0] == "-b":
+                git(clone, "branch", "-D", job["branch"])
+            raise
     branch = git(str(directory), "rev-parse", "--abbrev-ref", "HEAD")
     if branch != job["branch"]:
         # A run may leave its checkout on another branch, such as one it opened a pull

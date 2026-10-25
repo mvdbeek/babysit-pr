@@ -23,6 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol, TextIO
 
 import claude_accounts
+import safe_git
 import sandbox
 
 COMMANDS = ("wt", "wti", "wtpr")
@@ -58,6 +59,7 @@ VALUE_OPTIONS = {
     "--name": "name",
     "--label": "label",
     "--repo-path": "repo_path",
+    "--github-repo": "github_repo",
     "--worktree-root": "worktree_root",
     "--agent-arg": "agent_args",
     "--with": "also",
@@ -80,7 +82,15 @@ WT_OPTIONS = frozenset(
     }
 )
 DASHBOARD_OPTIONS = frozenset(
-    {"--no-focus", "--name", "--label", "--repo-path", "--worktree-root", "--agent-arg"}
+    {
+        "--no-focus",
+        "--name",
+        "--label",
+        "--repo-path",
+        "--github-repo",
+        "--worktree-root",
+        "--agent-arg",
+    }
 )
 OPTIONS = {
     "wt": WT_OPTIONS | DASHBOARD_OPTIONS,
@@ -172,6 +182,8 @@ options:
   --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
+  --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
+                          the GitHub token (others only when typed in a terminal)
   --worktree-root <path>  parent directory for the new checkout
   -h, --help    show this help
 """
@@ -202,6 +214,8 @@ options:
   --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
+  --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
+                          the GitHub token (others only when typed in a terminal)
   --worktree-root <path>  parent directory for the new checkout
   -h, --help    show this help
 """
@@ -250,6 +264,7 @@ class Options:
         "name",
         "label",
         "repo_path",
+        "github_repo",
         "worktree_root",
         "focus",
         "agent_args",
@@ -271,6 +286,7 @@ class Options:
         self.name = ""
         self.label = ""
         self.repo_path = ""
+        self.github_repo = ""
         self.worktree_root = ""
         self.focus = True
         self.agent_args: list[str] = []
@@ -330,6 +346,12 @@ def parse_args(
                 options.repo_override = True
             elif field == "also":
                 options.also.append(value)
+            elif field == "github_repo":
+                try:
+                    safe_git.github_url(value)
+                except ValueError as exc:
+                    raise WtError(f"{command}: --github-repo: {exc}") from exc
+                options.github_repo = value
             elif field == "agent_args":
                 if any(ord(char) < 32 or char == "\x7f" for char in value):
                     raise WtError(f"{command}: --agent-arg must not contain control characters")
@@ -810,8 +832,25 @@ class Tool:
     def warn(self, message: str) -> None:
         print(message, file=self.stderr, flush=True)
 
+    def git_command(
+        self, cwd: str, *args: str, credentials: bool = True
+    ) -> tuple[list[str], dict[str, str]]:
+        """Hardened Git: the clone's config and hooks are writable by its agents."""
+
+        def read(argv: list[str], env: Mapping[str, str]) -> str:
+            result = self.runner.run(argv, env=env)
+            if result.returncode:
+                raise ValueError(result.stderr.strip() or "git config failed")
+            return result.stdout
+
+        try:
+            return safe_git.prepare(cwd, *args, read=read, credentials=credentials)
+        except ValueError as exc:
+            raise WtError(str(exc)) from exc
+
     def git_query(self, cwd: str, *args: str) -> Completed:
-        return self.runner.run(["git", "-C", cwd, *args])
+        argv, env = self.git_command(cwd, *args)
+        return self.runner.run(argv, env=env)
 
     def git_value(self, cwd: str, *args: str) -> str:
         result = self.git_query(cwd, *args)
@@ -819,9 +858,10 @@ class Tool:
             raise WtError(result.stderr.strip() or f"git {' '.join(args)} failed")
         return result.stdout.strip()
 
-    def git_action(self, cwd: str, *args: str) -> None:
+    def git_action(self, cwd: str, *args: str, credentials: bool = True) -> None:
         """Mutating git commands keep their own output (progress, hints) on stderr."""
-        result = self.runner.run(["git", "-C", cwd, *args], output="stderr")
+        argv, env = self.git_command(cwd, *args, credentials=credentials)
+        result = self.runner.run(argv, env=env, output="stderr")
         if result.returncode:
             raise WtError(f"git {args[0]} failed with status {result.returncode}")
 
@@ -859,18 +899,88 @@ class Tool:
         path = parse_worktree_list(result.stdout).get(branch, "")
         return path if path and os.path.isdir(path) else ""
 
-    def add_worktree(self, repo_path: str, directory: str, branch: str, base: str) -> None:
-        """Reuse a local branch, else create from the remote or local base."""
+    def remote_slugs(self, repo_path: str) -> dict[str, str | None]:
+        """Each remote's GitHub repository as the clone's config (agent-writable) names it."""
+        result = self.git_query(repo_path, "config", "--get-regexp", r"^remote\..*\.url$")
+        found: dict[str, str | None] = {}
+        for line in result.stdout.splitlines() if not result.returncode else []:
+            key, _, url = line.partition(" ")
+            found[key[len("remote.") : -len(".url")]] = safe_git.github_slug(url)
+        return found
+
+    def trusts_origin(self, options: Options) -> bool:
+        """Whether origin's GitHub repository, as the clone's config names it, gets the token.
+
+        Only for the user typing the command in a terminal: a dashboard launch names its
+        repository (``--github-repo``) and runs with ``BABYSIT_HOME`` set, whatever its
+        stdin is, and any other run without a terminal keeps the strict rule.
+        """
+        return not options.github_repo and "BABYSIT_HOME" not in self.env and self.isatty()
+
+    def add_worktree(
+        self,
+        repo_path: str,
+        directory: str,
+        branch: str,
+        base: str,
+        slug: str = "",
+        trust: bool = False,
+    ) -> None:
+        """Reuse a local branch, else create from the remote or local base.
+
+        The base is fetched from a GitHub URL, never a remote's own (the agent writes
+        those): from ``slug``, the repository this run was asked for, with the GitHub
+        token, into the refs of the remote that tracks it; failing that from origin's
+        GitHub repository, with the token only when ``trust`` says so (see
+        ``trusts_origin``). Anything else starts from the local base.
+        """
         os.makedirs(os.path.dirname(directory), exist_ok=True)
-        remotes = self.git_value(repo_path, "remote").splitlines()
+        remotes = self.remote_slugs(repo_path)
         start_point = base
-        if "origin" in remotes:
-            self.git_action(repo_path, "fetch", "origin", base)
-            start_point = f"origin/{base}"
-        if self.branch_exists(repo_path, branch):
-            self.git_action(repo_path, "worktree", "add", directory, branch)
+        sources = [(slug, True), (remotes.get("origin") or "", trust)]
+        for target, token in sources:
+            tracking = [
+                n
+                for n in ("origin", "upstream", *sorted(remotes))
+                if remotes.get(n) == target.lower()
+            ]
+            if target and tracking:
+                remote = tracking[0]
+                self.git_action(
+                    repo_path,
+                    "fetch",
+                    safe_git.github_url(target),
+                    f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
+                    credentials=token,
+                )
+                start_point = f"{remote}/{base}"
+                break
         else:
-            self.git_action(repo_path, "worktree", "add", "-b", branch, directory, start_point)
+            if "origin" in remotes:
+                self.warn(f"wt: origin is not a GitHub repository; starting from the local {base}")
+        if self.branch_exists(repo_path, branch):
+            self.checkout_worktree(repo_path, directory, branch)
+        else:
+            self.checkout_worktree(repo_path, directory, start_point, new_branch=branch)
+
+    def checkout_worktree(
+        self, repo_path: str, directory: str, commit: str, new_branch: str = ""
+    ) -> None:
+        """``git worktree add``, with the files checked out from inside the new worktree.
+
+        Its branch and git dir can bring config the clone's own listing never sees, so
+        the files are written by a reset that lists config where it runs.
+        """
+        create = ["-b", new_branch] if new_branch else []
+        self.git_action(repo_path, "worktree", "add", "--no-checkout", *create, directory, commit)
+        try:
+            self.git_action(directory, "reset", "--hard", "--quiet")
+        except Exception:
+            # Left behind, the empty checkout would be reused with every file deleted.
+            self.git_action(repo_path, "worktree", "remove", "--force", directory)
+            if new_branch:
+                self.git_action(repo_path, "branch", "-D", new_branch)
+            raise
 
     def default_branch(self, repo_path: str) -> str:
         """The branch ``origin/HEAD`` names, else ``main``."""
@@ -920,10 +1030,12 @@ class Tool:
                 directory = os.path.join(root, os.path.basename(clone), branch)
                 if os.path.lexists(directory) or directory in (c.path for c, _ in planned):
                     raise WtError(f"wt: {directory} exists but does not have {branch} checked out")
-            common = self.git_value(
-                clone, "rev-parse", "--path-format=absolute", "--git-common-dir"
-            )
-            checkout = AlsoCheckout(clone, directory, os.path.realpath(common))
+            # Granted to the agent: never what an agent-written commondir file names.
+            try:
+                common = safe_git.common_dir(clone)
+            except ValueError as exc:
+                raise WtError(f"wt: --with: {exc}") from exc
+            checkout = AlsoCheckout(clone, directory, common)
             if ":" in checkout.path + checkout.common:
                 raise WtError(f"wt: Safehouse cannot grant a path containing ':': {directory}")
             planned.append((checkout, self.default_branch(clone) if create else ""))
@@ -936,7 +1048,9 @@ class Tool:
         self.command_for(trial, lambda _: sample)
         for checkout, base in planned:
             if base:
-                self.add_worktree(checkout.clone, checkout.path, branch, base)
+                self.add_worktree(
+                    checkout.clone, checkout.path, branch, base, trust=self.trusts_origin(options)
+                )
             else:
                 self.warn(f"wt: {branch} is already checked out at {checkout.path}; using that")
             options.also_checkouts.append(checkout._replace(path=os.path.realpath(checkout.path)))
@@ -1223,7 +1337,14 @@ class Tool:
                 self.warn(f"wt: {branch} is already checked out at {existing}; opening that")
                 directory = existing
             else:
-                self.add_worktree(repo_path, directory, branch, base)
+                self.add_worktree(
+                    repo_path,
+                    directory,
+                    branch,
+                    base,
+                    options.github_repo,
+                    trust=self.trusts_origin(options),
+                )
         self.open_session(options, directory, branch, repo_path)
 
     def reserve_wt(self, options: Options) -> None:
@@ -1243,7 +1364,14 @@ class Tool:
         if self.branch_exists(repo_path, branch):
             raise WtError(f"wt: explicit branch already exists: {branch}")
         base = args[0] if args else self.default_branch(repo_path)
-        self.add_worktree(repo_path, directory, branch, base)
+        self.add_worktree(
+            repo_path,
+            directory,
+            branch,
+            base,
+            options.github_repo,
+            trust=self.trusts_origin(options),
+        )
         self.open_session(options, directory, branch, repo_path)
 
     def run_wti(self, options: Options) -> None:
@@ -1258,7 +1386,7 @@ class Tool:
         issue = args[0]
         # A positional branch name may reuse an existing checkout; --name reserves a new one.
         requested = args[1] if len(args) > 1 else options.name
-        slug = ""
+        slug = options.github_repo
         parsed = parse_issue_url(issue)
         if parsed:
             url_owner, url_repo, issue = parsed
@@ -1272,6 +1400,8 @@ class Tool:
         if not os.path.isdir(os.path.join(repo_path, ".git")):
             raise WtError(f"wti: no main clone at {repo_path} (needed to attach a worktree)")
         validate_name(options.name, "wti")
+        # Named on the command line, not by the clone's config: its fetch gets the token.
+        host = slug
         slug = slug or self.repo_slug(repo_path, "wti")
         info = self.gh_json("wti", slug, "issue", "view", issue, "--json", "number,title")
         number, title = info.get("number"), info.get("title")
@@ -1287,7 +1417,14 @@ class Tool:
             return
         if options.name and self.branch_exists(repo_path, branch):
             raise WtError(f"wti: explicit branch already exists: {branch}")
-        self.add_worktree(repo_path, directory, branch, self.default_branch(repo_path))
+        self.add_worktree(
+            repo_path,
+            directory,
+            branch,
+            self.default_branch(repo_path),
+            host,
+            trust=self.trusts_origin(options),
+        )
         self.open_session(options, directory, branch, repo_path)
 
     def run_wtpr(self, options: Options) -> None:
@@ -1300,7 +1437,7 @@ class Tool:
         if not args:
             raise UsageError("wtpr", "wtpr: expected a PR number or GitHub PR URL")
         pr = args[0]
-        slug = ""
+        slug = options.github_repo
         parsed = parse_pr_url(pr)
         if parsed:
             url_owner, url_repo, pr = parsed
@@ -1314,6 +1451,11 @@ class Tool:
         if not os.path.isdir(os.path.join(repo_path, ".git")):
             raise WtError(f"wtpr: no main clone at {repo_path}")
         validate_name(options.name, "wtpr")
+        # A pull request of a repository named on the command line: its head repository
+        # is GitHub's answer, so its fetch gets the token. One the clone's config names
+        # could be any repository the token reads, and goes without unless the user typed
+        # this in a terminal (see trusts_origin).
+        host = slug
         slug = slug or self.repo_slug(repo_path, "wtpr")
         info = self.gh_json(
             "wtpr",
@@ -1345,12 +1487,12 @@ class Tool:
             # Git provenance before opening and never submits a task to an existing agent.
             if options.name:
                 raise WtError(f"wtpr: explicit worktree destination already exists: {directory}")
-            common = self.git_value(
-                directory, "rev-parse", "--path-format=absolute", "--git-common-dir"
-            )
-            expected = self.git_value(
-                repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir"
-            )
+            # From the layout: commondir files in the checkout's git dir are agent-written.
+            try:
+                common = safe_git.common_dir(directory)
+                expected = safe_git.common_dir(repo_path)
+            except ValueError as exc:
+                raise WtError(f"wtpr: {exc}") from exc
             current = self.git_value(directory, "symbolic-ref", "--short", "HEAD")
             if common != expected or current != branch:
                 raise WtError("wtpr: existing directory is not the requested checkout")
@@ -1374,13 +1516,26 @@ class Tool:
         ).stdout.strip()
         if existing and existing != url:
             raise WtError("wtpr: PR remote name belongs to another repository")
+        common = os.path.realpath(os.path.join(repo_path, ".git"))
+        try:
+            safe_git.writable_config(common)
+        except ValueError as exc:
+            raise WtError(f"wtpr: {exc}") from exc
         if not existing:
             self.git_action(repo_path, "remote", "add", remote, url)
         os.makedirs(root, exist_ok=True)
         self.git_action(
-            repo_path, "fetch", remote, f"refs/heads/{branch}:refs/heads/{local_branch}"
+            repo_path,
+            "fetch",
+            url,
+            f"refs/heads/{branch}:refs/heads/{local_branch}",
+            credentials=bool(host) or self.trusts_origin(options),
         )
-        self.git_action(repo_path, "worktree", "add", directory, local_branch)
+        self.checkout_worktree(repo_path, directory, local_branch)
+        try:
+            safe_git.writable_config(common)  # Again: the clone was writable meanwhile.
+        except ValueError as exc:
+            raise WtError(f"wtpr: {exc}") from exc
         self.git_action(directory, "config", f"branch.{local_branch}.remote", remote)
         self.git_action(directory, "config", f"branch.{local_branch}.merge", f"refs/heads/{branch}")
         self.open_session(options, directory, local_branch, repo_path)

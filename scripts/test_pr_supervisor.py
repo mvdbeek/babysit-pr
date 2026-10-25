@@ -544,7 +544,7 @@ def test_worktree_git_refuses_worker_jobs_and_keeps_local_argv(harness, monkeypa
         supervisor.git(cwd, "status", machine="mini")
     assert calls == []
     supervisor.verify_worktree({"cwd": cwd, "machine": None}, pr)
-    assert calls[0] == ["git", "-C", cwd, "symbolic-ref", "--short", "HEAD"]
+    assert calls[0] == supervisor.safe_git.prepare(cwd, "symbolic-ref", "--short", "HEAD")[0]
 
 
 def test_live_session_cannot_release_itself(harness):
@@ -614,8 +614,13 @@ def test_global_limit_queues_second_repair(harness, tmp_path):
         ["git", "clone", str(h["worktree"]), str(other_worktree)], check=True, capture_output=True
     )
     second = copy.deepcopy(h["job"])
+    # Registration records each checkout's own common dir; a resume checks it.
     second.update(
-        id="second", cwd=str(other_worktree), session_id=str(uuid.uuid4()), status="watching"
+        id="second",
+        cwd=str(other_worktree),
+        git_common_dir=str((other_worktree / ".git").resolve()),
+        session_id=str(uuid.uuid4()),
+        status="watching",
     )
     with h["db"]:
         supervisor.save_job(h["db"], second)

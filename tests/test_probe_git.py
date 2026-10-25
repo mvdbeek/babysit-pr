@@ -294,10 +294,14 @@ def test_the_viewer_diff_fetches_no_missing_object(tmp_path, evil, runner):
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("runner", ["worker", "local"])
-def test_the_viewer_refuses_a_checkout_pointing_git_elsewhere(tmp_path, runner):
+def test_the_viewer_never_reads_where_core_worktree_points(tmp_path):
     clone = branch(tmp_path)
     elsewhere = repo(tmp_path / "elsewhere")
+    (elsewhere / "f").write_text("elsewhere\n")
     git("config", "core.worktree", str(elsewhere), cwd=clone)
+    # A worker refuses the checkout; this machine pins Git to it (safe_git's --work-tree).
     with pytest.raises(ValueError, match="core.worktree"):
-        remote_probe.diff(runners()[runner], str(clone), "uncommitted")
+        remote_probe.diff(runners()["worker"], str(clone), "uncommitted")
+    found = remote_probe.diff(runners()["local"], str(clone), "uncommitted")
+    [changed] = found["files"]
+    assert changed["path"] == "f" and "+c" in changed["lines"]

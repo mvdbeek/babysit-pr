@@ -27,6 +27,7 @@ import github_cli
 import machines
 import owned_process
 import remote_probe
+import safe_git
 import workspace_viewer
 from pr_workspaces import COLLIE_URL, SLUG, clone_worktrees, herdr, remote_slugs, repo_config
 
@@ -76,13 +77,9 @@ BASE_BRANCH = re.compile(
 
 
 def git(path, *args, timeout=60, strip=True):
-    """Git in one checkout. Large repositories need more room than a quick query."""
-    result = owned_process.run(
-        ["git", "-C", str(path), *args],
-        env=github_cli.environment(),
-        text=True,
-        timeout=timeout,
-    )
+    """Hardened Git in one checkout. Large repositories need more room than a quick query."""
+    argv, env = safe_git.prepare(str(path), *args, env=github_cli.environment())
+    result = owned_process.run(argv, env=env, text=True, timeout=timeout)
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Git failed")[-4000:].strip())
     return result.stdout.strip() if strip else result.stdout
@@ -1576,10 +1573,21 @@ class WorkspaceOverview:
             steps.append("Checkout already removed")
             return
         self.progress(job, index, steps, f"Removing worktree {row['path']}")
-        arguments = ["worktree", "remove"]
-        if force:
-            arguments.append("--force")
-        git(row["repo_root"], *arguments, row["path"], timeout=300)
+        if not force:
+            # Git's own clean check runs `git status` in that worktree under config the
+            # clone's listing never saw, so the same check runs hardened here and Git is
+            # told to skip its own. It refuses what Git refuses: tracked changes and
+            # untracked files (ignored ones go), and any submodule.
+            path = row["path"]
+            if git(path, "status", "--porcelain", "-z", "--untracked-files=normal", timeout=300):
+                raise ValueError(f"{path} has uncommitted changes or untracked files; kept")
+            modules = git(path, "rev-parse", "--path-format=absolute", "--git-path", "modules")
+            staged = git(path, "ls-files", "--stage", "-z", timeout=300, strip=False)
+            if Path(modules).is_dir() or any(
+                entry.startswith("160000 ") for entry in staged.split("\0")
+            ):
+                raise ValueError(f"{path} contains submodules; kept")
+        git(row["repo_root"], "worktree", "remove", "--force", row["path"], timeout=300)
 
     def delete_branch(self, job, index, row, steps, approved):
         """Delete the branch only when no commit can be lost, and say so when it is kept.
