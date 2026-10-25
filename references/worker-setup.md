@@ -238,7 +238,7 @@ agent's socket without seeing `~/.gnupg`.
    Store the passphrase, mode 600, without echoing it or leaving it in shell history:
 
    ```sh
-   (umask 077 && read -rs pass && printf '%s\n' "$pass" > ~/.gnupg/signing-subkey.pass)
+   (umask 077 && read -rs pass && printf '%s' "$pass" > ~/.gnupg/signing-subkey.pass)
    ```
 
    and add `~/.config/systemd/user/babysit-gpg-preset.service`, with the subkey's

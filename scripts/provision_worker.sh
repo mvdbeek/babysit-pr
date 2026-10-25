@@ -737,6 +737,10 @@ gpg_checks() {
     problem "gpg cannot sign with user.signingkey without a prompt; is the preset unit's passphrase right?"
   fi
   wrapper=$(command -v babysit-bwrap) || wrapper=$HOME/src/babysit-pr/scripts/babysit-bwrap
+  if [[ ! -x $wrapper ]]; then
+    problem "no babysit-bwrap at $wrapper; pin ~/src/babysit-pr to a commit that has it"
+    return
+  fi
   tmp=$(mktemp -d)
   # A cd, since the sandbox starts in the caller's directory.
   if git init -q "$tmp" && (cd "$tmp" && "$wrapper" --enable=gpg --add-dirs="$tmp" -- \
@@ -765,7 +769,8 @@ user_checks() {
   else
     problem "bwrap --ro-bind / / true fails; rerun the system step"
   fi
-  if grep -q rootless <<<"$(docker info --format '{{.SecurityOptions}}' 2>/dev/null)"; then
+  if grep -q rootless <<<"$(DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock" \
+    docker info --format '{{.SecurityOptions}}' 2>/dev/null)"; then
     ok "docker is rootless"
   else
     problem "docker info does not report a rootless daemon"
@@ -816,6 +821,17 @@ user_step() {
     printf '  would prepend the npm prefix, ~/.local/bin and babysit-pr/scripts to PATH in ~/.bashrc\n'
   elif ! grep -qF "$marker" "$HOME/.bashrc" 2>/dev/null; then
     { printf '%s\n%s\n\n' "$marker" "$line" && cat "$HOME/.bashrc" 2>/dev/null; } >"$HOME/.bashrc.tmp.$$"
+    mv -f "$HOME/.bashrc.tmp.$$" "$HOME/.bashrc"
+  fi
+  # Without DOCKER_HOST the CLI asks the rootful daemon's socket, which this user
+  # cannot reach; agents and `ssh box docker ...` need the rootless one.
+  local docker_marker='# babysit-pr worker rootless docker'
+  # shellcheck disable=SC2016
+  local docker_line='export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"'
+  if ((dry)); then
+    printf '  would point DOCKER_HOST at the rootless daemon in ~/.bashrc\n'
+  elif ! grep -qF "$docker_marker" "$HOME/.bashrc" 2>/dev/null; then
+    { printf '%s\n%s\n\n' "$docker_marker" "$docker_line" && cat "$HOME/.bashrc"; } >"$HOME/.bashrc.tmp.$$"
     mv -f "$HOME/.bashrc.tmp.$$" "$HOME/.bashrc"
   fi
 
