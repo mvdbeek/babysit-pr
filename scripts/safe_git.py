@@ -13,7 +13,9 @@ helper. Pagers, external diffs and textconv have whole-command switches. Filter 
 have no such switch: their names come from the repository, so commands that read
 working tree files first list the effective config and neutralise each
 ``filter.<driver>`` the repository defines, keeping a definition from the user's own
-config (Git LFS, say) and blanking the rest; Git skips an empty filter command.
+config (Git LFS, say) and blanking the rest; Git skips an empty filter command. Git LFS
+takes its extensions, custom transfer programs and object store from that same config,
+so a repository that sets any of them is refused.
 ``remote.<name>.uploadpack`` is first-wins, so fetches pass ``--upload-pack`` instead.
 Only the https, ssh and file transports are allowed, and any ``protocol.<name>.allow``
 the repository adds is overridden, so no ``git-remote-<name>`` helper is started.
@@ -108,6 +110,9 @@ TLS = re.compile(
     r"|curloptresolve)|remote\..+\.proxy"
 )
 GITHUB = "credential.https://github.com.helper"
+# git-lfs, a filter the user's config keeps, reads these from the same config: programs it
+# runs and the directory it writes objects to. Its endpoints get no credentials here.
+LFS = re.compile(r"lfs\.(extension|customtransfer)\..+|lfs\.(standalonetransferagent|storage)")
 
 
 def subcommand(args: Sequence[str]) -> int:
@@ -133,6 +138,9 @@ def overrides(config: Sequence[tuple[str, str, str]], credentials: bool) -> list
     trusted = [(key, value) for scope, key, value in config if scope in TRUSTED]
     planted = [key for scope, key, _ in config if scope not in TRUSTED]
     options: list[str] = []
+    lfs = [key for key in planted if LFS.fullmatch(key)]
+    if lfs:
+        raise ValueError(f"Git LFS would take the repository's own {lfs[0]}; Git was not run")
     for key in dict.fromkeys(k for k in planted if FILTER.fullmatch(k)):
         if "=" in key:
             raise ValueError(f"Cannot neutralise the repository's {key!r}; Git was not run")

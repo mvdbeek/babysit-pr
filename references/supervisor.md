@@ -270,11 +270,16 @@ textconv, the repository's ssh/askpass/proxy programs and credential helpers, ev
 transport but https, ssh and local paths (so no `git-remote-*` helper starts, whatever
 `protocol.*.allow` the repository sets), submodule recursion and status/diff looks into
 submodules, auto gc and lazy fetches. Filter drivers the repository itself defines are
-blanked; a definition from the user's own config, such as Git LFS, is kept. Only a fetch
-gets the GitHub token, through `gh auth git-credential` alone, with the repository's
-`remote.*.uploadpack` replaced, and a fetch is refused when the repository's own config
-changes TLS verification, CAs, proxies, name resolution or cookie files. System and
-global config stay trusted.
+blanked; a definition from the user's own config, such as Git LFS, is kept. Commands
+that read files are refused when the repository sets Git LFS's extensions, custom transfer
+agents or object store (`lfs.extension.*`, `lfs.customtransfer.*`,
+`lfs.standalonetransferagent`, `lfs.storage`); its endpoints (`lfs.url`,
+`remote.*.lfsurl`) are left alone, since no token or credential helper reaches them
+outside a fetch, and filters never run in one. Only a fetch gets the GitHub token,
+through `gh auth git-credential` alone, with the repository's `remote.*.uploadpack`
+replaced, and a fetch is refused when the repository's own config changes TLS
+verification, CAs, proxies, name resolution or cookie files. System and global config
+stay trusted.
 
 Config also depends on the worktree (`config.worktree`, `includeIf` on branch or git
 dir), so new worktrees are added with `--no-checkout` and filled by a reset run inside

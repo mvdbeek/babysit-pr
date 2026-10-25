@@ -1,6 +1,7 @@
 """Host Git never runs what a sandboxed agent planted in a checkout's config or hooks."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -172,6 +173,47 @@ def test_filters_from_the_users_own_config_are_kept():
         "-c",
         "filter.planted.required=false",
     ]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "lfs.extension.planted.clean",
+        "lfs.extension.planted.smudge",
+        "lfs.customtransfer.planted.path",
+        "lfs.standalonetransferagent",
+        "lfs.storage",
+    ],
+)
+def test_lfs_programs_and_storage_the_repository_names_are_refused(key):
+    lfs = [("global", "filter.lfs.process", "git-lfs filter-process")]
+    with pytest.raises(ValueError, match="Git was not run"):
+        safe_git.overrides([*lfs, ("worktree", key, "planted")], credentials=False)
+    # The user's own git-lfs settings are theirs.
+    assert safe_git.overrides([*lfs, ("global", key, "mine")], credentials=False) == []
+    # Only the endpoint: no token or credential helper reaches it outside a fetch.
+    assert safe_git.overrides([*lfs, ("local", "lfs.url", "x")], credentials=False) == []
+
+
+@pytest.mark.skipif(not shutil.which("git-lfs"), reason="git-lfs is not installed")
+def test_git_lfs_runs_no_extension_the_repository_names(planted):
+    clone, marker, git = planted
+    script = marker.parent / "planted.sh"
+    global_config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    global_config.write_text(
+        '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\trequired = true\n'
+        "\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n"
+    )
+    with (clone / ".git" / "info" / "attributes").open("a") as attributes:
+        attributes.write("*.txt filter=lfs\n")
+    git("config", "lfs.extension.planted.clean", f"{script} clean %f")
+    git("config", "lfs.extension.planted.smudge", f"{script} smudge %f")
+    git("config", "lfs.extension.planted.priority", "0")
+    with pytest.raises(ValueError, match="lfs.extension"):
+        workspace_overview.git(clone, "status", "--porcelain")
+    with pytest.raises(ValueError, match="lfs.extension"):
+        workspace_viewer.diff(clone)
+    assert not marker.exists()
 
 
 def test_diff_commands_never_run_external_programs():
