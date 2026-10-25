@@ -527,6 +527,26 @@ def test_register_records_no_machine_and_refuses_workers(harness):
     assert supervisor.jobs(h["db"]) == []
 
 
+def test_worktree_git_refuses_worker_jobs_and_keeps_local_argv(harness, monkeypatch):
+    cwd = str(harness["worktree"])
+    pr = {"head_branch": "feature", "head_sha": supervisor.git(cwd, "rev-parse", "HEAD")}
+    real = subprocess.run
+    calls = []
+
+    def record(args, **kwargs):
+        calls.append(args)
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(supervisor.subprocess, "run", record)
+    with pytest.raises(RuntimeError, match="Git on worker machine mini is not supported yet"):
+        supervisor.verify_worktree({"cwd": cwd, "machine": "mini"}, pr)
+    with pytest.raises(RuntimeError, match="not supported yet"):
+        supervisor.git(cwd, "status", machine="mini")
+    assert calls == []
+    supervisor.verify_worktree({"cwd": cwd, "machine": None}, pr)
+    assert calls[0] == ["git", "-C", cwd, "symbolic-ref", "--short", "HEAD"]
+
+
 def test_live_session_cannot_release_itself(harness):
     h = harness
     env = os.environ.copy()

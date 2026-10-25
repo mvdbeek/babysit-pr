@@ -85,7 +85,10 @@ def locked(path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def git(cwd, *args):
+def git(cwd, *args, machine=None):
+    # Watches on workers are refused at registration; never check a same-named local path.
+    if machine is not None:
+        raise RuntimeError(f"Git on worker machine {machine} is not supported yet")
     proc = subprocess.run(
         ["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=30
     )
@@ -95,13 +98,14 @@ def git(cwd, *args):
 
 
 def verify_worktree(job, pr):
-    if git(job["cwd"], "symbolic-ref", "--short", "HEAD") != pr["head_branch"]:
+    machine = job.get("machine")
+    if git(job["cwd"], "symbolic-ref", "--short", "HEAD", machine=machine) != pr["head_branch"]:
         raise RuntimeError("Worktree branch differs from the watched branch; intervention required")
-    if git(job["cwd"], "rev-parse", "HEAD") != pr["head_sha"]:
+    if git(job["cwd"], "rev-parse", "HEAD", machine=machine) != pr["head_sha"]:
         raise RuntimeError(
             "Local HEAD differs from remote head; sync deliberately before releasing the watch"
         )
-    if git(job["cwd"], "status", "--porcelain"):
+    if git(job["cwd"], "status", "--porcelain", machine=machine):
         raise RuntimeError("Worktree has uncommitted changes; repair was not started")
 
 
@@ -527,7 +531,13 @@ def command_for(job, attempt_dir):
     if sandbox == "workspace-write":
         cmd += [
             "--add-dir",
-            git(job["cwd"], "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            git(
+                job["cwd"],
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                machine=job.get("machine"),
+            ),
         ]
     return [*cmd, "resume", job["session_id"], "-"]
 
