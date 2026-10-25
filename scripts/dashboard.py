@@ -17,7 +17,7 @@ import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import agent_messages
 import attachments
@@ -34,7 +34,7 @@ from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
 from pr_ci_logs import BackgroundLogs
 from pr_overview import Overview
-from pr_workspaces import COLLIE_URL, Workspaces
+from pr_workspaces import Workspaces, collie_url
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
@@ -1086,7 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
                         # deliver another checkout's comments.
                         "path": workspace_viewer.workspace_checkout(workspace_id),
                         "workspace": live,
-                        "url": live and f"{COLLIE_URL}/space/{quote(live, safe='')}",
+                        "url": live and collie_url(None, live),
                     }
                 self.send_json(200, value)
             elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:

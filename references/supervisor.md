@@ -533,10 +533,15 @@ PR monitoring is finished, not that local files have been checked for safe remov
 No session, pane, branch, worktree, or historical watch is automatically deleted.
 Branch-only watches have no PR closure event; register a PR watch when appropriate.
 
-## Worker machines (not yet used)
+## Worker machines
 
-`--home/machines.json` registers other machines for future remote workspaces.
-With or without it, every command still runs on this machine.
+`--home/machines.json` registers other machines. Agent cron jobs placed on a worker run
+there (see the Cron jobs section of the README); every other command still runs on
+this machine. Paths a worker reports are refused if they hold a control character, and
+so is any line a multiplexer is asked to type, here or there: in a terminal those are
+keystrokes, whatever the quoting. A worker's job checkout must be a linked worktree of
+the job's clone, outside its `.git`, so an agent cannot point the paths its sandbox is
+given at a repository of its own.
 `scripts/machines.py` loads and validates it; a malformed file is an error, a
 missing one means local only. `register --machine ID` checks the ID against the
 registry and then refuses: watches on other machines are not supported yet.
@@ -570,7 +575,10 @@ watches recorded on another machine.
 `id` (lowercase, at most 24 characters, not `local`) is the stable key; `label`
 is the herdr machine label passed as `herdr --machine=<label>` (labels cannot start with `-`). `id`, `label`, `ssh` and
 `os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
-`max_agents` is 1–64, `collie_url` is optional, and unknown keys are rejected.
+`max_agents` is 1–64, and unknown keys are rejected. `collie_url`, optional, is that
+machine's own Collie (an `http` or `https` URL with a host): its workspaces link
+`<collie_url>/space/<id>`; without one a worker's workspaces link no Collie at all,
+since this machine's Collie cannot open them.
 Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (`user@host` and `host`) are not detected.
 Disabled machines stay valid for records already pinned to them.

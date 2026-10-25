@@ -114,6 +114,7 @@
       job.claude_account && `Claude account: ${job.claude_account}`,
       job.docker && "Docker",
       job.unsandboxed && "Outside Safehouse",
+      job.machine && `On ${job.machine_label || job.machine}`,
     ]
       .filter(Boolean)
       .join(" · ");
@@ -296,7 +297,12 @@
     if (agent && run.agent_run) {
       // The session lives on in its workspace: open it there, or read it here.
       const open = node("div", undefined, "cron-open");
-      open.append(link("Open in Collie", run.agent_run.url));
+      const label = run.agent_run.machine_label;
+      open.append(
+        run.agent_run.url || !label
+          ? link("Open in Collie", run.agent_run.url)
+          : node("span", `Collie unavailable for ${label}`, "pr-sync"),
+      );
       if (window.workspaceViewer)
         open.append(
           ...window.workspaceViewer.buttons({
@@ -559,7 +565,13 @@
     container.replaceChildren(node("p", "Loading agents and local clones…", "pr-sync"));
     let fields, listed;
     try {
-      [fields, listed] = await Promise.all([tools.fields(), tools.repositories()]);
+      [fields, listed] = await Promise.all([
+        tools.fields({
+          remote: (label) =>
+            `The job runs on ${label}, in its own clone of the repository, always in its sandbox.`,
+        }),
+        tools.repositories(),
+      ]);
     } catch (error) {
       if (sequence === editorSequence)
         container.replaceChildren(
@@ -598,6 +610,11 @@
     branch.maxLength = 100;
     const base = text("cron-base", job?.base, "The clone’s current commit");
     const { agent, model, effort, account, settingsNote, docker, dockerLabel } = fields;
+    const { machineField, machineChoice } = fields;
+    // Hidden on a single machine; Auto is resolved when the job is saved, and kept.
+    const machine = machineField.querySelector("select");
+    machine.id = "cron-machine";
+    machineField.querySelector("label").htmlFor = machine.id;
     // Effort defaults follow the chosen repository.
     const project = () => repos[Number(repo.value)]?.repo ?? null;
     fields.setRepo(project());
@@ -619,12 +636,17 @@
       "The agent can change any file you can, including other clones. Agents it starts with wt stay in Safehouse.",
       "cron-unsandboxed-note",
     );
-    // Docker access is a Safehouse setting, so it has no meaning outside it.
+    // Docker access is a Safehouse setting, so it has no meaning outside it; a worker
+    // always runs the job in its sandbox.
+    const onWorker = () => !machineField.hidden && !["auto", "local"].includes(machine.value);
     const syncSandbox = () => {
+      if (onWorker()) unsandboxed.checked = false;
+      unsandboxed.disabled = onWorker();
       if (unsandboxed.checked) docker.checked = false;
       docker.disabled = unsandboxed.checked;
     };
     unsandboxed.addEventListener("change", syncSandbox);
+    machine.addEventListener("change", syncSandbox);
     // A saved setting the current choices lack (an uncached model, a removed account)
     // stays selected, so editing something else does not quietly drop it.
     const keep = (select, value) => {
@@ -648,6 +670,8 @@
       keep(account, job.claude_account);
       docker.checked = Boolean(job.docker);
       unsandboxed.checked = Boolean(job.unsandboxed);
+      // A saved job stays where it was placed, here unless it names a worker.
+      keep(machine, job.machine || "local");
     }
     syncSandbox();
     const prompt = node("textarea");
@@ -674,7 +698,14 @@
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    parts.push(settingsNote, fields.effortDefaults, dockerLabel, unsandboxedLabel, unsandboxedNote);
+    parts.push(
+      settingsNote,
+      fields.effortDefaults,
+      dockerLabel,
+      unsandboxedLabel,
+      unsandboxedNote,
+      machineField,
+    );
     field("Prompt", prompt);
     parts.push(
       node(
@@ -696,6 +727,7 @@
       docker,
       unsandboxed,
       prompt,
+      machineChoice,
     };
   }
   function openEditor(job) {
@@ -750,6 +782,7 @@
       docker: form.docker.checked,
       unsandboxed: form.unsandboxed.checked,
       prompt: form.prompt.value,
+      ...form.machineChoice(),
     };
   }
   async function save(event) {

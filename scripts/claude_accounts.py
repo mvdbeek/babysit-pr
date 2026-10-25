@@ -177,7 +177,7 @@ def environment(config_dir, *, subscription=False, base=None, config_env=False):
     return env
 
 
-def shell_command(command, config_dir, *, subscription=False, config_env=False):
+def shell_command(command, config_dir, *, subscription=False, config_env=False, backend=None):
     """Retain the user's shell function, including its Safehouse containment.
 
     The prefix only sets the environment, so a ``command claude …`` from an unsandboxed
@@ -190,7 +190,7 @@ def shell_command(command, config_dir, *, subscription=False, config_env=False):
     if config_env is None:
         unset.append("CLAUDE_CONFIG_DIR")
     else:
-        passed = sandbox.env_pass_prefix(["CLAUDE_CONFIG_DIR"])
+        passed = sandbox.env_pass_prefix(["CLAUDE_CONFIG_DIR"], backend)
         prefix = f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_env))}"
         command = f"{prefix} {passed} {command}" if passed else f"{prefix} {command}"
     if unset:

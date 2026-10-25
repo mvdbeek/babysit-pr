@@ -24,16 +24,17 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import quote
 
 import claude_accounts
 import herdr_handoff as handoff
 import machines
+import remote_probe
 import safe_git
+import sandbox
 import workspace_agents
 import workspace_exit
 import wt
-from pr_workspaces import BRANCH_NAME, COLLIE_URL, SLUG, herdr, run
+from pr_workspaces import BRANCH_NAME, SLUG, collie_url, herdr, run
 from pr_workspaces import git as workspaces_git
 from pr_workspaces import remote_slugs as workspaces_remote_slugs
 from pr_workspaces import repo_config as workspaces_repo_config
@@ -42,6 +43,14 @@ START_WAIT = 30  # Seconds for the agent to show up in its pane after the comman
 RESULT_LIMIT = 20000  # Characters of the agent's final response kept with a run.
 MAX_PROMPT = 32000
 PROMPT_KEEP = 86400  # Staged prompts are read once at startup; older ones are removed.
+# A worker's prompts, in a folder babysit-bwrap never grants an agent.
+REMOTE_PROMPTS = "~/.local/state/babysit-pr/cron-prompts"
+# How long a worker may take to make a job's checkout.
+CHECKOUT_TIMEOUT = 180
+# Seconds between looks at a run on a worker: each costs it ssh calls.
+REMOTE_WATCH = 60
+# A worker's sandbox follows its operating system.
+BACKENDS = {"darwin": "safehouse", "linux": "bwrap"}
 FENCE = re.compile(r"`{3,}\w*")
 
 
@@ -56,6 +65,9 @@ def validate(request, workspaces, home):
     repo, clone = request.get("repo"), request.get("clone")
     if not isinstance(repo, str) or not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
         raise ValueError("Choose a repository")
+    machine = place(request, workspaces, repo)
+    if machine is not None:
+        return validate_remote(request, machine, repo, home)
     if not isinstance(clone, str) or not any(
         r["repo"] == repo and r["clone"] == clone
         for r in workspaces.local_repositories(everything=True)["repos"]
@@ -84,6 +96,19 @@ def validate(request, workspaces, home):
     # The base is fetched from the job's repository, so it must name a branch.
     if base and (base.startswith("-") or "@" in base or not workspaces.valid_branch(clone, base)):
         raise ValueError("The base branch is not a valid branch name")
+    return {
+        "repo": repo,
+        # Registry id of the machine the job runs on; None is this one.
+        "machine": None,
+        "clone": clone,
+        "branch": branch,
+        "base": base,
+        **validate_settings(request, home),
+    }
+
+
+def validate_settings(request, home, machine=None):
+    """The agent, its options and the prompt; a worker's Claude account is checked there."""
     agent = request.get("agent")
     if agent not in {"codex", "claude"}:
         raise ValueError("Select Codex or Claude")
@@ -91,7 +116,16 @@ def validate(request, workspaces, home):
     if not all(isinstance(value, str) for value in settings.values()):
         raise ValueError("Invalid agent settings")
     workspace_agents.validate(agent, settings["model"], settings["effort"], home)
-    claude_accounts.validate(agent, settings["claude_account"] or None)
+    if machine is None:
+        claude_accounts.validate(agent, settings["claude_account"] or None)
+    elif settings["claude_account"]:
+        # The worker's own logins are checked there; only the name is checked here.
+        if agent != "claude":
+            raise ValueError("A Claude account can only be selected for Claude")
+        if not claude_accounts.NAME.fullmatch(settings["claude_account"]):
+            raise ValueError(
+                "Use an account name containing letters, digits, underscores or hyphens"
+            )
     docker = request.get("docker", False)
     if not isinstance(docker, bool):
         raise ValueError("Expected docker to be true or false")
@@ -106,12 +140,6 @@ def validate(request, workspaces, home):
     if "\0" in prompt:
         raise ValueError("The prompt cannot contain NUL characters")
     return {
-        "repo": repo,
-        # Registry id of the machine the job runs on; None is this one.
-        "machine": None,
-        "clone": clone,
-        "branch": branch,
-        "base": base,
         "agent": agent,
         "model": settings["model"],
         "effort": settings["effort"],
@@ -119,6 +147,56 @@ def validate(request, workspaces, home):
         "docker": docker,
         "unsandboxed": unsandboxed,
         "prompt": prompt,
+    }
+
+
+def place(request, workspaces, repo):
+    """The worker a job runs on, None for this machine; Auto is resolved once, here.
+
+    A request without ``machine`` runs here, as before workers existed.
+    """
+    choice = request.get("machine")
+    if "machine" not in request or choice is None:
+        return None
+    if not isinstance(choice, str):
+        raise ValueError("Choose a machine")
+    unsandboxed = request.get("unsandboxed") is True
+    fields = {
+        "repo": repo,
+        "agent": request.get("agent"),
+        "claude_account": request.get("claude_account") or None,
+        "docker": request.get("docker") is True,
+        "sandboxed": not unsandboxed,
+    }
+    machine_id = workspaces.place({"machine": choice}, fields)
+    return machines.resolve(workspaces.home, machine_id, placing=True)
+
+
+def validate_remote(request, machine, repo, home):
+    """A job for ``machine``: it works in that worker's clone, ``<src>/<repo name>``.
+
+    The clone, branch and base are checked there, by the probe that makes the checkout.
+    Nothing a run needs repairs for runs on a worker yet, and its agent is always
+    sandboxed.
+    """
+    if request.get("unsandboxed", False) is not False:
+        raise ValueError(f"Jobs on worker machines always run in their sandbox ({machine.label})")
+    branch = request.get("branch")
+    if not isinstance(branch, str) or not BRANCH_NAME.fullmatch(branch) or ".." in branch:
+        raise ValueError("Name the job's branch: letters, digits, '.', '_' and '-'")
+    base = request.get("base") or ""
+    if not isinstance(base, str):
+        raise ValueError("The base branch is not a valid branch name")
+    base = base.strip()
+    if base and (not BRANCH_NAME.fullmatch(base) or ".." in base):
+        raise ValueError("The base branch is not a valid branch name")
+    return {
+        "repo": repo,
+        "machine": machine.id,
+        "clone": f"{machine.src.rstrip('/')}/{repo.split('/')[1]}",
+        "branch": branch,
+        "base": base,
+        **validate_settings(request, home, machine),
     }
 
 
@@ -160,7 +238,8 @@ def checkout(job, src):
                     f"+refs/heads/{job['base']}:refs/remotes/{tracking[0]}/{job['base']}",
                     timeout=120,
                 )
-                start = f"{tracking[0]}/{job['base']}"
+                # In full, so no local branch or tag named <remote>/<base> wins.
+                start = f"refs/remotes/{tracking[0]}/{job['base']}"
             add = ["-b", job["branch"], str(directory), start]
         else:
             add = [str(directory), job["branch"]]
@@ -190,83 +269,206 @@ def checkout(job, src):
     return directory.resolve()
 
 
-def workspace_for(path):
-    for space in herdr("workspace", "list")["workspaces"]:
+def workspace_for(path, machine=None):
+    for space in herdr("workspace", "list", machine=machine)["workspaces"]:
         checkout_path = (space.get("worktree") or {}).get("checkout_path")
-        if checkout_path and Path(checkout_path).resolve() == path:
+        if machine is not None:
+            # A worker's path, as its probe resolved it there; never resolved here.
+            if checkout_path == str(path):
+                return space["workspace_id"]
+        elif checkout_path and Path(checkout_path).resolve() == path:
             return space["workspace_id"]
     return None
 
 
+def probe(home, machine, op, timeout, **args):
+    """One probe op on a worker; every failure, a timeout included, names the worker."""
+    try:
+        return remote_probe.call(home, machine, op, timeout, **args)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"{machine.label} did not answer within {timeout} seconds") from exc
+    except OSError as exc:
+        raise ValueError(f"{machine.label} could not be reached: {exc}") from exc
+
+
+def remote_checkout(job, home, machine):
+    """The job's checkout on its worker, made there with the worker's own hardened Git."""
+    name = job["repo"].split("/")[1]
+    return probe(
+        home,
+        machine,
+        "cron_checkout",
+        CHECKOUT_TIMEOUT,
+        clone=job["clone"],
+        repo=job["repo"],
+        branch=job["branch"],
+        base=job["base"],
+        directory=f"{machine.src.rstrip('/')}/worktrees/{name}/{job['branch']}",
+        agent=job["agent"],
+        account=job["claude_account"] or None,
+        babysit_root=machine.babysit_root,
+        sandbox=BACKENDS[machine.os],
+    )
+
+
+def remote_command(job, machine, found, staged, effort):
+    """The line typed on ``machine``: its own sandbox, with the paths its probe reported.
+
+    babysit-bwrap is given the checkout, its common dir and the agent's configuration
+    there; Safehouse on a Mac worker grants those through the user's shell functions.
+    A worker with the ``gpg`` label lets the agent sign.
+    """
+    backend = BACKENDS[machine.os]
+    features = ("gpg",) if "gpg" in machine.labels else ()
+    confined = None
+    if backend == "bwrap":
+        if not found["launcher"]:
+            raise ValueError(f"babysit-bwrap is not installed under {machine.babysit_root} there")
+        own = (
+            f"--claude-config-dir={found['claude_home']}"
+            if job["agent"] == "claude"
+            else f"--codex-home={found['codex_home']}"
+        )
+        confined = [
+            own,
+            *sandbox.flags(sandbox.Grants(add_dirs=(found["path"], found["common"])), backend),
+        ]
+    home = found["claude_home"] if job["agent"] == "claude" else None
+    return wt.agent_command(
+        job["agent"],
+        job["prompt"],
+        job["model"],
+        effort,
+        stage=lambda _: staged,
+        docker=job["docker"],
+        claude_config_dir=home,
+        claude_subscription=bool(job["claude_account"]),
+        # As the worker reported it: the literal path, or None for its default login.
+        claude_config_env=found["claude_env"] if home else None,
+        backend=backend,
+        features=features,
+        launcher=found["launcher"],
+        confined=confined,
+    )
+
+
 def start(job, run_id, home, src):
-    """Type the agent command into a new pane of the job's workspace."""
-    path = checkout(job, src)
-    workspace = workspace_for(path)
+    """Type the agent command into a new pane of the job's workspace.
+
+    A job with a ``machine`` does all of it on that worker, over herdr and ssh.
+    """
+    machine = machines.resolve(home, job["machine"], placing=True) if job.get("machine") else None
+    found = None
+    if machine is None:
+        path = checkout(job, src)
+        clone = job["clone"]
+    else:
+        if job.get("unsandboxed"):
+            raise ValueError(
+                f"Jobs on worker machines always run in their sandbox ({machine.label})"
+            )
+        found = remote_checkout(job, home, machine)
+        path, clone = found["path"], found["clone"]
+    workspace = workspace_for(path, machine)
     anchor = None
     if workspace is None:
         opened = herdr(
             "worktree",
             "open",
             "--cwd",
-            job["clone"],
+            clone,
             "--path",
             str(path),
             "--label",
             wt.sanitize_session_name(f"cron-{job['name']}"),
             "--no-focus",
+            machine=machine,
         )
-        workspace = workspace_for(path)
+        workspace = workspace_for(path, machine)
         anchor = (opened.get("root_pane") or {}).get("pane_id")
         if workspace is None or not anchor:
             raise ValueError("herdr did not open a workspace for the job's checkout")
-    elif any(a.get("workspace_id") == workspace for a in herdr("agent", "list")["agents"]):
+    elif any(
+        a.get("workspace_id") == workspace
+        for a in herdr("agent", "list", machine=machine)["agents"]
+    ):
         # Two agents in one checkout would trip over each other's changes.
         raise Busy("An agent is still open in the job's workspace")
     else:
         anchor = next(
-            (p["pane_id"] for p in herdr("pane", "list", "--workspace", workspace)["panes"]),
+            (
+                p["pane_id"]
+                for p in herdr("pane", "list", "--workspace", workspace, machine=machine)["panes"]
+            ),
             None,
         )
         if anchor is None:
             raise ValueError("The job's herdr workspace has no pane to split")
     # Everything that can fail before typing is done first, so no empty pane is left.
-    config = claude_accounts.validate(job["agent"], job["claude_account"] or None)
     marker = workspace_exit.new_marker()
-    staged = stage(home, run_id, job["prompt"].rstrip() + "\n" + workspace_exit.brief(marker))
-    command = wt.agent_command(
-        job["agent"],
-        job["prompt"],
-        job["model"],
-        # Left on Default: the repository's or global saved default, if any.
-        job["effort"]
-        or workspace_agents.default_effort(home, job["repo"], job["agent"], job["model"]),
-        stage=lambda _: str(staged),
-        docker=job["docker"],
-        claude_config_dir=str(config) if config else None,
-        claude_subscription=bool(job["claude_account"]),
-        # Jobs saved before the option existed lack it.
-        unsandboxed=job.get("unsandboxed", False),
-        directory=str(path),
+    brief = job["prompt"].rstrip() + "\n" + workspace_exit.brief(marker)
+    # Left on Default: the repository's or global saved default, if any.
+    effort = job["effort"] or workspace_agents.default_effort(
+        home, job["repo"], job["agent"], job["model"]
     )
+    if machine is None:
+        config = claude_accounts.validate(job["agent"], job["claude_account"] or None)
+        staged = stage(home, run_id, brief)
+        command = wt.agent_command(
+            job["agent"],
+            job["prompt"],
+            job["model"],
+            effort,
+            stage=lambda _: str(staged),
+            docker=job["docker"],
+            claude_config_dir=str(config) if config else None,
+            claude_subscription=bool(job["claude_account"]),
+            # Jobs saved before the option existed lack it.
+            unsandboxed=job.get("unsandboxed", False),
+            directory=str(path),
+        )
+    else:
+        staged = machines.put_file(
+            home,
+            machine,
+            machines.remote_path(REMOTE_PROMPTS),
+            f"{run_id}-{uuid.uuid4().hex[:8]}",
+            brief.encode(),
+            keep=PROMPT_KEEP,
+        )
+        command = remote_command(job, machine, found, staged, effort)
     # A fresh pane, as resumes use; the root pane stays a plain shell for the user.
-    pane = herdr("pane", "split", anchor, "--direction", "right", "--cwd", str(path), "--no-focus")[
-        "pane"
-    ]["pane_id"]
+    pane = herdr(
+        "pane",
+        "split",
+        anchor,
+        "--direction",
+        "right",
+        "--cwd",
+        str(path),
+        "--no-focus",
+        machine=machine,
+    )["pane"]["pane_id"]
     launched = {
         "machine": job.get("machine"),
         "workspace_id": workspace,
         "pane": pane,
         "path": str(path),
-        "url": f"{COLLIE_URL}/space/{quote(workspace, safe='')}",
+        "url": collie_url(machine, workspace),
         "exit_marker": marker,
         "launched_at": time.time(),
     }
+    if machine is not None:
+        # The viewer and the run's card name the worker's workspace by its qualified ID.
+        launched.update(
+            workspace_id=machines.qualify(machine.id, workspace), machine_label=machine.label
+        )
     try:
-        run(*machines.herdr_argv(None, "pane", "run", pane, command))
+        run(*machines.herdr_argv(machine, "pane", "run", pane, sandbox.typed(command)))
     except subprocess.TimeoutExpired:
         return {**launched, "uncertain": "herdr did not answer while typing the command"}
     except (OSError, ValueError, subprocess.SubprocessError):
-        close_pane(pane)  # Nothing was typed: the pane is an empty shell.
+        close_pane(pane, machine)  # Nothing was typed: the pane is an empty shell.
         raise
     # From here the command is typed: trouble makes the outcome uncertain, never a failure
     # to start, since the agent may be running.
@@ -275,7 +477,7 @@ def start(job, run_id, home, src):
         while time.monotonic() < deadline:
             if any(
                 a.get("pane_id") == pane and a.get("agent") == job["agent"]
-                for a in herdr("agent", "list")["agents"]
+                for a in herdr("agent", "list", machine=machine)["agents"]
             ):
                 return launched
             time.sleep(1)
@@ -326,6 +528,10 @@ def final_response(record, agent, marker):
         return None
     if not text:
         return None
+    return without_marker(text, marker)
+
+
+def without_marker(text, marker):
     lines = text.rstrip().splitlines()
     end = len(lines)
     # The marker may sit in its own code fence, as workspace_exit.confirms accepts.
@@ -339,13 +545,72 @@ def final_response(record, agent, marker):
     return text.rstrip()[:RESULT_LIMIT]
 
 
-def close_pane(pane):
+def remote_response(home, machine, run, launched):
+    """The worker agent's answer once a session of this run confirms the task, else None.
+
+    Its transcripts are found and read there, through the probe: the newest sessions
+    recorded in the checkout.
+    """
+    listed = probe(home, machine, "sessions", 30, root=launched["path"])
+    # The run's own marker tells its session apart; the worker's clock is not compared.
+    recent = [session for session in listed if session["agent"] == run["agent"]]
+    for session in recent[:3]:
+        try:
+            turn = probe(
+                home,
+                machine,
+                "turn",
+                20,
+                file=session["file"],
+                session=session["id"],
+                agent=run["agent"],
+            )
+        except ValueError:
+            continue  # Not a turn yet, or not this run's session.
+        text = turn["complete"]
+        if text and workspace_exit.confirms(text, launched["exit_marker"]):
+            return without_marker(text, launched["exit_marker"])
+    return None
+
+
+def remote_progress(home, run, launched):
+    """Where a run on a worker stands: watching, finished (with its answer) or gone.
+
+    Exiting the agent there, as ``workspace_exit`` does here, comes with exit-watch
+    forwarding; until then a finished agent stays open on the worker.
+    """
+    machine = machines.resolve(home, launched["machine"])
+    label = launched["machine_label"]
+    present = any(
+        agent.get("pane_id") == launched["pane"]
+        for agent in herdr("agent", "list", machine=machine, timeout=15)["agents"]
+    )
+    text = remote_response(home, machine, run, launched)
+    if text is not None:
+        return {
+            "state": "finished",
+            "text": text,
+            "message": f"Finished on {label}; its agent is still open there "
+            "(exiting agents on workers is not supported yet)",
+        }
+    if not present:
+        return {
+            "state": "gone",
+            "message": f"The agent left its pane on {label} without confirming the task was done",
+        }
+    return {"state": "watching", "message": f"Waiting for the agent on {label} to finish"}
+
+
+def close_pane(pane, machine=None):
     """Close a finished run's pane once only its shell is left in it."""
     try:
-        procs = handoff.result("pane", "process-info", "--pane", pane)["process_info"]
+        if machine is None:
+            procs = handoff.result("pane", "process-info", "--pane", pane)["process_info"]
+        else:
+            procs = herdr("pane", "process-info", "--pane", pane, machine=machine)["process_info"]
         if any(p.get("pid") != procs.get("shell_pid") for p in procs["foreground_processes"]):
             return False
-        run(*machines.herdr_argv(None, "pane", "close", pane))
+        run(*machines.herdr_argv(machine, "pane", "close", pane))
         return True
     except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError):
         return False

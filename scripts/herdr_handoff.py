@@ -13,6 +13,7 @@ from pathlib import Path
 
 import machines
 import pr_supervisor as supervisor
+import remote_probe
 
 SCRIPT = Path(__file__).resolve()
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
@@ -63,64 +64,14 @@ def latest_turn(rollout, session_id, agent="codex"):
 
 
 def latest_codex_turn(rollout, session_id):
-    meta, turn, complete = None, None, None
     with Path(rollout).open() as stream:
-        for line in stream:
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # the writer may still be appending the final line
-            payload = item.get("payload") or {}
-            if item.get("type") == "session_meta":
-                meta = payload.get("id")
-            elif item.get("type") == "event_msg":
-                if payload.get("type") == "task_started":
-                    turn, complete = payload.get("turn_id"), None
-                elif payload.get("type") == "task_complete" and payload.get("turn_id") == turn:
-                    complete = payload.get("last_agent_message", "")
-                elif payload.get("type") in {"turn_aborted", "user_message"}:
-                    complete = None
-    if meta != session_id or not turn:
-        raise RuntimeError("Cannot identify the current turn in the registered rollout")
-    return turn, complete
+        return remote_probe.codex_turn(stream, session_id)
 
 
 def latest_claude_turn(transcript, session_id):
-    """A turn is the last typed prompt; it is complete once its turn_duration record lands.
-
-    The completed text is the assistant text after the turn's final tool result, i.e. the
-    response the user sees, which must carry the handoff marker.
-    """
-    turn, complete, seen = None, None, False
-    texts: list[str] = []
+    """See ``remote_probe.claude_turn``, which a worker's probe reads its transcripts with."""
     with Path(transcript).open() as stream:
-        for line in stream:
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # the writer may still be appending the final line
-            if item.get("isSidechain"):
-                continue  # subagent traffic never ends the main conversation's turn
-            kind = item.get("type")
-            if kind in {"user", "assistant"}:
-                if item.get("sessionId") != session_id:
-                    raise RuntimeError("Claude transcript session ID does not match")
-                seen = True
-                complete = None
-            content = (item.get("message") or {}).get("content")
-            blocks = content if isinstance(content, list) else []
-            if kind == "user":
-                if any(b.get("type") == "tool_result" for b in blocks):
-                    texts = []  # tool output: the final response restarts after it
-                elif not item.get("isMeta"):  # injected context is not a new prompt
-                    turn, complete, texts = item.get("uuid"), None, []
-            elif kind == "assistant":
-                texts.extend(b.get("text", "") for b in blocks if b.get("type") == "text")
-            elif kind == "system" and item.get("subtype") == "turn_duration" and turn:
-                complete = "\n".join(texts)
-    if not seen or not turn:
-        raise RuntimeError("Cannot identify the current turn in the registered transcript")
-    return turn, complete
+        return remote_probe.claude_turn(stream, session_id)
 
 
 def styled_chars(line: str) -> list[tuple[str, bool]]:

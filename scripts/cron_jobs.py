@@ -9,6 +9,7 @@ A run that was due while it was stopped starts once when it returns, up to a day
 late. Each run's output is kept in a bounded log file next to its history.
 """
 
+import concurrent.futures
 import contextlib
 import fcntl
 import json
@@ -25,6 +26,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import cron_agents
+import machines
 import owned_process
 import workspace_exit
 
@@ -207,6 +209,8 @@ def validate(request, workspaces=None, home=None):
     if kind == "agent":
         task = cron_agents.validate(request, workspaces, home)
     elif kind == "shell":
+        if request.get("machine") not in (None, "local", "auto"):
+            raise ValueError("Only agent jobs run on worker machines")
         task = shell_task(request)
     else:
         raise ValueError("Choose a shell command or an agent task")
@@ -290,6 +294,10 @@ class CronJobs:
         self.logs.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.running: dict[str, Run] = {}
+        # Runs on workers are looked at in their own threads, one look per run at a time,
+        # so a slow or hung worker never holds up the schedule; made on first use.
+        self.remote_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self.remote_looks: set[str] = set()
         self.wake = threading.Event()
         self.stopping = threading.Event()
         self.scheduler: threading.Thread | None = None
@@ -382,6 +390,14 @@ class CronJobs:
                     job["upcoming"] = upcoming(job, now) if job["enabled"] else []
                 except ValueError:
                     job["upcoming"] = []
+        placed = [job for job in jobs if job.get("machine")]
+        if placed:
+            try:
+                labels = {m.id: m.label for m in machines.load(self.home).values()}
+            except (OSError, ValueError):
+                labels = {}
+            for job in placed:
+                job["machine_label"] = labels.get(job["machine"], job["machine"])
         jobs.sort(key=lambda job: job["name"].lower())
         return {
             "enabled": True,
@@ -457,8 +473,9 @@ class CronJobs:
                     if (
                         other["id"] != job["id"]
                         and other.get("kind") == "agent"
-                        and (other["clone"], other["branch"])
-                        == (definition["clone"], definition["branch"])
+                        # The same clone path on two machines is two clones.
+                        and (other.get("machine"), other["clone"], other["branch"])
+                        == (definition["machine"], definition["clone"], definition["branch"])
                     ):
                         raise ValueError(
                             f"“{other['name']}” already works on {definition['branch']}; "
@@ -678,16 +695,26 @@ class CronJobs:
                     finished_at=now(),
                     message=f"{launched['uncertain']}; check the job's workspace in Collie",
                 )
+            elif launched.get("machine"):
+                label = launched["machine_label"]
+                result.update(
+                    status="running", message=f"Waiting for the agent on {label} to finish"
+                )
             else:
                 result.update(
                     status="running",
                     exit=workspace_exit.watching(now()),
                     message="Waiting for the agent to finish",
                 )
+            where = launched["url"]
+            if launched.get("machine"):
+                label = launched["machine_label"]
+                where = f"{where or launched['workspace_id']} on {label}" + (
+                    "" if launched["url"] else f" (Collie unavailable for {label})"
+                )
             self.append_log(
                 run,
-                f"{job['agent'].capitalize()} started in {launched['path']}\n"
-                f"Workspace: {launched['url']}\n",
+                f"{job['agent'].capitalize()} started in {launched['path']}\nWorkspace: {where}\n",
             )
         with self.lock:
             try:
@@ -716,11 +743,36 @@ class CronJobs:
                 )
             ]
         for run in runs:
+            if run["agent_run"].get("machine"):
+                self.watch_elsewhere(run)
+                continue
             try:
                 self.watch_one(run)
             except Exception:
                 continue  # One watch must not stop the others; the next pass retries it.
         return bool(runs)
+
+    def watch_elsewhere(self, run):
+        """Look at a worker's run in the background, unless a look at it is still going."""
+        with self.lock:
+            if run["id"] in self.remote_looks or self.stopping.is_set():
+                return
+            self.remote_looks.add(run["id"])
+            if self.remote_pool is None:
+                self.remote_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="cron-remote"
+                )
+
+        def look():
+            try:
+                self.watch_one(run)
+            except Exception:
+                pass  # The next pass looks again.
+            finally:
+                with self.lock:
+                    self.remote_looks.discard(run["id"])
+
+        self.remote_pool.submit(look)
 
     def current(self, run):
         """The run as stored, or None once it is deleted or no longer followed."""
@@ -732,6 +784,8 @@ class CronJobs:
     def watch_one(self, run):
         now = self.clock()
         launched = run["agent_run"]
+        if launched.get("machine"):
+            return self.watch_remote(run, now)
         op = cron_agents.operation(run, launched)
 
         def persist(record):
@@ -778,6 +832,38 @@ class CronJobs:
         else:
             changes = {"status": "attention", "message": record["message"]}
         self.update_run(run, exit=record, finished_at=now, result=bool(text), **changes)
+        self.prune(run["job"])
+
+    def watch_remote(self, run, now):
+        """A worker's run, until its agent confirms the task, leaves its pane or times out.
+
+        Each look costs the worker ssh calls, so it is looked at every REMOTE_WATCH seconds.
+        """
+        if now - run.get("remote_checked_at", 0) < cron_agents.REMOTE_WATCH:
+            return
+        launched = run["agent_run"]
+        label = launched["machine_label"]
+        try:
+            seen = cron_agents.remote_progress(self.home, run, launched)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            seen = {"state": "watching", "message": f"Cannot check the agent on {label}: {exc}"}
+        if seen["state"] == "watching" and now - run["started_at"] > run["timeout"]:
+            limit = f"the {run['timeout'] // 60} min time limit"
+            seen = {
+                "state": "left_open",
+                "message": f"Still working at {limit}; left open on {label}",
+            }
+        if not self.current(run):
+            return
+        if seen["state"] == "watching":
+            self.update_run(run, remote_checked_at=now, message=seen["message"])
+            return
+        text = seen.get("text")
+        if text:
+            self.append_log(run, f"\nFinal response:\n{text}\n")
+        self.update_run(
+            run, status="attention", message=seen["message"], finished_at=now, result=bool(text)
+        )
         self.prune(run["job"])
 
     def skip(self, db, job, trigger, due_at, now, reason="The previous run was still going"):
@@ -965,6 +1051,8 @@ class CronJobs:
             threads = [run.thread for run in self.running.values() if run.thread]
         for thread in threads:
             thread.join(STOP_GRACE + 5)
+        if self.remote_pool is not None:
+            self.remote_pool.shutdown(wait=False, cancel_futures=True)
         self.owner.close()
 
     def loop(self):

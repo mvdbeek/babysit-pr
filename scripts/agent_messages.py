@@ -34,6 +34,7 @@ import claude_accounts
 import exit_watch
 import herdr_handoff
 import machines
+import sandbox
 import session_locks
 import workspace_viewer
 import wt
@@ -1335,6 +1336,9 @@ def launch(
         )
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
+    # A transcript's recorded cwd is the agent's to write; quoting does not stop a
+    # control character in it from acting as a keystroke.
+    sandbox.typed(command)
     _recent[session_id] = (pane, time.monotonic())
     try:
         # `pane run` answers with plain text, not herdr's JSON envelope.

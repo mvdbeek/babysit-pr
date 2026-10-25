@@ -828,3 +828,21 @@ def test_wt_in_a_terminal_trusts_origins_github_repository_with_the_token(
     # Named by the dashboard, the repository is the host's record, never origin's.
     options.github_repo = "base/repo"
     assert not tool.trusts_origin(options)
+
+
+def test_new_worktrees_start_from_the_remote_tracking_ref_not_a_lookalike(planted, tmp_path):
+    clone, _, git = planted
+    fetched = git("rev-parse", "refs/remotes/origin/main")
+    # A local branch and a tag named origin/main would win `origin/main` by DWIM.
+    quiet(git, "commit", "-q", "--allow-empty", "-m", "planted", "--", ".")
+    planted_sha = git("rev-parse", "HEAD")
+    quiet(git, "branch", "origin/main", planted_sha)
+    quiet(git, "tag", "origin/main", planted_sha)
+    quiet(git, "reset", "-q", "--soft", "HEAD~1")
+    job = {"clone": str(clone), "repo": "base/repo", "branch": "job", "base": "main"}
+    directory = cron_agents.checkout(job, tmp_path / "src")
+    assert git("rev-parse", "HEAD", cwd=directory) == fetched
+    tool = wt.Tool(wt.SubprocessRunner(os.environ), dict(os.environ))
+    other = str(tmp_path / "worktrees" / "topic")
+    tool.add_worktree(str(clone), other, "topic", "main", "base/repo")
+    assert git("rev-parse", "HEAD", cwd=Path(other)) == fetched

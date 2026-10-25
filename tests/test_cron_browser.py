@@ -515,3 +515,65 @@ def test_a_run_that_needs_attention_is_dismissed_from_needs_you(page, site, erro
     expect(page.locator(".cron-job .badge")).to_have_text("Needs attention · dismissed")
     expect(detail.get_by_role("button", name="Run now")).to_be_visible()
     expect(detail.get_by_role("button", name="Dismiss")).to_have_count(0)
+
+
+def test_an_agent_job_can_be_placed_on_a_worker(page, agent_site, errors, tmp_path):
+    url, jobs, manager, _ = agent_site
+    worker = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin"}
+    (manager.home / "machines.json").write_text(
+        json.dumps({"version": 1, "machines": [{**worker, "labels": ["safehouse"]}]})
+    )
+    page.set_viewport_size({"width": 390, "height": 1000})
+    page.goto(url + "/#cron")
+    page.get_by_role("button", name="New job").click()
+    dialog = page.locator("#cron-dialog")
+    dialog.get_by_label("Name").fill("Nightly on the mini")
+    dialog.get_by_label("Branch", exact=True).fill("nightly")
+    dialog.get_by_label("Agent", exact=True).select_option("codex")
+    machine = dialog.get_by_label("Machine", exact=True)
+    expect(machine).to_have_value("auto")
+    outside = dialog.get_by_label("Run outside Safehouse (can write anywhere)")
+    outside.check()
+    machine.select_option("mini")
+    # A worker always runs the job in its sandbox.
+    expect(outside).not_to_be_checked()
+    expect(outside).to_be_disabled()
+    expect(dialog.locator(".machine-choice")).to_contain_text("The job runs on Mac mini")
+    dialog.get_by_label("Prompt").fill("Triage")
+    page.screenshot(path=str(tmp_path / "worker-job-dialog.png"))
+    dialog.get_by_role("button", name="Save job").click()
+    expect(dialog).to_be_hidden()
+    [saved] = jobs.snapshot()["jobs"]
+    assert (saved["machine"], saved["clone"], saved["unsandboxed"]) == ("mini", "~/src/repo", False)
+    page.locator(".cron-job").first.click()
+    detail = page.locator("#cron-detail")
+    expect(detail).to_contain_text("Codex · On Mac mini")
+    # A run there links no Collie when the registry names none for that worker.
+    with jobs.lock, jobs.db() as db:
+        jobs.record(
+            db,
+            saved,
+            kind="agent",
+            trigger="manual",
+            due_at=None,
+            started_at=time.time(),
+            finished_at=time.time(),
+            status="attention",
+            message="Finished on Mac mini; its agent is still open there",
+            agent="codex",
+            agent_run={
+                "machine": "mini",
+                "machine_label": "Mac mini",
+                "workspace_id": "mini/w1",
+                "pane": "w1:p10",
+                "path": "/w",
+                "url": None,
+            },
+        )
+    page.reload()
+    page.locator(".cron-job").first.click()
+    expect(detail.locator(".cron-open")).to_contain_text("Collie unavailable for Mac mini")
+    expect(detail.get_by_role("link", name="Open in Collie")).to_have_count(0)
+    detail.get_by_role("button", name="Edit").click()
+    expect(machine).to_have_value("mini")
+    assert page.evaluate("document.documentElement.scrollWidth") <= 390

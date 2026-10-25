@@ -19,6 +19,7 @@ the tests set ``DEFAULT`` instead.
 """
 
 import os
+import re
 import shlex
 import sys
 from collections.abc import Callable, Sequence
@@ -38,6 +39,8 @@ SAFEHOUSE_FEATURES = {"docker": "docker", "playwright": "playwright-chrome", "gp
 # The saved Claude permission mode of a job whose sandbox launcher owns permissions.
 # Existing jobs store this value, so it keeps the name from before other backends.
 LAUNCHER_PERMISSIONS = "safehouse"
+# What a terminal acts on as it reads typed input: never in a line a multiplexer types.
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Repair marker, and git and gh failing fast instead of prompting in unattended repairs.
 REPAIR_ENV = (
     "BABYSIT_PR_REPAIR",
@@ -123,6 +126,18 @@ def launcher_backend(word: str) -> str | None:
     return LAUNCHERS.get(Path(word).name)
 
 
+def typed(line: str) -> str:
+    """``line`` as it is, refused when it holds a control character.
+
+    A multiplexer types the line into a shell, where one is a keystroke: Ctrl-U clears
+    what came before it, and a bracketed-paste end lets the rest run as typed. Quoting
+    does not help, since the terminal acts on it before the shell parses anything.
+    """
+    if CONTROL.search(line):
+        raise ValueError("A typed line cannot contain a control character")
+    return line
+
+
 def typed_line(
     words: Sequence[str],
     grants: Grants,
@@ -131,6 +146,8 @@ def typed_line(
     name: str | None = None,
     worktree: str | None = None,
     claude_config_dir: str | None = None,
+    launcher: str | None = None,
+    confined: Sequence[str] | None = None,
 ) -> str:
     """The shell line a multiplexer types to start agent ``words`` in the sandbox.
 
@@ -140,11 +157,15 @@ def typed_line(
     itself; babysit-bwrap is given ``worktree`` and the agent's configuration, typed
     (see ``confinement``), since callers that stage the prompt themselves return its
     path for every ``stage`` call.
+
+    A line typed on another machine names that machine's babysit-bwrap (``launcher``)
+    and its own options for the checkout and configuration there (``confined``), which
+    nothing here can look up.
     """
     name = backend(name)
     if name == "none":
         # `command` skips the shell function, so its flag is added here instead.
-        return shlex.join(["command", words[0], skip_permissions, *words[1:]])
+        return typed(shlex.join(["command", words[0], skip_permissions, *words[1:]]))
     dirs = list(dict.fromkeys(grants.add_dirs))
     if name == "safehouse":
         # The shell's `safe` function adds the permission flag and runs Safehouse.
@@ -155,13 +176,15 @@ def typed_line(
             # Extends the list safe.env exports.
             listed = shlex.quote(stage(":".join(dirs)))
             command = f"SAFEHOUSE_ADD_DIRS=${{SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}}$(cat {listed}) {command}"
-        return command
+        return typed(command)
     options = flags(grants._replace(add_dirs=()), name)
-    options += [shlex.quote(word) for word in confinement(words[0], worktree, claude_config_dir)]
+    if confined is None:
+        confined = confinement(words[0], worktree, claude_config_dir)
+    options += [shlex.quote(word) for word in confined]
     if dirs:
         options.append(f'"--add-dirs=$(cat {shlex.quote(stage(":".join(dirs)))})"')
-    launch = [shlex.quote(str(SCRIPTS / "babysit-bwrap")), *options, "--"]
-    return " ".join([*launch, shlex.join([words[0], skip_permissions, *words[1:]])])
+    launch = [shlex.quote(launcher or str(SCRIPTS / "babysit-bwrap")), *options, "--"]
+    return typed(" ".join([*launch, shlex.join([words[0], skip_permissions, *words[1:]])]))
 
 
 def env_pass_prefix(names: Sequence[str], name: str | None = None) -> str | None:

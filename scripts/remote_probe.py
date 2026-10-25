@@ -81,6 +81,33 @@ HOST_ENV = {
 SUBMODULE_READS = {"status", "diff"}
 # Reads need no GitHub token, and a checkout's filters or hooks must not inherit one.
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+# The one fetch a cron checkout makes: its job's repository by GitHub URL, the worker's
+# own gh login for credentials, and no transport but those (https, or what the worker's
+# own config rewrites it to); the repository's own rewrites and TLS settings refuse it.
+FETCH_CONFIG = [
+    *[f"protocol.{name}.allow=always" for name in ("https", "ssh", "file")],
+    "credential.helper=",
+    "credential.https://github.com.helper=",
+    "credential.https://github.com.helper=!gh auth git-credential",
+    "core.askPass=",
+    "core.sshCommand=ssh",
+    "core.alternateRefsCommand=",
+    "gc.auto=0",
+    "maintenance.auto=false",
+    "submodule.recurse=false",
+    "fetch.recurseSubmodules=false",
+]
+TRUSTED_SCOPES = {"system", "global", "command"}
+REDIRECT = re.compile(r"url\..+\.insteadof|remote\..*://.*")
+TLS = re.compile(
+    r"http\.(.+\.)?(sslverify|sslcainfo|sslcapath|sslbackend|proxy|cookiefile|savecookies"
+    r"|curloptresolve)|remote\..+\.proxy"
+)
+# A job's branch: what a cron job may name, checked again where it is used.
+BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+MAX_TURN = 20000  # Characters of an agent's final response a ``turn`` answer carries.
+# What a terminal acts on: never in a path that reaches a typed line.
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # A session listing reads at most this much of each transcript, and skips longer lines.
 MAX_SCAN = 32 * 1024 * 1024
 MAX_SCAN_LINE = 4 * 1024 * 1024
@@ -726,6 +753,66 @@ def transcript_lines(stream):
         yield line.decode("utf-8", errors="replace")
 
 
+def codex_turn(lines, session_id):
+    """The current turn of a Codex rollout's ``lines`` and its final message once complete."""
+    meta, turn, complete = None, None, None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # the writer may still be appending the final line
+        payload = item.get("payload") or {}
+        if item.get("type") == "session_meta":
+            meta = payload.get("id")
+        elif item.get("type") == "event_msg":
+            if payload.get("type") == "task_started":
+                turn, complete = payload.get("turn_id"), None
+            elif payload.get("type") == "task_complete" and payload.get("turn_id") == turn:
+                complete = payload.get("last_agent_message", "")
+            elif payload.get("type") in {"turn_aborted", "user_message"}:
+                complete = None
+    if meta != session_id or not turn:
+        raise RuntimeError("Cannot identify the current turn in the registered rollout")
+    return turn, complete
+
+
+def claude_turn(lines, session_id):
+    """A turn is the last typed prompt; it is complete once its turn_duration record lands.
+
+    The completed text is the assistant text after the turn's final tool result, i.e. the
+    response the user sees, which must carry the handoff marker.
+    """
+    turn, complete, seen = None, None, False
+    texts: list[str] = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # the writer may still be appending the final line
+        if item.get("isSidechain"):
+            continue  # subagent traffic never ends the main conversation's turn
+        kind = item.get("type")
+        if kind in {"user", "assistant"}:
+            if item.get("sessionId") != session_id:
+                raise RuntimeError("Claude transcript session ID does not match")
+            seen = True
+            complete = None
+        content = (item.get("message") or {}).get("content")
+        blocks = content if isinstance(content, list) else []
+        if kind == "user":
+            if any(b.get("type") == "tool_result" for b in blocks):
+                texts = []  # tool output: the final response restarts after it
+            elif not item.get("isMeta"):  # injected context is not a new prompt
+                turn, complete, texts = item.get("uuid"), None, []
+        elif kind == "assistant":
+            texts.extend(b.get("text", "") for b in blocks if b.get("type") == "text")
+        elif kind == "system" and item.get("subtype") == "turn_duration" and turn:
+            complete = "\n".join(texts)
+    if not seen or not turn:
+        raise RuntimeError("Cannot identify the current turn in the registered transcript")
+    return turn, complete
+
+
 def records(lines):
     for line in lines:
         try:
@@ -1162,18 +1249,9 @@ def _host_sessions(root):
     return listed[:MAX_SESSIONS]
 
 
-def _host_tail(file, inode, offset, limit):
-    """Complete lines of one listed transcript from ``offset``, at most ``limit`` bytes.
-
-    A file replaced since (another ``inode``) or truncated below ``offset`` is read from
-    the start, which the answer's offset says. A full read inside one line longer than
-    ``limit`` is returned as it is, for the controller to join with the next.
-    """
+def _host_transcript(file):
+    """One of this machine's session transcripts, opened; refused for any other file."""
     _arg_paths([file])
-    if not (inode is None or (type(inode) is int and inode >= 0)):
-        raise ValueError("Expected an inode number")
-    if not (type(offset) is int and offset >= 0 and type(limit) is int and 0 < limit <= MAX_TAIL):
-        raise ValueError("Expected a byte offset and limit")
     path = Path(os.path.realpath(file))
     if path.suffix != ".jsonl" or not any(path.is_relative_to(r) for r in host_session_roots()):
         raise ValueError("Not a session transcript of this machine")
@@ -1181,7 +1259,7 @@ def _host_tail(file, inode, offset, limit):
         stream = open_beneath(path)
     except OSError as exc:
         raise ValueError("Not a session transcript of this machine") from exc
-    with stream:
+    try:
         info = os.fstat(stream.fileno())
         # What was opened must still be the file at the checked path: nothing on the way
         # there was swapped for a symlink in between.
@@ -1195,6 +1273,335 @@ def _host_tail(file, inode, offset, limit):
             or os.path.realpath(path) != str(path)
         ):
             raise ValueError("Not a session transcript of this machine")
+    except BaseException:
+        stream.close()
+        raise
+    return stream
+
+
+def _host_turn(file, session, agent):
+    """The current turn of one of this machine's transcripts, and its final response."""
+    if not isinstance(session, str) or not SESSION.match(session):
+        raise ValueError("Expected a session ID")
+    if agent not in {"claude", "codex"}:
+        raise ValueError("Expected claude or codex")
+    with _host_transcript(file) as stream:
+        lines = _ending_lines(stream)
+        turn, complete = (claude_turn if agent == "claude" else codex_turn)(lines, session)
+    return {
+        "turn": str(turn)[:MAX_TEXT],
+        "complete": None if complete is None else str(complete)[:MAX_TURN],
+    }
+
+
+def _ending_lines(stream):
+    """A transcript's first line and its last MAX_SCAN bytes, from a line start.
+
+    The latest turn is at the end; a Codex rollout names its session in its first line.
+    """
+    size = os.fstat(stream.fileno()).st_size
+    if size <= MAX_SCAN:
+        yield from transcript_lines(stream)
+        return
+    first = stream.readline(MAX_SCAN_LINE + 1)
+    if first.endswith(b"\n"):
+        yield first.decode("utf-8", errors="replace")
+    stream.seek(size - MAX_SCAN)
+    stream.readline()  # The rest of the line the seek landed in.
+    yield from transcript_lines(stream)
+
+
+def _host_fetch_refusals(clone, timeout):
+    """Refuse a fetch the clone's own config would redirect, or expose credentials on."""
+    result = _host_run([*HOST_GIT, "-C", clone, "config", "--list", "-z", "--show-scope"], timeout)
+    if result.returncode:
+        raise ValueError((result.stderr or "Git config unreadable")[-400:].strip())
+    fields = result.stdout.split("\0")
+    for index in range(0, len(fields) - 1, 2):  # zip(strict=) needs Python 3.10.
+        scope, key = fields[index], fields[index + 1].partition("\n")[0]
+        if scope in TRUSTED_SCOPES:
+            continue
+        if REDIRECT.fullmatch(key):
+            raise ValueError(f"The repository's own {key} redirects a fetch; Git was not run")
+        if TLS.fullmatch(key):
+            raise ValueError(
+                f"The repository's own {key} would expose GitHub credentials; Git was not run"
+            )
+
+
+def _host_fetch(clone, repo, base, remote, timeout=120):
+    """``base`` of github.com/``repo`` into ``refs/remotes/<remote>/<base>`` of ``clone``."""
+    _host_fetch_refusals(clone, timeout)
+    options = [arg for setting in FETCH_CONFIG for arg in ("-c", setting)]
+    result = _host_run(
+        [
+            *HOST_GIT,
+            *options,
+            *host_guard(clone),
+            "-C",
+            clone,
+            "fetch",
+            "--upload-pack=git-upload-pack",
+            "--no-write-fetch-head",
+            f"https://github.com/{repo}.git",
+            f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
+        ],
+        timeout,
+    )
+    if result.returncode:
+        raise ValueError((result.stderr or "git fetch failed")[-4000:].strip())
+
+
+def _host_common_dir(checkout):
+    """A linked worktree's Git common dir, read from its layout as safe_git.common_dir does.
+
+    Never what an agent-written ``commondir`` file names: ``.git`` must point at
+    ``<common>/worktrees/<id>``, whose ``gitdir`` registers this very checkout.
+    """
+    dot = os.path.join(checkout, ".git")
+
+    def refuse(reason):
+        return ValueError(f"The Git common dir of {checkout} cannot be verified: {reason}")
+
+    def read(path):
+        with open(path) as handle:
+            return handle.read(4096).strip()
+
+    if os.path.islink(dot) or not os.path.isfile(dot):
+        raise refuse(".git is not a worktree's gitdir file")
+    pointer = read(dot)
+    if not pointer.startswith("gitdir: "):
+        raise refuse(".git is not a gitdir file")
+    admin = os.path.realpath(os.path.join(checkout, pointer[len("gitdir: ") :]))
+    worktrees = os.path.dirname(admin)
+    common = os.path.dirname(worktrees)
+    if os.path.basename(worktrees) != "worktrees" or os.path.basename(common) != ".git":
+        raise refuse(f"{admin} is not a worktree of a clone's .git")
+    try:
+        registered = os.path.realpath(os.path.join(admin, read(os.path.join(admin, "gitdir"))))
+        named = os.path.realpath(os.path.join(admin, read(os.path.join(admin, "commondir"))))
+    except OSError as exc:
+        raise refuse(f"{admin} is incomplete ({exc.strerror})") from exc
+    if registered != os.path.realpath(dot):
+        raise refuse(f"{admin} does not register this checkout")
+    if named != common or os.path.lexists(os.path.join(common, "commondir")):
+        raise refuse(f"{admin}/commondir names another common dir")
+    if not os.path.isdir(os.path.join(common, "objects")):
+        raise refuse(f"{common} holds no objects")
+    return common
+
+
+def _host_trust(config, directory):
+    """Accept Claude's folder trust dialog for ``directory``, as claude_accounts.trust does.
+
+    ``--dangerously-skip-permissions`` does not skip that dialog. A missing or unreadable
+    config is left alone; ``BABYSIT_CLAUDE_TRUST=0`` turns it off.
+    """
+    if os.environ.get("BABYSIT_CLAUDE_TRUST") == "0":
+        return
+    path = Path(os.path.realpath(config))
+    temporary = None
+    try:
+        mode = path.stat().st_mode & 0o7777
+        value = json.loads(path.read_text())
+        projects = value.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            return
+        folder = Path(directory)
+        if any(
+            isinstance(projects.get(str(f)), dict)
+            and projects[str(f)].get("hasTrustDialogAccepted") is True
+            for f in (folder, *folder.parents)
+        ):
+            return
+        entry = projects.setdefault(str(folder), {})
+        if not isinstance(entry, dict):
+            return
+        entry["hasTrustDialogAccepted"] = True
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(json.dumps(value, indent=2, ensure_ascii=False))
+        os.replace(temporary, path)
+    except (OSError, ValueError, AttributeError, TypeError):
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def _branch(value, what):
+    if (
+        not isinstance(value, str)
+        or not BRANCH.fullmatch(value)
+        or ".." in value
+        or "//" in value
+        or value.endswith(("/", ".", ".lock"))
+    ):
+        raise ValueError(f"Expected a {what} branch name")
+    return value
+
+
+def _host_cron_checkout(
+    clone, repo, branch, base, directory, agent, account, babysit_root, sandbox
+):
+    """A cron job's checkout on this machine, made on first use as cron_agents does locally.
+
+    ``clone`` must be a clone of ``repo``: one of its remotes names that GitHub
+    repository. Every Git call is hardened (``host_git``), its one fetch names the job's
+    GitHub repository (``_host_fetch``), and the checkout must be a linked worktree of
+    that very clone, outside its ``.git``: an agent can rewrite the checkout's ``.git``
+    file to name any repository it made, but not that.
+
+    Returns the paths a launch line needs: the checkout, the clone, its common dir,
+    this machine's home, the agent's configuration directory (``claude_home``, real, for
+    the sandbox) and the ``CLAUDE_CONFIG_DIR`` to type (``claude_env``: literal, as
+    Claude names its Keychain item after it; None for the default login under
+    Safehouse), and babysit-pr's ``babysit-bwrap`` here. A Claude checkout is trusted in
+    the configuration the sandboxed Claude reads: babysit-bwrap (``sandbox``) always
+    sets ``CLAUDE_CONFIG_DIR``, so the default login reads ``~/.claude/.claude.json``.
+    """
+    _arg_paths([clone, directory, babysit_root], home=True)
+    if not isinstance(repo, str) or not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
+        raise ValueError("Expected an owner/repo")
+    _branch(branch, "job")
+    if base:
+        _branch(base, "base")
+    if agent not in {"claude", "codex"}:
+        raise ValueError("Expected claude or codex")
+    if account is not None and (not isinstance(account, str) or not ACCOUNT.fullmatch(account)):
+        raise ValueError("Expected a Claude account name")
+    if sandbox not in {"safehouse", "bwrap"}:
+        raise ValueError("Expected safehouse or bwrap")
+    literal_home = os.path.expanduser("~")
+    home = os.path.realpath(literal_home)
+    claude_home = claude_env = config = None
+    if agent == "claude":
+        named = account not in (None, "default")
+        default = os.path.join(literal_home, ".claude")
+        literal = os.path.join(default, "accounts", str(account)) if named else default
+        if named and not os.path.isdir(literal):
+            raise ValueError(f"Unknown Claude account {account} on this machine")
+        claude_home = os.path.realpath(literal)
+        claude_env = literal if named or sandbox == "bwrap" else None
+        config = (
+            os.path.join(claude_home, ".claude.json")
+            if claude_env
+            else os.path.join(home, ".claude.json")
+        )
+    clone = os.path.realpath(os.path.expanduser(clone))
+    remotes = remote_slugs(repo_config(host_git, clone))
+    tracking = [
+        name
+        for name in ("origin", "upstream", *sorted(remotes))
+        if remotes.get(name) == repo.lower()
+    ]
+    if not tracking:
+        raise ValueError(f"{clone} is not a clone of {repo}: none of its remotes names it")
+    common_expected = os.path.join(clone, ".git")
+    if os.path.islink(common_expected) or not os.path.isdir(common_expected):
+        raise ValueError(f"{clone} has no .git directory of its own")
+    common_expected = os.path.realpath(common_expected)
+    directory = os.path.expanduser(directory)
+    if os.path.isdir(directory):
+        path = os.path.realpath(directory)
+    else:
+        listing = host_git(clone, "worktree", "list", "--porcelain")
+        existing = _worktree_branches(listing).get(branch)
+        if existing and os.path.isdir(existing):
+            # An unattended agent never works in the user's own clone.
+            if os.path.realpath(existing) == clone:
+                raise ValueError(f"{branch} is checked out in the clone itself")
+            path = os.path.realpath(existing)
+        else:
+            if os.path.realpath(directory).startswith(common_expected + os.sep):
+                raise ValueError(f"{directory} lies inside {clone}'s .git")
+            os.makedirs(os.path.dirname(directory), exist_ok=True)
+            try:
+                host_git(clone, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+            except ValueError:
+                start = base or "HEAD"
+                # The job's own repository, never a URL the clone's config names; it lands
+                # in the refs of the remote that tracks it, named in full so no local
+                # branch or tag called <remote>/<base> wins.
+                if base:
+                    _host_fetch(clone, repo, base, tracking[0])
+                    start = f"refs/remotes/{tracking[0]}/{base}"
+                add = ["-b", branch, directory, start]
+            else:
+                add = [directory, branch]
+            # The new worktree's branch and git dir can bring config the clone's listing
+            # never sees, so its files are checked out by a reset run inside it.
+            host_git(clone, "worktree", "add", "--no-checkout", *add, timeout=120)
+            try:
+                host_git(directory, "reset", "--hard", "--quiet", timeout=120)
+            except Exception:
+                # Left behind, the empty checkout would be reused with every file deleted.
+                host_git(clone, "worktree", "remove", "--force", directory, timeout=120)
+                if add[0] == "-b":
+                    host_git(clone, "branch", "-D", branch)
+                raise
+            path = os.path.realpath(directory)
+    # Whatever route found it, the checkout is a worktree of this clone, outside its .git.
+    common = _host_common_dir(path)
+    if common != common_expected:
+        raise ValueError(f"{path} is not a worktree of {clone}")
+    if path == common or path.startswith(common + os.sep):
+        raise ValueError(f"{path} lies inside {clone}'s .git")
+    current = host_git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    if current != branch:
+        stated = f"{path} has {current} checked out instead of {branch}"
+        if host_git(path, "status", "--porcelain", "--untracked-files=no"):
+            raise ValueError(f"{stated}, with uncommitted changes")
+        try:
+            host_git(path, "switch", "--quiet", branch)
+        except ValueError as exc:
+            raise ValueError(f"{stated}, and switching back failed: {exc}") from exc
+    if config is not None:
+        _host_trust(config, path)
+    root = os.path.realpath(os.path.expanduser(babysit_root))
+    launcher = os.path.join(root, "scripts", "babysit-bwrap")
+    return {
+        "path": path,
+        "clone": clone,
+        "common": common,
+        "home": home,
+        "claude_home": claude_home,
+        "claude_env": claude_env,
+        "codex_home": os.path.realpath(
+            os.environ.get("CODEX_HOME") or os.path.join(home, ".codex")
+        ),
+        "launcher": launcher if os.access(launcher, os.X_OK) else None,
+    }
+
+
+def _worktree_branches(listing):
+    """``branch -> checkout path`` from ``git worktree list --porcelain``, as wt reads it."""
+    found: dict[str, str] = {}
+    path = ""
+    for line in listing.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            path = value
+        elif key == "branch" and path:
+            found.setdefault(value.removeprefix("refs/heads/"), path)
+        elif not key:
+            path = ""
+    return found
+
+
+def _host_tail(file, inode, offset, limit):
+    """Complete lines of one listed transcript from ``offset``, at most ``limit`` bytes.
+
+    A file replaced since (another ``inode``) or truncated below ``offset`` is read from
+    the start, which the answer's offset says. A full read inside one line longer than
+    ``limit`` is returned as it is, for the controller to join with the next.
+    """
+    if not (inode is None or (type(inode) is int and inode >= 0)):
+        raise ValueError("Expected an inode number")
+    if not (type(offset) is int and offset >= 0 and type(limit) is int and 0 < limit <= MAX_TAIL):
+        raise ValueError("Expected a byte offset and limit")
+    stream = _host_transcript(file)
+    with stream:
+        info = os.fstat(stream.fileno())
         start = offset if info.st_ino == inode and info.st_size >= offset else 0
         stream.seek(start)
         # No further than the size reported, though the file may grow meanwhile.
@@ -1218,6 +1625,8 @@ OPS: dict[str, Callable[..., Any]] = {
     "bases": _host_bases,
     "sessions": _host_sessions,
     "tail": _host_tail,
+    "turn": _host_turn,
+    "cron_checkout": _host_cron_checkout,
 }
 
 
@@ -1539,12 +1948,47 @@ def validate_tail(value):
     return {**value, "data": data}
 
 
+def validate_turn(value):
+    """Check a worker's answer for the current turn of a transcript."""
+    _expect(isinstance(value, dict) and set(value) == {"turn", "complete"}, "fields")
+    _expect(_text(value["turn"]) and value["turn"], "turn")
+    complete = value["complete"]
+    _expect(complete is None or (isinstance(complete, str) and len(complete) <= MAX_TURN), "text")
+    return value
+
+
+def validate_cron_checkout(value):
+    """Check a worker's cron checkout: absolute paths for the launch line, nothing else."""
+    fields = {
+        "path",
+        "clone",
+        "common",
+        "home",
+        "claude_home",
+        "claude_env",
+        "codex_home",
+        "launcher",
+    }
+    _expect(isinstance(value, dict) and set(value) == fields, "fields")
+    # These end up in a line typed into the worker's shell: a control character there
+    # is a keystroke.
+    for key in ("path", "clone", "common", "home", "codex_home"):
+        _expect(_absolute(value[key]) and not CONTROL.search(value[key]), key)
+    for key in ("claude_home", "claude_env", "launcher"):
+        _expect(
+            value[key] is None or (_absolute(value[key]) and not CONTROL.search(value[key])), key
+        )
+    return value
+
+
 VALIDATORS = {
     "inventory": validate_inventory,
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,
     "tail": validate_tail,
+    "turn": validate_turn,
+    "cron_checkout": validate_cron_checkout,
 }
 
 

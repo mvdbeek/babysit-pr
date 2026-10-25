@@ -37,7 +37,7 @@ def save():
  # Replaced whole, so a concurrent call (one machine's load beside another's) never
  # reads half a file.
  t=p.with_name(f'{p.name}.{os.getpid()}'); t.write_text(json.dumps(store)); os.replace(t,p)
-store['calls'].append(a); data=store
+store['calls'].append(a); data=store; label=None
 if a[:1] and a[0].startswith('--machine='):
  # Each saved machine keeps its own workspaces and agents, so two hosts can both hand out w1.
  label=a[0].split('=',1)[1]
@@ -103,6 +103,7 @@ elif a[:2] == ['pane','run']:
  data.setdefault('runs',[]).append(a[2:])
  save()
  env={**os.environ,'FAKE_WORKSPACE':w['workspace_id'],'FAKE_PANE':a[2]}
+ if label: env['FAKE_MACHINE']=label  # The agent starts on that machine.
  subprocess.check_call(['/bin/zsh','-fc',a[3]],cwd=w['worktree']['checkout_path'],env=env)
  sys.exit(0)
 save(); print(json.dumps({'result':result}))
@@ -120,8 +121,10 @@ if os.environ.get('SAFEHOUSE_ADD_DIRS'): agent['safehouse_add_dirs']=os.environ[
 if os.environ.get('CLAUDE_CONFIG_DIR'): agent['claude_config_dir']=os.environ['CLAUDE_CONFIG_DIR']
 for flag in ('resume','--resume'):
  if flag in sys.argv[1:]: agent['agent_session']={'value':sys.argv[sys.argv.index(flag)+1]}
+store=data
+if os.environ.get('FAKE_MACHINE'): data=data['machines'][os.environ['FAKE_MACHINE']]
 data['agents'].append(agent)
-p.write_text(json.dumps(data))
+p.write_text(json.dumps(store))
 """
 
 TMUX = """import json,os,sys

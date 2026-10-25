@@ -495,6 +495,11 @@ def agent_command(
     directory: str | None = None,
     worktree: str | None = None,
     sandbox_config_dir: str | None = None,
+    claude_config_env: str | None | bool = False,
+    backend: str | None = None,
+    features: Sequence[str] = (),
+    launcher: str | None = None,
+    confined: Sequence[str] | None = None,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -536,6 +541,12 @@ def agent_command(
     is given it explicitly; it defaults to ``directory``. ``sandbox_config_dir`` is the
     Claude configuration it may write, for callers that set the account up themselves;
     it defaults to ``claude_config_dir``.
+
+    A line for another machine names its own facts instead: ``backend`` (its
+    operating system's sandbox), ``features`` beyond Docker (``gpg`` where it can sign),
+    its babysit-bwrap ``launcher`` and ``confined`` options, and ``claude_config_env``,
+    the ``CLAUDE_CONFIG_DIR`` to type (None: Claude's default there), as
+    ``claude_accounts.shell_command`` takes it.
     """
     if unsandboxed and docker:
         raise ValueError("Docker access only applies inside Safehouse")
@@ -547,12 +558,16 @@ def agent_command(
     extra = [*added, *extra]
     command = sandbox.typed_line(
         agent_words(agent, model, effort, extra),
-        sandbox.Grants(add_dirs=tuple(grants), features=("docker",) if docker else ()),
+        sandbox.Grants(
+            add_dirs=tuple(grants), features=(("docker",) if docker else ()) + tuple(features)
+        ),
         stage,
         UNSANDBOXED_FLAGS[agent],
-        "none" if unsandboxed else None,
+        "none" if unsandboxed else backend,
         worktree or directory,
         sandbox_config_dir or claude_config_dir,
+        launcher,
+        confined,
     )
     if prompt:
         # `--` stops variadic options from swallowing the prompt.
@@ -560,10 +575,15 @@ def agent_command(
         command = f'{command}{separator} "$(cat {shlex.quote(stage(prompt))})"'
     if claude_config_dir:
         command = claude_accounts.shell_command(
-            command, claude_config_dir, subscription=claude_subscription
+            command,
+            claude_config_dir,
+            subscription=claude_subscription,
+            config_env=claude_config_env,
+            backend=backend,
         )
     if also and len(command.encode()) > TYPED_LIMIT:
         raise ValueError("The agent command is too long to type; use fewer --with clones")
+    sandbox.typed(command)  # The staged paths and account prefix as well.
     if directory and agent == "claude":
         claude_accounts.trust(claude_config_dir or claude_accounts.current_home(), directory)
     return command
@@ -953,7 +973,8 @@ class Tool:
                     f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
                     credentials=token,
                 )
-                start_point = f"{remote}/{base}"
+                # In full, so no local branch or tag named <remote>/<base> wins.
+                start_point = f"refs/remotes/{remote}/{base}"
                 break
         else:
             if "origin" in remotes:

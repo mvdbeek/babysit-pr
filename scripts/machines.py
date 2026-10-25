@@ -20,6 +20,7 @@ import threading
 import time
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 import owned_process
 
@@ -75,6 +76,22 @@ class RemotePath(str):
 # limit is per process; several supervisor processes each get their own.
 _channels: dict[str, threading.BoundedSemaphore] = {}
 _channels_lock = threading.Lock()
+
+
+def _collie_url(value):
+    # The dashboard puts it in links: an http(s) URL with a host, and nothing that could
+    # leave an attribute or start markup.
+    if not isinstance(value, str) or len(value) > 512 or not value.isprintable():
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return (
+        parts.scheme in {"http", "https"}
+        and bool(parts.hostname)
+        and not any(c in value for c in " \"'<>`\\")
+    )
 
 
 def _remote_path(value):
@@ -148,17 +165,7 @@ def _machine(raw):
             and all(isinstance(x, str) and CAPABILITY.fullmatch(x) for x in machine.labels),
             "labels",
         ),
-        (
-            machine.collie_url is None
-            or (
-                isinstance(machine.collie_url, str)
-                and machine.collie_url.startswith(("http://", "https://"))
-                and len(machine.collie_url) <= 512
-                and machine.collie_url.isprintable()
-                and " " not in machine.collie_url
-            ),
-            "collie_url",
-        ),
+        (machine.collie_url is None or _collie_url(machine.collie_url), "collie_url"),
         (isinstance(machine.enabled, bool), "enabled"),
     ]
     for ok, field in checks:
@@ -376,6 +383,47 @@ def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=Non
         )
     finally:
         channel.release()
+
+
+# A staged file's name: no path, no option, no hidden file.
+FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Writes stdin to a new private file and prints its absolute path. The folder must be
+# this user's own, writable by nobody else and not a symlink, before anything in it is
+# removed or written. With ``keep``, older regular files in it are removed first.
+PUT_FILE = (
+    'umask 077 && mkdir -p -- "$1" || exit 1\n'
+    'if [ -L "$1" ]; then echo "$1 is a symbolic link" >&2; exit 1; fi\n'
+    'cd -P -- "$1" || exit 1\n'
+    'if [ -z "$(find . -maxdepth 0 -user "$(id -u)" ! -perm -g+w ! -perm -o+w)" ]; then\n'
+    '  echo "$1 is not a folder only this user can write" >&2; exit 1\n'
+    "fi\n"
+    'if [ -n "$3" ]; then find . -maxdepth 1 -type f -mmin "+$3" -exec rm -f {} + ; fi\n'
+    'set -C && cat > "$2" && printf "%s/%s" "$(pwd -P)" "$2"'
+)
+# A terminal acts on these: never in a path a typed line will carry.
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def put_file(home, m: Machine, directory, name, data: bytes, *, keep=None, timeout=30) -> str:
+    """Write ``data`` to ``directory/name`` on ``m``: a new file only its owner reads.
+
+    ``directory`` is a ``RemotePath`` (it may start with ``~``) and is made if missing.
+    Returns the file's absolute path there; never overwrites one. ``keep`` (seconds)
+    first removes regular files in the folder older than that.
+    """
+    if not isinstance(name, str) or not FILE_NAME.fullmatch(name):
+        raise ValueError(f"Invalid staged file name {name!r}")
+    if not isinstance(directory, RemotePath):
+        directory = remote_path(directory)
+    minutes = "" if keep is None else str(max(1, int(keep) // 60))
+    result = run(
+        home, m, ["sh", "-c", PUT_FILE, "sh", directory, name, minutes], timeout=timeout, input=data
+    )
+    path = result.stdout.decode(errors="replace")
+    if result.returncode or not path.startswith("/") or CONTROL.search(path):
+        detail = result.stderr.decode(errors="replace").strip()[-300:]
+        raise ValueError(f"Could not stage {name} on {m.label}: {detail or 'no path returned'}")
+    return path
 
 
 def qualify(machine_id: str | None, wid: str) -> str:
