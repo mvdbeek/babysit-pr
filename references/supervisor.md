@@ -360,3 +360,14 @@ per ssh target in one process. They run with the worker's own environment and
 credentials, under `sh -c`, so the worker's login shell need not be POSIX.
 A timeout kills only the local ssh client; the remote process may keep running,
 so long-running remote work needs its own lifeline.
+
+With a registry, the dashboard's launch dialogs (Handle, Create, New task, batch
+review) offer a Machine select, and the Workspaces heading shows each machine's
+health and load from `herdr --machine=<label> workspace list`, cached for 15 s and
+refreshed in the background so no request waits on a worker. Auto always places on
+this machine for now. Choosing a worker by name checks it against the launch
+(disabled, unreachable, missing `labels` such as `docker`, `safehouse`/`bwrap` for
+the sandbox, `claude-account:<name>`, or a repo's `requires`) and records it on the
+operation or scheduled task, but the launch is refused: "Launching on <label> is
+not supported yet". `GET /api/placement?repo=&agent=&account=&docker=1` previews
+where Auto would place a launch and which machines can take it.

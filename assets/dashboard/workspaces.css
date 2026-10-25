@@ -1,6 +1,10 @@
 #workspaces-panel {
   min-width: 0;
 }
+/* Machine badges sit beside the heading, the filters keep the far side. */
+#ws-machines {
+  margin-right: auto;
+}
 #ws-status-line,
 #ws-notices {
   overflow-wrap: anywhere;

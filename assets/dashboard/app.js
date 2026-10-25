@@ -2129,6 +2129,40 @@ async function loadWorkspaces() {
   workspaceShown = request;
   workspaceData = value;
   workspaceLoadedAt = Date.now();
+  renderMachines();
+}
+// The machines launches can run on, from the registry, with their last known load.
+// Everything below stays hidden on a single machine.
+function machineName(id) {
+  return workspaceData.machines?.find((entry) => entry.id === id)?.label ?? id;
+}
+function machineText(entry) {
+  if (!entry.local && !entry.enabled) return `${entry.label} · disabled`;
+  if (!entry.local && entry.error) return `${entry.label} · unreachable`;
+  return entry.local
+    ? `${entry.label} · ${entry.agents} agents`
+    : `${entry.label} · ${entry.agents}/${entry.max_agents} busy`;
+}
+// Health and capacity beside the Workspaces heading.
+function renderMachines() {
+  const machines = workspaceData.machines ?? [];
+  const box = $("ws-machines");
+  box.hidden = machines.length < 2;
+  box.replaceChildren(
+    ...(box.hidden ? [] : machines).map((entry) => {
+      const tone =
+        !entry.local && !entry.enabled
+          ? ""
+          : !entry.local && entry.error
+            ? "red"
+            : !entry.local && entry.agents >= entry.max_agents
+              ? "amber"
+              : "green";
+      const badge = el("span", machineText(entry), `badge ${tone}`.trim());
+      if (entry.error) badge.title = entry.error;
+      return badge;
+    }),
+  );
 }
 // Overview ids are globally unique; watch ids carry a separate prefix.
 function workspaceInfo(item) {
@@ -2155,7 +2189,10 @@ async function refreshWorkspaces() {
     overviewVisible() ||
     !$("watcher-panel").hidden ||
     !$("attention-panel").hidden ||
-    $("workspace-dialog").open;
+    $("workspace-dialog").open ||
+    // Machine badges follow the snapshot once it lists workers; one machine has none.
+    (!$("workspaces-panel").hidden &&
+      (!workspaceLoadedAt || (workspaceData.machines?.length ?? 0) > 1));
   if (workspaceBusy || document.hidden || !visible) return;
   workspaceBusy = true;
   try {
@@ -2573,6 +2610,7 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
     repo = value;
     renderEffortDefaults();
     updateEfforts();
+    void updatePlacement();
   }
   function updateModels() {
     const choices = workspaceData.agent_choices?.[agent.value];
@@ -2635,16 +2673,21 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
   }
   function onUsage() {
     if (!agent.isConnected) window.removeEventListener("usage-updated", onUsage);
-    else applyUsage();
+    else {
+      applyUsage();
+      void updatePlacement();
+    }
   }
   agent.onchange = () => {
     personChose = true;
     updateModels();
     describeUsage();
+    void updatePlacement();
   };
   account.onchange = () => {
     personChose = true;
     describeUsage();
+    void updatePlacement();
   };
   model.onchange = () => {
     personChose = true;
@@ -2666,6 +2709,67 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
   docker.type = "checkbox";
   const dockerLabel = el("label", undefined, "workspace-later");
   dockerLabel.append(docker, " Allow Docker in the agent’s sandbox");
+  docker.addEventListener("change", () => void updatePlacement());
+  // Where the agent runs. Auto names the machine the server would pick for this repo,
+  // agent and Docker choice; machines that cannot take the launch are disabled.
+  const machines = workspaceData.machines ?? [];
+  const machine = el("select");
+  machine.id = "workspace-machine";
+  const machineNote = el("small", "", "machine-choice");
+  const machineLabel = el("label", "Machine");
+  machineLabel.htmlFor = machine.id;
+  const machineField = el("div", undefined, "new-task-fields");
+  machineField.append(machineLabel, machine, machineNote);
+  machineField.hidden = machines.length < 2;
+  const auto = el("option", "Auto");
+  auto.value = "auto";
+  machine.append(auto);
+  for (const entry of machines) {
+    const option = el("option", machineText(entry));
+    option.value = entry.id;
+    option.disabled = !entry.local && (!entry.enabled || Boolean(entry.error));
+    machine.append(option);
+  }
+  let preview = null,
+    previews = 0;
+  function describeMachine() {
+    const chosen = preview?.options.find((option) => option.id === machine.value);
+    machineNote.textContent =
+      machine.value === "auto"
+        ? (preview?.error ?? preview?.reason ?? "")
+        : chosen
+          ? `${chosen.note}. Starting agents on ${chosen.label} is not supported yet.`
+          : "Runs on this machine.";
+  }
+  machine.onchange = describeMachine;
+  async function updatePlacement() {
+    if (machineField.hidden) return;
+    const request = ++previews;
+    const query = new URLSearchParams({ agent: agent.value });
+    if (repo) query.set("repo", repo);
+    if (docker.checked) query.set("docker", "1");
+    if (agent.value === "claude" && account.value) query.set("account", account.value);
+    let value;
+    try {
+      value = await get(`/api/placement?${query}`);
+    } catch (error) {
+      value = { error: `Cannot preview placement: ${error.message}`, options: [] };
+    }
+    if (request !== previews) return;
+    preview = value;
+    auto.textContent = value.label ? `Auto (→ ${value.label})` : "Auto";
+    for (const entry of value.options) {
+      const option = [...machine.options].find((node) => node.value === entry.id);
+      if (!option) continue;
+      option.textContent = `${entry.label} · ${entry.note}`;
+      option.disabled = entry.disabled;
+    }
+    if (machine.selectedOptions[0]?.disabled) machine.value = "auto";
+    describeMachine();
+  }
+  void updatePlacement();
+  // The request field; none on a single machine, so its launches are unchanged.
+  const machineChoice = () => (machineField.hidden ? {} : { machine: machine.value });
   // `wt --exit-when-done`, for a launch that starts now; scheduled ones always quit.
   const quit = el("input");
   quit.id = "workspace-quit";
@@ -2687,6 +2791,8 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
     quitLabel,
     effortDefaults,
     setRepo,
+    machineField,
+    machineChoice,
   };
 }
 // A Start later checkbox and the time it reveals. `startTime()` is null to start now,
@@ -2823,6 +2929,8 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
         quit,
         quitLabel,
         effortDefaults,
+        machineField,
+        machineChoice,
       } = agentFields({ repo: item.repo, preferred });
       const task = el("textarea");
       task.id = "workspace-task";
@@ -2851,7 +2959,7 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
       field("Model (optional)", model);
       field("Reasoning effort (optional)", effort);
       field("Claude account", account);
-      form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel);
+      form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel, machineField);
       field("Task", task);
       form.append(promptHistory(task));
       const files = attachmentField(form, task);
@@ -2901,6 +3009,7 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
                 ? { claude_account: account.value }
                 : {}),
               ...(docker.checked ? { docker: true } : {}),
+              ...machineChoice(),
               ...(quit.checked && !start ? { exit_when_done: true } : {}),
               task: task.value.replaceAll(BATCH_URL, item.url || BATCH_URL),
               ...(handling && task.value === handling ? { prefilled: true } : {}),
@@ -3151,13 +3260,15 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       quitLabel,
       effortDefaults,
       setRepo,
+      machineField,
+      machineChoice,
     } = agentFields({ repo: repos[Number(repo.value)]?.repo });
     repo.addEventListener("change", () => setRepo(repos[Number(repo.value)]?.repo));
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel);
+    form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel, machineField);
     const task = el("textarea");
     task.id = "workspace-task";
     task.required = true;
@@ -3198,6 +3309,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
             ...(effort.value ? { effort: effort.value } : {}),
             ...(agent.value === "claude" && account.value ? { claude_account: account.value } : {}),
             ...(docker.checked ? { docker: true } : {}),
+            ...machineChoice(),
             ...(quit.checked ? { exit_when_done: true } : {}),
             ...(also.size ? { also: [...also] } : {}),
             task: task.value,
@@ -3354,12 +3466,14 @@ async function batchDialog(items, done, { nouns: [one, many], tasks, preferred =
       docker,
       dockerLabel,
       effortDefaults,
+      machineField,
+      machineChoice,
     } = agentFields({ ...projects(items), preferred });
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);
     field("Claude account", account);
-    form.append(usageNote, settingsNote, effortDefaults, dockerLabel);
+    form.append(usageNote, settingsNote, effortDefaults, dockerLabel, machineField);
     let template = taskPrompt(tasks[0], BATCH_URL);
     if (tasks.length > 1) {
       const picker = el("select");
@@ -3512,6 +3626,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks, preferred =
             ...(effort.value ? { effort: effort.value } : {}),
             ...(agent.value === "claude" && account.value ? { claude_account: account.value } : {}),
             ...(docker.checked ? { docker: true } : {}),
+            ...machineChoice(),
             task: task.value,
             ...(task.value === template ? { prefilled: true } : {}),
             ...(start ? { start_at: start } : {}),
@@ -3553,7 +3668,8 @@ function updateWorkspaceOperation() {
   const op = workspaceInfo(workspaceDialogItem)?.operation;
   if (!op) return;
   // The result below links Collie once the workspace is ready.
-  $("workspace-progress").textContent = `${op.status}: ${op.message}`;
+  $("workspace-progress").textContent =
+    `${op.status}: ${op.message}` + (op.machine ? ` · On ${machineName(op.machine)}` : "");
   $("workspace-log").textContent = op.log || "";
   if (op.result?.url)
     $("workspace-result").replaceChildren(
@@ -3674,6 +3790,7 @@ function scheduledCard(task) {
         request.effort && `${request.effort} effort`,
         request.claude_account && `Claude account: ${request.claude_account}`,
         request.docker && "Docker",
+        task.machine && `On ${machineName(task.machine)}`,
       ]
         .filter(Boolean)
         .join(" · "),

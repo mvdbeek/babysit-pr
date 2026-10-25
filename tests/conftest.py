@@ -32,18 +32,25 @@ else:
 HERDR = """import json,os,sys,subprocess
 from pathlib import Path
 p=Path(os.environ['FAKE_HERDR']); store=json.loads(p.read_text()); a=sys.argv[1:]
+def save():
+ # Replaced whole, so a concurrent call (one machine's load beside another's) never
+ # reads half a file.
+ t=p.with_name(f'{p.name}.{os.getpid()}'); t.write_text(json.dumps(store)); os.replace(t,p)
 store['calls'].append(a); data=store
 if a[:1] and a[0].startswith('--machine='):
  # Each saved machine keeps its own workspaces and agents, so two hosts can both hand out w1.
- data=store.setdefault('machines',{}).setdefault(a[0].split('=',1)[1],{'workspaces':[],'agents':[],'calls':[]})
+ label=a[0].split('=',1)[1]
+ data=store.setdefault('machines',{}).setdefault(label,{'workspaces':[],'agents':[],'calls':[]})
  a=a[1:]; data['calls'].append(a)
+ if label in os.environ.get('FAKE_HERDR_DOWN','').split(','):
+  save(); print(json.dumps({'error':{'message':f'cannot reach {label}'}})); sys.exit(1)
 result={}
 if a[:2] == ['status','server']: result={'running':os.environ.get('FAKE_HERDR_RUNNING','true')=='true'}
 elif a[:2] == ['workspace','list']: result={'workspaces':data['workspaces']}
 elif a[:2] == ['agent','list']: result={'agents':data['agents']}
 elif a[:2] == ['worktree','open']:
  if os.environ.get('FAKE_HERDR_OPEN_ERROR'):
-  p.write_text(json.dumps(store)); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_OPEN_ERROR']}})); sys.exit(1)
+  save(); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_OPEN_ERROR']}})); sys.exit(1)
  path=a[a.index('--path')+1]; root=a[a.index('--cwd')+1]
  existing=next((w for w in data['workspaces'] if w['worktree']['checkout_path']==path),None)
  if existing: wid=existing['workspace_id']
@@ -58,10 +65,10 @@ elif a[:2] == ['workspace','close']:
  data['workspaces']=[w for w in data['workspaces'] if w['workspace_id']!=a[2]]
  data['agents']=[g for g in data['agents'] if g.get('workspace_id')!=a[2]]
  if os.environ.get('FAKE_HERDR_CLOSE_ERROR'):
-  p.write_text(json.dumps(store)); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_CLOSE_ERROR']}})); sys.exit(1)
+  save(); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_CLOSE_ERROR']}})); sys.exit(1)
 elif a[:2] == ['agent','prompt']:
  if os.environ.get('FAKE_HERDR_PROMPT_ERROR'):
-  p.write_text(json.dumps(store)); print(json.dumps({'error':{'code':os.environ['FAKE_HERDR_PROMPT_ERROR'],'message':'refused'}})); sys.exit(1)
+  save(); print(json.dumps({'error':{'code':os.environ['FAKE_HERDR_PROMPT_ERROR'],'message':'refused'}})); sys.exit(1)
  data.setdefault('prompts',[]).append(a[2:4])
 elif a[:2] == ['pane','send-text']:
  data.setdefault('typed_text',[]).append([a[2], ' '.join(a[3:])])
@@ -72,7 +79,7 @@ elif a[:2] == ['agent','read']:
  # A scripted dialog: each key or text sent to the pane advances to its next screen.
  sent=[c for c in data['calls'] if c[:2] in (['agent','send-keys'],['pane','send-text']) and c[2]==a[2]]
  screens=data.get('screens',{}).get(a[2]) or ['']
- p.write_text(json.dumps(store)); print(screens[min(len(sent),len(screens)-1)]); sys.exit(0)
+ save(); print(screens[min(len(sent),len(screens)-1)]); sys.exit(0)
 elif a[:2] == ['pane','list']:
  wid=a[a.index('--workspace')+1] if '--workspace' in a else None
  result={'panes':[x for x in data.get('panes',[]) if wid is None or x['workspace_id']==wid]}
@@ -93,11 +100,11 @@ elif a[:2] == ['pane','split']:
 elif a[:2] == ['pane','run']:
  w=next(w for w in data['workspaces'] if a[2].startswith(w['workspace_id']+':'))
  data.setdefault('runs',[]).append(a[2:])
- p.write_text(json.dumps(store))
+ save()
  env={**os.environ,'FAKE_WORKSPACE':w['workspace_id'],'FAKE_PANE':a[2]}
  subprocess.check_call(['/bin/zsh','-fc',a[3]],cwd=w['worktree']['checkout_path'],env=env)
  sys.exit(0)
-p.write_text(json.dumps(store)); print(json.dumps({'result':result}))
+save(); print(json.dumps({'result':result}))
 """
 
 AGENT = """import json,os,sys
