@@ -183,7 +183,7 @@ options:
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
   --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
-                          the GitHub token (others go without)
+                          the GitHub token (others only when typed in a terminal)
   --worktree-root <path>  parent directory for the new checkout
   -h, --help    show this help
 """
@@ -215,7 +215,7 @@ options:
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
   --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
-                          the GitHub token (others go without)
+                          the GitHub token (others only when typed in a terminal)
   --worktree-root <path>  parent directory for the new checkout
   -h, --help    show this help
 """
@@ -908,20 +908,36 @@ class Tool:
             found[key[len("remote.") : -len(".url")]] = safe_git.github_slug(url)
         return found
 
+    def trusts_origin(self, options: Options) -> bool:
+        """Whether origin's GitHub repository, as the clone's config names it, gets the token.
+
+        Only for the user typing the command in a terminal: a dashboard launch names its
+        repository (``--github-repo``) and runs with ``BABYSIT_HOME`` set, whatever its
+        stdin is, and any other run without a terminal keeps the strict rule.
+        """
+        return not options.github_repo and "BABYSIT_HOME" not in self.env and self.isatty()
+
     def add_worktree(
-        self, repo_path: str, directory: str, branch: str, base: str, slug: str = ""
+        self,
+        repo_path: str,
+        directory: str,
+        branch: str,
+        base: str,
+        slug: str = "",
+        trust: bool = False,
     ) -> None:
         """Reuse a local branch, else create from the remote or local base.
 
         The base is fetched from a GitHub URL, never a remote's own (the agent writes
         those): from ``slug``, the repository this run was asked for, with the GitHub
         token, into the refs of the remote that tracks it; failing that from origin's
-        GitHub repository without the token. Anything else starts from the local base.
+        GitHub repository, with the token only when ``trust`` says so (see
+        ``trusts_origin``). Anything else starts from the local base.
         """
         os.makedirs(os.path.dirname(directory), exist_ok=True)
         remotes = self.remote_slugs(repo_path)
         start_point = base
-        sources = [(slug, True), (remotes.get("origin") or "", False)]
+        sources = [(slug, True), (remotes.get("origin") or "", trust)]
         for target, token in sources:
             tracking = [
                 n
@@ -1032,7 +1048,9 @@ class Tool:
         self.command_for(trial, lambda _: sample)
         for checkout, base in planned:
             if base:
-                self.add_worktree(checkout.clone, checkout.path, branch, base)
+                self.add_worktree(
+                    checkout.clone, checkout.path, branch, base, trust=self.trusts_origin(options)
+                )
             else:
                 self.warn(f"wt: {branch} is already checked out at {checkout.path}; using that")
             options.also_checkouts.append(checkout._replace(path=os.path.realpath(checkout.path)))
@@ -1319,7 +1337,14 @@ class Tool:
                 self.warn(f"wt: {branch} is already checked out at {existing}; opening that")
                 directory = existing
             else:
-                self.add_worktree(repo_path, directory, branch, base, options.github_repo)
+                self.add_worktree(
+                    repo_path,
+                    directory,
+                    branch,
+                    base,
+                    options.github_repo,
+                    trust=self.trusts_origin(options),
+                )
         self.open_session(options, directory, branch, repo_path)
 
     def reserve_wt(self, options: Options) -> None:
@@ -1339,7 +1364,14 @@ class Tool:
         if self.branch_exists(repo_path, branch):
             raise WtError(f"wt: explicit branch already exists: {branch}")
         base = args[0] if args else self.default_branch(repo_path)
-        self.add_worktree(repo_path, directory, branch, base, options.github_repo)
+        self.add_worktree(
+            repo_path,
+            directory,
+            branch,
+            base,
+            options.github_repo,
+            trust=self.trusts_origin(options),
+        )
         self.open_session(options, directory, branch, repo_path)
 
     def run_wti(self, options: Options) -> None:
@@ -1385,7 +1417,14 @@ class Tool:
             return
         if options.name and self.branch_exists(repo_path, branch):
             raise WtError(f"wti: explicit branch already exists: {branch}")
-        self.add_worktree(repo_path, directory, branch, self.default_branch(repo_path), host)
+        self.add_worktree(
+            repo_path,
+            directory,
+            branch,
+            self.default_branch(repo_path),
+            host,
+            trust=self.trusts_origin(options),
+        )
         self.open_session(options, directory, branch, repo_path)
 
     def run_wtpr(self, options: Options) -> None:
@@ -1414,7 +1453,8 @@ class Tool:
         validate_name(options.name, "wtpr")
         # A pull request of a repository named on the command line: its head repository
         # is GitHub's answer, so its fetch gets the token. One the clone's config names
-        # could be any repository the token reads, and goes without.
+        # could be any repository the token reads, and goes without unless the user typed
+        # this in a terminal (see trusts_origin).
         host = slug
         slug = slug or self.repo_slug(repo_path, "wtpr")
         info = self.gh_json(
@@ -1489,7 +1529,7 @@ class Tool:
             "fetch",
             url,
             f"refs/heads/{branch}:refs/heads/{local_branch}",
-            credentials=bool(host),
+            credentials=bool(host) or self.trusts_origin(options),
         )
         self.checkout_worktree(repo_path, directory, local_branch)
         try:

@@ -442,11 +442,16 @@ remote that tracks that repository (`origin/<base>`, or `upstream/<base>` when o
 a fork of it). Only those fetches get the GitHub token, through `gh auth git-credential`
 alone (no other credential helper), with the repository's `remote.*.uploadpack`
 replaced; a fetch with the token is refused when the repository's own config changes TLS
-verification, CAs, proxies, name resolution or cookie files. Without such a record (`wt`
-typed in a terminal, `--with` clones, `wtpr <number>` without a URL), `wt` fetches the
-GitHub repository origin's URL names without the token, so a redirected origin can reach
-nothing private, and a private origin fails to fetch; an origin that is no GitHub
-repository is not fetched, and the worktree starts from the local base. The user's own
+verification, CAs, proxies, name resolution or cookie files. Without such a record (`wt <branch>`,
+`--with` clones, `wtpr <number>` without a URL), `wt` fetches the GitHub repository
+origin's URL names. Typed in a terminal (stdin a TTY, no `--github-repo`, no
+`BABYSIT_HOME`, which dashboard launches always set), that fetch gets the token, so the
+user's own private repositories keep working. That leaves one gap: an agent that
+rewrote origin to another private GitHub repository the token reads has it fetched,
+into the common dir it reads, the next time the user runs `wt` in that clone. Any other
+run (dashboard, cron, agents) fetches it without the token, so a redirected origin
+reaches nothing private there and a private origin fails to fetch. An origin that is no
+GitHub repository is never fetched, and the worktree starts from the local base. The user's own
 URL rewrites still apply (to ssh, or a local mirror), so https, ssh and local paths stay
 allowed during a fetch. System and global config stay trusted.
 

@@ -796,3 +796,35 @@ def test_wt_fetches_another_github_repository_origin_names_only_without_the_toke
     [(argv, env)] = wt_fetches(spy)
     assert URL in argv and "+refs/heads/main:refs/remotes/upstream/main" in argv
     assert env["GH_TOKEN"]
+
+
+@pytest.mark.parametrize(
+    "tty,env,trusted",
+    [
+        (True, {}, True),  # The user typing wt in a terminal, in their own clone.
+        (False, {}, False),  # An agent or any other non-interactive run.
+        (True, {"BABYSIT_HOME": "/state"}, False),  # A dashboard launch, whatever stdin is.
+    ],
+)
+def test_wt_in_a_terminal_trusts_origins_github_repository_with_the_token(
+    planted, private, tmp_path, tty, env, trusted
+):
+    clone, _, git = planted
+    git("config", "remote.origin.url", "https://github.com/other/secret.git")
+    spy = Spy(dict(os.environ))
+    tool = wt.Tool(spy, {**os.environ, **env}, isatty=lambda: tty)
+    options = wt.Options()
+    tool.add_worktree(
+        str(clone),
+        str(tmp_path / "worktrees" / "a"),
+        "a",
+        "main",
+        trust=tool.trusts_origin(options),
+    )
+    [(argv, fetch_env)] = wt_fetches(spy)
+    assert "https://github.com/other/secret.git" in argv
+    assert bool(fetch_env.get("GH_TOKEN")) is trusted
+    assert any("gh auth" in arg for arg in argv) is trusted
+    # Named by the dashboard, the repository is the host's record, never origin's.
+    options.github_repo = "base/repo"
+    assert not tool.trusts_origin(options)
