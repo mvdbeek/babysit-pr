@@ -1107,9 +1107,16 @@ class Workspaces:
         ]
 
     def reservations(self):
-        """Launches running in this process by machine; herdr may not list them yet."""
+        """Launches running in this process by machine that herdr does not list yet.
+
+        One with a result has its workspace, which herdr already counts.
+        """
         ops = (self.operation(key) for key in list(self.workers))
-        placed = [op.get("machine") or placement.LOCAL for op in ops if op]
+        placed = [
+            op.get("machine") or placement.LOCAL
+            for op in ops
+            if op and op["status"] in {"queued", "running"} and not op.get("result")
+        ]
         return {machine_id: placed.count(machine_id) for machine_id in set(placed)}
 
     def place(self, request, fields, history=None):

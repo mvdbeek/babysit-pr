@@ -79,19 +79,25 @@ def exclusions(req, machines, loads, reservations, now):
     for machine_id, machine in machines.items():
         load = loads.get(machine_id) or {}
         since = load.get("unreachable_since")
+        # A refresh that has not finished for two TTLs leaves counts and unreachability
+        # that may no longer hold; the machine is checked again instead.
+        stale = now - load.get("attempted_at", now) > 2 * LOAD_TTL
         lacking = [label for label in requirements(req, machine) if label not in machine.labels]
-        missing = [repo for repo in req.get("also", []) if repo not in load.get("clones", ())]
+        # Clones are only known once a load lists them; until then the launch goes ahead
+        # and is refused for not being supported yet.
+        also = req.get("also", []) if "clones" in load else []
+        missing = [repo for repo in also if repo not in load["clones"]]
         used = busy(machine_id, loads, reservations)
         if not machine.enabled:
             excluded[machine_id] = Exclusion("disabled", False)
-        elif since is not None and now - since > LOAD_TTL:
+        elif since is not None and not stale and now - since > LOAD_TTL:
             excluded[machine_id] = Exclusion(f"unreachable {age(now - since)}", False)
         elif lacking:
             excluded[machine_id] = Exclusion(f"lacks {', '.join(lacking)}", False)
         elif missing and machine_id != LOCAL:
             # `wt --with` checks every clone out on one host.
             excluded[machine_id] = Exclusion(f"lacks clones of {', '.join(missing)}", False)
-        elif machine_id != LOCAL and load.get("pending"):
+        elif machine_id != LOCAL and (stale or load.get("pending")):
             # No load has come back yet, so its agents are unknown.
             excluded[machine_id] = Exclusion("checking…", True)
         elif machine_id != LOCAL and used >= machine.max_agents:
