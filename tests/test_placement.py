@@ -58,7 +58,11 @@ def test_hard_filter_reasons():
         "full": machine("full", "Full", max_agents=2),
         "gone": machine("gone", "Gone"),
     }
-    loads = {"full": load(agents=1), "gone": load(unreachable_since=NOW - 180)}
+    loads = {
+        "mini": load(clones=()),
+        "full": load(agents=1),
+        "gone": load(unreachable_since=NOW - 180),
+    }
     req = {"agent": "codex", "docker": True, "also": ["base/other"]}
     found = pl.exclusions(req, fleet, loads, {"full": 1}, NOW)
     assert {k: tuple(v) for k, v in found.items()} == {
@@ -74,6 +78,41 @@ def test_hard_filter_reasons():
     # Unreachable for less than one load TTL is still offered.
     recent = {"gone": load(unreachable_since=NOW - 5)}
     assert "gone" not in pl.exclusions({}, fleet, recent, {}, NOW)
+
+
+def test_clones_are_only_checked_once_a_worker_lists_them():
+    req = {"sandboxed": False, "also": ["base/other"]}
+    # No clone inventory yet: the launch is recorded, then refused as not supported.
+    assert pl.exclusions(req, FLEET, {"mini": load(), "box": load()}, {}, NOW) == {}
+    loads = {"mini": load(clones=("base/other",)), "box": load(clones=("base/repo",))}
+    assert pl.exclusions(req, FLEET, loads, {}, NOW) == {
+        "box": pl.Exclusion("lacks clones of base/other", False)
+    }
+
+
+def test_a_load_not_refreshed_for_two_ttls_is_checked_again():
+    stale, fresh = NOW - 2 * pl.LOAD_TTL - 1, NOW - 2 * pl.LOAD_TTL
+    req = {"sandboxed": False}
+    # Old counts are not trusted: neither an idle nor a full worker is offered to Auto.
+    for agents in (0, 4):
+        loads = {"mini": load(agents=agents, attempted_at=stale), "local": load(agents=8)}
+        assert pl.exclusions(req, FLEET, loads, {}, NOW) == {
+            "mini": pl.Exclusion("checking…", True)
+        }
+        assert choose(req, loads=loads, auto_remote=True).machine == "box"
+    # Nor is old unreachability: chosen by name, it is no longer refused outright.
+    gone = {"mini": load(unreachable_since=NOW - 600, attempted_at=stale)}
+    assert choose({"override": "mini"}, loads=gone).reason == "chosen; checking…"
+    # A hard reason still outranks it.
+    with pytest.raises(ValueError, match="^Linux box: lacks docker$"):
+        choose({"override": "box", "docker": True}, loads={"box": load(attempted_at=stale)})
+    # Within two TTLs both are trusted.
+    assert pl.exclusions(req, FLEET, {"mini": load(attempted_at=fresh)}, {}, NOW) == {}
+    with pytest.raises(ValueError, match="^Mac mini: unreachable 10m$"):
+        choose(
+            {"override": "mini"},
+            loads={"mini": load(unreachable_since=NOW - 600, attempted_at=fresh)},
+        )
 
 
 def test_auto_stays_local_until_remote_auto_is_enabled():

@@ -1929,6 +1929,8 @@ async function refresh(force = false) {
     data = await get("/api/status");
     window.dashboardNotifications?.watcher(data);
     render();
+    // Workers show their badges without waiting for the next machines poll.
+    if (data.workers && !workspaceData.machines) void refreshMachines();
     // Overview rows show their watch's state; unchanged rows are left as they are.
     if (!$("prs-panel").hidden) prTable.render();
     if (!$("issues-panel").hidden) issueTable.render();
@@ -2210,15 +2212,14 @@ async function refreshWorkspaces() {
     workspaceBusy = false;
   }
 }
-// Machine badges poll the registry and cached loads alone, never the whole snapshot.
-// A single machine has no badges: after the first attempt, answered or failed, it is
-// asked again only once a snapshot lists workers.
-let machinesAsked = false,
-  machinesBusy = false;
+// Machine badges poll the registry and cached loads alone, never the whole snapshot,
+// and only once the watcher status or a snapshot names workers: a single machine has
+// no badges and never asks.
+let machinesBusy = false;
 async function refreshMachines() {
-  if (machinesBusy || document.hidden || $("workspaces-panel").hidden) return;
-  if (machinesAsked && (workspaceData.machines?.length ?? 0) < 2) return;
-  machinesAsked = machinesBusy = true;
+  const workers = data?.workers || (workspaceData.machines?.length ?? 0) > 1;
+  if (machinesBusy || document.hidden || $("workspaces-panel").hidden || !workers) return;
+  machinesBusy = true;
   try {
     workspaceData.machines = (await get("/api/machines")).machines;
     renderMachines();

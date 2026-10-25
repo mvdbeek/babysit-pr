@@ -1,5 +1,6 @@
 """The Machine select, placement preview and machine badges, with stubbed workspace data."""
 
+import json
 import time
 
 import pytest
@@ -133,6 +134,12 @@ def site(page, dashboard_site):
     return dashboard_site[0], snapshot, previews, sent, calls
 
 
+def register_workers(site_home):
+    """The watcher status names workers, which is what lets the badges poll at all."""
+    worker = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin"}
+    (site_home / "machines.json").write_text(json.dumps({"version": 1, "machines": [worker]}))
+
+
 def open_new_task(page, url):
     page.goto(url)
     page.get_by_role("button", name="New task").click()
@@ -192,8 +199,9 @@ def test_machine_select_previews_and_disables_machines_that_cannot_take_it(page,
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_workspaces_toolbar_shows_machine_health(page, site, width):
+def test_workspaces_toolbar_shows_machine_health(page, site, dashboard_site, width):
     url, snapshot, _, _, calls = site
+    register_workers(dashboard_site[1])
     snapshot["machines"] = [
         LOCAL,
         MINI,
@@ -232,20 +240,36 @@ def test_workspaces_toolbar_shows_machine_health(page, site, width):
     page.screenshot(path=f"reports/placement-badges-{width}.png")
 
 
-@pytest.mark.parametrize("down", [False, True])
-def test_one_machine_asks_for_machines_once(page, site, down):
+def test_one_machine_never_asks_for_machines(page, site):
     url, _, _, _, calls = site
-    calls["machines_down"] = down
     page.clock.install()
     page.clock.pause_at(time.time() + 1)
-    page.goto(url + "/#workspaces")
+    with page.expect_response("**/api/status"):
+        page.goto(url + "/#workspaces")
     expect(page.locator("#ws-count")).to_have_text("0")
-    page.wait_for_function("() => !machinesBusy && machinesAsked")
     for _ in range(3):
-        page.clock.run_for(15000)
+        with page.expect_response("**/api/status"):
+            page.clock.run_for(15000)
+    expect(page.locator("#ws-machines")).to_be_hidden()
+    assert calls["machines"] == 0 and calls["workspaces"] == 0
+
+
+def test_badges_appear_once_the_status_names_workers(page, site, dashboard_site):
+    url, snapshot, _, _, calls = site
+    register_workers(dashboard_site[1])
+    snapshot["machines"] = [LOCAL, MINI]
+    calls["machines_down"] = True
+    page.goto(url + "/#workspaces")
+    # A failed answer is asked again by the next poll, never left for good.
     page.wait_for_function("() => !machinesBusy")
     expect(page.locator("#ws-machines")).to_be_hidden()
-    assert calls["machines"] == 1 and calls["workspaces"] == 0
+    asked = calls["machines"]
+    assert asked >= 1
+    calls["machines_down"] = False
+    expect(page.locator("#ws-machines .badge")).to_have_text(
+        ["This machine · 2 agents", "Mac mini · 4/4 busy"], timeout=20000
+    )
+    assert calls["workspaces"] == 0
 
 
 def test_a_refused_choice_stays_with_its_reason(page, site):

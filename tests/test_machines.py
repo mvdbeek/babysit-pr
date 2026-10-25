@@ -2,9 +2,11 @@
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -92,6 +94,12 @@ def test_valid_registry_with_defaults_and_repos(tmp_path):
         ({"ssh": "-oProxyCommand=x"}, "Invalid ssh"),
         ({"ssh": "mini host"}, "Invalid ssh"),
         ({"ssh": "mini;id"}, "Invalid ssh"),
+        ({"ssh": "a@-oProxyCommand=x"}, "Invalid ssh"),
+        ({"ssh": "a@b@c"}, "Invalid ssh"),
+        ({"ssh": "-a@b"}, "Invalid ssh"),
+        ({"ssh": "a" * 256}, "Invalid ssh"),
+        ({"os": ["linux"]}, "Invalid os"),
+        ({"os": {"linux": 1}}, "Invalid os"),
         ({"os": "windows"}, "Invalid os"),
         ({"src": "src"}, "Invalid src"),
         ({"babysit_root": "~other/babysit-pr"}, "Invalid babysit_root"),
@@ -120,23 +128,32 @@ def test_missing_required_field(tmp_path):
         machines.load(tmp_path)
 
 
-def test_duplicate_ids_and_labels(tmp_path):
+def test_duplicate_ids_labels_and_ssh_targets(tmp_path):
     write(tmp_path, MINI, {**MINI, "label": "Other"})
     with pytest.raises(ValueError, match="Duplicate machine id mini"):
         machines.load(tmp_path)
-    write(tmp_path, MINI, {**MINI, "id": "other"})
+    write(tmp_path, MINI, {**MINI, "id": "other", "ssh": "other"})
     with pytest.raises(ValueError, match="Duplicate machine label Mac mini"):
         machines.load(tmp_path)
+    write(tmp_path, MINI, {**MINI, "id": "other", "label": "Other"})
+    with pytest.raises(ValueError, match="Duplicate machine ssh target mini.tail1234.ts.net"):
+        machines.load(tmp_path)
+    write(tmp_path, MINI, {**MINI, "id": "other", "label": "Other", "ssh": "me@mini"})
+    assert sorted(machines.load(tmp_path)) == ["mini", "other"]  # aliases are not caught
 
 
 @pytest.mark.parametrize(
     ("top", "message"),
     [
         ({"version": 2}, "version must be 1"),
+        ({"version": True}, "version must be 1"),
+        ({"version": 1.0}, "version must be 1"),
         ({"extra": True}, "Unknown registry keys: extra"),
         ({"machines": {"mini": MINI}}, "list of at most 64"),
         ({"repos": {"not-a-slug": {}}}, "Invalid repos entry"),
         ({"repos": {"a/b": {"prefer": "nowhere"}}}, "prefers unknown machine nowhere"),
+        ({"repos": {"a/b": {"prefer": ["mini"]}}}, "Invalid prefer for a/b"),
+        ({"repos": {"a/b": {"prefer": {"mini": 1}}}}, "Invalid prefer for a/b"),
         ({"repos": {"a/b": {"requires": "docker"}}}, "Invalid requires"),
         ({"repos": {"a/b": {"pin": "mini"}}}, "Unknown keys for a/b: pin"),
     ],
@@ -181,13 +198,20 @@ def test_herdr_argv_local_is_unchanged_and_remote_uses_label(tmp_path):
     ]
 
 
+def unwrap(command):
+    """The sh command line inside ``remote_argv``'s octal-escaped wrapper."""
+    match = re.fullmatch(r"sh -c 'eval \"\$\(printf \"((?:\\[0-7]{3})*)\"\)\"'", command)
+    assert match, command
+    return bytes(int(x, 8) for x in match[1].split("\\")[1:]).decode()
+
+
 def test_remote_argv_quotes_hostile_arguments_and_paths(tmp_path, short_tmp):
     home = write(short_tmp / "home", MINI)
     mini = machines.resolve(home, "mini")
     argv = machines.remote_argv(
         home, mini, ["git", "log", "--format=%H", "a b; rm -rf /"], cwd="/w/it's $(id)"
     )
-    assert argv == [
+    assert argv[:-1] == [
         "ssh",
         "-o",
         "BatchMode=yes",
@@ -203,19 +227,79 @@ def test_remote_argv_quotes_hostile_arguments_and_paths(tmp_path, short_tmp):
         f"ControlPath={home}/ssh/%C",
         "mini.tail1234.ts.net",
         "--",
-        "sh -c 'cd -- '\"'\"'/w/it'\"'\"'\"'\"'\"'\"'\"'\"'s $(id)'\"'\"' && "
-        "git log --format=%H '\"'\"'a b; rm -rf /'\"'\"''",
     ]
-    assert machines.remote_argv(home, mini, ["ls"], cwd="~/src/my repo")[-1] == (
-        "sh -c 'cd -- \"$HOME\"/'\"'\"'src/my repo'\"'\"' && ls'"
+    assert unwrap(argv[-1]) == (
+        "cd -- '/w/it'\"'\"'s $(id)' && git log --format=%H 'a b; rm -rf /'"
     )
-    assert machines.remote_argv(home, mini, [machines.remote_path("~/b in/x"), "~/y"])[-1] == (
-        "sh -c '\"$HOME\"/'\"'\"'b in/x'\"'\"' '\"'\"'~/y'\"'\"''"
+    assert unwrap(machines.remote_argv(home, mini, ["ls"], cwd="~/src/my repo")[-1]) == (
+        "cd -- \"$HOME\"/'src/my repo' && ls"
     )
+    assert unwrap(
+        machines.remote_argv(home, mini, [machines.remote_path("~/b in/x"), "~/y"])[-1]
+    ) == ("\"$HOME\"/'b in/x' '~/y'")
     with pytest.raises(ValueError, match="Remote path"):
         machines.remote_path("rel/x")
     with pytest.raises(ValueError, match="absolute"):
         machines.remote_argv(home, mini, ["ls"], cwd="src")
+    with pytest.raises(ValueError, match="NUL"):
+        machines.remote_argv(home, mini, ["echo", "a\0b"])
+
+
+HOSTILE = [
+    "!",
+    "!!",
+    "a!b",
+    "!$",
+    "line\nbreak",
+    "\n",
+    "trailing\n",
+    "'",
+    "\\'';touch pwned;\\",
+    "\\",
+    "\\\\",
+    '"$HOME"',
+    "$(touch pwned)",
+    "`touch pwned`",
+    "~",
+    "%s%n",
+    "*",
+    "{a,b}",
+    "a\tb c",
+    "",
+    "-n",
+    "é ✓",
+]
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh", "dash", "ksh", "tcsh", "csh", "fish"])
+def test_remote_command_survives_any_login_shell(tmp_path, short_tmp, shell):
+    """sshd hands the command string to the worker's login shell as ``$SHELL -c``."""
+    path = shutil.which(shell)
+    if path is None:
+        pytest.skip(f"{shell} is not installed")
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    remote_home = tmp_path / "remote"
+    work = remote_home / "it's !x"
+    work.mkdir(parents=True)
+    echo = [
+        sys.executable,
+        "-c",
+        "import json,os,sys; print(json.dumps([os.getcwd(), *sys.argv[1:]]))",
+    ]
+    command = machines.remote_argv(home, mini, [*echo, *HOSTILE], cwd="~/it's !x")[-1]
+    assert set(command) <= set("sh -c'eval\"$(printf\\01234567)")
+    result = subprocess.run(
+        [path, "-c", command],
+        cwd=tmp_path,
+        env={"HOME": str(remote_home), "PATH": os.environ["PATH"], "LC_ALL": "en_US.UTF-8"},
+        capture_output=True,
+        input=b"",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [str(work.resolve()), *HOSTILE]
+    assert not list(tmp_path.rglob("pwned"))
 
 
 def test_control_path_directory_is_private_and_falls_back_when_too_long(tmp_path, short_tmp):
@@ -273,13 +357,32 @@ def test_run_remote_executes_in_fake_host_home(tmp_path, fake_tools, short_tmp):
     assert os.path.realpath(result.stdout.decode().strip()) == str(hostile.resolve())
     assert not list(tmp_path.rglob("pwned"))
     recorded = json.loads(fake_tools.read_text())["ssh"]
-    assert recorded[-1] == {
-        "target": "mini.tail1234.ts.net",
-        "command": "sh -c 'cd -- \"$HOME\"/'\"'\"'src/it'\"'\"'\"'\"'\"'\"'\"'\"'s $(touch pwned)'\"'\"' && pwd'",
-    }
+    assert recorded[-1]["target"] == "mini.tail1234.ts.net"
+    assert unwrap(recorded[-1]["command"]) == (
+        "cd -- \"$HOME\"/'src/it'\"'\"'s $(touch pwned)' && pwd"
+    )
 
     with pytest.raises(ValueError, match="worker's environment"):
         machines.run(home, mini, ["env"], timeout=10, env={"GH_TOKEN": "secret"})
+
+
+def test_run_remote_never_reads_the_controller_stdin(tmp_path, fake_tools, short_tmp):
+    home = write(short_tmp / "home", MINI)
+    script = (
+        "import machines,sys; m=machines.resolve(sys.argv[1],'mini');"
+        "r=machines.run(sys.argv[1],m,['cat'],timeout=10);"
+        "r2=machines.run(sys.argv[1],m,['cat'],timeout=10,input=b'given');"
+        "print(repr((r.stdout,r2.stdout)))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(home)],
+        input=b"controller stdin",
+        capture_output=True,
+        timeout=30,
+        env={**os.environ, "PYTHONPATH": str(Path(machines.__file__).parent)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.decode().strip() == repr((b"", b"given"))
 
 
 def test_run_expands_remote_paths_on_the_host_or_locally(
@@ -441,7 +544,5 @@ def test_wrappers_drive_herdr_here_and_git_over_ssh(tmp_path, fake_tools, short_
     head = pr_workspaces.git(clone, "symbolic-ref", "HEAD", machine=mini, home=home)
     assert head == "refs/heads/main"
     [call] = json.loads(fake_tools.read_text())["ssh"]
-    assert call == {
-        "target": "mini.tail1234.ts.net",
-        "command": f"sh -c 'git -C {clone} symbolic-ref HEAD'",
-    }
+    assert call["target"] == "mini.tail1234.ts.net"
+    assert unwrap(call["command"]) == f"git -C {clone} symbolic-ref HEAD"
