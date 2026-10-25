@@ -12,10 +12,10 @@ import secrets
 import sqlite3
 import subprocess
 from contextlib import contextmanager
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import agent_messages
-from pr_workspaces import COLLIE_URL, herdr
+from pr_workspaces import collie_url, herdr
 
 EXTENSION_ID = re.compile(r"[a-p]{32}")
 REQUEST_ID = re.compile(r"[a-zA-Z0-9-]{16,80}")
@@ -218,7 +218,7 @@ class Extension:
                     "session": (agent.get("agent_session") or {}).get("value"),
                     "targets": sorted(match["targets"]),
                     "repos": sorted(repos),
-                    "url": f"{COLLIE_URL}/space/{quote(agent['workspace_id'], safe='')}",
+                    "url": collie_url(None, agent["workspace_id"]),
                 }
             )
         return choices, None

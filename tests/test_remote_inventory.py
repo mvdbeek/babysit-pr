@@ -965,3 +965,13 @@ def test_a_failing_worker_backs_off_longer_each_time(fleet, monkeypatch):
     assert "mini" not in plugin.retry and plugin.value["machines"]["mini"]["status"] == "ok"
     monkeypatch.setenv("FAKE_SSH_DOWN", "mini.test")
     assert backoff() == 2
+
+
+def test_a_worker_row_links_its_own_collie_when_the_registry_names_one(fleet):
+    register(fleet["home"], {**MINI, "collie_url": "https://mini.example.ts.net:8787"})
+    value = wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect()
+    merged = by_key(value)[f"m:mini:{fleet['mini'] / 'merged-work'}"]
+    assert merged["workspace_url"] == "https://mini.example.ts.net:8787/space/w1"
+    assert by_key(value)["workspace:mini:w2"]["workspace_url"] == (
+        "https://mini.example.ts.net:8787/space/w2"
+    )

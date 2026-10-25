@@ -13,6 +13,7 @@ from unittest.mock import ANY
 from urllib.parse import quote
 
 import dashboard
+import pr_workspaces
 import pytest
 import workspace_overview as wso
 import workspace_viewer as wso_viewer
@@ -1204,7 +1205,9 @@ def test_open_workspace_reuses_or_creates_without_touching_agents(server, site, 
         status, value = request(
             port, "/api/workspace-open", {"key": str(worktrees / name)}, action="workspace-open"
         )
-        assert status == 200 and value == {"url": f"{wso.COLLIE_URL}/space/{workspace_id}"}
+        assert status == 200 and value == {
+            "url": f"{pr_workspaces.COLLIE_URL}/space/{workspace_id}"
+        }
     opened = calls(state, ["worktree", "open"])
     assert len(opened) == (0 if name == "merged-work" else 1)
     if opened:
@@ -1432,7 +1435,7 @@ def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
             ]
             assert value["path"].endswith("merged-work") and value["sessions"] == []
             # Text that sends the reader to Collie links this workspace there.
-            assert value["url"] == f"{wso.COLLIE_URL}/space/w1"
+            assert value["url"] == f"{pr_workspaces.COLLIE_URL}/space/w1"
             body = {"workspace": "w1", "text": "Please add a test.\r\nThen push.\x1b[201~\x15"}
             status, value = request(
                 port, "/api/workspace-message", body, action="workspace-message"
@@ -2127,7 +2130,7 @@ def test_the_viewer_follows_a_workspace_reopened_under_a_new_id(site, tmp_path, 
             port = httpd.server_port
             status, value = request(port, "/api/workspace-agents?workspace=w1")
             assert status == 200 and value["workspace"] == "w7"
-            assert value["url"] == f"{wso.COLLIE_URL}/space/w7"
+            assert value["url"] == f"{pr_workspaces.COLLIE_URL}/space/w7"
             assert [agent["pane"] for agent in value["agents"]] == ["w7:p1"]
             assert value["path"] == str((worktrees / "merged-work").resolve())
             body = {"workspace": "w1", "text": "Carry on"}

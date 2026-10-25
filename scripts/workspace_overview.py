@@ -29,7 +29,7 @@ import owned_process
 import remote_probe
 import safe_git
 import workspace_viewer
-from pr_workspaces import COLLIE_URL, SLUG, clone_worktrees, herdr, remote_slugs, repo_config
+from pr_workspaces import SLUG, clone_worktrees, collie_url, herdr, remote_slugs, repo_config
 
 INTERVAL = 300  # Local rescan cadence; GitHub state has its own freshness window.
 MIN_REFRESH = 60  # Floor between requested rescans, however often the tab asks.
@@ -1145,7 +1145,10 @@ class WorkspaceOverview:
             machine_label=machine.label,
             machine_stale=False,
             workspace_ids=[machines.qualify(machine.id, wid) for wid in row["workspace_ids"]],
-            workspace_url=None,
+            # The worker's own Collie, if the registry names one.
+            workspace_url=collie_url(machine, row["workspace_ids"][0])
+            if row["workspace_ids"]
+            else None,
             removable=False,
         )
         return row
@@ -1204,9 +1207,7 @@ class WorkspaceOverview:
             "missing": False,
             "upstream": ":".join(part for part in item.get("upstream") or [] if part) or None,
             "workspace_ids": [space["workspace_id"] for space in found],
-            "workspace_url": (
-                f"{COLLIE_URL}/space/{quote(found[0]['workspace_id'], safe='')}" if found else None
-            ),
+            "workspace_url": collie_url(None, found[0]["workspace_id"]) if found else None,
             "agent_status": found[0].get("agent_status") if found else None,
             "agents": [
                 {
@@ -1273,7 +1274,7 @@ class WorkspaceOverview:
                     "missing": missing,
                     "upstream": None,
                     "workspace_ids": [space["workspace_id"]],
-                    "workspace_url": f"{COLLIE_URL}/space/{quote(space['workspace_id'], safe='')}",
+                    "workspace_url": collie_url(None, space["workspace_id"]),
                     "agent_status": space.get("agent_status"),
                     "agents": [
                         {

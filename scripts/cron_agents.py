@@ -24,7 +24,6 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import quote
 
 import claude_accounts
 import herdr_handoff as handoff
@@ -33,7 +32,7 @@ import safe_git
 import workspace_agents
 import workspace_exit
 import wt
-from pr_workspaces import BRANCH_NAME, COLLIE_URL, SLUG, herdr, run
+from pr_workspaces import BRANCH_NAME, SLUG, collie_url, herdr, run
 from pr_workspaces import git as workspaces_git
 from pr_workspaces import remote_slugs as workspaces_remote_slugs
 from pr_workspaces import repo_config as workspaces_repo_config
@@ -257,7 +256,7 @@ def start(job, run_id, home, src):
         "workspace_id": workspace,
         "pane": pane,
         "path": str(path),
-        "url": f"{COLLIE_URL}/space/{quote(workspace, safe='')}",
+        "url": collie_url(None, workspace),
         "exit_marker": marker,
         "launched_at": time.time(),
     }

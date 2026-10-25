@@ -39,6 +39,17 @@ from issue_overview import branch_number
 
 # Collie's own setting for the URL it is reached at; unset means its loopback default.
 COLLIE_URL = (os.environ.get("COLLIE_PUBLIC_URL") or "http://127.0.0.1:8787").rstrip("/")
+
+
+def collie_url(machine, workspace_id):
+    """Collie's page for a herdr workspace on ``machine`` (None: this one).
+
+    A worker's comes from its registry ``collie_url``; without one there is no link.
+    """
+    base = COLLIE_URL if machine is None else (machine.collie_url or "").rstrip("/")
+    return f"{base}/space/{quote(workspace_id, safe='')}" if base else None
+
+
 # The portable wt/wti/wtpr implementation shipped next to this module.
 WORKTREE_HELPER = str(Path(__file__).resolve().with_name("wt.py"))
 POLL_SECONDS = 15
@@ -869,7 +880,7 @@ class Workspaces:
                             "agent_status": workspace.get("agent_status", "unknown")
                             if workspace
                             else "No workspace",
-                            "url": f"{COLLIE_URL}/space/{quote(wid, safe='')}" if wid else None,
+                            "url": collie_url(None, wid) if wid else None,
                             "linked_pr": linked["number"] if linked else None,
                         }
                     )
@@ -2055,7 +2066,7 @@ class Workspaces:
                         "created_at": float(w["created_at"]),
                         "state": w["exit"]["state"],
                         "message": w["exit"]["message"],
-                        "url": f"{COLLIE_URL}/space/{quote(w['workspace_id'], safe='')}",
+                        "url": collie_url(None, w["workspace_id"]),
                     }
                 )
             except (KeyError, TypeError, ValueError):

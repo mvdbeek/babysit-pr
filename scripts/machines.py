@@ -20,6 +20,7 @@ import threading
 import time
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 import owned_process
 
@@ -75,6 +76,22 @@ class RemotePath(str):
 # limit is per process; several supervisor processes each get their own.
 _channels: dict[str, threading.BoundedSemaphore] = {}
 _channels_lock = threading.Lock()
+
+
+def _collie_url(value):
+    # The dashboard puts it in links: an http(s) URL with a host, and nothing that could
+    # leave an attribute or start markup.
+    if not isinstance(value, str) or len(value) > 512 or not value.isprintable():
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return (
+        parts.scheme in {"http", "https"}
+        and bool(parts.hostname)
+        and not any(c in value for c in " \"'<>`\\")
+    )
 
 
 def _remote_path(value):
@@ -148,17 +165,7 @@ def _machine(raw):
             and all(isinstance(x, str) and CAPABILITY.fullmatch(x) for x in machine.labels),
             "labels",
         ),
-        (
-            machine.collie_url is None
-            or (
-                isinstance(machine.collie_url, str)
-                and machine.collie_url.startswith(("http://", "https://"))
-                and len(machine.collie_url) <= 512
-                and machine.collie_url.isprintable()
-                and " " not in machine.collie_url
-            ),
-            "collie_url",
-        ),
+        (machine.collie_url is None or _collie_url(machine.collie_url), "collie_url"),
         (isinstance(machine.enabled, bool), "enabled"),
     ]
     for ok, field in checks:
