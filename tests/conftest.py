@@ -156,7 +156,9 @@ while a and a[0].startswith('-') and a[0] != '--':
  a=a[2:] if a[0] in ('-o','-p','-l','-i','-F','-S','-J') else a[1:]
 target=a[0]; a=a[2:] if a[1:2] == ['--'] else a[1:]
 command=' '.join(a)
-data.setdefault('ssh',[]).append({'target':target,'command':command}); p.write_text(json.dumps(data))
+data.setdefault('ssh',[]).append({'target':target,'command':command})
+# Replaced whole, like herdr's state, so a herdr call beside it never reads half a file.
+t=p.with_name(f'{p.name}.{os.getpid()}'); t.write_text(json.dumps(data)); os.replace(t,p)
 if os.environ.get('FAKE_SSH_DOWN') == target:
  print(f'ssh: connect to host {target} port 22: Connection refused',file=sys.stderr); sys.exit(255)
 # The remote side: the command line through a shell, from a per-host home.

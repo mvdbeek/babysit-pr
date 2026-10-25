@@ -350,6 +350,9 @@ class Feed:
         if not (snapshot or {}).get("enabled"):
             return
         for row in snapshot.get("workspaces") or []:
+            # A worker's rows are listed on the Workspaces tab only, until they can be acted on.
+            if row.get("machine"):
+                continue
             agents = row.get("agents") or []
             reasons = self.agent_reasons([a.get("status") for a in agents])
             links = [

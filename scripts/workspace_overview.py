@@ -24,7 +24,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 import github_cli
+import machines
 import owned_process
+import remote_probe
 import workspace_viewer
 from pr_workspaces import COLLIE_URL, SLUG, clone_worktrees, herdr, remote_slugs, repo_config
 
@@ -44,8 +46,9 @@ MAX_TARGETS = 50
 MAX_LINKS = 500
 MAX_STATE = 4 * 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
-MAX_CHANGES = 1000
-MAX_UNPUSHED = 100
+MAX_UNPUSHED = remote_probe.MAX_UNPUSHED
+# One worker's whole scan, herdr listings and probe together; slower ones are left stale.
+REMOTE_TIMEOUT = 120
 EXIT_WAIT = 5
 CACHE_VERSION = 1
 WORKING = {"working", "blocked"}
@@ -113,147 +116,22 @@ class Budget:
         return self.fetch(endpoint) if payload is None else self.fetch(endpoint, payload)
 
 
-def counted(value, limit):
-    return min(len(value), limit)
+checkout_times = remote_probe.checkout_times
 
 
-def checkout_times(path, changed=()):
-    """Worktree creation and activity; inspection must never advance these times."""
-    root = Path(path)
-    created = None
-    updated = []
-    try:
-        stat = root.stat()
-        created = getattr(stat, "st_birthtime", None)
-        updated.append(stat.st_mtime)
-        git_dir = root / ".git"
-        if git_dir.is_file():
-            pointer = git_dir.read_text().strip().removeprefix("gitdir: ")
-            git_dir = (root / pointer).resolve()
-        log = git_dir / "logs" / "HEAD"
-        try:
-            # The first reflog entry records worktree creation, even on filesystems
-            # without birth times. Its mtime follows commits, resets and checkouts.
-            with log.open() as stream:
-                created = float(stream.readline().split("\t", 1)[0].split()[-2])
-            updated.append(log.stat().st_mtime)
-        except (OSError, ValueError, IndexError):
-            updated.append((git_dir / "HEAD").stat().st_mtime)
-        for name in changed[:MAX_CHANGES]:
-            if name:
-                try:
-                    updated.append((root / name).lstat().st_mtime)
-                except OSError:
-                    pass  # A deleted file has no remaining timestamp.
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return {"created_at": created, "updated_at": max(updated, default=created)}
+def session_cwd(file, agent):
+    session = workspace_viewer.details(file, agent)
+    return session["cwd"] if session else None
 
 
 def transcript_updates(paths, src):
-    """Scan session stores once per inventory, matching the most specific checkout."""
-    roots = [src, *(Path(path) for path in paths if not Path(path).is_relative_to(src))]
-    seen = set()
-    updates: dict[str, float] = {}
-    for root in roots:
-        for agent, file in workspace_viewer.session_files(root):
-            if file in seen:
-                continue
-            seen.add(file)
-            session = workspace_viewer.details(file, agent)
-            if not session:
-                continue
-            cwd = Path(session["cwd"]).resolve()
-            checkout = next((str(p) for p in (cwd, *cwd.parents) if str(p) in paths), None)
-            if checkout:
-                try:
-                    updates[checkout] = max(updates.get(checkout, 0), file.stat().st_mtime)
-                except OSError:
-                    pass
-    return updates
-
-
-def landed(path, missing, merges):
-    """Of commits no remote carries by name, those whose content is upstream anyway.
-
-    A branch rebased before it merged keeps every change and loses every commit name,
-    so the local copy looks entirely unpushed while the base carries the same patches.
-    `git cherry` compares patch ids rather than names and marks those `-`. It skips
-    merge commits, which hold nothing of their own beyond a conflict resolution, so a
-    merge is landed exactly when its combined diff against all parents is empty.
-
-    Unknowable is not landed, and the error is always towards keeping work: without a
-    base branch, when Git declines to answer, or when a squash folded several commits
-    into one patch equal to none of them, every commit stays counted.
-    """
-    try:
-        base = git(path, "rev-parse", "--abbrev-ref", "origin/HEAD")
-        equivalent = {
-            line[2:].strip()
-            for line in git(path, "cherry", base, "HEAD").splitlines()
-            if line.startswith("-")
-        }
-    except (OSError, ValueError, subprocess.SubprocessError):
-        equivalent = set()
-    found = {sha for sha in missing if sha in equivalent}
-    for sha in merges - found:
-        try:
-            # -U0 keeps an evil merge's combined diff small; only its emptiness matters.
-            if not git(path, "show", "--format=", "--cc", "-U0", sha, strip=False).strip():
-                found.add(sha)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
-    return found
+    """This machine's session stores, scanned once per inventory; see ``remote_probe``."""
+    return remote_probe.transcript_updates(paths, src, workspace_viewer.session_files, session_cwd)
 
 
 def local_state(path, branch=None):
-    """Uncommitted changes and commits only this branch has, without touching either."""
-    try:
-        status = git(path, "--no-optional-locks", "status", "--porcelain", "-z", strip=False)
-        changes = []
-        records = iter(status.split("\0"))
-        for record in records:
-            if not record:
-                continue
-            # NUL-delimited porcelain leaves paths unquoted, including newlines.
-            changes.append(record[3:])
-            if "R" in record[:2] or "C" in record[:2]:
-                next(records, None)  # Renames/copies carry the old path separately.
-        # Only a commit that no remote ref and no other local branch carries would be
-        # lost with this worktree, so those are the ones worth blocking on.
-        # `--exclude` matches `--branches` with the refs/heads/ prefix already stripped.
-        exclude = [f"--exclude={branch}"] if branch else []
-        missing, merges = set(), set()
-        for record in git(
-            path,
-            "--no-optional-locks",
-            "rev-list",
-            f"--max-count={MAX_UNPUSHED}",
-            "--parents",
-            "HEAD",
-            "--not",
-            "--remotes",
-            *exclude,
-            "--branches",
-            "--tags",
-        ).splitlines():
-            sha, *parents = record.split()
-            missing.add(sha)
-            if len(parents) > 1:
-                merges.add(sha)
-        # Carrying a name no remote knows is not the same as carrying lost work, and
-        # reading the whole set is only affordable while it stays under the ceiling.
-        if missing and len(missing) < MAX_UNPUSHED:
-            missing -= landed(path, missing, merges)
-        return {
-            **checkout_times(path, changes),
-            "changes": counted(changes, MAX_CHANGES),
-            "unpushed": len(missing),
-            "error": None,
-        }
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        detail = (str(exc).splitlines() or [""])[0][:120]
-        return {"changes": None, "unpushed": None, "error": f"Local state unavailable: {detail}"}
+    """Uncommitted changes and commits only this branch has, through this machine's Git."""
+    return remote_probe.local_state(git, path, branch)
 
 
 def candidates(item, base, origin_owner):
@@ -477,6 +355,8 @@ class WorkspaceOverview:
         self.partial: dict | None = None
         self.src = Path(src).expanduser() if src else Path.home() / "src"
         self.roots: list[Path] = []
+        # Worker machine ids whose failed scan is not retried before this time.
+        self.retry: dict[str, float] = {}
         try:
             config_path = self.directory / "config.json"
             if not config_path.exists():
@@ -511,10 +391,23 @@ class WorkspaceOverview:
     # Inventory -----------------------------------------------------------------
 
     def inventory_scope(self):
-        return {
+        scope: dict = {
             "src": str(self.src.resolve()),
             "roots": sorted({str(root.resolve()) for root in self.roots}),
         }
+        # A registry change discards the cached rows; without one the scope is as before.
+        if workers := sorted(machine.id for machine in self.remote_machines()):
+            scope["machines"] = workers
+        return scope
+
+    def remote_machines(self, warnings=None):
+        """Enabled worker machines, scanned beside this one; none without a registry."""
+        try:
+            return [machine for machine in machines.load(self.home).values() if machine.enabled]
+        except (OSError, ValueError) as exc:
+            if warnings is not None:
+                warnings.append(f"Machine registry unavailable; scanning this machine only: {exc}")
+            return []
 
     def snapshot(self, start=True):
         """The inventory as it is; `start=False` reads it without bringing a scan forward."""
@@ -627,27 +520,29 @@ class WorkspaceOverview:
             finally:
                 temporary.unlink(missing_ok=True)
 
-    def spaces(self, warnings):
+    def spaces(self, warnings, machine=None):
         try:
-            return herdr("workspace", "list")["workspaces"]
+            return herdr("workspace", "list", machine=machine)["workspaces"]
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-            warnings.append(f"herdr workspaces unavailable: {exc}")
+            where = f"{machine.label}: " if machine else ""
+            warnings.append(f"{where}herdr workspaces unavailable: {exc}")
             return []
 
-    def agents(self, warnings):
+    def agents(self, warnings, machine=None):
         try:
-            return herdr("agent", "list")["agents"]
+            return herdr("agent", "list", machine=machine)["agents"]
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-            warnings.append(f"herdr agents unavailable: {exc}")
+            where = f"{machine.label}: " if machine else ""
+            warnings.append(f"{where}herdr agents unavailable: {exc}")
             return []
 
     def scanned_roots(self, spaces):
         """Clone roots this experiment is allowed to touch: its own scan, nothing else."""
-        roots = {Path(w["worktree"]["repo_root"]).resolve() for w in spaces if w.get("worktree")}
-        roots.update(root.resolve() for root in self.roots if (root / ".git").exists())
-        if self.src.exists():
-            roots.update(p.resolve() for p in self.src.iterdir() if (p / ".git").is_dir())
-        return roots
+        return remote_probe.scanned_roots(
+            self.src,
+            self.roots,
+            [w["worktree"]["repo_root"] for w in spaces if w.get("worktree")],
+        )
 
     def inventory(self, warnings):
         """Every clone's worktrees plus the herdr workspaces and agents attached to them."""
@@ -666,10 +561,14 @@ class WorkspaceOverview:
                 checkouts[item["path"]] = item
         return clones, checkouts, spaces, agents
 
-    def base_repo(self, clone, budget, warnings):
-        """The repository pull requests target: an `upstream` remote, or origin's parent."""
-        remotes = remote_slugs(repo_config(clone["path"]))
-        saved = self.bases.get(clone["path"])
+    def base_repo(self, clone, budget, warnings, config=None, key=None):
+        """The repository pull requests target: an `upstream` remote, or origin's parent.
+
+        A worker's clone brings the ``config`` its probe read and caches under its row key.
+        """
+        remotes = remote_slugs(repo_config(clone["path"]) if config is None else config)
+        key = key or clone["path"]
+        saved = self.bases.get(key)
         if saved and time.time() - saved.get("checked_at", 0) < BASE_TTL:
             return saved["repo"], saved.get("origin_owner")
         origin = remotes.get("origin")
@@ -687,7 +586,7 @@ class WorkspaceOverview:
                 return (saved["repo"] if saved else None), owner
         if base and (not SLUG.fullmatch(base) or base.split("/")[1] in {".", ".."}):
             base = None
-        self.bases[clone["path"]] = {
+        self.bases[key] = {
             "repo": base,
             "origin_owner": owner,
             "checked_at": time.time(),
@@ -802,6 +701,8 @@ class WorkspaceOverview:
 
     def collect(self, publish=None):
         warnings: list[str] = []
+        # Workers scan in their own threads while this machine scans as it always has.
+        scans = self.start_scans(self.remote_machines(warnings))
         clones, checkouts, spaces, agents = self.inventory(warnings)
         watched = self.watched_checkouts()
         opened = {
@@ -879,10 +780,15 @@ class WorkspaceOverview:
                     waiting.append((path, future.result()))
                 else:
                     add(path, future.result())
+        failed = lookups.result()
+        statuses = {}
+        if scans:
+            remote, statuses = self.collect_remote(scans, budget, warnings, wanted, failed, publish)
+            rows.extend(remote)
         # Only lookups never answered are worth a warning; the rest keep their last answer.
         # One shared cause, such as a failed request, is reported once for all it affected.
         unresolved: dict[str, list] = {}
-        for cache_key, reason in lookups.result().items():
+        for cache_key, reason in failed.items():
             if cache_key not in self.links:
                 unresolved.setdefault(reason, []).append(wanted[cache_key])
         for reason, missed in unresolved.items():
@@ -890,26 +796,230 @@ class WorkspaceOverview:
                 warnings.append("{} {} {}: {}".format(*missed[0], reason))
             else:
                 warnings.append(f"{len(missed)} GitHub lookups unresolved: {reason}")
-        return {
+        value = {
             "workspaces": self.sorted_rows(rows),
             "warnings": warnings,
             "calls": budget.calls,
             "src": str(self.src),
         }
+        if statuses:
+            value["machines"] = statuses
+        return value
+
+    # Worker machines --------------------------------------------------------------
+
+    def start_scans(self, workers):
+        """One thread per worker; None for one still backing off after a failed scan."""
+        scans: dict = {}
+        for machine in workers:
+            if time.time() < self.retry.get(machine.id, 0):
+                scans[machine] = None
+                continue
+            future: concurrent.futures.Future = concurrent.futures.Future()
+
+            def scan(machine=machine, future=future):
+                try:
+                    future.set_result(self.scan_machine(machine))
+                except BaseException as exc:  # Everything a worker raises stays its own.
+                    future.set_exception(exc)
+
+            threading.Thread(target=scan, daemon=True).start()
+            scans[machine] = future
+        return scans
+
+    def scan_machine(self, machine):
+        """A worker's herdr listings and its one probe call; raises when it is unreachable."""
+        notes: list[str] = []
+        spaces = [
+            space
+            for space in self.spaces(notes, machine)
+            if isinstance(space, dict)
+            and isinstance(space.get("workspace_id"), str)
+            and machines.WORKSPACE.fullmatch(space["workspace_id"])
+        ]
+        agents = [agent for agent in self.agents(notes, machine) if isinstance(agent, dict)]
+
+        def paths(field):
+            values = (
+                (space.get("worktree") or {}).get(field)
+                for space in spaces
+                if isinstance(space.get("worktree"), dict)
+            )
+            return sorted({v for v in values if isinstance(v, str) and v.startswith("/")})
+
+        found = remote_probe.call(
+            self.home,
+            machine,
+            "inventory",
+            REMOTE_TIMEOUT,
+            src=machine.src,
+            roots=[],
+            repo_roots=paths("repo_root"),
+            opened=paths("checkout_path"),
+        )
+        # Its paths are the worker's: the checkout herdr names becomes the one the probe
+        # resolved there, and nothing about it is looked up on this filesystem.
+        for index, space in enumerate(spaces):
+            worktree = space.get("worktree")
+            if isinstance(worktree, dict):
+                info = found["paths"].get(worktree.get("checkout_path"))
+                spaces[index] = {
+                    **space,
+                    "worktree": {
+                        **worktree,
+                        "checkout_path": info["path"] if info else None,
+                        "exists": bool(info and info["exists"]),
+                    },
+                }
+        return spaces, agents, found, notes
+
+    def collect_remote(self, scans, budget, warnings, wanted, failed, publish):
+        """Every worker's rows: from this scan's probe, or its last rows marked stale.
+
+        Their GitHub lookups share the scan's budget after this machine's, and add to
+        ``wanted`` and ``failed``. Returns the rows and each worker's status.
+        """
+        started = time.monotonic()
+        previous = self.value.get("machines") or {}
+        rows: list[dict] = []
+        statuses: dict[str, dict] = {}
+        scanned = []
+        for machine, future in scans.items():
+            last = previous.get(machine.id) or {}
+            try:
+                if future is None:
+                    raise ValueError(last.get("error") or "Waiting before the next attempt")
+                left = max(0.0, REMOTE_TIMEOUT - (time.monotonic() - started))
+                spaces, agents, found, notes = future.result(timeout=left)
+            except Exception as exc:
+                if isinstance(exc, concurrent.futures.TimeoutError):
+                    error = f"No answer within {REMOTE_TIMEOUT} seconds"
+                else:
+                    error = (str(exc) or type(exc).__name__)[-400:]
+                if future is not None:
+                    self.retry[machine.id] = time.time() + INTERVAL
+                kept = [
+                    {**row, "machine_stale": True}
+                    for row in self.value["workspaces"]
+                    if row.get("machine") == machine.id
+                ]
+                rows.extend(kept)
+                statuses[machine.id] = {
+                    "label": machine.label,
+                    "status": "stale" if kept else "unreachable",
+                    "error": error,
+                    "synced_at": last.get("synced_at"),
+                }
+                shown = "; showing its last scanned workspaces" if kept else ""
+                warnings.append(f"{machine.label} unavailable: {error}{shown}")
+                continue
+            self.retry.pop(machine.id, None)
+            warnings.extend(notes)
+            statuses[machine.id] = {
+                "label": machine.label,
+                "status": "ok",
+                "error": None,
+                "synced_at": time.time(),
+            }
+            scanned.append((machine, spaces, agents, found))
+        pending = []
+        own: dict[str, tuple] = {}
+        jobs = self.jobs()
+        for machine, spaces, agents, found in scanned:
+            clones = {clone["main"]["path"]: clone for clone in found["clones"]}
+            checkouts = {item["path"]: item for clone in found["clones"] for item in clone["items"]}
+            # A worker's watch names its checkout as the worker spells it.
+            watched = {
+                job["cwd"]
+                for job in jobs
+                if job.get("cwd")
+                and job.get("machine") == machine.id
+                and job.get("status") not in {"closed", "stopped"}
+            }
+            for row in self.orphan_rows(spaces, agents, checkouts, machine):
+                rows.append(row)
+                if publish:
+                    publish(row)
+            bases = {}
+            for path, state in found["states"].items():
+                item = checkouts[path]
+                root = str(Path(item["common"]).parent)
+                clone = clones.get(root)
+                if root not in bases:
+                    bases[root] = (
+                        self.base_repo(
+                            clone["main"],
+                            budget,
+                            warnings,
+                            config=clone["config"],
+                            key=f"m:{machine.id}:{root}",
+                        )
+                        if clone
+                        else (None, None)
+                    )
+                base, owner = bases[root]
+                main = path in clones
+                if base and not main:
+                    for kind, key in candidates(item, base, owner):
+                        own[f"{base}#{kind}#{key}"] = (base, kind, key)
+                update = found["updates"].get(path)
+                pending.append(
+                    (machine, item, state, base, owner, main, spaces, agents, watched, update)
+                )
+        with self.lock:
+            self.live |= set(own)
+        wanted.update(own)
+        failed.update(self.refresh_links(self.due_links(own), budget))
+        for machine, item, state, base, owner, main, spaces, agents, watched, update in pending:
+            if main:
+                links, stale = [], False
+            elif base:
+                links, stale = self.resolve_links(item, base, owner, failed)
+            else:
+                links, stale = [], True
+            row = self.row(item, state, links, stale, spaces, agents, watched, base, main, machine)
+            if update:
+                row["updated_at"] = max(row.get("updated_at") or 0, update)
+            rows.append(row)
+            if publish:
+                publish(row)
+        return rows, statuses
 
     @staticmethod
-    def workspace_records(spaces, agents, path):
+    def on_machine(row, machine):
+        """A worker's row: keys and workspace ids naming it, and no actions on it yet."""
+        key = row["key"]
+        workspace = key.startswith("workspace:")
+        row.update(
+            key=f"workspace:{machine.id}:{key[10:]}" if workspace else f"m:{machine.id}:{key}",
+            machine=machine.id,
+            machine_label=machine.label,
+            machine_stale=False,
+            workspace_ids=[machines.qualify(machine.id, wid) for wid in row["workspace_ids"]],
+            workspace_url=None,
+            removable=False,
+        )
+        return row
+
+    @staticmethod
+    def workspace_records(spaces, agents, path, resolve=True):
+        # A worker's spaces arrive with the checkout its probe resolved.
         found = [
             space
             for space in spaces
             if space.get("worktree")
-            and str(Path(space["worktree"]["checkout_path"]).resolve()) == path
+            and (
+                str(Path(space["worktree"]["checkout_path"]).resolve())
+                if resolve
+                else space["worktree"]["checkout_path"]
+            )
+            == path
         ]
         ids = {space["workspace_id"] for space in found}
         return found, [agent for agent in agents if agent.get("workspace_id") in ids]
 
-    def row(self, item, state, links, stale, spaces, agents, watched, base, main):
-        found, attached = self.workspace_records(spaces, agents, item["path"])
+    def row(self, item, state, links, stale, spaces, agents, watched, base, main, machine=None):
+        found, attached = self.workspace_records(spaces, agents, item["path"], machine is None)
         watch = item["path"] in watched
         blockers = []
         if main:
@@ -967,19 +1077,23 @@ class WorkspaceOverview:
             "removable": (not main or bool(found)) and not watch,
         }
         row["status"] = row_status(row)
-        return row
+        return self.on_machine(row, machine) if machine else row
 
-    def orphan_rows(self, spaces, agents, checkouts):
+    def orphan_rows(self, spaces, agents, checkouts, machine=None):
         """herdr workspaces with no known checkout: closeable, with nothing to remove."""
         rows = []
         for space in spaces:
             worktree = space.get("worktree") or {}
             path = worktree.get("checkout_path")
-            resolved = str(Path(path).resolve()) if path else None
+            # A worker's checkout is resolved, and checked for, by its own probe.
+            resolved = (str(Path(path).resolve()) if machine is None else path) if path else None
             if resolved in checkouts:
                 continue
             attached = [a for a in agents if a.get("workspace_id") == space["workspace_id"]]
-            missing = resolved is not None and not Path(resolved).exists()
+            if machine is None:
+                missing = resolved is not None and not Path(resolved).exists()
+            else:
+                missing = resolved is not None and not worktree.get("exists")
             if not resolved:
                 blockers = [
                     blocker("detached", "No Git checkout is attached; closing this ends its panes")
@@ -1030,6 +1144,8 @@ class WorkspaceOverview:
                 }
             )
             rows[-1]["status"] = "missing" if missing else row_status(rows[-1])
+            if machine:
+                self.on_machine(rows[-1], machine)
         return rows
 
     def open_workspace(self, request):
@@ -1080,6 +1196,8 @@ class WorkspaceOverview:
                 raise ValueError("The workspace experiment is disabled")
             listed = self.value["workspaces"] + ((self.partial or {}).get("workspaces") or [])
             row = next((entry for entry in listed if entry["key"] == key), None)
+        if row is not None and row.get("machine"):
+            raise ValueError(f"Not available for workspaces on {row['machine_label']} yet")
         if row is None or row["path"] != key or row["missing"] or not Path(key).is_dir():
             raise ValueError("Unknown workspace; refresh the list")
         return key
@@ -1148,8 +1266,25 @@ class WorkspaceOverview:
                 job["finished_at"] = time.time()
                 self.next_poll = 0.0
 
+    def worker_label(self, key):
+        """The worker a row key names, by label; None for a key of this machine."""
+        if key.startswith("m:"):
+            machine_id = key[2:].partition(":")[0]
+        elif key.startswith("workspace:") and ":" in key[10:]:
+            machine_id = key[10:].partition(":")[0]
+        else:
+            return None
+        try:
+            machine = machines.load(self.home).get(machine_id)
+        except (OSError, ValueError):
+            machine = None
+        return machine.label if machine else machine_id
+
     def resolve(self, key):
         """Re-read herdr and this one checkout's clone; a stale selection is never acted on."""
+        # Nothing acts on a worker's checkout or workspace from here yet.
+        if (label := self.worker_label(key)) is not None:
+            raise ValueError(f"Not available for workspaces on {label} yet")
         warnings: list[str] = []
         spaces, agents = self.spaces(warnings), self.agents(warnings)
         if key.startswith("workspace:"):

@@ -1,6 +1,7 @@
 """Workspace experiment browser coverage against temporary servers and a stubbed cleanup."""
 
 import copy
+import re
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -252,6 +253,63 @@ def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, w
     expect(page.locator("#workspaces-panel")).to_be_visible()
     assert not errors
     assert plugin.next_poll == float("inf")
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_worker_rows_show_their_machine_and_offer_no_actions(page, site, width):
+    url, plugin, _ = site
+    remote = {"machine": "mini", "machine_label": "Mac mini", "removable": False}
+    plugin.value["workspaces"] = [
+        row("local-work"),
+        row(
+            "remote-work",
+            key="m:mini:/src/worktrees/repo/remote-work",
+            workspace_ids=["mini/w3"],
+            machine_stale=False,
+            status="ready",
+            links=[link("pr", 7, "merged")],
+            **remote,
+        ),
+        row(
+            "stale-work", key="m:mini:/src/worktrees/repo/stale-work", machine_stale=True, **remote
+        ),
+    ]
+    plugin.value["machines"] = {
+        "mini": {"label": "Mac mini", "status": "stale", "error": "unreachable", "synced_at": 1}
+    }
+    page.set_viewport_size({"width": width, "height": 1000})
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(url + "/#workspaces")
+    unavailable = "Not available for workspaces on Mac mini yet"
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("remote-work", exact=True))
+    chip = line.locator(".ws-machine")
+    expect(chip).to_have_text("Mac mini")
+    expect(chip).to_have_attribute("title", "On Mac mini")
+    for name in ("Open workspace", "Diff", "Transcript"):
+        button = line.get_by_role("button", name=name, exact=True)
+        expect(button).to_be_disabled()
+        expect(button).to_have_attribute("title", unavailable)
+    box = line.get_by_role("checkbox", name="Select remote-work")
+    expect(box).to_be_disabled()
+    expect(box).to_have_attribute("title", unavailable)
+    stale = page.locator("#ws-list tr").filter(has=page.get_by_text("stale-work", exact=True))
+    expect(stale.get_by_role("button", name="Create workspace", exact=True)).to_be_disabled()
+    expect(stale.locator(".ws-machine")).to_have_class(re.compile(r"\bamber\b"))
+    expect(stale.locator(".ws-machine")).to_have_attribute("title", re.compile("did not answer"))
+    # This machine's row keeps its actions beside them.
+    local = page.locator("#ws-list tr").filter(has=page.get_by_text("local-work", exact=True))
+    expect(local.get_by_role("button", name="Create workspace", exact=True)).to_be_enabled()
+    expect(local.get_by_role("button", name="Diff", exact=True)).to_be_enabled()
+    expect(local.locator(".ws-machine")).to_have_count(0)
+    page.get_by_role("searchbox", name="Search workspaces").fill("mac mini")
+    expect(page.locator("#ws-list tr")).to_have_count(2)
+    page.get_by_role("searchbox", name="Search workspaces").fill("")
+    # Selecting everything shown never sweeps a worker's row into a cleanup.
+    page.get_by_role("checkbox", name="Select all shown").check()
+    expect(page.locator("#ws-selected")).to_have_text("1 selected")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    assert not errors
 
 
 def test_selection_confirmation_override_and_cleanup_progress(page, site):

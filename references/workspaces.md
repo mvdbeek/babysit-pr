@@ -22,6 +22,8 @@ Workspaces default to **Last updated**, newest first. **Sort by** also offers **
 
 The base repository is the `upstream` remote when one exists, otherwise `origin` or, when `origin` is a fork, its parent. That answer is cached for a day; a failed or budget-exhausted lookup is never cached as an answer.
 
+With a machine registry (`--home/machines.json`, see the supervisor reference), every scan also lists each enabled worker machine's worktrees and herdr workspaces, read-only and marked with the machine's label. Each worker costs one ssh call per scan, which streams `scripts/remote_probe.py` to the worker's `python3 -I` (nothing is installed there) and reads its clones under its `src`, plus `herdr --machine=<label>` for its workspaces and agents. Its Git runs without hooks or fsmonitor. GitHub links are resolved here as for local rows. A worker that does not answer within two minutes keeps its last rows, marked stale, and is not asked again for five minutes; this machine's rows are unaffected. Opening, diff, transcript and cleanup are not offered for a worker's rows yet, and the server refuses them.
+
 ## Opening a workspace
 
 The **Actions** column offers **Open workspace** for an existing herdr workspace and **Create workspace** for a checkout without one. Both open Collie in a new tab, with an **Open in Collie** fallback link if popups are blocked. Creation attaches a herdr workspace to the listed checkout without starting an agent or changing native focus. Existing agents are preserved. The action revalidates the listed checkout and shares the cleanup/creation lock so repeated clicks reuse the workspace instead of duplicating it. Errors appear beside the button and can be retried.

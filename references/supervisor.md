@@ -374,4 +374,5 @@ is left out of Auto. Handle on a verified checkout stays on that checkout's mach
 choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`
 previews where Auto would place a launch and which machines can take it;
 `GET /api/machines` lists the machines with their cached loads and placement verdict,
-which the Workspaces badges poll.
+which the Workspaces badges poll. The experimental Workspaces tab lists each enabled
+worker's worktrees read-only (see the workspaces reference).

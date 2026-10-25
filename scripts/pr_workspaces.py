@@ -31,6 +31,7 @@ import exit_watch
 import github_cli
 import machines
 import placement
+import remote_probe
 import workspace_agents
 import workspace_exit
 from issue_overview import branch_number
@@ -115,39 +116,19 @@ def herdr(*args, machine: machines.Machine | None = None, timeout=30):
     return value["result"]
 
 
-def remote_slug(value):
-    match = re.fullmatch(
-        r"(?:https://github.com/|git@github.com:|ssh://git@github.com/)([^/]+/[^/]+?)(?:\.git)?/?",
-        value,
-    )
-    return match[1].lower() if match and SLUG.fullmatch(match[1]) else None
+remote_slug = remote_probe.remote_slug
 
 
 def git(path, *args, machine=None, home=None):
     return run("git", "-C", path, *args, timeout=15, machine=machine, home=home)
 
 
-CONFIG_KEYS = r"^(remote\..*\.url|branch\..*\.(remote|merge))$"
-
-
 def repo_config(path):
     """Remote URLs and branch upstreams of one repository; empty when none are set."""
-    try:
-        return dict(
-            line.split(" ", 1)
-            for line in git(path, "config", "--get-regexp", CONFIG_KEYS).splitlines()
-            if " " in line
-        )
-    except ValueError:
-        return {}
+    return remote_probe.repo_config(git, path)
 
 
-def remote_slugs(config):
-    return {
-        key[7:-4]: slug
-        for key, value in config.items()
-        if key.startswith("remote.") and key.endswith(".url") and (slug := remote_slug(value))
-    }
+remote_slugs = remote_probe.remote_slugs
 
 
 def file_remotes(git_dir):
@@ -190,19 +171,7 @@ def last_activity(git_dir):
     return max(times, default=0.0)
 
 
-def provenance(path, common, branch, sha, config, remotes):
-    remote = config.get(f"branch.{branch}.remote")
-    ref = config.get(f"branch.{branch}.merge")
-    return {
-        "path": str(path),
-        "common": str(common),
-        "branch": branch,
-        "sha": sha,
-        "remotes": list(remotes.values()),
-        "upstream": [remotes.get(remote), ref.removeprefix("refs/heads/")]
-        if remote and ref
-        else None,
-    }
+provenance = remote_probe.provenance
 
 
 def checkout(path):
@@ -224,46 +193,8 @@ def checkout(path):
 
 
 def clone_worktrees(root, wanted=None):
-    """The clone at ``root`` and its attached worktrees, or None when not a wanted clone.
-
-    Three Git calls per clone replace five per worktree: the shared config supplies
-    remotes and branch upstreams, ``worktree list`` supplies every path, head and
-    branch. Bare, detached and prunable entries are skipped, as ``checkout`` skips them.
-    ``wanted`` of None accepts every clone, for callers that inventory all of them.
-    """
-    config = repo_config(root)
-    remotes = remote_slugs(config)
-    if wanted is not None and not wanted.intersection(remotes.values()):
-        return None
-    try:
-        toplevel, common = git(
-            root, "rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir"
-        ).splitlines()
-        records = git(root, "worktree", "list", "--porcelain", "-z").split("\0\0")
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-    if Path(toplevel).resolve() != root:
-        return None
-    common = Path(common).resolve()
-    items = []
-    for record in records:
-        fields = dict(
-            line.split(" ", 1) if " " in line else (line, "") for line in record.split("\0") if line
-        )
-        if (
-            "worktree" not in fields
-            or "bare" in fields
-            or "prunable" in fields
-            or not fields.get("branch", "").startswith("refs/heads/")
-        ):
-            continue
-        path = Path(fields["worktree"]).resolve()
-        if not path.is_dir():
-            continue
-        branch = fields["branch"].removeprefix("refs/heads/")
-        items.append(provenance(path, common, branch, fields.get("HEAD", ""), config, remotes))
-    main = next((item for item in items if item["path"] == str(root)), None)
-    return (main, items) if main else None
+    """The clone at ``root`` and its attached worktrees; see ``remote_probe.clone_worktrees``."""
+    return remote_probe.clone_worktrees(git, root, wanted)
 
 
 def workspaces_by_path(inventory):
