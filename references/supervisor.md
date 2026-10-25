@@ -41,11 +41,13 @@ Otherwise, exit the original CLI with Ctrl-D and run the returned `release_argv`
 command. A headless caller may release after its original agent process exits.
 Release transfers session/worktree ownership to the service. Service locks protect
 its workers; they cannot lock a manually launched TUI. Never manually release a
-live conversation. Each repair holds a per-session flock (`scripts/session_locks.py`)
-that every supervisor home shares: a local session's lock lives in
-`CLAUDE_CONFIG_DIR`/`CODEX_HOME` under `babysit-pr-locks/`, a worker machine's in
-`~/.local/state/babysit-pr/session-locks/<machine>/` on the controller. A
-`<session>.orphan` file beside a worker session's lock keeps it held until cleared.
+live conversation. Each repair holds a flock (`scripts/session_locks.py`), one lease
+per machine and session owned by the controller, which every supervisor home there
+contends for: a local session's lock lives in `CLAUDE_CONFIG_DIR`/`CODEX_HOME` under
+`babysit-pr-locks/`, a worker machine's in
+`~/.local/state/babysit-pr/session-locks/<machine>/` on the controller. The same
+session id on two machines takes two leases. A `<session>.orphan` file beside a
+worker session's lock keeps it held until cleared.
 
 For Codex, the guardian runs `codex exec ... resume SESSION_UUID -` for each repair and exits.
 With `--pane PANE`, herdr submits the bounded runner in the original shell and
@@ -351,13 +353,16 @@ qualified as `ID/w1` and views of watches recorded on another machine.
 is the herdr machine label passed as `herdr --machine=<label>` (labels cannot start with `-`). `id`, `label`, `ssh` and
 `os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
 `max_agents` is 1–64, `collie_url` is optional, and unknown keys are rejected.
+Ids, labels and `ssh` targets must be unique, though two spellings of one host
+(`user@host` and `host`) are not detected.
 Disabled machines stay valid for records already pinned to them.
 
 Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, and a shared
 master connection whose socket lives in `--home/ssh/` (or a short temporary
 directory when that path is too long), with at most four concurrent commands
 per ssh target in one process. They run with the worker's own environment and
-credentials, under `sh -c`, so the worker's login shell need not be POSIX.
+credentials, under `sh -c`, so the worker's login shell need not be POSIX: it
+sees only octal escapes that `sh` decodes, and no controller stdin.
 A timeout kills only the local ssh client; the remote process may keep running,
 so long-running remote work needs its own lifeline.
 

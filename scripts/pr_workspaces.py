@@ -89,6 +89,8 @@ REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
+    if machine is not None and home is None:
+        raise ValueError("home is required for a remote machine")
     # RemotePath arguments stay marked so a worker expands their ``~``.
     argv = [arg if isinstance(arg, str) else str(arg) for arg in args]
     # git may call the gh credential helper; both get the shared token and never prompt.
@@ -710,10 +712,11 @@ class Workspaces:
                 found.extend(
                     {**item, "kind": kind} for item in overview.snapshot()[overview.kind.key]
                 )
+        # A watch on a worker names a path there, never a checkout on this machine.
         found.extend(
             {**job, "id": f"watch:{job['id']}", "kind": "watch", "head_repo": job.get("ci_repo")}
             for job in self.jobs()
-            if job.get("id") and job.get("repo") and job.get("cwd")
+            if job.get("id") and job.get("repo") and job.get("cwd") and job.get("machine") is None
         )
         if self.sentry is not None:
             # An experiment failure must never break PR, issue or watch workspaces.
@@ -781,7 +784,7 @@ class Workspaces:
             for path in {
                 str(Path(j["cwd"]).resolve())
                 for j in self.jobs()
-                if j.get("cwd") and os.path.isdir(j["cwd"])
+                if j.get("cwd") and j.get("machine") is None and os.path.isdir(j["cwd"])
             } - items.keys():
                 item = checkout(path)
                 if item:
@@ -852,6 +855,7 @@ class Workspaces:
                     w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"),
                 )
                 for w in watches
+                if w.get("machine") is None
             },
         }
 

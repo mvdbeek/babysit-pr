@@ -12,6 +12,7 @@ from pathlib import Path
 
 import dashboard
 import issue_overview
+import machines
 import pr_workspaces as pw
 import pytest
 import workspace_viewer
@@ -258,6 +259,47 @@ def test_watch_workspace_uses_recorded_checkout_without_overview(local, branch, 
     assert not manager.matches(manager.target("watch:watch-one"), manager.scan())[0]
     with pytest.raises(ValueError, match="verified checkout"):
         manager.action(request)
+
+
+def test_worker_watches_never_bind_or_list_local_checkouts(local):
+    manager, pr, git, state, jobs = local
+    path = make_checkout(local)
+    git("commit", "--allow-empty", "-m", "unpushed", cwd=path)
+    outside = state.parent / "outside-src"
+    git("clone", "-q", str(manager.src / "repo"), str(outside))
+    remote = {
+        "machine": "mini",
+        "repo": pr["repo"],
+        "url": pr["url"],
+        "branch": "feature",
+        "status": "watching",
+        "snapshot": {"pr": {"head_branch": "feature"}},
+    }
+    jobs.extend(
+        [
+            {**remote, "id": "on-mini", "cwd": str(path)},
+            {**remote, "id": "outside", "cwd": str(outside)},
+        ]
+    )
+    space(state, path, manager.src / "repo")
+    inventory = manager.scan()
+    assert str(outside) not in {item["path"] for item in inventory["checkouts"]}
+    assert not manager.matches(pr, inventory)[0]
+    assert manager.snapshot()["watches"] == {}
+    with pytest.raises(ValueError, match="Unknown PR or issue or watch"):
+        manager.target("watch:on-mini")
+    jobs[0]["machine"] = None  # The same watch on this machine binds the checkout.
+    assert manager.matches(pr, manager.scan())[0]
+
+
+def test_remote_commands_need_a_registry_home():
+    mini = machines.Machine(
+        "mini", "Mac mini", "mini", "darwin", "~/src", "~/b", "python3", 4, (), None, True
+    )
+    with pytest.raises(ValueError, match="home is required for a remote machine"):
+        pw.git("/repo", "status", machine=mini)
+    with pytest.raises(ValueError, match="home is required for a remote machine"):
+        pw.run("true", machine=mini)
 
 
 def test_watch_reopens_checkout_outside_inventory_without_starting_agent(local):

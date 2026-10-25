@@ -97,6 +97,16 @@ def test_session_ids_must_be_uuids(session_id):
         session_locks.path("codex", session_id)
 
 
+@pytest.mark.parametrize("session_id", ["abcdefgh-session", "agent-a1b2c3d4", "../x", ""])
+@pytest.mark.parametrize("machine", [None, "mini"])
+def test_ids_no_repair_can_lock_are_never_held(homes, session_id, machine):
+    import agent_messages
+
+    assert not session_locks.held("claude", session_id, None, machine)
+    assert agent_messages.watch_owner(session_id, "claude", homes / "state") is None
+    agent_messages.claim_from_watch(session_id, "codex", homes / "state")
+
+
 def test_only_remote_sessions_can_be_orphaned():
     with pytest.raises(ValueError, match="worker machine"):
         session_locks.mark_orphan("claude", SID, None, "a1", None)

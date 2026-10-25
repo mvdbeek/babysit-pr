@@ -94,7 +94,9 @@ def test_loads_come_from_each_machines_herdr_and_isolate_failures(
 
 
 def test_a_hung_machine_blocks_neither_requests_nor_other_machines(tmp_path, monkeypatch):
-    register(tmp_path, MINI, BOX, {**MINI, "id": "off", "label": "Off", "enabled": False})
+    register(
+        tmp_path, MINI, BOX, {**MINI, "id": "off", "label": "Off", "ssh": "off", "enabled": False}
+    )
     release = threading.Event()
     asked = []
 
