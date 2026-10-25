@@ -88,9 +88,12 @@ REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
-    argv = list(map(str, args))
+    # RemotePath arguments stay marked so a worker expands their ``~``.
+    argv = [arg if isinstance(arg, str) else str(arg) for arg in args]
     # git may call the gh credential helper; both get the shared token and never prompt.
     if argv[0] == "gh":
+        if machine is not None:
+            raise ValueError("gh runs on this machine only")
         result = github_cli.run(argv, cwd=cwd, text=True, timeout=timeout, pass_fds=pass_fds)
     else:
         # A worker's git uses its own gh login; the shared token stays on this machine.
@@ -103,7 +106,7 @@ def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
     return result.stdout.strip()
 
 
-def herdr(*args, machine=None):
+def herdr(*args, machine: machines.Machine | None = None):
     # herdr reaches a worker's server itself, so the command always runs here.
     value = json.loads(run(*machines.herdr_argv(machine, *args)))
     if value.get("error"):

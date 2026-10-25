@@ -34,7 +34,7 @@ CLAUDE_EXIT_HINT = "Press Ctrl-D again to exit"
 RULE = re.compile(r"^\s*─+\s*$")
 
 
-def herdr(*args, machine=None):
+def herdr(*args, machine: machines.Machine | None = None):
     # herdr reaches a worker's server itself, so the command always runs here.
     proc = machines.run(None, None, machines.herdr_argv(machine, *args), text=True, timeout=15)
     if proc.returncode:

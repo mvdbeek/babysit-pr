@@ -979,11 +979,15 @@ def start_daemon(home, max_workers):
 
 
 def register(db, args):
-    cwd = str(Path(args.cwd).resolve())
     # A registry id; None (the default) is this machine.
     machine = getattr(args, "machine", None)
     if machine is not None:
-        machines.resolve(Path(args.home).expanduser(), machine)
+        worker = machines.resolve(Path(args.home).expanduser(), machine)
+        assert worker is not None
+        # Validation, repairs and release still run here, so a watch on a worker would
+        # quietly act on a same-named local checkout.
+        raise ValueError(f"Watches on {worker.label} are not supported yet")
+    cwd = str(Path(args.cwd).resolve())
     agent_kind = getattr(args, "agent", "codex")
     sid = args.session or (os.environ.get("CODEX_THREAD_ID") if agent_kind == "codex" else None)
     if not sid:

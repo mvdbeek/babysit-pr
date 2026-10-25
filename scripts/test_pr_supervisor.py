@@ -511,24 +511,20 @@ def test_duplicate_registration_and_wrong_session_refused(harness):
         supervisor.session_info(str(uuid.uuid4()), h["worktree"], h["rollout"])
 
 
-def test_register_records_machine_and_duplicates_compare_machine_and_cwd(harness):
+def test_register_records_no_machine_and_refuses_workers(harness):
     h = harness
     assert h["job"]["machine"] is None
     mini = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin"}
     (h["home"] / "machines.json").write_text(json.dumps({"version": 1, "machines": [mini]}))
-    # Another PR's watch, from another session, owns the same worktree path here.
     with h["db"]:
         h["db"].execute("DELETE FROM jobs WHERE id=?", (h["job"]["id"],))
-        supervisor.save_job(h["db"], {**h["job"], "id": "other", "session_id": str(uuid.uuid4())})
-    with pytest.raises(ValueError, match="already owns"):
-        supervisor.register(h["db"], h["args"])
     remote = argparse.Namespace(**{**vars(h["args"]), "home": h["home"], "machine": "unknown"})
     with pytest.raises(ValueError, match="Unknown machine unknown"):
         supervisor.register(h["db"], remote)
     remote.machine = "mini"
-    job = supervisor.register(h["db"], remote)
-    assert job["machine"] == supervisor.get_job(h["db"], job["id"])["machine"] == "mini"
-    assert supervisor.get_job(h["db"], "other")["machine"] is None
+    with pytest.raises(ValueError, match="Watches on Mac mini are not supported yet"):
+        supervisor.register(h["db"], remote)
+    assert supervisor.jobs(h["db"]) == []
 
 
 def test_live_session_cannot_release_itself(harness):
