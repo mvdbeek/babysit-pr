@@ -90,6 +90,8 @@ REMOTE_SECTION = re.compile(r'\[\s*remote\s+"([^"]+)"\s*\]', re.IGNORECASE)
 
 
 def run(*args, cwd=None, timeout=30, pass_fds=(), machine=None, home=None):
+    if machine is not None and home is None:
+        raise ValueError("home is required for a remote machine")
     # RemotePath arguments stay marked so a worker expands their ``~``.
     argv = [arg if isinstance(arg, str) else str(arg) for arg in args]
     # git may call the gh credential helper; both get the shared token and never prompt.
@@ -641,10 +643,11 @@ class Workspaces:
                 found.extend(
                     {**item, "kind": kind} for item in overview.snapshot()[overview.kind.key]
                 )
+        # A watch on a worker names a path there, never a checkout on this machine.
         found.extend(
             {**job, "id": f"watch:{job['id']}", "kind": "watch", "head_repo": job.get("ci_repo")}
             for job in self.jobs()
-            if job.get("id") and job.get("repo") and job.get("cwd")
+            if job.get("id") and job.get("repo") and job.get("cwd") and job.get("machine") is None
         )
         if self.sentry is not None:
             # An experiment failure must never break PR, issue or watch workspaces.
@@ -712,7 +715,7 @@ class Workspaces:
             for path in {
                 str(Path(j["cwd"]).resolve())
                 for j in self.jobs()
-                if j.get("cwd") and os.path.isdir(j["cwd"])
+                if j.get("cwd") and j.get("machine") is None and os.path.isdir(j["cwd"])
             } - items.keys():
                 item = checkout(path)
                 if item:
@@ -783,6 +786,7 @@ class Workspaces:
                     w.get("snapshot", {}).get("pr", {}).get("head_branch") or w.get("branch"),
                 )
                 for w in watches
+                if w.get("machine") is None
             },
         }
 
@@ -1034,9 +1038,16 @@ class Workspaces:
         ]
 
     def reservations(self):
-        """Launches running in this process by machine; herdr may not list them yet."""
+        """Launches running in this process by machine that herdr does not list yet.
+
+        One with a result has its workspace, which herdr already counts.
+        """
         ops = (self.operation(key) for key in list(self.workers))
-        placed = [op.get("machine") or placement.LOCAL for op in ops if op]
+        placed = [
+            op.get("machine") or placement.LOCAL
+            for op in ops
+            if op and op["status"] in {"queued", "running"} and not op.get("result")
+        ]
         return {machine_id: placed.count(machine_id) for machine_id in set(placed)}
 
     def place(self, request, fields, history=None):

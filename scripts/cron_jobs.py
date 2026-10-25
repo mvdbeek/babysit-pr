@@ -43,6 +43,7 @@ WATCH_SECONDS = 10  # How often an agent run's session is checked while it works
 SHELL_KEYS = {"command", "cwd"}
 AGENT_KEYS = {
     "repo",
+    "machine",
     "clone",
     "branch",
     "base",

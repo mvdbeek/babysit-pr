@@ -1,10 +1,13 @@
 """Per-session leases: the one place that names, takes and probes a session's lock.
 
-A repair holds its session's flock for as long as its agent runs, and every supervisor
-home on the controller shares the same lock. A local session (``machine`` None) keeps
-its lock beside the agent's own store, under ``CLAUDE_CONFIG_DIR`` or ``CODEX_HOME``.
-A session on a worker machine is locked on the controller instead, so its guardian is
-still local and the flock is released when the guardian dies.
+A repair holds its session's flock for as long as its agent runs. There is one lease
+per (machine, session), owned by the controller: every supervisor home on it contends
+for the same lock. A local session (``machine`` None) keeps its lock beside the agent's
+own store, under ``CLAUDE_CONFIG_DIR`` or ``CODEX_HOME``. A session on a worker machine
+is locked on the controller instead, so its guardian is still local and the flock is
+released when the guardian dies. Locks are keyed by machine, so one session id recorded
+on two machines takes two leases; nothing here stops a conversation copied to another
+host from being resumed there.
 
 A remote repair that loses its worker cannot tell whether the agent still runs; it
 leaves a ``<session>.orphan`` tombstone beside the lock, and the session stays held
@@ -67,6 +70,10 @@ def acquire(agent, session_id, config_dir=None, machine=None):
 
 def held(agent, session_id, config_dir=None, machine=None):
     """Whether a babysit repair holds this session right now, from any home."""
+    try:
+        uuid.UUID(session_id)
+    except (TypeError, ValueError):
+        return False  # acquire takes only UUIDs, so nothing holds a sidechain or other id.
     if machine is not None and _orphan(agent, session_id, config_dir, machine).exists():
         return True
     lock = path(agent, session_id, config_dir, machine)

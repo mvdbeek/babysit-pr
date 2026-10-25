@@ -8,7 +8,17 @@ import time
 import dashboard
 import pr_workspaces as pw
 import pytest
-from test_pr_workspaces import finish, helper_calls, local, synced  # noqa: F401 (fixture)
+from test_new_tasks import other_clone
+from test_new_tasks import request as new_request
+from test_pr_workspaces import (  # noqa: F401 (fixture)
+    finish,
+    helper_calls,
+    local,
+    make_checkout,
+    scheduled_task,
+    second_issue,
+    synced,
+)
 
 MINI = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin", "labels": ["safehouse"]}
 BOX = {"id": "box", "label": "Linux box", "ssh": "box", "os": "linux", "max_agents": 8}
@@ -94,7 +104,9 @@ def test_loads_come_from_each_machines_herdr_and_isolate_failures(
 
 
 def test_a_hung_machine_blocks_neither_requests_nor_other_machines(tmp_path, monkeypatch):
-    register(tmp_path, MINI, BOX, {**MINI, "id": "off", "label": "Off", "enabled": False})
+    register(
+        tmp_path, MINI, BOX, {**MINI, "id": "off", "label": "Off", "ssh": "off", "enabled": False}
+    )
     release = threading.Event()
     asked = []
 
@@ -185,6 +197,7 @@ def test_without_a_registry_nothing_asks_another_machine(local):  # noqa: F811
         "options": [],
     }
     assert not [c for c in json.loads(state.read_text())["calls"] if "--machine" in c[0]]
+    assert "workers" not in dashboard.status(manager.home)  # So the page never asks.
     with pytest.raises(ValueError, match="Unknown machine mini"):
         manager.action({"id": pr["id"], "action": "handle", "task": "x", "machine": "mini"})
 
@@ -255,6 +268,97 @@ def test_a_scheduled_launch_on_a_worker_is_recorded_then_not_started(synced):  #
     settle(manager.loads)
 
 
+def test_a_new_task_with_other_clones_is_recorded_then_refused_on_a_worker(local):  # noqa: F811
+    manager, _, git, state, _ = local
+    register(manager.home, MINI)
+    manager.loads.snapshot()
+    settle(manager.loads)
+    other = other_clone(manager, git)
+    value = manager.new_task(new_request(manager, name="remote", also=[str(other)], machine="mini"))
+    op = finish(manager, value["operation"]["pr"])
+    assert op["machine"] == "mini" and op["status"] == "failed"
+    assert op["message"] == "Launching on Mac mini is not supported yet"
+    assert not json.loads(state.read_text())["agents"]
+
+
+def test_reservations_count_only_launches_herdr_cannot_list_yet(local):  # noqa: F811
+    manager, *_ = local
+    ops = {
+        "queued": {"status": "queued", "machine": "mini"},
+        "running": {"status": "running", "machine": "mini"},
+        "here": {"status": "running", "machine": None},
+        "listed": {"status": "running", "machine": "mini", "result": {"workspace_id": "w1"}},
+        "complete": {"status": "complete", "machine": "mini", "result": {"workspace_id": "w2"}},
+        "failed": {"status": "failed", "machine": "mini"},
+    }
+    for key, op in ops.items():
+        manager.save_operation({"id": key, "pr": key, **op})
+        manager.workers[key] = threading.Thread(target=lambda: None)
+    try:
+        assert manager.reservations() == {"mini": 2, "local": 1}
+    finally:
+        manager.workers.clear()
+
+
+def test_handle_on_a_verified_checkout_stays_on_its_machine(local):  # noqa: F811
+    manager, pr, git, *_ = local
+    register(manager.home, MINI)
+    make_checkout(local)
+    git("remote", "add", "fork", "git@github.com:fork/repo.git")
+    assert manager.matches(pr, manager.scan())[0]
+    request = {"id": pr["id"], "action": "handle", "task": "Fix it"}
+    with pytest.raises(
+        ValueError, match="existing workspace is on This machine; choose it or Auto"
+    ):
+        manager.action({**request, "machine": "mini"})
+    assert manager.operation(pr["id"]) is None
+    settle(manager.loads)
+
+
+def test_disabled_and_unreachable_workers_are_refused(local):  # noqa: F811
+    manager, pr, *_ = local
+    register(manager.home, {**MINI, "enabled": False}, BOX)
+    now = time.time()
+    manager.loads.entries["box"] = {"unreachable_since": now - 60, "attempted_at": now}
+    launch = {"id": pr["id"], "action": "create", "task": "Remote task"}
+    for machine, why in (
+        ("mini", "^Mac mini: disabled$"),
+        ("box", r"^Linux box: unreachable \d+s$"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            manager.action({**launch, "machine": machine})
+        with pytest.raises(ValueError, match=why):
+            manager.new_task(new_request(manager, name="remote", machine=machine))
+    assert manager.operation(pr["id"]) is None and not manager.new_operations(manager.state())
+
+
+def test_a_batch_records_its_machine_on_every_item(synced):  # noqa: F811
+    manager, *_ = synced
+    register(manager.home, MINI)
+    second_issue(manager)
+    value = manager.batch(
+        {"items": [{"id": "I_one"}, {"id": "I_two"}], "task": "Fix {url}", "machine": "mini"}
+    )
+    tasks = [r["scheduled"] for r in value["results"]]
+    assert [(t["machine"], t["request"]["machine"]) for t in tasks] == [("mini", "mini")] * 2
+    settle(manager.loads)
+
+
+def test_a_scheduled_auto_launch_is_placed_again_and_starts_here(synced):  # noqa: F811
+    manager, pr, *_ = synced
+    register(manager.home, MINI)
+    start = time.time() + 3600
+    request = {"id": pr["id"], "action": "create", "task": "Later", "machine": "auto"}
+    task = manager.action({**request, "start_at": start})["scheduled"]
+    assert task["machine"] is None and task["request"]["machine"] == "auto"
+    manager.run_due(now=start)
+    assert scheduled_task(manager, task["id"])["status"] == "started"
+    op = finish(manager, pr["id"])
+    assert op["status"] == "complete", op["log"]
+    assert op["machine"] is None
+    settle(manager.loads)
+
+
 def test_placement_preview_over_http(local):  # noqa: F811
     manager, *_ = local
     register(manager.home, MINI)
@@ -271,6 +375,7 @@ def test_placement_preview_over_http(local):  # noqa: F811
                 conn.close()
                 return response.status, value
 
+            assert get("/api/status")[1]["workers"] == 1
             status, value = get("/api/machines")
             assert status == 200
             assert [(m["id"], m["available"]) for m in value["machines"]] == [
