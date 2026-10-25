@@ -49,6 +49,9 @@ MAX_RESPONSE = 4 * 1024 * 1024
 MAX_UNPUSHED = remote_probe.MAX_UNPUSHED
 # One worker's whole scan, herdr listings and probe together; slower ones are left stale.
 REMOTE_TIMEOUT = 120
+# A worker that failed is not asked again for twice the rescan interval, doubling with
+# each further failure up to this many intervals.
+MAX_BACKOFF = 16
 REMOTE_GRACE = 5  # Beyond a worker's deadline, for an answer already on its way back.
 HERDR_TIMEOUT = 30
 # What one worker may contribute to a scan, and so to the cache shared with this machine.
@@ -363,8 +366,10 @@ class WorkspaceOverview:
         self.partial: dict | None = None
         self.src = Path(src).expanduser() if src else Path.home() / "src"
         self.roots: list[Path] = []
-        # Worker machine ids whose failed scan is not retried before this time.
+        # Worker machine ids whose failed scan is not retried before this time, and how
+        # many scans in a row each has failed.
         self.retry: dict[str, float] = {}
+        self.failures: dict[str, int] = {}
         try:
             config_path = self.directory / "config.json"
             if not config_path.exists():
@@ -449,14 +454,22 @@ class WorkspaceOverview:
         try:
             with self.lock:
                 self.partial = copy.deepcopy(self.value)
-            value = self.collect(publish=self.publish_row)
-            value["synced_at"] = time.time()
-            with self.lock:
-                self.value, self.error = value, None
-                self.partial = None
-                if self.next_poll:
-                    self.next_poll = value["synced_at"] + INTERVAL
-            self.save()
+
+            def complete(value, final):
+                value["synced_at"] = time.time()
+                with self.lock:
+                    self.value, self.error = value, None
+                    # Workers still scanning publish their rows onto this machine's.
+                    self.partial = None if final else copy.deepcopy(value)
+                    if self.next_poll:
+                        self.next_poll = value["synced_at"] + INTERVAL
+                self.save()
+
+            # This machine's rows are complete while workers may still take minutes.
+            value = self.collect(
+                publish=self.publish_row, local_done=lambda value: complete(value, False)
+            )
+            complete(value, True)
         except Exception as exc:
             with self.lock:
                 self.error = f"Workspace inventory failed: {exc}"
@@ -711,7 +724,11 @@ class WorkspaceOverview:
             and job.get("status") not in {"closed", "stopped"}
         }
 
-    def collect(self, publish=None):
+    def collect(self, publish=None, local_done=None):
+        """The whole inventory; ``local_done`` gets this machine's part before any worker's.
+
+        That part keeps each worker's last rows and status until its scan answers.
+        """
         warnings: list[str] = []
         # Workers scan in their own threads while this machine scans as it always has.
         scans = self.start_scans(self.remote_machines(warnings))
@@ -794,6 +811,26 @@ class WorkspaceOverview:
                     add(path, future.result())
         failed = lookups.result()
         statuses = {}
+        if scans and local_done:
+            workers = {machine.id for machine in scans}
+            local_done(
+                {
+                    "workspaces": self.sorted_rows(
+                        [
+                            *rows,
+                            *(r for r in self.value["workspaces"] if r.get("machine") in workers),
+                        ]
+                    ),
+                    "warnings": list(warnings),
+                    "calls": budget.calls,
+                    "src": str(self.src),
+                    "machines": {
+                        machine_id: status
+                        for machine_id, status in (self.value.get("machines") or {}).items()
+                        if machine_id in workers
+                    },
+                }
+            )
         if scans:
             remote, statuses = self.collect_remote(scans, budget, warnings, wanted, failed, publish)
             rows.extend(remote)
@@ -959,7 +996,9 @@ class WorkspaceOverview:
         """A worker this scan could not use: its last rows, marked stale, and a warning."""
         last = (self.value.get("machines") or {}).get(machine.id) or {}
         if retry:
-            self.retry[machine.id] = time.time() + INTERVAL
+            failures = self.failures[machine.id] = self.failures.get(machine.id, 0) + 1
+            # Longer than the rescan interval, so a failed worker skips at least one scan.
+            self.retry[machine.id] = time.time() + INTERVAL * min(2**failures, MAX_BACKOFF)
         kept = [
             {**row, "machine_stale": True}
             for row in self.value["workspaces"]
@@ -1018,6 +1057,7 @@ class WorkspaceOverview:
             finally:
                 budget.calls += share.calls
             self.retry.pop(machine.id, None)
+            self.failures.pop(machine.id, None)
             seen |= bases
             warnings.extend(notes)
             with self.lock:

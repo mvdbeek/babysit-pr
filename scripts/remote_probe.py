@@ -2,7 +2,7 @@
 
 Each op takes its ``git`` runner (and session-store readers) as arguments: this machine
 passes its own wrappers, so local behaviour is exactly the code that ran before. A
-worker gets this file's source on ``python3 -I -`` over ssh with the op and its
+worker gets this file's source on ``python3 -I -S -`` over ssh with the op and its
 arguments as base64 JSON, so nothing is installed there and no shell ever sees a path.
 It answers one JSON document, which ``call`` bounds and validates before anyone reads it.
 
@@ -44,21 +44,41 @@ EXPIRED = 124  # The probe's exit status once its deadline passed.
 SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 CONFIG_KEYS = r"^(remote\..*\.url|branch\..*\.(remote|merge))$"
 ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
-# A worker's own Git must not run repository-supplied programs while it is only read.
-# Kept in step with this machine's Git hardening.
+# A worker's own Git must not run repository-supplied programs while it is only read:
+# agents write these checkouts, and the probe runs unsandboxed as the worker's user.
+# ``host_guard`` adds the overrides that depend on each repository's config.
+HOST_CONFIG = [
+    "core.fsmonitor=false",
+    "core.hooksPath=/dev/null",
+    # No signature is ever checked, so no configured program is asked to.
+    "log.showSignature=false",
+    "gpg.program=false",
+    "gpg.openpgp.program=false",
+    "gpg.ssh.program=false",
+    "gpg.x509.program=false",
+    # A submodule's diff stays one commit line rather than a diff run inside it.
+    "diff.submodule=short",
+    # Nothing is fetched, not even a promisor remote's missing object: no transport,
+    # and so no configured upload-pack or ssh command, is allowed.
+    *[
+        f"protocol.{name}.allow=never"
+        for name in ("file", "git", "ssh", "http", "https", "ftp", "ftps", "ext")
+    ],
+    "protocol.allow=never",
+]
 HOST_GIT = [
     "git",
-    "-c",
-    "core.fsmonitor=false",
-    "-c",
-    "core.hooksPath=/dev/null",
+    *[arg for setting in HOST_CONFIG for arg in ("-c", setting)],
     "--no-optional-locks",
 ]
 HOST_ENV = {
     "GH_PROMPT_DISABLED": "1",
     "GIT_TERMINAL_PROMPT": "0",
     "GCM_INTERACTIVE": "never",
+    "GIT_NO_LAZY_FETCH": "1",
 }
+# Subcommands that look into a submodule's own repository, whose config is not guarded.
+SUBMODULE_READS = {"status", "diff"}
 # Reads need no GitHub token, and a checkout's filters or hooks must not inherit one.
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 # A session listing reads at most this much of each transcript, and skips longer lines.
@@ -173,9 +193,9 @@ def checkout_times(path, changed=()):
     created = None
     updated = []
     try:
-        stat = root.stat()
-        created = getattr(stat, "st_birthtime", None)
-        updated.append(stat.st_mtime)
+        info = root.stat()
+        created = getattr(info, "st_birthtime", None)
+        updated.append(info.st_mtime)
         git_dir = root / ".git"
         if git_dir.is_file():
             pointer = git_dir.read_text().strip().removeprefix("gitdir: ")
@@ -184,9 +204,16 @@ def checkout_times(path, changed=()):
         try:
             # The first reflog entry records worktree creation, even on filesystems
             # without birth times. Its mtime follows commits, resets and checkouts.
-            with log.open() as stream:
-                created = float(stream.readline().split("\t", 1)[0].split()[-2])
-            updated.append(log.stat().st_mtime)
+            # Only a regular file is read, and only its first line's start: a FIFO
+            # planted there must not block, nor a reflog without newlines be read whole.
+            descriptor = os.open(log, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "rb") as stream:
+                found = os.fstat(descriptor)
+                if not stat.S_ISREG(found.st_mode):
+                    raise OSError(f"Not a regular file: {log}")
+                line = stream.readline(4096).decode("utf-8", errors="replace")
+            created = float(line.split("\t", 1)[0].split()[-2])
+            updated.append(found.st_mtime)
         except (OSError, ValueError, IndexError):
             updated.append((git_dir / "HEAD").stat().st_mtime)
         for name in changed[:MAX_CHANGES]:
@@ -226,7 +253,19 @@ def landed(git, path, missing, merges):
     for sha in merges - found:
         try:
             # -U0 keeps an evil merge's combined diff small; only its emptiness matters.
-            if not git(path, "show", "--format=", "--cc", "-U0", sha, strip=False).strip():
+            # A checkout's textconv or external diff could make it look empty, or run.
+            shown = git(
+                path,
+                "show",
+                "--format=",
+                "--cc",
+                "-U0",
+                "--no-textconv",
+                "--no-ext-diff",
+                sha,
+                strip=False,
+            )
+            if not shown.strip():
                 found.add(sha)
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
@@ -325,7 +364,8 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
         config = repo_config(git, root)
         return config, clone_worktrees(git, root, None, config)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    try:
         clones, checkouts = [], {}
         for config, result in pool.map(survey, found):
             if not result:
@@ -347,6 +387,9 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
             for path in selected
         }
         states = {path: future.result() for path, future in pending.items()}
+    finally:
+        # An expired deadline must not wait for a step that is stuck.
+        pool.shutdown(wait=False, cancel_futures=True)
     updates = transcript_updates(set(selected), src.resolve(), files, cwd_of)
     return {
         "roots": [str(root) for root in found],
@@ -759,22 +802,84 @@ def _within_deadline(timeout):
     return timeout
 
 
+def _past_deadline():
+    # Cut short by the deadline itself, which the alarm may not have reported yet.
+    return DEADLINE is not None and time.monotonic() >= DEADLINE
+
+
 def host_environment():
     env = {k: v for k, v in os.environ.items() if k not in TOKENS}
     env.update(HOST_ENV)
     return env
 
 
+def _host_run(argv, timeout):
+    try:
+        return subprocess.run(
+            argv,
+            env=host_environment(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_within_deadline(timeout),
+        )
+    except subprocess.TimeoutExpired as exc:
+        if _past_deadline():
+            raise Expired("Probe deadline expired") from exc
+        raise
+
+
+# Overrides by repository path, read once per probe run.
+_guards: dict[str, list[str]] = {}
+
+
+def host_guard(path, timeout=60):
+    """``-c`` overrides for the programs ``path``'s own config could name.
+
+    Attributes (``.gitattributes``, ``.git/info/attributes``) pick a filter driver by
+    name, so blanking every driver the config defines covers them all, git-lfs's
+    included: git-lfs, and the extensions and transfer agents it would run, never
+    starts. ``core.worktree`` would point Git at another directory and is refused.
+    """
+    key = str(path)
+    if key not in _guards:
+        result = _host_run(
+            [*HOST_GIT, "-C", key, "config", "-z", "--get-regexp", r"^filter\.|^core\.worktree$"],
+            timeout,
+        )
+        if result.returncode not in (0, 1):  # 1: no such keys.
+            raise ValueError((result.stderr or "Git config unreadable")[-4000:].strip())
+        drivers: dict[str, None] = {}  # Ordered, without repeats.
+        for entry in result.stdout.split("\0"):
+            name = entry.split("\n", 1)[0]
+            if name == "core.worktree":
+                raise ValueError("core.worktree points Git at another directory; not read")
+            if name.startswith("filter.") and name.count(".") >= 2:
+                drivers[name[len("filter.") : name.rindex(".")]] = None
+        if any("=" in driver for driver in drivers):
+            raise ValueError("A filter driver's name cannot be overridden; not read")
+        _guards[key] = [
+            arg
+            for driver in drivers
+            for setting in ("clean=", "smudge=", "process=", "required=false")
+            for arg in ("-c", f"filter.{driver}.{setting}")
+        ]
+    return _guards[key]
+
+
+def host_argv(path, args, options=()):
+    """The hardened Git command line for ``args`` in ``path``, after Git ``options``."""
+    command = next((arg for arg in args if not arg.startswith("-")), None)
+    # A submodule's status or diff would run Git in it, under its own filters.
+    if command in SUBMODULE_READS:
+        at = args.index(command) + 1
+        args = (*args[:at], "--ignore-submodules=all", *args[at:])
+    return [*HOST_GIT, *options, *host_guard(path), "-C", str(path), *args]
+
+
 def host_git(path, *args, timeout=60, strip=True):
     """Git in one checkout on the machine this probe runs on, hardened and non-interactive."""
-    result = subprocess.run(
-        [*HOST_GIT, "-C", str(path), *args],
-        env=host_environment(),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=_within_deadline(timeout),
-    )
+    result = _host_run(host_argv(path, args), timeout)
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Git failed")[-4000:].strip())
     return result.stdout.strip() if strip else result.stdout
@@ -794,7 +899,7 @@ def host_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
     truncated = False
     with tempfile.TemporaryFile() as errors:
         proc = subprocess.Popen(
-            [*HOST_GIT, "-c", "core.quotePath=false", "-C", str(path), *args],
+            host_argv(path, args, ("-c", "core.quotePath=false")),
             env=host_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -807,6 +912,8 @@ def host_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
                 while not truncated:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        if _past_deadline():
+                            raise Expired("Probe deadline expired")
                         raise ValueError(f"git {args[0]} took longer than {timeout:.0f} seconds")
                     if not selector.select(remaining):
                         continue
@@ -816,7 +923,13 @@ def host_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
                     chunks.append(data[: limit - size])
                     size += len(chunks[-1])
                     truncated = size >= limit
-            if not truncated and proc.wait(timeout=max(0.1, deadline - time.monotonic())):
+            try:
+                failed = not truncated and proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                if _past_deadline():
+                    raise Expired("Probe deadline expired") from exc
+                raise
+            if failed:
                 errors.seek(0)
                 detail = errors.read()[-4000:].decode("utf-8", errors="replace").strip()
                 raise ValueError(detail[-400:] or f"git {args[0]} failed")
@@ -1079,14 +1192,18 @@ OPS: dict[str, Callable[..., Any]] = {
 }
 
 
-def _expire(signum, frame):
+def _stop_group():
     # A probe leading its own process group (see __main__) stops its Git children too;
-    # it ignores the signal it sends them, then unwinds to report and exit.
-    global EXPIRED_AT_ALARM
-    EXPIRED_AT_ALARM = True
+    # it ignores the signal it sends them.
     if os.getpgrp() == os.getpid():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         os.killpg(0, signal.SIGTERM)
+
+
+def _expire(signum, frame):
+    global EXPIRED_AT_ALARM
+    EXPIRED_AT_ALARM = True
+    _stop_group()
     raise Expired("Probe deadline expired")
 
 
@@ -1142,6 +1259,7 @@ def _answer(argv):
         answer = {"protocol": PROTOCOL, "result": OPS[request["op"]](**request["args"])}
     except Expired as exc:
         answer = {"protocol": PROTOCOL, "error": str(exc)}
+        _stop_group()  # Expiry seen first by a Git timeout, before the alarm.
     except Exception as exc:
         answer = {"protocol": PROTOCOL, "error": f"{type(exc).__name__}: {exc}"[:400]}
     finally:
@@ -1421,7 +1539,8 @@ def call(home, machine, op, timeout, **args):
         result = machines.run(
             home,
             machine,
-            [python, "-I", "-", PROTOCOL, payload],
+            # -S: no site hooks (.pth files, sitecustomize) run before the probe.
+            [python, "-I", "-S", "-", PROTOCOL, payload],
             timeout=timeout,
             input=Path(__file__).read_bytes(),
             max_output=MAX_STDOUT,
@@ -1450,4 +1569,7 @@ if __name__ == "__main__":
         os.setpgid(0, 0)  # Its own group, so an expired deadline stops its Git children.
     except OSError:
         pass  # Already leading its session, and so its group.
-    raise SystemExit(main(sys.argv))
+    status = main(sys.argv)
+    sys.stdout.flush()
+    # Answered: a thread still stuck in a read must not keep the process alive.
+    os._exit(status)

@@ -968,7 +968,7 @@ def test_restart_shows_inventory_while_one_background_refresh_runs(site, monkeyp
     finished = threading.Event()
     scans = []
 
-    def collect(publish=None):
+    def collect(publish=None, local_done=None):
         scans.append(True)
         assert gate.wait(timeout=10)
         return {"workspaces": [], "warnings": []}
