@@ -285,9 +285,14 @@ create it for the next launch; a link there is refused, since binding it would
 follow it outside the sandbox (copy a shared `settings.json` into each account
 instead of linking it). Install plugins and skills, and change these settings,
 outside the sandbox. Claude's `.claude.json` stays writable, since Claude rewrites
-it constantly, so a launch with `--enable=docker` is refused while it declares MCP
-servers (top level or in any project), which any agent of that account could have
-added. The wrapper
+it constantly, and any agent of the account can add MCP servers to it: a launch
+with `--enable=docker` and a Claude configuration must run `claude` itself, which
+babysit-bwrap gives `--strict-mcp-config`, so it starts no MCP servers at all.
+Each sandbox gets its own empty shell snapshot directory (Claude's
+`shell-snapshots`, Codex's `shell_snapshots`, sourced before every command), an
+`--add-dirs` grant that holds, equals or lies inside the configuration directory
+is refused (it could move the directory, read-only entries and all), and a link
+at the default account's `accounts` is refused. The wrapper
 discovers nothing from its working directory or git, whose files the agent can
 rewrite; babysit passes the worktree and its git common directory in `--add-dirs`
 from its own records (the worktree `wt` created, the job `cwd` that the repair
@@ -311,8 +316,9 @@ service definition (`~/.config/systemd`, `~/.local/share/systemd`,
 `~/.codex` are refused too, except as the matching configuration directory:
 `--claude-config-dir` may be `~/.claude` itself or one of its
 `accounts/<name>`, and `--codex-home` may be `~/.codex`. When the default
-account `~/.claude` is bound, its `accounts` directory is covered by an empty
-tmpfs, so that agent never reaches the named accounts. babysit-bwrap also
+account `~/.claude` is bound, its `accounts` directory is always covered by an
+empty tmpfs, so that agent never reaches the named accounts nor plants a link
+where they will be. babysit-bwrap also
 refuses its own directory and, when it runs from a checkout's `scripts/`, that
 checkout and its git common directory (read from the `.git` file or directory,
 without running git there), since an agent writing either would change what the
@@ -347,7 +353,7 @@ Known gaps of the Linux sandbox:
   for now; run the worker headless, without a desktop session for its user.
   Egress isolation is a later step.
 - The rest of the agent configuration directory stays writable: `.claude.json`
-  (MCP servers, which a granted launch refuses but an unsandboxed one starts),
+  (MCP servers, which a granted launch ignores but an unsandboxed one starts),
   transcripts and auto-memory under `projects/`, and any script there that a
   read-only hook or status line command names. Hooks and commands must name
   files the sandbox cannot write (inside `hooks/`, or outside the account).

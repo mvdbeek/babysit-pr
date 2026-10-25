@@ -126,7 +126,9 @@ done
 self=$(realpath -- "${BASH_SOURCE[0]}")
 protected+=("${self%/*}")
 deployed=${self%/*/*}
-if [[ -d $deployed/.git ]]; then
+if [[ ${self%/*} != */scripts ]]; then
+  : # installed elsewhere: only its own directory
+elif [[ -d $deployed/.git ]]; then
   protected+=("$deployed" "$(resolve "$deployed/.git")")
 elif [[ -f $deployed/.git ]]; then
   read -r gitdir <"$deployed/.git" || true
@@ -218,18 +220,12 @@ granted=
 granted=${granted#,}
 # Everything below must keep a launch without these grants from leaving code for a
 # launch with them, of any agent of the same configuration, to run.
-if [[ -n $granted && $config_var == CLAUDE_CONFIG_DIR && -e $config_dir/.claude.json ]]; then
-  # Claude rewrites this file all the time, so it stays writable; its MCP servers start
-  # with the agent. Refused rather than removed, since the agent may still be writing it.
-  python3 -I -c '
-import json, sys
-config = json.load(open(sys.argv[1]))
-projects = config.get("projects") or {}
-servers = [config.get("mcpServers")]
-servers += [p.get("mcpServers") for p in projects.values() if isinstance(p, dict)]
-sys.exit(any(servers))
-' "$config_dir/.claude.json" 2>/dev/null ||
-    die "refusing --enable=$granted: $config_dir/.claude.json declares MCP servers (or cannot be read), which an agent without that grant could have added"
+command=("$@")
+if [[ -n $granted && $config_var == CLAUDE_CONFIG_DIR ]]; then
+  # Claude rewrites .claude.json all the time, so it stays writable, and the MCP servers
+  # any agent of the account adds there start with Claude: a granted Claude starts none.
+  [[ ${1##*/} == claude ]] || die "refusing --enable=$granted for $1 with a Claude configuration; run claude itself"
+  command=("$1" --strict-mcp-config "${@:2}")
 fi
 # Package caches for sandboxed agents only: nothing outside the sandbox runs code from
 # them, unlike the host caches an agent could otherwise plant code in. One per agent
@@ -237,7 +233,7 @@ fi
 # fewer grants could have replaced.
 sha=(sha256sum)
 command -v sha256sum >/dev/null || sha=(shasum -a 256) # macOS dry runs
-key=$(printf '%s=%s%s' "$config_var" "$config_dir" "${granted:+ enable=$granted}" | "${sha[@]}")
+key=$(printf '%s\0%s\0%s' "$config_var" "$config_dir" "$granted" | "${sha[@]}")
 cache=$home/.cache/babysit-sandbox/${key:0:16}
 
 # Writable: the sandbox cache, the agent configuration and the explicit grants. They
@@ -247,12 +243,25 @@ argv+=(--bind "$cache" "$cache")
 for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   [[ -n $path ]] || continue
   real=$(writable "$path")
-  [[ -z $real ]] || grant "$real"
+  [[ -n $real ]] || continue
+  # A grant holding the configuration could move it, read-only entries and all.
+  if [[ -n $config_var ]] &&
+    [[ $real == "$config_dir" || $config_dir == "$real"/* || $real == "$config_dir"/* ]]; then
+    die "refusing $path, which overlaps the agent configuration $config_dir"
+  fi
+  grant "$real"
 done
-# The default Claude account's directory holds the named accounts: hide them.
-if [[ $config_var == CLAUDE_CONFIG_DIR && -d $config_dir/accounts ]] &&
-  [[ $config_dir == "$real_home/.claude" || $config_dir == "$(resolve "$home/.claude")" ]]; then
-  argv+=(--tmpfs "$config_dir/accounts")
+if [[ $config_var == CLAUDE_CONFIG_DIR ]]; then
+  # The default account's directory holds the named accounts: hide them, always, or its
+  # agent could create accounts as a link that a later account launch resolves through.
+  if [[ $config_dir == "$real_home/.claude" || $config_dir == "$(resolve "$home/.claude")" ]]; then
+    [[ ! -L $config_dir/accounts ]] || die "refusing $config_dir/accounts, a link"
+    argv+=(--tmpfs "$config_dir/accounts")
+  fi
+  # Claude sources its shell snapshot before every Bash command: one per sandbox.
+  argv+=(--tmpfs "$config_dir/shell-snapshots")
+elif [[ $config_var == CODEX_HOME ]]; then
+  argv+=(--tmpfs "$config_dir/shell_snapshots")
 fi
 
 if ((gpg)); then
@@ -337,12 +346,16 @@ if [[ -n $config_var ]]; then
   for name in "${code[@]}"; do
     path=$config_dir/$name
     if ((!print)) && [[ ! -e $path && ! -L $path ]]; then
-      # Without following or replacing anything another sandbox creates meanwhile.
-      case $name in
-        *.json) (set -C && printf '{}\n' >"$path") ;;
-        *.*) (set -C && : >"$path") ;;
-        *) mkdir -m 0700 "$path" ;;
-      esac 2>/dev/null || true
+      # Without following or replacing anything another sandbox creates meanwhile:
+      # mkdir and a hard link from a fresh file both fail on any existing name.
+      if [[ $name == *.* ]]; then
+        placeholder=$(mktemp "$config_dir/.babysit-placeholder.XXXXXX") || die "cannot create $path"
+        [[ $name != *.json ]] || printf '{}\n' >>"$placeholder"
+        ln "$placeholder" "$path" 2>/dev/null || true
+        rm -f "$placeholder"
+      else
+        mkdir -m 0700 "$path" 2>/dev/null || true
+      fi
     fi
     if [[ -L $path ]]; then
       die "refusing $path, a link; make it a file or directory of its own"
@@ -390,7 +403,7 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
 [[ -z $config_var ]] || argv+=(--setenv "$config_var" "$config_dir")
 ((!gpg)) || argv+=(--setenv GNUPGHOME "$gnupghome")
 
-argv+=(--chdir "$(pwd -P)" -- "$@")
+argv+=(--chdir "$(pwd -P)" -- "${command[@]}")
 if ((print)); then
   printf '%s\0' "${argv[@]}"
   exit 0
