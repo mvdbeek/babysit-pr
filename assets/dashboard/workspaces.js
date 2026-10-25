@@ -152,9 +152,11 @@
     choose.append(box);
     line.append(choose);
     const name = node("td");
-    name.append(
-      entry.workspace_url ? anchor(entry.name, entry.workspace_url) : node("span", entry.name),
-    );
+    const plain = node("span", entry.name);
+    // A worker's workspace links only that worker's own Collie, when one is registered.
+    if (entry.machine && entry.workspace_ids.length)
+      plain.title = `Collie unavailable for ${entry.machine_label}`;
+    name.append(entry.workspace_url ? anchor(entry.name, entry.workspace_url) : plain);
     if (entry.machine) {
       const chip = badge(entry.machine_label, entry.machine_stale ? "amber" : "");
       chip.classList.add("ws-machine");

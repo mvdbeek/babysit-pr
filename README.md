@@ -925,7 +925,24 @@ exited by the time limit is reported with the time it finished and the reason, f
 example a pane too short to show the agent's composer. Agents keep running when the dashboard
 restarts, and the restarted dashboard keeps following them.
 
-**Run outside Safehouse (can write anywhere)**, off by default, is for jobs that
+With a machine registry (`--home/machines.json`, see `references/supervisor.md`), an
+agent task also has a **Machine**: **Auto** (resolved once when the job is saved, and
+kept; Auto still always means this machine), this machine, or a worker. A job on a
+worker works in that worker's clone, `<src>/<repo name>` from its registry entry, and
+everything a run does happens there: the probe makes the checkout with the worker's own
+hardened Git (its one fetch is the job's GitHub repository, with the worker's own `gh`
+login), the prompt is staged in `~/.cache/babysit/cron-prompts/` there, and the agent
+is typed into a pane of the worker's herdr workspace through its own sandbox (Safehouse
+on a Mac, `babysit-bwrap` from its `babysit_root` on Linux, with signing allowed when the
+worker has the `gpg` label). Such a job always runs in its sandbox and cannot be a shell
+command. The dashboard looks at the run every minute: once a session in the checkout
+confirms the task, its final response is kept, but the agent is not exited on a worker
+yet, so the run **Needs attention** with the agent still open there; one that leaves
+its pane without confirming, or is still working at the time limit, also needs
+attention. **Open in Collie** links the worker's own Collie when its registry entry
+has a `collie_url`; otherwise the run says **Collie unavailable for <label>**.
+
+**Run outside Safehouse (can write anywhere)**, off by default, is for jobs that**Run outside Safehouse (can write anywhere)**, off by default, is for jobs that
 orchestrate work in other repositories, for example by making worktrees in other
 clones with `wt`, which Safehouse blocks because it grants writes to the job's own
 checkout only. The run then types `command claude --dangerously-skip-permissions …` or

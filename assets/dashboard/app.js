@@ -2518,7 +2518,13 @@ function savedEffort(repo, levels) {
 }
 // `repo` is the project the launch is for; `mixed` launches in several projects.
 // `preferred` preselects an agent the person already chose, as a second review does.
-function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
+// `remote` describes a worker that can take the launch; cron jobs run there already.
+function agentFields({
+  repo = null,
+  mixed = false,
+  preferred = null,
+  remote = (label) => `Starting agents on ${label} is not supported yet.`,
+} = {}) {
   const usage = window.dashboardUsage;
   const agent = el("select");
   agent.id = "workspace-agent";
@@ -2760,10 +2766,10 @@ function agentFields({ repo = null, mixed = false, preferred = null } = {}) {
         : chosen?.disabled
           ? `${chosen.label} cannot take this launch: ${chosen.note}.`
           : chosen
-            ? `${chosen.note}. Starting agents on ${chosen.label} is not supported yet.`
+            ? `${chosen.note}. ${remote(chosen.label)}`
             : "Runs on this machine.";
   }
-  machine.onchange = describeMachine;
+  machine.addEventListener("change", describeMachine);
   async function updatePlacement() {
     if (machineField.hidden) return;
     const request = ++previews;

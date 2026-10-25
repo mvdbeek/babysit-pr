@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import cron_agents
+import machines
 import owned_process
 import workspace_exit
 
@@ -384,6 +385,14 @@ class CronJobs:
                     job["upcoming"] = upcoming(job, now) if job["enabled"] else []
                 except ValueError:
                     job["upcoming"] = []
+        placed = [job for job in jobs if job.get("machine")]
+        if placed:
+            try:
+                labels = {m.id: m.label for m in machines.load(self.home).values()}
+            except (OSError, ValueError):
+                labels = {}
+            for job in placed:
+                job["machine_label"] = labels.get(job["machine"], job["machine"])
         jobs.sort(key=lambda job: job["name"].lower())
         return {
             "enabled": True,
