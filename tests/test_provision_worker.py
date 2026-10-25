@@ -261,6 +261,10 @@ def test_user_step_moves_path_from_the_old_clone_to_the_deployed_copy(tmp_path):
     # What the first provisioning of a worker wrote.
     old = 'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/src/babysit-pr/scripts:$PATH"'
     (home / ".bashrc").write_text(f"# babysit-pr worker PATH\n{old}\n\n# Ubuntu's own\n")
+    marker = home / ".config/babysit-pr/worker.json"
+    marker.parent.mkdir(parents=True)
+    # What --controller recorded: a rerun keeps it.
+    marker.write_text(json.dumps({"version": 1, "controller": "https://c.test", "token": "t"}))
     done = subprocess.run(
         ["bash", str(SCRIPT), "--user-step", "--sha", "0123abc" * 5 + "01234"],
         capture_output=True,
@@ -272,10 +276,11 @@ def test_user_step_moves_path_from_the_old_clone_to_the_deployed_copy(tmp_path):
     assert "src/babysit-pr" not in bashrc, done.stdout + done.stderr
     assert "$HOME/.local/share/babysit-pr/app/scripts:$PATH" in bashrc
     assert bashrc.count("# babysit-pr worker PATH") == 1 and "# Ubuntu's own" in bashrc
-    marker = home / ".config/babysit-pr/worker.json"
     assert json.loads(marker.read_text()) == {
         "version": 1,
         "app": str(home / ".local/share/babysit-pr/app"),
+        "controller": "https://c.test",
+        "token": "t",
     }
     assert marker.stat().st_mode & 0o777 == 0o600
     assert all(
@@ -378,3 +383,39 @@ def test_checks_flag_root_equivalent_groups(tmp_path, group):
     assert f"PROBLEM: babysit is in the {group} group" in done.stderr
     # Device access rather than root, but still more than an agent account needs.
     assert "WARNING: babysit is in the kvm group" in done.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the user step refuses root")
+def test_controller_step_records_the_token_without_showing_it(tmp_path):
+    home = tmp_path / "home"
+    marker = home / ".config/babysit-pr/worker.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"version": 1, "app": "/app"}))
+    token = "s3cr3t-" + "x" * 36
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
+
+    def controller(*args, stdin=token + "\n"):
+        return subprocess.run(
+            ["bash", str(SCRIPT), "--controller", *args],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    done = controller("https://babysitter.example.ts.net/")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert token not in done.stdout + done.stderr
+    assert json.loads(marker.read_text()) == {
+        "version": 1,
+        "app": "/app",
+        "controller": "https://babysitter.example.ts.net",
+        "token": token,
+    }
+    assert marker.stat().st_mode & 0o777 == 0o600
+    for url in ("ftp://x", "https://u:p@x", "https://x/?q=1", ""):
+        assert controller(url).returncode == 2
+    assert controller("https://x", stdin="").returncode == 2
+    assert controller("https://x", stdin="short\n").returncode == 2
+    assert json.loads(marker.read_text())["token"] == token

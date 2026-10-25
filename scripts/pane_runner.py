@@ -9,15 +9,23 @@ import sandbox
 from herdr_handoff import herdr, result
 
 
-def inspect(pane):
-    info = result("pane", "get", pane)["pane"]
-    procs = result("pane", "process-info", "--pane", pane)["process_info"]
+def inspect(pane, machine=None):
+    info = result("pane", "get", pane, machine=machine)["pane"]
+    procs = result("pane", "process-info", "--pane", pane, machine=machine)["process_info"]
     return info, procs
 
 
-def capture(pane, cwd, agent_kind="codex"):
-    info, procs = inspect(pane)
-    if Path(info.get("foreground_cwd") or info.get("cwd", "")).resolve() != Path(cwd).resolve():
+def same_path(path, cwd, machine=None):
+    # A worker's paths are compared as they are, never resolved on this machine.
+    if machine is not None:
+        return path == cwd
+    return Path(path).resolve() == Path(cwd).resolve()
+
+
+def capture(pane, cwd, agent_kind="codex", machine=None):
+    """The binding of ``pane`` (on ``machine``, a ``machines.Machine``; None is here)."""
+    info, procs = inspect(pane, machine)
+    if not same_path(info.get("foreground_cwd") or info.get("cwd", ""), cwd, machine):
         raise RuntimeError("Pane worktree does not match this watch")
     if not procs.get("shell_pid"):
         raise RuntimeError("Pane has no identifiable shell")
@@ -55,24 +63,30 @@ def release_is_foreground(procs, pane):
     return True
 
 
-def locate(binding, cwd, require_shell=False, runner_pid=None, allow_release=False):
+def locate(binding, cwd, require_shell=False, runner_pid=None, allow_release=False, machine=None):
     # Terminal identity survives pane moves; never fall back to a matching cwd.
-    panes = result("pane", "list")["panes"]
+    panes = result("pane", "list", machine=machine)["panes"]
     matches = [p for p in panes if p.get("terminal_id") == binding["terminal_id"]]
     if len(matches) != 1:
         raise RuntimeError("Original herdr terminal is missing; no background fallback")
     pane = matches[0]["pane_id"]
-    info, procs = inspect(pane)
+    info, procs = inspect(pane, machine)
     if (
         info["terminal_id"] != binding["terminal_id"]
         or procs.get("shell_pid") != binding["shell_pid"]
     ):
         raise RuntimeError("Original herdr terminal or shell was replaced")
     foreground = procs.get("foreground_processes") or []
-    if Path(info.get("foreground_cwd") or info.get("cwd", "")).resolve() != Path(cwd).resolve():
+    if not same_path(info.get("foreground_cwd") or info.get("cwd", ""), cwd, machine):
         raise RuntimeError("Original pane changed worktree; pause and inspect it")
     shell_only = bool(foreground) and all(p["pid"] == binding["shell_pid"] for p in foreground)
-    own_release = allow_release and not info.get("agent") and release_is_foreground(procs, pane)
+    # A release typed on this machine is never in a worker's pane.
+    own_release = (
+        allow_release
+        and machine is None
+        and not info.get("agent")
+        and release_is_foreground(procs, pane)
+    )
     if require_shell and (info.get("agent") or not (shell_only or own_release)):
         raise RuntimeError("Original pane is busy; leave its agent or command undisturbed")
     if runner_pid is not None and not any(p["pid"] == runner_pid for p in foreground):

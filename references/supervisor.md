@@ -543,15 +543,57 @@ keystrokes, whatever the quoting. A worker's job checkout must be a linked workt
 the job's clone, outside its `.git`, so an agent cannot point the paths its sandbox is
 given at a repository of its own.
 `scripts/machines.py` loads and validates it; a malformed file is an error, a
-missing one means local only. `register --machine ID` checks the ID against the
-registry and then refuses: watches on other machines are not supported yet. On a
-worker `register` and `handoff` refuse: watch registration from worker machines isn't
-supported yet. A worker is one with `~/.config/babysit-pr/worker.json` (written by
-`provision_worker.sh --user-step`) or with `BABYSIT_WORKER` set. A launch sets it for
-the `wt` it runs, not for the agent's pane, whose shell herdr's server starts; inside
-babysit-bwrap, where `$HOME` is empty, the wrapper sets `BABYSIT_WORKER=1` whenever the
-host has that file. This is a guard against mistakes, not a boundary: an agent outside
-babysit-bwrap, or one that unsets the variable, is not stopped by it.
+missing one means local only.
+
+### Watches on workers
+
+A watch on a worker lives on this machine (the controller) like any other, with
+`machine` set. `register --machine ID` reads everything about it on that worker, never
+at a same-named path here: the checkout (probe op `worktree`: its top, branch, head,
+changes and Git common dir) and the session (probe op `session_info`, which checks the
+worker's rollout or Claude transcript as `register` checks its own, and records the
+worker's account directory). The PR is named (`--pr URL`, or a number with `--repo`,
+or `--branch`); `--pr auto` would need the worker's checkout. A worker watch's
+launcher is that worker's own babysit-bwrap (`<babysit_root>/scripts/babysit-bwrap`,
+`~` meaning the worker's home, with `--enable=gpg` when the machine has the `gpg`
+label); `--codex-command`/`--claude-command` are refused, so a registration never
+chooses what runs outside the sandbox there. Only Linux workers take watches. Repairs
+of worker watches are not supported yet: such a watch is blocked when one is due.
+
+On a worker, `register` forwards to the controller's dashboard instead of keeping a
+watch of its own, which would act where nobody looks. A worker is one with
+`~/.config/babysit-pr/worker.json` (written by `provision_worker.sh --user-step`) or
+with `BABYSIT_WORKER` set. A launch sets it for the `wt` it runs, not for the agent's
+pane, whose shell herdr's server starts; inside babysit-bwrap, where `$HOME` is empty,
+the wrapper sets `BABYSIT_WORKER=1` whenever the host has that file. The worker resolves
+`--pr auto` with its own `gh` in its checkout, then POSTs the registration to
+`<controller>/api/worker/register` with `Authorization: Bearer <token>`, both from
+`worker.json` (`provision_worker.sh --controller`). It follows no redirect and uses no
+proxy from the environment, so the token goes only to that URL. Without a controller
+and token there, `register` refuses. `handoff` on a worker refuses for now: exit the
+original agent and release the watch on the controller (`release_argv` in the answer).
+
+The dashboard's `/api/worker/register` takes only that: the Host must be one the
+dashboard accepts (`--allow-host`, for the tailnet name), and a request carrying
+`Origin` or `Sec-Fetch-Site` (a browser) is refused. The token decides the machine; the
+body is exactly the registration fields (PR, repo, CI repo or branch, absolute `cwd`,
+session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
+poll interval, budget and timeout), checked by type, form and length, with no control
+characters (the instructions may span lines). One registration per machine runs at a
+time. `pr_supervisor.py worker-token ID` issues a machine's token: 32 random bytes,
+printed once into a pipe (never to a terminal), and stored on the controller only as
+its SHA-256 in `--home/worker-tokens.json` (mode 600), not in `machines.json`, which
+may be shared. Issuing again replaces it; `--revoke` removes it; a disabled or
+unregistered machine's token is refused. Tokens are compared in constant time against
+every entry.
+
+Residual: babysit-bwrap shows `worker.json` read-only to every sandboxed agent on the
+worker, so any agent there (or anything else running as the worker user) can register
+watches as that machine: for sessions and checkouts that exist there, with instructions
+of its choosing, which a later release turns into repairs of that session. It cannot
+name another machine, choose a launcher, or reach anything but this endpoint with the
+token. Revoke a lost worker's token with `worker-token ID --revoke`.
+
 Watches record `machine` (null for this machine), and a worktree path is a
 duplicate only on the same machine. The dashboard reads the diff and
 transcripts of a workspace ID qualified as `ID/w1` on that machine (see the

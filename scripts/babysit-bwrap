@@ -390,6 +390,11 @@ for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .git
   .config/git .config/gh; do
   argv+=(--ro-bind-try "$home/$path" "$home/$path")
 done
+# A worker's controller URL and registration token, read-only: `pr_supervisor.py
+# register` inside forwards there (worker_api). Every sandboxed agent here can read it,
+# and so register watches on this machine.
+marker=$home/.config/babysit-pr/worker.json
+[[ ! -f $marker || -L $marker ]] || argv+=(--ro-bind "$marker" "$marker")
 
 for name in PATH HOME TERM LANG USER ${env_pass[@]+"${env_pass[@]}"}; do
   [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid variable name $name"

@@ -511,7 +511,7 @@ def test_duplicate_registration_and_wrong_session_refused(harness):
         supervisor.session_info(str(uuid.uuid4()), h["worktree"], h["rollout"])
 
 
-def test_register_records_no_machine_and_refuses_workers(harness):
+def test_register_records_no_machine_and_checks_workers(harness):
     h = harness
     assert h["job"]["machine"] is None
     mini = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin"}
@@ -522,12 +522,13 @@ def test_register_records_no_machine_and_refuses_workers(harness):
     with pytest.raises(ValueError, match="Unknown machine unknown"):
         supervisor.register(h["db"], remote)
     remote.machine = "mini"
-    with pytest.raises(ValueError, match="Watches on Mac mini are not supported yet"):
+    # Repairs there need babysit-bwrap; tests/test_remote_registration.py covers Linux.
+    with pytest.raises(ValueError, match="Watches on Mac mini need a Linux worker"):
         supervisor.register(h["db"], remote)
     assert supervisor.jobs(h["db"]) == []
 
 
-def test_worktree_git_refuses_worker_jobs_and_keeps_local_argv(harness, monkeypatch):
+def test_worktree_git_never_reads_worker_paths_here_and_keeps_local_argv(harness, monkeypatch):
     cwd = str(harness["worktree"])
     pr = {"head_branch": "feature", "head_sha": supervisor.git(cwd, "rev-parse", "HEAD")}
     real = subprocess.run
@@ -538,8 +539,10 @@ def test_worktree_git_refuses_worker_jobs_and_keeps_local_argv(harness, monkeypa
         return real(args, **kwargs)
 
     monkeypatch.setattr(supervisor.subprocess, "run", record)
-    with pytest.raises(RuntimeError, match="Git on worker machine mini is not supported yet"):
-        supervisor.verify_worktree({"cwd": cwd, "machine": "mini"}, pr)
+    # A worker's checkout is read there, from its probe's answer.
+    state = {"path": cwd, "branch": "feature", "head": pr["head_sha"], "dirty": True}
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        supervisor.verify_worktree({"cwd": cwd, "machine": "mini"}, pr, state=state)
     with pytest.raises(RuntimeError, match="not supported yet"):
         supervisor.git(cwd, "status", machine="mini")
     assert calls == []
@@ -553,7 +556,8 @@ def test_worktree_git_refuses_worker_jobs_and_keeps_local_argv(harness, monkeypa
 )
 @pytest.mark.parametrize("marked", ["file", "environment"])
 def test_a_worker_never_registers_watches_of_its_own(tmp_path, command, marked):
-    # A worker's own supervisor would act on the watch where nobody looks.
+    # A worker's own supervisor would act on the watch where nobody looks; without the
+    # controller's URL and token it cannot forward one either.
     home = tmp_path / "home"
     env = {**os.environ, "HOME": str(home)}
     env.pop("BABYSIT_WORKER", None)
@@ -570,10 +574,12 @@ def test_a_worker_never_registers_watches_of_its_own(tmp_path, command, marked):
         capture_output=True,
     )
     assert result.returncode == 1
-    assert json.loads(result.stdout) == {
-        "error": "Watch registration from worker machines isn't supported yet"
-    }
-    assert supervisor.jobs(supervisor.open_db(state)) == []
+    error = json.loads(result.stdout)["error"]
+    if command[0] == "handoff":
+        assert error == "Automatic handoff from worker machines isn't supported yet"
+    else:
+        assert "needs the controller's URL and token" in error
+    assert not state.exists()
 
 
 def test_live_session_cannot_release_itself(harness):

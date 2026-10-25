@@ -538,9 +538,14 @@ def test_wrapper_tells_a_workers_agent_it_is_on_a_worker(checkout):
     env = environment(home, BABYSIT_WORKER="")
     argv = printed(worktree, env, "--env-pass=BABYSIT_WORKER", "--", "agent")
     assert [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_WORKER"] == [""]
+    marker = str(home / ".config" / "babysit-pr" / "worker.json")
+    assert not any(marker in word for word in argv)
     (home / ".config" / "babysit-pr").mkdir(parents=True)
     (home / ".config" / "babysit-pr" / "worker.json").write_text("{}")
     argv = printed(worktree, env, "--env-pass=BABYSIT_WORKER", "--", "agent")
+    # Its controller URL and token, read-only, so `register` inside can forward.
+    assert (marker, marker) in pairs(argv, "--ro-bind")
+    assert not any(marker in pair for pair in pairs(argv, "--bind"))
     # Set last, so no passed value can clear it.
     assert [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_WORKER"][-1] == "1"
     assert dict(pairs(argv, "--setenv"))["BABYSIT_WORKER"] == "1"

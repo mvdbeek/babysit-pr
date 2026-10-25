@@ -26,6 +26,7 @@ import github_cli
 import llm_usage
 import machines
 import owned_process
+import remote_probe
 import safe_git
 import sandbox
 import sentry_llm
@@ -38,6 +39,8 @@ TERMINAL = {"stopped", "closed", "blocked"}
 # close must end them without anyone cancelling by hand.
 IDLE = {"blocked", "paused", "awaiting_release"}
 LIFECYCLE_SECONDS = 600
+# One read of a worker checkout or session store, ssh included.
+PROBE_TIMEOUT = 60
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -89,7 +92,7 @@ def locked(path):
 
 
 def git(cwd, *args, machine=None):
-    # Watches on workers are refused at registration; never check a same-named local path.
+    # A worker's checkout is read there (checkout_state); never a same-named local path.
     if machine is not None:
         raise RuntimeError(f"Git on worker machine {machine} is not supported yet")
     try:
@@ -102,8 +105,32 @@ def git(cwd, *args, machine=None):
     return proc.stdout.strip()
 
 
-def verify_worktree(job, pr):
+def checkout_state(home, machine_id, cwd):
+    """A worker checkout's top, branch, head, changes and common dir, read on the worker."""
+    worker = machines.resolve(home, machine_id)
+    assert worker is not None
+    return remote_probe.call(home, worker, "worktree", PROBE_TIMEOUT, path=cwd)
+
+
+def verify_worktree(job, pr, home=None, state=None):
+    """The watched branch at the PR's head, clean. A worker's checkout is read there, or
+    taken from ``state`` (``checkout_state``) when the caller just read it."""
     machine = job.get("machine")
+    if machine is not None:
+        state = state or checkout_state(home, machine, job["cwd"])
+        if state["path"] != job["cwd"]:
+            raise RuntimeError("Worktree is no longer at the registered path")
+        if state["branch"] != pr["head_branch"]:
+            raise RuntimeError(
+                "Worktree branch differs from the watched branch; intervention required"
+            )
+        if state["head"] != pr["head_sha"]:
+            raise RuntimeError(
+                "Local HEAD differs from remote head; sync deliberately before releasing the watch"
+            )
+        if state["dirty"]:
+            raise RuntimeError("Worktree has uncommitted changes; repair was not started")
+        return
     if git(job["cwd"], "symbolic-ref", "--short", "HEAD", machine=machine) != pr["head_branch"]:
         raise RuntimeError("Worktree branch differs from the watched branch; intervention required")
     if git(job["cwd"], "rev-parse", "HEAD", machine=machine) != pr["head_sha"]:
@@ -552,11 +579,12 @@ def command_for(job, attempt_dir):
     return [*cmd, "resume", job["session_id"], "-"]
 
 
-def bind_pane(db, key, pane):
+def bind_pane(db, home, key, pane):
     import pane_runner
 
     job = get_job(db, key)
-    binding = pane_runner.capture(pane, job["cwd"], job.get("agent", "codex"))
+    worker = machines.resolve(home, job.get("machine"))
+    binding = pane_runner.capture(pane, job["cwd"], job.get("agent", "codex"), worker)
     with db:
         db.execute("BEGIN IMMEDIATE")
         current = get_job(db, key)
@@ -629,7 +657,7 @@ def run_repair(home, job_id, attempt):
                 raise RuntimeError("PR closed before repair started")
             if current["head_sha"] != job["snapshot"]["pr"]["head_sha"]:
                 raise RuntimeError("Remote head changed before repair started")
-            verify_worktree(job, current)
+            verify_worktree(job, current, home)
             if any(key.startswith("green:") for key in job.get("dispatched_keys", [])):
                 fresh, _ = observe(job)
                 check = {
@@ -644,7 +672,7 @@ def run_repair(home, job_id, attempt):
                     }
                     return
                 job["snapshot"] = fresh
-                verify_worktree(job, fresh["pr"])
+                verify_worktree(job, fresh["pr"], home)
             watch.save_state(folder / "schema.json", RESULT_SCHEMA)
             prompt_path = folder / "prompt.txt"
             prompt_path.write_text(repair_prompt(job))
@@ -739,6 +767,10 @@ def run_repair(home, job_id, attempt):
 
 
 def start_repair(db, home, job):
+    if job.get("machine") is not None:
+        job.update(status="blocked", summary=f"Repairs on {job['machine']} are not supported yet")
+        save_job(db, job)
+        return
     if job.get("pane"):
         import pane_runner
 
@@ -990,32 +1022,81 @@ def start_daemon(home, max_workers):
     raise RuntimeError("Supervisor startup is unconfirmed; inspect status")
 
 
-def refuse_worker_registration():
-    """Watches live on the controller, whose supervisor repairs them; a worker's own would
-    act where nobody looks. Provisioning marks a worker, and launches there say so.
+def release_argv(home, key):
+    return [sys.executable, str(SCRIPT), "--home", str(home), "release", key]
 
-    Registration forwarded to the controller's dashboard will replace this refusal.
-    """
-    marker = Path.home() / ".config" / "babysit-pr" / "worker.json"
-    if os.environ.get("BABYSIT_WORKER") or marker.exists():
-        raise ValueError("Watch registration from worker machines isn't supported yet")
+
+def forward_from_worker(args):
+    """Watches live on the controller, whose supervisor repairs them; a worker's own would
+    act where nobody looks. Provisioning marks a worker, and launches there say so: its
+    ``register`` goes to the controller's dashboard (``worker_api``)."""
+    import worker_api
+
+    if args.command == "handoff":
+        raise ValueError("Automatic handoff from worker machines isn't supported yet")
+    worker_api.controller()  # Without the controller's URL and token, nothing else matters.
+    return worker_api.forward("register", worker_api.registration(args))
+
+
+def worker_launcher(worker, agent):
+    """A worker's repair launcher: its own babysit-bwrap (``~`` is the worker's home),
+    never one a registration names, which would run outside the sandbox there."""
+    grants = sandbox.Grants(
+        env_pass=sandbox.REPAIR_ENV,
+        features=("playwright", *(["gpg"] if "gpg" in worker.labels else [])),
+    )
+    argv = ["claude", "--dangerously-skip-permissions"] if agent == "claude" else ["codex"]
+    launcher = f"{worker.babysit_root.rstrip('/')}/scripts/babysit-bwrap"
+    return [launcher, *sandbox.flags(grants, "bwrap"), "--", *argv]
 
 
 def register(db, args):
     # A registry id; None (the default) is this machine.
     machine = getattr(args, "machine", None)
-    if machine is not None:
-        worker = machines.resolve(Path(args.home).expanduser(), machine)
-        assert worker is not None
-        # Validation, repairs and release still run here, so a watch on a worker would
-        # quietly act on a same-named local checkout.
-        raise ValueError(f"Watches on {worker.label} are not supported yet")
-    cwd = str(Path(args.cwd).resolve())
     agent_kind = getattr(args, "agent", "codex")
-    sid = args.session or (os.environ.get("CODEX_THREAD_ID") if agent_kind == "codex" else None)
+    worker = state = None
+    if machine is not None:
+        # Everything about the checkout and session is read on the worker, never at a
+        # same-named path here.
+        home = Path(args.home).expanduser()
+        worker = machines.resolve(home, machine, placing=True)
+        assert worker is not None
+        if worker.os != "linux":
+            raise ValueError(f"Watches on {worker.label} need a Linux worker with babysit-bwrap")
+        if (args.pr == "auto" and not getattr(args, "branch", None)) or (
+            args.pr.isdigit() and not args.repo
+        ):
+            raise ValueError(
+                f"A watch on {worker.label} names its PR (--pr URL, or a number with --repo) "
+                "or --branch"
+            )
+        if args.codex_command or getattr(args, "claude_command", None):
+            raise ValueError(f"Repairs on {worker.label} always run in its own sandbox launcher")
+        if not args.session:
+            raise ValueError("Supply the exact --session UUID")  # Never this machine's.
+        state = checkout_state(home, machine, args.cwd)
+        cwd = state["path"]
+        sid = args.session
+    else:
+        cwd = str(Path(args.cwd).resolve())
+        sid = args.session or (os.environ.get("CODEX_THREAD_ID") if agent_kind == "codex" else None)
     if not sid:
         raise ValueError("Supply the exact --session UUID")
-    if agent_kind == "claude":
+    if worker is not None:
+        if getattr(args, "claude_account", None) and agent_kind != "claude":
+            raise ValueError("A Claude account can only be selected for Claude")
+        info = remote_probe.call(
+            home,
+            worker,
+            "session_info",
+            PROBE_TIMEOUT,
+            agent=agent_kind,
+            session=str(uuid.UUID(sid)),
+            cwd=cwd,
+            rollout=args.rollout,
+            account=getattr(args, "claude_account", None),
+        )
+    elif agent_kind == "claude":
         import claude_accounts
         import claude_runner
 
@@ -1029,17 +1110,19 @@ def register(db, args):
     if getattr(args, "pane", None):
         import pane_runner
 
-        pane = pane_runner.capture(args.pane, cwd, agent_kind)
+        pane = pane_runner.capture(args.pane, cwd, agent_kind, worker)
     elif not getattr(args, "headless", False):
         raise ValueError("Supply the original --pane, or explicitly select --headless")
     branch = getattr(args, "branch", None)
     if branch and (not args.repo or args.pr != "auto" or getattr(args, "ci_repo", None)):
         raise ValueError("--branch requires --repo and cannot be combined with --pr or --ci-repo")
-    pr = watch.resolve_subject(args.pr, repo_override=args.repo, branch=branch, cwd=cwd)
+    pr = watch.resolve_subject(
+        args.pr, repo_override=args.repo, branch=branch, cwd=None if worker else cwd
+    )
     ci_repo = watch.resolve_ci_repo(getattr(args, "ci_repo", None), pr)
     if pr["closed"] or pr["merged"]:
         raise ValueError("PR is already closed")
-    verify_worktree({"cwd": cwd}, pr)
+    verify_worktree({"cwd": cwd, "machine": machine}, pr, state=state)
     selection = (
         getattr(args, "claude_command", None) if agent_kind == "claude" else args.codex_command
     )
@@ -1047,7 +1130,11 @@ def register(db, args):
         agent_kind == "codex" and getattr(args, "claude_command", None)
     ):
         raise ValueError("Launcher must match --agent; do not replace the original agent kind")
-    if agent_kind == "claude" and not selection:
+    if worker is not None:
+        command = worker_launcher(worker, agent_kind)
+        if agent_kind == "claude" and info["claude_permission_mode"] != "plan":
+            info["claude_permission_mode"] = sandbox.LAUNCHER_PERMISSIONS
+    elif agent_kind == "claude" and not selection:
         command = sandbox.claude_launcher()
         if info["claude_permission_mode"] != "plan":
             info["claude_permission_mode"] = sandbox.LAUNCHER_PERMISSIONS
@@ -1059,11 +1146,14 @@ def register(db, args):
         or not all(isinstance(v, str) and v for v in command)
     ):
         raise ValueError("Agent launcher must be a nonempty JSON argv array")
-    try:
-        # Recorded so a later grant of the common dir can tell when it moved.
-        recorded = {"git_common_dir": safe_git.common_dir(cwd)}
-    except ValueError:
-        recorded = {}
+    if state is not None:
+        recorded = {"git_common_dir": state["common"]} if state["common"] else {}
+    else:
+        try:
+            # Recorded so a later grant of the common dir can tell when it moved.
+            recorded = {"git_common_dir": safe_git.common_dir(cwd)}
+        except ValueError:
+            recorded = {}
     key = hashlib.sha256(pr["url"].encode()).hexdigest()[:16]
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -1200,6 +1290,12 @@ def main():
         type=Path,
         help="Directory for files attached to agent messages (default: HOME/attachments)",
     )
+    token = sub.add_parser(
+        "worker-token",
+        help="Issue a worker's registration token (printed for provision_worker.sh --controller)",
+    )
+    token.add_argument("machine", help="Registered machine id")
+    token.add_argument("--revoke", action="store_true", help="Stop the machine's token working")
     start = sub.add_parser("start", help="Restart the shared watcher after logout/reboot")
     start.add_argument("--max-workers", type=int, default=2)
     server = sub.add_parser("serve", help="Run shared watcher in foreground")
@@ -1217,6 +1313,29 @@ def main():
         parser.error(
             "Repair workers must return to their existing supervisor, not change its lifecycle"
         )
+    if args.command in {"register", "handoff"}:
+        import worker_api
+
+        if worker_api.on_worker():
+            try:
+                emit(forward_from_worker(args))
+            except (OSError, ValueError, RuntimeError) as exc:
+                emit({"error": str(exc)})
+                return 1
+            return 0
+    if args.command == "worker-token":
+        import worker_api
+
+        try:
+            if args.revoke:
+                worker_api.revoke(home, args.machine)
+                emit({"machine": args.machine, "revoked": True})
+            else:
+                worker_api.print_token(worker_api.issue(home, args.machine))
+        except (OSError, ValueError) as exc:
+            emit({"error": str(exc)})
+            return 1
+        return 0
     if args.command == "dashboard":
         import dashboard
 
@@ -1234,8 +1353,6 @@ def main():
             return 1
     db = open_db(home)
     try:
-        if args.command in {"register", "handoff"}:
-            refuse_worker_registration()
         if args.command == "register":
             job = register(db, args)
             emit(
@@ -1243,14 +1360,7 @@ def main():
                     "id": job["id"],
                     "status": job["status"],
                     "session": job["session_id"],
-                    "release_argv": [
-                        sys.executable,
-                        str(SCRIPT),
-                        "--home",
-                        str(home),
-                        "release",
-                        job["id"],
-                    ],
+                    "release_argv": release_argv(home, job["id"]),
                 }
             )
         elif args.command == "handoff":
@@ -1261,7 +1371,7 @@ def main():
             job = configure_on_green(db, args.id, args.instructions)
             emit({"id": job["id"], "status": job["status"], "summary": job["summary"]})
         elif args.command == "bind-pane":
-            job = bind_pane(db, args.id, args.pane)
+            job = bind_pane(db, home, args.id, args.pane)
             emit({"id": job["id"], "status": job["status"], "pane": job["pane"]})
         elif args.command == "stop":
             job = stop_watch(db, args.id)
@@ -1295,7 +1405,11 @@ def main():
                         import pane_runner
 
                         pane_runner.locate(
-                            job["pane"], job["cwd"], require_shell=True, allow_release=True
+                            job["pane"],
+                            job["cwd"],
+                            require_shell=True,
+                            allow_release=True,
+                            machine=machines.resolve(home, job.get("machine")),
                         )
                     if job["status"] == "running":
                         raise ValueError("Repair is already running; inspect status")

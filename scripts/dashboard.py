@@ -27,6 +27,7 @@ import dashboard_settings
 import llm_usage
 import machines
 import service_control
+import worker_api
 import workspace_agents
 import workspace_viewer
 from dashboard_push import check_result
@@ -597,6 +598,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/extension":
             self.extension_request()
             return
+        if self.path.startswith("/api/worker/"):
+            self.worker_request()
+            return
         host = self.headers.get("Host")
         allowed = {
             f"127.0.0.1:{self.server.server_port}",
@@ -933,6 +937,37 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.fail(503, f"Cannot deliver task: {exc}")
+
+    def worker_request(self):
+        """Registration forwarded by a worker machine; its token names the machine.
+
+        Not a browser's: a request with an Origin or Fetch metadata is refused.
+        """
+        action = self.path.removeprefix("/api/worker/")
+        machine = (
+            worker_api.authenticate(self.server.home, self.headers.get("Authorization"))
+            if self.extension_host()
+            and action in worker_api.ACTIONS
+            and self.headers.get("Origin") is None
+            and self.headers.get("Sec-Fetch-Site") is None
+            else None
+        )
+        if machine is None:
+            self.send_json(403, {"error": "This needs a worker token issued by the controller"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if (
+                not 0 < length <= worker_api.MAX_BODY
+                or self.headers.get("Content-Type") != "application/json"
+            ):
+                raise ValueError("Send one JSON request body")
+            request = json.loads(self.read_body(length, 10))
+            self.send_json(200, worker_api.handle(self.server.home, machine, action, request))
+        except (ValueError, RuntimeError) as exc:
+            self.fail(400, str(exc))
+        except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            self.fail(503, f"Cannot register the watch: {exc}")
 
     def get(self):
         port = self.server.server_port
