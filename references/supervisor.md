@@ -373,11 +373,14 @@ Known gaps of the Linux sandbox:
   gives up the filesystem boundary (`docker run -v $HOME:/h` reaches every file
   of the user), so enabling Docker trusts the agent with them.
 - `--enable=gpg` mounts a throwaway `~/.gnupg` (copies of `pubring.kbx` and
-  `trustdb.gpg`, a `gpg.conf` with `no-autostart`) and the user's gpg-agent
-  socket, so git signs through the agent; the private keys, any passphrase file
-  and the agent's configuration stay outside. The agent is a signing oracle: while
-  it runs, the sandboxed agent can have it sign arbitrary data with the unlocked
-  key, not only its own commits, as on macOS. Setup is in
+  `trustdb.gpg`, a `gpg.conf` with `no-autostart`) and, at the gpg-agent socket
+  path, a per-launch proxy (`scripts/gpg_agent_proxy.py`) that passes on only the
+  commands gpg signs with, so git signs through the agent; the private keys, any
+  passphrase file, the agent's configuration and its real socket stay outside. The
+  agent is still a signing oracle: while it runs, the sandboxed agent can have it
+  sign arbitrary data with the unlocked key, not only its own commits, as on
+  macOS. Signing is a grant: it keys its own sandbox cache, and a granted Claude
+  gets `--strict-mcp-config`. Setup is in
   [the worker checklist](worker-setup.md#signing-with-a-gpg-subkey).
 - The dashboard's Docker toggle is macOS-only for now: it inspects Seatbelt, and
   its restart looks for the launcher in the agent's parent process, which under

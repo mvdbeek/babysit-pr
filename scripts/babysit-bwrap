@@ -214,6 +214,7 @@ fi
 # The grants that reach beyond the sandbox, in a fixed order.
 granted=
 ((!docker)) || granted+=,docker
+((!gpg)) || granted+=,gpg
 granted=${granted#,}
 # Everything below must keep a launch without these grants from leaving code for a
 # launch with them, of any agent of the same configuration, to run.
@@ -257,10 +258,13 @@ fi
 if ((gpg)); then
   # Signing through this user's gpg-agent, and nothing else of ~/.gnupg (protected, so
   # never bound): a throwaway home on the sandbox's tmpfs holding copies of the public
-  # keyring and trust database and a gpg.conf that never starts an agent inside, plus
-  # the agent's standard socket. Private keys, any passphrase file and the agent's own
-  # configuration stay outside; the agent signs whatever the sandbox asks while it is
-  # unlocked. Copies, so gpg may lock and update them without touching the originals.
+  # keyring and trust database and a gpg.conf that never starts an agent inside, plus,
+  # at the agent's standard socket path, a proxy for this launch that passes on only
+  # what signing needs (gpg_agent_proxy.py). Private keys, any passphrase file and the
+  # agent's own configuration stay outside; the sandbox can have the unlocked key sign
+  # anything, but cannot export it, read or clear passphrases, delete keys, stop the
+  # agent or aim a pinentry at a terminal. Copies, so gpg may lock and update them
+  # without touching the originals.
   command -v gpgconf >/dev/null || die "gpgconf is not installed"
   gnupghome=$home/.gnupg
   # The default home's socket, whatever GNUPGHOME the caller passes: the sandbox uses
@@ -278,12 +282,26 @@ if ((gpg)); then
     exec {trustdb}<"$gnupghome/trustdb.gpg" || die "cannot open $gnupghome/trustdb.gpg"
     argv+=(--perms 0600 --file "$trustdb" "$gnupghome/trustdb.gpg")
   fi
+  # The proxy lives in a private directory of its own, outside every sandbox, and exits
+  # with bwrap (which this script becomes), removing it.
+  if ((print)); then
+    proxy=$(mktemp -d -u "${XDG_RUNTIME_DIR:-/tmp}/babysit-gpg.XXXXXX")
+  else
+    command -v python3 >/dev/null || die "python3 is not installed"
+    proxy=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/babysit-gpg.XXXXXX") || die "cannot create a gpg-agent proxy directory"
+    exec {ready}< <(exec python3 -I "${self%/*}/gpg_agent_proxy.py" "$proxy/S.gpg-agent" "$socket" </dev/null)
+    if ! read -r -u "$ready" line || [[ $line != ready ]]; then
+      rmdir "$proxy" 2>/dev/null || true
+      die "the gpg-agent proxy did not start"
+    fi
+    exec {ready}<&-
+  fi
   # gpg uses /run/user/<uid>/gnupg only while it and its parent are private to the user,
   # else it looks in the home. A socket cannot be opened, so it is bound by path: it
-  # lives in the user's private runtime directory, which no sandbox can write.
+  # lives in a private directory, which no sandbox can write.
   socket_dir=$(dirname -- "$socket")
   argv+=(--perms 0700 --dir "$(dirname -- "$socket_dir")" --perms 0700 --dir "$socket_dir"
-    --bind "$socket" "$socket")
+    --bind "$proxy/S.gpg-agent" "$socket")
 fi
 
 if ((docker)); then

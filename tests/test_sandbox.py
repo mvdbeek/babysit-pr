@@ -5,6 +5,7 @@ produced before ``sandbox.py`` existed, so the refactor stays byte-identical on 
 No real agent ever starts; only the Linux-gated tests run bubblewrap, with ``sh``.
 """
 
+import contextlib
 import hashlib
 import itertools
 import json
@@ -15,6 +16,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import agent_docker
@@ -963,7 +966,11 @@ def test_wrapper_gives_gpg_the_agent_socket_and_public_keyring_only(checkout, gn
     assert "S.gpg-agent" not in " ".join(printed(worktree, env, "agent"))
     argv = printed(worktree, env, "--env-pass=GNUPGHOME", "--enable=gpg", "agent")
     gnupghome = str(home / ".gnupg")
-    assert (str(path), str(path)) in pairs(argv, "--bind")
+    # Never the agent's own socket: a proxy's, which passes on only what signing needs.
+    sources = [source for source, target in pairs(argv, "--bind") if target == str(path)]
+    assert len(sources) == 1 and sources[0] != str(path)
+    assert sources[0].endswith("/S.gpg-agent") and "babysit-gpg." in sources[0]
+    assert str(path) not in [source for source, _ in pairs(argv, "--bind")]
     # --perms MODE --file FD TARGET and --perms MODE --dir TARGET, in order.
     made = [tuple(argv[i + 1 : i + 5]) for i, word in enumerate(argv) if word == "--perms"]
     copies = {words[3]: words[0] for words in made if words[1] == "--file"}
@@ -974,11 +981,79 @@ def test_wrapper_gives_gpg_the_agent_socket_and_public_keyring_only(checkout, gn
     assert dirs == [(str(p), "0700") for p in (gnupghome, path.parent.parent, path.parent)]
     # Even a passed-through GNUPGHOME cannot point gpg elsewhere.
     assert dict(pairs(argv, "--setenv"))["GNUPGHOME"] == gnupghome
+    # Signing is a grant: its cache is apart from that of launches without it.
+    assert dict(pairs(argv, "--setenv"))["XDG_CACHE_HOME"] == sandbox_cache(home, granted="gpg")
     joined = "\0".join(argv)
     for secret in ("private-keys-v1.d", "signing-subkey.pass", "gpg-agent.conf", "GRIP.key"):
         assert secret not in joined
     for other in ("S.gpg-agent.extra", "S.gpg-agent.browser", "S.gpg-agent.ssh"):
         assert other not in joined
+
+
+@fd_bash
+def test_wrapper_starts_a_gpg_agent_proxy_for_the_launch(checkout, gnupg, tmp_path):
+    worktree, _, home = checkout
+    env, path = gnupg
+    # The fixture's socket becomes an agent that answers every command OK.
+    path.unlink()
+    agent = socket.socket(socket.AF_UNIX)
+    agent.bind(str(path))
+    agent.listen()
+    received = []
+
+    def answer():
+        with contextlib.suppress(OSError):
+            while True:
+                connection, _ = agent.accept()
+                with connection, connection.makefile("rb") as lines:
+                    connection.sendall(b"OK hello\n")
+                    for line in lines:
+                        received.append(line)
+                        connection.sendall(b"OK\n")
+
+    threading.Thread(target=answer, daemon=True).start()
+    # A bwrap that, instead of sandboxing, talks to whatever it binds at the agent socket.
+    fake = tmp_path / "client-bwrap"
+    fake.mkdir()
+    (fake / "bwrap").write_text(
+        f"#!{sys.executable}\n"
+        "import socket, sys\n"
+        "if sys.argv[1:] == ['--help']: sys.exit(0)\n"
+        "argv = sys.argv\n"
+        f"source = next(argv[i + 1] for i, w in enumerate(argv) if w == '--bind' and argv[i + 2] == {str(path)!r})\n"
+        "client = socket.socket(socket.AF_UNIX)\n"
+        "client.connect(source)\n"
+        "lines = client.makefile('rb')\n"
+        "lines.readline()\n"
+        "for command in (b'DELETE_KEY --force GRIP\\n', b'HAVEKEY GRIP\\n'):\n"
+        "    client.sendall(command)\n"
+        "    sys.stdout.buffer.write(lines.readline())\n"
+        "print(source)\n"
+    )
+    (fake / "bwrap").chmod(0o755)
+    env["PATH"] = f"{fake}:{env['PATH']}"
+    try:
+        result = subprocess.run(
+            ["bash", WRAPPER, "--enable=gpg", "--", "agent"],
+            cwd=worktree,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        deleted, probed, source = result.stdout.splitlines()
+        assert deleted.startswith("ERR 67109115 Forbidden") and probed == "OK"
+        assert received == [b"HAVEKEY GRIP\n"]
+        # The proxy leaves with the launch, and takes its socket with it.
+        for _ in range(100):
+            if not Path(source).parent.exists():
+                break
+            time.sleep(0.1)
+        assert not Path(source).parent.exists()
+    finally:
+        agent.close()
 
 
 def test_wrapper_refuses_gpg_without_an_agent_socket_or_keyring(checkout, gnupg):

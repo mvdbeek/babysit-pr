@@ -191,8 +191,8 @@ protection allows, or give the worker a GPG signing subkey as below.
 
 The worker holds only a dedicated signing subkey of your key; the primary stays on the
 Mac, so the worker can sign but cannot certify, add or revoke keys. gpg-agent keeps
-the subkey unlocked, and `babysit-bwrap --enable=gpg` lets a sandboxed agent reach that
-agent's socket without seeing `~/.gnupg`.
+the subkey unlocked, and `babysit-bwrap --enable=gpg` lets a sandboxed agent sign
+through a proxy in front of that agent, without seeing `~/.gnupg`.
 
 1. On the Mac, add a signing subkey valid for a year:
 
@@ -292,10 +292,19 @@ agent's socket without seeing `~/.gnupg`.
 
 Sandboxed agents sign only with `--enable=gpg`. babysit-bwrap then mounts a throwaway
 `~/.gnupg` on the sandbox's tmpfs holding copies of `pubring.kbx` and `trustdb.gpg`
-and a `gpg.conf` with `no-autostart`, plus the agent's standard socket (from
-`gpgconf --list-dirs agent-socket`) at the same path, so gpg inside finds it; never the
-private keys, the passphrase file, `gpg-agent.conf` or the extra, browser and ssh
-sockets. `~/.gitconfig` is already mounted read-only, so the signing configuration
+and a `gpg.conf` with `no-autostart`, and at the agent's standard socket path (from
+`gpgconf --list-dirs agent-socket`), where gpg inside looks, the socket of
+`scripts/gpg_agent_proxy.py` (python3). babysit-bwrap starts one proxy per launch in
+a private directory; it exits with the sandbox. It passes on only what gpg sends to
+sign (`RESET`, `GETINFO version`, `HAVEKEY`, `KEYINFO`, `SIGKEY`, `SETHASH`,
+`PKSIGN`, two harmless options) and refuses the rest, among it `EXPORT_KEY`,
+`DELETE_KEY`, `GET_PASSPHRASE`, `PRESET_PASSPHRASE`, `CLEAR_PASSPHRASE`,
+`KILLAGENT` and `UPDATESTARTUPTTY`. Terminal, display and loopback-pinentry options
+and the key description are acknowledged but never reach the agent, so a sandbox
+cannot show a passphrase prompt on someone's terminal or answer one itself. The
+sandbox never sees the agent's own socket, the private keys, the passphrase file,
+`gpg-agent.conf` or the extra, browser and ssh sockets. The agent needs no new
+options; the preset unit above keeps the subkey unlocked as before. `~/.gitconfig` is already mounted read-only, so the signing configuration
 applies inside. In babysit this is the `gpg` feature of a launch's grants
 (`sandbox.Grants(features=("gpg",))`); once the machine registry lands, the worker's
 `gpg` label in `machines.json` turns it on for that machine's launches.
@@ -389,8 +398,9 @@ From the Linux sandbox section of the supervisor reference, restated for operato
   agents you would trust with that, and keep nothing personal in the account.
 - **gpg-agent is a signing oracle.** With `--enable=gpg` an agent can have the agent
   sign arbitrary data, not only its own commits, for as long as it runs, as on macOS.
-  It never gets the key itself; revoke the subkey (above) if the worker is
-  compromised.
+  Through the proxy it cannot export the key, read, preset or clear passphrases,
+  delete keys, stop the agent or show a pinentry; anyone who runs code as `babysit`
+  outside the sandbox can. Revoke the subkey (above) if the worker is compromised.
 - **Git directories stay writable**, so hooks an agent leaves in a worktree's git
   directory run when git is later used there outside the sandbox.
 - **bubblewrap 0.9.0** keeps the bind-by-path race unless upgraded (above).
