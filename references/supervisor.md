@@ -301,6 +301,9 @@ agents keep job control only where the kernel already blocks injection.
 launches on Linux invoke the wrapper directly; there are no shell functions there
 to rely on.
 
+Provisioning a Linux worker (bubblewrap under AppArmor, rootless Docker, accounts)
+is in [the worker setup checklist](worker-setup.md).
+
 Known gaps of the Linux sandbox:
 
 - The worktree's git directory, including its hooks and config, stays writable
