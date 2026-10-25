@@ -719,8 +719,11 @@ is the herdr machine label passed as `herdr --machine=<label>` (labels cannot st
 `os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
 `max_agents` is 1–64, and unknown keys are rejected. `collie_url`, optional, is that
 machine's own Collie (an `http` or `https` URL with a host): its workspaces link
-`<collie_url>/space/<id>`; without one a worker's workspaces link no Collie at all,
-since this machine's Collie cannot open them.
+`<collie_url>/space/<id>`. `collie_host`, optional, is the machine's name in a Collie
+crew this machine leads (`collie crew add <ssh>`, then `collie crew status`): its
+workspaces open through this machine's Collie, or the lead `collie_url` names, as
+`<lead>/space/<id>?h=<collie_host>`. With neither, a worker's workspaces link no Collie
+at all, since this machine's Collie cannot open them.
 Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (`user@host` and `host`) are not detected.
 Disabled machines stay valid for records already pinned to them.

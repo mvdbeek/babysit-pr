@@ -46,10 +46,20 @@ COLLIE_URL = (os.environ.get("COLLIE_PUBLIC_URL") or "http://127.0.0.1:8787").rs
 def collie_url(machine, workspace_id):
     """Collie's page for a herdr workspace on ``machine`` (None: this one).
 
-    A worker's comes from its registry ``collie_url``; without one there is no link.
+    A worker's comes from its registry ``collie_url``; without one there is no link. A
+    worker that is a member of this machine's Collie crew (``collie_host``) opens through
+    the lead, this machine's Collie unless ``collie_url`` names another, addressed to it.
     """
-    base = COLLIE_URL if machine is None else (machine.collie_url or "").rstrip("/")
-    return f"{base}/space/{quote(workspace_id, safe='')}" if base else None
+    if machine is None:
+        base = COLLIE_URL
+    else:
+        base = (machine.collie_url or (COLLIE_URL if machine.collie_host else "")).rstrip("/")
+    if not base:
+        return None
+    url = f"{base}/space/{quote(workspace_id, safe='')}"
+    return (
+        f"{url}?h={quote(machine.collie_host, safe='')}" if machine and machine.collie_host else url
+    )
 
 
 # The portable wt/wti/wtpr implementation shipped next to this module.

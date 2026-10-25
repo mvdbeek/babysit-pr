@@ -217,6 +217,15 @@ itself, and a link would be followed outside the sandbox). Copy the file instead
 and keep any script a hook or status line runs out of the account directory or in
 its `hooks/`.
 
+A freshly signed-in account still shows Claude's first-run screens (the theme picker,
+then the bypass-permissions warning), and an unattended launch waits on them forever;
+the sandboxed Claude can't save the answers into its read-only `settings.json`. After
+`claude-account login <name>`, mark it done outside the sandbox: set
+`"hasCompletedOnboarding": true` in `~/.claude/accounts/<name>/.claude.json` and
+`"skipDangerousModePermissionPrompt": true` in its `settings.json` (as the Mac's
+settings already have). `--check` reports an account that is missing either, or that
+is not signed in.
+
 The worker's `gh` login is used only by agents and git on the worker; the controller
 keeps polling GitHub with its own. Prefer a fine-grained token or a separate GitHub
 account limited to the repositories babysit works on.

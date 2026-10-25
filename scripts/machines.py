@@ -33,6 +33,8 @@ WORKSPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 CAPABILITY = re.compile(r"[a-z0-9][a-z0-9:._-]{0,63}")
 COMMAND = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
+# A Collie crew member's name, as `collie crew status` lists it; it goes in a link's query.
+COLLIE_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 OSES = {"darwin", "linux"}
 FIELDS = {
     "id",
@@ -45,6 +47,7 @@ FIELDS = {
     "max_agents",
     "labels",
     "collie_url",
+    "collie_host",
     "enabled",
     "tailnet_ip",
 }
@@ -68,6 +71,7 @@ class Machine(NamedTuple):
     labels: tuple[str, ...]
     collie_url: str | None
     enabled: bool
+    collie_host: str | None = None
     # Where its registrations reach the dashboard from (IPv4, IPv6), as `tailscale serve`
     # reports it.
     tailnet_ip: tuple[str, ...] | None = None
@@ -141,6 +145,7 @@ def _machine(raw):
         labels=raw.get("labels", []),
         collie_url=raw.get("collie_url"),
         enabled=raw.get("enabled", True),
+        collie_host=raw.get("collie_host"),
         tailnet_ip=raw.get("tailnet_ip"),
     )
     name = machine.id if isinstance(machine.id, str) else "?"
@@ -179,6 +184,13 @@ def _machine(raw):
             "labels",
         ),
         (machine.collie_url is None or _collie_url(machine.collie_url), "collie_url"),
+        (
+            machine.collie_host is None
+            or (
+                isinstance(machine.collie_host, str) and COLLIE_HOST.fullmatch(machine.collie_host)
+            ),
+            "collie_host",
+        ),
         (isinstance(machine.enabled, bool), "enabled"),
         (
             machine.tailnet_ip is None
