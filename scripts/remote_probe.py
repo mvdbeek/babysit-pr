@@ -746,6 +746,8 @@ class Expired(Exception):
 
 # Monotonic time after which no further Git starts; None when no deadline was given.
 DEADLINE = None
+# Set once the alarm fired, so expiry is reported even if it lands mid-cleanup.
+EXPIRED_AT_ALARM = False
 
 
 def _within_deadline(timeout):
@@ -1080,6 +1082,8 @@ OPS: dict[str, Callable[..., Any]] = {
 def _expire(signum, frame):
     # A probe leading its own process group (see __main__) stops its Git children too;
     # it ignores the signal it sends them, then unwinds to report and exit.
+    global EXPIRED_AT_ALARM
+    EXPIRED_AT_ALARM = True
     if os.getpgrp() == os.getpid():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         os.killpg(0, signal.SIGTERM)
@@ -1092,8 +1096,29 @@ def main(argv):
     A killed ssh client leaves the probe running, so it carries its own lifeline: an
     alarm at the deadline, and no Git started after it. Expiry exits with EXPIRED.
     """
-    global DEADLINE
     code = 0
+    try:
+        answer = _answer(argv)
+    except Expired as exc:
+        # The one-shot alarm can land while _answer is already handling an error or
+        # cleaning up, and then escapes it; expiry is still reported as expiry.
+        answer = {"protocol": PROTOCOL, "error": str(exc)}
+    if EXPIRED_AT_ALARM or answer.get("error") == "Probe deadline expired":
+        code = EXPIRED
+        answer = {"protocol": PROTOCOL, "error": "Probe deadline expired"}
+    # UTF-8 rather than \u escapes keeps a diff's answer close to its own size. A lone
+    # surrogate (an undecodable file name) comes out as the escape JSON would have used.
+    sys.stdout.flush()
+    sys.stdout.buffer.write(
+        json.dumps(answer, ensure_ascii=False).encode("utf-8", "backslashreplace")
+    )
+    sys.stdout.flush()
+    return code
+
+
+def _answer(argv):
+    global DEADLINE, EXPIRED_AT_ALARM
+    EXPIRED_AT_ALARM = False
     previous = None
     try:
         if len(argv) != 3 or argv[1] != PROTOCOL:
@@ -1116,7 +1141,6 @@ def main(argv):
             signal.setitimer(signal.ITIMER_REAL, deadline)
         answer = {"protocol": PROTOCOL, "result": OPS[request["op"]](**request["args"])}
     except Expired as exc:
-        code = EXPIRED
         answer = {"protocol": PROTOCOL, "error": str(exc)}
     except Exception as exc:
         answer = {"protocol": PROTOCOL, "error": f"{type(exc).__name__}: {exc}"[:400]}
@@ -1125,14 +1149,7 @@ def main(argv):
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
         DEADLINE = None
-    # UTF-8 rather than \u escapes keeps a diff's answer close to its own size. A lone
-    # surrogate (an undecodable file name) comes out as the escape JSON would have used.
-    sys.stdout.flush()
-    sys.stdout.buffer.write(
-        json.dumps(answer, ensure_ascii=False).encode("utf-8", "backslashreplace")
-    )
-    sys.stdout.flush()
-    return code
+    return answer
 
 
 # The controller side ---------------------------------------------------------

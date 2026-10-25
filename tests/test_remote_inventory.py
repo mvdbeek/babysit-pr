@@ -765,6 +765,25 @@ def test_the_probe_stops_at_its_deadline(capsys, monkeypatch):
         assert "deadline must be" in answer["error"]
 
 
+def test_expiry_while_an_error_is_being_reported_still_exits_expired(capsys, monkeypatch):
+    class Slow(Exception):
+        def __str__(self):
+            time.sleep(10)  # The alarm fires while the probe formats this error.
+            return "slow"
+
+    def failing(**args):
+        raise Slow
+
+    monkeypatch.setitem(remote_probe.OPS, "inventory", failing)
+    request = {"op": "inventory", "args": {}, "deadline": 0.2}
+    code = remote_probe.main(["-", remote_probe.PROTOCOL, encoded(request)])
+    assert code == remote_probe.EXPIRED
+    assert json.loads(capsys.readouterr().out)["error"] == "Probe deadline expired"
+    # The next request starts with no memory of that expiry.
+    answer = run_main(capsys, remote_probe.PROTOCOL, encoded({**request, "deadline": 0}))
+    assert "deadline must be" in answer["error"]
+
+
 def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
