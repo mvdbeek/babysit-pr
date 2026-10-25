@@ -40,14 +40,23 @@ It:
    refused if `~/.ssh` or `authorized_keys` is a symlink.
 2. Installs git, bubblewrap, socat, build-essential, curl, jq, uidmap,
    dbus-user-session, slirp4netns, python3 (3.12 on 24.04), python3-venv, AppArmor
-   tools and `apparmor-profiles`.
+   tools and `apparmor-profiles`. Throughout, only packages `dpkg-query` reports
+   missing are installed, so a rerun never upgrades an installed package (and so
+   never restarts the operator's rootful Docker or containerd).
 3. Adds apt repositories, each keyed only by the one pinned primary fingerprint: the
    key is imported into a scratch GNUPGHOME, must be exactly that key, and only it is
-   exported (binary) to `/etc/apt/keyrings/<name>.gpg` for `signed-by`; an older `.asc`
-   keyring from earlier runs is removed. Repositories: GitHub CLI (`gh`; skipped when
-   the distro's `gh` is installed), Docker (`docker-ce`, `docker-ce-rootless-extras`,
-   buildx; skipped when Ubuntu's `docker.io` is installed, `DOCKER_SOURCE` overrides)
-   and Claude Code (Anthropic's
+   exported (binary) to `/etc/apt/keyrings/<name>.gpg` for `signed-by`. A repository
+   whose URL any source already names, one-line (`*.list`) or deb822 (`*.sources`,
+   as Docker's own instructions now write `docker.sources` with
+   `/etc/apt/keyrings/docker.asc`), is reused as it is; a second entry with another
+   `Signed-By` would stop apt working. An entry an earlier run wrote for such a
+   repository (recognised by its exact content) is removed; keyrings never are.
+   Repositories: GitHub CLI (`gh`; skipped when the distro's `gh` is installed and no
+   GitHub CLI source exists), Docker (`docker-ce`, `docker-ce-rootless-extras`,
+   buildx; skipped when Ubuntu's `docker.io` is installed and neither `docker-ce` nor
+   a Docker source is, `DOCKER_SOURCE` overrides; with `docker-ce` already installed
+   only `docker-ce-rootless-extras` at that same version is added, and with
+   `docker.io` only `rootlesskit`) and Claude Code (Anthropic's
    signed repository, `stable` channel; `CLAUDE_CHANNEL=latest` or `INSTALL_CLAUDE=0`).
    apt-installed Claude does not auto-update; upgrade with `apt upgrade claude-code`.
    It lives in `/usr`, which the sandbox mounts read-only, so an agent cannot replace it.

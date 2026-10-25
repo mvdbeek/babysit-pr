@@ -19,7 +19,17 @@ TOOLS = (
 
 
 @pytest.fixture
-def run(tmp_path):
+def root(tmp_path):
+    """The machine the dry runs inspect: an empty /etc/apt and a dpkg that knows packages."""
+    root = tmp_path / "root"
+    (root / "etc/apt/sources.list.d").mkdir(parents=True)
+    (root / "etc/apt/keyrings").mkdir()
+    (root / "installed").write_text("")
+    return root
+
+
+@pytest.fixture
+def run(tmp_path, root):
     fakes = tmp_path / "bin"
     fakes.mkdir()
     calls = tmp_path / "calls"
@@ -27,6 +37,14 @@ def run(tmp_path):
         fake = fakes / tool
         fake.write_text(f'#!/bin/sh\necho "{tool} $*" >> "{calls}"\nexit 97\n')
         fake.chmod(0o755)
+    # Read-only, so it answers instead of recording: lines of "package version".
+    (fakes / "dpkg-query").write_text(
+        "#!/bin/sh\nfor package; do :; done\n"
+        f'version=$(awk -v p="$package" \'$1 == p {{ print $2 }}\' "{root / "installed"}")\n'
+        '[ -n "$version" ] || exit 1\n'
+        'case "$*" in *Status*) echo "install ok installed" ;; *) echo "$version" ;; esac\n'
+    )
+    (fakes / "dpkg-query").chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
 
@@ -35,7 +53,12 @@ def run(tmp_path):
             ["bash", str(SCRIPT), *args],
             capture_output=True,
             text=True,
-            env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home), **env},
+            env={
+                "PATH": f"{fakes}:/usr/bin:/bin",
+                "HOME": str(home),
+                "PROVISION_ROOT": str(root),
+                **env,
+            },
             timeout=30,
         )
         assert not calls.exists(), calls.read_text()
@@ -242,3 +265,75 @@ def test_user_step_moves_path_from_the_old_clone_to_the_deployed_copy(tmp_path):
     assert all(
         SAFE_GIT in line for line in calls.read_text().splitlines() if line.startswith("git -")
     )
+
+
+def install_line(out):
+    """The packages of the last apt-get install the dry run planned."""
+    lines = [line for line in out.splitlines() if "would run: apt-get install" in line]
+    return lines[-1].split("--no-install-recommends")[1].split()
+
+
+DOCKER_SOURCES = """Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: noble
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc
+"""
+
+
+def test_existing_deb822_docker_and_gh_repositories_are_reused(run, root):
+    # Docker's current instructions, and an operator's GitHub CLI source.
+    (root / "etc/apt/sources.list.d/docker.sources").write_text(DOCKER_SOURCES)
+    (root / "etc/apt/keyrings/docker.asc").write_text("operator key")
+    (root / "etc/apt/sources.list.d/github-cli.list").write_text(
+        "deb [signed-by=/etc/apt/keyrings/github.gpg] https://cli.github.com/packages stable main\n"
+    )
+    done = run("--dry-run")
+    assert done.returncode == 0, done.stderr
+    out = done.stdout
+    assert "reusing the https://download.docker.com/linux/ubuntu repository" in out
+    assert "reusing the https://cli.github.com/packages repository" in out
+    # A second entry with another Signed-By would break apt for the whole machine.
+    assert "would trust https://download.docker.com" not in out
+    assert "would trust https://cli.github.com" not in out
+    assert out.count("would trust https://") == 1  # Claude Code's
+    assert {"docker-ce", "docker-ce-rootless-extras", "gh"} <= set(install_line(out))
+
+
+def test_a_repository_this_script_added_gives_way_to_the_operators(run, root):
+    lists = root / "etc/apt/sources.list.d"
+    (lists / "docker.sources").write_text(DOCKER_SOURCES)
+    (lists / "docker.list").write_text(
+        "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] "
+        "https://download.docker.com/linux/ubuntu noble stable\n"
+    )
+    done = run("--dry-run")
+    assert done.returncode == 0, done.stderr
+    assert f"would run: rm -f {lists / 'docker.list'}" in done.stdout
+    # Never a keyring: one this script did not write may be another source's Signed-By.
+    assert not re.search(r"\brm\b[^\n]*keyrings", SCRIPT.read_text())
+
+
+def test_installed_docker_is_never_upgraded_or_restarted(run, root):
+    (root / "etc/apt/sources.list.d/docker.sources").write_text(DOCKER_SOURCES)
+    (root / "installed").write_text(
+        "docker-ce 5:27.3.1-1~ubuntu.24.04~noble\ndocker-ce-cli 5:27.3.1-1~ubuntu.24.04~noble\n"
+        "containerd.io 1.7.22-1\ngit 1:2.43.0-1ubuntu7\ncurl 8.5.0-2ubuntu10\n"
+    )
+    done = run("--dry-run")
+    assert done.returncode == 0, done.stderr
+    # Only what rootless needs, at the running daemon's own version.
+    docker = [p for p in install_line(done.stdout) if p.startswith(("docker", "containerd"))]
+    assert docker == ["docker-ce-rootless-extras=5:27.3.1-1~ubuntu.24.04~noble"]
+    base = [line for line in done.stdout.splitlines() if "apt-get install" in line][0]
+    assert " git " not in base and " curl " not in base and " bubblewrap " in base
+
+
+def test_installed_distro_docker_only_gets_rootlesskit(run, root):
+    (root / "installed").write_text("docker.io 26.1.3-0ubuntu1\ncontainerd 1.7.12-0ubuntu4\n")
+    done = run("--dry-run")
+    assert done.returncode == 0, done.stderr
+    assert "download.docker.com" not in done.stdout
+    packages = install_line(done.stdout)
+    assert "rootlesskit" in packages
+    assert not {"docker.io", "containerd", "docker-ce"} & set(packages)

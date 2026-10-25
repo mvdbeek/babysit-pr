@@ -76,6 +76,8 @@ dry=0
 sha=
 repo=${BABYSIT_REPO:-https://github.com/mvdbeek/babysit-pr.git}
 user_name=${BABYSIT_USER:-babysit}
+# Test hook: the root the apt sources are read and written under. Empty on a machine.
+ROOT=${PROVISION_ROOT:-}
 # The babysit-pr this worker runs, apart from ~/src where agents work on clones: an agent
 # able to write it would change babysit-bwrap itself, which refuses to grant it.
 APP=.local/share/babysit-pr/app
@@ -178,19 +180,62 @@ fetch_verified() {
   rm -rf "$tmp"
 }
 
-# apt_repo NAME KEY_URL FINGERPRINT DEB_LINE: import the downloaded key into a scratch
-# GNUPGHOME, require exactly one key whose primary fingerprint is the pinned one, and
-# export only that key (binary) as the repository's signed-by keyring.
+# --- packages --------------------------------------------------------------------------
+
+# installed PACKAGE: dpkg has it installed.
+installed() {
+  [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null) == *' ok installed' ]]
+}
+
+# want PACKAGE...: adds those not installed to packages. apt-get install upgrades an
+# installed package, and upgrading docker-ce, docker.io or containerd restarts the
+# operator's rootful daemon, so only missing packages are ever installed.
+want() {
+  local package
+  for package; do
+    installed "$package" || packages+=("$package")
+  done
+}
+
+# repo_files URL [EXCEPT]: the apt sources, one-line or deb822, other than EXCEPT that
+# use URL in a line that is not a comment.
+repo_files() {
+  local url=$1 except=${2:-} file
+  for file in "$ROOT/etc/apt/sources.list" "$ROOT"/etc/apt/sources.list.d/*.list \
+    "$ROOT"/etc/apt/sources.list.d/*.sources; do
+    [[ -f $file && $file != "$except" ]] || continue
+    if grep -qE "^[^#]*${url//./\\.}(/| |\$)" "$file"; then
+      printf '%s\n' "$file"
+    fi
+  done
+}
+
+# apt_repo NAME KEY_URL FINGERPRINT URL DEB_LINE: reuse a source that already names URL;
+# else import the downloaded key into a scratch GNUPGHOME, require exactly one key
+# whose primary fingerprint is the pinned one, and export only that key (binary) as
+# the repository's signed-by keyring. A second source for one URL with another
+# Signed-By would stop apt working at all ("Conflicting values set for option
+# Signed-By"). Keyrings are never removed: one this script did not write may be
+# another source's Signed-By, and an unreferenced one is trusted by nothing.
 apt_repo() {
-  local name=$1 key_url=$2 fpr=$3 line=$4 tmp got
-  local keyring=/etc/apt/keyrings/$name.gpg
+  local name=$1 key_url=$2 fpr=$3 url=$4 line=$5 tmp got others
+  local keyring=/etc/apt/keyrings/$name.gpg list=$ROOT/etc/apt/sources.list.d/$name.list
   line=${line//@KEYRING@/$keyring}
+  others=$(repo_files "$url" "$list")
+  if [[ -n $others ]]; then
+    ok "reusing the $url repository in $(tr '\n' ' ' <<<"$others")"
+    # An earlier run's own entry, recognised by its exact content.
+    if [[ -f $list ]] && [[ $(cat "$list") == "$line" ]]; then
+      run rm -f "$list"
+    fi
+    return 0
+  fi
   if ((dry)); then
     printf '  would trust %s (fingerprint %s), gpg --export only that key to %s and add: %s\n' \
       "$key_url" "$fpr" "$keyring" "$line"
     return 0
   fi
-  install -d -m 0755 /etc/apt/keyrings
+  install -d -m 0755 "$ROOT/etc/apt/keyrings"
   tmp=$(mktemp -d -p "$work")
   mkdir -m 0700 "$tmp/gnupg"
   curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp/key" "$key_url"
@@ -204,11 +249,9 @@ apt_repo() {
     exit 1
   fi
   gpg --batch --homedir "$tmp/gnupg" --export "$fpr" >"$tmp/keyring.gpg"
-  install -m 0644 -o root -g root "$tmp/keyring.gpg" "$keyring"
+  install -m 0644 -o root -g root "$tmp/keyring.gpg" "$ROOT$keyring"
   rm -rf "$tmp"
-  write_file "/etc/apt/sources.list.d/$name.list" 0644 "$line" || true
-  # Earlier versions of this script wrote the key as .asc (or unexported as-is).
-  rm -f "/etc/apt/keyrings/$name.asc"
+  write_file "$list" 0644 "$line" || true
 }
 
 # --- root-owned install markers ----------------------------------------------------------
@@ -557,17 +600,24 @@ system_step() {
 
   say "Base packages"
   run apt-get update -q
-  run apt-get install -y -q --no-install-recommends ca-certificates curl gnupg git jq \
-    bubblewrap socat build-essential uidmap dbus-user-session slirp4netns python3 \
-    python3-venv xz-utils apparmor apparmor-utils apparmor-profiles iproute2
+  local packages=()
+  want ca-certificates curl gnupg git jq bubblewrap socat build-essential uidmap \
+    dbus-user-session slirp4netns python3 python3-venv xz-utils apparmor apparmor-utils \
+    apparmor-profiles iproute2
+  if ((${#packages[@]})); then
+    run apt-get install -y -q --no-install-recommends "${packages[@]}"
+  else
+    ok "base packages are installed"
+  fi
 
   say "Signed apt repositories"
   # Keep a distro-packaged gh and docker.io rather than adding a conflicting repository.
-  local packages=() docker_src=${DOCKER_SOURCE:-auto} setuptool=dockerd-rootless-setuptool.sh
+  packages=()
+  local docker_src=${DOCKER_SOURCE:-auto} setuptool=dockerd-rootless-setuptool.sh
+  local docker_url=https://download.docker.com/linux/ubuntu gh_url=https://cli.github.com/packages
   if [[ $docker_src == auto ]]; then
     docker_src=docker-ce
-    if ((!dry)) && [[ ! -e /etc/apt/sources.list.d/docker.list ]] &&
-      dpkg-query -W -f='${Status}' docker.io 2>/dev/null | grep -q 'ok installed'; then
+    if ! installed docker-ce && [[ -z $(repo_files "$docker_url") ]] && installed docker.io; then
       docker_src=docker.io
     fi
   fi
@@ -576,30 +626,41 @@ system_step() {
     exit 2
     ;;
   esac
-  if ((dry)) || { [[ -e /etc/apt/sources.list.d/githubcli.list ]] ||
-    ! dpkg-query -W -f='${Status}' gh 2>/dev/null | grep -q 'ok installed'; }; then
-    apt_repo githubcli https://cli.github.com/packages/githubcli-archive-keyring.gpg "$GH_KEY_FPR" \
-      "deb [arch=$arch signed-by=@KEYRING@] https://cli.github.com/packages stable main"
-    packages+=(gh)
+  if [[ -n $(repo_files "$gh_url") ]] || ! installed gh; then
+    apt_repo githubcli "$gh_url/githubcli-archive-keyring.gpg" "$GH_KEY_FPR" "$gh_url" \
+      "deb [arch=$arch signed-by=@KEYRING@] $gh_url stable main"
+    want gh
   else
     ok "gh is installed from the distro; not adding the GitHub CLI repository"
   fi
   if [[ $docker_src == docker-ce ]]; then
-    apt_repo docker https://download.docker.com/linux/ubuntu/gpg "$DOCKER_KEY_FPR" \
-      "deb [arch=$arch signed-by=@KEYRING@] https://download.docker.com/linux/ubuntu $codename stable"
-    packages+=(docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras docker-buildx-plugin)
+    apt_repo docker "$docker_url/gpg" "$DOCKER_KEY_FPR" "$docker_url" \
+      "deb [arch=$arch signed-by=@KEYRING@] $docker_url $codename stable"
+    if installed docker-ce; then
+      # Rootless needs only the extras, at the running daemon's version: a newer one
+      # would pull a docker-ce upgrade, which restarts the operator's daemon.
+      installed docker-ce-rootless-extras ||
+        packages+=("docker-ce-rootless-extras=$(dpkg-query -W -f='${Version}' docker-ce)")
+    else
+      want docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras docker-buildx-plugin
+    fi
   else
     ok "using the distro's docker.io; not adding Docker's repository"
-    packages+=(docker.io rootlesskit)
+    want docker.io rootlesskit
   fi
   if [[ ${INSTALL_CLAUDE:-1} == 1 ]]; then
     local channel=${CLAUDE_CHANNEL:-stable}
     apt_repo claude-code https://downloads.claude.ai/keys/claude-code.asc "$CLAUDE_KEY_FPR" \
+      "https://downloads.claude.ai/claude-code/apt/$channel" \
       "deb [signed-by=@KEYRING@] https://downloads.claude.ai/claude-code/apt/$channel $channel main"
-    packages+=(claude-code)
+    want claude-code
   fi
   run apt-get update -q
-  run apt-get install -y -q --no-install-recommends "${packages[@]}"
+  if ((${#packages[@]})); then
+    run apt-get install -y -q --no-install-recommends "${packages[@]}"
+  else
+    ok "repository packages are installed"
+  fi
 
   # Repair what an earlier version of this script left agent-owned (tar kept the
   # archive's uid), then trust nothing but the root-owned markers.
