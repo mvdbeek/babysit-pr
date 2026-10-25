@@ -36,6 +36,7 @@ import remote_probe
 import safe_git
 import workspace_agents
 import workspace_exit
+import wt
 from issue_overview import branch_number
 
 # Collie's own setting for the URL it is reached at; unset means its loopback default.
@@ -110,10 +111,11 @@ PROMPT_KEEP = 86400
 PREPARE_TIMEOUT = 60
 # Seconds between looks at a worker agent's exit watch: each costs the worker ssh calls.
 REMOTE_WATCH = 60
+# Failed looks in a row after which a worker agent's exit watch is left.
+REMOTE_FAILURES = 30
 # What a worker's wt hands back about the exit watch of the agent it typed.
 WATCH_ID = re.compile(r"[0-9a-f]{32}")
 WATCH_MARKER = re.compile(r"\[babysit-done:[0-9a-f]{16}\]")
-WATCH_LABEL = re.compile(r"[A-Za-z0-9._-]{1,200}")
 PANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_-]{0,127}")
 
 
@@ -967,9 +969,11 @@ class Workspaces:
         if state is None:
             state = self.state()
         op = state["operations"].get(pr["id"])
+        # A worker's launch names its paths there: no local checkout or workspace is it.
+        remote = op is not None and op.get("machine") is not None
         # Recover the durable resource reservation even if the server exited before
         # recording its association. Name alone is never sufficient provenance.
-        if op and op.get("path") and op.get("branch") and op.get("common"):
+        if op and not remote and op.get("path") and op.get("branch") and op.get("common"):
             found = (state.get("index") or checkout_index(inventory))["path"].get(op["path"])
             item = inventory["checkouts"][found[0]] if found else None
             if (
@@ -990,9 +994,12 @@ class Workspaces:
             and op["status"] in {"queued", "running", "uncertain"}
             and pr["id"] not in self.workers
         ):
-            result = next(
-                (m for m in matches if m["path"] == op.get("path") and m["workspace_id"]), None
-            )
+            result = None
+            if not remote:
+                result = next(
+                    (m for m in matches if m["path"] == op.get("path") and m["workspace_id"]),
+                    None,
+                )
             if result and self.agent_started(result, op.get("agent")):
                 self.save_operation(
                     op, status="complete", result=result, message="Recovered existing workspace"
@@ -2103,8 +2110,21 @@ class Workspaces:
         ``row`` is a ``wt`` exit watch, or a scheduled task with its launch ``op``.
         Exiting agents on workers comes with exit-watch forwarding; until then the watch
         only says when the agent finished, or left without confirming, and leaves it open.
+        A watch also ends after a week, once its worker leaves the registry, or after
+        REMOTE_FAILURES failed looks in a row.
         """
         now = time.time() if now is None else now
+        if now - row["exit"].get("since", now) > workspace_exit.WATCH_LIMIT:
+            self.swap_exit(
+                table,
+                row,
+                {
+                    **row["exit"],
+                    "state": "left_open",
+                    "message": "Still not finished after a week; stopped watching",
+                },
+            )
+            return
         if now - row["exit"].get("checked_at", 0) < REMOTE_WATCH:
             return
         if op is None:
@@ -2137,7 +2157,18 @@ class Workspaces:
                 "agent": op["agent"],
             }
         machine = machines.load(self.home).get(machine_id)
-        launched.update(machine=machine_id, machine_label=machine.label if machine else machine_id)
+        if machine is None:
+            self.swap_exit(
+                table,
+                row,
+                {
+                    **row["exit"],
+                    "state": "left_open",
+                    "message": f"Stopped watching: {machine_id} is no longer registered",
+                },
+            )
+            return
+        launched.update(machine=machine_id, machine_label=machine.label)
         key = f"{table}:{row['id']}"
         with self.lock:
             if key in self.remote_looks or self.stopping.is_set():
@@ -2151,16 +2182,20 @@ class Workspaces:
         import cron_agents
 
         try:
+            record = {**row["exit"], "checked_at": time.time()}
             try:
                 seen = cron_agents.remote_progress(
                     self.home, {"agent": launched["agent"]}, launched
                 )
+                record.pop("failures", None)
             except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+                failures = record["failures"] = record.get("failures", 0) + 1
                 seen = {
-                    "state": "watching",
-                    "message": f"Could not look at the agent on {launched['machine_label']}: {exc}",
+                    "state": "watching" if failures < REMOTE_FAILURES else "unreachable",
+                    "message": f"Could not look at the agent on {launched['machine_label']}: {exc}"
+                    + ("" if failures < REMOTE_FAILURES else f"; stopped after {failures} tries"),
                 }
-            record = {**row["exit"], "message": seen["message"], "checked_at": time.time()}
+            record["message"] = seen["message"]
             if seen["state"] != "watching":
                 record["state"] = "left_open"
             self.swap_exit(table, row, record)
@@ -2221,7 +2256,8 @@ class Workspaces:
         if watch.get("machine") is None:
             return collie_url(None, watch["workspace_id"])
         machine = machines.load(self.home).get(watch["machine"])
-        return collie_url(machine, watch["workspace_id"]) if machine else None
+        _, wid = machines.split(watch["workspace_id"])
+        return collie_url(machine, wid) if machine else None
 
     def operation_status(self, key):
         """The current operation with this ID, as a snapshot shows it, or None.
@@ -2319,7 +2355,10 @@ class Workspaces:
                 if (
                     op.get("status") in {"complete", "failed"}
                     and (op.get("updated_at") or op.get("created_at") or 0) < cutoff
-                    and not (op.get("path") and os.path.lexists(op["path"]))
+                    # A worker's path names nothing on this machine.
+                    and not (
+                        op.get("machine") is None and op.get("path") and os.path.lexists(op["path"])
+                    )
                 ):
                     db.execute("DELETE FROM operations WHERE pr=? AND data=?", (key, data))
             # Finished `wt --exit-when-done` watches: the most recent ones from the last month.
@@ -2820,7 +2859,9 @@ class Workspaces:
                 # From here the agent is typed: trouble makes the launch uncertain.
                 typed = True
                 if op.get("exit_when_done"):
-                    self.record_remote_watch(machine, op, found["path"], done.stdout)
+                    # The label wt gives the workspace, as long as the branch it names.
+                    expected = wt.sanitize_session_name(label[1] if label else name)
+                    self.record_remote_watch(machine, op, found["path"], expected, done.stdout)
                 self.save_operation(op, message="Verifying checkout and agent startup")
                 made = cron_agents.probe(
                     self.home, machine, "wt_checkout", 30, clone=found["clone"], path=found["path"]
@@ -2892,7 +2933,7 @@ class Workspaces:
                 self.workers.pop(pr["id"], None)
                 self.next_poll = 0
 
-    def record_remote_watch(self, machine, op, path, output):
+    def record_remote_watch(self, machine, op, path, label, output):
         """Record the exit watch a worker's wt printed, with the machine it is on.
 
         Only what herdr and the transcript reader there need is kept, each checked: the
@@ -2914,8 +2955,7 @@ class Workspaces:
             and PANE.fullmatch(watch["pane_id"])
             and isinstance(watch.get("marker"), str)
             and WATCH_MARKER.fullmatch(watch["marker"])
-            and isinstance(watch.get("label"), str)
-            and WATCH_LABEL.fullmatch(watch["label"])
+            and watch.get("label") == label
         ):
             raise ValueError(f"wt on {machine.label} did not hand back the agent's exit watch")
         now = time.time()
@@ -2923,9 +2963,10 @@ class Workspaces:
             self.home,
             {
                 "id": watch["id"],
-                "label": watch["label"],
+                "label": label,
                 "path": path,
-                "workspace_id": watch["workspace_id"],
+                # Qualified: no dashboard takes it for a workspace of its own herdr.
+                "workspace_id": machines.qualify(machine.id, watch["workspace_id"]),
                 "pane_id": watch["pane_id"],
                 "agent": op["agent"],
                 "claude_account": op.get("claude_account"),

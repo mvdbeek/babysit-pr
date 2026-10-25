@@ -21,6 +21,7 @@ import machines
 import pr_workspaces as pw
 import pytest
 import remote_probe
+import workspace_exit
 from test_new_tasks import request as new_request
 from test_pr_workspaces import finish, helper_calls, local  # noqa: F401 (fixture)
 from test_remote_cron import git, host, rollout, short_tmp  # noqa: F401 (fixtures)
@@ -123,13 +124,20 @@ def test_a_review_on_a_worker_starts_there(remote):
     # The controller records the exit watch, with the machine it is on; the worker's own
     # state home never holds one.
     [watch] = watches(manager.home)
-    assert (watch["machine"], watch["path"], watch["workspace_id"]) == ("mini", str(path), "w1")
+    # Qualified, so no dashboard can take it for a workspace of its own herdr.
+    assert (watch["machine"], watch["path"], watch["workspace_id"]) == (
+        "mini",
+        str(path),
+        "mini/w1",
+    )
     assert watch["pane_id"] == agent["pane_id"] and watch["agent"] == "codex"
     assert not (worker / ".local/state/babysit-pr/pr-workspaces.sqlite").exists()
     # The clone lock is the worker's clone, never a same-named one here.
     key = hashlib.sha256(b"mini\0~/src/repo").hexdigest()
     assert (manager.home / "workspace-locks" / key).exists()
     assert manager.scheduled_tasks()["launched"][0]["url"] is None
+    register(manager.home, collie_url="https://collie.mini.test")
+    assert manager.scheduled_tasks()["launched"][0]["url"] == "https://collie.mini.test/space/w1"
 
 
 def test_a_workers_exit_watch_is_looked_at_there_and_never_exited(remote):
@@ -388,6 +396,98 @@ def test_worker_launch_paths_with_control_characters_are_refused(bad):
             remote_probe.validate_wt_prepare({**found, key: f"{found[key]}{bad}"})
 
 
+def test_a_long_pr_branch_keeps_its_launch_and_exit_watch(remote, monkeypatch):
+    manager, pr, state, worker = remote
+    # The fork names the branch: as long as Git allows, and the label grows with it.
+    branch = "b" * 230
+    subprocess.check_call(["git", "-C", os.environ["FAKE_HEAD"], "branch", branch, "feature"])
+    pr["head_branch"] = branch
+    reply = {"headRefName": branch, "headRepository": {"name": "repo"}}
+    monkeypatch.setenv(
+        "FAKE_GH_PR", json.dumps({**reply, "headRepositoryOwner": {"login": "fork"}})
+    )
+    request = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
+    manager.action({**request, "exit_when_done": True})
+    op = finish(manager, pr["id"])
+    assert op["status"] == "complete", op
+    [watch] = watches(manager.home)
+    assert watch["label"] == f"pr-repo-{branch}"
+
+
+def old_operation(manager, key, **fields):
+    """An operation as saved long ago, without save_operation's fresh timestamp."""
+    old = time.time() - pw.HISTORY_SECONDS - 60
+    op = {"id": str(uuid.uuid4()), "pr": key, "created_at": old, "updated_at": old, **fields}
+    with manager.db() as db:
+        db.execute("INSERT OR REPLACE INTO operations VALUES (?,?)", (key, json.dumps(op)))
+    return op
+
+
+def test_a_workers_paths_are_never_looked_up_here(remote, tmp_path):
+    manager, pr, state, _ = remote
+    # A worker laid out like this machine names a path that also exists here.
+    here = tmp_path / "same-layout"
+    here.mkdir()
+    old_operation(manager, pr["id"], status="complete", machine="mini", path=str(here))
+    manager.prune_history()
+    assert manager.operation(pr["id"]) is None
+    # Nor does a local workspace at that path recover a worker's uncertain launch.
+    manager.action({"id": pr["id"], "action": "create", "task": "Here"})
+    op = finish(manager, pr["id"])
+    assert op["status"] == "complete" and op["machine"] is None
+    old_operation(
+        manager, pr["id"], status="uncertain", machine="mini", path=op["path"], agent="codex"
+    )
+    assert manager.describe(pr, manager.scan())["operation"]["status"] == "uncertain"
+
+
+def worker_watch(home, machine="mini", **changes):
+    now = time.time()
+    watch = {
+        "id": uuid.uuid4().hex,
+        "label": "pr-repo-feature",
+        "path": "/h/src/worktrees/repo/pr-base-7",
+        "workspace_id": f"{machine}/w1",
+        "pane_id": "w1:p1",
+        "agent": "codex",
+        "claude_account": None,
+        "marker": exit_watch.new_marker(),
+        "created_at": now,
+        "exit": exit_watch.watching(now),
+        "machine": machine,
+        **changes,
+    }
+    exit_watch.register(home, watch)
+    return watch
+
+
+def test_a_workers_exit_watch_ends_when_it_cannot_be_looked_at(remote, monkeypatch):
+    manager, *_ = remote
+    gone = worker_watch(manager.home, machine="box")
+    manager.exit_launched()
+    looked(manager)
+    [found] = [w for w in watches(manager.home) if w["id"] == gone["id"]]
+    assert found["exit"]["state"] == "left_open"
+    assert "box is no longer registered" in found["exit"]["message"]
+    # An unreachable worker is given a few looks, then left.
+    monkeypatch.setenv("FAKE_HERDR_DOWN", "Mac mini")
+    monkeypatch.setattr(pw, "REMOTE_FAILURES", 2)
+    down = worker_watch(manager.home)
+    for state in ("watching", "left_open"):
+        manager.exit_launched()
+        looked(manager)
+        [found] = [w for w in watches(manager.home) if w["id"] == down["id"]]
+        assert found["exit"]["state"] == state
+        assert found["exit"]["message"].startswith("Could not look at the agent on Mac mini")
+    # So is one watched for longer than any watch is kept.
+    old = time.time() - workspace_exit.WATCH_LIMIT - 60
+    stale = worker_watch(manager.home, created_at=old, exit=exit_watch.watching(old))
+    manager.exit_launched()
+    looked(manager)
+    [found] = [w for w in watches(manager.home) if w["id"] == stale["id"]]
+    assert found["exit"]["state"] == "left_open"
+
+
 def test_an_exit_watch_a_worker_hands_back_is_checked(remote):
     manager, *_ = remote
     worker = machines.resolve(manager.home, "mini")
@@ -406,9 +506,12 @@ def test_an_exit_watch_a_worker_hands_back_is_checked(remote):
         {"pane_id": "p\x15"},
         {"marker": "done"},
         {"id": "x"},
+        {"label": "pr-repo-other"},
     ):
         with pytest.raises(ValueError, match="did not hand back"):
-            manager.record_remote_watch(worker, op, "/h/w", json.dumps({**watch, **change}))
+            manager.record_remote_watch(
+                worker, op, "/h/w", "pr-repo-feature", json.dumps({**watch, **change})
+            )
     with pytest.raises(ValueError, match="did not hand back"):
-        manager.record_remote_watch(worker, op, "/h/w", "not json")
+        manager.record_remote_watch(worker, op, "/h/w", "pr-repo-feature", "not json")
     assert not watches(manager.home)

@@ -627,7 +627,9 @@ it is done**: it prints the exit watch instead of recording it, and the dashboar
 records it with the machine. Clone locks hash the machine with the clone. The checkout
 and agent are verified through probe ops and `herdr --machine`. Exit watches on workers
 are looked at there every minute but never exited: the watch says when the agent
-finished, or left without confirming, and leaves it open.
+finished, or left without confirming, and leaves it open. It also stops after a week,
+once the worker leaves the registry, or after 30 failed looks in a row. Their records
+name the workspace qualified (`<id>/w1`), so no dashboard takes it for one of its own.
 
 Handle on a verified checkout stays on that checkout's machine;
 choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`
