@@ -403,6 +403,9 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
   --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright")
 [[ -z $config_var ]] || argv+=(--setenv "$config_var" "$config_dir")
 ((!gpg)) || argv+=(--setenv GNUPGHOME "$gnupghome")
+# Inside, $HOME is empty: a worker's agent learns it is on one from this, set last so
+# no --env-pass value can clear it, and pr_supervisor refuses to register watches there.
+[[ ! -e $home/.config/babysit-pr/worker.json ]] || argv+=(--setenv BABYSIT_WORKER 1)
 
 argv+=(--chdir "$(pwd -P)" -- "${command[@]}")
 if ((print)); then

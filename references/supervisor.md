@@ -545,9 +545,13 @@ given at a repository of its own.
 `scripts/machines.py` loads and validates it; a malformed file is an error, a
 missing one means local only. `register --machine ID` checks the ID against the
 registry and then refuses: watches on other machines are not supported yet. On a
-worker (`~/.config/babysit-pr/worker.json`, written by `provision_worker.sh
---user-step`, or `BABYSIT_WORKER` set by a launch) `register` and `handoff` refuse:
-watch registration from worker machines isn't supported yet.
+worker `register` and `handoff` refuse: watch registration from worker machines isn't
+supported yet. A worker is one with `~/.config/babysit-pr/worker.json` (written by
+`provision_worker.sh --user-step`) or with `BABYSIT_WORKER` set. A launch sets it for
+the `wt` it runs, not for the agent's pane, whose shell herdr's server starts; inside
+babysit-bwrap, where `$HOME` is empty, the wrapper sets `BABYSIT_WORKER=1` whenever the
+host has that file. This is a guard against mistakes, not a boundary: an agent outside
+babysit-bwrap, or one that unsets the variable, is not stopped by it.
 Watches record `machine` (null for this machine), and a worktree path is a
 duplicate only on the same machine. The dashboard reads the diff and
 transcripts of a workspace ID qualified as `ID/w1` on that machine (see the
