@@ -948,17 +948,20 @@ def test_a_failing_worker_backs_off_longer_each_time(fleet, monkeypatch):
     register(fleet["home"], MINI)
     monkeypatch.setenv("FAKE_SSH_DOWN", "mini.test")
     plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
-    waits = []
-    for _ in range(3):
+
+    def backoff():
+        """How long after its failed scan the worker waits, in rescan intervals."""
         plugin.retry["mini"] = 0  # Due again, as once its back-off has passed.
         before = time.time()
         plugin.value = plugin.collect()
-        waits.append(plugin.retry["mini"] - before)
-    assert wso.INTERVAL < waits[0] < waits[1] < waits[2]
+        after = time.time()
+        waits = [(plugin.retry["mini"] - at) / wso.INTERVAL for at in (after, before)]
+        return next(n for n in (2, 4, 8, 16) if waits[0] <= n <= waits[1])
+
+    assert [backoff() for _ in range(5)] == [2, 4, 8, 16, 16]
     monkeypatch.delenv("FAKE_SSH_DOWN")
     plugin.retry["mini"] = 0
     plugin.value = plugin.collect()
     assert "mini" not in plugin.retry and plugin.value["machines"]["mini"]["status"] == "ok"
     monkeypatch.setenv("FAKE_SSH_DOWN", "mini.test")
-    plugin.value = plugin.collect()
-    assert plugin.retry["mini"] - time.time() == pytest.approx(waits[0], abs=5)
+    assert backoff() == 2
