@@ -388,6 +388,18 @@ def test_remote_channel_wait_respects_timeout(short_tmp, monkeypatch):
     assert 0 < seen[0] <= 30
 
 
+def test_remote_channel_without_timeout_waits_for_a_free_channel(short_tmp, monkeypatch):
+    home = write(short_tmp / "home", MINI)
+    mini = machines.resolve(home, "mini")
+    monkeypatch.setattr(machines, "_channels", {})
+    semaphore = machines._channel(mini)
+    for _ in range(machines.CHANNELS):
+        semaphore.acquire()
+    monkeypatch.setattr(owned_process, "run", lambda args, **kw: "ok")
+    threading.Timer(0.2, semaphore.release).start()
+    assert machines.run(home, mini, ["true"], timeout=None) == "ok"
+
+
 @pytest.mark.parametrize(
     ("machine_id", "wid", "qid"), [(None, "w111", "w111"), ("mini", "w1", "mini/w1")]
 )
@@ -418,8 +430,8 @@ def test_wrappers_drive_herdr_here_and_git_over_ssh(tmp_path, fake_tools, short_
     state = json.loads(fake_tools.read_text())
     assert state["calls"] == [
         ["workspace", "list"],
-        ["--machine", "Mac mini", "workspace", "list"],
-        ["--machine", "Mac mini", "agent", "list"],
+        ["--machine=Mac mini", "workspace", "list"],
+        ["--machine=Mac mini", "agent", "list"],
     ]
     assert "ssh" not in state  # herdr reaches the worker itself
 
@@ -430,5 +442,5 @@ def test_wrappers_drive_herdr_here_and_git_over_ssh(tmp_path, fake_tools, short_
     [call] = json.loads(fake_tools.read_text())["ssh"]
     assert call == {
         "target": "mini.tail1234.ts.net",
-        "command": f"git -C {clone} symbolic-ref HEAD",
+        "command": f"sh -c 'git -C {clone} symbolic-ref HEAD'",
     }
