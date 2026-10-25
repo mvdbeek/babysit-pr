@@ -266,11 +266,28 @@ writes only to `--add-dirs`, the one agent configuration directory it is given
 (exported as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Claude always gets an explicit
 one, so its `.claude.json` lives inside it; a missing one is refused rather than
 exported into the empty home) and `~/.cache/babysit-sandbox/<hash of that
-configuration directory>`, a cache used only by sandboxed agents of that
-configuration (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
-`npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`), so agents with different grants
-never run each other's downloads. Host caches are never writable: code planted
-there would run outside the sandbox. The wrapper
+configuration directory and the enabled grants>`, a cache used only by sandboxed
+agents of that configuration (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
+`npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). Each set of grants that reaches
+beyond the sandbox (`--enable=docker`) gets its own, so a launch with Docker never
+runs downloads that a launch without it could have replaced. Host caches are
+never writable: code planted there would run outside the sandbox.
+
+What a harness runs from its configuration directory is bound read-only on top of
+it in every launch, granted or not, so no agent leaves code there for the next
+launch of the same account: for Claude `settings.json` (hooks, status line, helper
+commands), `CLAUDE.md`, `agents`, `commands`, `hooks`, `output-styles`, `plugins`,
+`rules`, `session-env` (scripts Claude sources before Bash commands), `skills` and
+`workflows`; for Codex `config.toml`, `hooks.json`, `AGENTS.md`,
+`AGENTS.override.md`, `packages`, `plugins`, `prompts`, `rules` and `skills`. A
+missing one is first created empty (`{}` for JSON), since an agent could otherwise
+create it for the next launch; a link there is refused, since binding it would
+follow it outside the sandbox (copy a shared `settings.json` into each account
+instead of linking it). Install plugins and skills, and change these settings,
+outside the sandbox. Claude's `.claude.json` stays writable, since Claude rewrites
+it constantly, so a launch with `--enable=docker` is refused while it declares MCP
+servers (top level or in any project), which any agent of that account could have
+added. The wrapper
 discovers nothing from its working directory or git, whose files the agent can
 rewrite; babysit passes the worktree and its git common directory in `--add-dirs`
 from its own records (the worktree `wt` created, the job `cwd` that the repair
@@ -326,10 +343,23 @@ Known gaps of the Linux sandbox:
   that listen on them, which can start programs outside the sandbox. Accepted
   for now; run the worker headless, without a desktop session for its user.
   Egress isolation is a later step.
-- The writable agent configuration directory lets the agent plant hooks, MCP
-  servers or notify commands there, which run unsandboxed whenever the same
-  account is used outside the sandbox. Accepted: keep accounts used sandboxed
-  separate from accounts used unsandboxed.
+- The rest of the agent configuration directory stays writable: `.claude.json`
+  (MCP servers, which a granted launch refuses but an unsandboxed one starts),
+  transcripts and auto-memory under `projects/`, and any script there that a
+  read-only hook or status line command names. Hooks and commands must name
+  files the sandbox cannot write (inside `hooks/`, or outside the account).
+  Accepted: keep accounts used sandboxed separate from accounts used unsandboxed.
+  Agents of one account can also write each other's transcripts and memory, so a
+  launch with a grant trusts every agent of its account not to steer it through
+  them.
+- The git common directory of a repository is writable by every agent working in
+  one of its worktrees, and its `config` and `hooks` run code in whichever
+  sandbox runs git next (`core.hooksPath`, `core.fsmonitor`, filters, aliases,
+  `gpg.program`). Enabling Docker for one worktree therefore trusts every agent
+  sharing that clone. Making `hooks` read-only would not help: `config` must stay
+  writable for `git branch`, `git push -u` and `git worktree add`, and alone can
+  run anything, while read-only hooks would break `pre-commit install`. Give
+  workspaces that need Docker a clone of their own.
 - With a bwrap older than 0.10.0 writable directories are bound by path, so a
   process that can write a bound directory's parent could swap it for a link
   between the check and the bind. Refusing shared main checkouts closes the

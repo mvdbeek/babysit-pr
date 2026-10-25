@@ -6,9 +6,9 @@
 #
 # Deny by default: a read-only system, an empty $HOME, and writes only to --add-dirs (the
 # caller passes the worktree and its git common directory there), the one agent
-# configuration directory (which must exist) and a cache root that only sandboxed agents
-# of that configuration use. Nothing is
-# discovered from the working directory or its git files, which the agent can rewrite.
+# configuration directory (which must exist; what it runs code from stays read-only) and
+# a cache root that only sandboxed agents of that configuration and grants use. Nothing
+# is discovered from the working directory or its git files, which the agent can rewrite.
 # Every writable path must be absolute and is resolved first; home, its ancestors and
 # protected paths are refused. The environment is cleared except for a small baseline,
 # the agent configuration variable, the cache variables and the --env-pass names that
@@ -170,12 +170,13 @@ writable() {
   printf '%s\n' "$real"
 }
 
-# Adds a writable bind of resolved directory $1. By descriptor when bwrap can: the open
-# follows whatever the path is now, so the descriptor must still name $1 itself, and
-# bwrap then mounts that directory whatever happens to the path. The descriptor stays
-# open into bwrap, which closes it after mounting.
+# Adds a writable bind of resolved directory $1, or a read-only one of resolved file or
+# directory $1 with $2=ro-. By descriptor when bwrap can: the open follows whatever the
+# path is now, so the descriptor must still name $1 itself, and bwrap then mounts that
+# directory whatever happens to the path. The descriptor stays open into bwrap, which
+# closes it after mounting.
 grant() {
-  local real=$1 fd now
+  local real=$1 kind=${2:-} fd now
   if ((bind_fd)); then
     exec {fd}<"$real" || die "cannot open $real"
     if [[ -d /proc/self/fd ]]; then
@@ -184,9 +185,9 @@ grant() {
       now=$real # a dry run off Linux, which has no /proc to ask
     fi
     [[ ${now:-} == "$real" ]] || die "refusing $real, which changed while it was checked"
-    argv+=(--bind-fd "$fd" "$real")
+    argv+=("--${kind}bind-fd" "$fd" "$real")
   else
-    argv+=(--bind "$real" "$real")
+    argv+=("--${kind}bind" "$real" "$real")
   fi
 }
 
@@ -207,12 +208,32 @@ if [[ -n $config_var ]]; then
   [[ -n $real ]] || die "the agent configuration directory $config_dir does not exist"
   config_dir=$real
 fi
+# The grants that reach beyond the sandbox, in a fixed order.
+granted=
+((!docker)) || granted+=,docker
+granted=${granted#,}
+# Everything below must keep a launch without these grants from leaving code for a
+# launch with them, of any agent of the same configuration, to run.
+if [[ -n $granted && $config_var == CLAUDE_CONFIG_DIR && -e $config_dir/.claude.json ]]; then
+  # Claude rewrites this file all the time, so it stays writable; its MCP servers start
+  # with the agent. Refused rather than removed, since the agent may still be writing it.
+  python3 -I -c '
+import json, sys
+config = json.load(open(sys.argv[1]))
+projects = config.get("projects") or {}
+servers = [config.get("mcpServers")]
+servers += [p.get("mcpServers") for p in projects.values() if isinstance(p, dict)]
+sys.exit(any(servers))
+' "$config_dir/.claude.json" 2>/dev/null ||
+    die "refusing --enable=$granted: $config_dir/.claude.json declares MCP servers (or cannot be read), which an agent without that grant could have added"
+fi
 # Package caches for sandboxed agents only: nothing outside the sandbox runs code from
 # them, unlike the host caches an agent could otherwise plant code in. One per agent
-# configuration, so agents with different grants never run each other's downloads.
+# configuration and set of grants, so an agent never runs downloads that one with
+# fewer grants could have replaced.
 sha=(sha256sum)
 command -v sha256sum >/dev/null || sha=(shasum -a 256) # macOS dry runs
-key=$(printf '%s=%s' "$config_var" "$config_dir" | "${sha[@]}")
+key=$(printf '%s=%s%s' "$config_var" "$config_dir" "${granted:+ enable=$granted}" | "${sha[@]}")
 cache=$home/.cache/babysit-sandbox/${key:0:16}
 
 # Writable: the sandbox cache, the agent configuration and the explicit grants. They
@@ -246,6 +267,41 @@ if ((docker)); then
   [[ -S $socket ]] || die "no rootless Docker socket at $socket"
   [[ -O $socket ]] || die "refusing $socket, which belongs to another user"
   argv+=(--bind "$socket" "$socket" --setenv DOCKER_HOST "unix://$socket")
+fi
+
+# What the agent runs from its configuration, read-only on top of its writable bind in
+# every launch: settings and hooks, plugins, skills, commands, agents and instructions.
+# Missing ones become empty placeholders first, or an agent could create them for the
+# next launch to load; a link is refused, since binding it would follow it outside.
+if [[ -n $config_var ]]; then
+  if [[ $config_var == CLAUDE_CONFIG_DIR ]]; then
+    code=(settings.json CLAUDE.md agents commands hooks output-styles plugins rules session-env
+      skills workflows)
+  else
+    code=(config.toml hooks.json AGENTS.md AGENTS.override.md packages plugins prompts rules
+      skills)
+  fi
+  for name in "${code[@]}"; do
+    path=$config_dir/$name
+    if ((!print)) && [[ ! -e $path && ! -L $path ]]; then
+      # Without following or replacing anything another sandbox creates meanwhile.
+      case $name in
+        *.json) (set -C && printf '{}\n' >"$path") ;;
+        *.*) (set -C && : >"$path") ;;
+        *) mkdir -m 0700 "$path" ;;
+      esac 2>/dev/null || true
+    fi
+    if [[ -L $path ]]; then
+      die "refusing $path, a link; make it a file or directory of its own"
+    elif [[ -f $path || -d $path ]]; then
+      grant "$path" ro-
+    elif [[ -e $path ]]; then
+      die "refusing $path, which is neither a file nor a directory"
+    else
+      ((print)) || die "cannot create $path"
+      argv+=(--ro-bind "$path" "$path")
+    fi
+  done
 fi
 
 # Read-only system. Merged-/usr links stay links.
