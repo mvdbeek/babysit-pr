@@ -366,6 +366,21 @@ check_headless() {
   fi
 }
 
+# check_groups USER: membership that is (or leads to) root, or to raw devices.
+check_groups() {
+  local user=$1 group groups
+  groups=$(id -nG "$user" 2>/dev/null | tr ' ' '\n') || groups=
+  # Container and VM managers mount any host path; disk is raw block devices.
+  for group in sudo admin wheel adm docker lxd incus-admin libvirt disk; do
+    if grep -qx "$group" <<<"$groups"; then
+      problem "$user is in the $group group, which is (or leads to) root on this machine"
+    fi
+  done
+  if grep -qx kvm <<<"$groups"; then
+    warn "$user is in the kvm group: /dev/kvm access, more than agents need"
+  fi
+}
+
 check_docker_rootless() {
   local uid sock
   uid=$(id -u "$user_name")
@@ -375,12 +390,7 @@ check_docker_rootless() {
   else
     problem "no rootless docker socket at $sock"
   fi
-  local group
-  for group in sudo admin lxd disk adm docker; do
-    if id -nG "$user_name" | tr ' ' '\n' | grep -qx "$group"; then
-      problem "$user_name is in the $group group, which is (or leads to) root on this machine"
-    fi
-  done
+  check_groups "$user_name"
   if grep -q 'may run the following commands' <<<"$(sudo -n -l -U "$user_name" 2>/dev/null)"; then
     problem "sudoers grants $user_name commands (sudo -l -U $user_name)"
   fi
@@ -832,6 +842,7 @@ gpg_checks() {
 user_checks() {
   local app=$HOME/$APP head found
   say "Checks"
+  check_groups "$(id -un)"
   if [[ -d $app/.git ]] && head=$("${SAFE_GIT[@]}" -C "$app" rev-parse HEAD 2>/dev/null); then
     ok "babysit-pr deployed at $app ($head)"
     [[ -z $("${SAFE_GIT[@]}" -C "$app" status --porcelain 2>/dev/null) ]] ||

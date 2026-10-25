@@ -152,7 +152,8 @@ unless `BWRAP_ACCEPT_OLD=1`. Options:
   Unix sockets (X11, a D-Bus session bus) are reachable from it and can start
   programs outside it. Keep the worker headless.
 - Rootless Docker socket at `/run/user/<uid>/docker.sock`; `babysit` in none of
-  `sudo`, `admin`, `lxd`, `disk`, `adm`, `docker`, with no sudoers entry
+  `sudo`, `admin`, `wheel`, `adm`, `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`
+  (a warning for `kvm`; the user step's `--check` repeats this), with no sudoers entry
   (`sudo -l -U babysit`), and unable to write `/var/run/docker.sock`; Tailscale up, `/etc/subuid` entry, sshd keepalive.
 
 ## 3. User step (as `babysit`)

@@ -198,6 +198,8 @@ def test_user_check_verifies_signing_without_printing_secrets(tmp_path, works):
         (fakes / tool).write_text(f"#!/bin/sh\necho rootless\nexit {status}\n")
     (app / "scripts" / "babysit-bwrap").write_text(f"#!/bin/sh\nexit {status}\n")
     (app / "scripts" / "babysit-bwrap").chmod(0o755)
+    # The account's groups, not those of whoever runs the tests.
+    (fakes / "id").write_text('#!/bin/sh\ncase "$1" in -u) echo 1000 ;; *) echo babysit ;; esac\n')
     # git answers the signing key and the identity; every other git call follows `works`.
     (fakes / "git").write_text(
         '#!/bin/sh\ncase "$*" in *user.signingkey*) echo KEYID-SECRET!; exit 0 ;; esac\n'
@@ -337,3 +339,28 @@ def test_installed_distro_docker_only_gets_rootlesskit(run, root):
     packages = install_line(done.stdout)
     assert "rootlesskit" in packages
     assert not {"docker.io", "containerd", "docker-ce"} & set(packages)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root --check inspects the host instead")
+@pytest.mark.parametrize("group", ["incus-admin", "lxd", "libvirt", "disk", "docker", "sudo"])
+def test_checks_flag_root_equivalent_groups(tmp_path, group):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    (fakes / "id").write_text(
+        f'#!/bin/sh\ncase "$1" in -un) echo babysit ;; -nG) echo "babysit {group} kvm" ;; '
+        "*) echo 1000 ;; esac\n"
+    )
+    (fakes / "id").chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--check"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    assert done.returncode == 1
+    assert f"PROBLEM: babysit is in the {group} group" in done.stderr
+    # Device access rather than root, but still more than an agent account needs.
+    assert "WARNING: babysit is in the kvm group" in done.stderr
