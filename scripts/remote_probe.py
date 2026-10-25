@@ -462,8 +462,9 @@ def host_guard(path, timeout=60):
 def host_git(path, *args, timeout=60, strip=True):
     """Git in one checkout on the machine this probe runs on, hardened and non-interactive."""
     command = next((arg for arg in args if not arg.startswith("-")), None)
-    # A submodule's status or diff would run Git in it, under its own filters.
-    extra = ["--ignore-submodules=all"] if command in SUBMODULE_READS else []
+    # Looking into a submodule's working tree would run Git there, under its own
+    # filters; a new commit checked out in it still shows.
+    extra = ["--ignore-submodules=dirty"] if command in SUBMODULE_READS else []
     if extra:
         at = args.index(command) + 1
         args = (*args[:at], *extra, *args[at:])

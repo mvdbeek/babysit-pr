@@ -126,6 +126,11 @@ def test_a_submodules_own_filter_never_runs(tmp_path, evil):
     git("config", "filter.x.clean", str(script), cwd=clone / "s")
     stat_dirty(clone / "s" / "f")
     assert scan(clone)["error"] is None and not marker.exists()
+    # A new commit checked out in it is still a change of the parent's.
+    git("commit", "-q", "--allow-empty", "-m", "moved", cwd=clone / "s")
+    marker.unlink(missing_ok=True)  # That commit's own refresh ran it, not the scan.
+    stat_dirty(clone / "s" / "f")
+    assert scan(clone)["changes"] == 1 and not marker.exists()
 
 
 def evil_merge(clone):
