@@ -323,8 +323,10 @@ With or without it, every command still runs on this machine.
 missing one means local only. `register --machine ID` checks the ID against the
 registry and then refuses: watches on other machines are not supported yet.
 Watches record `machine` (null for this machine), and a worktree path is a
-duplicate only on the same machine. The dashboard refuses workspace IDs
-qualified as `ID/w1` and views of watches recorded on another machine.
+duplicate only on the same machine. The dashboard reads the diff and
+transcripts of a workspace ID qualified as `ID/w1` on that machine (see the
+workspaces reference), refuses every other action on it, and refuses views of
+watches recorded on another machine.
 
 ```json
 {

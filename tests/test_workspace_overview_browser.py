@@ -256,7 +256,7 @@ def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, w
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_worker_rows_show_their_machine_and_offer_no_actions(page, site, width):
+def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, width):
     url, plugin, _ = site
     remote = {"machine": "mini", "machine_label": "Mac mini", "removable": False}
     plugin.value["workspaces"] = [
@@ -286,10 +286,12 @@ def test_worker_rows_show_their_machine_and_offer_no_actions(page, site, width):
     chip = line.locator(".ws-machine")
     expect(chip).to_have_text("Mac mini")
     expect(chip).to_have_attribute("title", "On Mac mini")
-    for name in ("Open workspace", "Diff", "Transcript"):
-        button = line.get_by_role("button", name=name, exact=True)
-        expect(button).to_be_disabled()
-        expect(button).to_have_attribute("title", unavailable)
+    button = line.get_by_role("button", name="Open workspace", exact=True)
+    expect(button).to_be_disabled()
+    expect(button).to_have_attribute("title", unavailable)
+    # Its diff and transcripts are read on the worker.
+    for name in ("Diff", "Transcript"):
+        expect(line.get_by_role("button", name=name, exact=True)).to_be_enabled()
     box = line.get_by_role("checkbox", name="Select remote-work")
     expect(box).to_be_disabled()
     expect(box).to_have_attribute("title", unavailable)

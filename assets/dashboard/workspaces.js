@@ -188,17 +188,17 @@
     line.append(cleanup);
     const actions = node("td", undefined, "pr-actions");
     if (entry.machine) {
-      for (const label of [
+      // Its diff and transcripts are read there; opening it waits for later.
+      const button = node(
+        "button",
         entry.workspace_ids.length ? "Open workspace" : "Create workspace",
-        "Diff",
-        "Transcript",
-      ]) {
-        const button = node("button", label);
-        button.type = "button";
-        button.disabled = true;
-        button.title = unavailable(entry);
-        actions.append(button);
-      }
+      );
+      button.type = "button";
+      button.disabled = true;
+      button.title = unavailable(entry);
+      actions.append(button);
+      const target = viewTarget(entry);
+      if (target) actions.append(...window.workspaceViewer.buttons(target, viewTargets));
       line.append(actions);
       return line;
     }
@@ -228,15 +228,16 @@
     return line;
   }
   // Scanned checkouts are read by their row; a row that is only a herdr workspace is
-  // read through that workspace.
+  // read through that workspace. A worker's rows are keyed by machine and read there.
   function viewTarget(entry) {
-    if (entry.machine) return null;
-    const scanned = entry.key === entry.path && !entry.missing;
+    const own = entry.machine ? `m:${entry.machine}:${entry.path}` : entry.path;
+    const scanned = entry.key === own && !entry.missing;
     if (!scanned && !entry.workspace_ids.length) return null;
     return {
       id: entry.key,
       ...(scanned ? { key: entry.key } : {}),
       workspace: entry.workspace_ids[0],
+      ...(entry.machine ? { machineLabel: entry.machine_label } : {}),
       name: entry.name,
       links: entry.links
         .filter((link) => link.number)

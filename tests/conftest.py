@@ -226,7 +226,7 @@ def fresh_viewer_caches(monkeypatch):
     """Viewer caches are per process; each test starts with none."""
     import workspace_viewer
 
-    for name in ("_checkouts", "_details", "_parsers"):
+    for name in ("_checkouts", "_details", "_parsers", "_sessions"):
         monkeypatch.setattr(workspace_viewer, name, {})
     import agent_docker
     import agent_messages
