@@ -322,10 +322,13 @@
     );
   }
   // A viewer opened from a list can step through it. `siblings` returns the list as it
-  // is now, so a filter or refresh changed since is followed.
-  function openViewer(entry, mode, siblings = null) {
+  // is now, so a filter or refresh changed since is followed. `state` picks the scope,
+  // base and session to start with, as a restored viewer does. Settles once loaded.
+  function openViewer(entry, mode, siblings = null, state = null) {
     const last = viewer?.siblings === siblings ? viewer.position : -1;
-    viewer = { entry, mode, scope: "branch", base: null, session: null, data: null, nodes: [] };
+    viewer = { entry, mode, scope: "branch", base: null, session: null, ...state };
+    viewer.data = null;
+    viewer.nodes = [];
     viewer.siblings = siblings;
     viewer.position = last;
     viewer.id = identity(entry);
@@ -337,7 +340,7 @@
     const dialog = byId("ws-viewer");
     if (!dialog.open) dialog.showModal();
     renderNav();
-    void loadViewer();
+    return loadViewer();
   }
   // Taken when the entry opens: a reopened agent may give it another workspace since.
   function identity(target) {
@@ -2067,6 +2070,194 @@
       // Without storage the choice lasts until the page reloads.
     }
   };
+  // Minimized viewers wait as chips in a tray at the bottom of the page, kept across
+  // reloads, until one is restored as it was left: same tab, session, diff scope and base,
+  // and reading position. Minimizing a workspace again replaces its chip; restoring one
+  // takes it out of the tray. The page behind an open viewer is inert, so chips are only
+  // restored while no viewer is open.
+  const TRAY_KEY = "ws-viewer-tray";
+  const TRAY_LIMIT = 12;
+  function loadTray() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(TRAY_KEY) || "[]");
+      if (Array.isArray(saved)) return saved.filter((item) => item?.id && item.entry);
+    } catch {
+      // Storage may be unavailable or hold something else; start empty.
+    }
+    return [];
+  }
+  let tray = loadTray();
+  // The lists minimized viewers stepped through, until the page reloads.
+  const traySiblings = new Map();
+  let trayNoteTimer = 0;
+  function storeTray() {
+    for (const id of traySiblings.keys()) {
+      if (!tray.some((item) => item.id === id)) traySiblings.delete(id);
+    }
+    try {
+      if (tray.length) localStorage.setItem(TRAY_KEY, JSON.stringify(tray));
+      else localStorage.removeItem(TRAY_KEY);
+    } catch {
+      // Without storage the tray lasts as long as the page.
+    }
+  }
+  // Where the reader is. In a transcript: the end while they follow it, or else the first
+  // entry in view and its offset, which newer entries arriving meanwhile do not move.
+  function readingPosition() {
+    const scroller = byId("ws-viewer");
+    if (!viewer.data) return null;
+    if (viewer.mode !== "transcript" || !viewer.nodes.length) return { top: scroller.scrollTop };
+    if (nearBottom()) return { end: true };
+    const header = scroller.querySelector(".ws-viewer-header").getBoundingClientRect();
+    const top = Math.max(header.bottom, scroller.getBoundingClientRect().top);
+    const index = viewer.nodes.findIndex((item) => item.getBoundingClientRect().bottom > top);
+    if (index < 0) return { end: true };
+    const offset = viewer.nodes[index].getBoundingClientRect().top - top;
+    return { entry: viewer.data.start + index, offset };
+  }
+  function restorePosition(position) {
+    const scroller = byId("ws-viewer");
+    if (!position || position.end) return;
+    if (position.entry === undefined) {
+      scroller.scrollTop = position.top;
+      return;
+    }
+    const item = viewer.nodes[position.entry - viewer.data.start];
+    if (!item) {
+      // An entry before the loaded ones: the top, where earlier entries can be loaded.
+      if (position.entry < viewer.data.start) scroller.scrollTop = 0;
+      return;
+    }
+    const header = scroller.querySelector(".ws-viewer-header").getBoundingClientRect();
+    const top = Math.max(header.bottom, scroller.getBoundingClientRect().top);
+    scroller.scrollTop += item.getBoundingClientRect().top - top - position.offset;
+  }
+  function minimize() {
+    if (!viewer) return;
+    const entry = JSON.parse(JSON.stringify(viewer.entry));
+    const id = identity(entry);
+    const { mode, scope, base, session } = viewer;
+    const item = { id, entry, mode, scope, base, session, position: readingPosition() };
+    tray = [item, ...tray.filter((other) => other.id !== id)].slice(0, TRAY_LIMIT);
+    if (viewer.siblings) traySiblings.set(id, viewer.siblings);
+    storeTray();
+    renderTray();
+    const dialog = byId("ws-viewer");
+    // The keyboard follows the viewer to its chip, after the dialog returns focus.
+    dialog.addEventListener("close", () => focusChip(0), { once: true });
+    dialog.close();
+  }
+  function trayNote(text) {
+    clearTimeout(trayNoteTimer);
+    byId("ws-tray-note").textContent = text;
+    if (text) trayNoteTimer = setTimeout(() => trayNote(""), 8000);
+    renderTray();
+  }
+  function unpark(id) {
+    tray = tray.filter((other) => other.id !== id);
+    storeTray();
+  }
+  // Keep the keyboard in the tray, on the chip now at the place of one that went.
+  function focusChip(at) {
+    const left = byId("ws-tray-chips").querySelectorAll(".ws-tray-restore");
+    left[Math.min(at, left.length - 1)]?.focus();
+  }
+  function chipIndex(button) {
+    return [...byId("ws-tray-chips").children].indexOf(button.closest(".ws-tray-chip"));
+  }
+  function dismiss(id, button) {
+    const at = chipIndex(button);
+    unpark(id);
+    renderTray();
+    focusChip(at);
+  }
+  // Only a checkout the dashboard says is gone drops its chip, with a note: a herdr
+  // workspace closed or without its checkout, or a watch no longer listed. Other failures,
+  // such as a worker not answering or the Workspaces list not read yet since a restart,
+  // keep it and say why. A session no longer recorded gives way to the newest one.
+  const GONE = /herdr workspace is not open|herdr workspace has no checkout|^Unknown watch/;
+  async function restore(id, button) {
+    if (byId("ws-viewer").open) return;
+    const at = chipIndex(button);
+    let item = tray.find((other) => other.id === id);
+    const name = item.entry.name || "Workspace";
+    button.disabled = true;
+    let failure = null;
+    let sessions = null;
+    try {
+      const response = await fetch(`/api/workspace-transcript?${query(where(item.entry))}`);
+      let value = null;
+      try {
+        value = await response.json();
+      } catch {
+        // A proxy error page is not JSON.
+      }
+      if (!response.ok || value?.error) failure = value?.error || `HTTP ${response.status}`;
+      else sessions = value.sessions;
+    } catch (error) {
+      failure = error.message;
+    }
+    button.disabled = false;
+    // Another tab may have restored, dismissed or replaced it meanwhile.
+    item = tray.find((other) => other.id === id);
+    if (!item || byId("ws-viewer").open) return;
+    if (failure) {
+      if (GONE.test(failure)) {
+        unpark(id);
+        trayNote(`${name} is no longer available; removed it from the tray.`);
+      } else trayNote(`Could not open ${name}: ${failure}`);
+      focusChip(at);
+      return;
+    }
+    const known = !item.session || sessions?.some((session) => session.id === item.session);
+    unpark(id);
+    renderTray();
+    const loading = openViewer(item.entry, item.mode, traySiblings.get(id) || null, {
+      scope: item.scope || "branch",
+      base: item.base ?? null,
+      session: known ? item.session : null,
+    });
+    const current = viewer;
+    await loading;
+    // Only onto the view it was taken from, not once another tab or session shows.
+    const same =
+      current.mode === item.mode &&
+      (item.mode === "diff"
+        ? current.scope === item.scope && (!item.base || current.base === item.base)
+        : current.session === item.session);
+    if (viewer === current && current.data && same) restorePosition(item.position);
+  }
+  function renderTray() {
+    byId("ws-tray-chips").replaceChildren(
+      ...tray.map((item) => {
+        const chip = node("span", undefined, "ws-tray-chip");
+        const name = item.entry.name || "Workspace";
+        const tab = item.mode === "diff" ? "Diff" : "Transcript";
+        const open = node("button", undefined, "ws-tray-restore");
+        open.type = "button";
+        open.title = `Restore the ${tab.toLowerCase()} of ${name}`;
+        open.append(node("span", tab, "ws-tray-tab"), " ", node("span", name, "ws-tray-name"));
+        open.onclick = () => void restore(item.id, open);
+        const close = node("button", "×", "ws-tray-dismiss");
+        close.type = "button";
+        close.setAttribute("aria-label", `Remove ${tab} ${name} from the tray`);
+        close.onclick = () => dismiss(item.id, close);
+        chip.append(open, close);
+        return chip;
+      }),
+    );
+    const shown = tray.length > 0 || Boolean(byId("ws-tray-note").textContent);
+    byId("ws-tray").hidden = !shown;
+    document.body.classList.toggle("ws-tray-shown", shown);
+  }
+  byId("ws-viewer-minimize").onclick = minimize;
+  // Another tab minimized or restored a viewer.
+  window.addEventListener("storage", (event) => {
+    if (event.key !== TRAY_KEY && event.key !== null) return;
+    tray = loadTray();
+    renderTray();
+  });
+  renderTray();
   // The button that opened the entry last viewed, or its counterpart in a refreshed list.
   function returnFocus() {
     const own = (button) => button?.closest(".ws-view-buttons")?.dataset.viewer === viewer.id;
