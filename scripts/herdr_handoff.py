@@ -424,7 +424,7 @@ def schedule(db, home, args):
     return {**scheduled, "audit_file": str(folder / f"{token}.audit.json")}
 
 
-def send_exit(target, expected, before, owned, save, machine=None, home=None):
+def send_exit(target, expected, before, owned, save, machine=None, home=None, *, typed=False):
     """Press Ctrl-D in a verified idle TUI, then confirm its process exited.
 
     ``expected`` is the (turn, complete) pair and ``before`` the transcript fingerprint the
@@ -432,11 +432,13 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None):
     unconfirmed exit raises without pressing again. A Claude on ``machine``, a worker, is
     asked with /exit instead: its second Ctrl-D would have to come sooner than the checks
     before it can read that worker. Enter follows only once the composer holds exactly
-    /exit, so it never answers a dialog that opened meanwhile.
+    /exit, so it never answers a dialog that opened meanwhile. ``typed`` asks a Claude on
+    this machine the same way, for a caller without a transcript turn to check against.
     """
     agent = target.get("agent", "codex")
     pane = target["pane_id"]
-    if machine is not None and agent == "claude":
+    typed = agent == "claude" and (typed or machine is not None)
+    if typed:
         herdr("pane", "send-text", pane, sandbox.typed("/exit"), machine=machine)
         typed_by = time.monotonic() + TYPED_EXIT_WAIT
         while (shown := claude_composer(read_screen(pane, machine))) != "/exit":
@@ -457,7 +459,7 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None):
         # Never repeat blindly: a Ctrl-D that reaches the shell could close it. Claude asks
         # for a second press within about a second; it goes only to the still-running TUI.
         herdr("agent", "send-keys", pane, "ctrl+d", machine=machine)
-    if agent == "claude" and machine is None:
+    if agent == "claude" and not typed:
         confirmation_deadline = time.monotonic() + 0.75
         while time.monotonic() < confirmation_deadline:
             owned()

@@ -274,3 +274,4 @@ def fresh_viewer_caches(monkeypatch):
     # Never query the host's Seatbelt policies for the fake agent PIDs.
     monkeypatch.setattr(agent_docker, "has_access", lambda pid: True)
     monkeypatch.setattr(agent_messages, "_recent", {})
+    monkeypatch.setattr(agent_messages, "_exiting", set())

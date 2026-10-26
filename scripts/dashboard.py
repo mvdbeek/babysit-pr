@@ -114,6 +114,17 @@ def viewed_workspace(home, value):
     return machine, workspace_id
 
 
+def local_label(home):
+    """What the viewer calls this machine beside workers; None while there are none."""
+    try:
+        workers = machines.load(home)
+    except (OSError, ValueError):
+        workers = {}
+    if not workers:
+        return None
+    return "this Mac" if sys.platform == "darwin" else "this machine"
+
+
 def watch_checkout(home, watch_id):
     """A watch's registered checkout and the session its repairs resume."""
     job = next((j for j in read_jobs(home) if j.get("id") == watch_id), None)
@@ -630,6 +641,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-choose",
                 "workspace-docker",
                 "workspace-interrupt",
+                "workspace-quit",
                 "workspace-prompt-forget",
                 "attachment-upload",
                 "sentry-action",
@@ -780,6 +792,12 @@ class Handler(BaseHTTPRequestHandler):
             if action == "workspace-interrupt":
                 try:
                     self.send_json(200, agent_messages.interrupt(request))
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
+                return
+            if action == "workspace-quit":
+                try:
+                    self.send_json(200, agent_messages.exit_agent(request, self.server.home))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
                 return
@@ -1134,6 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace": live,
                         "url": live and collie_url(None, live),
                     }
+                value["machine_label"] = local_label(self.server.home)
                 self.send_json(200, value)
             elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:
                 query = parse_qs(route.query)

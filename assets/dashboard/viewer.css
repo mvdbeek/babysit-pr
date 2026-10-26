@@ -121,10 +121,13 @@
   border-radius: 8px;
   background: var(--bg);
 }
+/* The workspace's other agents, below the session shown. */
 #ws-live-agents {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
 }
 .ws-live-agent {
   display: flex;
@@ -136,12 +139,30 @@
 .ws-live-agent button {
   padding: 5px 10px;
 }
-.ws-live-agent .ws-stop {
+#ws-live-agents:empty,
+#ws-live-confirm:empty {
+  display: none;
+}
+/* The session shown: live or not, set off from the other agents below it. */
+.ws-live-state[data-live="false"],
+.ws-live-state[data-live="none"],
+.ws-live-state[data-live="unknown"] {
+  color: var(--muted);
+}
+.ws-live-activity.amber {
+  color: var(--amber);
+}
+.ws-live-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   margin-left: auto;
+}
+.ws-live .ws-quit:not(:disabled) {
   color: var(--red);
   border-color: var(--danger-line);
 }
-.ws-live-agent .ws-stop:hover {
+.ws-live .ws-quit:not(:disabled):hover {
   background: var(--red-bg);
 }
 .ws-live-agent[data-status="working"] .badge:before {

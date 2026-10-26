@@ -1640,6 +1640,395 @@ def test_the_dashboard_relays_stops(working, tmp_path):
             thread.join(5)
 
 
+QUIT_RULE = "─" * 40
+CLAUDE_READY = "\n".join(["⏺ Done.", "", QUIT_RULE, "❯ ", QUIT_RULE, "  ? for shortcuts"])
+CLAUDE_EXIT_TYPED = CLAUDE_READY.replace("❯ ", "❯ /exit")
+CODEX_READY = "› \x1b[2mAsk Codex to do anything\x1b[0m"
+
+
+def quit_agent_state(kind="claude", status="idle", session="s1"):
+    """Pane w1:p2 runs one agent its shell started, on ``session``."""
+    return (
+        {
+            "pane_id": "w1:p2",
+            "agent": kind,
+            "agent_status": status,
+            "agent_session": {"value": session},
+        },
+        {
+            "shell_pid": 100,
+            "foreground_processes": [
+                {"pid": 4242, "argv0": f"/opt/bin/{kind}", "argv": [kind], "cwd": "/src/w"}
+            ],
+        },
+        [CLAUDE_READY, CLAUDE_EXIT_TYPED] if kind == "claude" else [CODEX_READY],
+    )
+
+
+@pytest.fixture
+def quitting(site, monkeypatch):
+    """An idle Claude on session s1 in pane w1:p2, beside the workspace's Codex. Esc leaves
+    an agent idle; any other key exits it, leaving only the pane's shell."""
+    import herdr_handoff
+
+    state = site[4]
+    data = read(state)
+    agent, procs, screens = quit_agent_state()
+    data["agents"] = [data["agents"][0], {**data["agents"][0], **agent}]
+    data["process_info"] = {"w1:p2": procs}
+    data["screens"] = {"w1:p2": screens}
+    state.write_text(json.dumps(data))
+    real = herdr_handoff.herdr
+
+    def herdr(*args, machine=None):
+        if args[:2] == ("agent", "send-keys") and args[3] == "esc":
+            # Stops the turn, or dismisses the dialog; the agent stays, now idle.
+            data = read(state)
+            data["calls"].append(list(args))
+            for agent in data["agents"]:
+                if agent.get("pane_id") == args[2]:
+                    agent["agent_status"] = "idle"
+            state.write_text(json.dumps(data))
+            return "{}"
+        return real(*args, machine=machine)
+
+    def kill(pid, signal):
+        assert (pid, signal) == (4242, 0)
+        if not any(a.get("pane_id") == "w1:p2" for a in read(state)["agents"]):
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(herdr_handoff, "herdr", herdr)
+    monkeypatch.setattr(herdr_handoff.os, "kill", kill)
+    return state
+
+
+def set_quit_agent(state, *args, **changes):
+    agent, procs, screens = quit_agent_state(*args)
+    data = read(state)
+    data["agents"][1].update(agent, **changes)
+    data["process_info"]["w1:p2"] = procs
+    data["screens"]["w1:p2"] = screens
+    state.write_text(json.dumps(data))
+    return data
+
+
+def keys(state):
+    return [call[3] for call in calls(state, ["agent", "send-keys", "w1:p2"])]
+
+
+def test_quit_types_exit_into_an_idle_claude_and_sees_it_leave(quitting):
+    import agent_messages
+
+    assert agent_messages.exit_agent(stop_request()) == {
+        "quit": True,
+        "pane": "w1:p2",
+        "warning": None,
+    }
+    assert read(quitting)["typed_text"] == [["w1:p2", "/exit"]]
+    assert keys(quitting) == ["enter"]
+    assert calls(quitting, ["agent", "wait"]) == []
+    # The pane stays, its shell alone in the foreground.
+    assert read(quitting)["process_info"]["w1:p2"]["foreground_processes"] == [{"pid": 100}]
+
+
+def test_an_idle_codex_gets_ctrl_d(quitting):
+    import agent_messages
+
+    set_quit_agent(quitting, "codex")
+    assert agent_messages.exit_agent(stop_request())["quit"]
+    assert keys(quitting) == ["ctrl+d"]
+    assert "typed_text" not in read(quitting)
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex"])
+@pytest.mark.parametrize("status", ["working", "blocked"])
+def test_a_busy_agent_is_stopped_with_esc_before_it_is_quit(quitting, kind, status):
+    import agent_messages
+
+    data = set_quit_agent(quitting, kind, status)
+    if kind == "claude":
+        # A dialog on screen; Esc dismisses it, and the composer shows again.
+        data["screens"]["w1:p2"] = [
+            "Allow?\n❯ 1. Yes\nEsc to cancel",
+            CLAUDE_READY,
+            CLAUDE_EXIT_TYPED,
+        ]
+        quitting.write_text(json.dumps(data))
+    assert agent_messages.exit_agent(stop_request())["quit"]
+    assert keys(quitting) == ["esc", "enter" if kind == "claude" else "ctrl+d"]
+    assert calls(quitting, ["agent", "wait"]) == [
+        ["agent", "wait", "w1:p2", "--until", "idle", "--until", "done", "--timeout", "5000"]
+    ]
+
+
+def test_a_claude_herdr_wrongly_calls_blocked_is_quit_without_esc(quitting):
+    import agent_messages
+
+    set_quit_agent(quitting, "claude", "blocked")
+    assert agent_messages.exit_agent(stop_request())["quit"]
+    assert keys(quitting) == ["enter"]
+
+
+def test_an_agent_still_busy_after_esc_is_not_quit(quitting, monkeypatch):
+    import agent_messages
+    import herdr_handoff
+
+    set_quit_agent(quitting, "codex", "working")
+    real = herdr_handoff.herdr
+
+    def herdr(*args, machine=None):
+        if args[:2] == ("agent", "wait"):
+            raise RuntimeError('{"code":"timeout"}')
+        return real(*args, machine=machine)
+
+    monkeypatch.setattr(herdr_handoff, "herdr", herdr)
+    with pytest.raises(ValueError, match="did not settle; it was not quit"):
+        agent_messages.exit_agent(stop_request())
+    assert keys(quitting) == ["esc"]
+
+
+@pytest.mark.parametrize(
+    ("change", "request_", "error"),
+    [
+        (None, stop_request(session="s1-other"), "no longer running"),
+        (None, stop_request(pane="w1:p9"), "no longer running"),
+        (None, stop_request(session=None), "no longer running"),
+        (None, {"workspace": "w1", "pane": "w1:p2"}, "Invalid quit"),
+        (None, stop_request(extra=1), "Invalid quit"),
+        (None, stop_request(pane=""), "Invalid quit"),
+        (None, stop_request(workspace="w9"), "not open"),
+        ({"agent": "aider"}, stop_request(), "Only Claude and Codex"),
+        ({"root": True}, stop_request(), "root process; quitting it would close the pane"),
+        ({"twice": True}, stop_request(), "Could not identify the agent's process"),
+        ({"draft": True}, stop_request(), "composer holds a draft"),
+        ({"scrolled": True}, stop_request(), "terminal is scrolled"),
+    ],
+)
+def test_quit_is_refused_before_any_key_is_sent(quitting, monkeypatch, change, request_, error):
+    import agent_messages
+    import herdr_handoff
+
+    data = read(quitting)
+    procs = data["process_info"]["w1:p2"]
+    change = change or {}
+    if "agent" in change:
+        data["agents"][1]["agent"] = change["agent"]
+    if change.get("root"):
+        procs["foreground_processes"][0]["pid"] = procs["shell_pid"]
+    if change.get("twice"):
+        procs["foreground_processes"].append({**procs["foreground_processes"][0], "pid": 4243})
+    if change.get("draft"):
+        data["screens"]["w1:p2"] = [CLAUDE_READY.replace("❯ ", "❯ half a thought")]
+    quitting.write_text(json.dumps(data))
+    if change.get("scrolled"):
+        real = herdr_handoff.result
+
+        def result(*args, machine=None):
+            value = real(*args, machine=machine)
+            if args[:2] == ("pane", "get"):
+                value["pane"]["scroll"] = {"offset_from_bottom": 3}
+            return value
+
+        monkeypatch.setattr(herdr_handoff, "result", result)
+    with pytest.raises(ValueError, match=error):
+        agent_messages.exit_agent(request_)
+    assert keys(quitting) == []
+    assert "typed_text" not in read(quitting)
+
+
+def test_an_unconfirmed_exit_is_reported_without_repeating_a_key(quitting, monkeypatch):
+    import agent_messages
+    import herdr_handoff
+
+    monkeypatch.setenv("FAKE_HERDR_KEEP_AGENT", "1")
+    monkeypatch.setattr(herdr_handoff, "EXIT_WAIT", 0)
+    value = agent_messages.exit_agent(stop_request())
+    assert not value["quit"] and value["warning"].startswith("Exit unconfirmed")
+    assert keys(quitting) == ["enter"]
+
+
+def test_an_exit_is_attempted_once_per_process(quitting, monkeypatch):
+    import agent_messages
+    import herdr_handoff
+
+    monkeypatch.setenv("FAKE_HERDR_KEEP_AGENT", "1")
+    monkeypatch.setattr(herdr_handoff, "EXIT_WAIT", 0)
+    assert not agent_messages.exit_agent(stop_request())["quit"]
+    # The first exit may still be taking: a second could reach the shell.
+    with pytest.raises(ValueError, match="already attempted"):
+        agent_messages.exit_agent(stop_request())
+    assert keys(quitting) == ["enter"]
+    assert read(quitting)["typed_text"] == [["w1:p2", "/exit"]]
+
+
+def test_a_working_claude_with_a_draft_is_refused_before_esc(quitting):
+    import agent_messages
+
+    data = set_quit_agent(quitting, "claude", "working")
+    data["screens"]["w1:p2"] = [
+        "✻ Thinking… (esc to interrupt)\n" + CLAUDE_READY.replace("❯ ", "❯ also check the docs")
+    ]
+    quitting.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="holds a draft"):
+        agent_messages.exit_agent(stop_request())
+    assert keys(quitting) == []
+
+
+@pytest.mark.parametrize(
+    ("after_esc", "error"),
+    [
+        ({"pid": 5151}, "changed while its turn was stopped"),
+        ({"agent_status": "working"}, "busy again"),
+        ({"agent_session": {"value": "s2"}}, "no longer running"),
+        ({"gone": True}, "no longer running"),
+    ],
+)
+def test_after_esc_only_the_same_idle_agent_is_quit(quitting, monkeypatch, after_esc, error):
+    import agent_messages
+    import herdr_handoff
+
+    set_quit_agent(quitting, "codex", "working")
+    stop = herdr_handoff.herdr
+
+    def herdr(*args, machine=None):
+        value = stop(*args, machine=machine)
+        if args[3:4] == ("esc",):
+            data = read(quitting)
+            if "pid" in after_esc:
+                data["process_info"]["w1:p2"]["foreground_processes"][0]["pid"] = 5151
+            elif after_esc.get("gone"):
+                data["agents"] = data["agents"][:1]
+            else:
+                data["agents"][1].update(after_esc)
+            quitting.write_text(json.dumps(data))
+        return value
+
+    monkeypatch.setattr(herdr_handoff, "herdr", herdr)
+    with pytest.raises(ValueError, match=error):
+        agent_messages.exit_agent(stop_request())
+    assert keys(quitting) == ["esc"]
+
+
+def test_a_stopped_turn_gets_a_moment_to_redraw_its_composer(quitting, monkeypatch):
+    import agent_messages
+    import herdr_handoff
+
+    set_quit_agent(quitting, "codex", "working")
+    # Codex's screen is read only after Esc: blank at first, then its empty composer.
+    screens = iter(["", CODEX_READY])
+    monkeypatch.setattr(herdr_handoff, "read_screen", lambda pane, machine=None: next(screens))
+    monkeypatch.setattr(agent_messages.time, "sleep", lambda seconds: None)
+    assert agent_messages.exit_agent(stop_request())["quit"]
+    assert keys(quitting) == ["esc", "ctrl+d"]
+
+
+def test_a_typed_exit_that_never_shows_gets_no_enter(quitting, monkeypatch):
+    import agent_messages
+    import herdr_handoff
+
+    data = read(quitting)
+    data["screens"]["w1:p2"] = [CLAUDE_READY]
+    quitting.write_text(json.dumps(data))
+    monkeypatch.setattr(herdr_handoff, "TYPED_EXIT_WAIT", 0)
+    value = agent_messages.exit_agent(stop_request())
+    assert not value["quit"] and "Enter not sent" in value["warning"]
+    assert keys(quitting) == []
+
+
+def test_a_worker_agent_is_quit_through_its_own_herdr(quitting, monkeypatch):
+    import agent_messages
+    import herdr_handoff
+    import machines
+
+    store = read(quitting)
+    agent, procs, screens = quit_agent_state()
+    store["machines"] = {
+        "Mac mini": {
+            "workspaces": [],
+            "agents": [{**agent, "workspace_id": "w7"}],
+            "process_info": {"w1:p2": procs},
+            "screens": {"w1:p2": screens},
+            "calls": [],
+        }
+    }
+    quitting.write_text(json.dumps(store))
+    mini = machines.Machine(
+        "mini",
+        "Mac mini",
+        "mini.test",
+        "darwin",
+        "~/src",
+        "~/babysit",
+        "python3",
+        2,
+        (),
+        None,
+        True,
+    )
+    asked = []
+
+    def alive(target, machine, home):
+        asked.append((target["agent_pid"], machine.id, home))
+        return bool(read(quitting)["machines"]["Mac mini"]["agents"])
+
+    monkeypatch.setattr(herdr_handoff, "alive", alive)
+    value = agent_messages.exit_agent(stop_request(workspace="w7"), "HOME", mini)
+    assert value == {"quit": True, "pane": "w1:p2", "warning": None}
+    remote = read(quitting)["machines"]["Mac mini"]
+    assert remote["typed_text"] == [["w1:p2", "/exit"]]
+    assert [c[3] for c in remote["calls"] if c[:2] == ["agent", "send-keys"]] == ["enter"]
+    assert asked == [(4242, "mini", "HOME")]
+    # Nothing reached this machine's panes.
+    assert keys(quitting) == [] and "typed_text" not in read(quitting)
+
+
+def test_the_dashboard_relays_quits_and_names_this_machine_beside_workers(quitting, tmp_path):
+    home = tmp_path / "plain"
+    with dashboard.DashboardServer(home, 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            status, value = request(port, "/api/workspace-agents?workspace=w1")
+            assert status == 200 and value["machine_label"] is None
+            home.mkdir(exist_ok=True)
+            (home / "machines.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "machines": [
+                            {"id": "mini", "label": "Mac mini", "ssh": "mini.test", "os": "darwin"}
+                        ],
+                    }
+                )
+            )
+            status, value = request(port, "/api/workspace-agents?workspace=w1")
+            assert value["machine_label"] in {"this Mac", "this machine"}
+            status, value = request(
+                port, "/api/workspace-quit", stop_request(session="s9"), action="workspace-quit"
+            )
+            assert status == 400 and "no longer running" in value["error"]
+            # A worker's agents are not quit from here yet.
+            status, value = request(
+                port,
+                "/api/workspace-quit",
+                stop_request(workspace="mini/w1"),
+                action="workspace-quit",
+            )
+            assert status == 400 and "cannot be opened" in value["error"]
+            status, _ = request(port, "/api/workspace-quit", stop_request(), action="cancel")
+            assert status == 404
+            assert keys(quitting) == []
+            status, value = request(
+                port, "/api/workspace-quit", stop_request(), action="workspace-quit"
+            )
+            assert status == 200 and value["quit"], value
+            assert keys(quitting) == ["enter"]
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
 def test_dash_leading_messages_are_text(site):
     import agent_messages
 

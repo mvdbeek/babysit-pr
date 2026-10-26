@@ -314,6 +314,38 @@ def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, w
     assert not errors
 
 
+def test_a_worker_transcript_names_its_machine_and_cannot_quit_its_agent_yet(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row(
+            "remote-work",
+            key="m:mini:/src/worktrees/repo/remote-work",
+            workspace_ids=["mini/w3"],
+            machine="mini",
+            machine_label="Mac mini",
+            machine_stale=False,
+            removable=False,
+        )
+    ]
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    asked = []
+    page.on("request", lambda request: asked.append(request.url))
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("remote-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
+    strip = live.locator(".ws-live-state")
+    expect(strip).to_have_attribute("data-live", "unknown")
+    expect(strip).to_contain_text("Status unknownon Mac mini")
+    quit_button = strip.get_by_role("button", name="Quit agent")
+    expect(quit_button).to_be_disabled()
+    expect(quit_button).to_have_attribute(
+        "title", "Agents on Mac mini cannot be quit from this dashboard yet"
+    )
+    live.screenshot(path="reports/viewer-strip-worker.png")
+    assert not any("/api/workspace-agents" in url for url in asked)
+
+
 def test_selection_confirmation_override_and_cleanup_progress(page, site):
     url, plugin, removed = site
     errors = []
@@ -621,17 +653,19 @@ def test_a_stop_on_its_way_holds_only_the_row_it_was_sent_from(page, site):
     line = page.locator("#ws-list tr").filter(has=page.get_by_text("dirty-work", exact=True))
     line.get_by_role("button", name="Transcript", exact=True).click()
     dialog = page.locator("#ws-viewer")
-    dialog.get_by_role("button", name="Stop Claude in dirty-work:p1").click()
+    dialog.get_by_role("button", name="Stop the turn of Claude in dirty-work:p1").click()
     expect(dialog.locator(".ws-stop")).to_have_text("Stopping…")
+    # The quit waits too: one action at a time per viewed entry.
+    expect(dialog.locator(".ws-quit")).to_be_disabled()
     dialog.get_by_role("button", name="Next workspace").click()
     expect(page.locator("#ws-viewer-title")).to_have_text("merged-work")
-    stop = dialog.get_by_role("button", name="Stop Claude in merged-work:p1")
-    expect(stop).to_have_text("Stop")
+    stop = dialog.get_by_role("button", name="Stop the turn of Claude in merged-work:p1")
+    expect(stop).to_have_text("Stop turn")
     expect(stop).to_be_enabled()
     dialog.get_by_role("button", name="Previous workspace").click()
     expect(dialog.locator(".ws-stop")).to_have_text("Stopping…")
     held[0].fulfill(json={"stopped": True, "pane": "dirty-work:p1", "warning": None})
-    expect(dialog.locator(".ws-stop")).to_have_text("Stop")
+    expect(dialog.locator(".ws-stop")).to_have_text("Stop turn")
     assert held[0].request.post_data_json["pane"] == "dirty-work:p1"
 
 
