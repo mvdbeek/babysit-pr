@@ -994,6 +994,9 @@ def _host_run(argv, timeout):
             if _past_deadline():
                 raise Expired("Probe deadline expired") from exc
             raise
+        except BaseException:
+            proc.kill()  # As subprocess.run does: the alarm's Expired leaves no Git behind.
+            raise
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
