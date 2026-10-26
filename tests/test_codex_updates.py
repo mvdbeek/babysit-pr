@@ -29,6 +29,9 @@ echo "changed 1 package"
 @pytest.fixture(autouse=True)
 def fresh_version(monkeypatch):
     monkeypatch.setattr(workspace_agents, "_version", {})
+    # The fake CLI is a shell script; on a loaded runner even that can take seconds to
+    # answer, and an unanswered `codex --version` shows no update at all.
+    monkeypatch.setattr(workspace_agents, "VERSION_TIMEOUT", 60)
 
 
 @pytest.fixture
@@ -61,7 +64,8 @@ def checker(home, latest="0.161.0", now=time.time):
 
 
 def installed(updates):
-    updates.installer.join(timeout=10)
+    updates.installer.join(timeout=60)
+    assert not updates.installer.is_alive(), "npm did not finish"
     return updates.snapshot()
 
 
@@ -191,6 +195,13 @@ def test_only_an_npm_installed_codex_is_updatable(tmp_path, fake_tools, monkeypa
     assert codex_updates.npm_installed() is False
 
 
+def test_a_slow_codex_cli_still_offers_its_update(tmp_path, npm_codex):
+    cli = next(npm_codex.parent.glob("prefix/lib/node_modules/@openai/codex/bin/codex.js"))
+    cli.write_text("#!/bin/sh\nsleep 3.5\n" + cli.read_text().split("\n", 1)[1])
+    shown = checker(tmp_path).snapshot()
+    assert shown["installed"] == "0.160.1" and shown["available"] is True
+
+
 def test_update_installs_the_release_shown_and_reports_it(tmp_path, npm_codex):
     updates = checker(tmp_path)
     shown = updates.snapshot()
@@ -281,7 +292,7 @@ def test_dashboard_serves_and_starts_the_update(tmp_path, npm_codex, serve):
     assert not npm_codex.exists()
     code, started = request(server, "POST")
     assert code == 200 and started["update"]["version"] == "0.161.0"
-    updates.installer.join(timeout=10)
+    updates.installer.join(timeout=60)
     code, shown = request(server)
     assert shown["installed"] == "0.161.0" and shown["update"]["ok"] is True
     assert request(server, "POST") == (400, {"error": "No Codex update is available"})
