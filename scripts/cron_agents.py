@@ -359,9 +359,20 @@ def remote_command(job, machine, found, staged, effort, extra=()):
 def start(job, run_id, home, src):
     """Type the agent command into a new pane of the job's workspace.
 
-    A job with a ``machine`` does all of it on that worker, over herdr and ssh.
+    A job with a ``machine`` does all of it on that worker, over herdr and ssh, holding
+    the worker clone's lock until its agent is typed: cleanup and launches there take it,
+    by the clone's real path there, so none removes the checkout before it has an agent.
     """
     machine = machines.resolve(home, job["machine"], placing=True) if job.get("machine") else None
+    if machine is None:
+        return started(job, run_id, home, src, None)
+    real = probe(home, machine, "realpath", 30, path=job["clone"])["path"]
+    with machines.clone_lock(home, machine, real).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return started(job, run_id, home, src, machine)
+
+
+def started(job, run_id, home, src, machine):
     found = None
     if machine is None:
         path = checkout(job, src)
@@ -371,12 +382,7 @@ def start(job, run_id, home, src):
             raise ValueError(
                 f"Jobs on worker machines always run in their sandbox ({machine.label})"
             )
-        # Its worktree is made under the clone's lock, which cleanup and launches on that
-        # worker take by the clone's real path there.
-        real = probe(home, machine, "realpath", 30, path=job["clone"])["path"]
-        with machines.clone_lock(home, machine, real).open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            found = remote_checkout(job, home, machine)
+        found = remote_checkout(job, home, machine)
         path, clone = found["path"], found["clone"]
     workspace = workspace_for(path, machine)
     anchor = None

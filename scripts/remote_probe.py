@@ -1512,15 +1512,22 @@ def _host_trust(config, directory):
     """Accept Claude's folder trust dialog for ``directory``, as claude_accounts.trust does.
 
     ``--dangerously-skip-permissions`` does not skip that dialog. A missing or unreadable
-    config is left alone; ``BABYSIT_CLAUDE_TRUST=0`` turns it off.
+    config is left alone; ``BABYSIT_CLAUDE_TRUST=0`` turns it off. Unlike this machine's,
+    a config that is a symlink is left alone too: a sandboxed agent can write its Claude
+    home, and a link it planted would have another file of this user rewritten.
     """
     if os.environ.get("BABYSIT_CLAUDE_TRUST") == "0":
         return
-    path = Path(os.path.realpath(config))
+    path = Path(os.path.realpath(os.path.dirname(config))) / os.path.basename(config)
     temporary = None
     try:
-        mode = path.stat().st_mode & 0o7777
-        value = json.loads(path.read_text())
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            found = os.fstat(descriptor)
+            if not stat.S_ISREG(found.st_mode):
+                return
+            mode = found.st_mode & 0o7777
+            value = json.loads(stream.read())
         projects = value.setdefault("projects", {})
         if not isinstance(projects, dict):
             return
@@ -2073,7 +2080,7 @@ def _host_remove(root, path, force, branch, safe):
     )
     if os.path.dirname(common) != root:
         raise ValueError(f"{root} is not the top of a clone")
-    listed = {}
+    listed, records = {}, {}
     listing = host_git(root, "worktree", "list", "--porcelain", "-z", strip=False)
     for record in listing.split("\0\0"):
         fields = dict(
@@ -2081,6 +2088,7 @@ def _host_remove(root, path, force, branch, safe):
         )
         if "worktree" in fields:
             listed[fields["worktree"]] = fields.get("branch")
+            records[fields["worktree"]] = fields
     real = os.path.realpath(path)
     named = next((entry for entry in listed if os.path.realpath(entry) == real), None)
     if named is None:
@@ -2090,6 +2098,9 @@ def _host_remove(root, path, force, branch, safe):
         raise ValueError(f"{path} is the clone's own checkout; kept")
     if real == common or real.startswith(common + os.sep):
         raise ValueError(f"{path} lies inside {root}'s Git directory; kept")
+    # Git refuses to remove a locked worktree only once asked to; nothing is deleted first.
+    if "locked" in records[named]:
+        raise ValueError(f"{path} is locked ({records[named]['locked'] or 'no reason'}); kept")
     worktree = "missing"
     if os.path.lexists(path):
         if not force:

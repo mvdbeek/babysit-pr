@@ -1546,16 +1546,21 @@ class WorkspaceOverview:
             raise ValueError(f"{machine.label} answered an unreadable herdr listing")
         spaces = [space for space in map(self.remote_space, spaces) if space]
         agents = [agent for agent in map(self.remote_agent, agents) if agent]
-        if key.startswith("workspace:"):
+        orphan = key.startswith("workspace:")
+        if orphan:
             wid = key.split(":", 2)[2]
             spaces = [space for space in spaces if space["workspace_id"] == wid]
-            root = ((spaces or [{}])[0].get("worktree") or {}).get("repo_root")
-            if not spaces or not root or not root.startswith("/"):
-                # Without its clone the checkout is unknown, never taken for missing.
+            worktree = (spaces or [{}])[0].get("worktree") or {}
+            root, path = worktree.get("repo_root"), worktree.get("checkout_path")
+            root = root if root and root.startswith("/") else None
+            path = path if path and path.startswith("/") else None
+            if not spaces or (root is None and path is None):
+                # As the scan reads it: no checkout it could look for.
                 self.resolved_spaces(spaces, {})
                 rows = self.orphan_rows(spaces, agents, {}, machine)
                 return rows[0] if rows else None
-            path = None
+            # Without its clone, its checkout's own clone tells it apart, as in the scan.
+            path = None if root else path
         else:
             path, root = key.split(":", 2)[2], None
         found = workspace_viewer.probe(
@@ -1571,7 +1576,7 @@ class WorkspaceOverview:
         )
         self.resolved_spaces(spaces, found["paths"])
         checkouts = {item["path"]: item for clone in found["clones"] for item in clone["items"]}
-        if path is None:
+        if orphan:
             rows = self.orphan_rows(spaces, agents, checkouts, machine)
             return rows[0] if rows else None
         if found["root"] is None:
@@ -1595,20 +1600,48 @@ class WorkspaceOverview:
         )
 
     def remove(self, job, index, target):
-        """Act only on blockers the user actually approved, re-read a moment ago."""
+        """Act only on blockers the user actually approved, re-read a moment ago.
+
+        The row is read again once its clone's lock is held: a launch that held it may
+        have opened a workspace or started an agent there meanwhile.
+        """
         key, approved = target["key"], set(target["approve"])
         machine = self.key_machine(key)
         row = self.resolve(key)
         steps: list[str] = []
+        if not self.approved(job, index, row, approved, steps):
+            return
+        lock_path = self.lock_file(row["repo_root"] or row["key"], machine)
+        with lock_path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fresh = self.resolve(key)
+            if fresh is not None and fresh["repo_root"] != row["repo_root"]:
+                self.record(
+                    job, index, status="skipped", message="Workspace changed; refresh the list"
+                )
+                return
+            row = fresh
+            if not self.approved(job, index, row, approved, steps):
+                return
+            self.close_workspaces(job, index, row, steps, machine)
+            if machine is not None:
+                kept = self.remove_remote(job, index, row, steps, approved, machine)
+            else:
+                self.remove_worktree(job, index, row, steps, bool(approved & CLEAN_OVERRIDES))
+                kept = self.delete_branch(job, index, row, steps, approved)
+        self.record(job, index, status="done", message=kept or "Cleaned up", steps=steps)
+
+    def approved(self, job, index, row, approved, steps):
+        """Whether ``row`` may go with what was ``approved``; records why not otherwise."""
         if row is None:
             self.record(
                 job, index, status="done", message="Already removed", steps=["Nothing to remove"]
             )
-            return
+            return False
         if not row["removable"]:
             reason = row["blockers"][0]["text"] if row["blockers"] else "This cannot be removed"
             self.record(job, index, status="skipped", message=reason, steps=steps)
-            return
+            return False
         unseen = [item for item in row["blockers"] if item["kind"] not in approved]
         if unseen:
             self.record(
@@ -1618,17 +1651,8 @@ class WorkspaceOverview:
                 message="Skipped: " + "; ".join(item["text"] for item in unseen),
                 steps=steps,
             )
-            return
-        lock_path = self.lock_file(row["repo_root"] or row["key"], machine)
-        with lock_path.open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            self.close_workspaces(job, index, row, steps, machine)
-            if machine is not None:
-                kept = self.remove_remote(job, index, row, steps, approved, machine)
-            else:
-                self.remove_worktree(job, index, row, steps, bool(approved & CLEAN_OVERRIDES))
-                kept = self.delete_branch(job, index, row, steps, approved)
-        self.record(job, index, status="done", message=kept or "Cleaned up", steps=steps)
+            return False
+        return True
 
     def lock_file(self, clone, machine=None):
         """The lock of one clone; a worker's, which its probe resolved, is the one its

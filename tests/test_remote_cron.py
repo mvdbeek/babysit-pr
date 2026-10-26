@@ -311,25 +311,34 @@ def test_a_workers_job_checkout_holds_its_clones_lock(remote, monkeypatch):
     """The lock cleanup and launches on that worker take, by the clone's real path there."""
     jobs, manager, git_local, state, host = remote
     held = []
-    real = cron_agents.remote_checkout
+    real_checkout, real_run = cron_agents.remote_checkout, cron_agents.run
 
-    def checkout(job, home, machine):
+    def locked(home, machine):
         lock = machines.clone_lock(home, machine, str((host / "src/repo").resolve()))
         with lock.open("a") as other:
             try:
                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                held.append(True)
-            else:
-                fcntl.flock(other, fcntl.LOCK_UN)
-                held.append(False)
-        return real(job, home, machine)
+                return True
+            fcntl.flock(other, fcntl.LOCK_UN)
+            return False
+
+    def checkout(job, home, machine):
+        held.append(("checkout", locked(home, machine)))
+        return real_checkout(job, home, machine)
+
+    def run(*args, **kwargs):
+        if args[2:4] == ("pane", "run"):
+            # Until its agent is typed, a cleanup must not take the new checkout away.
+            held.append(("typed", locked(manager.home, machines.load(manager.home)["mini"])))
+        return real_run(*args, **kwargs)
 
     monkeypatch.setattr(cron_agents, "remote_checkout", checkout)
+    monkeypatch.setattr(cron_agents, "run", run)
     saved = jobs.save(job_request(manager))
     jobs.run_now(saved["id"])
     assert settled(jobs)["status"] == "running"
-    assert held == [True]
+    assert held == [("checkout", True), ("typed", True)]
 
 
 def test_a_job_on_a_worker_starts_its_agent_there(remote):

@@ -164,21 +164,68 @@ def test_approving_only_a_working_agent_keeps_the_local_clean_check(fleet, plugi
     assert (path / "written-meanwhile.txt").exists()
 
 
-def test_a_worker_workspace_without_its_clone_is_never_taken_for_missing(fleet, plugin):
+def test_a_worker_workspace_without_its_clone_is_checked_as_the_scan_shows_it(fleet):
+    elsewhere = fleet["hosts"] / "mini.test" / "elsewhere"
+    elsewhere.mkdir()
     store = read(fleet["state"])
     store["machines"]["Mac mini"]["workspaces"].append(
         {
             "workspace_id": "w5",
             "label": "odd",
-            "worktree": {
-                "repo_root": "relative",
-                "checkout_path": str(fleet["mini"] / "merged-work"),
-            },
+            "worktree": {"repo_root": "relative", "checkout_path": str(elsewhere)},
         }
     )
     fleet["state"].write_text(json.dumps(store))
+    register(fleet["home"], MINI)
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    plugin.value = plugin.collect()
+    listed = next(r for r in plugin.value["workspaces"] if r["key"] == "workspace:mini:w5")
     row = plugin.resolve("workspace:mini:w5")
-    assert not row["missing"] and [b["kind"] for b in row["blockers"]] == ["detached"]
+    assert not row["missing"] and not row["removable"]
+    assert [b["kind"] for b in row["blockers"]] == [b["kind"] for b in listed["blockers"]]
+    assert row["removable"] == listed["removable"]
+
+
+def test_a_cleanup_reads_its_row_again_once_it_holds_the_clones_lock(fleet, plugin, monkeypatch):
+    """A launch holding the lock may start an agent there meanwhile; that is never removed."""
+    key = f"m:mini:{fleet['mini'] / 'dirty-work'}"
+    real = plugin.resolve
+    calls = []
+
+    def resolve(wanted):
+        row = real(wanted)
+        if not calls:
+            # What the launch the cleanup waited for leaves behind.
+            store = read(fleet["state"])
+            mini = store["machines"]["Mac mini"]
+            mini["workspaces"].append(
+                {
+                    "workspace_id": "w7",
+                    "label": "dirty-work",
+                    "worktree": {
+                        "repo_root": str(fleet["hosts"] / "mini.test" / "src" / "repo"),
+                        "checkout_path": str(fleet["mini"] / "dirty-work"),
+                    },
+                }
+            )
+            mini["agents"].append(
+                {
+                    "workspace_id": "w7",
+                    "agent": "claude",
+                    "agent_status": "working",
+                    "pane_id": "w7:p1",
+                }
+            )
+            fleet["state"].write_text(json.dumps(store))
+        calls.append(wanted)
+        return row
+
+    monkeypatch.setattr(plugin, "resolve", resolve)
+    result = cleanup(plugin, (key, ["dirty"]))[key]
+    assert len(calls) == 2
+    assert result["status"] == "skipped" and "agent" in result["message"], result
+    assert (fleet["mini"] / "dirty-work" / "scratch.txt").exists()
+    assert ["workspace", "close", "w7"] not in worker_calls(fleet["state"])
 
 
 def test_worker_pane_ids_are_checked_before_herdr_gets_them(fleet, plugin, monkeypatch):
@@ -266,6 +313,15 @@ def test_remove_deletes_the_tree_without_following_symlinks_then_unregisters_it(
     assert deleted == [str(topic.resolve())]
     assert (outside / "keep.txt").exists() and not topic.exists()
     assert str(topic) not in git("worktree", "list", cwd=clone)
+
+
+def test_remove_deletes_nothing_of_a_locked_worktree(clone):
+    topic = clone.parent / "worktrees" / "repo" / "topic"
+    (topic / "build.out").write_text("ignored output")
+    git("worktree", "lock", "--reason", "keep it", str(topic), cwd=clone)
+    with pytest.raises(ValueError, match=r"is locked \(keep it\); kept"):
+        remote_probe._host_remove(str(clone), str(topic), True, "topic", True)
+    assert (topic / "build.out").exists() and "topic" in branches(clone)
 
 
 def test_remove_refuses_the_main_checkout_named_from_a_linked_worktree(clone):
@@ -618,6 +674,14 @@ def test_the_resume_probe_reports_the_workers_own_paths(worker, monkeypatch):
     remote_probe._host_resume(str(worker.checkout), str(worker.checkout), **args)
     projects = json.loads(config.read_text())["projects"]
     assert projects[found["path"]] == {"hasTrustDialogAccepted": True}
+    # A config the agent swapped for a symlink is never written through.
+    target = worker.host / "babysit-state.json"
+    target.write_text('{"version": 1}')
+    config.unlink()
+    config.symlink_to(target)
+    (worker.checkout / "other").mkdir()
+    remote_probe._host_resume(str(worker.checkout), str(worker.checkout / "other"), **args)
+    assert target.read_text() == '{"version": 1}' and config.is_symlink()
     for bad in ({"cwd": "/w\x1b[2J"}, {"cwd_exists": "yes"}, {"launcher": "relative"}):
         with pytest.raises(ValueError, match="Malformed probe answer"):
             remote_probe.validate_resume({**found, **bad})
