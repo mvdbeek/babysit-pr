@@ -4,7 +4,6 @@ import contextlib
 import os
 import signal
 import sys
-import time
 
 import gh_pr_watch
 import pr_ci
@@ -12,6 +11,7 @@ import pr_ci_logs
 import pr_overview
 import pytest
 import upstream_tests
+from processes import wait_gone
 
 
 @pytest.mark.parametrize("caller", ["overview", "watch", "ci", "job", "log", "upstream"])
@@ -50,14 +50,8 @@ def test_github_poll_reaps_abandoned_credential_helper(tmp_path, monkeypatch, ca
                 else:
                     upstream_tests.gh_bytes("repos/test/repo")
         pid = int(pidfile.read_text())
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return
-            time.sleep(0.02)
-        pytest.fail("GitHub poll left its credential helper running after gh exited")
+        if not wait_gone(pid, 3):
+            pytest.fail("GitHub poll left its credential helper running after gh exited")
     finally:
         if pid is None and pidfile.exists():
             pid = int(pidfile.read_text())

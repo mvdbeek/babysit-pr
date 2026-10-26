@@ -24,7 +24,7 @@ import remote_probe
 import workspace_exit
 from test_new_tasks import request as new_request
 from test_pr_workspaces import finish, helper_calls, local  # noqa: F401 (fixture)
-from test_remote_cron import git, host, rollout, short_tmp  # noqa: F401 (fixtures)
+from test_remote_cron import bwrap, git, host, rollout, short_tmp  # noqa: F401 (fixtures)
 
 APP = Path(pw.__file__).resolve().parent.parent
 URL = "https://github.com/base/repo.git"
@@ -149,10 +149,11 @@ def idle_agent(state, path, screen=None):
     mini = data["machines"]["Mac mini"]
     [agent] = mini["agents"]
     agent["agent_status"] = "idle"
-    foreground = [{"pid": 4242, "argv0": "codex", "argv": agent["argv"], "cwd": str(path)}]
+    argv = ["codex", *agent["argv"]]
+    foreground = [{"pid": 4242, "name": "codex", "argv": argv, "cwd": str(path)}]
     mini.setdefault("process_info", {})[agent["pane_id"]] = {
         "shell_pid": 100,
-        "foreground_processes": [{"pid": 100}, *foreground],
+        "foreground_processes": [{"pid": 100}, *bwrap(str(path)), *foreground],
     }
     if screen is not None:
         mini.setdefault("screens", {})[agent["pane_id"]] = [screen]

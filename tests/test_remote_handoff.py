@@ -7,6 +7,7 @@ reads its transcript there through the probe.
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,15 @@ CONTEXT = {
 STARTED = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}}
 
 
+def bwrap(cwd):
+    """The processes babysit-bwrap puts before a worker's agent in its pane's foreground."""
+    argv = ["bwrap", "--die-with-parent", "--unshare-pid", "--", "claude"]
+    return [
+        {"pid": 4240, "name": "bwrap", "argv": argv, "cwd": cwd},
+        {"pid": 4241, "name": "bwrap", "argv": argv, "cwd": cwd},
+    ]
+
+
 def worker_herdr(fake_tools, tree, agent="codex"):
     """The worker's herdr: one idle agent in PANE, its shell and process there."""
     store = json.loads(fake_tools.read_text())
@@ -48,9 +58,11 @@ def worker_herdr(fake_tools, tree, agent="codex"):
             "process_info": {
                 PANE: {
                     "shell_pid": 100,
+                    # The agent runs in babysit-bwrap: bwrap, its child, then the agent.
                     "foreground_processes": [
                         {"pid": 100},
-                        {"pid": 4242, "argv0": agent, "argv": [agent], "cwd": str(tree)},
+                        *bwrap(str(tree)),
+                        {"pid": 4242, "name": agent, "argv": [agent], "cwd": str(tree)},
                     ],
                 }
             },
@@ -305,7 +317,7 @@ def test_an_agent_still_running_off_the_foreground_has_not_exited(watched, fake_
         )
     finally:
         alive.kill()
-        alive.wait()
+        alive.wait(timeout=10)
 
 
 def test_an_agent_started_with_a_long_brief_is_still_seen_running(watched, fake_tools):
@@ -313,7 +325,8 @@ def test_an_agent_started_with_a_long_brief_is_still_seen_running(watched, fake_
     brief = "Review it carefully.\n" * 500
     argv = ["/bin/sh", "-c", "sleep 60; :", brief]
     assert len(brief) > 4096
-    alive = subprocess.Popen(argv)
+    # Its own group: the sleep the shell starts is stopped with it, never left behind.
+    alive = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL)
     try:
         machine = supervisor.machines.resolve(watched["home"], "box")
         target = {"agent_pid": alive.pid, "agent_argv": argv}
@@ -321,8 +334,8 @@ def test_an_agent_started_with_a_long_brief_is_still_seen_running(watched, fake_
         other = {**target, "agent_argv": [*argv[:-1], brief + "!"]}
         assert herdr_handoff.alive(other, machine, watched["home"]) is False
     finally:
-        alive.kill()
-        alive.wait()
+        os.killpg(alive.pid, signal.SIGKILL)
+        alive.wait(timeout=10)
     assert herdr_handoff.alive(target, machine, watched["home"]) is False
 
 
@@ -360,7 +373,7 @@ def test_the_alive_probe_compares_the_process_command_line(watched):
         assert remote_probe._host_alive(alive.pid, digest(["sleep", "61"])) == {"alive": False}
     finally:
         alive.kill()
-        alive.wait()
+        alive.wait(timeout=10)
     assert remote_probe._host_alive(alive.pid, digest(["sleep", "60"])) == {"alive": False}
     for bad in ((1, digest(["x"])), ("2", digest(["x"])), (os.getpid(), "x"), (os.getpid(), None)):
         with pytest.raises(ValueError):
@@ -392,7 +405,7 @@ def test_a_worker_hands_off_only_the_pane_its_watch_is_bound_to(watched, served,
         "shell_pid": 300,
         "foreground_processes": [
             {"pid": 300},
-            {"pid": 4343, "argv0": "codex", "argv": ["codex"], "cwd": tree},
+            {"pid": 4343, "name": "codex", "argv": ["codex"], "cwd": tree},
         ],
     }
     fake_tools.write_text(json.dumps(store))
@@ -482,11 +495,13 @@ def test_register_through_a_running_broker_is_sent_as_it_always_was(monkeypatch,
     server = socket.socket(socket.AF_UNIX)
     server.bind(str(listen))
     server.listen()
+    server.settimeout(30)  # Nothing here waits unbounded, whatever goes wrong.
     seen = []
 
     def serve():
         for _ in range(2):
             client, _ = server.accept()
+            client.settimeout(30)
             with client:
                 data = b""
                 while chunk := client.recv(65536):
@@ -565,6 +580,7 @@ def test_the_broker_refuses_a_handoff_of_another_launchs_session(box, broker, fa
         "rollout": None,
     }
     with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(60)
         client.connect(str(listen))
         client.sendall(json.dumps(request).encode())
         client.shutdown(socket.SHUT_WR)
@@ -579,9 +595,21 @@ def test_the_broker_refuses_a_handoff_of_another_launchs_session(box, broker, fa
             else {**request, name: 1}
         )
         with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(60)
             client.connect(str(listen))
             client.sendall(json.dumps(bad).encode())
             client.shutdown(socket.SHUT_WR)
             data = client.recv(65536)
         assert "handoff fields" in json.loads(data)["error"]
     assert Path(box["home"] / "handoffs").exists() is False
+
+
+def test_a_process_is_named_by_argv0_or_else_its_first_argument():
+    # herdr on macOS adds argv0; on Linux it reports only argv and name.
+    assert herdr_handoff.program({"argv0": "/usr/local/bin/claude", "argv": ["x"]}) == "claude"
+    assert (
+        herdr_handoff.program({"argv": ["claude", "--effort", "high"], "name": "claude"})
+        == "claude"
+    )
+    assert herdr_handoff.program({"argv": ["/usr/bin/bwrap", "--"]}) == "bwrap"
+    assert herdr_handoff.program({"pid": 100}) == ""

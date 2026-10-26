@@ -369,6 +369,15 @@ def rollout(host, cwd, sid, *events):
 EMPTY = "› \x1b[2mAsk Codex to do anything\x1b[0m"
 
 
+def bwrap(cwd):
+    """The processes babysit-bwrap puts before a worker's agent in its pane's foreground."""
+    argv = ["bwrap", "--die-with-parent", "--unshare-pid", "--", "codex"]
+    return [
+        {"pid": 4240, "name": "bwrap", "argv": argv, "cwd": cwd},
+        {"pid": 4241, "name": "bwrap", "argv": argv, "cwd": cwd},
+    ]
+
+
 def idle_agent(state, path, screen):
     """The worker's agent at rest in its pane, with its shell and process there."""
     data = store(state)
@@ -379,7 +388,8 @@ def idle_agent(state, path, screen):
         "shell_pid": 100,
         "foreground_processes": [
             {"pid": 100},
-            {"pid": 4242, "argv0": "codex", "argv": agent["argv"], "cwd": str(path)},
+            *bwrap(str(path)),
+            {"pid": 4242, "name": "codex", "argv": ["codex", *agent["argv"]], "cwd": str(path)},
         ],
     }
     mini.setdefault("screens", {})[agent["pane_id"]] = [screen]

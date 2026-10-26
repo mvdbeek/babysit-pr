@@ -794,7 +794,10 @@ records it with the machine. Clone locks hash the machine with the clone. The ch
 and agent are verified through probe ops and `herdr --machine`. Exit watches on workers
 (these, scheduled launches there, and worker cron runs) are followed every minute, in
 the background, the way local ones are (`workspace_exit`), through the worker's herdr:
-the agent's own pane is pinned, worker paths are compared as strings, and the
+the agent's own pane is pinned, its process is named by herdr's `argv0` where it
+reports one (macOS) or else its first argument (herdr on Linux, where babysit-bwrap's
+`bwrap` processes share the foreground until the agent exits), worker paths are
+compared as strings, and the
 transcript is read there through probe ops (`sessions`, `first_turn`, `turn`,
 `fingerprint`). Its session is the one in the checkout, among the newest five of the
 agent's kind, whose first prompt carries the brief's marker; the worker's clock is

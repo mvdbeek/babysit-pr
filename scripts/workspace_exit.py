@@ -84,7 +84,7 @@ def capture(op, machine=None):
     matches = [
         p
         for p in procs["foreground_processes"]
-        if Path(p.get("argv0", "")).name == op["agent"]
+        if handoff.program(p) == op["agent"]
         and pane_runner.same_path(p.get("cwd", ""), path, machine)
     ]
     if info.get("agent") != op["agent"] or len(matches) != 1:
