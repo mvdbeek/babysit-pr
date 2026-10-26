@@ -3768,20 +3768,28 @@ def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopp
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     viewer = page.locator("#ws-viewer")
-    live = viewer.get_by_role("region", name="Running agents")
-    rows = live.locator(".ws-live-agent")
-    expect(rows).to_have_count(2)
+    live = viewer.get_by_role("region", name="Agent status")
+    # The transcript's own agent heads the strip; the workspace's others follow.
+    state = live.locator(".ws-live-state")
+    rows = live.get_by_role("group", name="Other running agents").locator(".ws-live-agent")
+    expect(state).to_have_attribute("data-live", "true")
+    expect(state).to_contain_text("LiveWorkingClaude in w1:p2")
+    expect(rows).to_have_count(1)
     expect(rows.nth(0)).to_contain_text("IdleCodexin w1:p1")
-    expect(rows.nth(1)).to_contain_text("WorkingClaudein w1:p2this transcript")
     # The session choice marks each session an agent is running.
     options = viewer.get_by_label("Session", exact=True).locator("option")
     expect(options.nth(0)).to_contain_text("● Working · ")
     expect(options.nth(1)).to_contain_text("● Idle · ")
-    expect(rows.nth(0).get_by_role("button", name="Stop")).to_have_count(0)
+    # Only a working agent has a turn to stop; every live agent can be quit.
+    expect(rows.nth(0).get_by_role("button", name=re.compile("^Stop"))).to_have_count(0)
+    expect(rows.nth(0).get_by_role("button", name="Quit Codex in w1:p1")).to_have_text("Quit agent")
+    stop = state.get_by_role("button", name="Stop the turn of Claude in w1:p2")
+    expect(stop).to_have_text("Stop turn")
+    expect(stop).to_have_attribute("title", re.compile("the agent keeps running"))
     page.screenshot(path=f"reports/viewer-running-agents-{width}.png")
-    rows.nth(1).get_by_role("button", name="Stop Claude in w1:p2").click()
-    expect(page.locator("#ws-live-status")).to_have_text("Stopped Claude in w1:p2.")
-    expect(rows.nth(1)).to_contain_text("Idle")
+    stop.click()
+    expect(page.locator("#ws-live-status")).to_have_text("Stopped the turn of Claude in w1:p2.")
+    expect(state).to_contain_text("LiveIdleClaude in w1:p2")
     expect(live.get_by_role("button", name=re.compile("^Stop"))).to_have_count(0)
     expect(options.nth(0)).to_contain_text("● Idle · ")
     assert stops == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
@@ -3789,7 +3797,8 @@ def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopp
     # Another running session's transcript is one click away.
     rows.nth(0).get_by_role("button", name="Show its transcript").click()
     expect(viewer.locator(".ws-msg-text")).to_have_text("Working on Earlier")
-    expect(rows.nth(0)).to_contain_text("this transcript")
+    expect(state).to_contain_text("LiveIdleCodex in w1:p1")
+    expect(rows.nth(0)).to_contain_text("IdleClaudein w1:p2")
     assert asked[-1] == "s2"
 
 
@@ -3809,17 +3818,129 @@ def test_a_refused_stop_says_why_and_running_agents_follow_polls(
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-live")
-    live.get_by_role("button", name="Stop Claude in w1:p2").click()
+    live.get_by_role("button", name="Stop the turn of Claude in w1:p2").click()
     expect(page.locator("#ws-live-status")).to_have_text(
         "The agent is not working on anything right now; refresh"
     )
     # The agents are read again while the transcript is open.
     viewer_routes["agents"] = []
     page.clock.run_for(11000)
-    expect(live.locator(".ws-live-agent")).to_have_count(0)
+    expect(live.locator(".ws-live-state")).to_have_attribute("data-live", "false")
+    expect(live.locator(".ws-live-state")).to_contain_text("Not running")
     expect(page.locator("#ws-live-status")).to_be_visible()
     page.locator("#ws-view-diff").click()
     expect(live).to_be_hidden()
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    claude = {"pane": "w1:p2", "agent": "claude", "status": "working", "session": "s1"}
+    state = {"agents": [claude]}
+    # With workers registered, the server names this machine beside them.
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "agents": state["agents"],
+                "sessions": [],
+                "path": "/fixture/checkout",
+                "machine_label": "this Mac",
+            }
+        ),
+    )
+    quits = []
+
+    def quit_(route):
+        assert route.request.headers["x-babysit-action"] == "workspace-quit"
+        quits.append(route.request.post_data_json)
+        state["agents"] = []
+        route.fulfill(json={"quit": True, "pane": "w1:p2", "warning": None})
+
+    page.route("**/api/workspace-quit", quit_)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
+    strip = live.locator(".ws-live-state")
+    expect(strip).to_have_text(re.compile(r"^Liveon this Mac · WorkingClaude in w1:p2"))
+    expect(strip.get_by_role("button", name="Stop the turn of Claude in w1:p2")).to_be_visible()
+    if width == 1280:
+        live.screenshot(path="reports/viewer-strip-live-local.png")
+    quit_button = strip.get_by_role("button", name="Quit Claude in w1:p2")
+    quit_button.click()
+    card = live.get_by_role("group", name="Confirm quitting the agent")
+    expect(card).to_contain_text("Quit Claude in w1:p2?")
+    expect(card).to_contain_text("Its current turn is stopped first.")
+    expect(card).to_contain_text("the session can be resumed")
+    # Enter on the question keeps the agent.
+    expect(card.get_by_role("button", name="Keep it running")).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(card).to_have_count(0)
+    assert not quits
+    claude["status"] = "idle"
+    page.locator("#ws-viewer").get_by_role("button", name="Refresh").click()
+    expect(strip).to_contain_text("Liveon this Mac · Idle")
+    quit_button.click()
+    expect(card).not_to_contain_text("stopped first")
+    card.get_by_role("button", name="Yes, quit").click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "Quit Claude in w1:p2; its session can be resumed."
+    )
+    expect(strip).to_have_attribute("data-live", "false")
+    expect(strip).to_have_text("Not runningon this Mac · no agent has this session open right now")
+    expect(live.get_by_role("button", name=re.compile("^Quit"))).to_have_count(0)
+    assert quits == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
+    if width == 1280:
+        live.screenshot(path="reports/viewer-strip-not-running.png")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_a_refused_quit_says_why_and_a_vanished_agent_drops_the_question(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [viewer_routes["agents"][1]]
+    viewer_routes["agents"][0].update(session="s1", status="idle")
+    page.route(
+        "**/api/workspace-quit",
+        lambda route: route.fulfill(
+            status=400,
+            json={
+                "error": "Not quit: Composer contains input or an unknown layout; no exit key sent"
+            },
+        ),
+    )
+    page.clock.install()
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-live")
+    # Without workers, the strip names no machine, as before them.
+    expect(live.locator(".ws-live-state")).to_have_text(re.compile(r"^LiveIdleClaude in w1:p2"))
+    live.get_by_role("button", name="Quit Claude in w1:p2").click()
+    live.get_by_role("button", name="Yes, quit").click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "Not quit: Composer contains input or an unknown layout; no exit key sent"
+    )
+    expect(live.locator(".ws-live-state")).to_have_attribute("data-live", "true")
+    live.get_by_role("button", name="Quit Claude in w1:p2").click()
+    expect(live.get_by_role("group", name="Confirm quitting the agent")).to_be_visible()
+    # A poll that redraws the open question leaves the reader's focus where it is.
+    page.locator("#ws-message-text").focus()
+    viewer_routes["agents"][0]["status"] = "done"
+    page.clock.run_for(11000)
+    expect(live.locator(".ws-live-state")).to_contain_text("LiveDone")
+    expect(live.get_by_role("group", name="Confirm quitting the agent")).to_be_visible()
+    expect(page.locator("#ws-message-text")).to_be_focused()
+    # The agent exits on its own before the answer: nothing is left to confirm.
+    viewer_routes["agents"] = []
+    page.clock.run_for(11000)
+    expect(live.get_by_role("group", name="Confirm quitting the agent")).to_have_count(0)
+    expect(live.locator(".ws-live-state")).to_have_text(
+        "Not runningno agent has this session open right now"
+    )
 
 
 TRANSCRIPT_MARKDOWN = """Both PRs are forwarded; **one** test is <img src=x onerror="window.injected=true"> open.

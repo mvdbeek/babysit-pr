@@ -449,38 +449,41 @@ def advance(record, op, persist, now, machine=None, home=None):
     failed: tuple[type[Exception], ...] = (OSError, RuntimeError)
     if machine is not None:
         failed += (ValueError, subprocess.SubprocessError)
-    try:
-        info, procs, state = handoff.inspect(target["pane_id"], machine)
-        handoff.verify_identity(target, info, procs)
-        handoff.verify_screen(target, info, handoff.read_screen(target["pane_id"], machine))
-        unchanged = (
-            info.get("agent_status") in {"idle", "done"}
-            and state.get("state_change_seq") == seq
-            and list(handoff.fingerprint(target["rollout"], machine, home)) == ready[1]
-            and handoff.latest_turn(
-                target["rollout"], target["session_id"], target["agent"], machine, home
+    # A quit or handoff exiting this pane in another process goes first; the recheck then
+    # finds its agent gone.
+    with handoff.pane_lock(home, target["pane_id"], machine):
+        try:
+            info, procs, state = handoff.inspect(target["pane_id"], machine)
+            handoff.verify_identity(target, info, procs)
+            handoff.verify_screen(target, info, handoff.read_screen(target["pane_id"], machine))
+            unchanged = (
+                info.get("agent_status") in {"idle", "done"}
+                and state.get("state_change_seq") == seq
+                and list(handoff.fingerprint(target["rollout"], machine, home)) == ready[1]
+                and handoff.latest_turn(
+                    target["rollout"], target["session_id"], target["agent"], machine, home
+                )
+                == (turn, complete)
             )
-            == (turn, complete)
-        )
-    except failed:
-        unchanged = False
-    if not unchanged:
-        del record["ready"], record["ready_at"]
-        record.update(state="watching", message="The agent changed just before exiting")
-        return
-    try:
-        handoff.send_exit(
-            target,
-            (turn, complete),
-            tuple(ready[1]),
-            lambda: None,
-            lambda *a, **k: None,
-            machine,
-            home,
-        )
-    except Exception as exc:
-        record.update(state="unconfirmed", message=f"Exit unconfirmed ({exc}); check its pane")
-        return
+        except failed:
+            unchanged = False
+        if not unchanged:
+            del record["ready"], record["ready_at"]
+            record.update(state="watching", message="The agent changed just before exiting")
+            return
+        try:
+            handoff.send_exit(
+                target,
+                (turn, complete),
+                tuple(ready[1]),
+                lambda: None,
+                lambda *a, **k: None,
+                machine,
+                home,
+            )
+        except Exception as exc:
+            record.update(state="unconfirmed", message=f"Exit unconfirmed ({exc}); check its pane")
+            return
     record.update(state="exited", message="The agent confirmed the task was done and exited")
 
 

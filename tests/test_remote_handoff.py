@@ -132,6 +132,7 @@ def test_a_worker_hands_its_watch_to_the_controller_which_exits_its_agent_there(
     watched,
     served,  # noqa: F811
     fake_tools,
+    monkeypatch,
 ):
     auth = {"Authorization": f"Bearer {worker_api.issue(watched['home'], 'box')}"}
     status, answer = post(served, "/api/worker/handoff", asked(watched), auth)
@@ -156,6 +157,16 @@ def test_a_worker_hands_its_watch_to_the_controller_which_exits_its_agent_there(
     with watched["rollout"].open("a") as stream:
         stream.write(json.dumps(done) + "\n")
     screens(fake_tools, f"{answer['final_response_marker']}\n{EMPTY}")
+    send_exit = herdr_handoff.send_exit
+
+    def held(target, *args, **kwargs):
+        # The exit keys go out holding the pane, as a quit or an exit watch would.
+        with pytest.raises(BlockingIOError):
+            with herdr_handoff.pane_lock(watched["home"], PANE, args[4], wait=False):
+                pass
+        return send_exit(target, *args, **kwargs)
+
+    monkeypatch.setattr(herdr_handoff, "send_exit", held)
     db = supervisor.open_db(watched["home"])
     try:
         herdr_handoff.perform(handed, watched["home"], db)
