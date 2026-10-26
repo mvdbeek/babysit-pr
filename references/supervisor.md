@@ -278,7 +278,9 @@ plan mode is still preserved.
 `scripts/sandbox.py` owns this launcher choice and every other sandbox detail
 (typed launch prefixes, account environment, launcher detection). The sandbox is
 external to the agent harness: agents run with their own permissions off inside
-it, so a new harness only supplies its launch argv. The backend follows the
+it, so a new harness only supplies its launch argv. The one exception is a Claude agent
+started with `wt --permission-mode auto`, which runs in Claude's auto mode inside the
+same sandbox; repairs, cron jobs and dashboard launches never pass it. The backend follows the
 platform (`safehouse` on macOS, `bwrap` on Linux). Nothing in the environment
 selects it, since an agent sets the environment of the launches it starts; the
 tests set `sandbox.DEFAULT`.
