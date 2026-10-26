@@ -407,9 +407,8 @@ def test_a_worker_entry_round_trips(page, dashboard_site, tray_routes):
     offline["down"] = False
     chips(page).first.click()
     expect(viewer.locator("#ws-viewer-title")).to_have_text("Worker checkout")
-    expect(page.locator("#ws-message-readonly")).to_have_text(
-        "Not available for workspaces on chonk yet"
-    )
+    # Its composer reaches the worker, without the quit and attachments kept here.
+    expect(page.locator("#ws-message-quit-label")).to_be_hidden()
     expect(chips(page)).to_have_count(0)
     assert tray_routes[-1] == {"key": "m:chonk:/srv/w5", "session": "s-old"}
     viewer.get_by_role("button", name="Minimize workspace viewer").click()

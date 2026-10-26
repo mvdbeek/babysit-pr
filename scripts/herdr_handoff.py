@@ -7,6 +7,8 @@ reads its transcript there through the probe.
 """
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -35,6 +37,8 @@ MAX_REMOTE_HANDOFFS = 4
 # How long an exit may take to show, and a typed /exit to reach the composer.
 EXIT_WAIT = 20
 TYPED_EXIT_WAIT = 5
+# Lock files the panes' exits share (pane_lock); an unrelated pane's exit may wait on one.
+PANE_LOCKS = 256
 
 
 class ScreenNotReady(RuntimeError):
@@ -431,7 +435,29 @@ def schedule(db, home, args):
     return {**scheduled, "audit_file": str(folder / f"{token}.audit.json")}
 
 
-def send_exit(target, expected, before, owned, save, machine=None, home=None):
+@contextlib.contextmanager
+def pane_lock(home, pane, machine=None, *, wait=True):
+    """Hold the exit lock of ``pane`` (on ``machine``, a worker), shared through ``home``.
+
+    Every process that sends an agent its exit keys (a quit from the viewer, an exit
+    watch, a handoff) checks the agent again holding it and lets go only once its keys
+    are sent, so a second exit never follows the first into the pane's shell. ``wait``
+    False raises BlockingIOError while another holds it; without a home there is no one
+    to share it with. Panes share PANE_LOCKS files by hash, so the folder stays bounded:
+    a file must never be removed while another process may hold it.
+    """
+    if home is None:
+        yield
+        return
+    folder = Path(home) / "pane-locks"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    digest = hashlib.sha256(f"{machine.id if machine else ''}\0{pane}".encode()).digest()
+    with (folder / f"{digest[0] % PANE_LOCKS:02x}").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def send_exit(target, expected, before, owned, save, machine=None, home=None, *, typed=False):
     """Press Ctrl-D in a verified idle TUI, then confirm its process exited.
 
     ``expected`` is the (turn, complete) pair and ``before`` the transcript fingerprint the
@@ -439,11 +465,13 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None):
     unconfirmed exit raises without pressing again. A Claude on ``machine``, a worker, is
     asked with /exit instead: its second Ctrl-D would have to come sooner than the checks
     before it can read that worker. Enter follows only once the composer holds exactly
-    /exit, so it never answers a dialog that opened meanwhile.
+    /exit, so it never answers a dialog that opened meanwhile. ``typed`` asks a Claude on
+    this machine the same way, for a caller without a transcript turn to check against.
     """
     agent = target.get("agent", "codex")
     pane = target["pane_id"]
-    if machine is not None and agent == "claude":
+    typed = agent == "claude" and (typed or machine is not None)
+    if typed:
         herdr("pane", "send-text", pane, sandbox.typed("/exit"), machine=machine)
         typed_by = time.monotonic() + TYPED_EXIT_WAIT
         while (shown := claude_composer(read_screen(pane, machine))) != "/exit":
@@ -464,7 +492,7 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None):
         # Never repeat blindly: a Ctrl-D that reaches the shell could close it. Claude asks
         # for a second press within about a second; it goes only to the still-running TUI.
         herdr("agent", "send-keys", pane, "ctrl+d", machine=machine)
-    if agent == "claude" and machine is None:
+    if agent == "claude" and not typed:
         confirmation_deadline = time.monotonic() + 0.75
         while time.monotonic() < confirmation_deadline:
             owned()
@@ -629,23 +657,24 @@ def perform(target, home, db):
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for the final response; agent left open")
             time.sleep(1 if machine is None else REMOTE_POLL)
-        before = rollout_now()
-        info2, procs2, state2 = inspect(target["pane_id"], machine)
-        verify_identity(target, info2, procs2)
-        screen2 = check_screen(info2)
-        if (
-            info2.get("agent_status") not in {"idle", "done"}
-            or state.get("state_change_seq") is None
-            or state2.get("state_change_seq") != state.get("state_change_seq")
-            or target["marker"] not in SGR.sub("", screen2)
-            or not empty_composer(screen2, agent)
-            or rollout_now() != before
-            or turn_now() != (turn, complete)
-        ):
-            raise RuntimeError("Session or input changed before exit; handoff cancelled")
-        still_owned()
-        save("exit_sent", screen_before=screen2)
-        send_exit(target, (turn, complete), before, still_owned, save, machine, home)
+        with pane_lock(home, target["pane_id"], machine):
+            before = rollout_now()
+            info2, procs2, state2 = inspect(target["pane_id"], machine)
+            verify_identity(target, info2, procs2)
+            screen2 = check_screen(info2)
+            if (
+                info2.get("agent_status") not in {"idle", "done"}
+                or state.get("state_change_seq") is None
+                or state2.get("state_change_seq") != state.get("state_change_seq")
+                or target["marker"] not in SGR.sub("", screen2)
+                or not empty_composer(screen2, agent)
+                or rollout_now() != before
+                or turn_now() != (turn, complete)
+            ):
+                raise RuntimeError("Session or input changed before exit; handoff cancelled")
+            still_owned()
+            save("exit_sent", screen_before=screen2)
+            send_exit(target, (turn, complete), before, still_owned, save, machine, home)
         with db:
             db.execute("BEGIN IMMEDIATE")
             job = still_owned()

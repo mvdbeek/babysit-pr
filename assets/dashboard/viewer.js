@@ -304,6 +304,11 @@
   function messageable(target) {
     return Boolean(target.workspace || target.key || target.watch);
   }
+  // The worker machine a view is on: its label, or its id from a qualified workspace ID
+  // (`mini/w1`); null on this machine.
+  function workerLabel(target) {
+    return target.machineLabel || /^([a-z][a-z0-9-]*)\//.exec(target.workspace || "")?.[1] || null;
+  }
   // The issue, pull request or Sentry issue the checkout serves, as {label, url, title}.
   function renderLinks(links) {
     byId("ws-viewer-links").replaceChildren(
@@ -1041,6 +1046,13 @@
   let draft = null;
   let agents = [];
   let sessions = [];
+  // Whether `agents` was read: "loading", "loaded", "failed", or "unavailable" for a
+  // checkout with no workspace, row or watch to ask about.
+  let agentsRead = "loading";
+  // What the server calls this machine beside its workers; null without workers.
+  let hostLabel = null;
+  // The quit asked about ({id, pane, session}), until it is answered or the agent goes.
+  let quitQuestion = null;
   let changingDocker = false;
   let sending = false; // A send in flight keeps the button disabled through refreshes.
   // Cancelling the babysit watch that owns the picked session: the question asked
@@ -1092,7 +1104,7 @@
     byId("ws-message-quit").checked = false;
     // A worker's agents take messages, but its exit watches and uploads stay here; it is
     // named by its row or by a qualified workspace ID (`mini/w1`).
-    const worker = Boolean(entry.machineLabel || /^[a-z][a-z0-9-]*\//.test(entry.workspace || ""));
+    const worker = Boolean(workerLabel(entry));
     byId("ws-message-quit-label").hidden = worker;
     byId("ws-message-files").hidden = worker;
     watchQuestion = null;
@@ -1102,6 +1114,9 @@
     byId("ws-live-status").textContent = "";
     agents = [];
     sessions = [];
+    agentsRead = messageable(entry) ? "loading" : "unavailable";
+    hostLabel = null;
+    quitQuestion = null;
     if (!messageable(entry)) {
       // A checkout without a herdr workspace or a row has no agent to talk to.
       draft = null;
@@ -1161,11 +1176,17 @@
       }
       agents = value.agents;
       sessions = value.sessions;
+      agentsRead = "loaded";
+      hostLabel = value.machine_label || null;
       renderAgents();
       refreshQuestions();
       renderLive();
     } catch (error) {
-      if (viewer?.entry === entry && token === agentsRequest) renderAgents(error.message);
+      if (viewer?.entry !== entry || token !== agentsRequest) return;
+      // Agents read before stay listed; a first read that failed knows none.
+      if (agentsRead === "loading") agentsRead = "failed";
+      renderAgents(error.message);
+      renderLive();
     }
   }
   function agentLabel(agent) {
@@ -1534,16 +1555,32 @@
     return agents.find((agent) => agent.pane === picked) || agents[0];
   }
   // Running agents ------------------------------------------------------------------
-  // Above a transcript: each agent running in the workspace and what it is doing, a
-  // way to its session's transcript, and Stop, which interrupts its turn as Esc would.
+  // Above a transcript: whether an agent runs its session now, and on which machine;
+  // then the workspace's other agents. Each one can have its turn stopped, as Esc
+  // would, or be quit after a confirmation, which ends its process and keeps its pane's
+  // shell and its session.
   const ACTIVITY = {
     working: ["Working", "amber"],
     blocked: ["Waiting for an answer", "amber"],
     idle: ["Idle", "green"],
     done: ["Done", "green"],
   };
-  // The pane a stop is on its way to, per viewed entry: stepping to another one leaves
-  // its Stop buttons and polls alone.
+  const LIVE_ACTIONS = {
+    stop: {
+      path: "workspace-interrupt",
+      busy: "Stopping…",
+      done: (name, pane) => `Stopped the turn of ${name} in ${pane}.`,
+      unknown: "The stop could not be confirmed; refresh or check Collie.",
+    },
+    quit: {
+      path: "workspace-quit",
+      busy: "Quitting…",
+      done: (name, pane) => `Quit ${name} in ${pane}; its session can be resumed.`,
+      unknown: "The quit could not be confirmed; refresh or check Collie.",
+    },
+  };
+  // The action ({pane, action}) on its way, per viewed entry: stepping to another one
+  // leaves its buttons and polls alone.
   const stops = new Map();
   function stopping() {
     return viewer ? stops.get(viewer.id) : undefined;
@@ -1555,12 +1592,160 @@
     if (agent.status === "blocked" && agent.interaction?.idle) return ACTIVITY.idle;
     return ACTIVITY[agent.status] || [agent.status || "Unknown", ""];
   }
+  function liveButtons(agent) {
+    const busy = stopping();
+    const buttons = [];
+    const button = (action, label, className, aria, title) => {
+      const element = node(
+        "button",
+        busy?.pane === agent.pane && busy.action === action ? LIVE_ACTIONS[action].busy : label,
+        className,
+      );
+      element.type = "button";
+      element.disabled = Boolean(busy);
+      element.title = title;
+      element.setAttribute("aria-label", aria);
+      buttons.push(element);
+      return element;
+    };
+    const name = `${agentTitle(agent)} in ${agent.pane}`;
+    if (agent.status === "working")
+      button(
+        "stop",
+        "Stop turn",
+        "ws-stop",
+        `Stop the turn of ${name}`,
+        "Interrupt the current turn, as Esc does; the agent keeps running",
+      ).onclick = () => void liveAction(agent, "stop");
+    const quit = button(
+      "quit",
+      "Quit agent",
+      "ws-quit",
+      `Quit ${name}`,
+      "End the agent's process; its pane's shell stays open and its session can be resumed",
+    );
+    const worker = workerLabel(viewer.entry);
+    if (worker) {
+      // The server refuses it too: exit watches and quits stay on this machine's agents.
+      quit.disabled = true;
+      quit.title = `Agents on ${worker} cannot be quit from this dashboard yet`;
+    }
+    quit.onclick = () => {
+      // Focused once, on this click; a redraw while it is open leaves focus alone.
+      quitQuestion = {
+        id: viewer.id,
+        pane: agent.pane,
+        session: agent.session ?? null,
+        focus: true,
+      };
+      byId("ws-live-status").textContent = "";
+      renderLive();
+    };
+    const holder = node("span", undefined, "ws-live-actions");
+    holder.append(...buttons);
+    return holder;
+  }
+  // The headline for the session shown: live (and doing what), not running, or not
+  // known, with the machine it is on once workers are registered.
+  function liveState(shown, mine) {
+    const worker = workerLabel(viewer.entry);
+    const where = worker || hostLabel;
+    const row = node("div", undefined, "ws-live-agent ws-live-state");
+    if (mine) {
+      const [text, tone] = activity(mine);
+      row.dataset.live = "true";
+      row.dataset.status = mine.status || "";
+      row.append(
+        badge("Live", "green"),
+        node("span", where ? `on ${where} · ` : ""),
+        node("strong", text, `ws-live-activity ${tone}`.trim()),
+        node("span", `${agentTitle(mine)} in ${mine.pane}`, "pr-meta"),
+        liveButtons(mine),
+      );
+      return row;
+    }
+    const known = agentsRead === "loaded";
+    if (known && !shown) {
+      // No session recorded here: any agent running is listed below.
+      row.dataset.live = "none";
+      row.append(node("span", "No session is recorded in this checkout", "pr-meta"));
+      return row;
+    }
+    row.dataset.live = known ? "false" : "unknown";
+    row.append(
+      badge({ loaded: "Not running", loading: "Checking…" }[agentsRead] || "Status unknown"),
+    );
+    if (where) row.append(node("span", known && shown ? `on ${where} · ` : `on ${where}`));
+    if (known && shown)
+      row.append(node("span", "no agent has this session open right now", "pr-meta"));
+    return row;
+  }
+  function agentRow(agent, data) {
+    const [text, tone] = activity(agent);
+    const row = node("div", undefined, "ws-live-agent");
+    row.dataset.status = agent.status || "";
+    row.append(
+      badge(text, tone),
+      node("strong", agentTitle(agent)),
+      node("span", `in ${agent.pane}`, "pr-meta"),
+    );
+    if (data.sessions.some((session) => session.id === agent.session)) {
+      const show = node("button", "Show its transcript");
+      show.type = "button";
+      show.onclick = () => change((state) => (state.session = agent.session));
+      row.append(show);
+    }
+    row.append(liveButtons(agent));
+    return row;
+  }
+  // Asked inline before a quit, which ends the process; the answer goes to the same
+  // agent only while it still runs the same session.
+  function quitCard(agent) {
+    const card = node("div", undefined, "ws-question ws-quit-confirm");
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label", "Confirm quitting the agent");
+    const first =
+      agent.status === "working"
+        ? " Its current turn is stopped first."
+        : agent.status === "blocked" && !agent.interaction?.idle
+          ? " The question or approval it waits on is dismissed first."
+          : "";
+    card.append(
+      node("strong", `Quit ${agentTitle(agent)} in ${agent.pane}?`),
+      node(
+        "p",
+        `Its process exits, as its own /exit or Ctrl-D does.${first} The pane's shell stays open` +
+          (agent.session
+            ? ", and the session can be resumed from here later."
+            : "; herdr names no session for it, so it may not be resumable from here."),
+        "pr-meta",
+      ),
+    );
+    const actions = node("div", undefined, "ws-choices");
+    const yes = node("button", "Yes, quit", "ws-quit");
+    yes.type = "button";
+    yes.onclick = () => void liveAction(agent, "quit");
+    const no = node("button", "Keep it running");
+    no.type = "button";
+    no.onclick = () => {
+      quitQuestion = null;
+      renderLive();
+    };
+    actions.append(yes, no);
+    card.append(actions);
+    // Asked on the reader's click; Enter keeps the agent unless they choose otherwise.
+    if (quitQuestion.focus) {
+      quitQuestion.focus = false;
+      queueMicrotask(() => no.isConnected && no.focus());
+    }
+    return card;
+  }
   function renderLive() {
     const holder = byId("ws-live");
     const data = viewer?.mode === "transcript" ? viewer.data : null;
     const shown = data?.session?.id;
     const live = (id) => agents.find((agent) => agent.session && agent.session === id);
-    // A session with a running agent says so in the session choice.
+    // A session with a running agent says so in the session choice, as the strip does.
     const select = byId("ws-viewer-controls").querySelector('select[aria-label="Session"]');
     for (const option of select?.options || []) {
       const session = data?.sessions.find((s) => s.id === option.value);
@@ -1568,60 +1753,57 @@
       if (session)
         option.textContent = (agent ? `● ${activity(agent)[0]} · ` : "") + sessionLabel(session);
     }
-    holder.hidden = !data || !(agents.length || byId("ws-live-status").textContent);
+    holder.hidden = !data;
     if (holder.hidden) return;
+    const mine = shown ? live(shown) : undefined;
+    const asked =
+      quitQuestion?.id === viewer.id
+        ? agents.find(
+            (agent) =>
+              agent.pane === quitQuestion.pane && (agent.session ?? null) === quitQuestion.session,
+          )
+        : undefined;
+    // The agent left or changed sessions: there is nothing to confirm any more.
+    if (quitQuestion && !asked) quitQuestion = null;
     // Polls redraw only on a change, so a focused button stays focused.
-    const list = byId("ws-live-agents");
     const key = JSON.stringify([
       shown,
       stopping(),
+      quitQuestion && [quitQuestion.id, quitQuestion.pane, quitQuestion.session],
+      agentsRead,
+      hostLabel,
+      workerLabel(viewer.entry),
       data.sessions.map((session) => session.id),
-      agents.map((agent) => [agent.pane, agent.agent, agent.status, agent.session]),
+      agents.map((agent) => [
+        agent.pane,
+        agent.agent,
+        agent.status,
+        agent.session,
+        Boolean(agent.interaction?.idle),
+      ]),
     ]);
-    if (list.dataset.state === key) return;
-    list.dataset.state = key;
-    list.replaceChildren(
-      ...agents.map((agent) => {
-        const [text, tone] = activity(agent);
-        const row = node("div", undefined, "ws-live-agent");
-        row.dataset.status = agent.status || "";
-        row.append(
-          badge(text, tone),
-          node("strong", agentTitle(agent)),
-          node("span", `in ${agent.pane}`, "pr-meta"),
-        );
-        if (agent.session && agent.session === shown) {
-          row.append(node("small", "this transcript", "pr-meta"));
-        } else if (data.sessions.some((session) => session.id === agent.session)) {
-          const show = node("button", "Show its transcript");
-          show.type = "button";
-          show.onclick = () => change((state) => (state.session = agent.session));
-          row.append(show);
-        }
-        if (agent.status === "working") {
-          const stop = node("button", stopping() === agent.pane ? "Stopping…" : "Stop", "ws-stop");
-          stop.type = "button";
-          stop.disabled = Boolean(stopping());
-          stop.setAttribute("aria-label", `Stop ${agentTitle(agent)} in ${agent.pane}`);
-          stop.onclick = () => void stopAgent(agent);
-          row.append(stop);
-        }
-        return row;
-      }),
+    if (holder.dataset.state === key) return;
+    holder.dataset.state = key;
+    byId("ws-live-state").replaceChildren(liveState(shown, mine));
+    byId("ws-live-agents").replaceChildren(
+      ...agents.filter((agent) => agent !== mine).map((agent) => agentRow(agent, data)),
     );
+    byId("ws-live-confirm").replaceChildren(...(asked && !stopping() ? [quitCard(asked)] : []));
   }
-  async function stopAgent(agent) {
+  async function liveAction(agent, action) {
     if (!viewer || stopping()) return;
     const { entry, id } = viewer;
     const status = byId("ws-live-status");
-    stops.set(id, agent.pane);
+    const { path, done, unknown } = LIVE_ACTIONS[action];
+    quitQuestion = null;
+    stops.set(id, { pane: agent.pane, action });
     status.textContent = "";
     renderLive();
     let message;
     try {
-      const response = await fetch("/api/workspace-interrupt", {
+      const response = await fetch(`/api/${path}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-interrupt" },
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": path },
         body: JSON.stringify({
           workspace: entry.workspace,
           pane: agent.pane,
@@ -1629,9 +1811,9 @@
         }),
       });
       const value = await response.json();
-      message = value.error || value.warning || `Stopped ${agentTitle(agent)} in ${value.pane}.`;
+      message = value.error || value.warning || done(agentTitle(agent), value.pane);
     } catch {
-      message = "The stop could not be confirmed; refresh or check Collie.";
+      message = unknown;
     } finally {
       stops.delete(id);
     }

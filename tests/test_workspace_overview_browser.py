@@ -313,6 +313,59 @@ def test_worker_rows_show_their_machine_and_are_not_opened_from_here(page, site,
     assert not errors
 
 
+def test_a_worker_transcript_shows_its_agent_there_and_cannot_quit_it_yet(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row(
+            "remote-work",
+            key="m:mini:/src/worktrees/repo/remote-work",
+            workspace_ids=["mini/w3"],
+            machine="mini",
+            machine_label="Mac mini",
+            machine_stale=False,
+            removable=False,
+        )
+    ]
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    # The worker's agents are read there; its Docker access is not this Mac's to show.
+    agent = {
+        "pane": "w3:p2",
+        "agent": "claude",
+        "status": "working",
+        "title": None,
+        "session": "s1",
+        "docker": None,
+        "docker_supported": False,
+    }
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "agents": [agent],
+                "sessions": [],
+                "path": "/src/worktrees/repo/remote-work",
+                "workspace": "mini/w3",
+                "url": None,
+            }
+        ),
+    )
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("remote-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
+    strip = live.locator(".ws-live-state")
+    expect(strip).to_have_attribute("data-live", "true")
+    expect(strip).to_contain_text("on Mac mini")
+    expect(strip.get_by_role("button", name="Stop the turn of Claude in w3:p2")).to_be_enabled()
+    quit_button = strip.get_by_role("button", name="Quit Claude in w3:p2")
+    expect(quit_button).to_be_disabled()
+    expect(quit_button).to_have_attribute(
+        "title", "Agents on Mac mini cannot be quit from this dashboard yet"
+    )
+    expect(page.locator("#ws-docker")).to_be_hidden()
+    live.screenshot(path="reports/viewer-strip-worker.png")
+
+
 def test_selection_confirmation_override_and_cleanup_progress(page, site):
     url, plugin, removed = site
     errors = []
@@ -620,17 +673,19 @@ def test_a_stop_on_its_way_holds_only_the_row_it_was_sent_from(page, site):
     line = page.locator("#ws-list tr").filter(has=page.get_by_text("dirty-work", exact=True))
     line.get_by_role("button", name="Transcript", exact=True).click()
     dialog = page.locator("#ws-viewer")
-    dialog.get_by_role("button", name="Stop Claude in dirty-work:p1").click()
+    dialog.get_by_role("button", name="Stop the turn of Claude in dirty-work:p1").click()
     expect(dialog.locator(".ws-stop")).to_have_text("Stopping…")
+    # The quit waits too: one action at a time per viewed entry.
+    expect(dialog.locator(".ws-quit")).to_be_disabled()
     dialog.get_by_role("button", name="Next workspace").click()
     expect(page.locator("#ws-viewer-title")).to_have_text("merged-work")
-    stop = dialog.get_by_role("button", name="Stop Claude in merged-work:p1")
-    expect(stop).to_have_text("Stop")
+    stop = dialog.get_by_role("button", name="Stop the turn of Claude in merged-work:p1")
+    expect(stop).to_have_text("Stop turn")
     expect(stop).to_be_enabled()
     dialog.get_by_role("button", name="Previous workspace").click()
     expect(dialog.locator(".ws-stop")).to_have_text("Stopping…")
     held[0].fulfill(json={"stopped": True, "pane": "dirty-work:p1", "warning": None})
-    expect(dialog.locator(".ws-stop")).to_have_text("Stop")
+    expect(dialog.locator(".ws-stop")).to_have_text("Stop turn")
     assert held[0].request.post_data_json["pane"] == "dirty-work:p1"
 
 

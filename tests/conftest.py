@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import safe_git
 import sandbox
 
 GH = """import json,os,sys,subprocess
@@ -219,6 +220,18 @@ def delete_output_dir():
     """
 
 
+# This machine's Git, asked while PATH is still the real one: safe_git caches the first
+# answer per process, and one asked under a fake PATH would be (0,).
+safe_git._version.clear()
+REAL_GIT = safe_git.git_version()
+
+
+@pytest.fixture(autouse=True)
+def real_git_version(monkeypatch):
+    """Every test sees the real Git version, whichever test asked first in this worker."""
+    monkeypatch.setattr(safe_git, "_version", [REAL_GIT])
+
+
 @pytest.fixture(autouse=True)
 def github_token_from_env(monkeypatch):
     """No test opens the system keyring: gh gets its token from the environment."""
@@ -277,3 +290,4 @@ def fresh_viewer_caches(monkeypatch):
     # Never query the host's Seatbelt policies for the fake agent PIDs.
     monkeypatch.setattr(agent_docker, "has_access", lambda pid: True)
     monkeypatch.setattr(agent_messages, "_recent", {})
+    monkeypatch.setattr(agent_messages, "_exiting", set())

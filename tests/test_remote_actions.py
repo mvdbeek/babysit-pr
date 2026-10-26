@@ -724,6 +724,7 @@ def test_the_composer_routes_reach_the_worker(exited, site):
         status, value = request(port, path)
         assert status == 200, value
         assert value["workspace"] == "mini/w1" and value["path"] == str(exited.checkout)
+        assert value["machine_label"] == "Mac mini"
         assert value["agents"] == [] and value["url"] is None
         assert {s["id"] for s in value["sessions"]} == {CLAUDE_SID, CODEX_SID}
     body = {"workspace": "mini/w1", "resume": CLAUDE_SID, "text": "Go on"}

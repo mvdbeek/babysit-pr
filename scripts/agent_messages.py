@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import threading
 import time
@@ -77,6 +78,14 @@ DIALOG_HINTS = ("esc to cancel", "enter to select", "enter to confirm")
 MAX_ANSWER = 2000
 # How long a stop waits for the agent to leave its turn, in milliseconds.
 STOP_WAIT = 5000
+# How long a quit waits for a stopped turn's empty composer to show, in seconds.
+SCREEN_SETTLE = 2
+# Agent processes a quit sent an exit to, by (pane, pid): never sent another.
+_exiting: set[tuple[str, int]] = set()
+# Programs a pane's root may run for its agent's quit to leave the pane open.
+SHELLS = {"bash", "dash", "fish", "ksh", "sh", "tcsh", "zsh"}
+# The system's ps, never one earlier on PATH.
+PS = "/bin/ps"
 # Locks by (kind, name): a slow action waits only for others on its checkout, session or
 # pane, never for those elsewhere. Taken in this order of kinds.
 LOCK_ORDER = ("checkout", "session", "pane")
@@ -436,17 +445,31 @@ def change_docker(target, enabled, home):
         owner = watch_owner(session_id, record["agent"], home, chosen.get("claude_config_dir"))
         if owner:
             raise ValueError(f"Not restarted: {owner}")
-        agent_docker.quit_agent(record)
-        result = launch(
-            info["workspace_id"],
-            chosen,
-            target["pane"],
-            "",
-            home,
-            options=record["options"],
-            cwd=record["cwd"],
-            launcher=record["launcher"],
-        )
+        watched = exit_watcher(target["pane"], session_id, home)
+        if watched:
+            raise ValueError(
+                f"Not restarted: this agent quits by itself once its task is done ({watched}); "
+                "nothing was sent"
+            )
+        # Its exit is a quit's: never beside another exit of the pane (exit_agent).
+        with contextlib.ExitStack() as held:
+            try:
+                held.enter_context(herdr_handoff.pane_lock(home, target["pane"], wait=False))
+            except BlockingIOError:
+                raise ValueError(
+                    "Another exit of this agent is under way; nothing was sent. Check it in Collie"
+                ) from None
+            agent_docker.quit_agent(record)
+            result = launch(
+                info["workspace_id"],
+                chosen,
+                target["pane"],
+                "",
+                home,
+                options=record["options"],
+                cwd=record["cwd"],
+                launcher=record["launcher"],
+            )
         observed = None
         if not result["warning"]:
             try:
@@ -589,6 +612,281 @@ def interrupt(request, machine=None):
                 "warning": "Esc was sent, but the agent still shows as working; check it in Collie.",
             }
     return {"stopped": True, "pane": pane, "warning": None}
+
+
+def exit_agent(request, home=None):
+    """Quit the agent of a pane as its own exit does, keeping the pane's shell and session.
+
+    Only one Claude or Codex process the pane's interactive shell started, still on the
+    named session, is quit: exiting the pane's root process, or a command that ends with
+    the agent, would close the pane. A session a babysit watch owns (or is handing off),
+    an agent an exit watch quits by itself, a scrolled terminal and a draft in the
+    composer refuse the quit before anything is sent; a turn in progress or an open
+    dialog is then dismissed with Esc, as a stop does. Claude then gets a typed /exit
+    and Codex Ctrl-D (``send_exit``), and the process must leave. An exit is attempted
+    once per process, and never while another process exits the same pane
+    (``herdr_handoff.pane_lock`` under ``home``): a second could reach the shell once
+    the first took. Agents on workers are not quit from here.
+    """
+    if set(request) != {"workspace", "pane", "session"} or not (
+        all(isinstance(request[k], str) and request[k] for k in ("workspace", "pane"))
+        and (request["session"] is None or isinstance(request["session"], str))
+    ):
+        raise ValueError("Invalid quit parameters")
+    pane = request["pane"]
+
+    def identify():
+        target = next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
+        if target is None or target.get("session") != request["session"]:
+            raise ValueError("That session is no longer running in this pane; refresh")
+        kind = target["agent"]
+        if kind not in herdr_handoff.AGENTS:
+            raise ValueError("Only Claude and Codex agents can be quit from here")
+        info, procs, _ = herdr_handoff.inspect(pane)
+        matches = [
+            p
+            for p in procs["foreground_processes"]
+            if Path(p.get("argv0", "")).name == herdr_handoff.AGENTS[kind]["process"]
+        ]
+        if info.get("agent") != kind or len(matches) != 1:
+            raise ValueError("Could not identify the agent's process; nothing was sent")
+        if matches[0]["pid"] == procs["shell_pid"]:
+            raise ValueError(
+                "The agent is the pane's root process; quitting it would close the pane"
+            )
+        if not isinstance(matches[0].get("argv"), list):
+            raise ValueError("Could not identify the agent's process; nothing was sent")
+        return (
+            target,
+            info,
+            {
+                "agent": kind,
+                "pane_id": pane,
+                "terminal_id": info["terminal_id"],
+                "shell_pid": procs["shell_pid"],
+                "agent_pid": matches[0]["pid"],
+                "agent_argv": matches[0]["argv"],
+                "cwd": matches[0].get("cwd", ""),
+                # verify_screen asks for a receipt; a quit has none to wait for.
+                "marker": "",
+            },
+        )
+
+    # Nothing else is typed into the pane meanwhile, and its session cannot change
+    # between the checks and the keys.
+    with contextlib.ExitStack() as held:
+        held.enter_context(locked(("pane", pane)))
+        try:
+            held.enter_context(herdr_handoff.pane_lock(home, pane, wait=False))
+        except BlockingIOError:
+            raise ValueError(
+                "Another exit of this agent is under way; nothing was sent. Check it in Collie"
+            ) from None
+        try:
+            target, info, record = identify()
+            if (pane, record["agent_pid"]) in _exiting:
+                raise ValueError(
+                    "An exit was already attempted for this process; check its pane in Collie"
+                )
+            owner = request["session"] and watch_owner(request["session"], target["agent"], home)
+            if owner:
+                raise ValueError(f"Not quit: {owner}")
+            watched = exit_watcher(pane, request["session"], home)
+            if watched:
+                raise ValueError(
+                    f"Not quit: this agent quits by itself once its task is done ({watched}); "
+                    "nothing was sent"
+                )
+            if not interactive_shell(record["shell_pid"]):
+                raise ValueError(
+                    "Not quit: the pane's root process is not an interactive shell, so the pane "
+                    "could close with the agent; nothing was sent"
+                )
+            # Refused now rather than after Esc has cut its turn short.
+            if info.get("scroll", {}).get("offset_from_bottom", 0) != 0:
+                raise ValueError("Not quit: the terminal is scrolled; nothing was sent")
+            screen = herdr_handoff.read_screen(pane)
+            if target["agent"] == "claude":
+                draft = bool(herdr_handoff.claude_composer(screen))
+            else:
+                # Codex's composer is its last "›" line, unless it shows the faint placeholder.
+                typed = [
+                    line.lstrip()[1:].strip()
+                    for line in herdr_handoff.SGR.sub("", screen).splitlines()
+                    if line.lstrip().startswith("›")
+                ]
+                draft = bool(typed and typed[-1]) and not herdr_handoff.empty_codex_composer(screen)
+            if draft:
+                raise ValueError("Not quit: the composer holds a draft; clear it in Collie first")
+        except RuntimeError as exc:
+            # herdr_handoff reports a failed herdr call so; nothing was sent yet.
+            raise ValueError(f"herdr could not read the pane: {str(exc)[-300:]}") from exc
+        # From the first key on, a herdr call that fails or times out may have gone through.
+        sent = False
+        try:
+            if target["status"] == "working" or (
+                target["status"] == "blocked"
+                and not (target["agent"] == "claude" and idle_screen(pane, screen))
+            ):
+                sent = True
+                try:
+                    herdr_handoff.herdr("agent", "send-keys", pane, "esc")
+                except RuntimeError as exc:
+                    raise ValueError(f"herdr could not send Esc: {str(exc)[-300:]}") from exc
+                try:
+                    herdr_handoff.herdr(
+                        "agent",
+                        "wait",
+                        pane,
+                        "--until",
+                        "idle",
+                        "--until",
+                        "done",
+                        # A stopped turn may leave herdr calling Claude blocked; the settle
+                        # below goes by its screen. Esc on a dialog must leave blocked.
+                        *(["--until", "blocked"] if target["status"] == "working" else []),
+                        "--timeout",
+                        str(STOP_WAIT),
+                    )
+                    # The same process must still be there, now idle.
+                    settled = identify()[2]
+                except RuntimeError as exc:
+                    raise ValueError(
+                        "Esc was sent, but the agent did not settle; it was not quit. "
+                        "Check it in Collie"
+                    ) from exc
+                if settled != record:
+                    raise ValueError(
+                        "The agent changed while its turn was stopped; it was not quit"
+                    )
+            # A stopped turn may take a moment to redraw its empty composer.
+            settle_by = time.monotonic() + SCREEN_SETTLE
+            while True:
+                try:
+                    info, procs, _ = herdr_handoff.inspect(pane)
+                    herdr_handoff.verify_identity(record, info, procs)
+                    if (info.get("agent_session") or {}).get("value") != request["session"]:
+                        raise RuntimeError(
+                            "The agent moved to another session; no exit key was sent"
+                        )
+                    if info.get("agent_status") not in {"idle", "done"} and not (
+                        info.get("agent_status") == "blocked"
+                        and record["agent"] == "claude"
+                        and idle_screen(pane, herdr_handoff.read_screen(pane))
+                    ):
+                        raise RuntimeError("The agent is busy again; no exit key was sent")
+                    herdr_handoff.verify_screen(record, info, herdr_handoff.read_screen(pane))
+                    break
+                except herdr_handoff.ScreenNotReady as exc:
+                    if time.monotonic() >= settle_by:
+                        raise ValueError(f"Not quit: {exc}") from exc
+                    time.sleep(0.25)
+                except RuntimeError as exc:
+                    raise ValueError(f"Not quit: {exc}") from exc
+            _exiting.add((pane, record["agent_pid"]))
+            sent = True
+            try:
+                herdr_handoff.send_exit(
+                    record, None, None, lambda: None, lambda *a, **k: None, typed=True
+                )
+            except RuntimeError as exc:
+                return {"quit": False, "pane": pane, "warning": f"{exc}; check the pane in Collie."}
+        except (OSError, subprocess.SubprocessError) as exc:
+            if not sent:
+                raise
+            return {
+                "quit": False,
+                "pane": pane,
+                "warning": f"Keys may have been sent, but herdr did not answer ({exc}); "
+                "check the pane in Collie.",
+            }
+    return {"quit": True, "pane": pane, "warning": None}
+
+
+def interactive_shell(pid):
+    """Whether process ``pid`` is a shell taking typed commands, which outlives its agent.
+
+    Told by its command line: a shell's name with options only, never ``-c``,
+    ``--command`` or a script.
+    """
+    try:
+        args = subprocess.run(
+            [PS, "-o", "args=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (
+        bool(args)
+        and Path(args[0].lstrip("-")).name in SHELLS
+        and all(
+            (a.startswith("--") and not a.startswith("--command"))
+            or (a.startswith("-") and not a.startswith("--") and "c" not in a)
+            for a in args[1:]
+        )
+    )
+
+
+def exit_watcher(pane, session, home):
+    """What exit watch on this machine quits the agent of ``pane`` or ``session`` itself.
+
+    A message's or ``wt`` launch's watch, a scheduled task's or a cron run's, while it
+    is still waiting to exit the agent or exiting it. Read-only; None without a home.
+    """
+    if not home:
+        return None
+
+    def rows(name, query):
+        path = Path(home) / name
+        if not path.exists():
+            return []
+        db = None
+        try:
+            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+            found = [json.loads(data) for (data,) in db.execute(query)]
+        except sqlite3.Error as exc:
+            if "no such table" in str(exc):
+                return []  # Nothing was ever watched there.
+            raise ValueError(f"Could not read the exit watches ({exc}); nothing was sent") from exc
+        finally:
+            if db is not None:
+                db.close()
+        # A row this version cannot read must not hide the others.
+        return [row for row in found if isinstance(row, dict)]
+
+    def follows(row, place):
+        target = (row.get("exit") or {}).get("target") or {}
+        return (
+            (row.get("exit") or {}).get("state") in {"watching", "exiting"}
+            and place.get("machine") is None
+            and target.get("machine") is None
+            and (
+                pane in {place.get("pane_id"), target.get("pane_id")}
+                or (
+                    session is not None
+                    and session in {place.get("session_id"), target.get("session_id")}
+                )
+            )
+        )
+
+    for row in rows(exit_watch.DATABASE, "SELECT data FROM exit_watches"):
+        if follows(row, row):
+            return row.get("label") or "exit watch"
+    for row in rows(exit_watch.DATABASE, "SELECT data FROM scheduled"):
+        if follows(row, {}):
+            return "scheduled task"
+    for row in rows("cron.sqlite", "SELECT data FROM runs"):
+        run = row.get("agent_run") or {}
+        if (
+            row.get("kind") == "agent"
+            and row.get("status") == "running"
+            and follows(row, {"pane_id": run.get("pane"), "machine": run.get("machine") or None})
+        ):
+            return "cron job"
+    return None
 
 
 def paste(pane, text, machine=None):
