@@ -169,6 +169,19 @@ def test_restart_preserves_session_pane_cwd_options_and_enables_docker(rig, tmp_
     assert not list((tmp_path / "message-prompts").iterdir())
 
 
+@pytest.mark.parametrize("rig", ["claude"], indirect=True)
+def test_restart_keeps_an_auto_mode_claude_in_auto_mode(rig, tmp_path):
+    # `wt --permission-mode auto` types `safe claude --permission-mode auto`: no bypass.
+    rig.proc["argv"][1:2] = ["--permission-mode", "auto"]
+    rig.procs["foreground_processes"][0]["argv"][5:] = rig.proc["argv"]
+    messages.change_docker(rig.target, True, tmp_path)
+    command = rig.calls[-1][-1]
+    assert (
+        "--enable=docker -- claude --permission-mode auto --model fixture --resume " + SID
+    ) in command
+    assert "dangerously" not in command and "safe claude" not in command
+
+
 def test_matching_access_does_not_restart_even_while_working(rig, tmp_path, monkeypatch):
     rig.info["agent_status"] = "working"
     monkeypatch.setattr(docker, "has_access", lambda pid: True)

@@ -343,6 +343,65 @@ def test_docker_prefixes_the_safehouse_enable_variable(command):
     assert tool().command_for(options(prompt="go")) == 'claude "$(cat /tmp/wt-prompt.fixture)"'
 
 
+@pytest.mark.parametrize("command", ["wt", "wti", "wtpr"])
+def test_permission_mode_auto_is_claude_only_and_refused_before_anything_is_made(command, tmp_path):
+    assert wt.parse_args(command, ["--permission-mode", "auto", "7"]).permission_mode == "auto"
+    assert wt.parse_args(command, ["7"]).permission_mode == ""
+    assert "--permission-mode auto" in wt.HELP[command]
+    runner = FakeRunner(executables={"herdr"})
+    env = {"HOME": str(tmp_path), "WT_MULTIPLEXER": "herdr"}
+    with pytest.raises(wt.WtError, match="wt: --permission-mode auto is for Claude only"):
+        tool(runner, env).run(command, ["--codex", "--permission-mode", "auto", "7"])
+    with pytest.raises(wt.WtError, match="wt: unsupported permission mode; only auto"):
+        tool(runner, env).run(command, ["--permission-mode", "plan", "7"])
+    assert runner.calls == []
+
+
+def test_permission_mode_auto_runs_safe_without_the_bypass(monkeypatch, tmp_path):
+    # The claude() function adds --dangerously-skip-permissions, so auto mode calls the
+    # `safe` function it wraps, keeping Safehouse and every prefix.
+    monkeypatch.setattr(wt.claude_accounts, "default_home", lambda: tmp_path / ".claude")
+    assert tool().command_for(options(permission_mode="auto", prompt="go")) == (
+        'safe claude --permission-mode auto "$(cat /tmp/wt-prompt.fixture)"'
+    )
+    also = [wt.AlsoCheckout("/src/a", "/wt/a", "/src/a/.git")]
+    assert wt.agent_command(
+        "claude",
+        "go",
+        "opus",
+        "",
+        lambda text: "/tmp/p" if text == "go" else "/tmp/g",
+        docker=True,
+        claude_config_dir="/fixture/accounts/work",
+        also=also,
+        permission_mode="auto",
+    ) == (
+        "CLAUDE_CONFIG_DIR=/fixture/accounts/work "
+        "SAFEHOUSE_ENV_PASS=CLAUDE_CONFIG_DIR${SAFEHOUSE_ENV_PASS:+,$SAFEHOUSE_ENV_PASS} "
+        "SAFEHOUSE_ADD_DIRS=${SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}$(cat /tmp/g) "
+        "SAFE_ENABLE=docker safe claude --permission-mode auto --model opus --add-dir /wt/a -- "
+        '"$(cat /tmp/p)"'
+    )
+    # Without the option the line is unchanged: the claude() function adds the bypass.
+    assert tool().command_for(options(prompt="go")) == 'claude "$(cat /tmp/wt-prompt.fixture)"'
+    with pytest.raises(ValueError, match="Claude only"):
+        wt.agent_command("codex", permission_mode="auto")
+    with pytest.raises(ValueError, match="only applies inside the sandbox"):
+        wt.agent_command("claude", unsandboxed=True, permission_mode="auto")
+
+
+def test_permission_mode_auto_on_linux_replaces_the_bypass_flag(monkeypatch):
+    monkeypatch.setattr(wt.sandbox, "DEFAULT", "bwrap")
+    t = tool()
+    auto = t.command_for(options(permission_mode="auto"), directory="/wt/x")
+    bypass = t.command_for(options(), directory="/wt/x")
+    assert auto.endswith(" -- claude --permission-mode auto")
+    assert bypass.endswith(" -- claude --dangerously-skip-permissions")
+    assert auto.removesuffix("--permission-mode auto") == bypass.removesuffix(
+        "--dangerously-skip-permissions"
+    )
+
+
 def test_with_checkouts_widen_the_sandbox_and_become_agent_directories():
     also = [
         wt.AlsoCheckout("/src/a", "/wt/a/x", "/src/a/.git"),
@@ -1701,6 +1760,25 @@ def test_wt_branch_worktree_and_dispatch(repo):
     # wt.py with a leading subcommand behaves like the symlinked name.
     result = run_tool("wtpr", "--help")
     assert result.stdout.startswith("usage:\n  wtpr")
+
+
+def test_wt_permission_mode_auto_end_to_end(repo):
+    home, git, state = repo
+    # zsh -f has no functions: a fake `safe` stands in for the user's Safehouse function.
+    safe = state.parent / "bin" / "safe"
+    safe.write_text('#!/bin/sh\nexec "$@"\n')
+    safe.chmod(0o700)
+    run_tool("wt", "-r", "repo", "--permission-mode", "auto", "-p", "Go", "feature", "auto-b")
+    data = state_of(state)
+    typed = next(c for c in data["calls"] if c[:2] == ["pane", "run"])[3]
+    assert typed.startswith('safe claude --permission-mode auto "$(cat ')
+    assert data["agents"][-1]["argv"] == ["--permission-mode", "auto", "Go"]
+    assert data["agents"][-1]["cwd"] == str(home / "src/worktrees/repo/auto-b")
+    result = run_tool(
+        "wt", "-r", "repo", "--codex", "--permission-mode", "auto", "main", "x", check=False
+    )
+    assert result.returncode and "wt: --permission-mode auto is for Claude only" in result.stderr
+    assert not (home / "src/worktrees/repo/x").exists()
 
 
 @pytest.mark.parametrize("other_remote", [False, True])

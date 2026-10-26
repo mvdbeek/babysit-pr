@@ -764,3 +764,106 @@
   margin: 0;
   color: var(--muted);
 }
+/* Minimized viewers: a row of chips floating at the bottom left, scrolling sideways when
+   crowded. On a phone it stops short of the floating New task button. */
+.ws-tray {
+  --tray-left: max(16px, env(safe-area-inset-left));
+  --tray-right: max(16px, env(safe-area-inset-right));
+  position: fixed;
+  left: var(--tray-left);
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  z-index: 5;
+  box-sizing: border-box;
+  max-width: calc(100% - var(--tray-left) - var(--tray-right));
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--raised);
+  color: var(--ink);
+  box-shadow: var(--shadow-float);
+}
+.ws-tray[hidden] {
+  display: none;
+}
+#ws-tray-note {
+  margin: 2px 6px 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+#ws-tray-note:empty {
+  display: none;
+}
+.ws-tray-chips {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.ws-tray-chips:empty {
+  display: none;
+}
+.ws-tray-chip {
+  display: flex;
+  flex: none;
+  align-items: stretch;
+  border: 1px solid var(--field-line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--paper);
+}
+.ws-tray-chip button {
+  border: 0;
+  background: none;
+  color: inherit;
+}
+.ws-tray-restore {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 16em;
+  padding: 6px 4px 6px 10px;
+}
+.ws-tray-tab {
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 600;
+}
+.ws-tray-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-tray-dismiss {
+  padding: 0 10px;
+  color: var(--muted);
+  font-size: 16px;
+}
+@media (hover: hover) {
+  .ws-tray-chip button:hover {
+    background: var(--hover);
+  }
+}
+.ws-tray-restore:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+/* The page scrolls clear of the tray. */
+body.ws-tray-shown main {
+  padding-bottom: calc(90px + env(safe-area-inset-bottom));
+}
+@media (max-width: 540px) {
+  .ws-tray {
+    max-width: calc(100% - var(--tray-left) - var(--tray-right) - 64px);
+  }
+  .ws-tray-restore {
+    max-width: 12em;
+  }
+}
+@media (pointer: coarse) {
+  .ws-tray-chip button {
+    min-height: 44px;
+  }
+  .ws-tray-dismiss {
+    min-width: 44px;
+  }
+}
