@@ -109,7 +109,7 @@ def test_snapshot_codex_repair_sandbox(tmp_path, launcher, sandbox):
     ]
 
 
-def _typed(agent, docker, also, account, unsandboxed):
+def _typed(agent, docker, also, account, unsandboxed, permission_mode=None):
     checkouts = [wt.AlsoCheckout("/src/a", "/wt/a", "/src/a/.git")] if also else []
     return wt.agent_command(
         agent,
@@ -120,11 +120,14 @@ def _typed(agent, docker, also, account, unsandboxed):
         claude_subscription=account,
         unsandboxed=unsandboxed,
         also=checkouts,
+        permission_mode=permission_mode,
     )
 
 
-def _expected(agent, docker, also, account, unsandboxed):
+def _expected(agent, docker, also, account, unsandboxed, permission_mode=None):
     words = CODEX if agent == "codex" else agent
+    if permission_mode:
+        words = f"safe {agent} --permission-mode {permission_mode}"
     if unsandboxed:
         flag = wt.UNSANDBOXED_FLAGS[agent]
         words = f"command {agent} {flag}" + words[len(agent) :]
@@ -168,6 +171,35 @@ def test_snapshot_typed_launch_line_literals(default_home):
         _typed("claude", True, False, False, True)
     with pytest.raises(ValueError, match="A --with checkout path contains ':'"):
         wt.agent_command("claude", also=[wt.AlsoCheckout("/a", "/wt/a:b", "/a/.git")])
+
+
+@pytest.mark.parametrize(
+    ("docker", "also", "account"), list(itertools.product(*[[False, True]] * 3))
+)
+def test_auto_permission_mode_calls_safe_with_the_same_prefixes(
+    default_home, docker, also, account
+):
+    # claude() would add --dangerously-skip-permissions: auto mode calls `safe` itself.
+    assert _typed("claude", docker, also, account, False, "auto") == _expected(
+        "claude", docker, also, account, False, "auto"
+    )
+    assert _typed("claude", docker, also, account, False, None) == _expected(
+        "claude", docker, also, account, False
+    )
+
+
+def test_auto_permission_mode_line_literals(default_home):
+    assert _typed("claude", True, True, True, False, "auto") == (
+        f"(unset {UNSET}; CLAUDE_CONFIG_DIR='/fixture/accounts/work dir' "
+        "SAFEHOUSE_ENV_PASS=CLAUDE_CONFIG_DIR${SAFEHOUSE_ENV_PASS:+,$SAFEHOUSE_ENV_PASS} "
+        "SAFEHOUSE_ADD_DIRS=${SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}$(cat /tmp/g1) "
+        "SAFE_ENABLE=docker safe claude --permission-mode auto --add-dir /wt/a -- "
+        '"$(cat /tmp/p1)")'
+    )
+    line = sandbox.typed_line(
+        ["claude", "--model", "m"], sandbox.Grants(), str, "--x", "none", permission_mode="auto"
+    )
+    assert line == "command claude --permission-mode auto --model m"
 
 
 def test_snapshot_account_shell_prefix(default_home):
@@ -384,6 +416,10 @@ def test_linux_typed_lines_invoke_the_wrapper_explicitly(checkout, monkeypatch):
         "claude --dangerously-skip-permissions --add-dir /wt/a"
     )
     assert staged == ["/wt/a:/src/a/.git"]
+    auto = sandbox.typed_line(
+        words, grants, stage, flag, "bwrap", str(worktree), ACCOUNT, permission_mode="auto"
+    )
+    assert auto == line.replace(flag, "--permission-mode auto")
     monkeypatch.setenv("CODEX_HOME", "/fixture/codex")
     assert sandbox.typed_line(["codex"], sandbox.Grants(), stage, "--yolo", "bwrap") == (
         f"{SCRIPTS / 'babysit-bwrap'} --codex-home=/fixture/codex -- codex --yolo"

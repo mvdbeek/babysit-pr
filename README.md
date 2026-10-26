@@ -774,7 +774,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude] [--docker] [--with repo]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
@@ -813,6 +813,21 @@ one is refused.
 Write access to another clone's git directory includes its `hooks/` and `config`, which
 run outside the sandbox the next time you use git there. Safehouse already grants the
 same for the task's own repository; `--with` extends it to the chosen clones only.
+
+`--permission-mode auto` (all three commands, Claude only) starts Claude in its auto
+permission mode instead of bypassing its permission checks; the agent still runs in the
+sandbox. The shell's `claude` function always adds `--dangerously-skip-permissions`, so
+on macOS the line calls the `safe` function that `claude` wraps instead, with the same
+prefixes: `SAFE_ENABLE=docker safe claude --permission-mode auto …`. On Linux
+babysit-bwrap is given `claude --permission-mode auto …` in place of the bypass flag.
+Claude Code holds messages between a session that bypasses permissions and one that
+prompts (auto counts as prompting) for approval, so an agent started this way receives
+follow-ups from an orchestrating session in auto mode, while messages from bypassing
+sessions, such as dashboard-launched reviews, wait for approval. Without the option the
+typed line is unchanged. It is refused with `--codex`, which has no equivalent. A
+dashboard **Docker access** restart keeps the mode, as it keeps every known launch
+option; a session resumed from the dashboard after it exited starts through the shell's
+`claude` function again, so it bypasses permission checks as before.
 
 To use it from a shell, put `scripts/` on `PATH` or symlink the three launchers into
 a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `tmux`,
