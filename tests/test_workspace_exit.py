@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+import threading
 import time
 
 import exit_watch
@@ -263,6 +264,47 @@ def test_left_open_when_the_agent_process_is_gone(rig):
     step()
     assert record["state"] == "left_open" and "exited" in record["message"]
     assert not state["sent"]
+
+
+def test_the_exit_waits_for_another_exit_of_the_pane_and_checks_again(rig, tmp_path):
+    op, record, state, step, _ = rig
+    step()
+    passed = threading.Event()
+
+    def exiting():
+        state["clock"] += we.SETTLE_SECONDS
+        we.step(record, op, state["persisted"].append, now=state["clock"], home=tmp_path)
+        passed.set()
+
+    # A quit from the dashboard, holding the pane while it sends its own exit keys.
+    with handoff.pane_lock(tmp_path, "w1:p1"):
+        thread = threading.Thread(target=exiting, daemon=True)
+        thread.start()
+        assert not passed.wait(0.5)
+        assert state["persisted"][-1]["state"] == "exiting" and not state["sent"]
+        # That quit took: only the pane's shell is left.
+        state["procs"] = {"shell_pid": 100, "foreground_processes": [{"pid": 100}]}
+    thread.join(5)
+    assert passed.is_set()
+    assert not state["sent"]
+    assert record["state"] == "watching" and "changed just before exiting" in record["message"]
+
+
+def test_the_exit_keys_go_out_holding_the_pane(rig, tmp_path, monkeypatch):
+    op, record, state, step, _ = rig
+    sent = handoff.send_exit
+
+    def held(*args, **kwargs):
+        with pytest.raises(BlockingIOError):
+            with handoff.pane_lock(tmp_path, "w1:p1", wait=False):
+                pass
+        return sent(*args, **kwargs)
+
+    monkeypatch.setattr(handoff, "send_exit", held)
+    step()
+    state["clock"] += we.SETTLE_SECONDS
+    we.step(record, op, state["persisted"].append, now=state["clock"], home=tmp_path)
+    assert state["sent"] == ["w1:p1"] and record["state"] == "exited"
 
 
 @pytest.mark.parametrize("change", ["working", "status", "draft", "queued", "scrolled"])

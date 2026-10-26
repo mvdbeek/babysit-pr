@@ -7,6 +7,8 @@ reads its transcript there through the probe.
 """
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -431,6 +433,27 @@ def schedule(db, home, args):
     return {**scheduled, "audit_file": str(folder / f"{token}.audit.json")}
 
 
+@contextlib.contextmanager
+def pane_lock(home, pane, machine=None, *, wait=True):
+    """Hold the exit lock of ``pane`` (on ``machine``, a worker), shared through ``home``.
+
+    Every process that sends an agent its exit keys (a quit from the viewer, an exit
+    watch, a handoff) checks the agent again holding it and lets go only once its keys
+    are sent, so a second exit never follows the first into the pane's shell. ``wait``
+    False raises BlockingIOError while another holds it; without a home there is no one
+    to share it with.
+    """
+    if home is None:
+        yield
+        return
+    folder = Path(home) / "pane-locks"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(f"{machine.id if machine else ''}\0{pane}".encode()).hexdigest()
+    with (folder / key).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
 def send_exit(target, expected, before, owned, save, machine=None, home=None, *, typed=False):
     """Press Ctrl-D in a verified idle TUI, then confirm its process exited.
 
@@ -631,23 +654,24 @@ def perform(target, home, db):
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for the final response; agent left open")
             time.sleep(1 if machine is None else REMOTE_POLL)
-        before = rollout_now()
-        info2, procs2, state2 = inspect(target["pane_id"], machine)
-        verify_identity(target, info2, procs2)
-        screen2 = check_screen(info2)
-        if (
-            info2.get("agent_status") not in {"idle", "done"}
-            or state.get("state_change_seq") is None
-            or state2.get("state_change_seq") != state.get("state_change_seq")
-            or target["marker"] not in SGR.sub("", screen2)
-            or not empty_composer(screen2, agent)
-            or rollout_now() != before
-            or turn_now() != (turn, complete)
-        ):
-            raise RuntimeError("Session or input changed before exit; handoff cancelled")
-        still_owned()
-        save("exit_sent", screen_before=screen2)
-        send_exit(target, (turn, complete), before, still_owned, save, machine, home)
+        with pane_lock(home, target["pane_id"], machine):
+            before = rollout_now()
+            info2, procs2, state2 = inspect(target["pane_id"], machine)
+            verify_identity(target, info2, procs2)
+            screen2 = check_screen(info2)
+            if (
+                info2.get("agent_status") not in {"idle", "done"}
+                or state.get("state_change_seq") is None
+                or state2.get("state_change_seq") != state.get("state_change_seq")
+                or target["marker"] not in SGR.sub("", screen2)
+                or not empty_composer(screen2, agent)
+                or rollout_now() != before
+                or turn_now() != (turn, complete)
+            ):
+                raise RuntimeError("Session or input changed before exit; handoff cancelled")
+            still_owned()
+            save("exit_sent", screen_before=screen2)
+            send_exit(target, (turn, complete), before, still_owned, save, machine, home)
         with db:
             db.execute("BEGIN IMMEDIATE")
             job = still_owned()
