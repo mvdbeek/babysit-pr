@@ -52,6 +52,11 @@ def command(args, **kwargs):
             yield proc
         finally:
             stop_group(proc)
+            # Input still buffered for the stopped group has nowhere to go; flushing it
+            # in Popen.__exit__ would raise BrokenPipeError over the reason it stopped.
+            if proc.stdin:
+                with contextlib.suppress(OSError, ValueError):
+                    proc.stdin.close()
 
 
 def _feed(proc, data):

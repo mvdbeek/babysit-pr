@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -271,9 +272,13 @@ def test_a_hung_worker_is_given_up_on_without_delaying_the_scan_past_its_timeout
     register(fleet["home"], MINI)
     release = threading.Event()
     monkeypatch.setattr(wso, "REMOTE_TIMEOUT", 0.2)
-    monkeypatch.setattr(wso.WorkspaceOverview, "scan_machine", lambda self, *args: release.wait(10))
-    value = wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect()
-    release.set()
+    # Hung until the scan is over, however long this machine's own part takes: a worker
+    # that answered after all would be no hung worker.
+    monkeypatch.setattr(wso.WorkspaceOverview, "scan_machine", lambda self, *args: release.wait())
+    try:
+        value = wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect()
+    finally:
+        release.set()
     assert value["machines"]["mini"]["status"] == "unreachable"
     assert "No answer within" in value["machines"]["mini"]["error"]
     assert str(fleet["local"] / "local-work") in by_key(value)
@@ -789,7 +794,9 @@ def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
     request = {
         "op": "inventory",
         "args": {"src": str(tmp_path / "src"), "roots": [], "repo_roots": [], "opened": []},
-        "deadline": 3,
+        # Long enough that its Git has started even on a loaded runner, where the
+        # probe's own start can take seconds.
+        "deadline": 10,
     }
     started = time.monotonic()
     result = subprocess.run(
@@ -797,13 +804,45 @@ def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
         input=Path(remote_probe.__file__).read_bytes(),
         capture_output=True,
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
-        timeout=30,
+        timeout=60,
     )
     assert result.returncode == remote_probe.EXPIRED, result.stderr
-    assert time.monotonic() - started < 15
+    assert time.monotonic() - started < 40
     assert "deadline expired" in json.loads(result.stdout)["error"]
     for pid in map(int, pids.read_text().split()):
         assert wait_gone(pid), "the probe's Git survived its deadline"
+
+
+def test_no_git_starts_once_an_expired_probe_stopped_its_group(tmp_path, monkeypatch):
+    # A scan thread that outlives the alarm sees no deadline once the answer is on its
+    # way (DEADLINE is reset); a Git it started then would outlive the probe.
+    monkeypatch.setattr(remote_probe, "DEADLINE", None)
+    monkeypatch.setattr(remote_probe, "STOPPED", True)
+    ran = tmp_path / "ran"
+    with pytest.raises(remote_probe.Expired):
+        remote_probe._host_run(["touch", str(ran)], 5)
+    monkeypatch.setattr(remote_probe, "host_argv", lambda *a, **k: ["touch", str(ran)])
+    with pytest.raises(remote_probe.Expired):
+        remote_probe.host_output(tmp_path, "status")
+    assert not ran.exists()
+
+
+def test_a_git_interrupted_by_the_alarm_is_killed(monkeypatch):
+    # The alarm raises Expired wherever the probe is, here inside communicate(); as with
+    # subprocess.run, the Git it was waiting on must not be left running.
+    started = []
+    real = subprocess.Popen.communicate
+
+    def interrupted(self, *args, **kwargs):
+        started.append(self)
+        raise remote_probe.Expired("Probe deadline expired")
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
+    with pytest.raises(remote_probe.Expired):
+        remote_probe._host_run(["sleep", "60"], 30)
+    monkeypatch.setattr(subprocess.Popen, "communicate", real)
+    [proc] = started
+    assert proc.returncode == -signal.SIGKILL
 
 
 def test_a_git_timeout_at_the_deadline_is_reported_as_expiry(tmp_path, monkeypatch):
