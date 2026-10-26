@@ -2182,7 +2182,7 @@ class Workspaces:
                 return
             try:
                 op = launched_operation(row, time.time(), machine)
-            except workspace_exit.UNREACHABLE:
+            except (OSError, ValueError, subprocess.SubprocessError):
                 op = {"status": "running"}  # Looked at again on the next pass.
             self.follow_exit(table, row, op, exited=self.closer(row, machine), machine=machine)
         except Exception:

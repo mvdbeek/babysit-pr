@@ -842,9 +842,12 @@ class CronJobs:
             self.append_log(run, f"\nFinal response:\n{text}\n")
         if record["state"] == "exited":
             # Only the pane this run opened, and only if it is the one the agent left.
-            exited = (record.get("target") or {}).get("pane_id", launched["pane"])
+            target = record.get("target") or {}
+            exited = target.get("pane_id", launched["pane"])
+            # On a worker, whose herdr may reuse pane ids, only the agent's own shell.
+            shell = target.get("shell_pid") if machine is not None else None
             closed = exited == launched["pane"] and cron_agents.close_pane(
-                launched["pane"], machine
+                launched["pane"], machine, shell
             )
             changes = {
                 "status": "succeeded",

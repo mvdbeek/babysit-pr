@@ -130,7 +130,7 @@ def rig(tmp_path, monkeypatch, request):
             {"state_change_seq": state["seq"]},
         )
 
-    def send_exit(target, expected, before, owned, save, machine=None):
+    def send_exit(target, expected, before, owned, save, machine=None, home=None):
         assert expected == handoff.latest_turn(rollout, SID, agent)
         assert before == handoff.fingerprint(rollout)
         # The record says "exiting" durably before any key goes out.

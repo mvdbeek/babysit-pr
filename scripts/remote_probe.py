@@ -1339,6 +1339,37 @@ def _host_first_turn(file, agent, marker):
     return {"turn": None if turn is None else str(turn)[:MAX_TEXT], "marked": marked}
 
 
+def _host_turn_state(file, session, agent):
+    """``turn`` and ``fingerprint`` of one transcript, read together in one call."""
+    with _host_transcript(file) as stream:
+        info = os.fstat(stream.fileno())
+    found = _host_turn(file, session, agent)
+    return {**found, "inode": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+
+
+def _host_alive(pid, argv):
+    """Whether process ``pid`` still runs ``argv``: an agent stopped, or moved out of its
+    terminal's foreground, has not exited. Another program at that pid is not it."""
+    if not (type(pid) is int and 1 < pid < 2**31):
+        raise ValueError("Expected a process ID")
+    if not (
+        isinstance(argv, list)
+        and 0 < len(argv) <= 256
+        and all(isinstance(a, str) and "\0" not in a and len(a) <= MAX_TEXT for a in argv)
+    ):
+        raise ValueError("Expected a command line")
+    if os.path.isdir("/proc/self"):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as stream:
+                running = stream.read(256 * (MAX_TEXT + 1)).split(b"\0")[:-1]
+        except (FileNotFoundError, ProcessLookupError):
+            return {"alive": False}
+        return {"alive": [a.decode("utf-8", errors="replace") for a in running] == argv}
+    # No /proc (a Mac): ps names the command line only joined by spaces.
+    shown = _host_run(["ps", "-p", str(pid), "-o", "command="], 10)
+    return {"alive": shown.returncode == 0 and shown.stdout.strip() == " ".join(argv)}
+
+
 def _host_fingerprint(file):
     """Which file one of this machine's transcripts is, and how far it was written."""
     with _host_transcript(file) as stream:
@@ -1941,6 +1972,8 @@ OPS: dict[str, Callable[..., Any]] = {
     "turn": _host_turn,
     "first_turn": _host_first_turn,
     "fingerprint": _host_fingerprint,
+    "turn_state": _host_turn_state,
+    "alive": _host_alive,
     "cron_checkout": _host_cron_checkout,
     "version": _host_version,
     "wt_prepare": _host_wt_prepare,
@@ -2293,6 +2326,24 @@ def validate_fingerprint(value):
     return value
 
 
+def validate_turn_state(value):
+    """Check a worker's answer for a transcript's current turn and fingerprint together."""
+    _expect(isinstance(value, dict), "fields")
+    turn = {k: value[k] for k in ("turn", "complete") if k in value}
+    fingerprint = {k: value[k] for k in ("inode", "size", "mtime_ns") if k in value}
+    _expect(len(value) == len(turn) + len(fingerprint), "fields")
+    validate_turn(turn)
+    validate_fingerprint(fingerprint)
+    return value
+
+
+def validate_alive(value):
+    """Check a worker's answer for whether a process still runs."""
+    _expect(isinstance(value, dict) and set(value) == {"alive"}, "fields")
+    _expect(isinstance(value["alive"], bool), "alive")
+    return value
+
+
 def validate_cron_checkout(value):
     """Check a worker's cron checkout: absolute paths for the launch line, nothing else."""
     fields = {
@@ -2438,6 +2489,8 @@ VALIDATORS = {
     "turn": validate_turn,
     "first_turn": validate_first_turn,
     "fingerprint": validate_fingerprint,
+    "turn_state": validate_turn_state,
+    "alive": validate_alive,
     "cron_checkout": validate_cron_checkout,
     "version": validate_version,
     "wt_prepare": validate_wt_prepare,
@@ -2445,6 +2498,18 @@ VALIDATORS = {
     "worktree": validate_worktree,
     "session_info": validate_session_info,
 }
+
+
+class Unreachable(ValueError):
+    """The worker did not answer: ssh failed, or the probe ran out of time there."""
+
+
+class Failed(ValueError):
+    """The op failed on the worker; ``kind`` names the error it raised there."""
+
+    def __init__(self, message, kind):
+        super().__init__(message)
+        self.kind = kind
 
 
 def call(home, machine, op, timeout, **args):
@@ -2478,7 +2543,9 @@ def call(home, machine, op, timeout, **args):
     stderr = result.stderr[-MAX_STDERR:].decode(errors="replace").strip()
     if result.returncode:
         reason = "unreachable" if result.returncode == 255 else f"exit {result.returncode}"
-        raise ValueError(f"{machine.label} probe failed ({reason}): {stderr or 'no output'}")
+        # ssh's own failure, or a worker too slow to answer in time, may pass.
+        error = Unreachable if result.returncode in {255, EXPIRED} else ValueError
+        raise error(f"{machine.label} probe failed ({reason}): {stderr or 'no output'}")
     if len(result.stdout) > MAX_STDOUT:
         raise ValueError(f"{machine.label} probe answer exceeded {MAX_STDOUT} bytes")
     try:
@@ -2488,7 +2555,10 @@ def call(home, machine, op, timeout, **args):
     if not isinstance(answer, dict) or answer.get("protocol") != PROTOCOL:
         raise ValueError(f"{machine.label} probe speaks another protocol")
     if "error" in answer:
-        raise ValueError(f"{machine.label} probe failed: {str(answer['error'])[:400]}")
+        said = str(answer["error"])[:400]
+        if said == "Probe deadline expired":
+            raise Unreachable(f"{machine.label} probe failed: {said}")
+        raise Failed(f"{machine.label} probe failed: {said}", said.partition(":")[0])
     return VALIDATORS[op](answer.get("result"))
 
 

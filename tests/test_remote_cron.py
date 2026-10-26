@@ -235,6 +235,21 @@ def test_the_first_turn_and_fingerprint_of_a_workers_transcript(host, tmp_path):
             remote_probe.validate_first_turn(bad)
     with pytest.raises(ValueError, match="Malformed"):
         remote_probe.validate_fingerprint({**found, "size": -1})
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "system", "subtype": "turn_duration"}) + "\n")
+    state = remote_probe.validate_turn_state(
+        remote_probe._host_turn_state(str(path), sid, "claude")
+    )
+    stat = path.stat()
+    assert state == {
+        "turn": "u2",
+        "complete": "",
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    with pytest.raises(ValueError, match="Malformed"):
+        remote_probe.validate_turn_state({**state, "inode": "1"})
 
 
 # A job on the worker, run by the dashboard's cron runner ----------------------------
@@ -414,6 +429,24 @@ def test_a_workers_run_keeps_the_agents_answer_and_exits_it_once_it_confirms(rem
     # The next run is no longer skipped behind an agent left open.
     jobs.run_now(saved["id"])
     assert settled(jobs)["status"] == "running"
+
+
+def test_a_workers_pane_is_closed_only_while_it_holds_the_agents_shell(remote):
+    jobs, manager, _, state, host = remote
+    saved = jobs.save(job_request(manager))
+    jobs.run_now(saved["id"])
+    launched = settled(jobs)["agent_run"]
+    data = store(state)
+    data["machines"]["Mac mini"]["process_info"] = {
+        launched["pane"]: {"shell_pid": 999, "foreground_processes": [{"pid": 999}]}
+    }
+    Path(state).write_text(json.dumps(data))
+    worker = cron_agents.machines.resolve(manager.home, "mini")
+    # A pane id reused since: another shell, so it is left alone.
+    assert cron_agents.close_pane(launched["pane"], worker, shell=100) is False
+    calls = store(state)["machines"]["Mac mini"]["calls"]
+    assert ["pane", "close", launched["pane"]] not in calls
+    assert cron_agents.close_pane(launched["pane"], worker, shell=999) is True
 
 
 def test_a_workers_agent_that_leaves_without_confirming_needs_attention(remote):

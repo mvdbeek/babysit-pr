@@ -649,21 +649,27 @@ most one every 20 s per launch, with at most 4 connections open and 30 s to send
 request.
 The wrapper also shows the deployed babysit-pr read-only inside on a worker, so the
 skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on
-a worker goes the same way (`action` names it in a broker request, register when
-absent; at most one of each action every 20 s per launch): it sends the watch ID, pane
-and timeout with the asking conversation (`CLAUDE_CODE_SESSION_ID`, else
-`CODEX_THREAD_ID`) and its worktree, which the broker checks like a registration's,
-adding its configuration directory. The controller's `/api/worker/handoff` schedules
-the handoff only for a watch registered on the token's machine with that agent,
-session and worktree, whose transcript lies in that configuration directory, and
-answers every mismatch the same way. It then runs the detached handoff itself, as for
-a local watch: the agent is followed through `herdr --machine`, its transcript's turn
-and fingerprint are read through probe ops, worker paths are compared as strings and
-worker pids only against the worker herdr's own reports. Codex gets its one Ctrl-D;
-Claude gets a typed `/exit` and Enter, since its second Ctrl-D would have to come
-sooner than the checks before it can read the worker. The exit is confirmed once only
-the pane's shell is in its foreground and herdr no longer sees an agent there. A local
-`handoff` refuses a worker's watch, and a worker's refuses a local one.
+a worker goes the same way (`action: handoff` in a broker request; registrations carry
+no `action`, as brokers started before handoff expect; at most one of each action every
+20 s per launch): it sends the watch ID, pane and timeout with both conversations it
+may run in (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`) and its worktree. The broker
+keeps only its launch's agent's session, checks it and the worktree like a
+registration's, and adds the transcript it found. The controller's
+`/api/worker/handoff` schedules the handoff only for a watch registered on the token's
+machine with that worktree and its agent's session, whose transcript is exactly the
+broker's, from the watch's bound pane (terminal and shell), and answers every mismatch
+of watch the same way. At most 4 handoffs per worker run at once. It then runs the
+detached handoff itself, as for a local watch: the agent is followed through `herdr
+--machine` every 4 s (its screen gets 30 s to settle), its transcript's turn and
+fingerprint are read together through one probe op (`turn_state`), and worker paths are
+compared as strings. Codex gets its one Ctrl-D; Claude gets a typed `/exit`, since its
+second Ctrl-D would have to come sooner than the checks before it can read the worker,
+and Enter only once its composer holds exactly `/exit`. The exit is confirmed once only
+the pane's shell is in its foreground, herdr no longer sees an agent there, and the
+worker no longer runs the agent's command line at its pid (probe op `alive`), so a
+stopped or backgrounded agent has not exited. Failures to start on the controller reach
+the worker without this machine's paths. A local `handoff` refuses a worker's watch,
+and a worker's refuses a local one.
 
 The dashboard's `/api/worker/register` and `/api/worker/handoff` take only that: the Host must be one the
 dashboard accepts (`--allow-host`, for the tailnet name), and a request carrying
@@ -672,11 +678,12 @@ body is exactly the registration fields (PR, repo, CI repo or branch, absolute `
 session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
 poll interval, budget and timeout), checked by type, form and length, with no control
 characters (the instructions may span lines); a handoff's body is exactly the watch
-ID, pane, timeout (at most an hour), agent, session, absolute `cwd` and configuration
-directory or none. One request per machine runs at a time per worktree, at most 6 a
-minute per machine and worktree (a failed one costs 2
+ID, pane, timeout (at most an hour), a session or none per agent, absolute `cwd` and
+transcript or none. One request per machine runs at a time per worktree, at most 6 a
+minute per machine and worktree and 30 a minute per machine (a failed one costs 2
 more, so repeated failures back off; answered 429), so one sandbox cannot hold up the
-others, and a worker watch is polled no more often than every 30 s. With a machine's
+others; at most 256 worktree buckets are kept, a new one refused while that many are
+still refilling; and a worker watch is polled no more often than every 30 s. With a machine's
 optional `tailnet_ip` in `machines.json` (one address, or a list of up to four, such as
 its IPv4 and IPv6 ones), a registration is refused unless `X-Forwarded-For` is exactly
 one of them: `tailscale serve` sets it to the address the
@@ -789,7 +796,12 @@ agent's kind, whose first prompt carries the brief's marker; the worker's clock 
 never compared with this one's. Once it confirms and stays idle the agent is exited
 there (Codex with Ctrl-D, Claude with a typed `/exit` and Enter), and an exited `wt`
 agent's pane or workspace is closed as here. A watch stops after a week, once the
-worker leaves the registry, or after 30 looks in a row the worker did not answer.
+worker leaves the registry, or after 30 looks in a row the worker did not answer (ssh
+or the probe's deadline failed, or its herdr failed: from here those cannot be told
+apart). Anything else the worker answers leaves the agent open at once, but a
+transcript it will not read is skipped while looking for the session, and a turn it
+cannot identify yet is waited for. A worker cron run's pane is closed only while it
+still holds the agent's shell.
 Their records name the workspace qualified (`<id>/w1`), so no dashboard takes it for
 one of its own.
 

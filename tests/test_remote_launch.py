@@ -233,6 +233,61 @@ def test_two_sessions_that_took_one_brief_leave_the_agent_open(remote):
     assert store(state)["machines"]["Mac mini"]["agents"]  # Still open there.
 
 
+def test_a_session_the_worker_will_not_read_is_skipped_not_counted(remote, monkeypatch):
+    manager, pr, state, worker = remote
+    request = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
+    manager.action({**request, "exit_when_done": True})
+    op = finish(manager, pr["id"])
+    [watch] = watches(manager.home)
+    idle_agent(state, op["path"], f"Looks good.\n{watch['marker']}\n{EMPTY}")
+    # A transcript with a second name is refused by the probe; the launch's is still found.
+    planted = finished(worker, op["path"], watch["marker"])
+    os.link(planted, worker / "second-name.jsonl")
+    finished(worker, op["path"], watch["marker"])
+    manager.exit_launched()
+    looked(manager)
+    [watch] = watches(manager.home)
+    assert watch["exit"]["state"] == "watching", watch["exit"]
+    assert watch["exit"]["message"] == "Finished; exiting once the agent stays idle"
+    assert "failures" not in watch["exit"]
+
+
+def test_a_turn_the_worker_cannot_identify_yet_is_waited_for(remote):
+    manager, pr, state, worker = remote
+    request = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
+    manager.action({**request, "exit_when_done": True})
+    op = finish(manager, pr["id"])
+    [watch] = watches(manager.home)
+    idle_agent(state, op["path"])
+    prompt = {"type": "event_msg", "payload": {"type": "user_message", "message": watch["marker"]}}
+    rollout(worker, op["path"], str(uuid.uuid4()), prompt)
+    manager.exit_launched()
+    looked(manager)
+    [watch] = watches(manager.home)
+    assert watch["exit"]["state"] == "watching", watch["exit"]
+    assert "Cannot identify the current turn" in watch["exit"]["message"]
+    assert "failures" not in watch["exit"]
+
+
+def test_a_worker_refusing_a_transcript_leaves_the_agent_open_at_once(remote, monkeypatch):
+    manager, pr, state, worker = remote
+    request = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
+    manager.action({**request, "exit_when_done": True})
+    op = finish(manager, pr["id"])
+    [watch] = watches(manager.home)
+    idle_agent(state, op["path"], f"Looks good.\n{watch['marker']}\n{EMPTY}")
+    path = finished(worker, op["path"], watch["marker"])
+    manager.exit_launched()
+    looked(manager)
+    # Its transcript gains a second name: the probe refuses it every time from now on.
+    os.link(path, worker / "second-name.jsonl")
+    manager.exit_launched()
+    looked(manager)
+    [watch] = watches(manager.home)
+    assert watch["exit"]["state"] == "left_open", watch["exit"]
+    assert "Not a session transcript" in watch["exit"]["message"]
+
+
 def test_a_new_task_on_a_worker_branches_in_its_clone(remote):
     manager, _, state, worker = remote
     value = manager.new_task(new_request(manager, name="try", machine="mini"))

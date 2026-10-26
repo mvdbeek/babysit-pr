@@ -96,10 +96,9 @@ def asked(watched, **changes):
         "id": watched["job"]["id"],
         "pane": PANE,
         "timeout": 60,
-        "agent": "codex",
-        "session": watched["sid"],
+        "sessions": {"codex": watched["sid"], "claude": None},
         "cwd": str(watched["tree"]),
-        "config_dir": None,
+        "rollout": None,
         **changes,
     }
 
@@ -163,11 +162,12 @@ def test_a_worker_hands_its_watch_to_the_controller_which_exits_its_agent_there(
 @pytest.mark.parametrize(
     "changes",
     [
-        {"session": "00000000-0000-4000-8000-000000000000"},
+        {"sessions": {"codex": "00000000-0000-4000-8000-000000000000", "claude": None}},
         {"cwd": "/elsewhere"},
-        {"agent": "claude"},
+        {"sessions": {"codex": None, "claude": "00000000-0000-4000-8000-000000000000"}},
         {"id": "0" * 16},
-        {"config_dir": "/home/babysit/.claude"},
+        # The transcript the broker found must be the watch's own, not one beside it.
+        {"rollout": "/home/babysit/.codex/sessions/2026/10/25/rollout-x.jsonl"},
     ],
 )
 def test_a_worker_hands_off_only_its_own_conversations_watch(watched, served, changes):  # noqa: F811
@@ -185,6 +185,8 @@ def test_a_worker_hands_off_only_its_own_conversations_watch(watched, served, ch
         ({"timeout": 10**6}, "Invalid timeout"),
         ({"cwd": "relative"}, "absolute"),
         ({"machine": "box"}, "handoff fields"),
+        ({"sessions": {"codex": None, "claude": None}}, "Invalid sessions"),
+        ({"sessions": {"codex": "x"}}, "Invalid sessions"),
     ],
 )
 def test_a_workers_handoff_request_is_checked_strictly(watched, served, changes, message):  # noqa: F811
@@ -214,21 +216,235 @@ def test_a_workers_watch_is_never_handed_off_here_nor_a_local_one_from_a_worker(
         db.close()
 
 
-def test_a_claude_on_a_worker_is_asked_to_exit_with_a_typed_line(watched, fake_tools):
-    worker_herdr(fake_tools, watched["tree"], "claude")
-    target = {
+def claude_target(watched, **changes):
+    return {
         "job_id": watched["job"]["id"],
         "agent": "claude",
         "pane_id": PANE,
         "terminal_id": "terminal",
         "shell_pid": 100,
         "agent_pid": 4242,
+        "agent_argv": ["claude"],
         "machine": "box",
+        **changes,
+    }
+
+
+def test_a_claude_on_a_worker_is_asked_to_exit_with_a_typed_line(watched, fake_tools):
+    worker_herdr(fake_tools, watched["tree"], "claude")
+    typed = "─" * 20 + "\n❯ /exit\n" + "─" * 20 + "\n  /exit  Exit the REPL"
+    screens(fake_tools, CLAUDE_EMPTY, typed)
+    machine = supervisor.machines.resolve(watched["home"], "box")
+    herdr_handoff.send_exit(
+        claude_target(watched),
+        None,
+        None,
+        lambda: None,
+        lambda *a, **k: None,
+        machine,
+        watched["home"],
+    )
+    sent = [c for c in worker_store(fake_tools)["calls"] if c[0] in {"pane", "agent"}]
+    sent = [c for c in sent if c[1] in {"send-text", "send-keys"}]
+    assert sent == [["pane", "send-text", PANE, "/exit"], ["agent", "send-keys", PANE, "enter"]]
+
+
+@pytest.mark.parametrize(
+    "shown",
+    [
+        "Allow this command?\n❯ 1. Yes\n  2. No",  # A dialog opened meanwhile.
+        "─" * 20 + "\n❯ draft/exit\n" + "─" * 20,
+    ],
+)
+def test_enter_follows_a_typed_exit_only_once_the_composer_holds_exactly_it(
+    watched, fake_tools, monkeypatch, shown
+):
+    monkeypatch.setattr(herdr_handoff, "TYPED_EXIT_WAIT", 0.5)
+    worker_herdr(fake_tools, watched["tree"], "claude")
+    screens(fake_tools, CLAUDE_EMPTY, shown)
+    machine = supervisor.machines.resolve(watched["home"], "box")
+    with pytest.raises(RuntimeError, match="Enter not sent"):
+        herdr_handoff.send_exit(
+            claude_target(watched),
+            None,
+            None,
+            lambda: None,
+            lambda *a, **k: None,
+            machine,
+            watched["home"],
+        )
+    keys = [c for c in worker_store(fake_tools)["calls"] if c[:2] == ["agent", "send-keys"]]
+    assert keys == []
+
+
+def test_an_agent_still_running_off_the_foreground_has_not_exited(watched, fake_tools, monkeypatch):
+    monkeypatch.setattr(herdr_handoff, "EXIT_WAIT", 1)
+    # Stopped or moved out of the terminal's foreground: the worker still runs it.
+    alive = subprocess.Popen(["sleep", "60"])
+    try:
+        worker_herdr(fake_tools, watched["tree"])
+        target = {
+            **claude_target(watched),
+            "agent": "codex",
+            "agent_pid": alive.pid,
+            "agent_argv": ["sleep", "60"],
+        }
+        machine = supervisor.machines.resolve(watched["home"], "box")
+        with pytest.raises(RuntimeError, match="Exit unconfirmed"):
+            herdr_handoff.send_exit(
+                target, None, None, lambda: None, lambda *a, **k: None, machine, watched["home"]
+            )
+        # Gone, or another program at that pid: exited.
+        target["agent_argv"] = ["codex"]
+        herdr_handoff.send_exit(
+            target, None, None, lambda: None, lambda *a, **k: None, machine, watched["home"]
+        )
+    finally:
+        alive.kill()
+        alive.wait()
+
+
+def test_the_alive_probe_compares_the_process_command_line(watched):
+    import remote_probe
+
+    alive = subprocess.Popen(["sleep", "60"])
+    try:
+        found = remote_probe.validate_alive(remote_probe._host_alive(alive.pid, ["sleep", "60"]))
+        assert found == {"alive": True}
+        assert remote_probe._host_alive(alive.pid, ["sleep", "61"]) == {"alive": False}
+    finally:
+        alive.kill()
+        alive.wait()
+    assert remote_probe._host_alive(alive.pid, ["sleep", "60"]) == {"alive": False}
+    for bad in ((1, ["x"]), (os.getpid(), []), (os.getpid(), ["a\x00b"]), ("2", ["x"])):
+        with pytest.raises(ValueError):
+            remote_probe._host_alive(*bad)
+    with pytest.raises(ValueError, match="Malformed"):
+        remote_probe.validate_alive({"alive": 1})
+
+
+def test_a_worker_hands_off_only_the_pane_its_watch_is_bound_to(watched, served, fake_tools):  # noqa: F811
+    store = json.loads(fake_tools.read_text())
+    worker = store["machines"]["Box"]
+    tree = str(watched["tree"])
+    worker["agents"].append(
+        {"pane_id": "w1:p2", "agent": "codex", "cwd": tree, "agent_status": "idle"}
+    )
+    worker["process_info"]["w1:p2"] = {
+        "shell_pid": 300,
+        "foreground_processes": [
+            {"pid": 300},
+            {"pid": 4343, "argv0": "codex", "argv": ["codex"], "cwd": tree},
+        ],
+    }
+    fake_tools.write_text(json.dumps(store))
+    auth = {"Authorization": f"Bearer {worker_api.issue(watched['home'], 'box')}"}
+    status, answer = post(served, "/api/worker/handoff", asked(watched, pane="w1:p2"), auth)
+    assert status == 400 and "bound pane" in answer["error"], answer
+    assert not watched["spawned"]
+
+
+def test_a_machine_runs_only_so_many_handoffs_at_once(watched, served, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(herdr_handoff, "MAX_REMOTE_HANDOFFS", 1)
+    db = supervisor.open_db(watched["home"])
+    with db:
+        supervisor.save_job(db, {"id": "f" * 16, "machine": "box", "status": "handoff"})
+    db.close()
+    auth = {"Authorization": f"Bearer {worker_api.issue(watched['home'], 'box')}"}
+    status, answer = post(served, "/api/worker/handoff", asked(watched), auth)
+    assert status == 400 and "Too many handoffs running on Box" in answer["error"], answer
+    assert job(watched)["status"] == "awaiting_release" and not watched["spawned"]
+
+
+def test_a_failure_to_start_on_the_controller_tells_the_worker_no_paths(
+    watched,
+    served,  # noqa: F811
+    monkeypatch,
+):
+    def broken(*args):
+        raise RuntimeError(f"Supervisor failed to start; see {watched['home']}/supervisor.log")
+
+    monkeypatch.setattr(supervisor, "start_daemon", broken)
+    auth = {"Authorization": f"Bearer {worker_api.issue(watched['home'], 'box')}"}
+    status, answer = post(served, "/api/worker/handoff", asked(watched), auth)
+    assert status == 400 and str(watched["home"]) not in answer["error"], answer
+    assert "controller" in answer["error"]
+
+
+def test_one_machines_requests_share_a_bucket_whatever_worktree_they_name(
+    watched,
+    served,  # noqa: F811
+    monkeypatch,
+):
+    monkeypatch.setattr(worker_api, "MACHINE_RATE", 4)
+    auth = {"Authorization": f"Bearer {worker_api.issue(watched['home'], 'box')}"}
+    codes = [
+        post(served, "/api/worker/handoff", asked(watched, cwd=f"/nowhere/{n}"), auth)[0]
+        for n in range(4)
+    ]
+    assert codes[0] == 400 and codes[-1] == 429
+
+
+def test_rate_buckets_are_never_more_than_the_cap(monkeypatch):
+    monkeypatch.setattr(worker_api, "_buckets", {})
+    now = worker_api.time.monotonic()
+    worker_api._buckets.update({f"k{n}": (0.0, now) for n in range(worker_api.MAX_KEYS)})
+    assert worker_api._take("fresh") is False
+    assert len(worker_api._buckets) == worker_api.MAX_KEYS
+
+
+def test_a_handoff_names_both_conversations_and_the_controller_picks_the_watchs(
+    watched, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "11111111-1111-4111-8111-111111111111")
+    monkeypatch.setenv("CODEX_THREAD_ID", watched["sid"])
+    args = supervisor.argparse.Namespace(id=watched["job"]["id"], pane=PANE, timeout=60)
+    request = worker_api.handoff_request(args)
+    assert request["sessions"] == {
+        "claude": "11111111-1111-4111-8111-111111111111",
+        "codex": watched["sid"],
     }
     machine = supervisor.machines.resolve(watched["home"], "box")
-    herdr_handoff.send_exit(target, None, None, lambda: None, lambda *a, **k: None, machine)
-    sent = [c for c in worker_store(fake_tools)["calls"] if c[0] in {"pane", "agent"}]
-    assert sent[:2] == [["pane", "send-text", PANE, "/exit"], ["agent", "send-keys", PANE, "enter"]]
+    db = supervisor.open_db(watched["home"])
+    try:
+        request["cwd"] = str(watched["tree"])
+        found = herdr_handoff.schedule(
+            db, watched["home"], worker_api.handoff_args(machine, request)
+        )
+    finally:
+        db.close()
+    assert found["status"] == "handoff"
+
+
+def test_register_through_a_running_broker_is_sent_as_it_always_was(monkeypatch, short_tmp):  # noqa: F811
+    import socket
+    import threading
+
+    listen = short_tmp / "b.sock"
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(listen))
+    server.listen()
+    seen = []
+
+    def serve():
+        for _ in range(2):
+            client, _ = server.accept()
+            with client:
+                data = b""
+                while chunk := client.recv(65536):
+                    data += chunk
+                seen.append(json.loads(data))
+                client.sendall(b"{}")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    monkeypatch.setenv(worker_api.SOCKET_ENV, str(listen))
+    worker_api.forward("register", {"pr": "x"})
+    worker_api.forward("handoff", {"id": "y"})
+    thread.join(10)
+    server.close()
+    # A broker started before handoff existed expects exactly the registration fields.
+    assert seen == [{"pr": "x"}, {"id": "y", "action": "handoff"}]
 
 
 def test_handoff_inside_a_sandbox_goes_through_its_broker(watched, broker, tmp_path):  # noqa: F811
@@ -264,7 +480,12 @@ def test_handoff_inside_a_sandbox_goes_through_its_broker(watched, broker, tmp_p
     elsewhere = watched["worker"] / "src" / "repo"
     refused = handoff(elsewhere, CODEX_THREAD_ID=watched["sid"])
     assert "worktree this sandbox was given" in json.loads(refused.stdout)["error"]
-    done = handoff(watched["tree"], CODEX_THREAD_ID=watched["sid"].upper())
+    # Another conversation of the other kind beside it is not the launch's to name.
+    done = handoff(
+        watched["tree"],
+        CODEX_THREAD_ID=watched["sid"].upper(),
+        CLAUDE_CODE_SESSION_ID="11111111-1111-4111-8111-111111111111",
+    )
     assert done.returncode == 0, done.stdout + done.stderr
     assert json.loads(done.stdout)["status"] == "handoff"
     handed = target(watched)
@@ -281,10 +502,9 @@ def test_the_broker_refuses_a_handoff_of_another_launchs_session(box, broker, fa
         "id": "0" * 16,
         "pane": PANE,
         "timeout": 60,
-        "agent": "codex",
-        "session": box["sid"],
+        "sessions": {"codex": box["sid"], "claude": None},
         "cwd": str(box["tree"]),
-        "config_dir": None,
+        "rollout": None,
     }
     with socket.socket(socket.AF_UNIX) as client:
         client.connect(str(listen))

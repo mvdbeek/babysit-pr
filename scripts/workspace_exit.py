@@ -47,8 +47,8 @@ SHORT_PANE_ROWS = 15
 REMOTE_FAILURES = 30
 # Newest sessions of a worker's checkout searched for a launch's own.
 REMOTE_SESSIONS = 5
-# What reaching a worker's herdr or probe raises.
-UNREACHABLE = (OSError, RuntimeError, ValueError, subprocess.SubprocessError)
+# What a worker that did not answer raises; anything else it says leaves the agent open.
+UNREACHABLE = (OSError, subprocess.SubprocessError, remote_probe.Unreachable, handoff.Unreachable)
 
 
 class Wait(Exception):
@@ -223,30 +223,40 @@ def known_session(target, session_id):
     return {"rollout": str(found[0].resolve()), "session_id": session_id}
 
 
+def worker_first_turn(target, file, machine, home):
+    """``remote_probe.first_turn`` of a worker's transcript ``file``, read there."""
+    return remote_probe.call(
+        home,
+        machine,
+        "first_turn",
+        pr_supervisor.PROBE_TIMEOUT,
+        file=file,
+        agent=target["agent"],
+        marker=target["marker"],
+    )
+
+
 def worker_session(target, machine, home):
     """The one session of a worker's checkout whose first prompt carries this marker.
 
     The worker's clock is not compared with this one's, and a reused checkout keeps its
-    older sessions: the brief's marker tells the launch's own apart.
+    older sessions: the brief's marker tells the launch's own apart. A transcript the
+    worker will not read is no candidate.
     """
     listed = remote_probe.call(
         home, machine, "sessions", pr_supervisor.PROBE_TIMEOUT, root=target["cwd"]
     )
-    found = [
-        session
-        for session in [
-            s for s in listed if s["agent"] == target["agent"] and s["cwd"] == target["cwd"]
-        ][:REMOTE_SESSIONS]
-        if remote_probe.call(
-            home,
-            machine,
-            "first_turn",
-            pr_supervisor.PROBE_TIMEOUT,
-            file=session["file"],
-            agent=target["agent"],
-            marker=target["marker"],
-        )["marked"]
-    ]
+    recent = [s for s in listed if s["agent"] == target["agent"] and s["cwd"] == target["cwd"]]
+    found = []
+    for session in recent[:REMOTE_SESSIONS]:
+        try:
+            first = worker_first_turn(target, session["file"], machine, home)
+        except remote_probe.Unreachable:
+            raise
+        except ValueError:
+            continue
+        if first["marked"]:
+            found.append(session)
     if len(found) > 1:
         raise Leave("Several sessions ran in this worktree; left open")
     if not found:
@@ -397,15 +407,7 @@ def advance(record, op, persist, now, machine=None, home=None):
     elif turn != (
         first_turn(target["rollout"], target["agent"])
         if machine is None
-        else remote_probe.call(
-            home,
-            machine,
-            "first_turn",
-            pr_supervisor.PROBE_TIMEOUT,
-            file=target["rollout"],
-            agent=target["agent"],
-            marker=target["marker"],
-        )["turn"]
+        else worker_first_turn(target, target["rollout"], machine, home)["turn"]
     ):
         raise Leave("The session moved on to another turn; left open")
     if complete is None:
@@ -444,7 +446,9 @@ def advance(record, op, persist, now, machine=None, home=None):
     persist(record)
     # Recheck just before the key: anything that moved since the pass began cancels it.
     # A worker that does not answer now is no reason to give up the claimed exit either.
-    failed = (OSError, RuntimeError) if machine is None else UNREACHABLE
+    failed: tuple[type[Exception], ...] = (OSError, RuntimeError)
+    if machine is not None:
+        failed += (ValueError, subprocess.SubprocessError)
     try:
         info, procs, state = handoff.inspect(target["pane_id"], machine)
         handoff.verify_identity(target, info, procs)
@@ -466,7 +470,13 @@ def advance(record, op, persist, now, machine=None, home=None):
         return
     try:
         handoff.send_exit(
-            target, (turn, complete), tuple(ready[1]), lambda: None, lambda *a, **k: None, machine
+            target,
+            (turn, complete),
+            tuple(ready[1]),
+            lambda: None,
+            lambda *a, **k: None,
+            machine,
+            home,
         )
     except Exception as exc:
         record.update(state="unconfirmed", message=f"Exit unconfirmed ({exc}); check its pane")

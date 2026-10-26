@@ -25,10 +25,23 @@ SCRIPT = Path(__file__).resolve()
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
 SCREEN_SETTLE_TIMEOUT = 5.0
 SCREEN_SETTLE_INTERVAL = 0.25
+# A worker's checks each cross the network: its screen gets longer to settle, and its
+# agent is looked at less often while it works.
+REMOTE_SETTLE_TIMEOUT = 30.0
+REMOTE_POLL = 4
+# Handoffs one worker may have running here at once; each polls it until done.
+MAX_REMOTE_HANDOFFS = 4
+# How long an exit may take to show, and a typed /exit to reach the composer.
+EXIT_WAIT = 20
+TYPED_EXIT_WAIT = 5
 
 
 class ScreenNotReady(RuntimeError):
     """The final receipt or empty input has not finished rendering."""
+
+
+class Unreachable(RuntimeError):
+    """A worker's herdr failed; whether the worker or the command, it cannot tell."""
 
 
 # Which TUI a watch was registered from: the conversation ID its CLI exports to
@@ -45,7 +58,8 @@ def herdr(*args, machine: machines.Machine | None = None):
     # herdr reaches a worker's server itself, so the command always runs here.
     proc = machines.run(None, None, machines.herdr_argv(machine, *args), text=True, timeout=15)
     if proc.returncode:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "herdr failed")
+        error = RuntimeError if machine is None else Unreachable
+        raise error(proc.stderr.strip() or proc.stdout.strip() or "herdr failed")
     return proc.stdout
 
 
@@ -66,15 +80,21 @@ def inspect(pane, machine=None):
 def latest_turn(rollout, session_id, agent="codex", machine=None, home=None):
     """The transcript's current turn and its final response; a worker's is read there."""
     if machine is not None:
-        found = remote_probe.call(
-            home,
-            machine,
-            "turn",
-            supervisor.PROBE_TIMEOUT,
-            file=rollout,
-            session=session_id,
-            agent=agent,
-        )
+        try:
+            found = remote_probe.call(
+                home,
+                machine,
+                "turn",
+                supervisor.PROBE_TIMEOUT,
+                file=rollout,
+                session=session_id,
+                agent=agent,
+            )
+        except remote_probe.Failed as exc:
+            if exc.kind != "RuntimeError":
+                raise
+            # No turn to identify yet, as a local read would say it.
+            raise RuntimeError(str(exc)) from exc
         return found["turn"], found["complete"]
     if agent == "claude":
         return latest_claude_turn(rollout, session_id)
@@ -171,6 +191,20 @@ def empty_claude_composer(screen):
     return False
 
 
+def claude_composer(screen):
+    """The text in Claude's composer, between its rules; None for any other layout."""
+    lines = [SGR.sub("", line) for line in screen.splitlines()]
+    prompts = [index for index, line in enumerate(lines) if line.lstrip().startswith("❯")]
+    if not prompts or prompts[-1] == 0 or not RULE.fullmatch(lines[prompts[-1] - 1]):
+        return None
+    text = [lines[prompts[-1]].lstrip()[1:].strip()]
+    for line in lines[prompts[-1] + 1 :]:
+        if RULE.match(line):
+            return " ".join(part for part in text if part)
+        text.append(line.strip())
+    return None
+
+
 def verify_identity(target, info, procs):
     agent = target.get("agent", "codex")
     label = AGENTS[agent]["label"]
@@ -240,8 +274,10 @@ def schedule(db, home, args):
     """Hand the watch ``args.id`` over once its agent answers, then exit that agent.
 
     ``args.machine``, set for a worker's request (``worker_api.handoff_args``), is the
-    machine its token names; ``args.agent``, ``args.session`` and ``args.cwd`` are the
-    conversation and worktree that asked there, which must be the watch's own.
+    machine its token names; ``args.sessions`` (by agent) and ``args.cwd`` are the
+    conversations and worktree that asked there, of which the watch's must be one, and
+    ``args.rollout`` the transcript a sandbox's broker found for it. On a worker, only the
+    watch's bound pane is handed off, and at most MAX_REMOTE_HANDOFFS at once.
     """
     import pane_runner
 
@@ -251,14 +287,13 @@ def schedule(db, home, args):
             job = supervisor.get_job(db, args.id)
         except ValueError:
             job = None
-        # The watch's own agent, session and worktree, and on the token's machine. The
-        # broker found that session in the asking sandbox's configuration directory.
-        config = getattr(args, "config_dir", None)
+        # The watch's own session and worktree, and on the token's machine; from a
+        # sandbox, exactly the transcript its broker found in its configuration directory.
         if (
             job is None
-            or (job.get("machine"), job.get("agent", "codex"), job["session_id"], job["cwd"])
-            != (machine.id, args.agent, args.session, args.cwd)
-            or (config is not None and not job["rollout"].startswith(config.rstrip("/") + "/"))
+            or (job.get("machine"), job["session_id"], job["cwd"])
+            != (machine.id, args.sessions.get(job.get("agent", "codex")), args.cwd)
+            or args.rollout not in {None, job["rollout"]}
         ):
             raise ValueError(
                 f"No watch {args.id} of this conversation and worktree on {machine.label}"
@@ -295,6 +330,13 @@ def schedule(db, home, args):
         raise ValueError(
             "Pane has a pending dialog/question; use manual handoff after resolving it"
         )
+    bound = job.get("pane")
+    if (
+        machine is not None
+        and bound
+        and (info["terminal_id"], procs["shell_pid"]) != (bound["terminal_id"], bound["shell_pid"])
+    ):
+        raise ValueError("Hand off from the watch's bound pane")
     token = uuid.uuid4().hex
     target = {
         "job_id": job["id"],
@@ -316,12 +358,28 @@ def schedule(db, home, args):
     }
     # Bootstrap before asking the original agent to exit. No repair can launch
     # while this job is in handoff; this also proves the service can start here.
-    supervisor.start_daemon(home, args.max_workers)
+    try:
+        supervisor.start_daemon(home, args.max_workers)
+    except Exception as exc:
+        if machine is None:
+            raise
+        # This machine's paths are no worker's business; its own log says more.
+        print(f"Handoff of {job['id']} for {machine.label}: {exc}", file=sys.stderr)
+        raise RuntimeError("The controller's supervisor could not start") from None
     with db:
         db.execute("BEGIN IMMEDIATE")
         current = supervisor.get_job(db, job["id"])
         if current["epoch"] != job["epoch"] or current["status"] != job["status"]:
             raise ValueError("Watch ownership changed while scheduling")
+        if machine is not None and (
+            sum(
+                1
+                for other in supervisor.jobs(db)
+                if other.get("machine") == machine.id and other["status"] == "handoff"
+            )
+            >= MAX_REMOTE_HANDOFFS
+        ):
+            raise ValueError(f"Too many handoffs running on {machine.label}; try again later")
         current.update(
             status="handoff",
             epoch=current["epoch"] + 1,
@@ -353,26 +411,36 @@ def schedule(db, home, args):
                     summary=f"Could not start automatic handoff: {exc}",
                 )
                 supervisor.save_job(db, current)
-        raise
+        if machine is None:
+            raise
+        print(f"Handoff of {job['id']} for {machine.label}: {exc}", file=sys.stderr)
+        raise RuntimeError("Could not start the automatic handoff on the controller") from None
     scheduled = {"id": job["id"], "status": "handoff", "final_response_marker": target["marker"]}
     if machine is not None:
         return scheduled  # The audit is this machine's, out of a worker's reach.
     return {**scheduled, "audit_file": str(folder / f"{token}.audit.json")}
 
 
-def send_exit(target, expected, before, owned, save, machine=None):
+def send_exit(target, expected, before, owned, save, machine=None, home=None):
     """Press Ctrl-D in a verified idle TUI, then confirm its process exited.
 
     ``expected`` is the (turn, complete) pair and ``before`` the transcript fingerprint the
     caller verified; ``owned`` re-checks the caller's claim before every key. An
     unconfirmed exit raises without pressing again. A Claude on ``machine``, a worker, is
     asked with /exit instead: its second Ctrl-D would have to come sooner than the checks
-    before it can read that worker.
+    before it can read that worker. Enter follows only once the composer holds exactly
+    /exit, so it never answers a dialog that opened meanwhile.
     """
     agent = target.get("agent", "codex")
     pane = target["pane_id"]
     if machine is not None and agent == "claude":
         herdr("pane", "send-text", pane, sandbox.typed("/exit"), machine=machine)
+        typed_by = time.monotonic() + TYPED_EXIT_WAIT
+        while claude_composer(read_screen(pane, machine)) != "/exit":
+            if time.monotonic() >= typed_by:
+                raise RuntimeError("The composer does not hold just /exit; Enter not sent")
+            time.sleep(0.25)
+        owned()
         herdr("agent", "send-keys", pane, "enter", machine=machine)
     else:
         # Never repeat blindly: a Ctrl-D that reaches the shell could close it. Claude asks
@@ -402,7 +470,7 @@ def send_exit(target, expected, before, owned, save, machine=None):
                 herdr("agent", "send-keys", pane, "ctrl+d")
                 break
             time.sleep(0.05)
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + EXIT_WAIT
     while True:
         owned()
         info = result("pane", "get", pane, machine=machine)["pane"]
@@ -415,8 +483,9 @@ def send_exit(target, expected, before, owned, save, machine=None):
         foreground = procs["foreground_processes"]
         if foreground and all(p["pid"] == target["shell_pid"] for p in foreground):
             if machine is not None:
-                # A worker's pid means nothing here; its herdr no longer seeing an agent does.
-                if not info.get("agent"):
+                # Its herdr no longer sees an agent, and the worker no longer runs it there:
+                # a stopped agent, or one moved out of the foreground, is still running.
+                if not info.get("agent") and not alive(target, machine, home):
                     return
             else:
                 try:
@@ -426,6 +495,18 @@ def send_exit(target, expected, before, owned, save, machine=None):
         if time.monotonic() >= deadline:
             raise RuntimeError("Exit unconfirmed; no repeat key sent")
         time.sleep(0.5)
+
+
+def alive(target, machine, home):
+    """Whether the worker still runs the target's agent process."""
+    return remote_probe.call(
+        home,
+        machine,
+        "alive",
+        supervisor.PROBE_TIMEOUT,
+        pid=target["agent_pid"],
+        argv=target["agent_argv"],
+    )["alive"]
 
 
 def perform(target, home, db):
@@ -439,6 +520,21 @@ def perform(target, home, db):
 
     def rollout_now():
         return fingerprint(target["rollout"], machine, home)
+
+    def observe():
+        """The current turn; on a worker, also the fingerprint read with it in one call."""
+        if machine is None:
+            return (*turn_now(), None)
+        found = remote_probe.call(
+            home,
+            machine,
+            "turn_state",
+            supervisor.PROBE_TIMEOUT,
+            file=target["rollout"],
+            session=target["session_id"],
+            agent=agent,
+        )
+        return found["turn"], found["complete"], (found["inode"], found["size"], found["mtime_ns"])
 
     def save(stage, **details):
         supervisor.watch.save_state(audit, {**target, **diagnostics, "stage": stage, **details})
@@ -476,14 +572,14 @@ def perform(target, home, db):
             still_owned()
             info, procs, state = inspect(target["pane_id"], machine)
             verify_identity(target, info, procs)
-            turn, complete = turn_now()
+            turn, complete, seen = observe()
             if turn != target["turn_id"]:
                 raise RuntimeError("A new turn started; handoff cancelled")
             if info.get("agent_status") == "blocked":
                 raise RuntimeError("Dialog or question is pending; handoff cancelled")
             if settle_deadline is not None and (
                 info.get("agent_status") not in {"idle", "done"}
-                or (state.get("state_change_seq"), rollout_now()) != settle_identity
+                or (state.get("state_change_seq"), seen or rollout_now()) != settle_identity
                 or complete is None
             ):
                 raise RuntimeError(
@@ -494,10 +590,11 @@ def perform(target, home, db):
                     raise RuntimeError("Final response does not confirm this handoff")
                 if info.get("agent_status") in {"idle", "done"}:
                     if settle_deadline is None:
-                        settle_deadline = min(deadline, time.monotonic() + SCREEN_SETTLE_TIMEOUT)
+                        settle = SCREEN_SETTLE_TIMEOUT if machine is None else REMOTE_SETTLE_TIMEOUT
+                        settle_deadline = min(deadline, time.monotonic() + settle)
                         settle_identity = (
                             state.get("state_change_seq"),
-                            rollout_now(),
+                            seen or rollout_now(),
                         )
                     try:
                         check_screen(info)
@@ -512,7 +609,7 @@ def perform(target, home, db):
                     break
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for the final response; agent left open")
-            time.sleep(1)
+            time.sleep(1 if machine is None else REMOTE_POLL)
         before = rollout_now()
         info2, procs2, state2 = inspect(target["pane_id"], machine)
         verify_identity(target, info2, procs2)
@@ -529,7 +626,7 @@ def perform(target, home, db):
             raise RuntimeError("Session or input changed before exit; handoff cancelled")
         still_owned()
         save("exit_sent", screen_before=screen2)
-        send_exit(target, (turn, complete), before, still_owned, save, machine)
+        send_exit(target, (turn, complete), before, still_owned, save, machine, home)
         with db:
             db.execute("BEGIN IMMEDIATE")
             job = still_owned()

@@ -551,14 +551,17 @@ def without_marker(text, marker):
     return text.rstrip()[:RESULT_LIMIT]
 
 
-def close_pane(pane, machine=None):
-    """Close a finished run's pane once only its shell is left in it."""
+def close_pane(pane, machine=None, shell=None):
+    """Close a finished run's pane once only its shell is left in it; ``shell``, when
+    named, must be that shell, so a pane id reused since is left alone."""
     try:
         if machine is None:
             procs = handoff.result("pane", "process-info", "--pane", pane)["process_info"]
         else:
             procs = herdr("pane", "process-info", "--pane", pane, machine=machine)["process_info"]
-        if any(p.get("pid") != procs.get("shell_pid") for p in procs["foreground_processes"]):
+        if (shell is not None and procs.get("shell_pid") != shell) or any(
+            p.get("pid") != procs.get("shell_pid") for p in procs["foreground_processes"]
+        ):
             return False
         run(*machines.herdr_argv(machine, "pane", "close", pane))
         return True

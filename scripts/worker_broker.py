@@ -14,8 +14,9 @@ Claude, under ``sessions/`` for Codex). The controller is told to check that tra
 and that CONFIG_DIR, which it checks again on the path it opens; no Claude account is
 passed, so the account is where the transcript lies. So an agent never registers
 another task's checkout, nor a session of another account or Codex home. A handoff
-carries CONFIG_DIR too, and the controller acts only on a watch of that machine,
-worktree and session whose transcript lies there.
+names the launch's own conversation only, with the transcript found for it, and the
+controller acts only on a watch of that machine, worktree and session whose transcript
+is exactly that one.
 
 "Its own sessions" means every session in that configuration directory, which other
 launches of the same Claude account or Codex home share and can write: an agent can
@@ -78,32 +79,39 @@ def check(request, agent, config_dir, worktrees):
     checkout."""
     action = request.pop("action", "register") if isinstance(request, dict) else None
     if action == "handoff":
-        if set(request) != worker_api.HANDOFF:
+        sessions = request.get("sessions")
+        if set(request) != worker_api.HANDOFF or not isinstance(sessions, dict):
             raise ValueError("Expected exactly the handoff fields")
+        asked = sessions.get(agent)
     elif action != "register" or set(request) != worker_api.REGISTER:
         raise ValueError("Expected exactly the registration fields")
-    if request["agent"] != agent:
-        raise ValueError(f"This sandbox runs {agent}")
+    else:
+        if request["agent"] != agent:
+            raise ValueError(f"This sandbox runs {agent}")
+        asked = request["session"]
     cwd = request["cwd"]
     if not isinstance(cwd, str) or os.path.realpath(cwd) not in worktrees:
         raise ValueError("Ask from the worktree this sandbox was given")
     try:
-        session = str(uuid.UUID(request["session"]))
+        session = str(uuid.UUID(asked))
     except (TypeError, ValueError, AttributeError) as exc:
         raise ValueError("Supply the exact --session UUID") from exc
     found = transcript(agent, config_dir, session)
-    checked = {
-        **request,
-        "cwd": os.path.realpath(cwd),
-        "session": session,
-        "config_dir": os.path.realpath(config_dir),
-    }
+    checked = {**request, "cwd": os.path.realpath(cwd)}
     if action == "handoff":
-        return action, checked
+        # Only this launch's own conversation, with the transcript found for it here.
+        other = "codex" if agent == "claude" else "claude"
+        return action, {**checked, "sessions": {agent: session, other: None}, "rollout": found}
     rollout = request["rollout"]
     if rollout is not None and (not isinstance(rollout, str) or os.path.realpath(rollout) != found):
         raise ValueError(f"Session {session} is not one of this sandbox's own")
-    return action, {**checked, "rollout": found, "claude_account": None}
+    return action, {
+        **checked,
+        "session": session,
+        "rollout": found,
+        "claude_account": None,
+        "config_dir": os.path.realpath(config_dir),
+    }
 
 
 def answer(client, agent, config_dir, worktrees):
