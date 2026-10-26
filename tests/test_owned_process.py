@@ -130,6 +130,17 @@ def test_bounded_output_stops_a_command_that_never_stops_writing():
     assert time.monotonic() - started < 30
 
 
+def test_input_left_unsent_never_hides_why_the_command_was_stopped():
+    # Input still buffered for a child that stopped reading, as when the output cap stops
+    # a flood mid-feed: flushing it into the dead child's pipe must not replace the error.
+    with pytest.raises(RuntimeError, match="the cap"):
+        with owned_process.command(
+            ["yes", "babysit"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL
+        ) as proc:
+            proc.stdin.write(b"x" * 100)
+            raise RuntimeError("the cap")
+
+
 def test_bounded_output_feeds_input_and_keeps_the_end_of_stderr():
     script = (
         "import sys; data = sys.stdin.buffer.read(); sys.stdout.buffer.write(data[::-1]); "

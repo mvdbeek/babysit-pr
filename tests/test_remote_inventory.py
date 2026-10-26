@@ -806,6 +806,20 @@ def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
         assert wait_gone(pid), "the probe's Git survived its deadline"
 
 
+def test_no_git_starts_once_an_expired_probe_stopped_its_group(tmp_path, monkeypatch):
+    # A scan thread that outlives the alarm sees no deadline once the answer is on its
+    # way (DEADLINE is reset); a Git it started then would outlive the probe.
+    monkeypatch.setattr(remote_probe, "DEADLINE", None)
+    monkeypatch.setattr(remote_probe, "STOPPED", True)
+    ran = tmp_path / "ran"
+    with pytest.raises(remote_probe.Expired):
+        remote_probe._host_run(["touch", str(ran)], 5)
+    monkeypatch.setattr(remote_probe, "host_argv", lambda *a, **k: ["touch", str(ran)])
+    with pytest.raises(remote_probe.Expired):
+        remote_probe.host_output(tmp_path, "status")
+    assert not ran.exists()
+
+
 def test_a_git_timeout_at_the_deadline_is_reported_as_expiry(tmp_path, monkeypatch):
     """subprocess's own timeout can fire before the alarm does; it is the same expiry."""
     bin_dir = tmp_path / "bin"
