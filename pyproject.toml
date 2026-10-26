@@ -17,6 +17,11 @@ testpaths = ["scripts", "tests"]
 pythonpath = ["scripts"]
 addopts = "-ra --strict-markers --strict-config"
 markers = ["browser: real Chromium tests against an isolated local dashboard"]
+# A stuck test fails with every thread's stack instead of hanging CI. The thread method
+# works under xdist (the worker is replaced and its test named) and leaves SIGALRM to the
+# probe, which sets its own deadline with it.
+timeout = 120
+timeout_method = "thread"
 
 [tool.ruff]
 target-version = "py311"
@@ -59,6 +64,7 @@ dev = [
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
     "pytest-playwright==0.9.0",
+    "pytest-timeout==2.4.0",
     "pytest-xdist==3.8.0",
     "pyyaml==6.0.3",
     "ruff==0.16.7",

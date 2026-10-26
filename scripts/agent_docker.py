@@ -89,7 +89,7 @@ def kept_grants(pid, options):
 
 
 def process(procs, kind):
-    matches = [p for p in procs["foreground_processes"] if Path(p.get("argv0", "")).name == kind]
+    matches = [p for p in procs["foreground_processes"] if handoff.program(p) == kind]
     if len(matches) != 1:
         raise ValueError("Could not identify the agent process; nothing was sent")
     return matches[0]

@@ -65,6 +65,7 @@ def broker(box, served):  # noqa: F811
 
 def ask(listen, request):
     with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(60)  # A broker that never answers fails the test, not CI.
         client.connect(str(listen))
         client.sendall(json.dumps(request).encode())
         client.shutdown(socket.SHUT_WR)
@@ -196,6 +197,7 @@ def test_a_claude_launch_registers_only_transcripts_in_its_own_store(box, broker
 def test_the_broker_refuses_malformed_or_oversized_requests(box, broker, body):  # noqa: F811
     listen = broker([str(box["tree"])])
     with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(60)  # A broker that never answers fails the test, not CI.
         client.connect(str(listen))
         try:
             client.sendall(body)

@@ -9,18 +9,13 @@ import time
 
 import owned_process
 import pr_workspaces
+import processes
 import pytest
 
 
 def wait_gone(pid):
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.02)
-    pytest.fail(f"Child shell {pid} survived command cleanup")
+    if not processes.wait_gone(pid):
+        pytest.fail(f"Child shell {pid} survived command cleanup")
 
 
 @pytest.fixture
