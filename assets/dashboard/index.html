@@ -1205,6 +1205,10 @@
         <button id="ws-confirm" type="button">Clean up</button>
       </div>
     </dialog>
+    <section id="ws-tray" class="ws-tray" aria-label="Minimized viewers" hidden>
+      <p id="ws-tray-note" role="status"></p>
+      <div id="ws-tray-chips" class="ws-tray-chips"></div>
+    </section>
     <dialog id="ws-viewer" aria-labelledby="ws-viewer-title">
       <div class="ws-viewer-header">
         <div class="ws-viewer-actions">
@@ -1214,6 +1218,9 @@
             <button id="ws-viewer-next" type="button" aria-label="Next workspace">›</button>
           </span>
           <button id="ws-viewer-full" type="button" aria-pressed="false">Full screen</button>
+          <button id="ws-viewer-minimize" type="button" aria-label="Minimize workspace viewer">
+            Minimize
+          </button>
           <button id="ws-viewer-close" type="button" aria-label="Close workspace viewer">
             Close
           </button>
