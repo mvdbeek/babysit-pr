@@ -235,7 +235,7 @@ def panes(tmp_path, monkeypatch):
         assert gate.wait(10)
         return {"pane": target["pane"], "docker": enabled, "warning": None}
 
-    def herdr(*args):
+    def herdr(*args, machine=None):
         keys.append(args)
         return {}
 

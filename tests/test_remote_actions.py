@@ -4,17 +4,29 @@ The fake workers are directories under ``<tmp>/hosts/<ssh target>`` that the fak
 uses as HOME, with their herdr workspaces and agents in the fake herdr's per-label state.
 """
 
+import copy
 import hashlib
 import json
+import stat
+import threading
 import time
+from urllib.parse import quote
 
+import agent_messages
+import dashboard
+import machines
 import pytest
 import remote_probe
+import session_locks
 import workspace_overview as wso
+import workspace_viewer as wv
+from playwright.sync_api import expect
 from test_remote_inventory import BOX, MINI, fleet, git, make_clone, read, register, short_tmp
-from test_workspace_overview import FakeGitHub
+from test_remote_viewer import CLAUDE_SID, CODEX_SID, worker
+from test_workspace_overview import FakeGitHub, request
+from test_workspace_overview_browser import row
 
-__all__ = ["fleet", "short_tmp"]  # Fixtures, used by name.
+__all__ = ["fleet", "short_tmp", "worker"]  # Fixtures, used by name.
 
 
 def cleanup(plugin, *targets):
@@ -233,3 +245,343 @@ def test_malformed_remove_answers_are_refused(answer):
 def test_local_cleanup_refuses_a_branch_named_like_an_option():
     assert not wso.BRANCH_NAME.fullmatch("-D")
     assert wso.BRANCH_NAME.fullmatch("feature/x-1")
+
+
+# Messages and resumes -----------------------------------------------------------------
+
+
+def mini_store(worker, **changes):
+    store = read(worker.state)
+    store["machines"]["Mac mini"].update(changes)
+    worker.state.write_text(json.dumps(store))
+
+
+def mini(worker):
+    return read(worker.state)["machines"]["Mac mini"]
+
+
+@pytest.fixture
+def idle(worker):
+    """A Claude agent idle in the worker's w1, and this machine's own w1 beside it."""
+    agent = {
+        "workspace_id": "w1",
+        "agent": "claude",
+        "agent_status": "idle",
+        "pane_id": "w1:p1",
+        "agent_session": {"value": CLAUDE_SID},
+    }
+    mini_store(worker, agents=[agent])
+    store = read(worker.state)
+    store["workspaces"] = [
+        {
+            "workspace_id": "w1",
+            "label": "local",
+            "worktree": {"repo_root": str(worker.local), "checkout_path": str(worker.local)},
+        }
+    ]
+    store["agents"] = [{**agent, "agent_session": {"value": "local"}}]
+    worker.state.write_text(json.dumps(store))
+    return worker
+
+
+def test_a_worker_agent_is_listed_and_messaged_through_its_herdr(idle):
+    found = agent_messages.agents("w1", machine=idle.machine)
+    assert [(a["pane"], a["session"]) for a in found] == [("w1:p1", CLAUDE_SID)]
+    sent = agent_messages.send(
+        {"workspace": "w1", "text": "Add docs"}, idle.home, machine=idle.machine
+    )
+    assert sent == {"sent": True, "pane": "w1:p1", "warning": None}
+    assert mini(idle)["prompts"] == [["w1:p1", "Add docs"]]
+    assert "prompts" not in read(idle.state)
+    with pytest.raises(ValueError, match="not available for agents on Mac mini"):
+        agent_messages.send(
+            {"workspace": "w1", "text": "x", "exit_when_done": True},
+            idle.home,
+            machine=idle.machine,
+        )
+
+
+def test_a_worker_agent_is_stopped_through_its_herdr(idle):
+    mini_store(idle, agents=[{**mini(idle)["agents"][0], "agent_status": "working"}])
+    request = {"workspace": "w1", "pane": "w1:p1", "session": CLAUDE_SID}
+    assert agent_messages.interrupt(request, machine=idle.machine)["pane"] == "w1:p1"
+    assert ["agent", "send-keys", "w1:p1", "esc"] in mini(idle)["calls"]
+    assert not any(c[:2] == ["agent", "send-keys"] for c in read(idle.state)["calls"])
+
+
+def test_a_worker_agents_dialog_is_read_and_answered_there(idle):
+    screen = "\n".join(
+        ["─" * 40, " Allow this command?", " ❯ 1. Yes", "   2. No", "", " Esc to cancel"]
+    )
+    blocked = {**mini(idle)["agents"][0], "agent_status": "blocked"}
+    mini_store(idle, agents=[blocked], screens={"w1:p1": [screen]})
+    [agent] = agent_messages.agents("w1", interactions=True, machine=idle.machine)
+    choices = agent["interaction"]["choices"]
+    assert [o["label"] for o in choices["options"]] == ["Yes", "No"]
+    request = {
+        "workspace": "w1",
+        "pane": "w1:p1",
+        "session": CLAUDE_SID,
+        "dialog": choices["id"],
+        "option": "2",
+    }
+    assert agent_messages.choose(request, machine=idle.machine) == {"chosen": True, "pane": "w1:p1"}
+    assert ["agent", "send-keys", "w1:p1", "2"] in mini(idle)["calls"]
+    assert not any(c[:2] == ["agent", "read"] for c in read(idle.state)["calls"])
+
+
+@pytest.fixture
+def exited(worker):
+    """The worker's w1 with a shell pane and no agent: its sessions can be resumed."""
+    mini_store(worker, panes=[{"pane_id": "w1:p1", "workspace_id": "w1"}])
+    return worker
+
+
+def staged_prompts(worker):
+    return list((worker.host / ".local/state/babysit-pr/message-prompts").glob("resume-*"))
+
+
+def test_a_worker_session_resumes_there_with_its_prompt_staged_there(exited):
+    sessions = agent_messages.sessions("w1", exited.home, machine=exited.machine)
+    assert {s["id"] for s in sessions} == {CLAUDE_SID, CODEX_SID}
+    value = agent_messages.send(
+        {"workspace": "w1", "resume": CLAUDE_SID, "text": "Now add docs"},
+        exited.home,
+        machine=exited.machine,
+    )
+    store = mini(exited)
+    pane = store["panes"][-1]["pane_id"]
+    assert value == {"sent": True, "pane": pane, "resumed": CLAUDE_SID, "warning": None}
+    assert store["splits"] == [
+        ["w1:p1", "--direction", "right", "--cwd", str(exited.checkout), "--no-focus"]
+    ]
+    [staged] = staged_prompts(exited)
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert staged.read_text() == "Now add docs\n"
+    # The worker's default login, under its Safehouse: no CLAUDE_CONFIG_DIR is typed.
+    assert store["runs"] == [
+        [
+            pane,
+            f'(unset CLAUDE_CONFIG_DIR; claude --resume {CLAUDE_SID} -- "$(cat {staged})")',
+        ]
+    ]
+    assert store["agents"][0]["argv"] == ["--resume", CLAUDE_SID, "--", "Now add docs"]
+    # Nothing was staged, split or typed on this machine.
+    assert not (exited.home / "message-prompts").exists()
+    local = read(exited.state)
+    assert "runs" not in local and "splits" not in local
+    with pytest.raises(ValueError, match="already running"):
+        agent_messages.send(
+            {"workspace": "w1", "resume": CLAUDE_SID, "text": "again"},
+            exited.home,
+            machine=exited.machine,
+        )
+
+
+def test_a_worker_resume_is_refused_on_its_own_facts(exited):
+    def resume(sid):
+        return agent_messages.send(
+            {"workspace": "w1", "resume": sid, "text": "go"}, exited.home, machine=exited.machine
+        )
+
+    # The Codex session was recorded in a directory that is gone on the worker.
+    with pytest.raises(ValueError, match="directory no longer exists"):
+        resume(CODEX_SID)
+    # The worker's repair lease, which this machine holds for it.
+    with session_locks.acquire("claude", CLAUDE_SID, None, "mini"):
+        with pytest.raises(agent_messages.Refused, match="repair is running"):
+            resume(CLAUDE_SID)
+    # The session open in a pane there.
+    mini_store(
+        exited,
+        agents=[
+            {
+                "workspace_id": "w9",
+                "agent": "claude",
+                "agent_status": "idle",
+                "pane_id": "w9:p1",
+                "agent_session": {"value": CLAUDE_SID},
+            }
+        ],
+        panes=[
+            *mini(exited)["panes"],
+            {"pane_id": "w9:p1", "agent_session": {"value": CLAUDE_SID}},
+        ],
+    )
+    with pytest.raises(ValueError, match="already running in w9:p1"):
+        agent_messages.send(
+            {"workspace": "w1", "resume": CLAUDE_SID, "text": ""},
+            exited.home,
+            machine=exited.machine,
+        )
+    assert "runs" not in mini(exited) and not staged_prompts(exited)
+
+
+def test_a_closed_worker_workspace_is_reopened_there_and_followed(exited):
+    assert wv.remote_checkout(exited.machine, "w1") == str(exited.checkout)
+    # Another checkout's workspace stays open there, so the reopened one gets a new ID.
+    other = {"workspace_id": "w2", "label": "other", "worktree": {"checkout_path": "/elsewhere"}}
+    mini_store(exited, workspaces=[other], panes=[])
+    assert wv.live_workspace("w1", exited.machine) is None
+    value = agent_messages.send(
+        {"workspace": "w1", "resume": CLAUDE_SID, "text": ""}, exited.home, machine=exited.machine
+    )
+    store = mini(exited)
+    clone = exited.host / "src" / "repo"
+    assert [c for c in store["calls"] if c[:2] == ["worktree", "open"]] == [
+        ["worktree", "open", "--cwd", str(clone), "--path", str(exited.checkout), "--no-focus"]
+    ]
+    [space] = [w for w in store["workspaces"] if w["workspace_id"] != "w2"]
+    assert space["workspace_id"] == "w3"
+    assert value["pane"] == f"{space['workspace_id']}:p1" and value["resumed"] == CLAUDE_SID
+    assert store["runs"][0][1] == f"(unset CLAUDE_CONFIG_DIR; claude --resume {CLAUDE_SID})"
+    # The viewer left on w1 follows the workspace opened on its checkout since.
+    assert wv.live_workspace("w1", exited.machine) == space["workspace_id"]
+    assert "calls" not in read(exited.state) or not any(
+        c[:2] == ["worktree", "open"] for c in read(exited.state)["calls"]
+    )
+
+
+def test_a_linux_workers_resume_line_runs_its_babysit_bwrap():
+    box = machines.Machine(
+        "box", "Box", "box", "linux", "~/src", "~/b", "python3", 4, ("gpg",), None, True
+    )
+    found = {
+        "path": "/home/b/src/worktrees/repo/n",
+        "common": "/home/b/src/repo/.git",
+        "cwd": "/home/b/src/worktrees/repo/n",
+        "cwd_exists": True,
+        "claude_home": "/home/b/.claude",
+        "claude_env": "/home/b/.claude",
+        "codex_home": "/home/b/.codex",
+        "launcher": "/home/b/b/scripts/babysit-bwrap",
+    }
+    chosen = {"id": CLAUDE_SID, "agent": "claude", "claude_account": "default"}
+    assert agent_messages.remote_command(box, chosen, found, "go", "/home/b/p") == (
+        "CLAUDE_CONFIG_DIR=/home/b/.claude /home/b/b/scripts/babysit-bwrap --enable=gpg "
+        "--claude-config-dir=/home/b/.claude "
+        "--add-dirs=/home/b/src/worktrees/repo/n:/home/b/src/repo/.git -- "
+        f'claude --dangerously-skip-permissions --resume {CLAUDE_SID} -- "$(cat /home/b/p)"'
+    )
+    with pytest.raises(ValueError, match="babysit-bwrap is not installed under ~/b"):
+        agent_messages.remote_command(box, chosen, {**found, "launcher": None}, "", None)
+
+
+def test_the_resume_probe_reports_the_workers_own_paths(worker, monkeypatch):
+    monkeypatch.setenv("HOME", str(worker.host))
+    args = dict(agent="claude", account="default", babysit_root="~/b", sandbox="bwrap")
+    found = remote_probe._host_resume(str(worker.checkout), str(worker.checkout), **args)
+    assert remote_probe.validate_resume(found) == found
+    assert found["path"] == found["cwd"] == str(worker.checkout.resolve())
+    assert found["common"] == str((worker.host / "src" / "repo" / ".git").resolve())
+    assert found["cwd_exists"] and found["launcher"] is None
+    # Literal: Claude names its Keychain item after the path it is given.
+    assert found["claude_env"] == str(worker.host / ".claude")
+    gone = remote_probe._host_resume(str(worker.checkout), str(worker.checkout / "sub"), **args)
+    assert not gone["cwd_exists"]
+    with pytest.raises(ValueError, match="outside its checkout"):
+        remote_probe._host_resume(str(worker.checkout), str(worker.host), **args)
+    (worker.checkout / "deep").mkdir()
+    deep = str(worker.checkout / "deep")
+    with pytest.raises(ValueError, match="top of a Git checkout"):
+        remote_probe._host_resume(deep, deep, **args)
+    with pytest.raises(ValueError, match="Unknown Claude account"):
+        remote_probe._host_resume(
+            str(worker.checkout), str(worker.checkout), **{**args, "account": "nobody"}
+        )
+    for bad in ({"cwd": "/w\x1b[2J"}, {"cwd_exists": "yes"}, {"launcher": "relative"}):
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_resume({**found, **bad})
+
+
+# Through the dashboard -----------------------------------------------------------------
+
+
+@pytest.fixture
+def site(exited):
+    """A dashboard listing the worker's row, with its composer's routes live."""
+    directory = exited.home / "experiments" / "workspaces"
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text(json.dumps({"enabled": True}))
+    plugin = wso.WorkspaceOverview(exited.home, FakeGitHub())
+    plugin.next_poll = float("inf")
+    remote = row(
+        "feature",
+        key=f"m:mini:{exited.checkout}",
+        path=str(exited.checkout),
+        machine="mini",
+        machine_label="Mac mini",
+        machine_stale=False,
+        workspace_ids=["mini/w1"],
+    )
+    plugin.value = {"workspaces": [remote], "warnings": [], "synced_at": time.time()}
+    plugin.collect = lambda **kwargs: copy.deepcopy(plugin.value)
+    with dashboard.DashboardServer(exited.home, 0, workspace_overview=plugin) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield server.server_port, remote
+        server.shutdown()
+        thread.join(3)
+
+
+def test_the_composer_routes_reach_the_worker(exited, site):
+    port, remote = site
+    key = quote(remote["key"], safe="")
+    for path in (f"/api/workspace-agents?key={key}", "/api/workspace-agents?workspace=mini%2Fw1"):
+        status, value = request(port, path)
+        assert status == 200, value
+        assert value["workspace"] == "mini/w1" and value["path"] == str(exited.checkout)
+        assert value["agents"] == [] and value["url"] is None
+        assert {s["id"] for s in value["sessions"]} == {CLAUDE_SID, CODEX_SID}
+    body = {"workspace": "mini/w1", "resume": CLAUDE_SID, "text": "Go on"}
+    status, value = request(port, "/api/workspace-message", body, "workspace-message")
+    assert status == 200 and value["resumed"] == CLAUDE_SID, value
+    status, value = request(port, "/api/workspace-agents?workspace=mini%2Fw1")
+    [agent] = value["agents"]
+    # Docker access is a Safehouse grant on this Mac's own agents.
+    assert agent["docker"] is None and agent["docker_supported"] is False
+    attached = "2026-10-25-0000000a-a.txt"
+    (exited.home / "attachments").mkdir()
+    (exited.home / "attachments" / attached).write_text("notes")
+    docker = {"workspace": "mini/w1", "pane": "w1:p1", "session": CLAUDE_SID, "enabled": True}
+    for action, payload, error in [
+        ("workspace-docker", docker, "only for agents on this Mac"),
+        (
+            "workspace-message",
+            {"workspace": "mini/w1", "text": "x", "attachments": [attached]},
+            "cannot be attached for agents on Mac mini",
+        ),
+        ("workspace-message", {"workspace": "ghost/w1", "text": "x"}, "Unknown machine ghost"),
+    ]:
+        status, value = request(port, f"/api/{action}", payload, action)
+        assert status == 400 and error in value["error"], (action, value)
+    assert "prompts" not in mini(exited)
+
+
+@pytest.mark.browser
+def test_a_worker_agent_is_messaged_from_its_row_without_docker_access(page, exited, site):
+    port, _ = site
+    agent = {
+        "workspace_id": "w1",
+        "agent": "claude",
+        "agent_status": "idle",
+        "pane_id": "w1:p1",
+        "agent_session": {"value": CLAUDE_SID},
+    }
+    mini_store(exited, agents=[agent])
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(f"http://127.0.0.1:{port}/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("feature", exact=True))
+    expect(line.get_by_role("checkbox")).to_be_enabled()
+    expect(line.get_by_role("button", name="Open workspace", exact=True)).to_be_disabled()
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.locator("#ws-message-agent")).to_contain_text("To claude · idle")
+    expect(viewer.locator("#ws-docker")).to_be_hidden()
+    viewer.locator("#ws-message-text").fill("Add docs")
+    viewer.get_by_role("button", name="Send to agent").click()
+    expect(viewer.locator("#ws-message-status")).to_contain_text("Sent to the agent in w1:p1")
+    assert mini(exited)["prompts"] == [["w1:p1", "Add docs"]]
+    assert "prompts" not in read(exited.state)
+    assert not errors

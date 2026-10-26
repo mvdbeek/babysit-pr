@@ -197,8 +197,19 @@ def verify_screen(target, info, screen, *, confirming=False):
         raise ScreenNotReady("Final receipt is not yet visible; no exit key sent")
 
 
-def read_screen(pane):
-    return herdr("agent", "read", pane, "--source", "visible", "--lines", "100", "--format", "ansi")
+def read_screen(pane, machine=None):
+    return herdr(
+        "agent",
+        "read",
+        pane,
+        "--source",
+        "visible",
+        "--lines",
+        "100",
+        "--format",
+        "ansi",
+        machine=machine,
+    )
 
 
 def schedule(db, home, args):

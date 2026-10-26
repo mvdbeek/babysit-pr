@@ -302,12 +302,7 @@
     return target.key ? { key: target.key } : { watch: target.watch };
   }
   function messageable(target) {
-    return !workerLabel(target) && Boolean(target.workspace || target.key || target.watch);
-  }
-  // A worker machine's checkout is only read from here so far: its label, or its id from
-  // a qualified workspace ID (`mini/w1`); null on this machine.
-  function workerLabel(target) {
-    return target.machineLabel || /^([a-z][a-z0-9-]*)\//.exec(target.workspace || "")?.[1] || null;
+    return Boolean(target.workspace || target.key || target.watch);
   }
   // The issue, pull request or Sentry issue the checkout serves, as {label, url, title}.
   function renderLinks(links) {
@@ -1092,6 +1087,11 @@
     const form = byId("ws-message");
     // Never carried over: a box ticked for one agent must not quit another.
     byId("ws-message-quit").checked = false;
+    // A worker's agents take messages, but its exit watches and uploads stay here; it is
+    // named by its row or by a qualified workspace ID (`mini/w1`).
+    const worker = Boolean(entry.machineLabel || /^[a-z][a-z0-9-]*\//.test(entry.workspace || ""));
+    byId("ws-message-quit-label").hidden = worker;
+    byId("ws-message-files").hidden = worker;
     watchQuestion = null;
     byId("ws-agent-interaction").replaceChildren();
     delete byId("ws-agent-interaction").dataset.state;
@@ -1099,10 +1099,6 @@
     byId("ws-live-status").textContent = "";
     agents = [];
     sessions = [];
-    const worker = workerLabel(entry);
-    const notice = byId("ws-message-readonly");
-    notice.hidden = !worker;
-    notice.textContent = worker ? `Not available for workspaces on ${worker} yet` : "";
     if (!messageable(entry)) {
       // A checkout without a herdr workspace or a row has no agent to talk to.
       draft = null;
@@ -1649,8 +1645,9 @@
   }
   function renderDocker() {
     const agent = selectedAgent();
-    byId("ws-docker").hidden = !agent;
-    if (!agent) return;
+    // A worker's agents run in its own sandbox, not Safehouse on this Mac.
+    byId("ws-docker").hidden = !agent || agent.docker_supported === false;
+    if (byId("ws-docker").hidden) return;
     const checkbox = byId("ws-docker-enabled");
     const known = typeof agent.docker === "boolean";
     checkbox.checked =

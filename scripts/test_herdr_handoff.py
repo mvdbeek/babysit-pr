@@ -117,7 +117,7 @@ def rig(tmp_path, monkeypatch, request):
             {"state_change_seq": state["state_change_seq"]},
         )
 
-    def herdr(*args):
+    def herdr(*args, machine=None):
         if args[:2] == ("agent", "read"):
             state["reads"] += 1
             return state.get("screen2", state["screen"]) if state["reads"] == 2 else state["screen"]

@@ -256,9 +256,9 @@ def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, w
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, width):
+def test_worker_rows_show_their_machine_and_are_not_opened_from_here(page, site, width):
     url, plugin, _ = site
-    remote = {"machine": "mini", "machine_label": "Mac mini", "removable": False}
+    remote = {"machine": "mini", "machine_label": "Mac mini"}
     plugin.value["workspaces"] = [
         row("local-work"),
         row(
@@ -292,9 +292,8 @@ def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, w
     # Its diff and transcripts are read on the worker.
     for name in ("Diff", "Transcript"):
         expect(line.get_by_role("button", name=name, exact=True)).to_be_enabled()
-    box = line.get_by_role("checkbox", name="Select remote-work")
-    expect(box).to_be_disabled()
-    expect(box).to_have_attribute("title", unavailable)
+    # Cleanup runs on the worker.
+    expect(line.get_by_role("checkbox", name="Select remote-work")).to_be_enabled()
     stale = page.locator("#ws-list tr").filter(has=page.get_by_text("stale-work", exact=True))
     expect(stale.get_by_role("button", name="Create workspace", exact=True)).to_be_disabled()
     expect(stale.locator(".ws-machine")).to_have_class(re.compile(r"\bamber\b"))
@@ -307,9 +306,9 @@ def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, w
     page.get_by_role("searchbox", name="Search workspaces").fill("mac mini")
     expect(page.locator("#ws-list tr")).to_have_count(2)
     page.get_by_role("searchbox", name="Search workspaces").fill("")
-    # Selecting everything shown never sweeps a worker's row into a cleanup.
+    # A worker's removable rows are selected with this machine's.
     page.get_by_role("checkbox", name="Select all shown").check()
-    expect(page.locator("#ws-selected")).to_have_text("1 selected")
+    expect(page.locator("#ws-selected")).to_have_text("3 selected")
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     assert not errors
 

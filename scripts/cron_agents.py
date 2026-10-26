@@ -311,12 +311,13 @@ def remote_checkout(job, home, machine):
     )
 
 
-def remote_command(job, machine, found, staged, effort):
+def remote_command(job, machine, found, staged, effort, extra=()):
     """The line typed on ``machine``: its own sandbox, with the paths its probe reported.
 
     babysit-bwrap is given the checkout, its common dir and the agent's configuration
     there; Safehouse on a Mac worker grants those through the user's shell functions.
-    A worker with the ``gpg`` label lets the agent sign.
+    A worker with the ``gpg`` label lets the agent sign. ``extra`` are agent arguments
+    before the prompt, as a resume's.
     """
     backend = BACKENDS[machine.os]
     features = ("gpg",) if "gpg" in machine.labels else ()
@@ -340,6 +341,7 @@ def remote_command(job, machine, found, staged, effort):
         job["model"],
         effort,
         stage=lambda _: staged,
+        extra=extra,
         docker=job["docker"],
         claude_config_dir=home,
         claude_subscription=bool(job["claude_account"]),

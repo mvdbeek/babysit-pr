@@ -1824,10 +1824,50 @@ def _host_remove(root, path, force, branch, safe):
     return {**result, "branch": "deleted"}
 
 
+def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
+    """What the line resuming a session in the checkout ``root`` needs on this machine.
+
+    ``cwd`` is the directory the session recorded, which must lie in the checkout and
+    is reported with whether it still exists. The rest is what ``cron_checkout``
+    reports for a launch: the checkout's common dir, the agent's configuration (Claude's
+    home, and the ``CLAUDE_CONFIG_DIR`` to type, literal, for ``account``), Codex's home
+    and babysit-bwrap here.
+    """
+    _arg_paths([root, cwd])
+    _arg_paths([babysit_root], home=True)
+    path = _host_checkout(root)
+    dot = os.path.join(path, ".git")
+    if os.path.isdir(dot) and not os.path.islink(dot):
+        common = os.path.realpath(dot)
+    else:
+        common = _host_common_dir(path)
+    real = os.path.realpath(cwd)
+    if real != path and not real.startswith(path + os.sep):
+        raise ValueError("The session's directory is outside its checkout")
+    claude_home, claude_env, _ = _host_claude(agent, account, sandbox)
+    home = os.path.realpath(os.path.expanduser("~"))
+    launcher = os.path.join(
+        os.path.realpath(os.path.expanduser(babysit_root)), "scripts", "babysit-bwrap"
+    )
+    return {
+        "path": path,
+        "common": common,
+        "cwd": real,
+        "cwd_exists": os.path.isdir(real),
+        "claude_home": claude_home,
+        "claude_env": claude_env,
+        "codex_home": os.path.realpath(
+            os.environ.get("CODEX_HOME") or os.path.join(home, ".codex")
+        ),
+        "launcher": launcher if os.access(launcher, os.X_OK) else None,
+    }
+
+
 OPS: dict[str, Callable[..., Any]] = {
     "inventory": _host_inventory,
     "resolve": _host_resolve,
     "remove": _host_remove,
+    "resume": _host_resume,
     "diff": _host_diff,
     "bases": _host_bases,
     "sessions": _host_sessions,
@@ -2251,10 +2291,34 @@ def validate_remove(value):
     return value
 
 
+def validate_resume(value):
+    """Check the paths a worker's resume line will carry: a control character is a keystroke."""
+    fields = {
+        "path",
+        "common",
+        "cwd",
+        "cwd_exists",
+        "claude_home",
+        "claude_env",
+        "codex_home",
+        "launcher",
+    }
+    _expect(isinstance(value, dict) and set(value) == fields, "fields")
+    for key in ("path", "common", "cwd", "codex_home"):
+        _expect(_absolute(value[key]) and not CONTROL.search(value[key]), key)
+    for key in ("claude_home", "claude_env", "launcher"):
+        _expect(
+            value[key] is None or (_absolute(value[key]) and not CONTROL.search(value[key])), key
+        )
+    _expect(isinstance(value["cwd_exists"], bool), "cwd_exists")
+    return value
+
+
 VALIDATORS = {
     "inventory": validate_inventory,
     "resolve": validate_resolve,
     "remove": validate_remove,
+    "resume": validate_resume,
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,

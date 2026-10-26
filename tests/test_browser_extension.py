@@ -264,11 +264,13 @@ def test_invalid_submission_never_launches(extension_server, change):
 
 def test_followup_revalidates_session(tmp_path, monkeypatch):
     sent = []
-    monkeypatch.setattr(agent_messages, "agents", lambda _: [{"pane": "p1", "session": "current"}])
+    monkeypatch.setattr(
+        agent_messages, "agents", lambda _, machine=None: [{"pane": "p1", "session": "current"}]
+    )
     monkeypatch.setattr(
         agent_messages,
         "prompt",
-        lambda target, text: sent.append((target["pane"], text)) or {"sent": True},
+        lambda target, text, machine=None: sent.append((target["pane"], text)) or {"sent": True},
     )
     request = {
         "mode": "message",
@@ -395,12 +397,16 @@ def test_real_extension_followup(extension_browser, extension_server, monkeypatc
             ]
         },
     )
-    monkeypatch.setattr(agent_messages, "agents", lambda _: [{"pane": "p1", "session": "session1"}])
+    monkeypatch.setattr(
+        agent_messages, "agents", lambda _, machine=None: [{"pane": "p1", "session": "session1"}]
+    )
     messages = []
     monkeypatch.setattr(
         agent_messages,
         "prompt",
-        lambda target, text: messages.append((target["pane"], text)) or {"sent": True},
+        lambda target, text, machine=None: (
+            messages.append((target["pane"], text)) or {"sent": True}
+        ),
     )
     page = context.new_page()
     page.goto(f"chrome-extension://{client}/compose.html")
@@ -541,13 +547,13 @@ def test_exact_pr_conversation_and_ambiguity(
     monkeypatch.setattr(
         agent_messages,
         "agents",
-        lambda _: [{"pane": f"p{i}", "session": f"s{i}"} for i in range(count)],
+        lambda _, machine=None: [{"pane": f"p{i}", "session": f"s{i}"} for i in range(count)],
     )
     sent = []
     monkeypatch.setattr(
         agent_messages,
         "prompt",
-        lambda target, text: sent.append((target["pane"], text)) or {"sent": True},
+        lambda target, text, machine=None: sent.append((target["pane"], text)) or {"sent": True},
     )
     page = draft_page(
         context,

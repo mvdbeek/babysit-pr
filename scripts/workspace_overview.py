@@ -1466,7 +1466,9 @@ class WorkspaceOverview:
         if self.worker_label(key) is None:
             return None
         machine_id = key.split(":", 2)[1]
-        machine = machines.resolve(self.home, machine_id)
+        machine = machines.load(self.home).get(machine_id)
+        if machine is None:
+            raise ValueError(f"Unknown machine {machine_id}")
         if not machine.enabled:
             raise ValueError(f"{machine.label} is disabled")
         return machine

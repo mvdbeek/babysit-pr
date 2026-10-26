@@ -98,6 +98,15 @@ def local_workspace(home, value):
     raise unsupported_machine(home, machine_id)
 
 
+# Composer actions an agent on a worker takes as well, named by its qualified workspace ID.
+WORKER_ACTIONS = {
+    "workspace-message",
+    "workspace-interrupt",
+    "workspace-answer",
+    "workspace-choose",
+}
+
+
 def viewed_workspace(home, value):
     """A workspace ID from a view request as (machine, ID): ``w1`` on this machine, or
     ``<machine>/w1`` on a registered worker, whose checkout its views read there."""
@@ -682,11 +691,21 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.read_body(length, 5))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
+            attached = bool(request.get("attachments"))
             # Attached files become paths in the text the agent receives.
             attachments.attach(self.server.attachments, action, request)
+            # The worker an agent action names, from the registry; None for this machine.
+            machine = None
+            if action in WORKER_ACTIONS and "workspace" in request:
+                machine, request["workspace"] = viewed_workspace(
+                    self.server.home, request["workspace"]
+                )
+            elif action == "workspace-docker" and isinstance(request.get("workspace"), str):
+                if viewed_workspace(self.server.home, request["workspace"])[0] is not None:
+                    raise ValueError("Docker access can be changed only for agents on this Mac")
             if action.startswith("workspace-"):
                 for name in ("workspace", "workspace_id"):
-                    if name in request:
+                    if name in request and machine is None:
                         request[name] = local_workspace(self.server.home, request[name])
             if action == "notification-silence":
                 if not self.server.push:
@@ -751,13 +770,24 @@ class Handler(BaseHTTPRequestHandler):
                     # A Workspaces-tab row listed while no herdr workspace was open.
                     if not self.server.workspace_overview:
                         raise ValueError("The workspace experiment is disabled")
-                    checkout = self.server.workspace_overview.checkout(request.pop("key"))
+                    key = request.pop("key")
+                    worker = self.server.workspace_overview.worker_checkout(key)
+                    if worker:
+                        machine, checkout = worker
+                    else:
+                        checkout = self.server.workspace_overview.checkout(key)
                 if "watch" in request:
                     # A watch's checkout, where its repairs run without a workspace.
                     checkout, _ = watch_checkout(self.server.home, request.pop("watch"))
+                if machine is not None and attached:
+                    # Uploads are kept on this machine, where the worker's agent cannot read.
+                    raise ValueError(f"Files cannot be attached for agents on {machine.label} yet")
                 try:
                     self.send_json(
-                        200, agent_messages.send(request, self.server.home, checkout=checkout)
+                        200,
+                        agent_messages.send(
+                            request, self.server.home, checkout=checkout, machine=machine
+                        ),
                     )
                 except agent_messages.Refused as exc:
                     # The composer acts on the code: it offers to cancel the owning watch.
@@ -773,19 +803,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if action == "workspace-interrupt":
                 try:
-                    self.send_json(200, agent_messages.interrupt(request))
+                    self.send_json(200, agent_messages.interrupt(request, machine))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
                 return
             if action == "workspace-answer":
                 try:
-                    self.send_json(200, agent_messages.answer(request))
+                    self.send_json(200, agent_messages.answer(request, self.server.home, machine))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the question in Collie: {exc}"})
                 return
             if action == "workspace-choose":
                 try:
-                    self.send_json(200, agent_messages.choose(request))
+                    self.send_json(200, agent_messages.choose(request, machine))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the dialog in Collie: {exc}"})
                 return
@@ -1053,6 +1083,9 @@ class Handler(BaseHTTPRequestHandler):
                     len(values) != 1 for values in query.values()
                 ):
                     raise ValueError("Supply a workspace, a workspace key or a watch")
+                # A worker's row or workspace is read and messaged there; the machine
+                # comes from the inventory or the registry, never the client.
+                machine = None
                 if "key" in query or "watch" in query:
                     # A Workspaces-tab row listed while no herdr workspace was open, or a
                     # watch's checkout: the one open on it now, which the viewer then follows.
@@ -1060,17 +1093,24 @@ class Handler(BaseHTTPRequestHandler):
                         path, _ = watch_checkout(self.server.home, query["watch"][0])
                     elif not self.server.workspace_overview:
                         raise ValueError("The workspace experiment is disabled")
+                    elif worker := self.server.workspace_overview.worker_checkout(query["key"][0]):
+                        machine, path = worker
                     else:
                         path = self.server.workspace_overview.checkout(query["key"][0])
-                    workspace_id = workspace_viewer.checkout_workspace(path)
+                    workspace_id = workspace_viewer.checkout_workspace(path, machine)
                 else:
-                    workspace_id = local_workspace(self.server.home, query["workspace"][0])
-                    self.server.workspace_checkout(workspace_id)
+                    machine, workspace_id = viewed_workspace(
+                        self.server.home, query["workspace"][0]
+                    )
+                    if machine is None:
+                        self.server.workspace_checkout(workspace_id)
                 if workspace_id is None:
                     # Nobody to message, but a recorded session can be resumed.
                     value = {
                         "agents": [],
-                        "sessions": agent_messages.checkout_sessions(path, self.server.home),
+                        "sessions": agent_messages.checkout_sessions(
+                            path, self.server.home, machine
+                        ),
                         "path": path,
                         "workspace": None,
                         "url": None,
@@ -1078,15 +1118,20 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     # The workspace now open on this checkout: none once closed, another
                     # ID once reopened, which the viewer then follows.
-                    live = workspace_viewer.live_workspace(workspace_id)
+                    live = workspace_viewer.live_workspace(workspace_id, machine)
                     value = {
-                        "agents": agent_messages.docker_status(workspace_id, live),
-                        "sessions": agent_messages.sessions(workspace_id, self.server.home),
+                        "agents": agent_messages.docker_status(workspace_id, live, machine),
+                        "sessions": agent_messages.sessions(
+                            workspace_id, self.server.home, machine
+                        ),
                         # A draft names its checkout, so a reused workspace ID cannot
                         # deliver another checkout's comments.
-                        "path": workspace_viewer.workspace_checkout(workspace_id),
-                        "workspace": live,
-                        "url": live and collie_url(None, live),
+                        "path": agent_messages.workspace_root(workspace_id, machine),
+                        # A worker's named qualified, as the viewer names it.
+                        "workspace": machines.qualify(machine.id, live)
+                        if machine and live
+                        else live,
+                        "url": live and collie_url(machine, live),
                     }
                 self.send_json(200, value)
             elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:
