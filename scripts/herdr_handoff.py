@@ -64,6 +64,13 @@ def herdr(*args, machine: machines.Machine | None = None):
     return proc.stdout
 
 
+def program(process):
+    """A foreground process's program name: herdr's argv0 where it reports one (macOS),
+    else its first argument (herdr on Linux reports only argv and name)."""
+    argv = process.get("argv") or [""]
+    return Path(process.get("argv0") or argv[0] or "").name
+
+
 def result(*args, machine: machines.Machine | None = None):
     data = json.loads(herdr(*args, machine=machine))
     if data.get("error"):
@@ -321,7 +328,7 @@ def schedule(db, home, args):
     matches = [
         p
         for p in procs["foreground_processes"]
-        if Path(p.get("argv0", "")).name == spec["process"]
+        if program(p) == spec["process"]
         and pane_runner.same_path(p.get("cwd", ""), job["cwd"], machine)
     ]
     if info.get("agent") != agent or len(matches) != 1:

@@ -37,6 +37,15 @@ CONTEXT = {
 STARTED = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}}
 
 
+def bwrap(cwd):
+    """The processes babysit-bwrap puts before a worker's agent in its pane's foreground."""
+    argv = ["bwrap", "--die-with-parent", "--unshare-pid", "--", "claude"]
+    return [
+        {"pid": 4240, "name": "bwrap", "argv": argv, "cwd": cwd},
+        {"pid": 4241, "name": "bwrap", "argv": argv, "cwd": cwd},
+    ]
+
+
 def worker_herdr(fake_tools, tree, agent="codex"):
     """The worker's herdr: one idle agent in PANE, its shell and process there."""
     store = json.loads(fake_tools.read_text())
@@ -48,9 +57,11 @@ def worker_herdr(fake_tools, tree, agent="codex"):
             "process_info": {
                 PANE: {
                     "shell_pid": 100,
+                    # The agent runs in babysit-bwrap: bwrap, its child, then the agent.
                     "foreground_processes": [
                         {"pid": 100},
-                        {"pid": 4242, "argv0": agent, "argv": [agent], "cwd": str(tree)},
+                        *bwrap(str(tree)),
+                        {"pid": 4242, "name": agent, "argv": [agent], "cwd": str(tree)},
                     ],
                 }
             },
@@ -392,7 +403,7 @@ def test_a_worker_hands_off_only_the_pane_its_watch_is_bound_to(watched, served,
         "shell_pid": 300,
         "foreground_processes": [
             {"pid": 300},
-            {"pid": 4343, "argv0": "codex", "argv": ["codex"], "cwd": tree},
+            {"pid": 4343, "name": "codex", "argv": ["codex"], "cwd": tree},
         ],
     }
     fake_tools.write_text(json.dumps(store))
@@ -585,3 +596,14 @@ def test_the_broker_refuses_a_handoff_of_another_launchs_session(box, broker, fa
             data = client.recv(65536)
         assert "handoff fields" in json.loads(data)["error"]
     assert Path(box["home"] / "handoffs").exists() is False
+
+
+def test_a_process_is_named_by_argv0_or_else_its_first_argument():
+    # herdr on macOS adds argv0; on Linux it reports only argv and name.
+    assert herdr_handoff.program({"argv0": "/usr/local/bin/claude", "argv": ["x"]}) == "claude"
+    assert (
+        herdr_handoff.program({"argv": ["claude", "--effort", "high"], "name": "claude"})
+        == "claude"
+    )
+    assert herdr_handoff.program({"argv": ["/usr/bin/bwrap", "--"]}) == "bwrap"
+    assert herdr_handoff.program({"pid": 100}) == ""
