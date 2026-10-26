@@ -426,6 +426,12 @@ def test_another_tab_sees_the_tray_change(page, dashboard_site, tray_routes):
     transcript = {"sessions": [session], "session": session, "entries": [], "start": 0, "total": 0}
     other.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript))
     other.route("**/api/workspace-diff?*", lambda route: route.fulfill(json=COMMENT_DIFF))
+    other.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={"agents": [], "sessions": [], "path": "/fixture/checkout"}
+        ),
+    )
     other.goto(url + "/#prs")
     viewer = open_view(page, "test/alpha", "Diff")
     viewer.get_by_role("button", name="Minimize workspace viewer").click()
@@ -435,3 +441,124 @@ def test_another_tab_sees_the_tray_change(page, dashboard_site, tray_routes):
     expect(other.locator("#ws-viewer-meta")).to_contain_text("1 file changed")
     expect(page.get_by_role("region", name="Minimized viewers")).to_be_hidden()
     other.close()
+
+
+def test_a_chip_whose_workspace_id_now_names_another_checkout_is_dropped(
+    page, dashboard_site, tray_routes, viewer_routes
+):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    viewer = open_view(page, "test/alpha", "Transcript")
+    expect(page.locator("#ws-message-agent")).not_to_have_text("Looking for agents…")
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+    stored = json.loads(page.evaluate("localStorage.getItem('ws-viewer-tray')"))
+    assert stored[0]["path"] == "/fixture/checkout"
+    viewer = open_view(page, "test/beta", "Transcript")
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+    # herdr restarted: w1 is now another checkout. While its old one is remembered, the
+    # dashboard says so; once forgotten, only the path tells.
+    viewer_routes["path"] = "/fixture/elsewhere"
+    page.route(
+        "**/api/workspace-transcript?workspace=w2*",
+        lambda route: route.fulfill(
+            status=400, json={"error": "That herdr workspace now shows another checkout; refresh"}
+        ),
+    )
+    tray = page.get_by_role("region", name="Minimized viewers")
+    chips(page).filter(has_text="Renamed workspace").click()
+    expect(tray.get_by_role("status")).to_have_text(
+        "Renamed workspace now names another checkout; removed it from the tray."
+    )
+    expect(viewer).to_be_hidden()
+    chips(page).filter(has_text="Second workspace").click()
+    expect(tray.get_by_role("status")).to_have_text(
+        "Second workspace is no longer available; removed it from the tray."
+    )
+    expect(chips(page)).to_have_count(0)
+    expect(viewer).to_be_hidden()
+
+
+def test_saved_chips_are_checked_and_capped_on_load(page, dashboard_site, tray_routes):
+    url, _ = dashboard_site
+
+    def chip(index, **changes):
+        item = {
+            "id": f"watch:{index}",
+            "entry": {"watch": f"watch-{index}", "name": f"Watch {index}", "links": []},
+            "mode": "diff",
+            "scope": "branch",
+            "base": None,
+            "session": None,
+            "position": None,
+        }
+        item.update(changes)
+        return item
+
+    malformed = [
+        chip(100, entry="watch-100"),
+        chip(101, entry={"name": "No target"}),
+        chip(102, entry={"watch": "w", "name": "Bad links", "links": "nope"}),
+        chip(103, entry={"watch": ["w"], "name": "Bad watch"}),
+        chip(104, mode="bogus"),
+        chip(105, scope="everything"),
+        chip(106, base=7),
+        chip(107, session={"id": "s"}),
+        chip(108, id=108),
+        "not a chip",
+    ]
+    saved = malformed + [chip(index) for index in range(15)]
+    page.goto(url + "/#prs")
+    page.evaluate("value => localStorage.setItem('ws-viewer-tray', value)", json.dumps(saved))
+    page.reload()
+    expect(chips(page)).to_have_count(12)
+    expect(chips(page)).to_have_text([f"Diff Watch {index}" for index in range(12)])
+
+
+def test_a_restored_diff_whose_base_is_gone_falls_back_to_the_default(
+    page, dashboard_site, tray_routes
+):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    viewer = open_view(page, "test/alpha", "Diff")
+    choose_option(viewer.locator("select[aria-label=Base]"), "origin/dev")
+    expect(viewer.locator("select[aria-label=Base]")).to_have_value("origin/dev")
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+
+    def gone(route):
+        if "base=origin%2Fdev" in route.request.url:
+            route.fulfill(status=400, json={"error": "Choose one of the listed base branches"})
+        else:
+            route.fallback()
+
+    page.route("**/api/workspace-diff?*", gone)
+    chips(page).first.click()
+    expect(viewer.locator("select[aria-label=Base]")).to_have_value("origin/main")
+    expect(page.locator("#ws-viewer-error")).to_be_empty()
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("1 file changed")
+
+
+def test_a_followed_reopen_replaces_its_chip(page, dashboard_site, tray_routes, viewer_routes):
+    url, _ = dashboard_site
+    reopened = {"workspace": None}
+
+    def agents(route):
+        route.fulfill(
+            json={
+                "agents": viewer_routes["agents"],
+                "sessions": viewer_routes["sessions"],
+                "path": viewer_routes["path"],
+                "workspace": reopened["workspace"],
+            }
+        )
+
+    page.route("**/api/workspace-agents?*", agents)
+    page.goto(url + "/#prs")
+    viewer = open_view(page, "test/alpha", "Transcript")
+    expect(page.locator("#ws-message-agent")).not_to_have_text("Looking for agents…")
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+    # The agent was reopened in w9: the viewer follows it there.
+    reopened["workspace"] = "w9"
+    viewer = open_view(page, "test/alpha", "Diff")
+    expect(page.locator("#ws-message-agent")).not_to_have_text("Looking for agents…")
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+    expect(chips(page)).to_have_text(["Diff Renamed workspace"])

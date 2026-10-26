@@ -2077,10 +2077,31 @@
   // restored while no viewer is open.
   const TRAY_KEY = "ws-viewer-tray";
   const TRAY_LIMIT = 12;
+  // A saved chip is used only in the shape this page writes; anything else is dropped.
+  const optional = (value) => value === null || value === undefined || typeof value === "string";
+  function wellFormed(item) {
+    const entry = item?.entry;
+    return (
+      typeof item?.id === "string" &&
+      typeof entry === "object" &&
+      entry !== null &&
+      ["id", "workspace", "key", "watch", "name", "machineLabel"].every((name) =>
+        optional(entry[name]),
+      ) &&
+      Boolean(entry.workspace || entry.key || entry.watch) &&
+      (entry.links === undefined || entry.links === null || Array.isArray(entry.links)) &&
+      ["diff", "transcript"].includes(item.mode) &&
+      [undefined, "branch", "uncommitted"].includes(item.scope) &&
+      optional(item.base) &&
+      optional(item.session) &&
+      optional(item.path) &&
+      (item.position === undefined || typeof item.position === "object")
+    );
+  }
   function loadTray() {
     try {
       const saved = JSON.parse(localStorage.getItem(TRAY_KEY) || "[]");
-      if (Array.isArray(saved)) return saved.filter((item) => item?.id && item.entry);
+      if (Array.isArray(saved)) return saved.filter(wellFormed).slice(0, TRAY_LIMIT);
     } catch {
       // Storage may be unavailable or hold something else; start empty.
     }
@@ -2135,9 +2156,13 @@
   function minimize() {
     if (!viewer) return;
     const entry = JSON.parse(JSON.stringify(viewer.entry));
-    const id = identity(entry);
+    // The identity it opened with, which following a reopened workspace keeps.
+    const id = viewer.id;
+    // The checkout its agents were read from: a restore checks its workspace ID still
+    // names it, as a restarted herdr reuses IDs.
+    const path = draft?.path || null;
     const { mode, scope, base, session } = viewer;
-    const item = { id, entry, mode, scope, base, session, position: readingPosition() };
+    const item = { id, entry, path, mode, scope, base, session, position: readingPosition() };
     tray = [item, ...tray.filter((other) => other.id !== id)].slice(0, TRAY_LIMIT);
     if (viewer.siblings) traySiblings.set(id, viewer.siblings);
     storeTray();
@@ -2175,28 +2200,38 @@
   // workspace closed or without its checkout, or a watch no longer listed. Other failures,
   // such as a worker not answering or the Workspaces list not read yet since a restart,
   // keep it and say why. A session no longer recorded gives way to the newest one.
-  const GONE = /herdr workspace is not open|herdr workspace has no checkout|^Unknown watch/;
-  async function restore(id, button) {
-    if (byId("ws-viewer").open) return;
-    const at = chipIndex(button);
-    let item = tray.find((other) => other.id === id);
-    const name = item.entry.name || "Workspace";
-    button.disabled = true;
-    let failure = null;
-    let sessions = null;
+  const GONE =
+    /herdr workspace is not open|herdr workspace has no checkout|herdr workspace now shows another checkout|^Unknown watch/;
+  async function check(path, params) {
     try {
-      const response = await fetch(`/api/workspace-transcript?${query(where(item.entry))}`);
+      const response = await fetch(`${path}?${query(params)}`);
       let value = null;
       try {
         value = await response.json();
       } catch {
         // A proxy error page is not JSON.
       }
-      if (!response.ok || value?.error) failure = value?.error || `HTTP ${response.status}`;
-      else sessions = value.sessions;
+      if (!response.ok || value?.error)
+        return { failure: value?.error || `HTTP ${response.status}` };
+      return { value };
     } catch (error) {
-      failure = error.message;
+      return { failure: error.message };
     }
+  }
+  async function restore(id, button) {
+    if (byId("ws-viewer").open) return;
+    const at = chipIndex(button);
+    let item = tray.find((other) => other.id === id);
+    const name = item.entry.name || "Workspace";
+    button.disabled = true;
+    const [view, owner] = await Promise.all([
+      check("/api/workspace-transcript", where(item.entry)),
+      item.path && messageable(item.entry)
+        ? check("/api/workspace-agents", recipient(item.entry))
+        : null,
+    ]);
+    const failure = view.failure || owner?.failure;
+    const sessions = view.value?.sessions;
     button.disabled = false;
     // Another tab may have restored, dismissed or replaced it meanwhile.
     item = tray.find((other) => other.id === id);
@@ -2209,16 +2244,44 @@
       focusChip(at);
       return;
     }
+    if (owner?.value.path && owner.value.path !== item.path) {
+      // Its workspace ID was given to another checkout: never show or message that one.
+      unpark(id);
+      trayNote(`${name} now names another checkout; removed it from the tray.`);
+      focusChip(at);
+      return;
+    }
     const known = !item.session || sessions?.some((session) => session.id === item.session);
+    let loading;
+    try {
+      loading = openViewer(item.entry, item.mode, traySiblings.get(id) || null, {
+        scope: item.scope || "branch",
+        base: item.base ?? null,
+        session: known ? item.session : null,
+      });
+    } catch (error) {
+      // Kept for another try, with nothing left half open.
+      if (!byId("ws-viewer").open) viewer = null;
+      trayNote(`Could not open ${name}: ${error.message}`);
+      focusChip(at);
+      return;
+    }
     unpark(id);
     renderTray();
-    const loading = openViewer(item.entry, item.mode, traySiblings.get(id) || null, {
-      scope: item.scope || "branch",
-      base: item.base ?? null,
-      session: known ? item.session : null,
-    });
     const current = viewer;
     await loading;
+    if (
+      viewer === current &&
+      !current.data &&
+      current.mode === "diff" &&
+      current.base &&
+      /listed base branches/.test(byId("ws-viewer-error").textContent)
+    ) {
+      // Its base branch is gone: the default one instead.
+      current.base = null;
+      resetViewer("Loading…");
+      await loadViewer();
+    }
     // Only onto the view it was taken from, not once another tab or session shows.
     const same =
       current.mode === item.mode &&
