@@ -971,7 +971,7 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(503, f"Cannot deliver task: {exc}")
 
     def worker_request(self):
-        """Registration forwarded by a worker machine; its token names the machine.
+        """A registration or handoff forwarded by a worker machine; its token names the machine.
 
         Not a browser's: a request with an Origin or Fetch metadata is refused.
         """
@@ -1008,7 +1008,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RuntimeError) as exc:
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
-            self.fail(503, f"Cannot register the watch: {exc}")
+            self.fail(503, f"Cannot answer the worker: {exc}")
 
     def get(self):
         port = self.server.server_port

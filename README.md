@@ -940,11 +940,12 @@ is typed into a pane of the worker's herdr workspace through its own sandbox (Sa
 on a Mac, `babysit-bwrap` from its `babysit_root` on Linux, with signing allowed when the
 worker has the `gpg` label). Such a job always runs in its sandbox and cannot be a shell
 command. The dashboard looks at the run every minute, in the background so a slow worker
-never delays other jobs: once a session in the checkout
-confirms the task, its final response is kept, but the agent is not exited on a worker
-yet, so the run **Needs attention** with the agent still open there; one that leaves
-its pane without confirming, or is still working at the time limit, also needs
-attention. **Open in Collie** links the worker's Collie when its registry entry has a
+never delays other jobs, and follows the agent as it does a local one, through the
+worker's herdr and with its transcript read there: the session whose first prompt is
+the run's brief is followed, and once it confirms the task and stays idle its final
+response is kept, the agent is exited and its pane closed. One that leaves its pane
+without confirming, is still working at the time limit, or whose worker has not
+answered for 30 looks in a row needs attention. **Open in Collie** links the worker's Collie when its registry entry has a
 `collie_url`, or this machine's Collie crew when it has a `collie_host`; otherwise the
 run says **Collie unavailable for <label>**.
 

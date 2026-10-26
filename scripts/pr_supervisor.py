@@ -1057,13 +1057,13 @@ def release_argv(home, key):
 def forward_from_worker(args):
     """Watches live on the controller, whose supervisor repairs them; a worker's own would
     act where nobody looks. Provisioning marks a worker, and launches there say so: its
-    ``register`` goes to the controller's dashboard (``worker_api``)."""
+    ``register`` and ``handoff`` go to the controller's dashboard (``worker_api``)."""
     import worker_api
 
-    if args.command == "handoff":
-        raise ValueError("Automatic handoff from worker machines isn't supported yet")
     if not os.environ.get(worker_api.SOCKET_ENV):
         worker_api.controller()  # Without the controller's URL and token, nothing else matters.
+    if args.command == "handoff":
+        return worker_api.forward("handoff", worker_api.handoff_request(args))
     return worker_api.forward("register", worker_api.registration(args))
 
 

@@ -79,6 +79,9 @@ elif a[:2] == ['pane','send-text']:
 elif a[:2] == ['agent','send-keys']:
  if not os.environ.get('FAKE_HERDR_KEEP_AGENT'):
   data['agents']=[g for g in data['agents'] if g.get('pane_id')!=a[2]]
+  # Only the pane's shell is left in its foreground.
+  procs=data.get('process_info',{}).get(a[2])
+  if procs: procs['foreground_processes']=[{'pid':procs['shell_pid']}]
 elif a[:2] == ['agent','read']:
  # A scripted dialog: each key or text sent to the pane advances to its next screen.
  sent=[c for c in data['calls'] if c[:2] in (['agent','send-keys'],['pane','send-text']) and c[2]==a[2]]
@@ -96,6 +99,9 @@ elif a[:2] == ['pane','process-info']:
  agent=next((g for g in data['agents'] if g.get('pane_id')==a[a.index('--pane')+1]),{})
  default={'shell_pid':1,'foreground_processes':[{'pid':200,'argv0':agent.get('agent','codex')}] if agent else []}
  result={'process_info':data.get('process_info',{}).get(a[a.index('--pane')+1],default)}
+ if label:
+  # herdr on Linux names a process by its argv and name only; only macOS adds argv0.
+  result={'process_info':{**result['process_info'],'foreground_processes':[{k:v for k,v in f.items() if k!='argv0'} for f in result['process_info'].get('foreground_processes',[])]}}
 elif a[:2] == ['pane','split']:
  wid=a[2].split(':')[0]; pid=f"{wid}:p{len(data.setdefault('panes',[]))+10}"
  data['panes'].append({'pane_id':pid,'workspace_id':wid,'cwd':a[a.index('--cwd')+1]})

@@ -20,6 +20,7 @@ import pr_supervisor as supervisor
 import pytest
 import remote_repair
 import session_locks
+from processes import wait_gone
 from test_remote_cron import git, short_tmp  # noqa: F401 (fixture)
 from test_remote_registration import box, claude_transcript, register, registry  # noqa: F401
 
@@ -192,9 +193,7 @@ def test_a_failing_or_timed_out_repair_blocks_the_watch(worker, tmp_path, monkey
     supervisor.run_repair(worker["home"], job["id"], job["attempt"])
     assert time.monotonic() - started < 30
     assert result(folder) == {"status": "blocked", "summary": "Box: Timed out after 2 s"}
-    pid = calls(tmp_path)[-1]["pid"]
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert wait_gone(calls(tmp_path)[-1]["pid"])
 
 
 def test_stopping_the_guardian_stops_the_agent_on_the_worker(worker, tmp_path, monkeypatch):
@@ -213,16 +212,7 @@ def test_stopping_the_guardian_stops_the_agent_on_the_worker(worker, tmp_path, m
         "status": "blocked",
         "summary": "Repair interrupted; inspect before resuming",
     }
-    pid = calls(tmp_path)[0]["pid"]
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
-    else:
-        raise AssertionError("The worker's agent outlived its guardian")
+    assert wait_gone(calls(tmp_path)[0]["pid"], 10), "The worker's agent outlived its guardian"
     # The worker confirmed it stopped: nothing stays held.
     assert not session_locks.held("codex", worker["sid"], None, "box")
     run = remote_run(worker, job)

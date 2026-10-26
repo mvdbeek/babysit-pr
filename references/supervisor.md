@@ -648,19 +648,47 @@ so the account is where the transcript lies. One request is forwarded at a time,
 most one every 20 s per launch, with at most 4 connections open and 30 s to send a
 request.
 The wrapper also shows the deployed babysit-pr read-only inside on a worker, so the
-skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on a worker refuses for now: exit the
-original agent and release the watch on the controller (`release_argv` in the answer).
+skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on
+a worker goes the same way (`action: handoff` in a broker request; registrations carry
+no `action`, as brokers started before handoff expect; at most one of each action every
+20 s per launch): it sends the watch ID, pane and timeout with both conversations it
+may run in (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`) and its worktree. The broker
+keeps only its launch's agent's session, checks it and the worktree like a
+registration's, and adds the transcript it found. The controller's
+`/api/worker/handoff` schedules the handoff only for a watch registered on the token's
+machine with that worktree and its agent's session, whose transcript is exactly the
+broker's, from the watch's bound pane (terminal and shell; a watch registered without
+its pane is not handed off from a worker), and answers every mismatch
+of watch the same way. At most 4 handoffs per worker run at once. It then runs the
+detached handoff itself, as for a local watch: the agent is followed through `herdr
+--machine` every 4 s (its screen gets 30 s to settle), its transcript's turn and
+fingerprint are read together through one probe op (`turn_state`), and worker paths are
+compared as strings. Codex gets its one Ctrl-D; Claude gets a typed `/exit`, since its
+second Ctrl-D would have to come sooner than the checks before it can read the worker,
+and Enter only once its composer holds exactly `/exit`; otherwise the `/exit` typed
+here is taken back with backspaces when the composer shows it at its end, and no key is
+sent to anything else (a dialog, say). The exit is confirmed once only
+the pane's shell is in its foreground, herdr no longer sees an agent there, and the
+worker no longer runs the agent's command line at its pid (probe op `alive`, given
+the SHA-256 of its NUL-joined arguments, which may hold a whole brief, and reading them
+from /proc or macOS's kernel rather than `ps`), so a
+stopped or backgrounded agent has not exited. Failures to start on the controller reach
+the worker without this machine's paths. A local `handoff` refuses a worker's watch,
+and a worker's refuses a local one.
 
-The dashboard's `/api/worker/register` takes only that: the Host must be one the
+The dashboard's `/api/worker/register` and `/api/worker/handoff` take only that: the Host must be one the
 dashboard accepts (`--allow-host`, for the tailnet name), and a request carrying
 `Origin` or `Sec-Fetch-Site` (a browser) is refused. The token decides the machine; the
 body is exactly the registration fields (PR, repo, CI repo or branch, absolute `cwd`,
 session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
 poll interval, budget and timeout), checked by type, form and length, with no control
-characters (the instructions may span lines). One registration per machine runs at a
-time per worktree, at most 6 a minute per machine and worktree (a failed one costs 2
+characters (the instructions may span lines); a handoff's body is exactly the watch
+ID, pane, timeout (at most an hour), a session or none per agent, absolute `cwd` and
+transcript or none. One request per machine runs at a time per worktree, at most 6 a
+minute per machine and worktree and 30 a minute per machine (a failed one costs 2
 more, so repeated failures back off; answered 429), so one sandbox cannot hold up the
-others, and a worker watch is polled no more often than every 30 s. With a machine's
+others; at most 256 worktree buckets are kept, a new one refused while that many are
+still refilling; and a worker watch is polled no more often than every 30 s. With a machine's
 optional `tailnet_ip` in `machines.json` (one address, or a list of up to four, such as
 its IPv4 and IPv6 ones), a registration is refused unless `X-Forwarded-For` is exactly
 one of them: `tailscale serve` sets it to the address the
@@ -764,10 +792,26 @@ when the machine has the `gpg` label, and `--exit-watch-json` for **Quit the age
 it is done**: it prints the exit watch instead of recording it, and the dashboard
 records it with the machine. Clone locks hash the machine with the clone. The checkout
 and agent are verified through probe ops and `herdr --machine`. Exit watches on workers
-are looked at there every minute but never exited: the watch says when the agent
-finished, or left without confirming, and leaves it open. It also stops after a week,
-once the worker leaves the registry, or after 30 failed looks in a row. Their records
-name the workspace qualified (`<id>/w1`), so no dashboard takes it for one of its own.
+(these, scheduled launches there, and worker cron runs) are followed every minute, in
+the background, the way local ones are (`workspace_exit`), through the worker's herdr:
+the agent's own pane is pinned, its process is named by herdr's `argv0` where it
+reports one (macOS) or else its first argument (herdr on Linux, where babysit-bwrap's
+`bwrap` processes share the foreground until the agent exits), worker paths are
+compared as strings, and the
+transcript is read there through probe ops (`sessions`, `first_turn`, `turn`,
+`fingerprint`). Its session is the one in the checkout, among the newest five of the
+agent's kind, whose first prompt carries the brief's marker; the worker's clock is
+never compared with this one's. Once it confirms and stays idle the agent is exited
+there (Codex with Ctrl-D, Claude with a typed `/exit` and Enter), and an exited `wt`
+agent's pane or workspace is closed as here. A watch stops after a week, once the
+worker leaves the registry, or after 30 looks in a row the worker did not answer (ssh
+or the probe's deadline failed, or its herdr failed: from here those cannot be told
+apart). Anything else the worker answers leaves the agent open at once, but a
+transcript it will not read is skipped while looking for the session, and a turn it
+cannot identify yet is waited for. A worker cron run's pane is closed only while it
+still holds the agent's shell.
+Their records name the workspace qualified (`<id>/w1`), so no dashboard takes it for
+one of its own.
 
 Handle on a verified checkout stays on that checkout's machine;
 choosing another is refused. `GET /api/placement?repo=&agent=&account=&docker=1`

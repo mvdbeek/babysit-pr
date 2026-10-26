@@ -1662,7 +1662,7 @@ def test_scheduled_launch_asks_its_agent_to_confirm_and_is_watched(synced, monke
 
     seen = []
 
-    def step(record, launched, persist, now=None):
+    def step(record, launched, persist, now=None, *_):
         seen.append(launched["id"])
         persist({**record, "state": "exiting", "target": {"pane_id": "w1:p1"}})
         # The scheduler stops after "exiting" is durable; a restart must not resend.
@@ -1695,7 +1695,7 @@ def test_exit_watch_saves_only_changed_progress(synced, monkeypatch):
     writes = []
     real = manager.db
 
-    def step(record, launched, persist, now=None):
+    def step(record, launched, persist, now=None, *_):
         return {**record, "state": "exited", "message": "Exited"}
 
     monkeypatch.setattr(pw.workspace_exit, "step", step)
@@ -1719,7 +1719,7 @@ def test_exit_claim_fails_when_another_dashboard_changed_the_watch(synced, monke
     finish(manager, pr["id"])
     claims = []
 
-    def step(record, launched, persist, now=None):
+    def step(record, launched, persist, now=None, *_):
         # Another dashboard on this home advances the same watch first.
         with manager.db() as db:
             row = json.loads(
@@ -1748,7 +1748,7 @@ def test_exit_claim_fails_when_another_dashboard_changed_the_watch(synced, monke
     monkeypatch.setattr(
         pw.workspace_exit,
         "step",
-        lambda record, launched, persist, now=None: persist({**record, "state": "exiting"}),
+        lambda record, launched, persist, now=None, *_: persist({**record, "state": "exiting"}),
     )
     with pytest.raises(pw.workspace_exit.Leave):
         manager.exit_one({"id": task["id"], "exit": pw.workspace_exit.watching()})

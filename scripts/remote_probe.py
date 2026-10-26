@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hashlib
 import json
 import math
 import os
@@ -455,6 +456,11 @@ MAX_UNTRACKED = 200
 MAX_COMMITS = 200
 SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 MAX_SESSIONS = 50
+DIGEST = re.compile(r"[0-9a-f]{64}")
+# Bytes of a process's command line read to compare it: more than any argument limit.
+MAX_CMDLINE = 16 * 1024 * 1024
+# The line a scheduled brief asks its agent to end with once done (``exit_watch``).
+MARKER = re.compile(r"\[babysit-done:[0-9a-f]{16}\]")
 
 # Context Codex injects as user messages ahead of the typed prompt.
 CODEX_CONTEXT = re.compile(r"^\s*(# AGENTS\.md instructions|<[a-z_]+>)")
@@ -811,6 +817,38 @@ def claude_turn(lines, session_id):
     if not seen or not turn:
         raise RuntimeError("Cannot identify the current turn in the registered transcript")
     return turn, complete
+
+
+def first_turn(lines, agent, marker):
+    """A transcript's first prompt turn, a scheduled brief, and whether it names ``marker``.
+
+    Codex may record the prompt on either side of its turn's start; Claude's prompt is
+    its turn.
+    """
+    turn, marked = None, False
+    for item in records(lines):
+        payload = item.get("payload") or {}
+        if agent == "claude":
+            content = (item.get("message") or {}).get("content")
+            blocks = content if isinstance(content, list) else []
+            if (
+                item.get("type") == "user"
+                and not item.get("isSidechain")
+                and not item.get("isMeta")
+                and not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks)
+            ):
+                return item.get("uuid"), marker in block_text(content)
+            continue
+        kind = (item.get("type"), payload.get("type"))
+        if kind == ("event_msg", "task_started"):
+            if turn is not None:
+                break
+            turn = payload.get("turn_id")
+        elif kind == ("event_msg", "user_message"):
+            marked = marked or marker in str(payload.get("message") or "")
+        elif kind == ("response_item", "message") and payload.get("role") == "user":
+            marked = marked or marker in block_text(payload.get("content"))
+    return turn, marked
 
 
 def records(lines):
@@ -1292,6 +1330,84 @@ def _host_turn(file, session, agent):
         "turn": str(turn)[:MAX_TEXT],
         "complete": None if complete is None else str(complete)[:MAX_TURN],
     }
+
+
+def _host_first_turn(file, agent, marker):
+    """The first turn of one of this machine's transcripts, and whether it took ``marker``."""
+    if agent not in {"claude", "codex"}:
+        raise ValueError("Expected claude or codex")
+    if not isinstance(marker, str) or not MARKER.fullmatch(marker):
+        raise ValueError("Expected a completion marker")
+    with _host_transcript(file) as stream:
+        turn, marked = first_turn(transcript_lines(stream), agent, marker)
+    return {"turn": None if turn is None else str(turn)[:MAX_TEXT], "marked": marked}
+
+
+def _host_turn_state(file, session, agent):
+    """``turn`` and ``fingerprint`` of one transcript, read together in one call."""
+    with _host_transcript(file) as stream:
+        info = os.fstat(stream.fileno())
+    found = _host_turn(file, session, agent)
+    return {**found, "inode": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+
+
+def _host_alive(pid, digest):
+    """Whether process ``pid`` still runs the agent's command line: an agent stopped, or
+    moved out of its terminal's foreground, has not exited. Another program at that pid
+    is not it.
+
+    The command line is named by the SHA-256 of its arguments joined by NULs: a brief
+    may be one long argument. They are read as the kernel keeps them, which ps would
+    render lossily.
+    """
+    if not (type(pid) is int and 1 < pid < 2**31):
+        raise ValueError("Expected a process ID")
+    if not (isinstance(digest, str) and DIGEST.fullmatch(digest)):
+        raise ValueError("Expected a command line digest")
+    running = _proc_arguments(pid) if os.path.isdir("/proc/self") else _mac_arguments(pid)
+    return {"alive": running is not None and hashlib.sha256(running).hexdigest() == digest}
+
+
+def _proc_arguments(pid):
+    """A process's arguments, NUL-joined, from /proc; None once it is gone."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            running = stream.read(MAX_CMDLINE)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # Each argument ends in a NUL; a zombie's command line is empty.
+    return running[:-1] if running else None
+
+
+def _mac_arguments(pid):
+    """A process's arguments, NUL-joined, as macOS keeps them (KERN_PROCARGS2: argc, the
+    executable's path and its padding, then the arguments); None once it is gone."""
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    # The buffer is exactly kern.argmax long (CTL_KERN, KERN_ARGMAX); any other is refused.
+    argmax = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(argmax))
+    limit = (ctypes.c_int * 2)(1, 8)
+    if libc.sysctl(limit, 2, ctypes.byref(argmax), ctypes.byref(size), None, ctypes.c_size_t(0)):
+        raise OSError("Cannot read kern.argmax")
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(argmax.value)
+    found = ctypes.create_string_buffer(argmax.value)
+    if libc.sysctl(mib, 3, found, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+        return None
+    data = found.raw[: size.value]
+    argc = int.from_bytes(data[:4], sys.byteorder)
+    rest = data[4:]
+    rest = rest[rest.find(b"\0") :].lstrip(b"\0")
+    return b"\0".join(rest.split(b"\0")[:argc])
+
+
+def _host_fingerprint(file):
+    """Which file one of this machine's transcripts is, and how far it was written."""
+    with _host_transcript(file) as stream:
+        info = os.fstat(stream.fileno())
+    return {"inode": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
 
 def _ending_lines(stream):
@@ -2046,6 +2162,10 @@ OPS: dict[str, Callable[..., Any]] = {
     "sessions": _host_sessions,
     "tail": _host_tail,
     "turn": _host_turn,
+    "first_turn": _host_first_turn,
+    "fingerprint": _host_fingerprint,
+    "turn_state": _host_turn_state,
+    "alive": _host_alive,
     "cron_checkout": _host_cron_checkout,
     "version": _host_version,
     "wt_prepare": _host_wt_prepare,
@@ -2382,6 +2502,40 @@ def validate_turn(value):
     return value
 
 
+def validate_first_turn(value):
+    """Check a worker's answer for the first turn of a transcript."""
+    _expect(isinstance(value, dict) and set(value) == {"turn", "marked"}, "fields")
+    _expect(value["turn"] is None or (_text(value["turn"]) and value["turn"]), "turn")
+    _expect(isinstance(value["marked"], bool), "marked")
+    return value
+
+
+def validate_fingerprint(value):
+    """Check a worker's answer for which file a transcript is and how far it was written."""
+    fields = ("inode", "size", "mtime_ns")
+    _expect(isinstance(value, dict) and set(value) == set(fields), "fields")
+    _expect(all(_int(value[k]) for k in fields), "file facts")
+    return value
+
+
+def validate_turn_state(value):
+    """Check a worker's answer for a transcript's current turn and fingerprint together."""
+    _expect(isinstance(value, dict), "fields")
+    turn = {k: value[k] for k in ("turn", "complete") if k in value}
+    fingerprint = {k: value[k] for k in ("inode", "size", "mtime_ns") if k in value}
+    _expect(len(value) == len(turn) + len(fingerprint), "fields")
+    validate_turn(turn)
+    validate_fingerprint(fingerprint)
+    return value
+
+
+def validate_alive(value):
+    """Check a worker's answer for whether a process still runs."""
+    _expect(isinstance(value, dict) and set(value) == {"alive"}, "fields")
+    _expect(isinstance(value["alive"], bool), "alive")
+    return value
+
+
 def validate_cron_checkout(value):
     """Check a worker's cron checkout: absolute paths for the launch line, nothing else."""
     fields = {
@@ -2569,6 +2723,10 @@ VALIDATORS = {
     "sessions": validate_sessions,
     "tail": validate_tail,
     "turn": validate_turn,
+    "first_turn": validate_first_turn,
+    "fingerprint": validate_fingerprint,
+    "turn_state": validate_turn_state,
+    "alive": validate_alive,
     "cron_checkout": validate_cron_checkout,
     "version": validate_version,
     "wt_prepare": validate_wt_prepare,
@@ -2576,6 +2734,18 @@ VALIDATORS = {
     "worktree": validate_worktree,
     "session_info": validate_session_info,
 }
+
+
+class Unreachable(ValueError):
+    """The worker did not answer: ssh failed, or the probe ran out of time there."""
+
+
+class Failed(ValueError):
+    """The op failed on the worker; ``kind`` names the error it raised there."""
+
+    def __init__(self, message, kind):
+        super().__init__(message)
+        self.kind = kind
 
 
 def call(home, machine, op, timeout, **args):
@@ -2609,7 +2779,9 @@ def call(home, machine, op, timeout, **args):
     stderr = result.stderr[-MAX_STDERR:].decode(errors="replace").strip()
     if result.returncode:
         reason = "unreachable" if result.returncode == 255 else f"exit {result.returncode}"
-        raise ValueError(f"{machine.label} probe failed ({reason}): {stderr or 'no output'}")
+        # ssh's own failure, or a worker too slow to answer in time, may pass.
+        error = Unreachable if result.returncode in {255, EXPIRED} else ValueError
+        raise error(f"{machine.label} probe failed ({reason}): {stderr or 'no output'}")
     if len(result.stdout) > MAX_STDOUT:
         raise ValueError(f"{machine.label} probe answer exceeded {MAX_STDOUT} bytes")
     try:
@@ -2619,7 +2791,10 @@ def call(home, machine, op, timeout, **args):
     if not isinstance(answer, dict) or answer.get("protocol") != PROTOCOL:
         raise ValueError(f"{machine.label} probe speaks another protocol")
     if "error" in answer:
-        raise ValueError(f"{machine.label} probe failed: {str(answer['error'])[:400]}")
+        said = str(answer["error"])[:400]
+        if said == "Probe deadline expired":
+            raise Unreachable(f"{machine.label} probe failed: {said}")
+        raise Failed(f"{machine.label} probe failed: {said}", said.partition(":")[0])
     return VALIDATORS[op](answer.get("result"))
 
 

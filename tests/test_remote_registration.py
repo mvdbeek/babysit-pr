@@ -58,6 +58,7 @@ def claude_transcript(home, cwd, sid, account=None, **changes):
 @pytest.fixture(autouse=True)
 def fresh_rate_limits(monkeypatch):
     monkeypatch.setattr(worker_api, "_buckets", {})
+    monkeypatch.setattr(worker_api, "_machines", {})
 
 
 @pytest.fixture

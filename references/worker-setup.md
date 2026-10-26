@@ -518,6 +518,6 @@ From the Linux sandbox section of the supervisor reference, restated for operato
   root, pinned to the repository's Playwright version) is not automated yet. The user
   step writes `~/.config/babysit-pr/worker.json`, which marks the machine as a worker
   (babysit-bwrap passes it to agents as `BABYSIT_WORKER=1`, and starts a registration
-  broker for them instead of showing them the file). Watches on the worker are repaired there; automatic
-  handoff does not run there yet.
+  broker for them instead of showing them the file). Watches on the worker are repaired there, and
+  handed off through the controller, which exits the agent through the worker's herdr.
 - The dashboard's Docker toggle is macOS-only (supervisor reference).

@@ -21,6 +21,7 @@ import pr_workspaces
 import pytest
 import remote_probe
 import workspace_overview as wso
+from processes import wait_gone
 from test_workspace_overview import BASE, FakeGitHub
 
 MINI = {"id": "mini", "label": "Mac mini", "ssh": "mini.test", "os": "darwin"}
@@ -733,14 +734,7 @@ def test_a_streaming_worker_is_cut_off_at_the_answer_cap(fleet, monkeypatch):
         remote_probe.call(fleet["home"], machines.resolve(fleet["home"], "mini"), "inventory", 60)
     assert time.monotonic() - started < 30
     pid = int(pidfile.read_text())
-    deadline = time.monotonic() + 5
-    while True:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        assert time.monotonic() < deadline, "the streaming worker command survived"
-        time.sleep(0.05)
+    assert wait_gone(pid), "the streaming worker command survived"
 
 
 def test_the_probe_stops_at_its_deadline(capsys, monkeypatch):
@@ -800,14 +794,7 @@ def test_an_expired_probe_stops_its_git_and_exits_non_zero(tmp_path):
     assert time.monotonic() - started < 15
     assert "deadline expired" in json.loads(result.stdout)["error"]
     for pid in map(int, pids.read_text().split()):
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-            assert time.monotonic() < deadline, "the probe's Git survived its deadline"
-            time.sleep(0.05)
+        assert wait_gone(pid), "the probe's Git survived its deadline"
 
 
 def test_a_git_timeout_at_the_deadline_is_reported_as_expiry(tmp_path, monkeypatch):

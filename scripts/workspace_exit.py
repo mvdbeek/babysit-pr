@@ -7,18 +7,27 @@ passes, it presses Ctrl-D the way an automatic handoff does. The pane, its shell
 the worktree stay. Anything else leaves the agent open and stops watching it: a turn
 that ends without the marker (usually a question), a follow-up turn, a changed
 process. A draft in the composer or a scrolled terminal only delays the exit.
+
+An agent on a worker is followed and exited the same way through that worker's herdr,
+its transcript read there through the probe; its session is the one whose first prompt
+carries the brief's marker. A worker that cannot be reached leaves the agent open only
+after REMOTE_FAILURES passes in a row.
 """
 
 import datetime
 import json
 import os
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
 
 import claude_accounts
 import herdr_handoff as handoff
+import pane_runner
+import pr_supervisor
+import remote_probe
 
 # Shared with wt, which must stay cheap to import.
 from exit_watch import BRIEF as BRIEF
@@ -34,6 +43,12 @@ WATCH_LIMIT = 7 * 86400
 SETTLE_SECONDS = 20
 # A shorter pane can clip the agent's composer and final response off the visible screen.
 SHORT_PANE_ROWS = 15
+# Passes in a row a worker may fail to answer before its agent is left open.
+REMOTE_FAILURES = 30
+# Newest sessions of a worker's checkout searched for a launch's own.
+REMOTE_SESSIONS = 5
+# What a worker that did not answer raises; anything else it says leaves the agent open.
+UNREACHABLE = (OSError, subprocess.SubprocessError, remote_probe.Unreachable, handoff.Unreachable)
 
 
 class Wait(Exception):
@@ -44,15 +59,18 @@ class Leave(Exception):
     """Stop watching and leave the agent open."""
 
 
-def capture(op):
-    """The pane, shell and process of the agent this launch started."""
-    path = Path(op["path"]).resolve()
+def capture(op, machine=None):
+    """The pane, shell and process of the agent this launch started.
+
+    A worker's paths are compared as they are, never resolved here.
+    """
+    path = op["path"] if machine is not None else str(Path(op["path"]).resolve())
     panes = [
         a["pane_id"]
-        for a in handoff.result("agent", "list")["agents"]
+        for a in handoff.result("agent", "list", machine=machine)["agents"]
         if a.get("workspace_id") == op["result"]["workspace_id"]
         and a.get("agent") == op["agent"]
-        and Path(a.get("cwd") or "/missing").resolve() == path
+        and pane_runner.same_path(a.get("cwd") or "/missing", path, machine)
         # A message names the pane it was typed into, and the session running there then.
         and a["pane_id"] == op.get("pane_id", a["pane_id"])
         and (
@@ -62,11 +80,12 @@ def capture(op):
     ]
     if len(panes) != 1:
         raise Leave("Could not identify the agent's pane; left open")
-    info, procs, _ = handoff.inspect(panes[0])
+    info, procs, _ = handoff.inspect(panes[0], machine)
     matches = [
         p
         for p in procs["foreground_processes"]
-        if Path(p.get("argv0", "")).name == op["agent"] and Path(p.get("cwd", "")).resolve() == path
+        if handoff.program(p) == op["agent"]
+        and pane_runner.same_path(p.get("cwd", ""), path, machine)
     ]
     if info.get("agent") != op["agent"] or len(matches) != 1:
         raise Leave("Could not identify the agent's process; left open")
@@ -75,13 +94,14 @@ def capture(op):
     return {
         "agent": op["agent"],
         "claude_account": op.get("claude_account"),
-        "cwd": str(path),
+        "cwd": path,
         "pane_id": panes[0],
         "terminal_id": info["terminal_id"],
         "shell_pid": procs["shell_pid"],
         "agent_pid": matches[0]["pid"],
         "agent_argv": matches[0]["argv"],
         "marker": op["exit_marker"],
+        **({"machine": machine.id} if machine is not None else {}),
     }
 
 
@@ -203,6 +223,47 @@ def known_session(target, session_id):
     return {"rollout": str(found[0].resolve()), "session_id": session_id}
 
 
+def worker_first_turn(target, file, machine, home):
+    """``remote_probe.first_turn`` of a worker's transcript ``file``, read there."""
+    return remote_probe.call(
+        home,
+        machine,
+        "first_turn",
+        pr_supervisor.PROBE_TIMEOUT,
+        file=file,
+        agent=target["agent"],
+        marker=target["marker"],
+    )
+
+
+def worker_session(target, machine, home):
+    """The one session of a worker's checkout whose first prompt carries this marker.
+
+    The worker's clock is not compared with this one's, and a reused checkout keeps its
+    older sessions: the brief's marker tells the launch's own apart. A transcript the
+    worker will not read is no candidate.
+    """
+    listed = remote_probe.call(
+        home, machine, "sessions", pr_supervisor.PROBE_TIMEOUT, root=target["cwd"]
+    )
+    recent = [s for s in listed if s["agent"] == target["agent"] and s["cwd"] == target["cwd"]]
+    found = []
+    for session in recent[:REMOTE_SESSIONS]:
+        try:
+            first = worker_first_turn(target, session["file"], machine, home)
+        except remote_probe.Unreachable:
+            raise
+        except ValueError:
+            continue
+        if first["marked"]:
+            found.append(session)
+    if len(found) > 1:
+        raise Leave("Several sessions ran in this worktree; left open")
+    if not found:
+        raise Wait("Waiting for the agent's session transcript")
+    return {"rollout": found[0]["file"], "session_id": found[0]["id"]}
+
+
 def message_turn(rollout, agent, marker):
     """The turn that took the marked message, and whether more input followed it.
 
@@ -291,7 +352,7 @@ def confirms(response, marker):
     return bool(lines) and lines[-1] == marker
 
 
-def advance(record, op, persist, now):
+def advance(record, op, persist, now, machine=None, home=None):
     if now - record["since"] > WATCH_LIMIT:
         raise Leave("Still not finished after a week; stopped watching")
     if op is None or op.get("status") in {"failed", "uncertain"}:
@@ -300,22 +361,25 @@ def advance(record, op, persist, now):
         raise Wait("Waiting for the launch to finish")
     if not op.get("exit_marker"):
         raise Leave("This launch did not ask its agent to confirm completion")
+    if machine is not None and op.get("follow_up"):
+        raise Leave("Messages to agents on workers are not followed; left open")
     if "target" not in record:
-        record["target"] = capture(op)
+        record["target"] = capture(op, machine)
     target = record["target"]
     if "session_id" not in target:
         try:
-            target.update(
-                known_session(target, op["session_id"])
-                if op.get("session_id")
-                else locate(target, op.get("created_at", record["since"]))
-            )
+            if machine is not None:
+                target.update(worker_session(target, machine, home))
+            elif op.get("session_id"):
+                target.update(known_session(target, op["session_id"]))
+            else:
+                target.update(locate(target, op.get("created_at", record["since"])))
         except Wait:
             # Measured from when the launch finished: a long clone is not the agent's fault.
             if now - op.get("updated_at", record["since"]) > LOCATE_LIMIT:
                 raise Leave("Could not find the agent's session transcript; left open") from None
             raise
-    info, procs, state = handoff.inspect(target["pane_id"])
+    info, procs, state = handoff.inspect(target["pane_id"], machine)
     try:
         handoff.verify_identity(target, info, procs)
     except RuntimeError as exc:
@@ -329,7 +393,7 @@ def advance(record, op, persist, now):
             raise Wait("Waiting for the agent to take the message")
     try:
         turn, complete = handoff.latest_turn(
-            target["rollout"], target["session_id"], target["agent"]
+            target["rollout"], target["session_id"], target["agent"], machine, home
         )
     except RuntimeError as exc:
         raise Wait(str(exc)) from exc
@@ -340,7 +404,11 @@ def advance(record, op, persist, now):
         if turn != mine:
             raise Leave("The session moved on to another turn; left open")
     # Only the transcript's first turn is the scheduled task; any later one is the user's.
-    elif turn != first_turn(target["rollout"], target["agent"]):
+    elif turn != (
+        first_turn(target["rollout"], target["agent"])
+        if machine is None
+        else worker_first_turn(target, target["rollout"], machine, home)["turn"]
+    ):
         raise Leave("The session moved on to another turn; left open")
     if complete is None:
         raise Wait("The agent is working")
@@ -352,7 +420,7 @@ def advance(record, op, persist, now):
         if info.get("agent_status") not in {"idle", "done"}:
             raise Wait("Waiting for the agent to go idle")
         try:
-            handoff.verify_screen(target, info, handoff.read_screen(target["pane_id"]))
+            handoff.verify_screen(target, info, handoff.read_screen(target["pane_id"], machine))
         except handoff.ScreenNotReady as exc:
             record["blocked"] = f"{exc}{short_pane(info)}"
             raise Wait(f"Finished, but not exiting yet: {record['blocked']}") from exc
@@ -367,7 +435,7 @@ def advance(record, op, persist, now):
     # Exit only once later passes see the same session and transcript for a while. The
     # brief echo keeps the marker on screen, so the screen alone proves no final display.
     seq = state.get("state_change_seq")
-    ready = [seq, list(handoff.fingerprint(target["rollout"]))]
+    ready = [seq, list(handoff.fingerprint(target["rollout"], machine, home))]
     if seq is None or record.get("ready") != ready:
         record.update(ready=ready, ready_at=now)
         raise Wait("Finished; exiting once the agent stays idle")
@@ -377,18 +445,24 @@ def advance(record, op, persist, now):
     # Claims the exit; raises, sending nothing, if another process changed this watch.
     persist(record)
     # Recheck just before the key: anything that moved since the pass began cancels it.
+    # A worker that does not answer now is no reason to give up the claimed exit either.
+    failed: tuple[type[Exception], ...] = (OSError, RuntimeError)
+    if machine is not None:
+        failed += (ValueError, subprocess.SubprocessError)
     try:
-        info, procs, state = handoff.inspect(target["pane_id"])
+        info, procs, state = handoff.inspect(target["pane_id"], machine)
         handoff.verify_identity(target, info, procs)
-        handoff.verify_screen(target, info, handoff.read_screen(target["pane_id"]))
+        handoff.verify_screen(target, info, handoff.read_screen(target["pane_id"], machine))
         unchanged = (
             info.get("agent_status") in {"idle", "done"}
             and state.get("state_change_seq") == seq
-            and list(handoff.fingerprint(target["rollout"])) == ready[1]
-            and handoff.latest_turn(target["rollout"], target["session_id"], target["agent"])
+            and list(handoff.fingerprint(target["rollout"], machine, home)) == ready[1]
+            and handoff.latest_turn(
+                target["rollout"], target["session_id"], target["agent"], machine, home
+            )
             == (turn, complete)
         )
-    except (OSError, RuntimeError):
+    except failed:
         unchanged = False
     if not unchanged:
         del record["ready"], record["ready_at"]
@@ -396,7 +470,13 @@ def advance(record, op, persist, now):
         return
     try:
         handoff.send_exit(
-            target, (turn, complete), tuple(ready[1]), lambda: None, lambda *a, **k: None
+            target,
+            (turn, complete),
+            tuple(ready[1]),
+            lambda: None,
+            lambda *a, **k: None,
+            machine,
+            home,
         )
     except Exception as exc:
         record.update(state="unconfirmed", message=f"Exit unconfirmed ({exc}); check its pane")
@@ -404,17 +484,29 @@ def advance(record, op, persist, now):
     record.update(state="exited", message="The agent confirmed the task was done and exited")
 
 
-def step(record, op, persist, now=None):
-    """Advance one watch by a pass; ``persist`` saves the record before any key is sent."""
+def step(record, op, persist, now=None, machine=None, home=None):
+    """Advance one watch by a pass; ``persist`` saves the record before any key is sent.
+
+    ``machine``, a worker, runs the agent; ``home`` is this machine's state home.
+    """
     if record.get("state") != "watching":
         return record
     try:
-        advance(record, op, persist, time.time() if now is None else now)
+        advance(record, op, persist, time.time() if now is None else now, machine, home)
     except Wait as exc:
         record["message"] = str(exc)
     except Leave as exc:
         record.update(state="left_open", message=str(exc))
     except Exception as exc:
+        if machine is not None and isinstance(exc, UNREACHABLE):
+            failures = record["failures"] = record.get("failures", 0) + 1
+            message = f"Could not look at the agent on {machine.label}: {exc}"
+            if failures >= REMOTE_FAILURES:
+                message += f"; stopped after {failures} tries"
+                record["state"] = "left_open"
+            record["message"] = message
+            return record
         # Any surprise before a key is sent leaves the agent alone.
         record.update(state="left_open", message=f"Stopped watching: {exc}")
+    record.pop("failures", None)
     return record

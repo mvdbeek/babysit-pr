@@ -241,7 +241,7 @@ def test_finished_agents_keep_their_answer_and_close_their_pane(setup, monkeypat
     pane = run["agent_run"]["pane"]
     seen = {}
 
-    def step(record, op, persist, now):
+    def step(record, op, persist, now, *_):
         seen["op"] = op
         # The agent confirmed and was exited: its pane is back to a plain shell.
         data = herdr_state(state)
@@ -465,7 +465,7 @@ def test_a_deleted_job_sends_nothing_to_its_agent(setup, monkeypatch):
     jobs.delete(saved["id"])
     persisted = []
 
-    def step(record, op, persist, now):
+    def step(record, op, persist, now, *_):
         try:
             persist({**record, "state": "exiting"})
         except workspace_exit.Leave as exc:

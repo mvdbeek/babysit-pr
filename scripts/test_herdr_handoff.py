@@ -104,7 +104,7 @@ def rig(tmp_path, monkeypatch, request):
         state_change_seq=5,
     )
 
-    def inspect(_):
+    def inspect(_, machine=None):
         if state["exited"]:
             return (
                 copy.deepcopy(state["info"]),
@@ -134,7 +134,7 @@ def rig(tmp_path, monkeypatch, request):
         state["exited"] = state["confirm"]
         return "{}"
 
-    def result(*args):
+    def result(*args, machine=None):
         if args[:2] == ("pane", "get"):
             return {"pane": info}
         assert args[:2] == ("pane", "process-info")
@@ -157,7 +157,7 @@ def rig(tmp_path, monkeypatch, request):
     monkeypatch.setattr(handoff, "inspect", inspect)
     monkeypatch.setattr(handoff, "herdr", herdr)
     monkeypatch.setattr(handoff, "result", result)
-    monkeypatch.setattr(handoff, "latest_turn", lambda *a: state["turn"])
+    monkeypatch.setattr(handoff, "latest_turn", lambda *a, **k: state["turn"])
     monkeypatch.setattr(handoff.os, "kill", kill)
     monkeypatch.setattr(handoff.time, "monotonic", lambda: state["clock"])
     monkeypatch.setattr(handoff.time, "sleep", sleep)

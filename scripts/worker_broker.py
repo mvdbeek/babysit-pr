@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Watch registration for one sandbox: only its own worktrees and its own sessions.
+"""Watch registration and handoff for one sandbox: only its own worktrees and sessions.
 
     worker_broker.py LISTEN AGENT CONFIG_DIR [WORKTREE...]
 
 On a worker, babysit-bwrap starts this outside the sandbox and binds LISTEN inside,
 naming it in ``BABYSIT_REGISTER_SOCKET``; the sandbox never sees ``worker.json``, whose
-token this process holds. A client sends one registration request (``worker_api``'s
-fields) and closes its side; the answer is the controller's, or a refusal. Forwarded
-are only requests for the launch's ``AGENT`` whose ``cwd`` is one of the launch's
-granted WORKTREEs and whose session transcript lies, resolved, exactly in its
-CONFIG_DIR's store (``projects/<project>/<id>.jsonl`` for Claude, under ``sessions/``
-for Codex). The controller is told to check that transcript, and that CONFIG_DIR, which
-it checks again on the path it opens; no Claude account is passed, so the account is
-where the transcript lies. So an agent never registers another task's checkout, nor a
-session of another account or Codex home.
+token this process holds. A client sends one request (``worker_api``'s fields for its
+``action``, register when it names none) and closes its side; the answer is the
+controller's, or a refusal. Forwarded are only requests for the launch's ``AGENT``
+whose ``cwd`` is one of the launch's granted WORKTREEs and whose session transcript
+lies, resolved, exactly in its CONFIG_DIR's store (``projects/<project>/<id>.jsonl`` for
+Claude, under ``sessions/`` for Codex). The controller is told to check that transcript,
+and that CONFIG_DIR, which it checks again on the path it opens; no Claude account is
+passed, so the account is where the transcript lies. So an agent never registers
+another task's checkout, nor a session of another account or Codex home. A handoff
+names the launch's own conversation only, with the transcript found for it, and the
+controller acts only on a watch of that machine, worktree and session whose transcript
+is exactly that one.
 
 "Its own sessions" means every session in that configuration directory, which other
 launches of the same Claude account or Codex home share and can write: an agent can
@@ -21,8 +24,8 @@ register such a session (one recorded in its own worktree) or plant one there, s
 repair may resume a conversation another launch of that account started. That gives
 it no access beyond what the account and its worktree already have.
 
-One registration is forwarded at a time, at most one per MIN_INTERVAL seconds, so one
-sandbox cannot use up its worker's registrations at the controller.
+One request is forwarded at a time, at most one of each action per MIN_INTERVAL
+seconds, so one sandbox cannot use up its worker's requests at the controller.
 
 Prints ``ready`` once LISTEN accepts connections, then runs until its parent exits
 (babysit-bwrap execs bwrap, so that is the sandbox), and removes LISTEN and its
@@ -49,7 +52,7 @@ READ_TIMEOUT = 30  # For a whole request, however slowly it arrives.
 MIN_INTERVAL = 20
 CONNECTIONS = 4
 _forwarding = threading.Lock()
-_last = [0.0]
+_last = {"register": 0.0, "handoff": 0.0}
 _slots = threading.BoundedSemaphore(CONNECTIONS)
 
 
@@ -72,25 +75,38 @@ def transcript(agent, config_dir, session):
 
 
 def check(request, agent, config_dir, worktrees):
-    """The request to forward, or ValueError: this launch's own session and checkout."""
-    if not isinstance(request, dict) or set(request) != worker_api.REGISTER:
+    """The action and request to forward, or ValueError: this launch's own session and
+    checkout."""
+    action = request.pop("action", "register") if isinstance(request, dict) else None
+    if action == "handoff":
+        sessions = request.get("sessions")
+        if set(request) != worker_api.HANDOFF or not isinstance(sessions, dict):
+            raise ValueError("Expected exactly the handoff fields")
+        asked = sessions.get(agent)
+    elif action != "register" or set(request) != worker_api.REGISTER:
         raise ValueError("Expected exactly the registration fields")
-    if request["agent"] != agent:
-        raise ValueError(f"This sandbox runs {agent}")
+    else:
+        if request["agent"] != agent:
+            raise ValueError(f"This sandbox runs {agent}")
+        asked = request["session"]
     cwd = request["cwd"]
     if not isinstance(cwd, str) or os.path.realpath(cwd) not in worktrees:
-        raise ValueError("Register a watch from the worktree this sandbox was given")
+        raise ValueError("Ask from the worktree this sandbox was given")
     try:
-        session = str(uuid.UUID(request["session"]))
+        session = str(uuid.UUID(asked))
     except (TypeError, ValueError, AttributeError) as exc:
         raise ValueError("Supply the exact --session UUID") from exc
     found = transcript(agent, config_dir, session)
+    checked = {**request, "cwd": os.path.realpath(cwd)}
+    if action == "handoff":
+        # Only this launch's own conversation, with the transcript found for it here.
+        other = "codex" if agent == "claude" else "claude"
+        return action, {**checked, "sessions": {agent: session, other: None}, "rollout": found}
     rollout = request["rollout"]
     if rollout is not None and (not isinstance(rollout, str) or os.path.realpath(rollout) != found):
         raise ValueError(f"Session {session} is not one of this sandbox's own")
-    return {
-        **request,
-        "cwd": os.path.realpath(cwd),
+    return action, {
+        **checked,
         "session": session,
         "rollout": found,
         "claude_account": None,
@@ -114,24 +130,24 @@ def answer(client, agent, config_dir, worktrees):
                 data += chunk
             if len(data) > worker_api.MAX_BODY:
                 raise ValueError("Request too large")
-            request = check(json.loads(data), agent, config_dir, worktrees)
+            action, request = check(json.loads(data), agent, config_dir, worktrees)
             client.settimeout(None)
-            result = forward(request)
+            result = forward(action, request)
         except (ValueError, RuntimeError, OSError) as exc:
             result = {"error": str(exc)}
         with contextlib.suppress(OSError):
             client.sendall(json.dumps(result).encode())
 
 
-def forward(request):
+def forward(action, request):
     if not _forwarding.acquire(blocking=False):
-        raise ValueError("A registration from this sandbox is already running")
+        raise ValueError("A request from this sandbox is already running")
     try:
-        wait = _last[0] + MIN_INTERVAL - time.monotonic()
+        wait = _last[action] + MIN_INTERVAL - time.monotonic()
         if wait > 0:
-            raise ValueError(f"Registered moments ago; wait {wait:.0f} s")
-        _last[0] = time.monotonic()
-        return worker_api.post("register", request)
+            raise ValueError(f"Sent a {action} moments ago; wait {wait:.0f} s")
+        _last[action] = time.monotonic()
+        return worker_api.post(action, request)
     finally:
         _forwarding.release()
 
