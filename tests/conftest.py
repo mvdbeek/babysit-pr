@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import safe_git
 import sandbox
 
 GH = """import json,os,sys,subprocess
@@ -217,6 +218,18 @@ def delete_output_dir():
     Under xdist every worker is a session, so a late-starting worker would delete
     an earlier one's failure screenshots; tox clears the directory once instead.
     """
+
+
+# This machine's Git, asked while PATH is still the real one: safe_git caches the first
+# answer per process, and one asked under a fake PATH would be (0,).
+safe_git._version.clear()
+REAL_GIT = safe_git.git_version()
+
+
+@pytest.fixture(autouse=True)
+def real_git_version(monkeypatch):
+    """Every test sees the real Git version, whichever test asked first in this worker."""
+    monkeypatch.setattr(safe_git, "_version", [REAL_GIT])
 
 
 @pytest.fixture(autouse=True)
