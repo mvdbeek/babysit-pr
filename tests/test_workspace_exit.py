@@ -290,6 +290,15 @@ def test_the_exit_waits_for_another_exit_of_the_pane_and_checks_again(rig, tmp_p
     assert record["state"] == "watching" and "changed just before exiting" in record["message"]
 
 
+def test_pane_locks_are_a_fixed_set_of_files(tmp_path):
+    # Removing a lock file another process holds open would break the exclusion, so the
+    # files are never removed: panes share a bounded set of them instead.
+    for n in range(600):
+        with handoff.pane_lock(tmp_path, f"w{n}:p1"):
+            pass
+    assert len(list((tmp_path / "pane-locks").iterdir())) <= 256
+
+
 def test_the_exit_keys_go_out_holding_the_pane(rig, tmp_path, monkeypatch):
     op, record, state, step, _ = rig
     sent = handoff.send_exit

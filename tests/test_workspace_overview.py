@@ -1910,7 +1910,16 @@ def test_a_working_codex_with_a_draft_is_refused_before_esc(quitting):
 
 
 @pytest.mark.parametrize(
-    "command", ["bash -c claude", "bash /opt/start-claude.sh", "zsh -lc claude", "python3 run.py"]
+    "command",
+    [
+        "bash -c claude",
+        "bash /opt/start-claude.sh",
+        "zsh -lc claude",
+        "python3 run.py",
+        "fish --command=claude",
+        "fish --command claude",
+        "fish -i --command=claude",
+    ],
 )
 def test_an_agent_whose_pane_root_is_no_interactive_shell_is_not_quit(quitting, command):
     import agent_messages
@@ -1924,7 +1933,9 @@ def test_an_agent_whose_pane_root_is_no_interactive_shell_is_not_quit(quitting, 
     assert keys(quitting) == [] and "typed_text" not in read(quitting)
 
 
-@pytest.mark.parametrize("command", ["-zsh", "/bin/bash -l", "fish", "zsh --login -i"])
+@pytest.mark.parametrize(
+    "command", ["-zsh", "/bin/bash -l", "fish", "zsh --login -i", "bash --norc -i"]
+)
 def test_an_agent_under_an_interactive_shell_is_quit(quitting, command):
     import agent_messages
 
@@ -2033,6 +2044,30 @@ def test_ended_and_other_exit_watches_leave_the_quit_alone(quitting, tmp_path, w
     home = tmp_path / "home"
     home.mkdir()
     save_exit_watch(home, where, state, **row)
+    assert agent_messages.exit_agent(stop_request(), home)["quit"]
+
+
+def test_unreadable_exit_watches_refuse_the_quit(quitting, tmp_path):
+    import agent_messages
+
+    home = tmp_path / "home"
+    # A database that cannot even be opened.
+    (home / "pr-workspaces.sqlite").mkdir(parents=True)
+    with pytest.raises(ValueError, match="Could not read the exit watches"):
+        agent_messages.exit_agent(stop_request(), home)
+    assert keys(quitting) == []
+
+
+def test_an_exit_watch_row_this_version_cannot_read_is_skipped(quitting, tmp_path):
+    import agent_messages
+
+    home = tmp_path / "home"
+    home.mkdir()
+    save_exit_watch(home, "message", pane_id="w1:p9", session_id="s9")
+    db = sqlite3.connect(home / "pr-workspaces.sqlite")
+    with db:
+        db.execute("INSERT INTO exit_watches VALUES (?,?)", ("odd", "[1]"))
+    db.close()
     assert agent_messages.exit_agent(stop_request(), home)["quit"]
 
 

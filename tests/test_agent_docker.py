@@ -227,6 +227,43 @@ def test_failed_exit_is_never_repeated_and_never_resumes(rig, tmp_path):
     assert not any(c[:3] == ("herdr", "pane", "run") for c in rig.calls)
 
 
+def test_an_agent_an_exit_watch_will_quit_is_not_restarted(rig, tmp_path):
+    import exit_watch
+
+    exit_watch.register(
+        tmp_path,
+        {
+            "id": "m1",
+            "label": "Message: go",
+            "machine": None,
+            "pane_id": "w1:p1",
+            "session_id": SID,
+            "exit": exit_watch.watching(),
+        },
+    )
+    # Its exit and the restart's could both send Ctrl-D, the second to the pane's shell.
+    with pytest.raises(ValueError, match="Not restarted: this agent quits by itself"):
+        messages.change_docker(rig.target, True, tmp_path)
+    assert not rig.calls
+
+
+def test_a_restart_never_overlaps_another_exit_of_the_pane(rig, tmp_path, monkeypatch):
+    with docker.handoff.pane_lock(tmp_path, "w1:p1"):
+        with pytest.raises(ValueError, match="Another exit of this agent is under way"):
+            messages.change_docker(rig.target, True, tmp_path)
+    assert not rig.calls
+    quit_agent = docker.quit_agent
+
+    def held(record):
+        with pytest.raises(BlockingIOError):
+            with docker.handoff.pane_lock(tmp_path, "w1:p1", wait=False):
+                pass
+        return quit_agent(record)
+
+    monkeypatch.setattr(docker, "quit_agent", held)
+    assert messages.change_docker(rig.target, True, tmp_path)["docker"] is True
+
+
 @pytest.mark.parametrize("change", ["pid", "session", "sequence", "terminal", "shell"])
 def test_identity_is_rechecked_before_exit(rig, change):
     record = docker.prepare(rig.target, rig.info, rig.procs, rig.state, rig.proc)

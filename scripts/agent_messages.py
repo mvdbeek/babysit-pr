@@ -378,17 +378,31 @@ def change_docker(target, enabled, home):
         owner = watch_owner(session_id, record["agent"], home, chosen.get("claude_config_dir"))
         if owner:
             raise ValueError(f"Not restarted: {owner}")
-        agent_docker.quit_agent(record)
-        result = launch(
-            info["workspace_id"],
-            chosen,
-            target["pane"],
-            "",
-            home,
-            options=record["options"],
-            cwd=record["cwd"],
-            launcher=record["launcher"],
-        )
+        watched = exit_watcher(target["pane"], session_id, home)
+        if watched:
+            raise ValueError(
+                f"Not restarted: this agent quits by itself once its task is done ({watched}); "
+                "nothing was sent"
+            )
+        # Its exit is a quit's: never beside another exit of the pane (exit_agent).
+        with contextlib.ExitStack() as held:
+            try:
+                held.enter_context(herdr_handoff.pane_lock(home, target["pane"], wait=False))
+            except BlockingIOError:
+                raise ValueError(
+                    "Another exit of this agent is under way; nothing was sent. Check it in Collie"
+                ) from None
+            agent_docker.quit_agent(record)
+            result = launch(
+                info["workspace_id"],
+                chosen,
+                target["pane"],
+                "",
+                home,
+                options=record["options"],
+                cwd=record["cwd"],
+                launcher=record["launcher"],
+            )
         observed = None
         if not result["warning"]:
             try:
@@ -681,13 +695,15 @@ def exit_agent(request, home=None):
                     info, procs, _ = herdr_handoff.inspect(pane)
                     herdr_handoff.verify_identity(record, info, procs)
                     if (info.get("agent_session") or {}).get("value") != request["session"]:
-                        raise RuntimeError("The agent moved to another session; nothing was sent")
+                        raise RuntimeError(
+                            "The agent moved to another session; no exit key was sent"
+                        )
                     if info.get("agent_status") not in {"idle", "done"} and not (
                         info.get("agent_status") == "blocked"
                         and record["agent"] == "claude"
                         and idle_screen(pane, herdr_handoff.read_screen(pane))
                     ):
-                        raise RuntimeError("The agent is busy again; nothing was sent")
+                        raise RuntimeError("The agent is busy again; no exit key was sent")
                     herdr_handoff.verify_screen(record, info, herdr_handoff.read_screen(pane))
                     break
                 except herdr_handoff.ScreenNotReady as exc:
@@ -719,7 +735,8 @@ def exit_agent(request, home=None):
 def interactive_shell(pid):
     """Whether process ``pid`` is a shell taking typed commands, which outlives its agent.
 
-    Told by its command line: a shell's name with options only, never ``-c`` or a script.
+    Told by its command line: a shell's name with options only, never ``-c``,
+    ``--command`` or a script.
     """
     try:
         args = subprocess.run(
@@ -734,7 +751,11 @@ def interactive_shell(pid):
     return (
         bool(args)
         and Path(args[0].lstrip("-")).name in SHELLS
-        and all(a.startswith("--") or (a.startswith("-") and "c" not in a) for a in args[1:])
+        and all(
+            (a.startswith("--") and not a.startswith("--command"))
+            or (a.startswith("-") and not a.startswith("--") and "c" not in a)
+            for a in args[1:]
+        )
     )
 
 
@@ -751,15 +772,19 @@ def exit_watcher(pane, session, home):
         path = Path(home) / name
         if not path.exists():
             return []
-        db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+        db = None
         try:
-            return [json.loads(data) for (data,) in db.execute(query)]
+            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+            found = [json.loads(data) for (data,) in db.execute(query)]
         except sqlite3.Error as exc:
             if "no such table" in str(exc):
                 return []  # Nothing was ever watched there.
             raise ValueError(f"Could not read the exit watches ({exc}); nothing was sent") from exc
         finally:
-            db.close()
+            if db is not None:
+                db.close()
+        # A row this version cannot read must not hide the others.
+        return [row for row in found if isinstance(row, dict)]
 
     def follows(row, place):
         target = (row.get("exit") or {}).get("target") or {}

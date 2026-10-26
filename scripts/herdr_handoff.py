@@ -37,6 +37,8 @@ MAX_REMOTE_HANDOFFS = 4
 # How long an exit may take to show, and a typed /exit to reach the composer.
 EXIT_WAIT = 20
 TYPED_EXIT_WAIT = 5
+# Lock files the panes' exits share (pane_lock); an unrelated pane's exit may wait on one.
+PANE_LOCKS = 256
 
 
 class ScreenNotReady(RuntimeError):
@@ -441,15 +443,16 @@ def pane_lock(home, pane, machine=None, *, wait=True):
     watch, a handoff) checks the agent again holding it and lets go only once its keys
     are sent, so a second exit never follows the first into the pane's shell. ``wait``
     False raises BlockingIOError while another holds it; without a home there is no one
-    to share it with.
+    to share it with. Panes share PANE_LOCKS files by hash, so the folder stays bounded:
+    a file must never be removed while another process may hold it.
     """
     if home is None:
         yield
         return
     folder = Path(home) / "pane-locks"
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = hashlib.sha256(f"{machine.id if machine else ''}\0{pane}".encode()).hexdigest()
-    with (folder / key).open("a") as lock:
+    digest = hashlib.sha256(f"{machine.id if machine else ''}\0{pane}".encode()).digest()
+    with (folder / f"{digest[0] % PANE_LOCKS:02x}").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
 
