@@ -1678,12 +1678,14 @@ def quit_agent_state(kind="claude", status="idle", session="s1"):
 def quitting(site, monkeypatch):
     """An idle Claude on session s1 in pane w1:p2, beside the workspace's Codex. Esc leaves
     an agent idle; any other key exits it, leaving only the pane's shell."""
+    import agent_messages
     import herdr_handoff
 
     state = site[4]
     ps = state.parent / "bin" / "ps"
     ps.write_text(f"#!{sys.executable} -S\n" + PS)
     ps.chmod(0o700)
+    monkeypatch.setattr(agent_messages, "PS", str(ps))
     data = read(state)
     agent, procs, screens = quit_agent_state()
     data["agents"] = [data["agents"][0], {**data["agents"][0], **agent}]
@@ -1931,6 +1933,16 @@ def test_an_agent_whose_pane_root_is_no_interactive_shell_is_not_quit(quitting, 
     with pytest.raises(ValueError, match="not an interactive shell.*nothing was sent"):
         agent_messages.exit_agent(stop_request())
     assert keys(quitting) == [] and "typed_text" not in read(quitting)
+
+
+def test_the_root_shell_is_named_by_the_system_ps_never_one_on_path(fake_tools):
+    import agent_messages
+
+    # A ps earlier on PATH would call any process an interactive shell.
+    ps = fake_tools.parent / "bin" / "ps"
+    ps.write_text(f"#!{sys.executable} -S\n" + PS)
+    ps.chmod(0o700)
+    assert not agent_messages.interactive_shell(os.getpid())
 
 
 @pytest.mark.parametrize(

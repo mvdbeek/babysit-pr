@@ -79,6 +79,8 @@ SCREEN_SETTLE = 2
 _exiting: set[tuple[str, int]] = set()
 # Programs a pane's root may run for its agent's quit to leave the pane open.
 SHELLS = {"bash", "dash", "fish", "ksh", "sh", "tcsh", "zsh"}
+# The system's ps, never one earlier on PATH.
+PS = "/bin/ps"
 # Locks by (kind, name): a slow action waits only for others on its checkout, session or
 # pane, never for those elsewhere. Taken in this order of kinds.
 LOCK_ORDER = ("checkout", "session", "pane")
@@ -740,7 +742,7 @@ def interactive_shell(pid):
     """
     try:
         args = subprocess.run(
-            ["ps", "-o", "args=", "-p", str(pid)],
+            [PS, "-o", "args=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=5,
