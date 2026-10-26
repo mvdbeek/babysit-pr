@@ -241,10 +241,12 @@ cache=$home/.cache/babysit-sandbox/${key:0:16}
 # come before every read-only bind, so none of them can shadow one.
 argv+=(--bind "$cache" "$cache")
 [[ -z $config_var ]] || grant "$config_dir"
+granted_dirs=()
 for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   [[ -n $path ]] || continue
   real=$(writable "$path")
   [[ -n $real ]] || continue
+  granted_dirs+=("$real")
   # A grant holding the configuration could move it, read-only entries and all.
   if [[ -n $config_var ]] &&
     [[ $real == "$config_dir" || $config_dir == "$real"/* || $real == "$config_dir"/* ]]; then
@@ -312,6 +314,30 @@ if ((gpg)); then
   socket_dir=$(dirname -- "$socket")
   argv+=(--perms 0700 --dir "$(dirname -- "$socket_dir")" --perms 0700 --dir "$socket_dir"
     --bind "$proxy/S.gpg-agent" "$socket")
+fi
+
+# On a worker, watch registration goes through a broker for this launch, outside the
+# sandbox, which holds the controller's token from worker.json (never shown inside) and
+# forwards only this launch's own sessions, from its configuration directory, in its
+# granted worktrees (worker_broker.py). Its socket is bound like the gpg proxy's.
+broker=
+if [[ -f $home/.config/babysit-pr/worker.json && -n $config_var ]]; then
+  agent=claude
+  [[ $config_var == CLAUDE_CONFIG_DIR ]] || agent=codex
+  if ((print)); then
+    broker=$(mktemp -d -u "${XDG_RUNTIME_DIR:-/tmp}/babysit-register.XXXXXX")
+  else
+    command -v python3 >/dev/null || die "python3 is not installed"
+    broker=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/babysit-register.XXXXXX") || die "cannot create a registration broker directory"
+    exec {ready}< <(exec python3 -I "${self%/*}/worker_broker.py" "$broker/register.sock" "$agent" \
+      "$config_dir" ${granted_dirs[@]+"${granted_dirs[@]}"} </dev/null)
+    if ! read -r -u "$ready" line || [[ $line != ready ]]; then
+      rmdir "$broker" 2>/dev/null || true
+      die "the registration broker did not start"
+    fi
+    exec {ready}<&-
+  fi
+  argv+=(--perms 0700 --dir "$broker" --bind "$broker/register.sock" "$broker/register.sock")
 fi
 
 if ((docker)); then
@@ -390,6 +416,11 @@ for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .git
   .config/git .config/gh; do
   argv+=(--ro-bind-try "$home/$path" "$home/$path")
 done
+# On a worker, the deployed babysit-pr this launcher runs from, read-only (it is
+# protected): its skill and scripts, so an agent can register a watch from inside.
+if [[ -f $home/.config/babysit-pr/worker.json && ${self%/*} == */scripts ]]; then
+  argv+=(--ro-bind "$deployed" "$deployed")
+fi
 
 for name in PATH HOME TERM LANG USER ${env_pass[@]+"${env_pass[@]}"}; do
   [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid variable name $name"
@@ -406,6 +437,7 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
 # Inside, $HOME is empty: a worker's agent learns it is on one from this, set last so
 # no --env-pass value can clear it, and pr_supervisor refuses to register watches there.
 [[ ! -e $home/.config/babysit-pr/worker.json ]] || argv+=(--setenv BABYSIT_WORKER 1)
+[[ -z $broker ]] || argv+=(--setenv BABYSIT_REGISTER_SOCKET "$broker/register.sock")
 
 argv+=(--chdir "$(pwd -P)" -- "${command[@]}")
 if ((print)); then

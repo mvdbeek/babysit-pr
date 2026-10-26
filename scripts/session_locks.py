@@ -100,3 +100,23 @@ def mark_orphan(agent, session_id, config_dir, attempt, machine):
 
 def clear_orphan(agent, session_id, config_dir, machine):
     _orphan(agent, session_id, config_dir, machine).unlink(missing_ok=True)
+
+
+def orphan_attempt(session_id, machine):
+    """The attempt a remote session's tombstone names; None without one."""
+    try:
+        data = json.loads(_orphan(None, session_id, None, machine).read_text())
+    except (OSError, ValueError):
+        return None
+    return data.get("attempt") if isinstance(data, dict) else None
+
+
+def orphans():
+    """Every tombstoned remote session, as (machine, session id, attempt)."""
+    for tombstone in sorted((_state_home() / "session-locks").glob("*/*.orphan")):
+        machine, session_id = tombstone.parent.name, tombstone.name.removesuffix(".orphan")
+        try:
+            path(None, session_id, None, machine)
+        except ValueError:
+            continue  # Not a lease this module names.
+        yield machine, session_id, orphan_attempt(session_id, machine)

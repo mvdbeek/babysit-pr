@@ -24,7 +24,8 @@ def terminal(monkeypatch, tmp_path):
         "sent": [],
     }
 
-    def api(*args):
+    def api(*args, machine=None):
+        assert machine is None  # A local watch never addresses a worker's herdr.
         if args == ("pane", "list"):
             return {"panes": [{"pane_id": state["pane"], "terminal_id": state["terminal"]}]}
         if args[:2] == ("pane", "get"):
@@ -229,8 +230,8 @@ def releasing(terminal, monkeypatch):
     monkeypatch.setattr(pane_runner.os, "tcgetpgrp", lambda fd: 200)
     original = pane_runner.result
 
-    def api(*args):
-        response = original(*args)
+    def api(*args, machine=None):
+        response = original(*args, machine=machine)
         if args[:2] == ("pane", "process-info"):
             response["process_info"]["foreground_process_group_id"] = 200
         return response

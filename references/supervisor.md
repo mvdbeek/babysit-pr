@@ -170,6 +170,25 @@ does not cover children that deliberately detach into another process group,
 or a guardian killed with SIGKILL. A process parented by launchd is not by itself
 evidence of a leak: terminal prompt plugins can intentionally detach workers.
 
+A repair of a watch on a worker keeps its guardian here and runs only the agent
+there (`scripts/remote_repair.py`). The guardian holds an ssh connection to the
+worker half (`pr_supervisor.py _repair_worker`), whose stdin is its lifeline: when it
+ends, the worker half stops the agent's process group (5 s grace). SIGTERM or SIGHUP
+to the guardian ends the lifeline first, waits up to 15 s for the worker half to
+exit, stops the ssh client and then asks the worker to cancel (`_repair_cancel`); a
+guardian killed with SIGKILL ends the lifeline too. So, unlike a local repair, a
+remote one does not survive a controller restart, reboot or network loss: it is
+killed there, its watch blocked, and a later release retries it; nothing reattaches.
+The worker enforces the repair timeout; the guardian gives ssh 60 s more, and the
+service's own missing-result grace remains the backstop. When ssh fails mid-repair
+(exit 255 or that timeout), the guardian cannot tell whether the agent still runs:
+the watch is blocked as "unreachable mid-repair", and a tombstone beside the
+session's lease keeps the session held (no repair, no dashboard resume) until the
+service, once a minute, finds on the worker (`_repair_status`) that the run has a
+result or its worker half is gone. A worker's sshd with `ClientAliveInterval 15`
+and `ClientAliveCountMax 4` (provisioning sets it) ends a partitioned session's
+lifeline within about a minute.
+
 ## Fork and branch CI
 
 To continue the original task after green CI, add `--on-green 'AUTHORIZED_TASK'`
@@ -543,15 +562,131 @@ keystrokes, whatever the quoting. A worker's job checkout must be a linked workt
 the job's clone, outside its `.git`, so an agent cannot point the paths its sandbox is
 given at a repository of its own.
 `scripts/machines.py` loads and validates it; a malformed file is an error, a
-missing one means local only. `register --machine ID` checks the ID against the
-registry and then refuses: watches on other machines are not supported yet. On a
-worker `register` and `handoff` refuse: watch registration from worker machines isn't
-supported yet. A worker is one with `~/.config/babysit-pr/worker.json` (written by
-`provision_worker.sh --user-step`) or with `BABYSIT_WORKER` set. A launch sets it for
-the `wt` it runs, not for the agent's pane, whose shell herdr's server starts; inside
-babysit-bwrap, where `$HOME` is empty, the wrapper sets `BABYSIT_WORKER=1` whenever the
-host has that file. This is a guard against mistakes, not a boundary: an agent outside
-babysit-bwrap, or one that unsets the variable, is not stopped by it.
+missing one means local only.
+
+### Watches on workers
+
+A watch on a worker lives on this machine (the controller) like any other, with
+`machine` set. `register --machine ID` reads everything about it on that worker, never
+at a same-named path here: the checkout (probe op `worktree`: its top, branch, head,
+changes and Git common dir) and the session (probe op `session_info`, which checks the
+worker's rollout or Claude transcript as `register` checks its own, and records the
+worker's account directory). The PR is named (`--pr URL`, or a number with `--repo`,
+or `--branch`); `--pr auto` would need the worker's checkout. The checkout must be a
+clean linked worktree under the worker's `<src>/worktrees` (resolved there), never a
+main clone, whose `.git` other tasks share. Session ids are normalised before they are
+compared. Once the worker's own checks pass, any failure to resolve the PR, a closed PR
+or one whose branch and head the checkout does not match is reported only as "PR not
+found or not watchable from this worker", so registrations cannot probe what this
+machine's GitHub token can see. A worker watch's
+launcher is that worker's own babysit-bwrap (`<babysit_root>/scripts/babysit-bwrap`,
+`~` meaning the worker's home, with `--enable=gpg` when the machine has the `gpg`
+label); `--codex-command`/`--claude-command` are refused, so a registration never
+chooses what runs outside the sandbox there. Only Linux workers take watches.
+
+Repairs run on the worker (see the guardian notes under Controls): the guardian
+checks that the worker deploys this machine's babysit-pr commit (probe op `version`;
+otherwise the watch is blocked with the command to update it), checks the PR and the
+worker checkout as for a local repair, stages a spec (the session, account, timeout,
+expected branch and head, and the prompt) in
+`~/.local/state/babysit-pr/repair-specs/` there with `machines.put_file`, and runs the
+worker half from the worker's deployed copy. That half never opens a queue: it
+refuses a spec from anywhere else and a run folder that already exists (a spec runs
+once), checks the checkout again with that machine's hardened Git, builds the agent's
+environment with the worker's own Claude account directory, and runs the agent in its
+own process group inside the worker's babysit-bwrap (`--enable=gpg` with the machine's
+`gpg` label), keeping `~/.local/state/babysit-pr/runs/<attempt>/` (`agent.log`,
+`prompt.txt`, `reply.json`, `result.json`, `pid`) there. Codex gets its output schema
+and writes its reply in `~/.cache/babysit-repairs/<attempt>/`, the one extra folder its
+sandbox is given (the run folder lies under the protected state directory, and an agent
+able to write it could forge `result.json` or `pid`); the worker half copies the reply
+out, as a regular file read with a size limit, and removes the folder. Its output streams back into
+the guardian's `agent.log`, so a Claude result is read as for a local repair; a
+Codex `reply.json` is fetched by a separate `_repair_status` call after the run. The
+prompt names the agent's own copy of the skill. The session's lease is the
+controller's (`session_locks`, keyed by machine).
+
+A pane-bound watch on a worker (its pane captured through `herdr --machine`) gets the
+worker half's command line typed into that pane, once, by the guardian here. In the
+pane there is no lifeline: the worker half first checks, with the worker's own herdr,
+that it runs in the bound terminal's foreground, then runs the agent in view, bounded
+by the repair timeout, and parses a Claude result itself. The guardian polls
+`_repair_status` every 5 s until the timeout plus 60 s, then copies the last MB of the
+worker's `agent.log`; no result by then leaves the session held as for a lost worker.
+A stop request, even one that lands while the line is being typed, asks the worker to
+cancel (`_repair_cancel`), and leaves the session held when it cannot confirm the agent
+stopped. A cancel of a run that has not started takes its run folder (exclusive
+`mkdir`, result "Cancelled before start"), so a line that runs late fails at its own
+exclusive `mkdir` instead of starting a second agent on the session; clearing an
+orphan tombstone for a run that never started cancels it the same way first.
+
+On a worker, `register` forwards to the controller's dashboard instead of keeping a
+watch of its own, which would act where nobody looks. A worker is one with
+`~/.config/babysit-pr/worker.json` (written by `provision_worker.sh --user-step`) or
+with `BABYSIT_WORKER` set. A launch sets it for the `wt` it runs, not for the agent's
+pane, whose shell herdr's server starts; inside babysit-bwrap, where `$HOME` is empty,
+the wrapper sets `BABYSIT_WORKER=1` whenever the host has that file. The worker resolves
+`--pr auto` with its own `gh` in its checkout. Outside a sandbox it then POSTs the
+registration to `<controller>/api/worker/register` with `Authorization: Bearer
+<token>`, both from `worker.json` (`provision_worker.sh --controller`); it follows no
+redirect and uses no proxy from the environment, so the token goes only to that URL.
+Without a controller and token there, `register` refuses.
+
+Inside babysit-bwrap the sandbox never sees `worker.json`. For each launch with an
+agent configuration on a worker, the wrapper starts a registration broker
+(`scripts/worker_broker.py`) outside the sandbox, with the gpg proxy's lifecycle (a
+private directory under `$XDG_RUNTIME_DIR`, its own session, gone with bwrap), binds
+its socket in and names it last in `BABYSIT_REGISTER_SOCKET`. `register` inside sends
+the request there. The broker forwards only requests for the launch's agent whose
+`cwd` is one of the launch's granted directories and whose session's transcript, once
+resolved, lies exactly in the launch's own store (`--claude-config-dir`'s
+`projects/<project>/<id>.jsonl`, under `--codex-home`'s `sessions/`), so no link leads
+to another account's. It tells the controller to check exactly that transcript and
+passes the configuration directory, which the controller's probe checks again on the
+path it opens (a link swapped in meanwhile is refused); no Claude account is passed,
+so the account is where the transcript lies. One request is forwarded at a time, at
+most one every 20 s per launch, with at most 4 connections open and 30 s to send a
+request.
+The wrapper also shows the deployed babysit-pr read-only inside on a worker, so the
+skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on a worker refuses for now: exit the
+original agent and release the watch on the controller (`release_argv` in the answer).
+
+The dashboard's `/api/worker/register` takes only that: the Host must be one the
+dashboard accepts (`--allow-host`, for the tailnet name), and a request carrying
+`Origin` or `Sec-Fetch-Site` (a browser) is refused. The token decides the machine; the
+body is exactly the registration fields (PR, repo, CI repo or branch, absolute `cwd`,
+session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
+poll interval, budget and timeout), checked by type, form and length, with no control
+characters (the instructions may span lines). One registration per machine runs at a
+time per worktree, at most 6 a minute per machine and worktree (a failed one costs 2
+more, so repeated failures back off; answered 429), so one sandbox cannot hold up the
+others, and a worker watch is polled no more often than every 30 s. With a machine's
+optional `tailnet_ip` in `machines.json` (one address, or a list of up to four, such as
+its IPv4 and IPv6 ones), a registration is refused unless `X-Forwarded-For` is exactly
+one of them: `tailscale serve` sets it to the address the
+request came from, replacing any the client sent. A process on this machine that
+reaches the dashboard directly could still send that header, but it needs the token
+too. `pr_supervisor.py worker-token ID` issues a machine's token: 32 random bytes,
+printed once into a pipe (never to a terminal), and stored on the controller only as
+its SHA-256 in `--home/worker-tokens.json` (mode 600), not in `machines.json`, which
+may be shared. Issuing again replaces it; `--revoke` removes it; a disabled or
+unregistered machine's token is refused. Tokens are compared in constant time against
+every entry.
+
+Residual: a sandboxed agent can register watches only for sessions in its own
+configuration directory, recorded in its own checkout, with instructions of its
+choosing (as it could ask its user to). Its configuration directory is shared with
+every other launch of the same Claude account or Codex home, which can read and write
+those sessions: an agent can register (squat) a session another launch of that account
+recorded in this worktree, or plant one, and a repair then resumes that conversation
+here. That gives it no access the account and its worktree do not already have. Anything
+running unsandboxed as the worker user can read `worker.json` and register any linked
+worktree and session there; a later release turns that into repairs of the session, in
+that worktree's sandbox. Neither can name another machine or choose a launcher. A
+worker watch awaiting release shows its machine, worktree and session id in the
+dashboard and its attention item: release only the session you handed off. Revoke a
+lost worker's token with `worker-token ID --revoke`.
+
 Watches record `machine` (null for this machine), and a worktree path is a
 duplicate only on the same machine. The dashboard reads the diff and
 transcripts of a workspace ID qualified as `ID/w1` on that machine (see the
@@ -584,8 +719,11 @@ is the herdr machine label passed as `herdr --machine=<label>` (labels cannot st
 `os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
 `max_agents` is 1–64, and unknown keys are rejected. `collie_url`, optional, is that
 machine's own Collie (an `http` or `https` URL with a host): its workspaces link
-`<collie_url>/space/<id>`; without one a worker's workspaces link no Collie at all,
-since this machine's Collie cannot open them.
+`<collie_url>/space/<id>`. `collie_host`, optional, is the machine's name in a Collie
+crew this machine leads (`collie crew add <ssh>`, then `collie crew status`): its
+workspaces open through this machine's Collie, or the lead `collie_url` names, as
+`<lead>/space/<id>?h=<collie_host>`. With neither, a worker's workspaces link no Collie
+at all, since this machine's Collie cannot open them.
 Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (`user@host` and `host`) are not detected.
 Disabled machines stay valid for records already pinned to them.

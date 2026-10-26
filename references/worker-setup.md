@@ -217,6 +217,15 @@ itself, and a link would be followed outside the sandbox). Copy the file instead
 and keep any script a hook or status line runs out of the account directory or in
 its `hooks/`.
 
+A freshly signed-in account still shows Claude's first-run screens (the theme picker,
+then the bypass-permissions warning), and an unattended launch waits on them forever;
+the sandboxed Claude can't save the answers into its read-only `settings.json`. After
+`claude-account login <name>`, mark it done outside the sandbox: set
+`"hasCompletedOnboarding": true` in `~/.claude/accounts/<name>/.claude.json` and
+`"skipDangerousModePermissionPrompt": true` in its `settings.json` (as the Mac's
+settings already have). `--check` reports an account that is missing either, or that
+is not signed in.
+
 The worker's `gh` login is used only by agents and git on the worker; the controller
 keeps polling GitHub with its own. Prefer a fine-grained token or a separate GitHub
 account limited to the repositories babysit works on.
@@ -419,6 +428,29 @@ self-updates outside these checks; reinstall via the script with a new pin inste
 4. Keep the worker's babysit-pr at the controller's SHA: rerun the user step with the
    new `--sha` after updating the controller. A mismatch blocks remote work.
 
+5. Let the worker register watches with the controller's dashboard. It reaches the
+   dashboard over the tailnet, at the URL the dashboard is served on there (its
+   tailnet name must be one of the dashboard's `--allow-host` values). On the Mac,
+   issue the machine's token and pipe it straight into the worker's deployed copy;
+   the token is printed only into a pipe and stored on the Mac only as a digest:
+
+   ```sh
+   python3 scripts/pr_supervisor.py worker-token ubuntu-1 | ssh babysit@<box> \
+     'bash ~/.local/share/babysit-pr/app/scripts/provision_worker.sh --controller https://<dashboard tailnet name>'
+   ```
+
+   It adds `controller` and `token` to `~/.config/babysit-pr/worker.json` (mode 600);
+   later user steps keep them. Agents there can then run `pr_supervisor.py register`
+   (inside babysit-bwrap: `<babysit_root>/scripts/pr_supervisor.py`, shown read-only):
+   it forwards to the dashboard, which reads the worktree and session on the worker
+   before recording the watch. Sandboxed agents never see the token; their launch's
+   registration broker forwards only their own sessions in their own worktrees (the
+   supervisor reference's "Watches on workers" has the details). Issue a new token to
+   replace it, or `worker-token ubuntu-1 --revoke`. Optionally add the worker's
+   tailnet addresses as `"tailnet_ip"` to its `machines.json` entry (one address or a
+   list, from `tailscale ip <box>`): registrations then must come through
+   `tailscale serve` from one of them.
+
 **Migrating a worker provisioned before the deployed copy** (babysit-pr in
 `~/src/babysit-pr`, for example chonk pinned at `d55bebe`): rerun the user step with
 the current SHA. It clones the deployed copy to `~/.local/share/babysit-pr/app` and
@@ -485,5 +517,7 @@ From the Linux sandbox section of the supervisor reference, restated for operato
 - Installing Playwright's system libraries (`npx playwright install-deps chromium` as
   root, pinned to the repository's Playwright version) is not automated yet. The user
   step writes `~/.config/babysit-pr/worker.json`, which marks the machine as a worker
-  (babysit-bwrap passes it to agents as `BABYSIT_WORKER=1`).
+  (babysit-bwrap passes it to agents as `BABYSIT_WORKER=1`, and starts a registration
+  broker for them instead of showing them the file). Watches on the worker are repaired there; automatic
+  handoff does not run there yet.
 - The dashboard's Docker toggle is macOS-only (supervisor reference).

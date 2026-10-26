@@ -174,6 +174,13 @@ env={**os.environ,'HOME':str(home)}
 # herdr run there reaches that machine's server, which the controller names by its label.
 label=json.loads(os.environ.get('FAKE_HOST_LABELS','{}')).get(target)
 if label: env['FAKE_HERDR_LOCAL']=label
+drop=os.environ.get('FAKE_SSH_DROP','').split(':')
+if drop[0] == target and drop[1] in subprocess.run(['/bin/sh','-c',command.replace('eval','printf %s',1)],capture_output=True,text=True).stdout:
+ # The network fails mid-command: this client exits 255, the remote side runs on (in its
+ # own session, as on another host) until its stdin, the guardian's pipe, ends.
+ import time
+ subprocess.Popen(['/bin/sh','-c',command],cwd=home,env=env,start_new_session=True)
+ time.sleep(float(drop[2])); sys.exit(255)
 sys.exit(subprocess.call(['/bin/sh','-c',command],cwd=home,env=env))
 """
 

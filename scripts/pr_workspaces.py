@@ -46,10 +46,20 @@ COLLIE_URL = (os.environ.get("COLLIE_PUBLIC_URL") or "http://127.0.0.1:8787").rs
 def collie_url(machine, workspace_id):
     """Collie's page for a herdr workspace on ``machine`` (None: this one).
 
-    A worker's comes from its registry ``collie_url``; without one there is no link.
+    A worker's comes from its registry ``collie_url``; without one there is no link. A
+    worker that is a member of this machine's Collie crew (``collie_host``) opens through
+    the lead, this machine's Collie unless ``collie_url`` names another, addressed to it.
     """
-    base = COLLIE_URL if machine is None else (machine.collie_url or "").rstrip("/")
-    return f"{base}/space/{quote(workspace_id, safe='')}" if base else None
+    if machine is None:
+        base = COLLIE_URL
+    else:
+        base = (machine.collie_url or (COLLIE_URL if machine.collie_host else "")).rstrip("/")
+    if not base:
+        return None
+    url = f"{base}/space/{quote(workspace_id, safe='')}"
+    return (
+        f"{url}?h={quote(machine.collie_host, safe='')}" if machine and machine.collie_host else url
+    )
 
 
 # The portable wt/wti/wtpr implementation shipped next to this module.
@@ -167,16 +177,12 @@ def validate_account(agent, name, machine=None):
 def worker_refusal(target, machine):
     """Why ``target`` cannot start on ``machine``, or None.
 
-    Until repairs run on workers, only work that never needs them goes there: reviews
-    of pull requests and new tasks. An issue's or Sentry issue's fix can end in a pull
-    request watched for repairs.
+    Pull request work and new tasks start on workers, and a watch they register there is
+    repaired there. Issue and Sentry launches have no worker path yet.
     """
     if target.get("kind") in {"pr", "scratch"}:
         return None
-    return (
-        f"Only pull request reviews and new tasks can start on {machine.label} yet: "
-        "other work can lead to a watched pull request, and its repairs run on this machine"
-    )
+    return f"Only pull request work and new tasks can start on {machine.label} yet"
 
 
 remote_slug = remote_probe.remote_slug

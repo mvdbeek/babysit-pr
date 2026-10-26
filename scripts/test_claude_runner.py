@@ -111,7 +111,7 @@ def test_claude_output_is_visible_and_raw_stream_is_logged(capsys):
 def test_capture_matches_original_agent_kind(monkeypatch, tmp_path):
     info = {"terminal_id": "term", "cwd": str(tmp_path), "agent": "claude"}
     procs = {"shell_pid": 100, "foreground_processes": [{"pid": 200}]}
-    monkeypatch.setattr(pane_runner, "inspect", lambda pane: (info, procs))
+    monkeypatch.setattr(pane_runner, "inspect", lambda pane, machine=None: (info, procs))
     assert pane_runner.capture("w1:p1", tmp_path, "claude")["terminal_id"] == "term"
     with pytest.raises(RuntimeError):
         pane_runner.capture("w1:p1", tmp_path, "codex")

@@ -205,6 +205,13 @@ class Feed:
                 reasons.append(
                     reason("watch_blocked", "answer", f"Repair blocked: {clip(job.get('summary'))}")
                 )
+            elif status == "awaiting_release" and job.get("machine"):
+                # Any agent on a worker can register one there: say which session it is.
+                text = (
+                    f"Registered from {job['machine']} for {job.get('cwd')}, session "
+                    f"{job.get('session_id')}: release it only if you handed that session off"
+                )
+                reasons.append(reason("watch_release", "answer", text))
             elif status == "awaiting_release":
                 # A new watch waits for the user to exit the CLI session it will resume.
                 reasons.append(
