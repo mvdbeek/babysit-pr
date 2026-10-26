@@ -115,12 +115,12 @@ def rig(tmp_path, monkeypatch, request):
 
     turns((BRIEF, DONE))
 
-    def result(*args):
-        assert args == ("agent", "list")
+    def result(*args, machine=None):
+        assert args == ("agent", "list") and machine is None
         return {"agents": copy.deepcopy(state["agents"])}
 
-    def inspect(pane):
-        assert pane == "w1:p1"
+    def inspect(pane, machine=None):
+        assert pane == "w1:p1" and machine is None
         state["inspections"] += 1
         if state.get("on_inspect"):
             state["on_inspect"](state["inspections"])
@@ -130,7 +130,7 @@ def rig(tmp_path, monkeypatch, request):
             {"state_change_seq": state["seq"]},
         )
 
-    def send_exit(target, expected, before, owned, save):
+    def send_exit(target, expected, before, owned, save, machine=None, home=None):
         assert expected == handoff.latest_turn(rollout, SID, agent)
         assert before == handoff.fingerprint(rollout)
         # The record says "exiting" durably before any key goes out.
@@ -146,7 +146,7 @@ def rig(tmp_path, monkeypatch, request):
 
     monkeypatch.setattr(handoff, "result", result)
     monkeypatch.setattr(handoff, "inspect", inspect)
-    monkeypatch.setattr(handoff, "read_screen", lambda pane: state["screen"])
+    monkeypatch.setattr(handoff, "read_screen", lambda pane, machine=None: state["screen"])
     monkeypatch.setattr(handoff, "send_exit", send_exit)
     monkeypatch.setattr(
         we, "locate", lambda target, since: {"rollout": str(rollout), "session_id": SID}

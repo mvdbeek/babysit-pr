@@ -574,11 +574,7 @@ def test_a_worker_never_registers_watches_of_its_own(tmp_path, command, marked):
         capture_output=True,
     )
     assert result.returncode == 1
-    error = json.loads(result.stdout)["error"]
-    if command[0] == "handoff":
-        assert error == "Automatic handoff from worker machines isn't supported yet"
-    else:
-        assert "needs the controller's URL and token" in error
+    assert "needs the controller's URL and token" in json.loads(result.stdout)["error"]
     assert not state.exists()
 
 

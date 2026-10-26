@@ -698,7 +698,9 @@ class CronJobs:
             elif launched.get("machine"):
                 label = launched["machine_label"]
                 result.update(
-                    status="running", message=f"Waiting for the agent on {label} to finish"
+                    status="running",
+                    exit=workspace_exit.watching(now()),
+                    message=f"Waiting for the agent on {label} to finish",
                 )
             else:
                 result.update(
@@ -784,8 +786,12 @@ class CronJobs:
     def watch_one(self, run):
         now = self.clock()
         launched = run["agent_run"]
+        machine = None
         if launched.get("machine"):
-            return self.watch_remote(run, now)
+            # Each look costs the worker ssh calls: once every REMOTE_WATCH seconds.
+            if now - run.get("remote_checked_at", 0) < cron_agents.REMOTE_WATCH:
+                return
+            machine = machines.load(self.home).get(launched["machine"])
         op = cron_agents.operation(run, launched)
 
         def persist(record):
@@ -794,8 +800,19 @@ class CronJobs:
                 raise workspace_exit.Leave("The job was deleted; nothing was sent")
             self.update_run(run, exit=record)
 
-        previous = run["exit"].get("state")
-        record = workspace_exit.step(json.loads(json.dumps(run["exit"])), op, persist, now)
+        # A worker's run started before its agents could be exited there has no watch yet.
+        followed = run.get("exit") or workspace_exit.watching(run["started_at"])
+        previous = followed.get("state")
+        if launched.get("machine") and machine is None:
+            record = {
+                **followed,
+                "state": "left_open",
+                "message": f"Stopped watching: {launched['machine']} is no longer registered",
+            }
+        else:
+            record = workspace_exit.step(
+                json.loads(json.dumps(followed)), op, persist, now, machine, self.home
+            )
         if previous == "exiting":
             # The dashboard stopped between claiming the exit and confirming it.
             record.update(state="unconfirmed", message="Exit unconfirmed; check its pane")
@@ -815,15 +832,23 @@ class CronJobs:
         if not self.current(run):
             return
         if record["state"] == "watching":
-            self.update_run(run, exit=record, message=record["message"])
+            checked = {"remote_checked_at": now} if machine is not None else {}
+            self.update_run(run, exit=record, message=record["message"], **checked)
             return
-        text = cron_agents.final_response(record, run["agent"], launched["exit_marker"])
+        text = cron_agents.final_response(
+            record, run["agent"], launched["exit_marker"], machine, self.home
+        )
         if text:
             self.append_log(run, f"\nFinal response:\n{text}\n")
         if record["state"] == "exited":
             # Only the pane this run opened, and only if it is the one the agent left.
-            exited = (record.get("target") or {}).get("pane_id", launched["pane"])
-            closed = exited == launched["pane"] and cron_agents.close_pane(launched["pane"])
+            target = record.get("target") or {}
+            exited = target.get("pane_id", launched["pane"])
+            # On a worker, whose herdr may reuse pane ids, only the agent's own shell.
+            shell = target.get("shell_pid") if machine is not None else None
+            closed = exited == launched["pane"] and cron_agents.close_pane(
+                launched["pane"], machine, shell
+            )
             changes = {
                 "status": "succeeded",
                 "message": "The agent finished and exited"
@@ -832,38 +857,6 @@ class CronJobs:
         else:
             changes = {"status": "attention", "message": record["message"]}
         self.update_run(run, exit=record, finished_at=now, result=bool(text), **changes)
-        self.prune(run["job"])
-
-    def watch_remote(self, run, now):
-        """A worker's run, until its agent confirms the task, leaves its pane or times out.
-
-        Each look costs the worker ssh calls, so it is looked at every REMOTE_WATCH seconds.
-        """
-        if now - run.get("remote_checked_at", 0) < cron_agents.REMOTE_WATCH:
-            return
-        launched = run["agent_run"]
-        label = launched["machine_label"]
-        try:
-            seen = cron_agents.remote_progress(self.home, run, launched)
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-            seen = {"state": "watching", "message": f"Cannot check the agent on {label}: {exc}"}
-        if seen["state"] == "watching" and now - run["started_at"] > run["timeout"]:
-            limit = f"the {run['timeout'] // 60} min time limit"
-            seen = {
-                "state": "left_open",
-                "message": f"Still working at {limit}; left open on {label}",
-            }
-        if not self.current(run):
-            return
-        if seen["state"] == "watching":
-            self.update_run(run, remote_checked_at=now, message=seen["message"])
-            return
-        text = seen.get("text")
-        if text:
-            self.append_log(run, f"\nFinal response:\n{text}\n")
-        self.update_run(
-            run, status="attention", message=seen["message"], finished_at=now, result=bool(text)
-        )
         self.prune(run["job"])
 
     def skip(self, db, job, trigger, due_at, now, reason="The previous run was still going"):

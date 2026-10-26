@@ -202,6 +202,56 @@ def test_the_latest_turn_of_a_workers_transcript(host, tmp_path):
         remote_probe._host_turn(str(path), str(uuid.uuid4()), "claude")
 
 
+def test_the_first_turn_and_fingerprint_of_a_workers_transcript(host, tmp_path):
+    home, clone, _ = host
+    sid, marker = str(uuid.uuid4()), workspace_exit.new_marker()
+    turn = [
+        {"type": "user", "sessionId": sid, "isMeta": True, "message": {"content": "ctx"}},
+        {"type": "user", "sessionId": sid, "uuid": "u1", "message": {"content": f"Go\n{marker}"}},
+        {"type": "user", "sessionId": sid, "uuid": "u2", "message": {"content": "More"}},
+    ]
+    path = claude_session(home, clone, sid, *turn)
+    first = remote_probe.validate_first_turn(
+        remote_probe._host_first_turn(str(path), "claude", marker)
+    )
+    assert first == {"turn": "u1", "marked": True}
+    other = workspace_exit.new_marker()
+    assert remote_probe._host_first_turn(str(path), "claude", other)["marked"] is False
+    with pytest.raises(ValueError, match="completion marker"):
+        remote_probe._host_first_turn(str(path), "claude", "[babysit-done:x]")
+    stat = path.stat()
+    found = remote_probe.validate_fingerprint(remote_probe._host_fingerprint(str(path)))
+    assert found == {"inode": stat.st_ino, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text(path.read_text())
+    for op in (
+        lambda: remote_probe._host_fingerprint(str(outside)),
+        lambda: remote_probe._host_first_turn(str(outside), "claude", marker),
+    ):
+        with pytest.raises(ValueError, match="Not a session transcript"):
+            op()
+    for bad in ({"turn": "", "marked": True}, {"turn": "u1", "marked": 1}, {"turn": None}):
+        with pytest.raises(ValueError, match="Malformed"):
+            remote_probe.validate_first_turn(bad)
+    with pytest.raises(ValueError, match="Malformed"):
+        remote_probe.validate_fingerprint({**found, "size": -1})
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "system", "subtype": "turn_duration"}) + "\n")
+    state = remote_probe.validate_turn_state(
+        remote_probe._host_turn_state(str(path), sid, "claude")
+    )
+    stat = path.stat()
+    assert state == {
+        "turn": "u2",
+        "complete": "",
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    with pytest.raises(ValueError, match="Malformed"):
+        remote_probe.validate_turn_state({**state, "inode": "1"})
+
+
 # A job on the worker, run by the dashboard's cron runner ----------------------------
 
 
@@ -316,37 +366,87 @@ def rollout(host, cwd, sid, *events):
     return path
 
 
-def test_a_workers_run_keeps_the_agents_answer_once_it_confirms(remote):
+EMPTY = "› \x1b[2mAsk Codex to do anything\x1b[0m"
+
+
+def idle_agent(state, path, screen):
+    """The worker's agent at rest in its pane, with its shell and process there."""
+    data = store(state)
+    mini = data["machines"]["Mac mini"]
+    [agent] = mini["agents"]
+    agent["agent_status"] = "idle"
+    mini.setdefault("process_info", {})[agent["pane_id"]] = {
+        "shell_pid": 100,
+        "foreground_processes": [
+            {"pid": 100},
+            {"pid": 4242, "argv0": "codex", "argv": agent["argv"], "cwd": str(path)},
+        ],
+    }
+    mini.setdefault("screens", {})[agent["pane_id"]] = [screen]
+    Path(state).write_text(json.dumps(data))
+
+
+def test_a_workers_run_keeps_the_agents_answer_and_exits_it_once_it_confirms(remote, monkeypatch):
     jobs, manager, _, state, host = remote
+    monkeypatch.setattr(workspace_exit, "SETTLE_SECONDS", 0)
     saved = jobs.save(job_request(manager))
     jobs.run_now(saved["id"])
     run = settled(jobs)
     launched = run["agent_run"]
+    marker = launched["exit_marker"]
+    idle_agent(state, launched["path"], f"Triaged 3 issues.\n{marker}\n{EMPTY}")
     sid = str(uuid.uuid4())
     started = [
-        {"type": "event_msg", "payload": {"type": "user_message", "message": "Triage"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": f"Triage\n{marker}"}},
         {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
     ]
     path = rollout(host, launched["path"], sid, *started)
     watched(jobs)
     run = jobs.snapshot()["jobs"][0]["runs"][0]
-    assert run["status"] == "running" and "Mac mini" in run["message"]
+    assert run["status"] == "running" and run["message"] == "The agent is working"
     done = {
         "type": "event_msg",
         "payload": {
             "type": "task_complete",
             "turn_id": "t1",
-            "last_agent_message": f"Triaged 3 issues.\n{launched['exit_marker']}",
+            "last_agent_message": f"Triaged 3 issues.\n{marker}",
         },
     }
     with path.open("a") as stream:
         stream.write(json.dumps(done) + "\n")
+    watched(jobs)  # Finished: exited once it stays idle.
     watched(jobs)
     run = jobs.snapshot()["jobs"][0]["runs"][0]
-    assert run["status"] == "attention", run["message"]
-    assert run["message"].startswith("Finished on Mac mini") and "still open" in run["message"]
+    assert run["status"] == "succeeded", run["message"]
+    assert run["message"] == "The agent finished and exited"
     assert "Triaged 3 issues." in jobs.log(run["id"])["text"]
-    assert launched["exit_marker"] not in jobs.log(run["id"])["text"]
+    assert marker not in jobs.log(run["id"])["text"]
+    worker = store(state)["machines"]["Mac mini"]
+    assert ["agent", "send-keys", launched["pane"], "ctrl+d"] in worker["calls"]
+    assert ["pane", "close", launched["pane"]] in worker["calls"]
+    # Every herdr call went to the worker's server.
+    assert all(call[0] == "--machine=Mac mini" for call in store(state)["calls"])
+    # The next run is no longer skipped behind an agent left open.
+    jobs.run_now(saved["id"])
+    assert settled(jobs)["status"] == "running"
+
+
+def test_a_workers_pane_is_closed_only_while_it_holds_the_agents_shell(remote):
+    jobs, manager, _, state, host = remote
+    saved = jobs.save(job_request(manager))
+    jobs.run_now(saved["id"])
+    launched = settled(jobs)["agent_run"]
+    data = store(state)
+    data["machines"]["Mac mini"]["process_info"] = {
+        launched["pane"]: {"shell_pid": 999, "foreground_processes": [{"pid": 999}]}
+    }
+    Path(state).write_text(json.dumps(data))
+    worker = cron_agents.machines.resolve(manager.home, "mini")
+    # A pane id reused since: another shell, so it is left alone.
+    assert cron_agents.close_pane(launched["pane"], worker, shell=100) is False
+    calls = store(state)["machines"]["Mac mini"]["calls"]
+    assert ["pane", "close", launched["pane"]] not in calls
+    assert cron_agents.close_pane(launched["pane"], worker, shell=999) is True
 
 
 def test_a_workers_agent_that_leaves_without_confirming_needs_attention(remote):
@@ -359,7 +459,7 @@ def test_a_workers_agent_that_leaves_without_confirming_needs_attention(remote):
     Path(state).write_text(json.dumps(data))
     watched(jobs)
     run = jobs.snapshot()["jobs"][0]["runs"][0]
-    assert run["status"] == "attention" and "left its pane on Mac mini" in run["message"]
+    assert run["status"] == "attention" and "Could not identify the agent" in run["message"]
 
 
 @pytest.mark.parametrize(
@@ -644,12 +744,12 @@ def test_a_hung_worker_never_holds_up_the_scheduler(remote, monkeypatch):
     release = threading.Event()
     calls = []
 
-    def hung(home, run, launched):
-        calls.append(run["id"])
+    def hung(record, *args):
+        calls.append(record)
         release.wait(20)
-        return {"state": "watching", "message": "Still"}
+        return {**record, "message": "Still"}
 
-    monkeypatch.setattr(cron_agents, "remote_progress", hung)
+    monkeypatch.setattr(workspace_exit, "step", hung)
     try:
         started = time.monotonic()
         jobs.watch()
