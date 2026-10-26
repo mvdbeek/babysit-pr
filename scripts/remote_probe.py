@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -944,9 +945,17 @@ class Expired(Exception):
 DEADLINE = None
 # Set once the alarm fired, so expiry is reported even if it lands mid-cleanup.
 EXPIRED_AT_ALARM = False
+# Set once an expired probe stopped its group. A scan thread still running then starts
+# no Git: DEADLINE is reset as the answer goes out, and a Git started after the group
+# was stopped would outlive the probe. Starting one holds _spawning, so the last stop
+# (see __main__) sees every Git started before it.
+STOPPED = False
+_spawning = threading.Lock()
 
 
 def _within_deadline(timeout):
+    if STOPPED:
+        raise Expired("Probe deadline expired")
     if DEADLINE is not None:
         left = DEADLINE - time.monotonic()
         if left <= 0:
@@ -967,19 +976,29 @@ def host_environment():
 
 
 def _host_run(argv, timeout):
-    try:
-        return subprocess.run(
+    with _spawning:
+        timeout = _within_deadline(timeout)
+        proc = subprocess.Popen(
             argv,
             env=host_environment(),
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_within_deadline(timeout),
         )
-    except subprocess.TimeoutExpired as exc:
-        if _past_deadline():
-            raise Expired("Probe deadline expired") from exc
-        raise
+    with proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            proc.wait()
+            if _past_deadline():
+                raise Expired("Probe deadline expired") from exc
+            raise
+        except BaseException:
+            proc.kill()  # As subprocess.run does: the alarm's Expired leaves no Git behind.
+            raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 # Overrides by repository path, read once per probe run.
@@ -1047,19 +1066,21 @@ def host_output(path, *args, limit=None, timeout=GIT_TIMEOUT):
     unquoted, as the controller's own reader shows them.
     """
     limit = MAX_DIFF if limit is None else limit
-    timeout = _within_deadline(timeout)
-    deadline = time.monotonic() + timeout
     chunks: list[bytes] = []
     size = 0
     truncated = False
     with tempfile.TemporaryFile() as errors:
-        proc = subprocess.Popen(
-            host_argv(path, args, ("-c", "core.quotePath=false")),
-            env=host_environment(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=errors,
-        )
+        argv = host_argv(path, args, ("-c", "core.quotePath=false"))
+        with _spawning:
+            timeout = _within_deadline(timeout)
+            deadline = time.monotonic() + timeout
+            proc = subprocess.Popen(
+                argv,
+                env=host_environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+            )
         assert proc.stdout is not None
         try:
             with selectors.DefaultSelector() as selector:
@@ -2207,8 +2228,10 @@ OPS: dict[str, Callable[..., Any]] = {
 
 def _stop_group():
     # A probe leading its own process group (see __main__) stops its Git children too;
-    # it ignores the signal it sends them.
+    # it ignores the signal it sends them, and starts no more.
+    global STOPPED
     if os.getpgrp() == os.getpid():
+        STOPPED = True
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         os.killpg(0, signal.SIGTERM)
 
@@ -2247,8 +2270,8 @@ def main(argv):
 
 
 def _answer(argv):
-    global DEADLINE, EXPIRED_AT_ALARM
-    EXPIRED_AT_ALARM = False
+    global DEADLINE, EXPIRED_AT_ALARM, STOPPED
+    EXPIRED_AT_ALARM = STOPPED = False
     previous = None
     try:
         if len(argv) != 3 or argv[1] != PROTOCOL:
@@ -2841,5 +2864,9 @@ if __name__ == "__main__":
         pass  # Already leading its session, and so its group.
     status = main(sys.argv)
     sys.stdout.flush()
+    if status == EXPIRED:
+        # Once more, after any Git a scan thread was starting as the alarm came.
+        _spawning.acquire(timeout=5)
+        _stop_group()
     # Answered: a thread still stuck in a read must not keep the process alive.
     os._exit(status)

@@ -18,6 +18,8 @@ VERSION = re.compile(r"\d+\.\d+\.\d+[0-9A-Za-z.+-]*")
 # Package managers may keep an executable's timestamp across upgrades, so a version
 # found for an unchanged file is still rechecked after this many seconds.
 VERSION_RECHECK = 600
+# Seconds `codex --version` may take to answer.
+VERSION_TIMEOUT = 3
 REMEMBERED = "codex-models.json"
 # Reasoning efforts a launch left on Default uses: a global one and one per repository.
 DEFAULTS = "effort-defaults.json"
@@ -53,7 +55,7 @@ def codex_version():
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=VERSION_TIMEOUT,
                 check=False,
             ).stdout
         except (OSError, subprocess.SubprocessError):
