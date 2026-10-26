@@ -10,6 +10,7 @@ import json
 import stat
 import threading
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 import agent_messages
@@ -136,6 +137,70 @@ def test_a_worker_clone_is_locked_apart_from_this_machines(fleet, plugin):
     assert local.name == hashlib.sha256(clone.encode()).hexdigest()
     mini = plugin.key_machine("m:mini:/src/repo/x")
     assert plugin.lock_file(clone, mini).name == hashlib.sha256(b"mini\0/src/repo").hexdigest()
+    # The lock a launch on that worker takes for the same clone.
+    assert plugin.lock_file(clone, mini) == machines.clone_lock(fleet["home"], mini, clone)
+
+
+def stale_cleanup(plugin, monkeypatch, key, approve):
+    """Clean up ``key`` as resolved now, with an untracked file written after that."""
+    row = plugin.resolve(key)
+    path = row["path"]
+    monkeypatch.setattr(plugin, "resolve", lambda wanted: row)
+    (Path(path) / "written-meanwhile.txt").write_text("work")
+    return cleanup(plugin, (key, approve))[key], Path(path)
+
+
+def test_approving_only_a_working_agent_keeps_the_worker_clean_check(fleet, plugin, monkeypatch):
+    key = f"m:mini:{fleet['mini'] / 'merged-work'}"
+    result, path = stale_cleanup(plugin, monkeypatch, key, ["agent"])
+    assert result["status"] == "failed" and "untracked files; kept" in result["message"]
+    assert (path / "written-meanwhile.txt").exists()
+
+
+def test_approving_only_a_working_agent_keeps_the_local_clean_check(fleet, plugin, monkeypatch):
+    key = str(fleet["local"] / "local-work")
+    result, path = stale_cleanup(plugin, monkeypatch, key, ["agent"])
+    assert result["status"] == "failed" and "untracked files; kept" in result["message"]
+    assert (path / "written-meanwhile.txt").exists()
+
+
+def test_a_worker_workspace_without_its_clone_is_never_taken_for_missing(fleet, plugin):
+    store = read(fleet["state"])
+    store["machines"]["Mac mini"]["workspaces"].append(
+        {
+            "workspace_id": "w5",
+            "label": "odd",
+            "worktree": {
+                "repo_root": "relative",
+                "checkout_path": str(fleet["mini"] / "merged-work"),
+            },
+        }
+    )
+    fleet["state"].write_text(json.dumps(store))
+    row = plugin.resolve("workspace:mini:w5")
+    assert not row["missing"] and [b["kind"] for b in row["blockers"]] == ["detached"]
+
+
+def test_worker_pane_ids_are_checked_before_herdr_gets_them(fleet, plugin, monkeypatch):
+    agent = {"workspace_id": "w1", "agent": "claude", "agent_status": "idle"}
+    assert plugin.remote_agent({**agent, "pane_id": "--machine=box"})["pane_id"] is None
+    assert plugin.remote_agent({**agent, "pane_id": "w1:p1"})["pane_id"] == "w1:p1"
+    monkeypatch.setattr(wso, "herdr", lambda *args, **kwargs: {"agents": [1, "x", None]})
+    monkeypatch.setattr(wso, "EXIT_WAIT", 0.3)
+    plugin.await_exit({"w1:p1"}, plugin.key_machine("m:mini:/x"))
+
+
+def test_a_disabled_workers_row_is_not_messaged(fleet, plugin):
+    key = f"m:mini:{fleet['mini'] / 'dirty-work'}"
+    assert plugin.worker_checkout(key)[1] == str(fleet["mini"] / "dirty-work")
+    register(fleet["home"], {**MINI, "enabled": False})
+    with pytest.raises(ValueError, match="Mac mini is disabled"):
+        plugin.worker_checkout(key)
+
+
+def test_the_removal_probe_outlasts_its_git_calls():
+    # The clean check's status and listing, the removal, and its quick Git reads.
+    assert wso.REMOVE_TIMEOUT >= 3 * 300 + 3 * 60
 
 
 # The probe's remove op, in this process ----------------------------------------------
@@ -179,6 +244,37 @@ def test_remove_runs_the_hardened_clean_check_unless_forced(clone):
     assert not topic.exists() and "topic" not in branches(clone)
 
 
+def test_remove_deletes_the_tree_without_following_symlinks_then_unregisters_it(
+    clone, tmp_path, monkeypatch
+):
+    topic = clone.parent / "worktrees" / "repo" / "topic"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    (topic / "link").symlink_to(outside)
+    deleted = []
+    real = remote_probe.shutil.rmtree
+
+    def rmtree(path, **kwargs):
+        deleted.append(path)
+        return real(path, **kwargs)
+
+    rmtree.avoids_symlink_attacks = real.avoids_symlink_attacks
+    assert rmtree.avoids_symlink_attacks  # Linux and macOS both have the fd-based delete.
+    monkeypatch.setattr(remote_probe.shutil, "rmtree", rmtree)
+    remote_probe._host_remove(str(clone), str(topic), True, None, True)
+    assert deleted == [str(topic.resolve())]
+    assert (outside / "keep.txt").exists() and not topic.exists()
+    assert str(topic) not in git("worktree", "list", cwd=clone)
+
+
+def test_remove_refuses_the_main_checkout_named_from_a_linked_worktree(clone):
+    topic = clone.parent / "worktrees" / "repo" / "topic"
+    with pytest.raises(ValueError, match="not the top of a clone|own checkout"):
+        remote_probe._host_remove(str(topic), str(clone), True, None, True)
+    assert (clone / ".git").is_dir()
+
+
 def test_remove_keeps_a_branch_not_checked_out_there_or_not_merged(clone):
     worktrees = clone.parent / "worktrees" / "repo"
     done = remote_probe._host_remove(str(clone), str(worktrees / "topic"), False, "other", True)
@@ -191,6 +287,12 @@ def test_remove_keeps_a_branch_not_checked_out_there_or_not_merged(clone):
     done = remote_probe._host_remove(str(clone), str(other), False, "other", False)
     assert done["worktree"] == "removed" and done["branch"] == "kept"
     assert "not fully merged" in done["detail"] and "other" in branches(clone)
+
+
+def test_resolve_answers_pass_no_unvalidated_fields(clone):
+    topic = str(clone.parent / "worktrees" / "repo" / "topic")
+    found = remote_probe._host_resolve(str(clone.parent), [], [], path=topic)
+    assert "updates" not in remote_probe.validate_resolve({**found, "updates": {}})
 
 
 def test_resolve_reads_only_a_scanned_clone(clone, tmp_path):
@@ -417,6 +519,26 @@ def test_a_worker_resume_is_refused_on_its_own_facts(exited):
     assert "runs" not in mini(exited) and not staged_prompts(exited)
 
 
+def test_a_worker_resume_locks_its_checkout_by_the_workers_real_path(exited, monkeypatch):
+    link = exited.host / "linked"
+    link.symlink_to(exited.checkout)
+    store = mini(exited)
+    store["workspaces"][0]["worktree"]["checkout_path"] = str(link)
+    mini_store(exited, workspaces=store["workspaces"])
+    taken = []
+    real = agent_messages.locked
+
+    def locked(*keys):
+        taken.extend(keys)
+        return real(*keys)
+
+    monkeypatch.setattr(agent_messages, "locked", locked)
+    agent_messages.send(
+        {"workspace": "w1", "resume": CLAUDE_SID, "text": ""}, exited.home, machine=exited.machine
+    )
+    assert ("checkout", f"mini:{exited.checkout.resolve()}") in taken
+
+
 def test_a_closed_worker_workspace_is_reopened_there_and_followed(exited):
     assert wv.remote_checkout(exited.machine, "w1") == str(exited.checkout)
     # Another checkout's workspace stays open there, so the reopened one gets a new ID.
@@ -489,6 +611,13 @@ def test_the_resume_probe_reports_the_workers_own_paths(worker, monkeypatch):
         remote_probe._host_resume(
             str(worker.checkout), str(worker.checkout), **{**args, "account": "nobody"}
         )
+    # The folder is trusted in the config the sandboxed Claude reads, as launches trust it.
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")
+    config = worker.host / ".claude" / ".claude.json"
+    config.write_text("{}")
+    remote_probe._host_resume(str(worker.checkout), str(worker.checkout), **args)
+    projects = json.loads(config.read_text())["projects"]
+    assert projects[found["path"]] == {"hasTrustDialogAccepted": True}
     for bad in ({"cwd": "/w\x1b[2J"}, {"cwd_exists": "yes"}, {"launcher": "relative"}):
         with pytest.raises(ValueError, match="Malformed probe answer"):
             remote_probe.validate_resume({**found, **bad})

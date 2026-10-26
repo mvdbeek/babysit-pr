@@ -62,6 +62,10 @@ def remote(local, short_tmp, monkeypatch):  # noqa: F811
     return manager, pr, state, worker
 
 
+def clone_path(worker):
+    return str((worker / "src" / "repo").resolve())
+
+
 def store(state):
     return json.loads(Path(state).read_text())
 
@@ -132,9 +136,13 @@ def test_a_review_on_a_worker_starts_there(remote):
     )
     assert watch["pane_id"] == agent["pane_id"] and watch["agent"] == "codex"
     assert not (worker / ".local/state/babysit-pr/pr-workspaces.sqlite").exists()
-    # The clone lock is the worker's clone, never a same-named one here.
-    key = hashlib.sha256(b"mini\0~/src/repo").hexdigest()
+    # The clone lock is the worker's clone by its real path there, the lock its cleanup
+    # takes, never a same-named one here.
+    key = hashlib.sha256(f"mini\0{clone_path(worker)}".encode()).hexdigest()
     assert (manager.home / "workspace-locks" / key).exists()
+    mini_machine = machines.load(manager.home)["mini"]
+    lock = machines.clone_lock(manager.home, mini_machine, clone_path(worker))
+    assert lock.name == key
     assert manager.scheduled_tasks()["launched"][0]["url"] is None
     register(manager.home, collie_url="https://collie.mini.test")
     assert manager.scheduled_tasks()["launched"][0]["url"] == "https://collie.mini.test/space/w1"

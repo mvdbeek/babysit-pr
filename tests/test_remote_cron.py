@@ -4,6 +4,7 @@ The worker is a directory under ``<tmp>/hosts/<ssh target>`` that the fake ssh u
 HOME; its herdr state lives in the fake herdr's per-label store.
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -304,6 +305,31 @@ def settled(jobs, statuses=("starting",)):
 
 def store(state):
     return json.loads(Path(state).read_text())
+
+
+def test_a_workers_job_checkout_holds_its_clones_lock(remote, monkeypatch):
+    """The lock cleanup and launches on that worker take, by the clone's real path there."""
+    jobs, manager, git_local, state, host = remote
+    held = []
+    real = cron_agents.remote_checkout
+
+    def checkout(job, home, machine):
+        lock = machines.clone_lock(home, machine, str((host / "src/repo").resolve()))
+        with lock.open("a") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held.append(True)
+            else:
+                fcntl.flock(other, fcntl.LOCK_UN)
+                held.append(False)
+        return real(job, home, machine)
+
+    monkeypatch.setattr(cron_agents, "remote_checkout", checkout)
+    saved = jobs.save(job_request(manager))
+    jobs.run_now(saved["id"])
+    assert settled(jobs)["status"] == "running"
+    assert held == [True]
 
 
 def test_a_job_on_a_worker_starts_its_agent_there(remote):

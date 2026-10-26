@@ -1300,7 +1300,11 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
         raise ValueError("That session is not recorded for this workspace")
     if machine is not None and chosen["agent"] == "claude" and not chosen.get("claude_account"):
         raise ValueError(f"That session's Claude home is not an account on {machine.label}")
-    # A worker's checkout is named as it spells it; nothing looks it up here.
+    # A worker's own paths, its probe's: the checkout's real one names its lock there.
+    found = None
+    if machine is not None:
+        found = remote_resume(home, machine, root, chosen)
+        root = found["path"]
     real = os.path.realpath(root) if machine is None else root
     # One resume of a session, and in a checkout, at a time, held until its agent shows up:
     # a second request then sees it.
@@ -1323,14 +1327,12 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
             return prompt(elsewhere, text, machine)
         # A session resumes from the directory it was recorded in (Claude looks its ID up
         # in that directory's project folder).
-        found = None
-        if machine is None:
+        if found is None:
             details = workspace_viewer.details(chosen["_file"], chosen["agent"]) or {}
             cwd = details.get("cwd") or root
             exists = Path(cwd).is_dir()
         else:
-            found = remote_resume(home, machine, root, chosen)
-            cwd, exists, root = found["cwd"], found["cwd_exists"], found["path"]
+            cwd, exists = found["cwd"], found["cwd_exists"]
         if not exists:
             raise ValueError("The session's directory no longer exists")
         # Last before herdr is asked for a pane, so a confirmed cancellation is spent only

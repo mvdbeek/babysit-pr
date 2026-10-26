@@ -19,6 +19,7 @@ import math
 import os
 import re
 import selectors
+import shutil
 import signal
 import stat
 import subprocess
@@ -2070,6 +2071,8 @@ def _host_remove(root, path, force, branch, safe):
     common = os.path.realpath(
         host_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
     )
+    if os.path.dirname(common) != root:
+        raise ValueError(f"{root} is not the top of a clone")
     listed = {}
     listing = host_git(root, "worktree", "list", "--porcelain", "-z", strip=False)
     for record in listing.split("\0\0"):
@@ -2082,7 +2085,8 @@ def _host_remove(root, path, force, branch, safe):
     named = next((entry for entry in listed if os.path.realpath(entry) == real), None)
     if named is None:
         raise ValueError(f"{path} is not a worktree of {root}")
-    if real == root:
+    # Git lists the main worktree first.
+    if real == root or named == next(iter(listed)):
         raise ValueError(f"{path} is the clone's own checkout; kept")
     if real == common or real.startswith(common + os.sep):
         raise ValueError(f"{path} lies inside {root}'s Git directory; kept")
@@ -2099,6 +2103,11 @@ def _host_remove(root, path, force, branch, safe):
                 entry.startswith("160000 ") for entry in staged.split("\0")
             ):
                 raise ValueError(f"{path} contains submodules; kept")
+        # Git's own recursive delete goes by path, so a directory swapped for a symlink
+        # meanwhile would be followed out of the tree; this one never follows one. Git
+        # then only drops the registration of a tree already gone.
+        if shutil.rmtree.avoids_symlink_attacks:
+            shutil.rmtree(real)
         host_git(root, "worktree", "remove", "--force", named, timeout=300)
         worktree = "removed"
     result = {"worktree": worktree, "branch": None, "detail": None}
@@ -2113,6 +2122,12 @@ def _host_remove(root, path, force, branch, safe):
     return {**result, "branch": "deleted"}
 
 
+def _host_realpath(path):
+    """A path's real spelling here, for a lock the controller names after it."""
+    _arg_paths([path], home=True)
+    return {"path": os.path.realpath(os.path.expanduser(path))}
+
+
 def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
     """What the line resuming a session in the checkout ``root`` needs on this machine.
 
@@ -2120,7 +2135,8 @@ def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
     is reported with whether it still exists. The rest is what ``cron_checkout``
     reports for a launch: the checkout's common dir, the agent's configuration (Claude's
     home, and the ``CLAUDE_CONFIG_DIR`` to type, literal, for ``account``), Codex's home
-    and babysit-bwrap here.
+    and babysit-bwrap here. Claude is trusted for the checkout in the config its sandbox
+    reads, as launches trust it, so the resume never stops at the trust dialog.
     """
     _arg_paths([root, cwd])
     _arg_paths([babysit_root], home=True)
@@ -2133,7 +2149,9 @@ def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
     real = os.path.realpath(cwd)
     if real != path and not real.startswith(path + os.sep):
         raise ValueError("The session's directory is outside its checkout")
-    claude_home, claude_env, _ = _host_claude(agent, account, sandbox)
+    claude_home, claude_env, config = _host_claude(agent, account, sandbox)
+    if config is not None:
+        _host_trust(config, path)
     home = os.path.realpath(os.path.expanduser("~"))
     launcher = os.path.join(
         os.path.realpath(os.path.expanduser(babysit_root)), "scripts", "babysit-bwrap"
@@ -2157,6 +2175,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "resolve": _host_resolve,
     "remove": _host_remove,
     "resume": _host_resume,
+    "realpath": _host_realpath,
     "diff": _host_diff,
     "bases": _host_bases,
     "sessions": _host_sessions,
@@ -2609,7 +2628,7 @@ def validate_resolve(value):
     rest = {k: v for k, v in value.items() if k != "root"}
     _expect(isinstance(rest.get("clones"), list) and len(rest["clones"]) <= 1, "clones")
     validate_inventory({**rest, "updates": {}})
-    return value
+    return {k: v for k, v in value.items() if k != "updates"}
 
 
 def validate_remove(value):
@@ -2617,6 +2636,11 @@ def validate_remove(value):
     _expect(value["worktree"] in {"removed", "missing"}, "worktree")
     _expect(value["branch"] in {None, "deleted", "kept"}, "branch")
     _expect(_optional_text(value["detail"]), "detail")
+    return value
+
+
+def validate_realpath(value):
+    _expect(isinstance(value, dict) and set(value) == {"path"} and _absolute(value["path"]), "path")
     return value
 
 
@@ -2718,6 +2742,7 @@ VALIDATORS = {
     "resolve": validate_resolve,
     "remove": validate_remove,
     "resume": validate_resume,
+    "realpath": validate_realpath,
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,

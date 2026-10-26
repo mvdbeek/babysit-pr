@@ -19,6 +19,7 @@ Collie and the run needs attention. A job on a worker is followed and exited the
 way through that worker's herdr and probe.
 """
 
+import fcntl
 import os
 import re
 import subprocess
@@ -370,7 +371,12 @@ def start(job, run_id, home, src):
             raise ValueError(
                 f"Jobs on worker machines always run in their sandbox ({machine.label})"
             )
-        found = remote_checkout(job, home, machine)
+        # Its worktree is made under the clone's lock, which cleanup and launches on that
+        # worker take by the clone's real path there.
+        real = probe(home, machine, "realpath", 30, path=job["clone"])["path"]
+        with machines.clone_lock(home, machine, real).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            found = remote_checkout(job, home, machine)
         path, clone = found["path"], found["clone"]
     workspace = workspace_for(path, machine)
     anchor = None

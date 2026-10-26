@@ -29,7 +29,15 @@ import owned_process
 import remote_probe
 import safe_git
 import workspace_viewer
-from pr_workspaces import SLUG, clone_worktrees, collie_url, herdr, remote_slugs, repo_config
+from pr_workspaces import (
+    PANE,
+    SLUG,
+    clone_worktrees,
+    collie_url,
+    herdr,
+    remote_slugs,
+    repo_config,
+)
 
 INTERVAL = 300  # Local rescan cadence; GitHub state has its own freshness window.
 MIN_REFRESH = 60  # Floor between requested rescans, however often the tab asks.
@@ -57,7 +65,7 @@ REMOTE_GRACE = 5  # Beyond a worker's deadline, for an answer already on its way
 HERDR_TIMEOUT = 30
 # A worker's re-read of one clone, and its removal of one worktree with Git's own room.
 RESOLVE_TIMEOUT = 120
-REMOVE_TIMEOUT = 660
+REMOVE_TIMEOUT = 1200
 # What one worker may contribute to a scan, and so to the cache shared with this machine.
 MAX_REMOTE_CLONES = 200
 MAX_REMOTE_ITEMS = 1000
@@ -70,6 +78,9 @@ WORKING = {"working", "blocked"}
 # A cleanup override approves these by kind, so a changed count is not a new blocker
 # but a newly appeared condition is, and is never swept along by one tick.
 OVERRIDABLE = {"main", "dirty", "unpushed", "agent", "unknown", "detached"}
+# Only these approve losing what Git's clean check would keep: a working agent's
+# approval must not sweep away what it writes until its workspace closes.
+CLEAN_OVERRIDES = {"dirty", "unknown"}
 CLOSED = {"closed", "merged"}
 ISSUE_NAME = re.compile(r"^issue-(\d+)(?:-|$)")
 PR_NAME = re.compile(r"^pr-([A-Za-z0-9][A-Za-z0-9-]*?)-(\d+)(?:-\d+)?$")
@@ -911,10 +922,14 @@ class WorkspaceOverview:
     def remote_agent(self, agent):
         if not isinstance(agent, dict):
             return None
-        return {
+        found = {
             field: self.remote_text(agent.get(field))
-            for field in ("workspace_id", "agent", "agent_status", "pane_id")
+            for field in ("workspace_id", "agent", "agent_status")
         }
+        # Passed to herdr's command line by cleanup: never one read as an option.
+        pane = agent.get("pane_id")
+        found["pane_id"] = pane if isinstance(pane, str) and PANE.fullmatch(pane) else None
+        return found
 
     @staticmethod
     def capped(found, notes, label):
@@ -1381,7 +1396,10 @@ class WorkspaceOverview:
             or row["missing"]
         ):
             raise ValueError("Unknown workspace; refresh the list")
-        return machines.resolve(self.home, row["machine"]), row["path"]
+        machine = machines.resolve(self.home, row["machine"])
+        if machine is None or not machine.enabled:
+            raise ValueError(f"{row['machine_label']} is disabled")
+        return machine, row["path"]
 
     # Cleanup -------------------------------------------------------------------
 
@@ -1533,6 +1551,8 @@ class WorkspaceOverview:
             spaces = [space for space in spaces if space["workspace_id"] == wid]
             root = ((spaces or [{}])[0].get("worktree") or {}).get("repo_root")
             if not spaces or not root or not root.startswith("/"):
+                # Without its clone the checkout is unknown, never taken for missing.
+                self.resolved_spaces(spaces, {})
                 rows = self.orphan_rows(spaces, agents, {}, machine)
                 return rows[0] if rows else None
             path = None
@@ -1606,16 +1626,18 @@ class WorkspaceOverview:
             if machine is not None:
                 kept = self.remove_remote(job, index, row, steps, approved, machine)
             else:
-                self.remove_worktree(job, index, row, steps, bool(approved))
+                self.remove_worktree(job, index, row, steps, bool(approved & CLEAN_OVERRIDES))
                 kept = self.delete_branch(job, index, row, steps, approved)
         self.record(job, index, status="done", message=kept or "Cleaned up", steps=steps)
 
     def lock_file(self, clone, machine=None):
-        """The lock of one clone; a worker's clone is named with its machine."""
+        """The lock of one clone; a worker's, which its probe resolved, is the one its
+        launches take."""
+        if machine is not None:
+            return machines.clone_lock(self.home, machine, str(clone))
         directory = self.home / "workspace-locks"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        name = str(clone) if machine is None else f"{machine.id}\0{clone}"
-        return directory / hashlib.sha256(name.encode()).hexdigest()
+        return directory / hashlib.sha256(str(clone).encode()).hexdigest()
 
     def progress(self, job, index, steps, message):
         steps.append(message)
@@ -1647,7 +1669,8 @@ class WorkspaceOverview:
         deadline = time.monotonic() + EXIT_WAIT
         while time.monotonic() < deadline:
             try:
-                live = {a.get("pane_id") for a in herdr("agent", "list", machine=machine)["agents"]}
+                listed = herdr("agent", "list", machine=machine)["agents"]
+                live = {a.get("pane_id") for a in listed if isinstance(a, dict)}
             except (OSError, ValueError, KeyError, subprocess.SubprocessError):
                 return
             if not panes & live:
@@ -1718,7 +1741,7 @@ class WorkspaceOverview:
             REMOVE_TIMEOUT,
             root=row["repo_root"],
             path=row["path"],
-            force=bool(approved),
+            force=bool(approved & CLEAN_OVERRIDES),
             branch=branch,
             safe=row["unpushed"] == 0 or "unpushed" in approved,
         )
