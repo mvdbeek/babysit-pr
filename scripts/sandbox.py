@@ -151,10 +151,12 @@ def typed_line(
     claude_config_dir: str | None = None,
     launcher: str | None = None,
     confined: Sequence[str] | None = None,
+    permission_mode: str | None = None,
 ) -> str:
     """The shell line a multiplexer types to start agent ``words`` in the sandbox.
 
-    ``skip_permissions`` is the agent's flag that turns its own permissions off. The
+    ``skip_permissions`` is the agent's flag that turns its own permissions off;
+    ``permission_mode`` (Claude's ``--permission-mode``) replaces it. The
     granted directory list is staged through ``stage``, like the prompt, so the typed
     line does not grow with every path. Safehouse grants the shell's working directory
     itself; babysit-bwrap is given ``worktree`` and the agent's configuration, typed
@@ -166,13 +168,17 @@ def typed_line(
     nothing here can look up.
     """
     name = backend(name)
+    permissions = ["--permission-mode", permission_mode] if permission_mode else [skip_permissions]
     if name == "none":
         # `command` skips the shell function, so its flag is added here instead.
-        return typed(shlex.join(["command", words[0], skip_permissions, *words[1:]]))
+        return typed(shlex.join(["command", words[0], *permissions, *words[1:]]))
     dirs = list(dict.fromkeys(grants.add_dirs))
     if name == "safehouse":
-        # The shell's `safe` function adds the permission flag and runs Safehouse.
+        # The shell's agent function adds the permission flag and runs Safehouse through
+        # `safe`; another mode calls `safe` itself, so the flag is not added as well.
         command = shlex.join(words)
+        if permission_mode:
+            command = "safe " + shlex.join([words[0], *permissions, *words[1:]])
         if "docker" in grants.features:
             command = f"SAFE_ENABLE=docker {command}"
         if dirs:
@@ -187,7 +193,7 @@ def typed_line(
     if dirs:
         options.append(f'"--add-dirs=$(cat {shlex.quote(stage(":".join(dirs)))})"')
     launch = [shlex.quote(launcher or str(SCRIPTS / "babysit-bwrap")), *options, "--"]
-    return typed(" ".join([*launch, shlex.join([words[0], skip_permissions, *words[1:]])]))
+    return typed(" ".join([*launch, shlex.join([words[0], *permissions, *words[1:]])]))
 
 
 def env_pass_prefix(names: Sequence[str], name: str | None = None) -> str | None:

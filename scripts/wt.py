@@ -35,6 +35,8 @@ MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CODEX_EFFORTS = frozenset({"none", "minimal", "ultra"})
+# Claude permission modes wt starts instead of the shell function's bypass.
+PERMISSION_MODES = frozenset({"auto"})
 CODEX_NO_UPDATE_CHECK = "check_for_update_on_startup=false"
 # Canonical tty input drops a longer typed line (MAX_CANON is 1024 bytes on macOS).
 TYPED_LIMIT = 1000
@@ -56,6 +58,7 @@ VALUE_OPTIONS = {
     "--model": "model",
     "--effort": "effort",
     "--claude-account": "claude_account",
+    "--permission-mode": "permission_mode",
     "--name": "name",
     "--label": "label",
     "--repo-path": "repo_path",
@@ -72,6 +75,7 @@ WT_OPTIONS = frozenset(
         "--model",
         "--effort",
         "--claude-account",
+        "--permission-mode",
         "-r",
         "-p",
         "--prompt",
@@ -121,6 +125,8 @@ options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
   --claude-account <name>  use a named Claude login (or default)
+  --permission-mode auto  run Claude in its auto permission mode inside the sandbox,
+                instead of bypassing its permission checks (Claude only)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
                 the sandboxed agent write there (repeatable)
@@ -173,6 +179,8 @@ options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
   --claude-account <name>  use a named Claude login (or default)
+  --permission-mode auto  run Claude in its auto permission mode inside the sandbox,
+                instead of bypassing its permission checks (Claude only)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
                 the sandboxed agent write there (repeatable)
@@ -208,6 +216,8 @@ options:
   --codex       start Codex in the left pane
   --claude      start Claude in the left pane (default)
   --claude-account <name>  use a named Claude login (or default)
+  --permission-mode auto  run Claude in its auto permission mode inside the sandbox,
+                instead of bypassing its permission checks (Claude only)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
   --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
                 the sandboxed agent write there (repeatable)
@@ -272,6 +282,7 @@ class Options:
         "model",
         "effort",
         "claude_account",
+        "permission_mode",
         "name",
         "label",
         "repo_path",
@@ -296,6 +307,7 @@ class Options:
         self.model = ""
         self.effort = ""
         self.claude_account = ""
+        self.permission_mode = ""
         self.name = ""
         self.label = ""
         self.repo_path = ""
@@ -384,10 +396,15 @@ def parse_args(
     return options
 
 
-def validate_agent_options(agent: str, model: str, effort: str) -> None:
+def validate_agent_options(agent: str, model: str, effort: str, permission_mode: str = "") -> None:
     """Syntax only; model availability belongs to the agent CLI and its provider."""
     if model and not MODEL.fullmatch(model):
         raise WtError("wt: invalid model id")
+    if permission_mode:
+        if permission_mode not in PERMISSION_MODES:
+            raise WtError("wt: unsupported permission mode; only auto is accepted")
+        if agent != "claude":
+            raise WtError(f"wt: --permission-mode {permission_mode} is for Claude only")
     if not effort:
         return
     if effort in CODEX_EFFORTS:
@@ -520,6 +537,7 @@ def agent_command(
     features: Sequence[str] = (),
     launcher: str | None = None,
     confined: Sequence[str] | None = None,
+    permission_mode: str | None = None,
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -544,6 +562,10 @@ def agent_command(
     shell runs the agent binary directly instead of through ``safe``: no Safehouse, and
     no permission prompts to stall an unattended run. Only cron jobs that opt in pass
     it; ``wt`` itself never does, so agents it starts stay in Safehouse.
+
+    ``permission_mode`` (Claude's ``--permission-mode``, ``wt --permission-mode``)
+    replaces the bypass flag. The shell's ``claude`` function would add the flag, so on
+    macOS the line calls the ``safe`` function it wraps instead, keeping Safehouse.
 
     ``also`` (``--with`` checkouts) appends Safehouse grants to ``SAFEHOUSE_ADD_DIRS``,
     which the shell already exports from safe.env: each checkout and its git common
@@ -570,6 +592,10 @@ def agent_command(
     """
     if unsandboxed and docker:
         raise ValueError("Docker access only applies inside Safehouse")
+    if permission_mode and agent != "claude":
+        raise ValueError("--permission-mode is for Claude only")
+    if permission_mode and unsandboxed:
+        raise ValueError("A permission mode only applies inside the sandbox")
     grants = [path for checkout in also for path in (checkout.path, checkout.common)]
     if any(":" in path for path in grants):
         # Safehouse splits its directory lists on colons.
@@ -588,6 +614,7 @@ def agent_command(
         sandbox_config_dir or claude_config_dir,
         launcher,
         confined,
+        permission_mode,
     )
     if prompt:
         # `--` stops variadic options from swallowing the prompt.
@@ -1135,6 +1162,7 @@ class Tool:
                 also=options.also_checkouts,
                 directory=directory,
                 features=("gpg",) if options.gpg else (),
+                permission_mode=options.permission_mode or None,
             )
         except ValueError as exc:
             raise WtError(f"wt: {exc}") from exc
@@ -1360,7 +1388,9 @@ class Tool:
     # -- commands --
 
     def run_wt(self, options: Options) -> None:
-        validate_agent_options(options.agent, options.model, options.effort)
+        validate_agent_options(
+            options.agent, options.model, options.effort, options.permission_mode
+        )
         try:
             claude_accounts.validate(options.agent, options.claude_account)
         except ValueError as exc:
@@ -1431,7 +1461,9 @@ class Tool:
         self.open_session(options, directory, branch, repo_path)
 
     def run_wti(self, options: Options) -> None:
-        validate_agent_options(options.agent, options.model, options.effort)
+        validate_agent_options(
+            options.agent, options.model, options.effort, options.permission_mode
+        )
         try:
             claude_accounts.validate(options.agent, options.claude_account)
         except ValueError as exc:
@@ -1484,7 +1516,9 @@ class Tool:
         self.open_session(options, directory, branch, repo_path)
 
     def run_wtpr(self, options: Options) -> None:
-        validate_agent_options(options.agent, options.model, options.effort)
+        validate_agent_options(
+            options.agent, options.model, options.effort, options.permission_mode
+        )
         try:
             claude_accounts.validate(options.agent, options.claude_account)
         except ValueError as exc:
