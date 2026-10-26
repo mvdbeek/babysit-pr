@@ -657,16 +657,21 @@ keeps only its launch's agent's session, checks it and the worktree like a
 registration's, and adds the transcript it found. The controller's
 `/api/worker/handoff` schedules the handoff only for a watch registered on the token's
 machine with that worktree and its agent's session, whose transcript is exactly the
-broker's, from the watch's bound pane (terminal and shell), and answers every mismatch
+broker's, from the watch's bound pane (terminal and shell; a watch registered without
+its pane is not handed off from a worker), and answers every mismatch
 of watch the same way. At most 4 handoffs per worker run at once. It then runs the
 detached handoff itself, as for a local watch: the agent is followed through `herdr
 --machine` every 4 s (its screen gets 30 s to settle), its transcript's turn and
 fingerprint are read together through one probe op (`turn_state`), and worker paths are
 compared as strings. Codex gets its one Ctrl-D; Claude gets a typed `/exit`, since its
 second Ctrl-D would have to come sooner than the checks before it can read the worker,
-and Enter only once its composer holds exactly `/exit`. The exit is confirmed once only
+and Enter only once its composer holds exactly `/exit`; otherwise the `/exit` typed
+here is taken back with backspaces when the composer shows it at its end, and no key is
+sent to anything else (a dialog, say). The exit is confirmed once only
 the pane's shell is in its foreground, herdr no longer sees an agent there, and the
-worker no longer runs the agent's command line at its pid (probe op `alive`), so a
+worker no longer runs the agent's command line at its pid (probe op `alive`, given
+the SHA-256 of its NUL-joined arguments, which may hold a whole brief, and reading them
+from /proc or macOS's kernel rather than `ps`), so a
 stopped or backgrounded agent has not exited. Failures to start on the controller reach
 the worker without this machine's paths. A local `handoff` refuses a worker's watch,
 and a worker's refuses a local one.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hashlib
 import json
 import math
 import os
@@ -455,6 +456,9 @@ MAX_UNTRACKED = 200
 MAX_COMMITS = 200
 SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 MAX_SESSIONS = 50
+DIGEST = re.compile(r"[0-9a-f]{64}")
+# Bytes of a process's command line read to compare it: more than any argument limit.
+MAX_CMDLINE = 16 * 1024 * 1024
 # The line a scheduled brief asks its agent to end with once done (``exit_watch``).
 MARKER = re.compile(r"\[babysit-done:[0-9a-f]{16}\]")
 
@@ -1347,27 +1351,56 @@ def _host_turn_state(file, session, agent):
     return {**found, "inode": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
 
-def _host_alive(pid, argv):
-    """Whether process ``pid`` still runs ``argv``: an agent stopped, or moved out of its
-    terminal's foreground, has not exited. Another program at that pid is not it."""
+def _host_alive(pid, digest):
+    """Whether process ``pid`` still runs the agent's command line: an agent stopped, or
+    moved out of its terminal's foreground, has not exited. Another program at that pid
+    is not it.
+
+    The command line is named by the SHA-256 of its arguments joined by NULs: a brief
+    may be one long argument. They are read as the kernel keeps them, which ps would
+    render lossily.
+    """
     if not (type(pid) is int and 1 < pid < 2**31):
         raise ValueError("Expected a process ID")
-    if not (
-        isinstance(argv, list)
-        and 0 < len(argv) <= 256
-        and all(isinstance(a, str) and "\0" not in a and len(a) <= MAX_TEXT for a in argv)
-    ):
-        raise ValueError("Expected a command line")
-    if os.path.isdir("/proc/self"):
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as stream:
-                running = stream.read(256 * (MAX_TEXT + 1)).split(b"\0")[:-1]
-        except (FileNotFoundError, ProcessLookupError):
-            return {"alive": False}
-        return {"alive": [a.decode("utf-8", errors="replace") for a in running] == argv}
-    # No /proc (a Mac): ps names the command line only joined by spaces.
-    shown = _host_run(["ps", "-p", str(pid), "-o", "command="], 10)
-    return {"alive": shown.returncode == 0 and shown.stdout.strip() == " ".join(argv)}
+    if not (isinstance(digest, str) and DIGEST.fullmatch(digest)):
+        raise ValueError("Expected a command line digest")
+    running = _proc_arguments(pid) if os.path.isdir("/proc/self") else _mac_arguments(pid)
+    return {"alive": running is not None and hashlib.sha256(running).hexdigest() == digest}
+
+
+def _proc_arguments(pid):
+    """A process's arguments, NUL-joined, from /proc; None once it is gone."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            running = stream.read(MAX_CMDLINE)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # Each argument ends in a NUL; a zombie's command line is empty.
+    return running[:-1] if running else None
+
+
+def _mac_arguments(pid):
+    """A process's arguments, NUL-joined, as macOS keeps them (KERN_PROCARGS2: argc, the
+    executable's path and its padding, then the arguments); None once it is gone."""
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    # The buffer is exactly kern.argmax long (CTL_KERN, KERN_ARGMAX); any other is refused.
+    argmax = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(argmax))
+    limit = (ctypes.c_int * 2)(1, 8)
+    if libc.sysctl(limit, 2, ctypes.byref(argmax), ctypes.byref(size), None, ctypes.c_size_t(0)):
+        raise OSError("Cannot read kern.argmax")
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(argmax.value)
+    found = ctypes.create_string_buffer(argmax.value)
+    if libc.sysctl(mib, 3, found, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+        return None
+    data = found.raw[: size.value]
+    argc = int.from_bytes(data[:4], sys.byteorder)
+    rest = data[4:]
+    rest = rest[rest.find(b"\0") :].lstrip(b"\0")
+    return b"\0".join(rest.split(b"\0")[:argc])
 
 
 def _host_fingerprint(file):

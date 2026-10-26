@@ -250,20 +250,23 @@ def test_a_claude_on_a_worker_is_asked_to_exit_with_a_typed_line(watched, fake_t
 
 
 @pytest.mark.parametrize(
-    "shown",
+    "shown, removed",
     [
-        "Allow this command?\n❯ 1. Yes\n  2. No",  # A dialog opened meanwhile.
-        "─" * 20 + "\n❯ draft/exit\n" + "─" * 20,
+        # A dialog opened meanwhile: no key goes to it.
+        ("Allow this command?\n❯ 1. Yes\n  2. No", False),
+        # Someone typed too: only the /exit typed here is taken back.
+        ("─" * 20 + "\n❯ draft/exit\n" + "─" * 20, True),
     ],
 )
 def test_enter_follows_a_typed_exit_only_once_the_composer_holds_exactly_it(
-    watched, fake_tools, monkeypatch, shown
+    watched, fake_tools, monkeypatch, shown, removed
 ):
     monkeypatch.setattr(herdr_handoff, "TYPED_EXIT_WAIT", 0.5)
+    monkeypatch.setenv("FAKE_HERDR_KEEP_AGENT", "1")
     worker_herdr(fake_tools, watched["tree"], "claude")
     screens(fake_tools, CLAUDE_EMPTY, shown)
     machine = supervisor.machines.resolve(watched["home"], "box")
-    with pytest.raises(RuntimeError, match="Enter not sent"):
+    with pytest.raises(RuntimeError, match="Enter not sent") as raised:
         herdr_handoff.send_exit(
             claude_target(watched),
             None,
@@ -274,7 +277,8 @@ def test_enter_follows_a_typed_exit_only_once_the_composer_holds_exactly_it(
             watched["home"],
         )
     keys = [c for c in worker_store(fake_tools)["calls"] if c[:2] == ["agent", "send-keys"]]
-    assert keys == []
+    assert keys == ([["agent", "send-keys", PANE, "backspace"]] * 5 if removed else [])
+    assert ("taken back" if removed else "left in the pane") in str(raised.value)
 
 
 def test_an_agent_still_running_off_the_foreground_has_not_exited(watched, fake_tools, monkeypatch):
@@ -304,23 +308,77 @@ def test_an_agent_still_running_off_the_foreground_has_not_exited(watched, fake_
         alive.wait()
 
 
-def test_the_alive_probe_compares_the_process_command_line(watched):
-    import remote_probe
-
-    alive = subprocess.Popen(["sleep", "60"])
+def test_an_agent_started_with_a_long_brief_is_still_seen_running(watched, fake_tools):
+    # wt passes the whole brief as one argument, often longer than any path.
+    brief = "Review it carefully.\n" * 500
+    argv = ["/bin/sh", "-c", "sleep 60; :", brief]
+    assert len(brief) > 4096
+    alive = subprocess.Popen(argv)
     try:
-        found = remote_probe.validate_alive(remote_probe._host_alive(alive.pid, ["sleep", "60"]))
-        assert found == {"alive": True}
-        assert remote_probe._host_alive(alive.pid, ["sleep", "61"]) == {"alive": False}
+        machine = supervisor.machines.resolve(watched["home"], "box")
+        target = {"agent_pid": alive.pid, "agent_argv": argv}
+        assert herdr_handoff.alive(target, machine, watched["home"]) is True
+        other = {**target, "agent_argv": [*argv[:-1], brief + "!"]}
+        assert herdr_handoff.alive(other, machine, watched["home"]) is False
     finally:
         alive.kill()
         alive.wait()
-    assert remote_probe._host_alive(alive.pid, ["sleep", "60"]) == {"alive": False}
-    for bad in ((1, ["x"]), (os.getpid(), []), (os.getpid(), ["a\x00b"]), ("2", ["x"])):
+    assert herdr_handoff.alive(target, machine, watched["home"]) is False
+
+
+def test_a_linux_workers_command_line_is_read_whole_from_proc(monkeypatch):
+    import io
+
+    import remote_probe
+
+    brief = b"Review it carefully.\n" * 500
+    shown = {"/proc/7/cmdline": b"claude\0--\0" + brief + b"\0", "/proc/8/cmdline": b""}
+
+    def fake_open(path, mode):
+        if path not in shown:
+            raise FileNotFoundError(path)
+        return io.BytesIO(shown[path])
+
+    monkeypatch.setattr(remote_probe, "open", fake_open, raising=False)
+    assert remote_probe._proc_arguments(7) == b"claude\0--\0" + brief
+    assert remote_probe._proc_arguments(8) is None  # A zombie.
+    assert remote_probe._proc_arguments(9) is None  # Gone.
+
+
+def test_the_alive_probe_compares_the_process_command_line(watched):
+    import hashlib
+
+    import remote_probe
+
+    def digest(argv):
+        return hashlib.sha256("\0".join(argv).encode()).hexdigest()
+
+    alive = subprocess.Popen(["sleep", "60"])
+    try:
+        found = remote_probe._host_alive(alive.pid, digest(["sleep", "60"]))
+        assert remote_probe.validate_alive(found) == {"alive": True}
+        assert remote_probe._host_alive(alive.pid, digest(["sleep", "61"])) == {"alive": False}
+    finally:
+        alive.kill()
+        alive.wait()
+    assert remote_probe._host_alive(alive.pid, digest(["sleep", "60"])) == {"alive": False}
+    for bad in ((1, digest(["x"])), ("2", digest(["x"])), (os.getpid(), "x"), (os.getpid(), None)):
         with pytest.raises(ValueError):
             remote_probe._host_alive(*bad)
     with pytest.raises(ValueError, match="Malformed"):
         remote_probe.validate_alive({"alive": 1})
+
+
+def test_a_worker_hands_off_no_watch_without_a_bound_pane(watched, served):  # noqa: F811
+    db = supervisor.open_db(watched["home"])
+    with db:
+        current = supervisor.get_job(db, watched["job"]["id"])
+        supervisor.save_job(db, {**current, "pane": None})
+    db.close()
+    auth = {"Authorization": f"Bearer {worker_api.issue(watched['home'], 'box')}"}
+    status, answer = post(served, "/api/worker/handoff", asked(watched), auth)
+    assert status == 400 and "registered with its pane" in answer["error"], answer
+    assert job(watched)["status"] == "awaiting_release" and not watched["spawned"]
 
 
 def test_a_worker_hands_off_only_the_pane_its_watch_is_bound_to(watched, served, fake_tools):  # noqa: F811

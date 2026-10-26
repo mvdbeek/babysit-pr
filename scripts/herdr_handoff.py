@@ -7,6 +7,7 @@ reads its transcript there through the probe.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -298,6 +299,9 @@ def schedule(db, home, args):
             raise ValueError(
                 f"No watch {args.id} of this conversation and worktree on {machine.label}"
             )
+        if not job.get("pane"):
+            # Its pane is what ties the agent to exit to the one that registered it.
+            raise ValueError("Only a watch registered with its pane is handed off from a worker")
     else:
         job = supervisor.get_job(db, args.id)
         if job.get("machine") is not None:
@@ -330,11 +334,10 @@ def schedule(db, home, args):
         raise ValueError(
             "Pane has a pending dialog/question; use manual handoff after resolving it"
         )
-    bound = job.get("pane")
-    if (
-        machine is not None
-        and bound
-        and (info["terminal_id"], procs["shell_pid"]) != (bound["terminal_id"], bound["shell_pid"])
+    bound = job.get("pane") or {}
+    if machine is not None and (info["terminal_id"], procs["shell_pid"]) != (
+        bound.get("terminal_id"),
+        bound.get("shell_pid"),
     ):
         raise ValueError("Hand off from the watch's bound pane")
     token = uuid.uuid4().hex
@@ -436,9 +439,17 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None):
     if machine is not None and agent == "claude":
         herdr("pane", "send-text", pane, sandbox.typed("/exit"), machine=machine)
         typed_by = time.monotonic() + TYPED_EXIT_WAIT
-        while claude_composer(read_screen(pane, machine)) != "/exit":
+        while (shown := claude_composer(read_screen(pane, machine))) != "/exit":
             if time.monotonic() >= typed_by:
-                raise RuntimeError("The composer does not hold just /exit; Enter not sent")
+                # Only the /exit typed here is taken back, and only from the composer: a
+                # draft beside it stays, and no key goes to a dialog.
+                if shown is not None and shown.endswith("/exit"):
+                    for _ in "/exit":
+                        herdr("agent", "send-keys", pane, "backspace", machine=machine)
+                    left = "the typed /exit was taken back"
+                else:
+                    left = "a typed /exit may be left in the pane"
+                raise RuntimeError(f"The composer does not hold just /exit; Enter not sent; {left}")
             time.sleep(0.25)
         owned()
         herdr("agent", "send-keys", pane, "enter", machine=machine)
@@ -498,14 +509,15 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None):
 
 
 def alive(target, machine, home):
-    """Whether the worker still runs the target's agent process."""
+    """Whether the worker still runs the target's agent process, named by its pid and the
+    digest of its command line (``remote_probe._host_alive``)."""
     return remote_probe.call(
         home,
         machine,
         "alive",
         supervisor.PROBE_TIMEOUT,
         pid=target["agent_pid"],
-        argv=target["agent_argv"],
+        digest=hashlib.sha256("\0".join(target["agent_argv"]).encode()).hexdigest(),
     )["alive"]
 
 
