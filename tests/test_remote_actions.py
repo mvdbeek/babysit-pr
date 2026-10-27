@@ -843,7 +843,7 @@ def test_a_worker_agent_is_messaged_from_its_row_without_docker_access(page, exi
     expect(viewer.locator("#ws-message-agent")).to_contain_text("To claude · idle")
     expect(viewer.locator("#ws-docker")).to_be_hidden()
     viewer.locator("#ws-message-text").fill("Add docs")
-    viewer.get_by_role("button", name="Send to agent").click()
+    viewer.get_by_role("button", name="Send", exact=True).click()
     expect(viewer.locator("#ws-message-status")).to_contain_text("Sent to the agent in w1:p1")
     assert mini(exited)["prompts"] == [["w1:p1", "Add docs"]]
     assert "prompts" not in read(exited.state)
