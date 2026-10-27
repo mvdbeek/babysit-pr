@@ -353,10 +353,10 @@ def test_a_worker_without_the_clone_is_refused(remote):
 def test_work_that_may_need_repairs_stays_off_workers(remote):
     manager, _, state, _ = remote
     issue = manager.issues.value["issues"][0]
-    with pytest.raises(ValueError, match="Only pull request work and new tasks"):
+    with pytest.raises(ValueError, match="^Mac mini: only takes pull request work and new tasks$"):
         manager.action({"id": issue["id"], "action": "handle", "task": "Fix", "machine": "mini"})
     assert manager.operation(issue["id"]) is None
-    with pytest.raises(ValueError, match="Only pull request work and new tasks"):
+    with pytest.raises(ValueError, match="^Mac mini: only takes pull request work and new tasks$"):
         manager.new_task(new_request(manager, issue_title="Remote issue", machine="mini"))
     assert not store(state).get("gh")
     with pytest.raises(ValueError, match="Other repositories"):

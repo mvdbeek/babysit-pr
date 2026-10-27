@@ -1,4 +1,5 @@
-"""The settings the page keeps with the watcher: task prompts and the main reviewer."""
+"""The settings the page keeps with the watcher: task prompts, the main reviewer and how
+many agents this machine takes before Auto prefers a worker."""
 
 import json
 
@@ -7,7 +8,11 @@ import pytest
 
 
 def test_a_home_without_a_file_has_no_prompts_and_a_main_reviewer(tmp_path):
-    assert settings.settings(tmp_path) == {"task_prompts": {}, "reviewer": "codex"}
+    assert settings.settings(tmp_path) == {
+        "task_prompts": {},
+        "reviewer": "codex",
+        "local_max_agents": 20,
+    }
 
 
 def test_a_saved_prompt_replaces_the_pages_own_until_it_is_cleared(tmp_path):
@@ -24,8 +29,21 @@ def test_a_saved_prompt_replaces_the_pages_own_until_it_is_cleared(tmp_path):
 def test_the_main_reviewer_is_saved_on_its_own(tmp_path):
     settings.save(tmp_path, {"task": "issue", "prompt": "Resolve {url}."})
     saved = settings.save(tmp_path, {"reviewer": "claude"})
-    assert saved == {"task_prompts": {"issue": "Resolve {url}."}, "reviewer": "claude"}
+    assert saved == {
+        "task_prompts": {"issue": "Resolve {url}."},
+        "reviewer": "claude",
+        "local_max_agents": 20,
+    }
     assert settings.save(tmp_path, {"reviewer": "codex"})["reviewer"] == "codex"
+
+
+def test_this_machines_capacity_is_saved_on_its_own(tmp_path):
+    settings.save(tmp_path, {"reviewer": "claude"})
+    saved = settings.save(tmp_path, {"local_max_agents": 12})
+    assert saved == {"task_prompts": {}, "reviewer": "claude", "local_max_agents": 12}
+    assert settings.settings(tmp_path)["local_max_agents"] == 12
+    limit = settings.LOCAL_MAX_AGENTS_LIMIT
+    assert settings.save(tmp_path, {"local_max_agents": limit})["local_max_agents"] == limit
 
 
 @pytest.mark.parametrize(
@@ -36,9 +54,15 @@ def test_the_main_reviewer_is_saved_on_its_own(tmp_path):
         ({"task": "prReview", "prompt": 7}, "as text"),
         ({"task": "unknown", "prompt": "{url}"}, "Unknown task"),
         ({"reviewer": "gemini"}, "Codex or Claude"),
-        ({"task": "ci", "prompt": "{url}", "reviewer": "claude"}, "either"),
-        ({}, "either"),
-        ({"prompt": "{url}"}, "either"),
+        ({"task": "ci", "prompt": "{url}", "reviewer": "claude"}, "one setting"),
+        ({"reviewer": "claude", "local_max_agents": 4}, "one setting"),
+        ({}, "one setting"),
+        ({"prompt": "{url}"}, "one setting"),
+        ({"local_max_agents": 0}, "from 1 to 200"),
+        ({"local_max_agents": 201}, "from 1 to 200"),
+        ({"local_max_agents": 4.0}, "whole number"),
+        ({"local_max_agents": True}, "whole number"),
+        ({"local_max_agents": "8"}, "whole number"),
         ({"task": "ci", "prompt": "{url}", "agent": "codex"}, "Unknown setting"),
         ("reviewer", "Unknown setting"),
     ],
@@ -55,6 +79,7 @@ def test_a_hand_edited_file_keeps_only_what_the_page_can_use(tmp_path):
             {
                 "task_prompts": {"prReview": "Review {url}.", "deploy": "Ship it", "ci": "   "},
                 "reviewer": "gemini",
+                "local_max_agents": 0,
                 "theme": "dark",
             }
         )
@@ -62,17 +87,19 @@ def test_a_hand_edited_file_keeps_only_what_the_page_can_use(tmp_path):
     assert settings.settings(tmp_path) == {
         "task_prompts": {"prReview": "Review {url}."},
         "reviewer": "codex",
+        "local_max_agents": 20,
     }
     # Saving beside it writes back only the understood settings.
     settings.save(tmp_path, {"reviewer": "claude"})
     assert json.loads((tmp_path / settings.SETTINGS).read_text()) == {
         "task_prompts": {"prReview": "Review {url}."},
         "reviewer": "claude",
+        "local_max_agents": 20,
     }
 
 
 def test_an_unreadable_file_leaves_the_page_on_its_own_wording(tmp_path):
     (tmp_path / settings.SETTINGS).write_text("{ not json")
-    assert settings.settings(tmp_path) == {"task_prompts": {}, "reviewer": "codex"}
+    assert settings.settings(tmp_path) == settings.settings(tmp_path / "missing")
     (tmp_path / settings.SETTINGS).write_text(json.dumps(["prReview"]))
-    assert settings.settings(tmp_path) == {"task_prompts": {}, "reviewer": "codex"}
+    assert settings.settings(tmp_path) == settings.settings(tmp_path / "missing")

@@ -30,6 +30,7 @@ from pathlib import Path
 import claude_accounts
 import herdr_handoff as handoff
 import machines
+import placement
 import remote_probe
 import safe_git
 import sandbox
@@ -164,13 +165,15 @@ def place(request, workspaces, repo):
         raise ValueError("Choose a machine")
     unsandboxed = request.get("unsandboxed") is True
     fields = {
+        "kind": "cron",
         "repo": repo,
         "agent": request.get("agent"),
         "claude_account": request.get("claude_account") or None,
         "docker": request.get("docker") is True,
         "sandboxed": not unsandboxed,
     }
-    machine_id = workspaces.place({"machine": choice}, fields)
+    # Here a job works in a local clone, as a new task does.
+    machine_id = workspaces.place({"machine": choice}, fields, {placement.LOCAL: 1})
     return machines.resolve(workspaces.home, machine_id, placing=True)
 
 

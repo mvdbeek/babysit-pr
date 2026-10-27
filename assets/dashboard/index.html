@@ -211,6 +211,22 @@
         <select id="settings-reviewer"></select>
       </div>
       <p id="settings-reviewer-note" class="notifications-caption"></p>
+      <div id="settings-capacity-field" class="settings-field" hidden>
+        <label for="settings-capacity">Agents on this machine</label>
+        <input
+          id="settings-capacity"
+          type="number"
+          min="1"
+          max="200"
+          step="1"
+          inputmode="numeric"
+        />
+      </div>
+      <p id="settings-capacity-note" class="notifications-caption" hidden>
+        Auto starts launches on other machines once this many agents run here. Before that it keeps
+        a launch where its repository is cloned, and otherwise picks the less busy machine. A launch
+        no other machine can take still starts here.
+      </p>
       <div class="settings-field">
         <label for="settings-task">Task prompt</label>
         <select id="settings-task"></select>

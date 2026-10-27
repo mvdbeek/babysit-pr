@@ -747,7 +747,9 @@ watches recorded on another machine.
 `id` (lowercase, at most 24 characters, not `local`) is the stable key; `label`
 is the herdr machine label passed as `herdr --machine=<label>` (labels cannot start with `-`). `id`, `label`, `ssh` and
 `os` (`darwin` or `linux`) are required. Paths are remote: absolute or under `~`.
-`max_agents` is 1–64, and unknown keys are rejected. `collie_url`, optional, is that
+`max_agents` is 1–64, and unknown keys are rejected. `auto` (default `false`) lets Auto
+place launches there; without it the worker only runs what is sent to it by name, and
+setting it back to `false` takes effect on the next launch. `collie_url`, optional, is that
 machine's own Collie (an `http` or `https` URL with a host): its workspaces link
 `<collie_url>/space/<id>`. `collie_host`, optional, is the machine's name in a Collie
 crew this machine leads (`collie crew add <ssh>`, then `collie crew status`): its
@@ -771,12 +773,24 @@ so long-running remote work needs its own lifeline.
 With a registry, the dashboard's launch dialogs (Handle, Create, New task, batch
 review) offer a Machine select, and the Workspaces heading shows each machine's
 health and load from `herdr --machine=<label> workspace list`, cached for 15 s and
-refreshed in the background so no request waits on a worker. Auto always places on
-this machine for now. Choosing a worker by name checks it against the launch
-(disabled, unreachable, missing `labels` such as `docker`, `safehouse`/`bwrap` for
-the sandbox, `claude-account:<name>`, or a repo's `requires`) and records it on the
-operation or scheduled task. A worker whose load has not come back yet, or whose refresh has
-not finished for 30 s, shows "checking…" and is left out of Auto.
+refreshed in the background so no request waits on a worker. Auto only considers a
+worker registered with `"auto": true`; any worker can still be chosen by name. Either
+way the worker is checked against the launch (disabled, unreachable, missing `labels`
+such as `docker`, `safehouse`/`bwrap` for the sandbox, `claude-account:<name>`, or a
+repo's `requires`; a launch kind workers cannot start yet, listed below) and recorded on
+the operation or scheduled task. A worker whose load has not come back yet, or whose
+refresh has not finished for 30 s, shows "checking…" and is left out of Auto. Auto ranks
+the machines that can take a launch by stickiness first: a prior workspace for the same
+target, then a clone of its repository. New tasks and cron jobs always count this
+machine's clone, and pull request and issue work count it when this machine has one, so
+those launches stay here until it is full. Then come the repo's `prefer`, then load:
+agents plus launches placed but not yet listed, over the machine's capacity. This
+machine's capacity is **Agents on this machine** in Settings (default 20, shown once
+workers are registered): at that many agents Auto prefers a worker, and comes back here
+when no worker can take the launch. Chosen by name, a full machine is only noted. A cron
+job outside its sandbox never runs on a worker. The preview uses the same stickiness, the
+dialog's issue, other-repository and sandbox choices, but cannot see a Handle's verified
+checkout, which pins the launch to its machine.
 
 A launch placed on a worker (Handle or Create on a pull request, a new task, batch
 review, a scheduled launch) starts there. Until repairs run on workers, only work that

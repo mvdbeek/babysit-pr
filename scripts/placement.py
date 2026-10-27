@@ -1,25 +1,27 @@
 """Which machine a launch runs on: a pure function of the registry, cached loads and history.
 
 ``machines`` are the registry's workers by id. This machine is ``LOCAL``; without a
-``LOCAL`` entry it is assumed to meet every requirement and is never refused for load,
-which is how every launch ran before workers existed. ``loads`` are ``MachineLoads``
-entries by id, ``history`` a stickiness level by id (2: a prior workspace for the same
-target, 1: a clone of its repository is there), and ``reservations`` the launches placed
-on each machine that herdr does not list yet.
+``LOCAL`` entry it is assumed to meet every requirement, which is how every launch ran
+before workers existed. Past its capacity (``loads[LOCAL]["max_agents"]``, from the
+dashboard's settings) Auto prefers a worker, and comes back here when none can take the
+launch. ``loads`` are ``MachineLoads`` entries by id, ``history`` a stickiness level by
+id (2: a prior workspace for the same target, 1: a clone of its repository is there),
+and ``reservations`` the launches placed on each machine that herdr does not list yet.
 """
 
 import time
 from typing import NamedTuple
 
 LOCAL = "local"
-# Auto never picks a worker until remote launching, inventory and repairs have landed.
-# Until then a worker is only ever chosen by name.
-AUTO_REMOTE = False
 # Seconds a machine's cached load stays fresh, and how long it may stay unreachable
 # before placement stops offering it.
 LOAD_TTL = 15
-# Slots this machine counts as when its load is ranked against workers'.
-LOCAL_SLOTS = 8
+# Agents this machine takes before Auto prefers a worker, unless the settings say otherwise.
+LOCAL_SLOTS = 20
+# What a launch starts work on, and what of it a worker can start; anything else stays
+# here. Cron jobs are new tasks too.
+KINDS = {"pr", "issue", "sentry", "scratch", "cron"}
+WORKER_KINDS = {"pr", "scratch", "cron"}
 # The capability label a sandboxed agent needs, by operating system.
 SANDBOX = {"darwin": "safehouse", "linux": "bwrap"}
 
@@ -39,9 +41,10 @@ class Exclusion(NamedTuple):
 def request(fields, repos):
     """A placement request from launch ``fields`` plus the registry's per-repo rules.
 
-    ``fields``: ``repo``, ``agent``, ``claude_account``, ``docker``, ``sandboxed``
-    (default true), ``also`` (repositories cloned beside it), ``override`` (a machine id,
-    ``LOCAL`` or ``"auto"``) and ``pin`` (a machine an existing workspace is on).
+    ``fields``: ``kind`` (``pr``, ``issue``, ``sentry``, ``scratch`` or ``cron``),
+    ``repo``, ``agent``, ``claude_account``, ``docker``, ``sandboxed`` (default true),
+    ``also`` (repositories cloned beside it), ``override`` (a machine id, ``LOCAL`` or
+    ``"auto"``) and ``pin`` (a machine an existing workspace is on).
     """
     rules = {slug.lower(): rule for slug, rule in repos.items()}
     rule = rules.get((fields.get("repo") or "").lower(), {})
@@ -60,9 +63,11 @@ def requirements(req, machine):
     return list(dict.fromkeys([*needed, *req.get("requires", [])]))
 
 
-def slots(machine_id, machines):
+def slots(machine_id, machines, loads):
     machine = machines.get(machine_id)
-    return machine.max_agents if machine else LOCAL_SLOTS
+    if machine:
+        return machine.max_agents
+    return (loads.get(LOCAL) or {}).get("max_agents", LOCAL_SLOTS)
 
 
 def busy(machine_id, loads, reservations):
@@ -83,10 +88,6 @@ def exclusions(req, machines, loads, reservations, now):
         # that may no longer hold; the machine is checked again instead.
         stale = now - load.get("attempted_at", now) > 2 * LOAD_TTL
         lacking = [label for label in requirements(req, machine) if label not in machine.labels]
-        # Clones are only known once a load lists them; until then the launch goes ahead
-        # and is refused for not being supported yet.
-        also = req.get("also", []) if "clones" in load else []
-        missing = [repo for repo in also if repo not in load["clones"]]
         used = busy(machine_id, loads, reservations)
         if not machine.enabled:
             excluded[machine_id] = Exclusion("disabled", False)
@@ -94,14 +95,21 @@ def exclusions(req, machines, loads, reservations, now):
             excluded[machine_id] = Exclusion(f"unreachable {age(now - since)}", False)
         elif lacking:
             excluded[machine_id] = Exclusion(f"lacks {', '.join(lacking)}", False)
-        elif missing and machine_id != LOCAL:
-            # `wt --with` checks every clone out on one host.
-            excluded[machine_id] = Exclusion(f"lacks clones of {', '.join(missing)}", False)
+        elif machine_id != LOCAL and req.get("kind", "scratch") not in WORKER_KINDS:
+            excluded[machine_id] = Exclusion("only takes pull request work and new tasks", False)
+        elif machine_id != LOCAL and req.get("also"):
+            # `wt --with` checks every clone out on one host, so far only this one.
+            excluded[machine_id] = Exclusion("cannot check out other repositories yet", False)
+        elif machine_id != LOCAL and req.get("kind") == "cron" and not req.get("sandboxed", True):
+            excluded[machine_id] = Exclusion("runs jobs only in their sandbox", False)
         elif machine_id != LOCAL and (stale or load.get("pending")):
             # No load has come back yet, so its agents are unknown.
             excluded[machine_id] = Exclusion("checking…", True)
         elif machine_id != LOCAL and used >= machine.max_agents:
             excluded[machine_id] = Exclusion(f"full ({used}/{machine.max_agents})", True)
+    used, total = busy(LOCAL, loads, reservations), slots(LOCAL, machines, loads)
+    if LOCAL not in excluded and used >= total:
+        excluded[LOCAL] = Exclusion(f"full ({used}/{total})", True)
     return excluded
 
 
@@ -111,16 +119,18 @@ def label(machine_id, machines):
 
 
 def free(machine_id, machines, loads, reservations):
-    total = slots(machine_id, machines)
+    total = slots(machine_id, machines, loads)
     return f"{max(0, total - busy(machine_id, loads, reservations))}/{total} free"
 
 
-def choose(req, machines, loads, history, reservations, *, now=None, auto_remote=AUTO_REMOTE):
+def choose(req, machines, loads, history, reservations, *, now=None):
     """The machine ``req`` runs on, or ValueError naming why each machine could not take it.
 
     An explicit choice (``override``) wins, then a pin, and the two must agree; Auto
     ranks what is left by stickiness, the repository's preferred machine, load, then
     this machine first and label, so equal candidates always resolve the same way.
+    Auto only considers workers registered with ``auto``, and this machine when it is
+    full only if nothing else can take the launch.
     """
     now = time.time() if now is None else now
     found = exclusions(req, machines, loads, reservations, now)
@@ -150,11 +160,17 @@ def choose(req, machines, loads, history, reservations, *, now=None, auto_remote
         return named(override, "chosen")
     if pin is not None:
         return named(pin, "existing workspace")
-    candidates = [
-        machine_id
-        for machine_id in ({LOCAL, *machines} if auto_remote else {LOCAL})
-        if machine_id not in found
-    ]
+    offered = {LOCAL, *(m for m, machine in machines.items() if machine.auto)}
+    candidates = [machine_id for machine_id in offered if machine_id not in found]
+    local = found.get(LOCAL)
+    if not candidates and local and local.soft:
+        # Full, not unable: as before workers existed, it still takes the launch.
+        return Placement(
+            None,
+            "auto: this machine is full and no other machine can take it, "
+            + free(LOCAL, machines, loads, reservations),
+            excluded,
+        )
     if not candidates:
         reasons = "; ".join(f"{label(m, machines)}: {why}" for m, why in sorted(excluded.items()))
         raise ValueError(f"No machine can take this launch ({reasons})")
@@ -163,7 +179,7 @@ def choose(req, machines, loads, history, reservations, *, now=None, auto_remote
         return (
             -history.get(machine_id, 0),
             machine_id != req.get("prefer"),
-            busy(machine_id, loads, reservations) / slots(machine_id, machines),
+            busy(machine_id, loads, reservations) / slots(machine_id, machines, loads),
             (loads.get(machine_id) or {}).get("working", 0),
             machine_id != LOCAL,
             label(machine_id, machines),
@@ -173,7 +189,5 @@ def choose(req, machines, loads, history, reservations, *, now=None, auto_remote
     why = {2: "prior workspace", 1: "clone present"}.get(history.get(best, 0))
     if why is None and best == req.get("prefer"):
         why = "preferred for the repository"
-    if why is None and not auto_remote:
-        why = "workers are only used when chosen"
     reason = f"auto: {why or 'least busy'}, {free(best, machines, loads, reservations)}"
     return Placement(None if best == LOCAL else best, reason, excluded)
