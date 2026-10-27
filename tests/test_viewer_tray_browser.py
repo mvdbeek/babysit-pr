@@ -343,7 +343,7 @@ def test_the_tray_fits_a_phone_and_both_schemes(page, dashboard_site, tray_route
     assert footer["y"] + footer["height"] <= tray.bounding_box()["y"]
     page.screenshot(path=f"reports/viewer-tray-crowded-{width}.png")
     chips(page).filter(has_text="Renamed workspace").click()
-    send = viewer.get_by_role("button", name="Send to agent")
+    send = viewer.get_by_role("button", name="Send", exact=True)
     viewer.locator("#ws-message").scroll_into_view_if_needed()
     expect(send).to_be_in_viewport()
     assert send.evaluate("""el => {
