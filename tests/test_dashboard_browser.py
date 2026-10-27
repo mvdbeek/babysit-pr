@@ -3601,7 +3601,7 @@ def test_diff_comments_and_a_follow_up_reach_the_chosen_agent(page, dashboard_si
     viewer.locator(".ws-add").click()  # An open comment box, for the screenshot.
     page.screenshot(path="reports/viewer-comments.png")
     viewer.get_by_role("button", name="Cancel").click()
-    viewer.get_by_role("button", name="Send to agent").click()
+    viewer.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p2.")
     assert viewer_routes["sent"] == [
         (
@@ -3681,7 +3681,7 @@ def test_transcript_links_are_clickable_and_a_lone_agent_needs_no_choice(
     )
     expect(page.locator("#ws-message-agent")).to_have_text("To codex · idle · Fix it")
     page.locator("#ws-message-text").fill("Thanks, now update the changelog")
-    viewer.get_by_role("button", name="Send to agent").click()
+    viewer.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
     # The agent shown is the one addressed, even when it is the only one.
     assert viewer_routes["sent"][0][1]["pane"] == "w1:p1"
@@ -3713,7 +3713,7 @@ def test_a_transcript_loading_when_a_message_is_sent_is_reloaded_once_it_settles
     viewer.get_by_role("button", name="Refresh").click()
     expect(page.locator("#ws-message-agent")).to_have_text("To codex · idle · Fix it")
     page.locator("#ws-message-text").fill("Thanks, now update the changelog")
-    viewer.get_by_role("button", name="Send to agent").click()
+    viewer.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
     assert len(held) == 1
     page.clock.run_for(3000)  # The reload due after sending finds the refresh still loading.
@@ -3769,9 +3769,9 @@ def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopp
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     viewer = page.locator("#ws-viewer")
     live = viewer.get_by_role("region", name="Agent status")
-    # The transcript's own agent heads the strip; the workspace's others follow.
+    # The transcript's own agent is in the header; the workspace's others follow below it.
     state = live.locator(".ws-live-state")
-    rows = live.get_by_role("group", name="Other running agents").locator(".ws-live-agent")
+    rows = viewer.get_by_role("group", name="Other running agents").locator(".ws-live-agent")
     expect(state).to_have_attribute("data-live", "true")
     expect(state).to_contain_text("LiveWorkingClaude in w1:p2")
     expect(rows).to_have_count(1)
@@ -3941,6 +3941,114 @@ def test_a_refused_quit_says_why_and_a_vanished_agent_drops_the_question(
     expect(live.locator(".ws-live-state")).to_have_text(
         "Not runningno agent has this session open right now"
     )
+
+
+def test_shift_enter_sends_the_message_and_enter_starts_a_new_line(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    send = viewer.get_by_role("button", name="Send", exact=True)
+    expect(send).to_have_attribute("aria-keyshortcuts", "Shift+Enter")
+    expect(send).to_have_attribute("title", re.compile("Shift\\+Enter"))
+    expect(send).to_be_enabled()
+    box = viewer.get_by_label("Message the agent")
+    box.click()
+    page.keyboard.type("First line")
+    page.keyboard.press("Enter")
+    page.keyboard.type("second line")
+    expect(box).to_have_value("First line\nsecond line")
+    assert viewer_routes["sent"] == []
+    page.keyboard.press("Shift+Enter")
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
+    assert viewer_routes["sent"] == [
+        (
+            "workspace-message",
+            {"workspace": "w1", "pane": "w1:p1", "text": "First line\nsecond line"},
+        )
+    ]
+    expect(box).to_have_value("")
+
+
+def test_shift_enter_sends_nothing_while_the_button_cannot(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    # Waiting on a dialog, the agent takes no message.
+    viewer_routes["agents"] = [
+        {"pane": "w1:p2", "agent": "claude", "status": "blocked", "session": "s1"}
+    ]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.get_by_role("button", name="Send", exact=True)).to_be_disabled()
+    box = viewer.get_by_label("Message the agent")
+    box.fill("Hold on")
+    box.press("Shift+Enter")
+    # Nor does the key confirming an input method's composition, once the button can.
+    viewer_routes["agents"][0]["status"] = "idle"
+    viewer.get_by_role("button", name="Refresh").click()
+    expect(viewer.get_by_role("button", name="Send", exact=True)).to_be_enabled()
+    box.evaluate(
+        """el => el.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Enter", shiftKey: true, isComposing: true, bubbles: true, cancelable: true,
+        }))"""
+    )
+    page.wait_for_timeout(300)
+    expect(box).to_have_value("Hold on")
+    expect(page.locator("#ws-message-status")).to_be_empty()
+    assert viewer_routes["sent"] == []
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_the_agent_status_sits_beside_the_tabs_while_the_header_has_room(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    codex, claude = viewer_routes["agents"]
+    codex.update(session="s2", status="idle")
+    claude.update(session="s1", status="done")
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    header = viewer.locator(".ws-viewer-header")
+    live = header.get_by_role("region", name="Agent status")
+    tabs = header.get_by_role("tablist", name="Workspace view")
+
+    def placed():
+        expect(live.locator(".ws-live-state")).to_contain_text("LiveDoneClaude in w1:p2")
+        bar, box = tabs.bounding_box(), live.bounding_box()
+        if width >= 1000:
+            # On the tabs' line, to their right.
+            assert box["x"] >= bar["x"] + bar["width"] and box["y"] < bar["y"] + bar["height"]
+        else:
+            # A line of its own below them, still in the pinned header.
+            assert box["y"] >= bar["y"] + bar["height"]
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+        assert header.evaluate("el => el.scrollWidth <= el.clientWidth")
+
+    placed()
+    # The workspace's other agents are listed below the header.
+    others = viewer.get_by_role("group", name="Other running agents")
+    expect(others).to_contain_text("IdleCodexin w1:p1")
+    expect(header.get_by_role("group", name="Other running agents")).to_have_count(0)
+    # The question a quit asks, and its outcome, stay by the button in the pinned header.
+    live.get_by_role("button", name="Quit Claude in w1:p2").click()
+    card = header.get_by_role("group", name="Confirm quitting the agent")
+    expect(card).to_be_in_viewport()
+    card.get_by_role("button", name="Keep it running").click()
+    if width >= 1000:
+        viewer.get_by_role("button", name="Full screen").click()
+        placed()
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+    page.get_by_role("region", name="Minimized viewers").locator(".ws-tray-restore").click()
+    placed()
+    # The diff has no agent status.
+    viewer.get_by_role("tab", name="Diff").click()
+    expect(live).to_be_hidden()
+    expect(others).to_be_hidden()
 
 
 TRANSCRIPT_MARKDOWN = """Both PRs are forwarded; **one** test is <img src=x onerror="window.injected=true"> open.
@@ -4339,7 +4447,7 @@ def test_missing_question_is_answerable_without_the_transcript(
     # The visible transcript belongs to s1 and has no pending question at all.
     interaction = page.locator("#ws-agent-interaction")
     expect(interaction).to_contain_text("Live question from the agent")
-    send = page.get_by_role("button", name="Send to agent")
+    send = page.get_by_role("button", name="Send", exact=True)
     expect(send).to_be_disabled()
     page.get_by_label("Message the agent").fill("Restart, then open the PR")
     interaction.get_by_label("Other answer to: Merge").fill("Restart only")
@@ -4389,7 +4497,7 @@ def test_blocked_agent_selection_shows_unsupported_dialog(page, dashboard_site, 
     page.set_viewport_size({"width": 390, "height": 900})
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
-    send = page.get_by_role("button", name="Send to agent")
+    send = page.get_by_role("button", name="Send", exact=True)
     expect(send).to_be_enabled()
     expect(
         page.locator("#ws-viewer-links").get_by_role("link", name="Open in Collie")
@@ -4455,7 +4563,7 @@ def test_a_permission_dialog_is_answered_with_its_option_buttons(
     expect(interaction).to_contain_text("Live dialog from the agent")
     expect(interaction).to_contain_text("rm -rf build <b>x</b>")
     expect(interaction).not_to_contain_text("Answer this dialog in Collie")
-    expect(page.get_by_role("button", name="Send to agent")).to_be_disabled()
+    expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
     assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
     interaction.screenshot(path=f"reports/live-dialog-{width}.png")
     no = interaction.get_by_role("button", name="No, and tell Claude what to do differently (esc)")
@@ -4522,7 +4630,7 @@ def test_a_blocked_agent_with_an_idle_prompt_box_can_be_messaged(
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     page.get_by_label("Message the agent").fill("Carry on")
-    send = page.get_by_role("button", name="Send to agent")
+    send = page.get_by_role("button", name="Send", exact=True)
     expect(send).to_be_enabled()
     expect(page.locator("#ws-agent-interaction")).to_be_empty()
     send.click()
@@ -4612,7 +4720,7 @@ def test_files_attach_to_a_follow_up_message_and_stay_with_its_draft(
     expect(chips).to_have_count(2)
     chips.first.get_by_role("button", name="Remove attachment ci <b>log</b>.txt").click()
     expect(chips).to_have_count(1)
-    composer.get_by_role("button", name="Send to agent").click()
+    composer.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
     ((_, body),) = viewer_routes["sent"]
     assert body["text"] == "" and len(body["attachments"]) == 1
@@ -4719,7 +4827,7 @@ def test_files_dropped_onto_a_follow_up_message_attach(page, dashboard_site, vie
     )
     assert kept
     expect(chips).to_have_count(2)
-    composer.get_by_role("button", name="Send to agent").click()
+    composer.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p1.")
     ((_, body),) = viewer_routes["sent"]
     assert len(body["attachments"]) == 2
@@ -5193,7 +5301,7 @@ def test_nothing_to_send_without_an_agent_or_a_session(page, dashboard_site, vie
     expect(page.locator("#ws-message-agent")).to_have_text(
         "No agent is running and no session was recorded here."
     )
-    expect(page.get_by_role("button", name="Send to agent")).to_be_disabled()
+    expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
 
 
 def test_comments_by_keyboard_removal_and_word_selection(page, dashboard_site, viewer_routes):
@@ -5299,7 +5407,7 @@ def test_sending_stays_disabled_while_docker_access_changes(page, dashboard_site
     page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
     page.get_by_role("checkbox", name="Docker access", exact=True).click()
     expect(page.locator("#ws-docker-status")).to_have_text("Applying Docker access…")
-    send = page.get_by_role("button", name="Send to agent")
+    send = page.get_by_role("button", name="Send", exact=True)
     expect(send).to_be_disabled()
     agent["docker"] = True
     pending[0].fulfill(json={"pane": agent["pane"], "docker": True, "warning": None})
@@ -5316,7 +5424,7 @@ def test_unknown_docker_access_is_indeterminate_and_disabled(page, dashboard_sit
     expect(checkbox).to_be_disabled()
     expect(checkbox).to_have_js_property("indeterminate", True)
     expect(page.locator("#ws-docker-status")).to_have_text("Policy unavailable")
-    expect(page.get_by_role("button", name="Send to agent")).to_be_enabled()
+    expect(page.get_by_role("button", name="Send", exact=True)).to_be_enabled()
 
 
 @pytest.mark.parametrize("width,freeform", [(1280, False), (390, True)])

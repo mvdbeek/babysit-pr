@@ -282,6 +282,7 @@
     byId("ws-viewer-error").textContent = "";
     byId("ws-viewer-meta").textContent = message;
     byId("ws-live").hidden = true;
+    byId("ws-live-agents").hidden = true;
     for (const [id, mode] of [
       ["ws-view-diff", "diff"],
       ["ws-view-transcript", "transcript"],
@@ -1216,7 +1217,7 @@
     holder.replaceChildren();
     const send = byId("ws-message-send");
     const interaction = byId("ws-agent-interaction");
-    send.textContent = "Send to agent";
+    send.textContent = "Send";
     send.disabled = true;
     byId("ws-message-reopen").hidden = true;
     byId("ws-docker").hidden = true;
@@ -1754,6 +1755,7 @@
         option.textContent = (agent ? `● ${activity(agent)[0]} · ` : "") + sessionLabel(session);
     }
     holder.hidden = !data;
+    byId("ws-live-agents").hidden = !data;
     if (holder.hidden) return;
     const mine = shown ? live(shown) : undefined;
     const asked =
@@ -2212,6 +2214,16 @@
     renderComments();
   }
   byId("ws-message").addEventListener("submit", sendMessage);
+  // Shift+Enter sends as the button does, and only while the button could; Enter stays a
+  // newline, and a key that confirms an input method's composition sends nothing.
+  byId("ws-message-text").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || !event.shiftKey || event.altKey || event.ctrlKey) return;
+    if (event.metaKey || event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    const form = byId("ws-message");
+    const send = byId("ws-message-send");
+    if (!form.hidden && !send.hidden && !send.disabled) form.requestSubmit(send);
+  });
   byId("ws-message-reopen").onclick = () => void reopenSession(null);
   window.addEventListener("focus", () => {
     if (viewer && messageable(viewer.entry) && byId("ws-viewer").open)
