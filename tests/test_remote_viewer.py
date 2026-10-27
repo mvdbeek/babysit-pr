@@ -422,8 +422,7 @@ def test_views_resolve_worker_rows_and_ids_on_the_server(worker, dashboard_site,
         ("/api/workspace-diff?key=m%3Abox%3A%2Fsrc", "Unknown workspace"),
         ("/api/workspace-diff?workspace=box%2Fw1", "Unknown machine box"),
         ("/api/workspace-diff?workspace=mini%2Fw9", "not open"),
-        (f"/api/workspace-agents?key={key}", "Not available for workspaces on Mac mini yet"),
-        ("/api/workspace-agents?workspace=mini%2Fw1", "cannot be opened"),
+        ("/api/workspace-agents?workspace=box%2Fw1", "Unknown machine box"),
     ]:
         status, value = request(port, path)
         assert status == 400 and error in value["error"], path
@@ -435,7 +434,7 @@ def test_views_resolve_worker_rows_and_ids_on_the_server(worker, dashboard_site,
 
 
 @pytest.mark.browser
-def test_a_worker_row_opens_its_diff_and_transcript_read_only(page, worker, dashboard_site):
+def test_a_worker_row_opens_its_diff_transcript_and_composer(page, worker, dashboard_site):
     port, _ = dashboard_site
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
@@ -446,9 +445,12 @@ def test_a_worker_row_opens_its_diff_and_transcript_read_only(page, worker, dash
     viewer = page.locator("#ws-viewer")
     expect(viewer.locator("#ws-viewer-title")).to_have_text("feature")
     expect(viewer.locator("#ws-viewer-content")).to_contain_text(HOSTILE)
-    notice = viewer.locator("#ws-message-readonly")
-    expect(notice).to_have_text("Not available for workspaces on Mac mini yet")
-    expect(viewer.locator("#ws-message")).to_be_hidden()
+    # No agent runs there, so the composer offers to resume a session it recorded; its
+    # exit watches and uploads stay on this machine.
+    expect(viewer.locator("#ws-message")).to_be_visible()
+    expect(viewer.locator("#ws-message-agent")).to_contain_text("resumes this session")
+    expect(viewer.locator("#ws-message-quit-label")).to_be_hidden()
+    expect(viewer.locator("#ws-message-files")).to_be_hidden()
     viewer.get_by_role("tab", name="Transcript").click()
     # The newest session the worker recorded here, the Codex one.
     expect(viewer.locator("#ws-viewer-content")).to_contain_text("Codex task")
@@ -458,8 +460,8 @@ def test_a_worker_row_opens_its_diff_and_transcript_read_only(page, worker, dash
     local = page.locator("#ws-list tr").filter(has=page.get_by_text("local-work", exact=True))
     local.get_by_role("button", name="Diff", exact=True).click()
     expect(viewer.locator("#ws-viewer-content")).to_contain_text("local.txt")
-    expect(notice).to_be_hidden()
     expect(viewer.locator("#ws-message")).to_be_visible()
+    expect(viewer.locator("#ws-message-quit-label")).to_be_visible()
     assert not errors
 
 

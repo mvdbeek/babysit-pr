@@ -19,6 +19,7 @@ Collie and the run needs attention. A job on a worker is followed and exited the
 way through that worker's herdr and probe.
 """
 
+import fcntl
 import os
 import re
 import subprocess
@@ -312,12 +313,13 @@ def remote_checkout(job, home, machine):
     )
 
 
-def remote_command(job, machine, found, staged, effort):
+def remote_command(job, machine, found, staged, effort, extra=()):
     """The line typed on ``machine``: its own sandbox, with the paths its probe reported.
 
     babysit-bwrap is given the checkout, its common dir and the agent's configuration
     there; Safehouse on a Mac worker grants those through the user's shell functions.
-    A worker with the ``gpg`` label lets the agent sign.
+    A worker with the ``gpg`` label lets the agent sign. ``extra`` are agent arguments
+    before the prompt, as a resume's.
     """
     backend = BACKENDS[machine.os]
     features = ("gpg",) if "gpg" in machine.labels else ()
@@ -341,6 +343,7 @@ def remote_command(job, machine, found, staged, effort):
         job["model"],
         effort,
         stage=lambda _: staged,
+        extra=extra,
         docker=job["docker"],
         claude_config_dir=home,
         claude_subscription=bool(job["claude_account"]),
@@ -356,9 +359,20 @@ def remote_command(job, machine, found, staged, effort):
 def start(job, run_id, home, src):
     """Type the agent command into a new pane of the job's workspace.
 
-    A job with a ``machine`` does all of it on that worker, over herdr and ssh.
+    A job with a ``machine`` does all of it on that worker, over herdr and ssh, holding
+    the worker clone's lock until its agent is typed: cleanup and launches there take it,
+    by the clone's real path there, so none removes the checkout before it has an agent.
     """
     machine = machines.resolve(home, job["machine"], placing=True) if job.get("machine") else None
+    if machine is None:
+        return started(job, run_id, home, src, None)
+    real = probe(home, machine, "realpath", 30, path=job["clone"])["path"]
+    with machines.clone_lock(home, machine, real).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return started(job, run_id, home, src, machine)
+
+
+def started(job, run_id, home, src, machine):
     found = None
     if machine is None:
         path = checkout(job, src)

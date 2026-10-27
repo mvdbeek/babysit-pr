@@ -430,6 +430,14 @@ def run(home, m: Machine | None, argv, *, timeout, input=None, env=None, cwd=Non
         channel.release()
 
 
+def clone_lock(home, m: Machine, clone: str) -> Path:
+    """The lock of a worker's clone, named by its real path there: launches and cleanup
+    in one clone wait for each other, however each spells it."""
+    directory = Path(home) / "workspace-locks"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory / hashlib.sha256(f"{m.id}\0{clone}".encode()).hexdigest()
+
+
 # A staged file's name: no path, no option, no hidden file.
 FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 # Writes stdin to a new private file and prints its absolute path. The folder must be

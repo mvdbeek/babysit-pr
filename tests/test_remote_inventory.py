@@ -168,7 +168,7 @@ def test_without_a_registry_no_ssh_runs_and_the_snapshot_is_unchanged(fleet):
     assert fleet["herdr"] == []
 
 
-def test_each_worker_is_scanned_with_one_ssh_call_and_listed_read_only(fleet):
+def test_each_worker_is_scanned_with_one_ssh_call_and_listed(fleet):
     register(fleet["home"], MINI, BOX)
     plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
     value = plugin.collect()
@@ -193,11 +193,11 @@ def test_each_worker_is_scanned_with_one_ssh_call_and_listed_read_only(fleet):
     assert merged["repo"] == BASE and [link["number"] for link in merged["links"]] == [7]
     assert merged["workspace_ids"] == ["mini/w1"] and merged["workspace_url"] is None
     assert merged["agents"] == [{"agent": "codex", "status": "working", "pane": "w1:p1"}]
-    assert merged["removable"] is False and merged["status"] == "blocked"
+    assert merged["removable"] and merged["status"] == "blocked"
     dirty = rows[f"m:mini:{fleet['mini'] / 'dirty-work'}"]
     assert dirty["changes"] == 1 and dirty["created_at"] is not None
     gone = rows["workspace:mini:w2"]
-    assert gone["missing"] and gone["status"] == "missing" and gone["removable"] is False
+    assert gone["missing"] and gone["status"] == "missing" and gone["removable"]
     assert f"m:box:{fleet['box'] / 'box-work'}" in rows
     assert value["machines"] == {
         "mini": {
@@ -304,33 +304,24 @@ def test_hostile_worker_paths_round_trip_verbatim(fleet):
     assert not list(fleet["hosts"].rglob("PWNED")) and not list(Path.cwd().glob("PWNED"))
 
 
-def test_worker_rows_offer_no_actions_and_cleanup_refuses_them(fleet):
+def test_worker_rows_are_cleaned_up_there_but_not_opened_from_here(fleet):
     register(fleet["home"], MINI)
     plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
     plugin.value = plugin.collect()
+    rows = by_key(plugin.value)
     key = f"m:mini:{fleet['mini'] / 'dirty-work'}"
+    assert rows[key]["removable"] and rows["workspace:mini:w2"]["removable"]
+    # A working agent blocks cleanup until approved, as on this machine.
+    merged = rows[f"m:mini:{fleet['mini'] / 'merged-work'}"]
+    assert merged["removable"] and [b["kind"] for b in merged["blockers"]] == ["agent"]
     for refused in (key, "workspace:mini:w2"):
-        with pytest.raises(ValueError, match="Not available for workspaces on Mac mini yet"):
-            plugin.resolve(refused)
         with pytest.raises(ValueError, match="Not available for workspaces on Mac mini yet"):
             plugin.open_workspace({"key": refused})
     with pytest.raises(ValueError, match="Not available for workspaces on Mac mini yet"):
         plugin.checkout(key)
-    with pytest.raises(ValueError, match="on ghost yet"):
+    with pytest.raises(ValueError, match="Unknown machine ghost"):
         plugin.resolve("m:ghost:/src/x")
-    started = plugin.cleanup({"targets": [{"key": key, "approve": ["dirty"]}]})
-    assert started["accepted"]
-    deadline = time.time() + 10
-    while plugin.snapshot(start=False)["cleanup"]["status"] == "running":
-        assert time.time() < deadline
-        time.sleep(0.05)
-    result = plugin.snapshot(start=False)["cleanup"]["results"][0]
-    assert result["status"] == "failed" and "Not available" in result["message"]
-    assert (fleet["mini"] / "dirty-work" / "scratch.txt").exists()
-    assert not any(
-        call[0].startswith("--machine") and "close" in call
-        for call in read(fleet["state"])["calls"]
-    )
+    assert plugin.resolve(key)["key"] == key
 
 
 def test_worker_rows_stay_out_of_needs_you(fleet):

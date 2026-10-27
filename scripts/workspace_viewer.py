@@ -23,6 +23,7 @@ from pathlib import Path
 
 import claude_accounts
 import github_cli
+import machines
 import owned_process
 import remote_probe
 import safe_git
@@ -181,14 +182,15 @@ def workspace_checkout(workspace_id, recorded_checkout=None):
     return root
 
 
-def remember(workspace_id, root, spaces, *, recovered=False):
+def remember(workspace_id, root, spaces, *, recovered=False, machine=None):
     """Note a workspace's checkout, and the other workspaces on it while it is open.
 
     Those others are never taken for it once it closes: a clone's own checkout often
     holds several unrelated workspaces.
     """
+    key = (machine.id if machine else None, workspace_id)
     with _lock:
-        _, known, others = _checkouts.pop((None, workspace_id), (0, None, frozenset()))
+        _, known, others = _checkouts.pop(key, (0, None, frozenset()))
         if known != root:
             others = frozenset()
         # After recovery from an operation, we cannot tell whether an existing workspace
@@ -198,16 +200,31 @@ def remember(workspace_id, root, spaces, *, recovered=False):
             others |= {
                 w["workspace_id"]
                 for w in spaces
-                if w.get("workspace_id") != workspace_id and checkout_of(w) == root
+                if w.get("workspace_id") != workspace_id and checkout_of(w, machine) == root
             }
         # Re-inserted last, so the newest is evicted last.
-        _checkouts[(None, workspace_id)] = (time.monotonic(), root, others)
+        _checkouts[key] = (time.monotonic(), root, others)
         while len(_checkouts) > 200:
             _checkouts.pop(next(iter(_checkouts)), None)
 
 
-def checkout_of(space):
-    """The resolved checkout a listed herdr workspace was opened on, if it still exists."""
+def checkout_of(space, machine=None):
+    """The resolved checkout a listed herdr workspace was opened on, if it still exists.
+
+    A worker's is the path its herdr names, never looked up on this filesystem.
+    """
+    if machine is not None:
+        path = ((space.get("worktree") or {}) if isinstance(space, dict) else {}).get(
+            "checkout_path"
+        )
+        if (
+            isinstance(path, str)
+            and len(path) <= remote_probe.MAX_TEXT
+            and path.startswith("/")
+            and "\0" not in path
+        ):
+            return path
+        return None
     path = (space.get("worktree") or {}).get("checkout_path")
     return str(Path(path).resolve()) if path and Path(path).is_dir() else None
 
@@ -228,42 +245,61 @@ def resolve_workspace(workspace_id, spaces, known=None):
     return root
 
 
-def live_workspace(workspace_id):
+def live_workspace(workspace_id, machine=None):
     """The open herdr workspace for the checkout this ID names, or None.
 
     That is the workspace itself while it is open. Once it is closed, it is the one
     workspace opened on the same checkout since (herdr gives a reopened workspace a new
-    ID); with none, or several to choose from, there is none.
+    ID); with none, or several to choose from, there is none. A worker's comes from
+    its own herdr.
     """
-    root = workspace_checkout(workspace_id)
-    spaces = herdr("workspace", "list")["workspaces"]
+    if machine is None:
+        root = workspace_checkout(workspace_id)
+    else:
+        root = remote_checkout(machine, workspace_id)
+    spaces = listed_spaces(machine)
     own = next((w for w in spaces if w.get("workspace_id") == workspace_id), None)
     if own is not None:
-        if checkout_of(own) != root:
+        if checkout_of(own, machine) != root:
             # The ID now names another checkout: never act on the remembered one.
             raise ValueError("That herdr workspace now shows another checkout; refresh")
-        remember(workspace_id, root, spaces)
+        remember(workspace_id, root, spaces, machine=machine)
         return workspace_id
     with _lock:
-        others = _checkouts.get((None, workspace_id), (0, None, frozenset()))[2]
+        key = (machine.id if machine else None, workspace_id)
+        others = _checkouts.get(key, (0, None, frozenset()))[2]
     since = [
         w["workspace_id"]
         for w in spaces
-        if checkout_of(w) == root and w.get("workspace_id") not in others
+        if checkout_of(w, machine) == root and w.get("workspace_id") not in others
     ]
     return since[0] if len(since) == 1 else None
 
 
-def checkout_workspace(root):
+def listed_spaces(machine=None):
+    """herdr's workspaces; a worker's only those whose ID could name one."""
+    spaces = herdr("workspace", "list", machine=machine)["workspaces"]
+    if machine is None:
+        return spaces
+    return [
+        w
+        for w in (spaces if isinstance(spaces, list) else [])
+        if isinstance(w, dict)
+        and isinstance(w.get("workspace_id"), str)
+        and machines.WORKSPACE.fullmatch(w["workspace_id"])
+    ]
+
+
+def checkout_workspace(root, machine=None):
     """The herdr workspace open on a checkout now, or None.
 
     For a Workspaces-tab row listed while none was open: with several open, the first
     is taken, as that row lists them.
     """
-    spaces = herdr("workspace", "list")["workspaces"]
-    found = next((w["workspace_id"] for w in spaces if checkout_of(w) == root), None)
+    spaces = listed_spaces(machine)
+    found = next((w["workspace_id"] for w in spaces if checkout_of(w, machine) == root), None)
     if found:
-        remember(found, root, spaces)
+        remember(found, root, spaces, machine=machine)
     return found
 
 
@@ -275,36 +311,24 @@ def remote_checkout(machine, workspace_id):
     """
     if not isinstance(workspace_id, str) or not WORKSPACE_ID.match(workspace_id):
         raise ValueError("Supply a herdr workspace")
-    key = (machine.id, workspace_id)
     with _lock:
-        cached = _checkouts.get(key)
+        cached = _checkouts.get((machine.id, workspace_id))
     if cached and time.monotonic() - cached[0] < CHECKOUT_TTL:
         return cached[1]
     try:
-        spaces = herdr("workspace", "list", machine=machine)["workspaces"]
+        spaces = listed_spaces(machine)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ValueError(f"{machine.label} did not list its workspaces: {exc}") from exc
-    space = next(
-        (w for w in spaces if isinstance(w, dict) and w.get("workspace_id") == workspace_id), None
-    )
+    space = next((w for w in spaces if w["workspace_id"] == workspace_id), None)
     if space is not None:
-        root = (space.get("worktree") or {}).get("checkout_path")
-        if not (
-            isinstance(root, str)
-            and len(root) <= remote_probe.MAX_TEXT
-            and root.startswith("/")
-            and "\0" not in root
-        ):
+        root = checkout_of(space, machine)
+        if root is None:
             raise ValueError("That herdr workspace has no checkout to show")
     elif cached:
         root = cached[1]  # Closed since it was last seen.
     else:
         raise ValueError("That herdr workspace is not open; refresh")
-    with _lock:
-        _checkouts.pop(key, None)
-        _checkouts[key] = (time.monotonic(), root, frozenset())
-        while len(_checkouts) > 200:
-            _checkouts.pop(next(iter(_checkouts)), None)
+    remember(workspace_id, root, spaces, machine=machine)
     return root
 
 
