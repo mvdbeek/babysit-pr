@@ -88,6 +88,13 @@
 #ws-viewer-error:empty {
   display: none;
 }
+/* The tabs, and the agent's status beside them while the header has room for both. */
+.ws-viewer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px 16px;
+}
 .ws-viewer-tabs {
   display: flex;
   gap: 6px;
@@ -110,8 +117,21 @@
   align-items: end;
   gap: 10px 14px;
 }
-/* The agents running in the workspace, above a transcript. */
+/* Whether an agent runs the transcript's session, in the header: it takes the rest of the
+   tabs' line, and wraps below them once less than its basis is left. */
 .ws-live {
+  display: flex;
+  flex: 1 1 380px;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 4px 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+/* The workspace's other agents, above the transcript. */
+.ws-live-agents {
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -120,14 +140,6 @@
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg);
-}
-/* The workspace's other agents, below the session shown. */
-#ws-live-agents {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 6px;
-  border-top: 1px solid var(--line);
 }
 .ws-live-agent {
   display: flex;
@@ -158,11 +170,13 @@
   gap: 6px;
   margin-left: auto;
 }
-.ws-live .ws-quit:not(:disabled) {
+.ws-live .ws-quit:not(:disabled),
+.ws-live-agents .ws-quit:not(:disabled) {
   color: var(--red);
   border-color: var(--danger-line);
 }
-.ws-live .ws-quit:not(:disabled):hover {
+.ws-live .ws-quit:not(:disabled):hover,
+.ws-live-agents .ws-quit:not(:disabled):hover {
   background: var(--red-bg);
 }
 .ws-live-agent[data-status="working"] .badge:before {

@@ -831,7 +831,7 @@ def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
         "href", "https://collie.example.ts.net/space/w4"
     )
     dialog.get_by_label("Message the agent").fill("And add a test")
-    dialog.get_by_role("button", name="Send to agent").click()
+    dialog.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w4:p1.")
     assert sent[-1] == {"workspace": "w4", "pane": "w4:p1", "text": "And add a test"}
 

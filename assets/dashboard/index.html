@@ -1227,18 +1227,28 @@
         </div>
         <h2 id="ws-viewer-title">Workspace</h2>
         <p id="ws-viewer-links"></p>
-        <div class="ws-viewer-tabs" role="tablist" aria-label="Workspace view">
-          <button id="ws-view-diff" type="button" role="tab">Diff</button>
-          <button id="ws-view-transcript" type="button" role="tab">Transcript</button>
+        <div class="ws-viewer-bar">
+          <div class="ws-viewer-tabs" role="tablist" aria-label="Workspace view">
+            <button id="ws-view-diff" type="button" role="tab">Diff</button>
+            <button id="ws-view-transcript" type="button" role="tab">Transcript</button>
+          </div>
+          <!-- Beside the tabs while there is room, on a line of its own below them when not.
+               The question and outcome of its buttons stay with them in the pinned header. -->
+          <section id="ws-live" class="ws-live" aria-label="Agent status" hidden>
+            <div id="ws-live-state"></div>
+            <div id="ws-live-confirm"></div>
+            <p id="ws-live-status" role="status"></p>
+          </section>
         </div>
       </div>
       <div id="ws-viewer-controls" class="ws-viewer-controls"></div>
-      <section id="ws-live" class="ws-live" aria-label="Agent status" hidden>
-        <div id="ws-live-state"></div>
-        <div id="ws-live-agents" aria-label="Other running agents" role="group"></div>
-        <div id="ws-live-confirm"></div>
-        <p id="ws-live-status" role="status"></p>
-      </section>
+      <div
+        id="ws-live-agents"
+        class="ws-live-agents"
+        aria-label="Other running agents"
+        role="group"
+        hidden
+      ></div>
       <p id="ws-viewer-meta" role="status"></p>
       <p id="ws-viewer-error" role="alert"></p>
       <div id="ws-viewer-content"></div>
@@ -1253,7 +1263,14 @@
             rows="3"
             placeholder="Follow-up instructions; diff comments are sent with them"
           ></textarea>
-          <button id="ws-message-send" type="submit">Send to agent</button>
+          <button
+            id="ws-message-send"
+            type="submit"
+            title="Shift+Enter in the message also sends it"
+            aria-keyshortcuts="Shift+Enter"
+          >
+            Send
+          </button>
         </div>
         <div id="ws-message-files"></div>
         <div id="ws-docker" hidden>
