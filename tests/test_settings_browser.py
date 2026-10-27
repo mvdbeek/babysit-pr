@@ -121,3 +121,31 @@ def test_settings_that_cannot_be_read_leave_the_pages_own_wording(page: Page, da
     expect(dialog.locator("#settings-prompt")).to_have_value(
         re.compile(r"^Review \{url\}\. Read its description")
     )
+
+
+def test_this_machines_capacity_is_offered_only_with_workers(page: Page, dashboard_site):
+    url, home = dashboard_site
+    page.goto(url)
+    dialog = open_settings(page)
+    expect(dialog.locator("#settings-capacity-field")).to_be_hidden()
+    dialog.locator("#settings-close").click()
+    machines = [{"id": "local", "label": "This machine"}, {"id": "box", "label": "Linux box"}]
+    page.route("**/api/machines", lambda route: route.fulfill(json={"machines": machines}))
+    dialog = open_settings(page)
+    capacity = dialog.get_by_label("Agents on this machine")
+    expect(capacity).to_be_visible()
+    expect(capacity).to_have_value("20")
+    expect(dialog.locator("#settings-capacity-note")).to_contain_text(
+        "Auto starts launches on other machines once this many agents run here."
+    )
+    capacity.fill("7")
+    capacity.press("Enter")
+    expect(dialog.locator("#settings-status")).to_have_text("Saved.")
+    assert json.loads((home / "dashboard-settings.json").read_text())["local_max_agents"] == 7
+    capacity.fill("0")
+    capacity.press("Enter")
+    expect(dialog.locator("#settings-status")).to_have_text(
+        "Choose a whole number of agents from 1 to 200"
+    )
+    expect(capacity).to_have_value("7")
+    assert json.loads((home / "dashboard-settings.json").read_text())["local_max_agents"] == 7

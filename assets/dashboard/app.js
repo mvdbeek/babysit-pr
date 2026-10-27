@@ -2532,6 +2532,12 @@ function savedEffort(repo, levels) {
 // `remote` describes a worker that can take the launch.
 function agentFields({
   repo = null,
+  // What the launch starts work on, for the placement preview: pr, issue, sentry,
+  // scratch or cron. Workers only take some of them.
+  kind = "scratch",
+  // More preview parameters from the dialog's own choices, read at each preview, which
+  // `refreshPlacement` asks for again once they change.
+  hints = () => ({}),
   mixed = false,
   preferred = null,
   remote = (label) =>
@@ -2785,7 +2791,7 @@ function agentFields({
   async function updatePlacement() {
     if (machineField.hidden) return;
     const request = ++previews;
-    const query = new URLSearchParams({ agent: agent.value });
+    const query = new URLSearchParams({ agent: agent.value, kind, ...hints() });
     if (repo) query.set("repo", repo);
     if (docker.checked) query.set("docker", "1");
     if (agent.value === "claude" && account.value) query.set("account", account.value);
@@ -2831,6 +2837,7 @@ function agentFields({
     quitLabel,
     effortDefaults,
     setRepo,
+    refreshPlacement: () => void updatePlacement(),
     machineField,
     machineChoice,
   };
@@ -2971,7 +2978,12 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
         effortDefaults,
         machineField,
         machineChoice,
-      } = agentFields({ repo: item.repo, preferred });
+      } = agentFields({
+        repo: item.repo,
+        // A watch only reopens its checkout; the preview is for pull request work.
+        kind: item.kind && item.kind !== "watch" ? item.kind : "pr",
+        preferred,
+      });
       const task = el("textarea");
       task.id = "workspace-task";
       task.required = true;
@@ -3191,6 +3203,9 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     // Other clones the task also covers: the branch is checked out in each and the
     // agent's sandbox may write there (`wt --with`).
     const also = new Set();
+    // Filing an issue or adding clones keeps the task off workers; set once the
+    // Machine select exists, below.
+    let placementChanged = () => {};
     const alsoBox = el("details", undefined, "new-task-also");
     const alsoSummary = el("summary");
     const alsoList = el("div", undefined, "new-task-also-list");
@@ -3218,6 +3233,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
             if (box.checked) also.add(clone);
             else also.delete(clone);
             limitAlso();
+            placementChanged();
           };
           const label = el("label", undefined, "workspace-later");
           label.append(box, ` ${slug} · ${clone}`);
@@ -3286,6 +3302,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       branchFields.hidden = fileIssue.checked;
       title.required = fileIssue.checked;
       name.required = !fileIssue.checked;
+      placementChanged();
     };
     const {
       agent,
@@ -3300,9 +3317,17 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       quitLabel,
       effortDefaults,
       setRepo,
+      refreshPlacement,
       machineField,
       machineChoice,
-    } = agentFields({ repo: repos[Number(repo.value)]?.repo });
+    } = agentFields({
+      repo: repos[Number(repo.value)]?.repo,
+      hints: () => ({
+        ...(fileIssue.checked ? { kind: "issue" } : {}),
+        ...(also.size ? { also: "1" } : {}),
+      }),
+    });
+    placementChanged = refreshPlacement;
     repo.addEventListener("change", () => setRepo(repos[Number(repo.value)]?.repo));
     field("Agent", agent);
     field("Model (optional)", model);
@@ -3508,7 +3533,7 @@ async function batchDialog(items, done, { nouns: [one, many], tasks, preferred =
       effortDefaults,
       machineField,
       machineChoice,
-    } = agentFields({ ...projects(items), preferred });
+    } = agentFields({ ...projects(items), kind: one === "issue" ? "issue" : "pr", preferred });
     field("Agent", agent);
     field("Model (optional)", model);
     field("Reasoning effort (optional)", effort);

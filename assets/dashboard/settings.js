@@ -2,7 +2,8 @@
 // What the page prefills and who reviews: the task behind each Handle button, and the
 // agent a review starts with. Both used to be fixed in this file, so changing a word
 // meant editing the checkout; they are kept with the watcher instead, where a phone on
-// the tailnet can change them and every device sees the same ones.
+// the tailnet can change them and every device sees the same ones. With workers
+// registered, also how many agents this machine takes before Auto places elsewhere.
 (() => {
   const byId = (id) => document.getElementById(`settings-${id}`);
   const dialog = byId("dialog");
@@ -35,7 +36,7 @@
   ];
   const DEFAULTS = Object.fromEntries(TASKS.map((task) => [task.id, task.prompt]));
   // Until the saved settings arrive, and when they cannot be read, the page's own.
-  let saved = { task_prompts: {}, reviewer: "codex" };
+  let saved = { task_prompts: {}, reviewer: "codex", local_max_agents: 20 };
   let chosen = TASKS[0].id;
   // What was last written into the box. While it still holds that, a refresh may
   // replace it; once something else is in it, the person is typing and it stands.
@@ -103,8 +104,26 @@
     if (shown === null || byId("prompt").value === shown) showPrompt();
     byId("reset").disabled = !edited(chosen);
   }
+  function renderCapacity() {
+    const input = byId("capacity");
+    // A number being typed stands until it is saved or refused.
+    if (document.activeElement !== input) input.value = String(saved.local_max_agents);
+  }
+  // Only placement reads it, so it is offered once another machine can take launches.
+  async function showCapacity() {
+    let machines = [];
+    try {
+      const response = await fetch("/api/machines", { cache: "no-store" });
+      if (response.ok) machines = (await response.json()).machines ?? [];
+    } catch {
+      // Without the list the field stays hidden, as on a single machine.
+    }
+    byId("capacity-field").hidden = machines.length < 2;
+    byId("capacity-note").hidden = machines.length < 2;
+  }
   function render() {
     renderReviewer();
+    renderCapacity();
     renderTasks();
   }
   function dirty() {
@@ -157,9 +176,31 @@
       select.disabled = false;
     }
   };
+  byId("capacity").onchange = async (event) => {
+    const input = event.target;
+    const value = Number(input.value);
+    if (!Number.isInteger(value) || value < 1 || value > 200) {
+      status("Choose a whole number of agents from 1 to 200");
+      input.value = String(saved.local_max_agents);
+      return;
+    }
+    input.disabled = true;
+    status("Saving…");
+    try {
+      await send({ local_max_agents: value });
+      status("Saved.");
+    } catch (error) {
+      status(`Could not save: ${error.message}`);
+      input.value = String(saved.local_max_agents);
+    } finally {
+      renderCapacity();
+      input.disabled = false;
+    }
+  };
   document.getElementById("settings-toggle").onclick = async () => {
     status("");
     render();
+    void showCapacity();
     dialog.showModal();
     // Another device may have changed them; a failure leaves what this page knows.
     try {

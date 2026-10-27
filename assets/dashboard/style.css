@@ -365,6 +365,9 @@ header p {
   max-width: none;
   min-width: 0;
 }
+#settings-capacity {
+  width: 6em;
+}
 #settings-prompt {
   width: 100%;
   margin-top: 12px;

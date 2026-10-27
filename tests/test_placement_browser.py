@@ -94,7 +94,7 @@ def site(page, dashboard_site):
             json={
                 "machine": "local",
                 "label": "This machine",
-                "reason": "auto: workers are only used when chosen, 6/8 free",
+                "reason": "auto: least busy, 18/20 free",
                 "options": [
                     {
                         "id": "mini",
@@ -175,15 +175,15 @@ def test_machine_select_previews_and_disables_machines_that_cannot_take_it(page,
     )
     expect(select).to_have_value("auto")
     note = dialog.locator(".machine-choice")
-    expect(note).to_have_text("auto: workers are only used when chosen, 6/8 free")
+    expect(note).to_have_text("auto: least busy, 18/20 free")
     expect(options.nth(3)).to_be_disabled()
     expect(options.nth(2)).to_be_enabled()  # Full: a person may still choose it.
-    assert previews[0] == "agent=codex&repo=up%2Falpha"
+    assert previews[0] == "agent=codex&kind=scratch&repo=up%2Falpha"
     # Docker changes what each machine can take.
     dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
     expect(options.nth(2)).to_have_text("Mac mini · lacks docker")
     expect(options.nth(2)).to_be_disabled()
-    assert previews[-1] == "agent=codex&repo=up%2Falpha&docker=1"
+    assert previews[-1] == "agent=codex&kind=scratch&repo=up%2Falpha&docker=1"
     dialog.get_by_label("Allow Docker in the agent’s sandbox").uncheck()
     expect(options.nth(2)).to_be_enabled()
     select.select_option("mini")
@@ -296,3 +296,20 @@ def test_a_refused_choice_stays_with_its_reason(page, site):
     expect(page.locator("#workspace-progress")).to_contain_text("failed:")
     # The server, not the page, refuses it.
     assert sent[-1]["machine"] == "mini"
+
+
+def test_new_task_previews_again_when_it_files_an_issue(page, site):
+    url, snapshot, *_ = site
+    snapshot["machines"] = [LOCAL, MINI, BOX]
+    dialog = open_new_task(page, url)
+    expect(dialog.get_by_label("Machine", exact=True)).to_be_visible()
+    issue = dialog.get_by_label("File it as a GitHub issue first")
+
+    def preview(kind):
+        return lambda request: "/api/placement?" in request.url and f"kind={kind}" in request.url
+
+    # Workers take no issue work: the preview is asked again for one, and back.
+    with page.expect_request(preview("issue")):
+        issue.check()
+    with page.expect_request(preview("scratch")):
+        issue.uncheck()

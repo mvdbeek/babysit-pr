@@ -567,6 +567,10 @@
     try {
       [fields, listed] = await Promise.all([
         tools.fields({
+          kind: "cron",
+          // Read by id: the checkbox is made after these fields.
+          hints: () =>
+            document.getElementById("cron-unsandboxed")?.checked ? { unsandboxed: "1" } : {},
           remote: (label) =>
             `The job runs on ${label}, in its own clone of the repository, always in its sandbox.`,
         }),
@@ -640,12 +644,17 @@
     // always runs the job in its sandbox.
     const onWorker = () => !machineField.hidden && !["auto", "local"].includes(machine.value);
     const syncSandbox = () => {
-      if (onWorker()) unsandboxed.checked = false;
+      if (onWorker() && unsandboxed.checked) {
+        unsandboxed.checked = false;
+        // Set here, not by the person: the preview is asked again without it.
+        fields.refreshPlacement();
+      }
       unsandboxed.disabled = onWorker();
       if (unsandboxed.checked) docker.checked = false;
       docker.disabled = unsandboxed.checked;
     };
     unsandboxed.addEventListener("change", syncSandbox);
+    unsandboxed.addEventListener("change", () => fields.refreshPlacement());
     machine.addEventListener("change", syncSandbox);
     // A saved setting the current choices lack (an uncached model, a removed account)
     // stays selected, so editing something else does not quietly drop it.
@@ -714,6 +723,9 @@
       ),
     );
     container.replaceChildren(...parts);
+    // The first preview ran before the checkbox was in the page; a saved job outside its
+    // sandbox is previewed again with it.
+    if (unsandboxed.checked) fields.refreshPlacement();
     for (const select of [repo, model, effort]) tools.searchable(select);
     agentForm = {
       repos,

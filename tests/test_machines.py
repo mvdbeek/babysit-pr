@@ -81,7 +81,11 @@ def test_valid_registry_with_defaults_and_repos(tmp_path):
         collie_url=None,
         enabled=True,
         collie_host=None,
+        auto=False,
     )
+    # Auto places launches only on a worker registered for it.
+    write(tmp_path, {**MINI, "auto": True})
+    assert machines.load(tmp_path)["mini"].auto is True
 
 
 @pytest.mark.parametrize(
@@ -121,6 +125,8 @@ def test_valid_registry_with_defaults_and_repos(tmp_path):
         ({"collie_host": "mini&h=x"}, "Invalid collie_host"),
         ({"collie_host": ["mini"]}, "Invalid collie_host"),
         ({"enabled": "yes"}, "Invalid enabled"),
+        ({"auto": "yes"}, "Invalid auto"),
+        ({"auto": 1}, "Invalid auto"),
         ({"hostname": "mini"}, "Unknown machine keys: hostname"),
     ],
 )

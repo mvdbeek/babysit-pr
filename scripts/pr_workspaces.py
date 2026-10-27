@@ -28,6 +28,7 @@ from urllib.parse import quote
 
 import attachments
 import claude_accounts
+import dashboard_settings
 import exit_watch
 import github_cli
 import machines
@@ -178,7 +179,7 @@ def worker_refusal(target, machine):
     Pull request work and new tasks start on workers, and a watch they register there is
     repaired there. Issue and Sentry launches have no worker path yet.
     """
-    if target.get("kind") in {"pr", "scratch"}:
+    if target.get("kind") in placement.WORKER_KINDS:
         return None
     return f"Only pull request work and new tasks can start on {machine.label} yet"
 
@@ -556,6 +557,7 @@ class MachineLoads:
             "error": inventory["error"],
             "synced_at": inventory["synced_at"],
             "pending": False,
+            "max_agents": dashboard_settings.settings(self.home)["local_max_agents"],
         }
         return config, loads
 
@@ -1131,7 +1133,7 @@ class Workspaces:
         )
         listed = [{"id": placement.LOCAL, "label": placement.label(None, {}), "local": True}]
         for m in config["machines"].values():
-            fields = ("id", "label", "os", "max_agents", "labels", "enabled")
+            fields = ("id", "label", "os", "max_agents", "labels", "enabled", "auto")
             listed.append({**{k: getattr(m, k) for k in fields}, "local": False})
         return [
             {
@@ -1173,18 +1175,28 @@ class Workspaces:
 
     def preview(self, query):
         """Where Auto would place a launch, and which machines a person may choose."""
-        if set(query) - {"repo", "docker", "agent", "account"}:
+        if set(query) - {"repo", "docker", "agent", "account", "kind", "also", "unsandboxed"}:
             raise ValueError("Unknown placement parameter")
+        kind = query.get("kind", "scratch")
+        if kind not in placement.KINDS:
+            raise ValueError("Unknown launch kind")
         config, loads = self.loads.snapshot()
         fields = {
+            "kind": kind,
             "repo": query.get("repo", ""),
             "agent": query.get("agent", "codex"),
             "claude_account": query.get("account") or None,
             "docker": query.get("docker") == "1",
+            "sandboxed": query.get("unsandboxed") != "1",
+            # Which other clones does not matter here: workers take none yet.
+            "also": ["other"] if query.get("also") == "1" else [],
         }
         req = placement.request(fields, config["repos"])
         reservations = self.reservations()
-        found = placement.exclusions(req, config["machines"], loads, reservations, time.time())
+        # Choosing a worker for a cron job unticks running it outside its sandbox, so each
+        # machine is offered as the sandboxed job it would become; Auto keeps the choice.
+        offered = {**req, "sandboxed": True} if kind == "cron" else req
+        found = placement.exclusions(offered, config["machines"], loads, reservations, time.time())
         options = [
             {
                 "id": machine_id,
@@ -1197,7 +1209,13 @@ class Workspaces:
             for machine_id, machine in config["machines"].items()
         ]
         try:
-            chosen = placement.choose(req, config["machines"], loads, {}, reservations)
+            chosen = placement.choose(
+                req,
+                config["machines"],
+                loads,
+                self.local_history(kind, fields["repo"]),
+                reservations,
+            )
         except ValueError as exc:
             return {"machine": None, "error": str(exc), "options": options}
         machine_id = chosen.machine or placement.LOCAL
@@ -1207,6 +1225,18 @@ class Workspaces:
             "reason": chosen.reason,
             "options": options,
         }
+
+    def local_history(self, kind, repo):
+        """The stickiness a launch of ``kind`` gives this machine, as its launch will.
+
+        New tasks and cron jobs always start from a local clone here; pull request and
+        issue work count one when this machine has a clone of the repository. A verified
+        checkout pins Handle instead, which a preview cannot see.
+        """
+        if kind in {"scratch", "cron"}:
+            return {placement.LOCAL: 1}
+        cloned = any(repo.lower() in c["remotes"] for c in self.inventory["clones"])
+        return {placement.LOCAL: 1 if cloned else 0}
 
     def agent_started(self, target, agent):
         return not agent or agent_in(target["workspace_id"], target["path"], agent)
@@ -1378,6 +1408,7 @@ class Workspaces:
             machine = self.place(
                 request,
                 {
+                    "kind": pr.get("kind"),
                     "repo": pr.get("repo"),
                     "agent": request.get("agent", "codex"),
                     "claude_account": request.get("claude_account"),
@@ -1560,6 +1591,7 @@ class Workspaces:
         machine = self.place(
             request,
             {
+                "kind": "issue" if request.get("issue_title", "").strip() else "scratch",
                 "repo": repo,
                 "agent": request.get("agent", "codex"),
                 "claude_account": request.get("claude_account"),

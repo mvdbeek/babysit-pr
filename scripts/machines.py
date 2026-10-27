@@ -50,6 +50,7 @@ FIELDS = {
     "collie_host",
     "enabled",
     "tailnet_ip",
+    "auto",
 }
 REQUIRED = {"id", "label", "ssh", "os"}
 # sshd's MaxSessions defaults to 10; stay well below it on one multiplexed connection.
@@ -75,6 +76,8 @@ class Machine(NamedTuple):
     # Where its registrations reach the dashboard from (IPv4, IPv6), as `tailscale serve`
     # reports it.
     tailnet_ip: tuple[str, ...] | None = None
+    # Whether Auto may place launches here; otherwise it only runs what is sent by name.
+    auto: bool = False
 
 
 class RemotePath(str):
@@ -147,6 +150,7 @@ def _machine(raw):
         enabled=raw.get("enabled", True),
         collie_host=raw.get("collie_host"),
         tailnet_ip=raw.get("tailnet_ip"),
+        auto=raw.get("auto", False),
     )
     name = machine.id if isinstance(machine.id, str) else "?"
     checks = [
@@ -192,6 +196,7 @@ def _machine(raw):
             "collie_host",
         ),
         (isinstance(machine.enabled, bool), "enabled"),
+        (isinstance(machine.auto, bool), "auto"),
         (
             machine.tailnet_ip is None
             or _ip(machine.tailnet_ip)

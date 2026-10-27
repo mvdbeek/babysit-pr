@@ -476,7 +476,7 @@ def test_a_workers_agent_that_leaves_without_confirming_needs_attention(remote):
     ("changes", "message"),
     [
         ({"machine": "box"}, "Unknown machine box"),
-        ({"unsandboxed": True}, "always run in their sandbox"),
+        ({"unsandboxed": True}, "^Mac mini: runs jobs only in their sandbox$"),
         ({"machine": 3}, "Choose a machine"),
     ],
 )

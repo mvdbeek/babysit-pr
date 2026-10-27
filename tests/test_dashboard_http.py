@@ -550,15 +550,17 @@ def test_settings_start_empty_and_keep_what_was_saved(serve, tmp_path):
     server = serve()
     status, _, body = get(server, "/api/settings")
     assert status == 200
-    assert json.loads(body) == {"task_prompts": {}, "reviewer": "codex"}
+    assert json.loads(body) == {"task_prompts": {}, "reviewer": "codex", "local_max_agents": 20}
     status, _, body = post_settings(server, {"task": "prReview", "prompt": "Read {url}."})
     assert status == 200
-    assert json.loads(body) == {"task_prompts": {"prReview": "Read {url}."}, "reviewer": "codex"}
+    assert json.loads(body)["task_prompts"] == {"prReview": "Read {url}."}
     assert json.loads(post_settings(server, {"reviewer": "claude"})[2])["reviewer"] == "claude"
     # The answer is what the next page load reads, from the watcher's own home.
+    assert json.loads(post_settings(server, {"local_max_agents": 9})[2])["local_max_agents"] == 9
     assert json.loads(get(server, "/api/settings")[2]) == {
         "task_prompts": {"prReview": "Read {url}."},
         "reviewer": "claude",
+        "local_max_agents": 9,
     }
     assert json.loads((tmp_path / "dashboard-settings.json").read_text())["reviewer"] == "claude"
 
