@@ -1603,7 +1603,8 @@ class WorkspaceOverview:
         """Act only on blockers the user actually approved, re-read a moment ago.
 
         The row is read again once its clone's lock is held: a launch that held it may
-        have opened a workspace or started an agent there meanwhile.
+        have opened a workspace or started an agent there meanwhile. Approval is by kind,
+        so any workspace or agent pane the first read did not show skips the row.
         """
         key, approved = target["key"], set(target["approve"])
         machine = self.key_machine(key)
@@ -1615,7 +1616,11 @@ class WorkspaceOverview:
         with lock_path.open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             fresh = self.resolve(key)
-            if fresh is not None and fresh["repo_root"] != row["repo_root"]:
+            if fresh is not None and (
+                fresh["repo_root"] != row["repo_root"]
+                or set(fresh["workspace_ids"]) - set(row["workspace_ids"])
+                or {a["pane"] for a in fresh["agents"]} - {a["pane"] for a in row["agents"]}
+            ):
                 self.record(
                     job, index, status="skipped", message="Workspace changed; refresh the list"
                 )

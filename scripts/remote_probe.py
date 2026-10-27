@@ -113,6 +113,8 @@ MAX_TURN = 20000  # Characters of an agent's final response a ``turn`` answer ca
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # A session listing reads at most this much of each transcript, and skips longer lines.
 MAX_SCAN = 32 * 1024 * 1024
+# The largest Claude config the trust writer reads; an agent can write that file.
+MAX_CLAUDE_CONFIG = 64 * 1024 * 1024
 MAX_SCAN_LINE = 4 * 1024 * 1024
 
 
@@ -1533,7 +1535,8 @@ def _host_trust(config, directory):
     """Accept Claude's folder trust dialog for ``directory``, as claude_accounts.trust does.
 
     ``--dangerously-skip-permissions`` does not skip that dialog. A missing or unreadable
-    config is left alone; ``BABYSIT_CLAUDE_TRUST=0`` turns it off. Unlike this machine's,
+    config is left alone, as is one over ``MAX_CLAUDE_CONFIG``; ``BABYSIT_CLAUDE_TRUST=0``
+    turns it off. Unlike this machine's,
     a config that is a symlink is left alone too: a sandboxed agent can write its Claude
     home, and a link it planted would have another file of this user rewritten.
     """
@@ -1545,10 +1548,14 @@ def _host_trust(config, directory):
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
             found = os.fstat(descriptor)
-            if not stat.S_ISREG(found.st_mode):
+            if not stat.S_ISREG(found.st_mode) or found.st_size > MAX_CLAUDE_CONFIG:
                 return
-            mode = found.st_mode & 0o7777
-            value = json.loads(stream.read())
+            # Never the setuid, setgid or sticky bits of a file an agent controls.
+            mode = found.st_mode & 0o777
+            data = stream.read(MAX_CLAUDE_CONFIG + 1)
+            if len(data) > MAX_CLAUDE_CONFIG:
+                return
+            value = json.loads(data)
         projects = value.setdefault("projects", {})
         if not isinstance(projects, dict):
             return

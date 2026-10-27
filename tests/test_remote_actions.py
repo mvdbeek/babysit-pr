@@ -5,8 +5,10 @@ uses as HOME, with their herdr workspaces and agents in the fake herdr's per-lab
 """
 
 import copy
+import fcntl
 import hashlib
 import json
+import os
 import stat
 import threading
 import time
@@ -223,9 +225,63 @@ def test_a_cleanup_reads_its_row_again_once_it_holds_the_clones_lock(fleet, plug
     monkeypatch.setattr(plugin, "resolve", resolve)
     result = cleanup(plugin, (key, ["dirty"]))[key]
     assert len(calls) == 2
-    assert result["status"] == "skipped" and "agent" in result["message"], result
+    assert result["status"] == "skipped", result
+    assert result["message"] == "Workspace changed; refresh the list"
     assert (fleet["mini"] / "dirty-work" / "scratch.txt").exists()
     assert ["workspace", "close", "w7"] not in worker_calls(fleet["state"])
+
+
+def arrives_meanwhile(fleet, plugin, monkeypatch, workspaces=(), agents=()):
+    """Resolve rows as they are, then add these to the worker's herdr after the first read."""
+    real = plugin.resolve
+    calls = []
+
+    def resolve(wanted):
+        row = real(wanted)
+        if not calls:
+            store = read(fleet["state"])
+            store["machines"]["Mac mini"]["workspaces"].extend(workspaces)
+            store["machines"]["Mac mini"]["agents"].extend(agents)
+            fleet["state"].write_text(json.dumps(store))
+        calls.append(wanted)
+        return row
+
+    monkeypatch.setattr(plugin, "resolve", resolve)
+    return calls
+
+
+def test_a_workspace_opened_since_the_first_read_skips_the_cleanup(fleet, plugin, monkeypatch):
+    """Approving a kind of blocker never approves a workspace the user did not see."""
+    key = f"m:mini:{fleet['mini'] / 'dirty-work'}"
+    opened = {
+        "workspace_id": "w7",
+        "label": "dirty-work",
+        "worktree": {
+            "repo_root": str(fleet["hosts"] / "mini.test" / "src" / "repo"),
+            "checkout_path": str(fleet["mini"] / "dirty-work"),
+        },
+    }
+    calls = arrives_meanwhile(fleet, plugin, monkeypatch, workspaces=[opened])
+    result = cleanup(plugin, (key, ["dirty"]))[key]
+    assert len(calls) == 2
+    assert result["status"] == "skipped", result
+    assert result["message"] == "Workspace changed; refresh the list"
+    assert (fleet["mini"] / "dirty-work" / "scratch.txt").exists()
+    assert ["workspace", "close", "w7"] not in worker_calls(fleet["state"])
+
+
+def test_an_agent_started_since_the_first_read_skips_the_cleanup(fleet, plugin, monkeypatch):
+    """An idle agent is no blocker, but one that arrived since was never seen either."""
+    key = f"m:mini:{fleet['mini'] / 'merged-work'}"
+    agent = {"workspace_id": "w1", "agent": "claude", "agent_status": "idle", "pane_id": "w1:p2"}
+    arrives_meanwhile(fleet, plugin, monkeypatch, agents=[agent])
+    result = cleanup(plugin, (key, ["agent"]))[key]
+    assert result["status"] == "skipped", result
+    assert result["message"] == "Workspace changed; refresh the list"
+    assert (fleet["mini"] / "merged-work").exists()
+    calls = worker_calls(fleet["state"])
+    assert ["workspace", "close", "w1"] not in calls
+    assert not any(call[:2] == ["agent", "send-keys"] for call in calls)
 
 
 def test_worker_pane_ids_are_checked_before_herdr_gets_them(fleet, plugin, monkeypatch):
@@ -593,6 +649,19 @@ def test_a_worker_resume_locks_its_checkout_by_the_workers_real_path(exited, mon
         {"workspace": "w1", "resume": CLAUDE_SID, "text": ""}, exited.home, machine=exited.machine
     )
     assert ("checkout", f"mini:{exited.checkout.resolve()}") in taken
+
+
+def test_a_worker_resume_refuses_while_its_clone_is_locked(exited):
+    """A cleanup there holds the clone's lock while it removes the checkout; a resume
+    neither types an agent into it nor waits behind it."""
+    clone = os.path.realpath(exited.host / "src" / "repo")
+    request = {"workspace": "w1", "resume": CLAUDE_SID, "text": ""}
+    with machines.clone_lock(exited.home, exited.machine, clone).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with pytest.raises(ValueError, match="A cleanup or launch is running in this clone"):
+            agent_messages.send(request, exited.home, machine=exited.machine)
+    assert "runs" not in mini(exited) and "splits" not in mini(exited)
+    assert agent_messages.send(request, exited.home, machine=exited.machine)["resumed"]
 
 
 def test_a_closed_worker_workspace_is_reopened_there_and_followed(exited):

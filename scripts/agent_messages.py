@@ -18,6 +18,7 @@ without a message, leaving the session waiting for the reader in Collie.
 """
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -1605,8 +1606,11 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
         root = found["path"]
     real = os.path.realpath(root) if machine is None else root
     # One resume of a session, and in a checkout, at a time, held until its agent shows up:
-    # a second request then sees it.
-    with locked(("checkout", lock_name(machine, real)), ("session", session_id)):
+    # a second request then sees it. A worker's clone lock comes first, as cleanup takes it.
+    with (
+        clone_held(home, machine, found),
+        locked(("checkout", lock_name(machine, real)), ("session", session_id)),
+    ):
         if workspace_id is None:
             workspace_id = workspace_viewer.checkout_workspace(root, machine)
         if workspace_id and agents(workspace_id, machine=machine):
@@ -1696,6 +1700,28 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
             machine=machine,
             found=found,
         )
+
+
+@contextlib.contextmanager
+def clone_held(home, machine, found):
+    """Hold a worker clone's lock, as its launches and cleanup take it, or refuse at once.
+
+    Cleanup holds it while it removes a checkout there, for up to its removal timeout, so
+    a resume never waits behind it: the clone is the parent of the common dir ``found``,
+    by its real path there, as cleanup names it.
+    """
+    if machine is None:
+        yield
+        return
+    clone = os.path.dirname(found["common"])
+    with machines.clone_lock(home, machine, clone).open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError(
+                "A cleanup or launch is running in this clone; try again once it finishes"
+            ) from None
+        yield
 
 
 def pane_id(value, machine):

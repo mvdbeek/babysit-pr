@@ -704,6 +704,33 @@ def test_bwrap_trusts_the_config_its_sandboxed_claude_reads(host):
     assert outer[found["path"]] == {"hasTrustDialogAccepted": True}
 
 
+def test_the_trust_writer_leaves_an_oversized_config_alone(tmp_path, monkeypatch):
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")  # Only ever this test's own config.
+    monkeypatch.setattr(remote_probe, "MAX_CLAUDE_CONFIG", 64)
+    config = tmp_path / ".claude.json"
+    original = json.dumps({"projects": {}, "pad": "x" * 64})
+    config.write_text(original)
+    remote_probe._host_trust(str(config), str(tmp_path / "repo"))
+    assert config.read_text() == original
+    # One within the cap is trusted as before.
+    config.write_text("{}")
+    remote_probe._host_trust(str(config), str(tmp_path / "repo"))
+    projects = json.loads(config.read_text())["projects"]
+    assert projects == {str(tmp_path / "repo"): {"hasTrustDialogAccepted": True}}
+
+
+def test_the_trust_writer_keeps_only_the_configs_permission_bits(tmp_path, monkeypatch):
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")  # Only ever this test's own config.
+    config = tmp_path / ".claude.json"
+    config.write_text("{}")
+    # The sticky bit stands in for setuid and setgid, which a write here clears anyway.
+    config.chmod(0o1640)
+    assert config.stat().st_mode & 0o7777 == 0o1640
+    remote_probe._host_trust(str(config), str(tmp_path / "repo"))
+    assert config.stat().st_mode & 0o7777 == 0o640
+    assert json.loads(config.read_text())["projects"]
+
+
 def test_a_named_account_keeps_its_literal_path_for_claude(host, tmp_path):
     home, clone, _ = host
     elsewhere = tmp_path / "work-login"
