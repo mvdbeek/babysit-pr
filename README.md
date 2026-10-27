@@ -125,10 +125,14 @@ activity first, and a group heading collapses its rows:
   workspace agent that returned to its prompt and has not been looked at yet (herdr's
   **done**; an agent merely sitting idle needs nobody).
   Pull requests where you were **mentioned** also appear here, including merged or
-  closed PRs whose discussion may still need a response. This marks a mention, not
-  a verified unanswered question; use **Wait for activity** to set it aside.
-- **Unblock**: your pull request with failing CI and no live watch (a watch repairs
-  it itself; a paused one does not), changes requested or unresolved review threads
+  closed PRs whose discussion may still need a response, while another person
+  (not a bot) commented, reviewed or edited last, within the last two weeks. Once you
+  reply or act on the pull request, or only labels, milestones, references or commits
+  follow, the mention needs nobody. An open pull request whose last activity is
+  unknown still counts. This marks a mention, not a verified unanswered question;
+  use **Wait for activity** to set it aside.
+- **Unblock**: your pull request, not a draft, with failing CI and no live watch (a
+  watch repairs it itself; a paused one does not), changes requested or unresolved review threads
   on your pull request, a workspace launch that failed in the last day or needs
   checking, a scheduled task that needs checking or was missed or failed in the last
   day, or an enabled cron job whose last run failed.
@@ -230,8 +234,9 @@ involved in reviewing (including team requests and completed reviews), or are
 requested** marks the PRs still waiting on a review from you or one of your teams.
 It uses the active `gh` account on github.com. No registration is needed. These PRs are a
 read-only discovery results. Workspace actions require an explicit click and never register repair watches.
-The **Mentioned** search also includes merged and closed PRs updated in the last 30 days,
-so follow-up discussion after merging remains visible without scanning years of history.
+The **Mentioned** search also includes merged and closed PRs where another person
+commented or reviewed after they closed and in the last 30 days, so follow-up discussion
+after merging remains visible without scanning years of history.
 Those rows show **Merged** or **Closed**, have matching
 review-status filters, and do not appear as ready for review or needing changes.
 The other role searches remain limited to open PRs.

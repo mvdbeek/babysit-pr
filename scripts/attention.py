@@ -41,6 +41,9 @@ FINISHED_AGENT = {"done"}
 LIVE_WATCHES = {"watching", "running", "blocked", "awaiting_release", "handoff"}
 CLOSED_LINKS = {"closed", "merged"}
 FAILED_RUNS = {"error", "failed", "timed_out", "interrupted"}
+# Activity in which someone addresses the people on a pull request, unlike a label,
+# milestone, cross-reference or commit.
+SPOKEN = {"IssueComment", "PullRequestReview", "ContentEdited", "Opened"}
 # Failed launches and scheduled tasks older than this are history, not something to act on.
 RECENT = 24 * 3600
 # Feeds are shared by every open tab; one computation serves all polls in this window.
@@ -262,17 +265,42 @@ class Feed:
                 **fields,
             )
 
+    def awaits_reply(self, pr, is_open):
+        """Whether a mention may still want an answer from the user.
+
+        The search lists every pull request that ever mentioned the user, so a mention only
+        counts while another person had the last word, recently enough not to be parked. An
+        unknown last activity counts on an open pull request only: a bulk update can bring
+        years-old finished ones back into the search.
+        """
+        last = pr.get("latest_activity")
+        if not last:
+            return is_open
+        actor = last.get("actor") or ""
+        return (
+            last.get("type") in SPOKEN
+            and actor != self.login
+            and not actor.endswith("[bot]")
+            and self.now - (epoch(last.get("at")) or 0) < PARKED_AFTER
+        )
+
     def prs(self, snapshot, targets, watched):
         for pr in (snapshot or {}).get("prs") or []:
             roles = pr.get("roles") or []
             is_open = pr.get("state", "OPEN") == "OPEN"
             mine = is_open and "author" in roles
             reasons = []
-            if "mentioned" in roles:
+            if "mentioned" in roles and self.awaits_reply(pr, is_open):
                 reasons.append(reason("mentioned", "review", "You were mentioned"))
             watch = watched.get(subject_key(pr.get("url")))
-            if mine and pr.get("ci") in {"FAILURE", "ERROR"} and watch is None:
-                # A live watch repairs failing CI itself; only unwatched failures need the user.
+            # A draft is still being worked on, so its red CI is expected; a live watch
+            # repairs failing CI itself. Only the rest need the user.
+            if (
+                mine
+                and not pr.get("draft")
+                and pr.get("ci") in {"FAILURE", "ERROR"}
+                and watch is None
+            ):
                 reasons.append(
                     reason(
                         "ci_failing",

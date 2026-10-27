@@ -4,6 +4,8 @@ import attention
 import pytest
 
 NOW = 1_800_000_000.0
+# Someone else spoke last on a pull request, the day before NOW.
+REPLY = {"type": "IssueComment", "actor": "bob", "at": "2027-01-14T08:00:00Z"}
 
 
 def pr(**fields):
@@ -155,6 +157,7 @@ def test_pr_reasons_follow_authorship_review_state_and_ci():
         pr(id="ready", url="u/ready", review_decision="APPROVED"),
         pr(id="ready-draft", url="u/ready-draft", review_decision="APPROVED", draft=True),
         pr(id="ready-red", url="u/ready-red", review_decision="APPROVED", ci="FAILURE"),
+        pr(id="draft-red", url="u/draft-red", ci="FAILURE", draft=True),
         pr(id="theirs", url="u/theirs", roles=["reviewer"], ci="FAILURE", review_requests=["me"]),
         pr(id="team", url="u/team", roles=["reviewer"], review_requests=["team:core"]),
         pr(
@@ -176,6 +179,8 @@ def test_pr_reasons_follow_authorship_review_state_and_ci():
     assert codes(found["u/ready"]) == ["approved"] and found["u/ready"]["group"] == "review"
     assert "u/ready-draft" not in found
     assert codes(found["u/ready-red"]) == ["ci_failing"]
+    # A draft is still being worked on; its red CI is expected.
+    assert "u/draft-red" not in found
     # Someone else's failing CI is theirs to fix; a requested review is mine to give.
     assert codes(found["u/theirs"]) == ["review_requested"]
     # A team request is mine only when the search says the team is mine.
@@ -208,7 +213,10 @@ def test_groups_order_items_and_a_merged_item_takes_its_first_group():
 
 @pytest.mark.parametrize("state", ["OPEN", "MERGED", "CLOSED"])
 def test_mentions_need_attention_in_every_pr_state(state):
-    snapshot = {"login": "me", "prs": [pr(state=state, roles=["mentioned"])]}
+    snapshot = {
+        "login": "me",
+        "prs": [pr(state=state, roles=["mentioned"], latest_activity=REPLY)],
+    }
     feed = attention.collect(prs=snapshot, now=NOW)
     [item] = feed["items"]
     assert codes(item) == ["mentioned"]
@@ -232,9 +240,40 @@ def test_finished_prs_need_a_response_not_ci_repairs_reviews_or_merging(state, r
                 review_decision=decision,
                 unresolved_threads=0 if decision == "APPROVED" else 2,
                 review_requests=["me", "team:core"],
+                latest_activity=REPLY,
             )
         ],
     }
+    [item] = attention.collect(prs=snapshot, now=NOW)["items"]
+    assert codes(item) == ["mentioned"]
+
+
+@pytest.mark.parametrize(
+    "state, last",
+    [
+        # The user had the last word, by replying or by acting on the pull request.
+        ("OPEN", {**REPLY, "actor": "me"}),
+        ("OPEN", {**REPLY, "type": "PullRequestReview", "actor": "me"}),
+        # Housekeeping and bots address nobody.
+        ("OPEN", {**REPLY, "type": "DemilestonedEvent"}),
+        ("OPEN", {**REPLY, "type": "PullRequestCommit"}),
+        ("MERGED", {**REPLY, "actor": "github-actions[bot]"}),
+        # A reply from long ago, brought back by a bulk update.
+        ("MERGED", {**REPLY, "at": "2019-03-02T10:00:00Z"}),
+        ("OPEN", {**REPLY, "at": "2019-03-02T10:00:00Z"}),
+        ("MERGED", None),
+    ],
+)
+def test_mentions_need_nobody_once_someone_else_no_longer_has_the_last_word(state, last):
+    snapshot = {
+        "login": "me",
+        "prs": [pr(state=state, roles=["mentioned"], latest_activity=last)],
+    }
+    assert attention.collect(prs=snapshot, now=NOW)["items"] == []
+
+
+def test_a_mention_on_an_open_pr_counts_when_its_last_activity_is_unknown():
+    snapshot = {"login": "me", "prs": [pr(roles=["mentioned"], latest_activity=None)]}
     [item] = attention.collect(prs=snapshot, now=NOW)["items"]
     assert codes(item) == ["mentioned"]
 

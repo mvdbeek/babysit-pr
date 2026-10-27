@@ -38,13 +38,17 @@ def event(kind, who, at, typename="User"):
     return {"__typename": kind, stamp: at, person: {"login": who, "__typename": typename}}
 
 
+def days_ago(days):
+    return (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def finished(key, state="MERGED", *events):
     """A finished PR someone else discussed after it closed, unless events say otherwise."""
-    events = events or (event("IssueComment", "bob", "2026-09-11T11:00:00Z"),)
+    events = events or (event("IssueComment", "bob", days_ago(1)),)
     return pr(
         key,
         state=state,
-        closedAt="2026-09-10T12:00:00Z",
+        closedAt=days_ago(2),
         timelineItems={"nodes": list(events)},
     )
 
@@ -144,21 +148,23 @@ def test_a_pr_merged_during_refresh_takes_its_state_without_a_mention(monkeypatc
 
 
 @pytest.mark.parametrize(
-    "events",
+    "closed, events",
     [
         # Batch-deleting old fork branches bumps every PR they headed.
-        [event("HeadRefDeletedEvent", "alice", "2026-09-11T11:00:00Z")],
-        [event("LabeledEvent", "bob", "2026-09-11T11:00:00Z")],
-        [event("IssueComment", "alice", "2026-09-11T11:00:00Z")],
-        [event("PullRequestReview", "bob", "2026-09-09T11:00:00Z")],
+        (days_ago(3), [event("HeadRefDeletedEvent", "alice", days_ago(1))]),
+        (days_ago(3), [event("LabeledEvent", "bob", days_ago(1))]),
+        (days_ago(3), [event("IssueComment", "alice", days_ago(1))]),
+        (days_ago(3), [event("PullRequestReview", "bob", days_ago(4))]),
         # Release-note and backport bots comment on merged PRs as a matter of course.
-        [event("IssueComment", "github-actions", "2026-09-11T11:00:00Z", "Bot")],
-        [event("IssueComment", "dependabot[bot]", "2026-09-11T11:00:00Z")],
-        [],
+        (days_ago(3), [event("IssueComment", "github-actions", days_ago(1), "Bot")]),
+        (days_ago(3), [event("IssueComment", "dependabot[bot]", days_ago(1))]),
+        (days_ago(3), []),
+        # A reply from the week it merged, years ago, is not a discussion still going on.
+        (days_ago(900), [event("IssueComment", "bob", days_ago(899))]),
     ],
 )
-def test_finished_prs_without_later_discussion_are_not_mentions(monkeypatch, events):
-    quiet = pr("quiet", state="MERGED", closedAt="2026-09-10T12:00:00Z")
+def test_finished_prs_without_later_discussion_are_not_mentions(monkeypatch, closed, events):
+    quiet = pr("quiet", state="MERGED", closedAt=closed)
     quiet["timelineItems"] = {"nodes": events}
     fetch = Mock(side_effect=[page()] * 5 + [page([quiet, finished("talked", "CLOSED")])])
     monkeypatch.setattr(overview, "github_page", fetch)
