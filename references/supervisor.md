@@ -802,7 +802,8 @@ refuses a mismatch, naming the `provision_worker.sh --user-step --sha <sha>` tha
 it. It works in the worker's clone `<src>/<repo name>`, which must name the repository
 in a remote; nothing clones on a worker, so a missing clone is refused. A probe op names
 the new checkout under `<src>/worktrees/<repo name>` and trusts it for Claude in the
-config its sandbox reads; the brief is staged in `~/.local/state/babysit-pr/workspace-prompts`
+config its sandbox reads (a config that is a symlink or over 64 MiB is left alone, and
+the rewritten one keeps only its permission bits); the brief is staged in `~/.local/state/babysit-pr/workspace-prompts`
 there. The worker's own `wt.py` then runs over ssh with `BABYSIT_WORKER=<id>`, `--gpg`
 when the machine has the `gpg` label, and `--exit-watch-json` for **Quit the agent when
 it is done**: it prints the exit watch instead of recording it, and the dashboard

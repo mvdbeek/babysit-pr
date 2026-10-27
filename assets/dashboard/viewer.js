@@ -282,6 +282,7 @@
     byId("ws-viewer-error").textContent = "";
     byId("ws-viewer-meta").textContent = message;
     byId("ws-live").hidden = true;
+    byId("ws-live-agents").hidden = true;
     for (const [id, mode] of [
       ["ws-view-diff", "diff"],
       ["ws-view-transcript", "transcript"],
@@ -302,10 +303,10 @@
     return target.key ? { key: target.key } : { watch: target.watch };
   }
   function messageable(target) {
-    return !workerLabel(target) && Boolean(target.workspace || target.key || target.watch);
+    return Boolean(target.workspace || target.key || target.watch);
   }
-  // A worker machine's checkout is only read from here so far: its label, or its id from
-  // a qualified workspace ID (`mini/w1`); null on this machine.
+  // The worker machine a view is on: its label, or its id from a qualified workspace ID
+  // (`mini/w1`); null on this machine.
   function workerLabel(target) {
     return target.machineLabel || /^([a-z][a-z0-9-]*)\//.exec(target.workspace || "")?.[1] || null;
   }
@@ -1102,6 +1103,11 @@
     const form = byId("ws-message");
     // Never carried over: a box ticked for one agent must not quit another.
     byId("ws-message-quit").checked = false;
+    // A worker's agents take messages, but its exit watches and uploads stay here; it is
+    // named by its row or by a qualified workspace ID (`mini/w1`).
+    const worker = Boolean(workerLabel(entry));
+    byId("ws-message-quit-label").hidden = worker;
+    byId("ws-message-files").hidden = worker;
     watchQuestion = null;
     byId("ws-agent-interaction").replaceChildren();
     delete byId("ws-agent-interaction").dataset.state;
@@ -1112,10 +1118,6 @@
     agentsRead = messageable(entry) ? "loading" : "unavailable";
     hostLabel = null;
     quitQuestion = null;
-    const worker = workerLabel(entry);
-    const notice = byId("ws-message-readonly");
-    notice.hidden = !worker;
-    notice.textContent = worker ? `Not available for workspaces on ${worker} yet` : "";
     if (!messageable(entry)) {
       // A checkout without a herdr workspace or a row has no agent to talk to.
       draft = null;
@@ -1215,7 +1217,7 @@
     holder.replaceChildren();
     const send = byId("ws-message-send");
     const interaction = byId("ws-agent-interaction");
-    send.textContent = "Send to agent";
+    send.textContent = "Send";
     send.disabled = true;
     byId("ws-message-reopen").hidden = true;
     byId("ws-docker").hidden = true;
@@ -1616,13 +1618,20 @@
         `Stop the turn of ${name}`,
         "Interrupt the current turn, as Esc does; the agent keeps running",
       ).onclick = () => void liveAction(agent, "stop");
-    button(
+    const quit = button(
       "quit",
       "Quit agent",
       "ws-quit",
       `Quit ${name}`,
       "End the agent's process; its pane's shell stays open and its session can be resumed",
-    ).onclick = () => {
+    );
+    const worker = workerLabel(viewer.entry);
+    if (worker) {
+      // The server refuses it too: exit watches and quits stay on this machine's agents.
+      quit.disabled = true;
+      quit.title = `Agents on ${worker} cannot be quit from this dashboard yet`;
+    }
+    quit.onclick = () => {
       // Focused once, on this click; a redraw while it is open leaves focus alone.
       quitQuestion = {
         id: viewer.id,
@@ -1643,23 +1652,6 @@
     const worker = workerLabel(viewer.entry);
     const where = worker || hostLabel;
     const row = node("div", undefined, "ws-live-agent ws-live-state");
-    if (worker) {
-      // Not read from a worker yet; the server refuses the actions there too.
-      row.dataset.live = "unknown";
-      const quit = node("button", "Quit agent", "ws-quit");
-      quit.type = "button";
-      quit.disabled = true;
-      quit.title = `Agents on ${worker} cannot be quit from this dashboard yet`;
-      const actions = node("span", undefined, "ws-live-actions");
-      actions.append(quit);
-      row.append(
-        badge("Status unknown"),
-        node("span", `on ${worker} · `),
-        node("span", "whether an agent runs there is not read from workers yet", "pr-meta"),
-        actions,
-      );
-      return row;
-    }
     if (mine) {
       const [text, tone] = activity(mine);
       row.dataset.live = "true";
@@ -1763,6 +1755,7 @@
         option.textContent = (agent ? `● ${activity(agent)[0]} · ` : "") + sessionLabel(session);
     }
     holder.hidden = !data;
+    byId("ws-live-agents").hidden = !data;
     if (holder.hidden) return;
     const mine = shown ? live(shown) : undefined;
     const asked =
@@ -1839,8 +1832,9 @@
   }
   function renderDocker() {
     const agent = selectedAgent();
-    byId("ws-docker").hidden = !agent;
-    if (!agent) return;
+    // A worker's agents run in its own sandbox, not Safehouse on this Mac.
+    byId("ws-docker").hidden = !agent || agent.docker_supported === false;
+    if (byId("ws-docker").hidden) return;
     const checkbox = byId("ws-docker-enabled");
     const known = typeof agent.docker === "boolean";
     checkbox.checked =
@@ -2220,6 +2214,16 @@
     renderComments();
   }
   byId("ws-message").addEventListener("submit", sendMessage);
+  // Shift+Enter sends as the button does, and only while the button could; Enter stays a
+  // newline, and a key that confirms an input method's composition sends nothing.
+  byId("ws-message-text").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || !event.shiftKey || event.altKey || event.ctrlKey) return;
+    if (event.metaKey || event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    const form = byId("ws-message");
+    const send = byId("ws-message-send");
+    if (!form.hidden && !send.hidden && !send.disabled) form.requestSubmit(send);
+  });
   byId("ws-message-reopen").onclick = () => void reopenSession(null);
   window.addEventListener("focus", () => {
     if (viewer && messageable(viewer.entry) && byId("ws-viewer").open)

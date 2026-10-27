@@ -18,6 +18,7 @@ without a message, leaving the session waiting for the reader in Collie.
 """
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -32,14 +33,16 @@ from pathlib import Path
 
 import agent_docker
 import claude_accounts
+import cron_agents
 import exit_watch
 import herdr_handoff
 import machines
+import remote_probe
 import sandbox
 import session_locks
 import workspace_viewer
 import wt
-from pr_workspaces import herdr, run
+from pr_workspaces import PANE, herdr, run
 
 MAX_MESSAGE = 32000
 # The text is typed into a terminal: a carriage return would submit early, and other
@@ -50,6 +53,9 @@ CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 UNCERTAIN = "check it in Collie before resending"
 QUIT_UNWATCHED = "The agent will not quit by itself: its quit watch could not be set up."
 RESUME_WAIT = 20
+# A worker's resume prompts, private files there; one is read once, as its agent starts.
+REMOTE_PROMPTS = "~/.local/state/babysit-pr/message-prompts"
+PROMPT_KEEP = 86400
 # Codex resumes in-process: on the shared background server a session whose feature
 # settings differ opens a dialog whose default, Cancel, a typed message then selects.
 RESUME = {"claude": ["--resume"], "codex": ["--no-daemon", "resume"]}
@@ -124,16 +130,46 @@ def clean(text):
     return CONTROL.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def agents(workspace_id, interactions=False, live=_UNSET):
+def lock_name(machine, name):
+    """A lock's name: a worker's checkouts and panes are its own, apart from this machine's."""
+    return name if machine is None else f"{machine.id}:{name}"
+
+
+def listed_agents(machine=None):
+    """herdr's agents; a worker's only those whose fields a pane action can use."""
+    found = herdr("agent", "list", machine=machine)["agents"]
+    if machine is None:
+        return found
+    return [
+        {
+            **agent,
+            "terminal_title_stripped": remote_probe.display_text(
+                agent.get("terminal_title_stripped")
+            ),
+        }
+        for agent in (found if isinstance(found, list) else [])
+        if isinstance(agent, dict)
+        and isinstance(agent.get("pane_id"), str)
+        and PANE.fullmatch(agent["pane_id"])
+        and all(
+            isinstance(agent.get(field), (str, type(None)))
+            for field in ("workspace_id", "agent", "agent_status", "terminal_title_stripped")
+        )
+        and isinstance(agent.get("agent_session") or {}, dict)
+        and isinstance((agent.get("agent_session") or {}).get("value"), (str, type(None)))
+    ]
+
+
+def agents(workspace_id, interactions=False, live=_UNSET, machine=None):
     """The agents running in a herdr workspace, for choosing whom to message.
 
     Only a workspace on a Git checkout qualifies, the same ones the viewer shows.
     ``live`` is the open workspace a caller already resolved for this ID: None when it
-    found none open, so it is not looked up again.
+    found none open, so it is not looked up again. A worker's come from its own herdr.
     """
     # Follows the checkout: a closed workspace has none, a reopened one has a new ID.
     if live is _UNSET:
-        live = workspace_viewer.live_workspace(workspace_id)
+        live = workspace_viewer.live_workspace(workspace_id, machine)
     if live is None:
         return []
     found = [
@@ -145,26 +181,40 @@ def agents(workspace_id, interactions=False, live=_UNSET):
             # The session the pane runs, so its transcript's open question can be answered.
             "session": (agent.get("agent_session") or {}).get("value"),
         }
-        for agent in herdr("agent", "list")["agents"]
+        for agent in listed_agents(machine)
         if agent.get("workspace_id") == live and agent.get("pane_id")
     ]
     if interactions:
         for agent in found:
             if agent["status"] == "blocked":
                 try:
-                    agent["interaction"] = live_interaction(agent)
+                    agent["interaction"] = live_interaction(agent, machine)
                 # herdr_handoff reports a failed herdr call as a RuntimeError.
                 except (ValueError, RuntimeError, OSError, subprocess.SubprocessError):
                     agent["interaction"] = None
     return found
 
 
-def sessions(workspace_id, home=None):
+def workspace_root(workspace_id, machine=None):
+    """The checkout a workspace was opened on: this machine's, or a worker's as it spells it."""
+    if machine is None:
+        return workspace_viewer.workspace_checkout(workspace_id)
+    return workspace_viewer.remote_checkout(machine, workspace_id)
+
+
+def recorded(root, home=None, machine=None):
+    """The sessions recorded in a checkout, read on the worker it is on."""
+    if machine is None:
+        return workspace_viewer.sessions(root)
+    return workspace_viewer.remote_sessions(home, machine, root)
+
+
+def sessions(workspace_id, home=None, machine=None):
     """Sessions recorded in the workspace's checkout that a message could resume."""
-    return checkout_sessions(workspace_viewer.workspace_checkout(workspace_id), home)
+    return checkout_sessions(workspace_root(workspace_id, machine), home, machine)
 
 
-def checkout_sessions(root, home=None):
+def checkout_sessions(root, home=None, machine=None):
     """Sessions recorded in a checkout that a message could resume."""
     # The watch that owns a session is named up front, so the reader can cancel it
     # before resuming instead of meeting a refusal.
@@ -185,17 +235,18 @@ def checkout_sessions(root, home=None):
                 {"watch": watch_summary(watched[session["id"]])} if session["id"] in watched else {}
             ),
         }
-        for session in workspace_viewer.sessions(root)
+        for session in recorded(root, home, machine)
     ]
 
 
-def send(request, home=None, *, expected_session=None, checkout=None):
+def send(request, home=None, *, expected_session=None, checkout=None, machine=None):
     """Submit one message to one agent of a workspace; report what herdr saw.
 
     With a checkout instead of a workspace (a Workspaces-tab row listed while none was
     open), only a resume can be sent: it reopens a workspace there if none is open.
     With ``exit_when_done`` the agent is asked to mark the end of its answer, and the
     dashboard exits it and closes its pane once it has (`wt --exit-when-done`).
+    A ``machine`` names the worker the workspace or checkout is on.
     """
     if set(request) - {"workspace", "pane", "text", "resume", "stop_watch", "exit_when_done"}:
         raise ValueError("Invalid message parameters")
@@ -220,6 +271,9 @@ def send(request, home=None, *, expected_session=None, checkout=None):
         raise ValueError("Write a message for the agent to finish before it quits")
     if quit_when_done and home is None:
         raise ValueError("Quitting when done needs the dashboard's state directory")
+    if quit_when_done and machine is not None:
+        # Exit watches are followed on this machine's herdr and transcripts only.
+        raise ValueError(f"Quitting when done is not available for agents on {machine.label} yet")
     marker = exit_watch.new_marker() if quit_when_done else None
     if marker:
         text += exit_watch.follow_up(marker)
@@ -233,12 +287,13 @@ def send(request, home=None, *, expected_session=None, checkout=None):
             home,
             root=checkout,
             stop_watch=stop_watch,
+            machine=machine,
         )
         return watch_until_done(result, home, marker, request["text"]) if marker else result
     pane = request.get("pane")
     if pane is not None and not isinstance(pane, str):
         raise ValueError("Choose an agent")
-    running = agents(request.get("workspace"))
+    running = agents(request.get("workspace"), machine=machine)
     if not running:
         raise ValueError("No agent is running in this workspace; start one from Collie")
     if pane is None:
@@ -250,7 +305,7 @@ def send(request, home=None, *, expected_session=None, checkout=None):
         raise ValueError("That agent is no longer running; refresh")
     if expected_session is not None and target.get("session") != expected_session:
         raise ValueError("The agent session changed; reload the agent list")
-    result = prompt(target, text)
+    result = prompt(target, text, machine)
     return watch_until_done(result, home, marker, request["text"]) if marker else result
 
 
@@ -307,9 +362,20 @@ def watch_until_done(result, home, marker, message):
     return {**result, "exit_watch": watch["id"]}
 
 
-def docker_status(workspace_id, live=_UNSET):
-    """Report observed access; a failed probe must never look like disabled access."""
-    result = agents(workspace_id, interactions=True, live=live)
+def docker_status(workspace_id, live=_UNSET, machine=None):
+    """Report observed access; a failed probe must never look like disabled access.
+
+    A worker's agents have none to report: their sandbox is not Safehouse on this Mac.
+    """
+    result = agents(workspace_id, interactions=True, live=live, machine=machine)
+    if machine is not None:
+        for target in result:
+            target.update(
+                docker=None,
+                docker_supported=False,
+                docker_error="Docker access can only be inspected for agents on this Mac",
+            )
+        return result
     for target in result:
         target["docker"] = None
         try:
@@ -422,22 +488,22 @@ def change_docker(target, enabled, home):
         raise ValueError(str(exc)) from exc
 
 
-def prompt(target, text):
+def prompt(target, text, machine=None):
     """Type the message into a running agent's pane and submit it."""
     # Never interleaved with another message, an answer or a stop typed into the pane.
-    with locked(("pane", target["pane"])):
-        return prompt_locked(target, text)
+    with locked(("pane", lock_name(machine, target["pane"]))):
+        return prompt_locked(target, text, machine)
 
 
-def prompt_locked(target, text):
+def prompt_locked(target, text, machine=None):
     pane = target["pane"]
     if target["status"] == "blocked":
-        if target["agent"] != "claude" or not idle_screen(pane):
+        if target["agent"] != "claude" or not idle_screen(pane, machine=machine):
             raise ValueError(
                 "The agent is waiting on a question or approval; "
                 "use the transcript question card, or answer it in Collie"
             )
-        return paste(pane, text)
+        return paste(pane, text, machine)
     try:
         # Wait only until the agent reacts (starts working or asks something), not for
         # the turn to end; herdr reports a stall when it shows no reaction in 5 s.
@@ -453,6 +519,7 @@ def prompt_locked(target, text):
             "blocked",
             "--timeout",
             "8000",
+            machine=machine,
         )
     except subprocess.TimeoutExpired:
         return {
@@ -485,7 +552,7 @@ def prompt_locked(target, text):
     return {"sent": True, "pane": pane, "warning": None}
 
 
-def interrupt(request):
+def interrupt(request, machine=None):
     """Stop the turn a working agent is on, as Esc does in its terminal.
 
     Both Claude Code and Codex interrupt the running turn on Esc and keep the session
@@ -500,18 +567,20 @@ def interrupt(request):
     pane = request["pane"]
 
     def current():
-        return next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
+        return next(
+            (a for a in agents(request["workspace"], machine=machine) if a["pane"] == pane), None
+        )
 
     # Typing a message or an answer holds the pane's lock; Esc must not land mid-answer.
     # Only this pane's: a stop never waits for actions on other agents.
-    with locked(("pane", pane)):
+    with locked(("pane", lock_name(machine, pane))):
         target = current()
         if target is None or target.get("session") != request["session"]:
             raise ValueError("That session is no longer running in this pane; refresh")
         if target["status"] != "working":
             raise ValueError("The agent is not working on anything right now; refresh")
         try:
-            herdr("agent", "send-keys", pane, "esc")
+            herdr("agent", "send-keys", pane, "esc", machine=machine)
         except ValueError as exc:
             raise ValueError(f"herdr could not send Esc: {str(exc)[-300:]}") from exc
     # The wait holds no lock, so other workspaces' messages need not queue behind it.
@@ -528,6 +597,7 @@ def interrupt(request):
             "blocked",
             "--timeout",
             str(STOP_WAIT),
+            machine=machine,
         )
     except (ValueError, subprocess.SubprocessError):
         # The wait also fails when the agent exited after Esc: only a pane still
@@ -820,7 +890,7 @@ def exit_watcher(pane, session, home):
     return None
 
 
-def paste(pane, text):
+def paste(pane, text, machine=None):
     """Submit a message through the prompt box of an agent herdr wrongly calls blocked.
 
     `herdr agent prompt` refuses a blocked agent, so the text is pasted (bracketed, as
@@ -828,13 +898,15 @@ def paste(pane, text):
     shows it. A dialog that opened meanwhile never gets that Enter.
     """
     # Dialog choices type into the same pane; neither interleaves with the other.
-    with locked(("pane", pane)):
-        if not idle_screen(pane):
+    with locked(("pane", lock_name(machine, pane))):
+        if not idle_screen(pane, machine=machine):
             raise ValueError("The agent is waiting on a question or approval; answer it first")
-        run(*machines.herdr_argv(None, "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~"))
-        if not wait_for(pane, lambda screen: pasted(screen, text), read=herdr_handoff.read_screen):
+        run(*machines.herdr_argv(machine, "pane", "send-text", pane, f"\x1b[200~{text}\x1b[201~"))
+        if not wait_for(
+            pane, lambda screen: pasted(screen, text), herdr_handoff.read_screen, machine
+        ):
             raise ValueError(f"The text did not appear in the prompt box; {UNCERTAIN}")
-        herdr("agent", "send-keys", pane, "enter")
+        herdr("agent", "send-keys", pane, "enter", machine=machine)
     return {"sent": True, "pane": pane, "warning": None}
 
 
@@ -852,10 +924,10 @@ def pasted(screen, text):
     return bool(shown) and (shown.startswith("[Pasted text") or shown.startswith(start))
 
 
-def idle_screen(pane, screen=None):
+def idle_screen(pane, screen=None, machine=None):
     """Whether the pane shows Claude's empty prompt box and no dialog below it."""
     if screen is None:
-        screen = herdr_handoff.read_screen(pane)
+        screen = herdr_handoff.read_screen(pane, machine)
     plain = herdr_handoff.SGR.sub("", screen)
     tail = "\n".join(plain.splitlines()[-12:]).lower()
     # A turn in progress also shows an empty box, above "esc to interrupt".
@@ -967,20 +1039,22 @@ def cursor_options(body, lines):
     return start, labels, at - start + 1
 
 
-def live_interaction(target):
+def live_interaction(target, machine=None):
     """Expose a blocked pane even when its pending tool is absent from the transcript.
 
     Only a complete, single-choice, single-question Claude dialog can be answered
     from the screen. Other dialogs remain visible without guessing their controls.
     """
-    screen = run(*machines.herdr_argv(None, "agent", "read", target["pane"], "--source", "visible"))
+    screen = run(
+        *machines.herdr_argv(machine, "agent", "read", target["pane"], "--source", "visible")
+    )
     result = {"screen": screen, "question": None, "choices": None, "idle": False}
     if target["agent"] != "claude" or not target.get("session"):
         return result
     lines = [unquote(line) for line in screen.splitlines()]
     result["choices"] = screen_choices(lines)
     if not result["choices"]:
-        result["idle"] = idle_screen(target["pane"])
+        result["idle"] = idle_screen(target["pane"], machine=machine)
     rules = [i for i, line in enumerate(lines) if RULE.match(line)]
     if len(rules) < 2 or "Esc to cancel" not in screen or "ctrl+g to edit" in screen:
         return result
@@ -1031,13 +1105,13 @@ def live_interaction(target):
     return result
 
 
-def dialog(pane):
+def dialog(pane, machine=None):
     """The question dialog on the pane's screen, whitespace collapsed.
 
     It starts at the last rule above it, skipping the one that sets off its "Chat about
     this" line, and ends with its key hints (the review tab has none).
     """
-    screen = run(*machines.herdr_argv(None, "agent", "read", pane, "--source", "visible"))
+    screen = run(*machines.herdr_argv(machine, "agent", "read", pane, "--source", "visible"))
     lines = [unquote(line) for line in screen.splitlines()]
     hints = [i for i, line in enumerate(lines) if "Esc to cancel" in line]
     end = hints[-1] + 1 if hints else len(lines)
@@ -1050,10 +1124,10 @@ def dialog(pane):
     return squash("\n".join(lines[rules[-1] : end])) if rules else ""
 
 
-def wait_for(pane, shows, read=dialog):
+def wait_for(pane, shows, read=dialog, machine=None):
     deadline = time.monotonic() + DIALOG_WAIT
     while True:
-        if shows(read(pane)):
+        if shows(read(pane, machine)):
             return True
         if time.monotonic() > deadline:
             return False
@@ -1114,31 +1188,40 @@ def answer_steps(questions, answers, agent="claude"):
     return steps
 
 
-def answer(request):
+def answer(request, home=None, machine=None):
     """Serialize answers, including validation, so a queued duplicate is checked again."""
-    with locked(("pane", str(request.get("pane")))):
-        return answer_locked(request)
+    with locked(("pane", lock_name(machine, str(request.get("pane"))))):
+        return answer_locked(request, home, machine)
 
 
-def answer_locked(request):
+def answer_locked(request, home=None, machine=None):
     """Answer the question a running agent is waiting on, through its dialog."""
     if set(request) != {"workspace", "pane", "session", "tool", "answers"} or not all(
         isinstance(request[k], str) and request[k] for k in ("workspace", "pane", "session", "tool")
     ):
         raise ValueError("Invalid answer parameters")
     pane = request["pane"]
-    target = next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
+
+    def running():
+        return agents(request["workspace"], machine=machine)
+
+    target = next((a for a in running() if a["pane"] == pane), None)
     if target is None or target["agent"] not in RESUME or target["session"] != request["session"]:
         raise ValueError("That agent session is no longer running in this pane; refresh")
     if target["status"] != "blocked":
         raise ValueError("The agent is not waiting on a question; refresh")
     if request["tool"].startswith("screen:"):
-        asked = live_interaction(target)["question"]
+        asked = live_interaction(target, machine)["question"]
         if not asked or asked["id"] != request["tool"]:
             raise ValueError("The question on the agent's screen changed; refresh")
     else:
-        root = workspace_viewer.workspace_checkout(request["workspace"])
-        entries = workspace_viewer.transcript(root, request["session"])["entries"]
+        root = workspace_root(request["workspace"], machine)
+        if machine is None:
+            entries = workspace_viewer.transcript(root, request["session"])["entries"]
+        else:
+            entries = workspace_viewer.remote_transcript(home, machine, root, request["session"])[
+                "entries"
+            ]
         asked = next(
             (
                 e
@@ -1158,12 +1241,12 @@ def answer_locked(request):
     questions = asked["questions"]
     steps = answer_steps(questions, request["answers"], target["agent"])
     if target["agent"] == "codex":
-        return answer_codex(request, questions, steps)
+        return answer_codex(request, questions, steps, machine)
     typed = False
     try:
         for question, keys in zip(questions, steps, strict=True):
             # The agent may have moved on, or exited and left its dialog on screen.
-            current: dict = next((a for a in agents(request["workspace"]) if a["pane"] == pane), {})
+            current: dict = next((a for a in running() if a["pane"] == pane), {})
             if (current.get("agent"), current.get("session"), current.get("status")) != (
                 "claude",
                 request["session"],
@@ -1171,29 +1254,31 @@ def answer_locked(request):
             ):
                 raise ValueError("the agent stopped waiting")
             if request["tool"].startswith("screen:"):
-                live = live_interaction(current)["question"]
+                live = live_interaction(current, machine)["question"]
                 if not live or live["id"] != request["tool"]:
                     raise ValueError("the dialog changed")
-            if not wait_for(pane, shows_question(question)):
+            if not wait_for(pane, shows_question(question), machine=machine):
                 raise ValueError("the dialog did not show the next question")
             for kind, value in keys:
                 if kind == "text":
                     # The text field opens on the keypress before; its editor hint
                     # shows once it has focus.
-                    if not wait_for(pane, lambda screen: "ctrl+g to edit" in screen):
+                    if not wait_for(
+                        pane, lambda screen: "ctrl+g to edit" in screen, machine=machine
+                    ):
                         raise ValueError("the answer field did not open")
-                    run(*machines.herdr_argv(None, "pane", "send-text", pane, value))
+                    run(*machines.herdr_argv(machine, "pane", "send-text", pane, value))
                 else:
                     if value == str(len(question["options"]) + 1) and "ctrl+g to edit" in dialog(
-                        pane
+                        pane, machine
                     ):
                         raise ValueError("an answer field is already open")
-                    herdr("agent", "send-keys", pane, value)
+                    herdr("agent", "send-keys", pane, value, machine=machine)
                 typed = True
         if len(questions) > 1 or any(q["multi"] for q in questions):
-            if not wait_for(pane, lambda screen: "Submit answers" in screen):
+            if not wait_for(pane, lambda screen: "Submit answers" in screen, machine=machine):
                 raise ValueError("the dialog did not offer to submit")
-            herdr("agent", "send-keys", pane, "1")
+            herdr("agent", "send-keys", pane, "1", machine=machine)
     except (ValueError, subprocess.SubprocessError) as exc:
         if not typed:
             raise ValueError(
@@ -1204,50 +1289,52 @@ def answer_locked(request):
     return {"answered": True, "pane": pane}
 
 
-def choose(request):
+def choose(request, machine=None):
     """Pick one option of the Claude dialog on an agent's screen, by its number key."""
-    with locked(("pane", str(request.get("pane")))):
+    with locked(("pane", lock_name(machine, str(request.get("pane"))))):
         if set(request) != {"workspace", "pane", "session", "dialog", "option"} or not all(
             isinstance(request[k], str) and request[k] for k in request
         ):
             raise ValueError("Invalid choice parameters")
         pane = request["pane"]
-        target = next((a for a in agents(request["workspace"]) if a["pane"] == pane), None)
+        target = next(
+            (a for a in agents(request["workspace"], machine=machine) if a["pane"] == pane), None
+        )
         if target is None or target["agent"] != "claude" or target["session"] != request["session"]:
             raise ValueError("That agent session is no longer running in this pane; refresh")
         if target["status"] != "blocked":
             raise ValueError("The agent is not waiting on a dialog; refresh")
-        choices = live_interaction(target)["choices"]
+        choices = live_interaction(target, machine)["choices"]
         if not choices or choices["id"] != request["dialog"]:
             raise ValueError("The dialog on the agent's screen changed; refresh")
         if request["option"] not in {option["key"] for option in choices["options"]}:
             raise ValueError("Choose one of the dialog's options")
         if not choices["arrows"]:
-            herdr("agent", "send-keys", pane, request["option"])
+            herdr("agent", "send-keys", pane, request["option"], machine=machine)
             return {"chosen": True, "pane": pane}
         wanted = int(request["option"])
         moves = wanted - choices["cursor"]
         for _ in range(abs(moves)):
-            herdr("agent", "send-keys", pane, "down" if moves > 0 else "up")
+            herdr("agent", "send-keys", pane, "down" if moves > 0 else "up", machine=machine)
 
         def on_target(_):
-            moved = live_interaction(target)["choices"]
+            moved = live_interaction(target, machine)["choices"]
             return bool(moved) and moved["id"] == choices["id"] and moved["cursor"] == wanted
 
         # Only the cursor moved so far; Enter goes only to the dialog and option chosen.
-        if not wait_for(pane, on_target, read=lambda _: None):
+        if not wait_for(pane, on_target, read=lambda *_: None):
             raise ValueError("The cursor did not reach that option; nothing was confirmed")
-        herdr("agent", "send-keys", pane, "enter")
+        herdr("agent", "send-keys", pane, "enter", machine=machine)
         return {"chosen": True, "pane": pane}
 
 
-def codex_dialog(pane):
+def codex_dialog(pane, machine=None):
     """Only the final Codex question overlay, bounded by its progress and footer.
 
     Codex CLI 0.160 renders `Question i/n` and `enter to submit answer/all`.
     Unlike Claude, it has no horizontal rule around the dialog.
     """
-    screen = run(*machines.herdr_argv(None, "agent", "read", pane, "--source", "visible"))
+    screen = run(*machines.herdr_argv(machine, "agent", "read", pane, "--source", "visible"))
     headings = list(re.finditer(r"(?m)^\s*Question \d+/\d+[^\n]*\n", screen))
     if not headings:
         return ""
@@ -1275,7 +1362,7 @@ def codex_question_matches(screen, question, index, total):
     )
 
 
-def answer_codex(request, questions, steps):
+def answer_codex(request, questions, steps, machine=None):
     pane = request["pane"]
     identity = (request["session"], request["tool"])
     if identity in _codex_answered:
@@ -1284,9 +1371,11 @@ def answer_codex(request, questions, steps):
 
     def send(kind, value, shows):
         nonlocal typed
-        if not wait_for(pane, shows, read=codex_dialog):
+        if not wait_for(pane, shows, codex_dialog, machine):
             raise ValueError("the expected question or answer field is not visible")
-        current: dict = next((a for a in agents(request["workspace"]) if a["pane"] == pane), {})
+        current: dict = next(
+            (a for a in agents(request["workspace"], machine=machine) if a["pane"] == pane), {}
+        )
         if (current.get("agent"), current.get("session"), current.get("status")) != (
             "codex",
             request["session"],
@@ -1297,9 +1386,9 @@ def answer_codex(request, questions, steps):
         typed = True
         _codex_answered.add(identity)
         if kind == "text":
-            run(*machines.herdr_argv(None, "pane", "send-text", pane, value))
+            run(*machines.herdr_argv(machine, "pane", "send-text", pane, value))
         else:
-            herdr("agent", "send-keys", pane, value)
+            herdr("agent", "send-keys", pane, value, machine=machine)
 
     try:
         for index, (question, keys) in enumerate(zip(questions, steps, strict=True)):
@@ -1316,7 +1405,7 @@ def answer_codex(request, questions, steps):
                 continue
             placeholder = "Type your answer (optional)"
             if question["options"]:
-                screen = codex_dialog(pane)
+                screen = codex_dialog(pane, machine)
                 other = len(question["options"]) + 1
                 selected = re.search(r"(?m)^\s*› (\d+)\. ", screen)
                 if (
@@ -1412,12 +1501,13 @@ def watch_owner(session_id, agent, home, config_dir=None):
     return owned_message(job) if job else None
 
 
-def claim_from_watch(session_id, agent, home, config_dir=None, stop_watch=None):
+def claim_from_watch(session_id, agent, home, config_dir=None, stop_watch=None, machine=None):
     """Refuse a resume the watcher owns, after cancelling the watch the reader confirmed.
 
     The confirmed watch is cancelled only while it still owns the session. A watch in
     the middle of a repair stops only once the repair finishes, so nothing resumes then;
-    otherwise the lock and the queue are read again before the resume goes ahead.
+    otherwise the lock and the queue are read again before the resume goes ahead. A
+    worker's session lease is the one this machine holds for it.
     """
     job = owning_watch(session_id, home)
     if job and stop_watch is not None and job.get("id") == stop_watch:
@@ -1431,7 +1521,7 @@ def claim_from_watch(session_id, agent, home, config_dir=None, stop_watch=None):
                 "watch_finishing_repair",
                 watch=watch_summary(stopped),
             )
-    if session_locks.held(agent, session_id, config_dir):
+    if session_locks.held(agent, session_id, config_dir, machine.id if machine else None):
         raise Refused(f"Not resumed: {REPAIR_RUNNING}", "repair_running")
     job = owning_watch(session_id, home)
     if job:
@@ -1449,16 +1539,18 @@ def watch_jobs(home):
     return read_jobs(Path(home))
 
 
-def open_elsewhere(session_id):
-    """The running agent herdr sees on this session, in any workspace.
+def open_elsewhere(session_id, machine=None):
+    """The running agent herdr sees on this session, in any workspace of its machine.
 
     herdr keeps a pane's session after its agent exits back to the shell, so only a
     pane that still hosts a recognized agent counts.
     """
     panes = {
         pane.get("pane_id")
-        for pane in herdr("pane", "list")["panes"]
-        if (pane.get("agent_session") or {}).get("value") == session_id
+        for pane in herdr("pane", "list", machine=machine)["panes"]
+        if isinstance(pane, dict)
+        and isinstance(pane.get("agent_session") or {}, dict)
+        and (pane.get("agent_session") or {}).get("value") == session_id
     }
     return next(
         (
@@ -1468,7 +1560,7 @@ def open_elsewhere(session_id):
                 "status": agent.get("agent_status"),
                 "session": session_id,
             }
-            for agent in herdr("agent", "list")["agents"]
+            for agent in listed_agents(machine)
             if agent.get("pane_id") in panes
         ),
         None,
@@ -1490,26 +1582,38 @@ def prune(prompts):
             _recent.pop(key, None)
 
 
-def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
+def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, machine=None):
     """Resume a recorded session in the workspace with the message, if any, as its prompt.
 
     Given a checkout root instead, the session resumes in the workspace open there, or
     in one opened on it again. Given the ID of the babysit watch that owns the session,
-    the reader confirmed cancelling it first.
+    the reader confirmed cancelling it first. A ``machine`` names the worker it all is
+    on: its herdr, its session listing and its own paths, which its probe reports.
     """
     if not isinstance(session_id, str) or not workspace_viewer.SESSION.match(session_id):
         raise ValueError("Choose a recorded session to resume")
     if root is None:
-        root = workspace_viewer.workspace_checkout(workspace_id)
-    chosen = next((s for s in workspace_viewer.sessions(root) if s["id"] == session_id), None)
+        root = workspace_root(workspace_id, machine)
+    chosen = next((s for s in recorded(root, home, machine) if s["id"] == session_id), None)
     if chosen is None or chosen["agent"] not in RESUME:
         raise ValueError("That session is not recorded for this workspace")
+    if machine is not None and chosen["agent"] == "claude" and not chosen.get("claude_account"):
+        raise ValueError(f"That session's Claude home is not an account on {machine.label}")
+    # A worker's own paths, its probe's: the checkout's real one names its lock there.
+    found = None
+    if machine is not None:
+        found = remote_resume(home, machine, root, chosen)
+        root = found["path"]
+    real = os.path.realpath(root) if machine is None else root
     # One resume of a session, and in a checkout, at a time, held until its agent shows up:
-    # a second request then sees it.
-    with locked(("checkout", os.path.realpath(root)), ("session", session_id)):
+    # a second request then sees it. A worker's clone lock comes first, as cleanup takes it.
+    with (
+        clone_held(home, machine, found),
+        locked(("checkout", lock_name(machine, real)), ("session", session_id)),
+    ):
         if workspace_id is None:
-            workspace_id = workspace_viewer.checkout_workspace(root)
-        if workspace_id and agents(workspace_id):
+            workspace_id = workspace_viewer.checkout_workspace(root, machine)
+        if workspace_id and agents(workspace_id, machine=machine):
             # Two agents on one conversation would interleave; talk to the running one.
             raise ValueError("An agent is already running in this workspace; send to it instead")
         recent = _recent.get(session_id)
@@ -1517,47 +1621,73 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
             raise ValueError(
                 f"This session was just resumed in {recent[0]}; check it in Collie before resending"
             )
-        elsewhere = open_elsewhere(session_id)
+        elsewhere = open_elsewhere(session_id, machine)
         if elsewhere:
             # Already running in another workspace: talk to that agent, never a second one.
             if not text:
                 raise ValueError(f"This session is already running in {elsewhere['pane']}")
-            return prompt(elsewhere, text)
+            return prompt(elsewhere, text, machine)
         # A session resumes from the directory it was recorded in (Claude looks its ID up
         # in that directory's project folder).
-        details = workspace_viewer.details(chosen["_file"], chosen["agent"]) or {}
-        cwd = details.get("cwd") or root
-        if not Path(cwd).is_dir():
+        if found is None:
+            details = workspace_viewer.details(chosen["_file"], chosen["agent"]) or {}
+            cwd = details.get("cwd") or root
+            exists = Path(cwd).is_dir()
+        else:
+            cwd, exists = found["cwd"], found["cwd_exists"]
+        if not exists:
             raise ValueError("The session's directory no longer exists")
         # Last before herdr is asked for a pane, so a confirmed cancellation is spent only
         # on a resume that can go ahead.
         claim_from_watch(
-            session_id, chosen["agent"], home, chosen.get("claude_config_dir"), stop_watch
+            session_id, chosen["agent"], home, chosen.get("claude_config_dir"), stop_watch, machine
         )
         # Always a fresh pane, as launches use: an existing shell may hold a half-typed
         # line or a program that replaced it, and typing would join or feed it.
-        live = workspace_id and workspace_viewer.live_workspace(workspace_id)
+        live = workspace_id and workspace_viewer.live_workspace(workspace_id, machine)
         pane = None
         if not live:
             # The workspace was closed since the viewer opened, or none was open: open
             # one on its checkout again, whose first pane is a new shell.
-            live, pane = reopen(root)
+            live, pane = reopen(root, machine, found)
             workspace_id = workspace_id or live
-            if agents(workspace_id):
+            if agents(workspace_id, machine=machine):
                 raise ValueError(
                     "An agent is already running in this workspace; send to it instead"
                 )
         if pane is None:
             anchor = next(
-                (p["pane_id"] for p in herdr("pane", "list", "--workspace", live)["panes"]),
+                (
+                    p.get("pane_id")
+                    for p in herdr("pane", "list", "--workspace", live, machine=machine)["panes"]
+                    if isinstance(p, dict)
+                ),
                 None,
             )
             if anchor is None:
                 raise ValueError("That herdr workspace has no pane to split")
+            pane_id(anchor, machine)
             split = herdr(
-                "pane", "split", anchor, "--direction", "right", "--cwd", cwd, "--no-focus"
+                "pane",
+                "split",
+                anchor,
+                "--direction",
+                "right",
+                "--cwd",
+                cwd,
+                "--no-focus",
+                machine=machine,
             )
-            return launch(workspace_id, chosen, split["pane"]["pane_id"], text, home, worktree=root)
+            return launch(
+                workspace_id,
+                chosen,
+                pane_id(split["pane"]["pane_id"], machine),
+                text,
+                home,
+                worktree=root,
+                machine=machine,
+                found=found,
+            )
         # A reopened workspace's shell starts in the checkout, not the session's directory.
         return launch(
             workspace_id,
@@ -1567,71 +1697,186 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None):
             home,
             cwd=None if cwd == root else cwd,
             worktree=root,
+            machine=machine,
+            found=found,
         )
 
 
-def reopen(root):
+@contextlib.contextmanager
+def clone_held(home, machine, found):
+    """Hold a worker clone's lock, as its launches and cleanup take it, or refuse at once.
+
+    Cleanup holds it while it removes a checkout there, for up to its removal timeout, so
+    a resume never waits behind it: the clone is the parent of the common dir ``found``,
+    by its real path there, as cleanup names it.
+    """
+    if machine is None:
+        yield
+        return
+    clone = os.path.dirname(found["common"])
+    with machines.clone_lock(home, machine, clone).open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError(
+                "A cleanup or launch is running in this clone; try again once it finishes"
+            ) from None
+        yield
+
+
+def pane_id(value, machine):
+    """A pane a worker's herdr named, before it reaches a command line here."""
+    if machine is not None and not (isinstance(value, str) and PANE.fullmatch(value)):
+        raise ValueError(f"herdr on {machine.label} named no usable pane; open it in Collie")
+    return value
+
+
+def remote_resume(home, machine, root, chosen):
+    """The worker's own paths for resuming ``chosen``: its checkout, common dir, the
+    session's directory (and whether it still exists) and the agent's configuration."""
+    return workspace_viewer.probe(
+        home,
+        machine,
+        "resume",
+        root=root,
+        cwd=chosen["_cwd"],
+        agent=chosen["agent"],
+        account=chosen.get("claude_account"),
+        babysit_root=machine.babysit_root,
+        sandbox=cron_agents.BACKENDS[machine.os],
+    )
+
+
+def reopen(root, machine=None, found=None):
     """Open a herdr workspace on a checkout again; its ID, and its new shell pane if any.
 
     A linked worktree opens under its clone, as `wt` opens it; a clone's own checkout gets
     a workspace of its own. An open that finds one already there gives no pane to type in.
+    A worker's common dir is the one its probe ``found``.
     """
-    common = Path(
-        workspace_viewer.git_text(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    )
+    if machine is None:
+        common = Path(
+            workspace_viewer.git_text(
+                root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+            )
+        )
+    else:
+        common = Path(found["common"])
     if common == Path(root) / ".git":
-        opened = herdr("workspace", "create", "--cwd", root, "--no-focus")
+        opened = herdr("workspace", "create", "--cwd", root, "--no-focus", machine=machine)
     else:
         opened = herdr(
-            "worktree", "open", "--cwd", str(common.parent), "--path", root, "--no-focus"
+            "worktree",
+            "open",
+            "--cwd",
+            str(common.parent),
+            "--path",
+            root,
+            "--no-focus",
+            machine=machine,
         )
     pane = (opened.get("root_pane") or {}).get("pane_id")
     live = (opened.get("workspace") or {}).get("workspace_id") or (
         pane.split(":")[0] if isinstance(pane, str) and ":" in pane else None
     )
-    if not live:
+    if not live or (
+        machine is not None and not (isinstance(live, str) and machines.WORKSPACE.fullmatch(live))
+    ):
         raise ValueError("herdr did not report the reopened workspace; open it in Collie")
     # One that was already open may hold a shell in use: that one gets a split.
-    return live, None if opened.get("already_open") else pane
+    if opened.get("already_open"):
+        return live, None
+    return live, pane if pane is None else pane_id(pane, machine)
+
+
+def remote_command(machine, chosen, found, text, staged):
+    """The resume line typed on a worker: its own sandbox, with the paths its probe found.
+
+    The Claude configuration is the worker's account home, typed as the worker spells
+    it; nothing about this machine's accounts applies there.
+    """
+    account = chosen.get("claude_account")
+    job = {
+        "agent": chosen["agent"],
+        "prompt": text,
+        "model": "",
+        "docker": False,
+        "claude_account": "" if account in (None, "default") else account,
+    }
+    return cron_agents.remote_command(
+        job, machine, found, staged, "", extra=[*RESUME[chosen["agent"]], chosen["id"]]
+    )
 
 
 def launch(
-    workspace_id, chosen, pane, text, home, *, options=(), cwd=None, launcher=None, worktree=None
+    workspace_id,
+    chosen,
+    pane,
+    text,
+    home,
+    *,
+    options=(),
+    cwd=None,
+    launcher=None,
+    worktree=None,
+    machine=None,
+    found=None,
 ):
     """Resume once into a fresh or verified empty shell pane, optionally with a prompt.
 
-    ``worktree`` is the workspace checkout, which the agent may write.
+    ``worktree`` is the workspace checkout, which the agent may write. On a worker the
+    prompt is staged there and the line names the paths its probe ``found``.
     """
     session_id = chosen["id"]
     # The prompt is read back from a private file, as launches do: a typed line has
     # a length ceiling, and command-substitution output needs no escaping.
-    prompts = Path(home or os.environ.get("TMPDIR") or "/tmp") / "message-prompts"
-    prompts.mkdir(mode=0o700, parents=True, exist_ok=True)
-    prune(prompts)
-    staged = prompts / f"resume-{uuid.uuid4()}"
-    if text:
-        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(text + "\n")
-    command = wt.agent_command(
-        chosen["agent"],
-        text,
-        extra=[*options, *RESUME[chosen["agent"]], chosen["id"]],
-        stage=lambda _: str(staged),
-        worktree=worktree,
-        sandbox_config_dir=chosen.get("claude_config_dir"),
-    )
-    if launcher:
-        # Direct Safehouse invocation already contains the executable. Its original
-        # permission flags are in options; shell wrappers must not add them again.
-        command = shlex.join(launcher) + command[len(chosen["agent"]) :]
-    if chosen["agent"] == "claude" and chosen.get("claude_config_dir"):
-        command = claude_accounts.shell_command(
-            command,
-            chosen["claude_config_dir"],
-            subscription=chosen.get("claude_account") not in (None, "default"),
-            config_env=chosen.get("claude_config_env", False),
+    staged: Path | None = None  # This machine's; a worker's is pruned there after a day.
+    if machine is not None:
+        remote = None
+        if text:
+            # Older ones there, left by resumes whose agent never showed up, go first.
+            remote = machines.put_file(
+                home,
+                machine,
+                machines.remote_path(REMOTE_PROMPTS),
+                f"resume-{uuid.uuid4()}",
+                (text + "\n").encode(),
+                keep=PROMPT_KEEP,
+            )
+        command = remote_command(machine, chosen, found, text, remote)
+    else:
+        prompts = Path(home or os.environ.get("TMPDIR") or "/tmp") / "message-prompts"
+        prompts.mkdir(mode=0o700, parents=True, exist_ok=True)
+        prune(prompts)
+        staged = local = prompts / f"resume-{uuid.uuid4()}"
+        if text:
+            descriptor = os.open(local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(text + "\n")
+        command = wt.agent_command(
+            chosen["agent"],
+            text,
+            extra=[*options, *RESUME[chosen["agent"]], chosen["id"]],
+            stage=lambda _: str(local),
+            worktree=worktree,
+            sandbox_config_dir=chosen.get("claude_config_dir"),
         )
+        if launcher:
+            # Direct Safehouse invocation already contains the executable. Its original
+            # permission flags are in options; shell wrappers must not add them again.
+            command = shlex.join(launcher) + command[len(chosen["agent"]) :]
+        if chosen["agent"] == "claude" and chosen.get("claude_config_dir"):
+            command = claude_accounts.shell_command(
+                command,
+                chosen["claude_config_dir"],
+                subscription=chosen.get("claude_account") not in (None, "default"),
+                config_env=chosen.get("claude_config_env", False),
+            )
+
+    def discard():
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
     # A transcript's recorded cwd is the agent's to write; quoting does not stop a
@@ -1640,7 +1885,7 @@ def launch(
     _recent[session_id] = (pane, time.monotonic())
     try:
         # `pane run` answers with plain text, not herdr's JSON envelope.
-        run(*machines.herdr_argv(None, "pane", "run", pane, command))
+        run(*machines.herdr_argv(machine, "pane", "run", pane, command))
     except subprocess.TimeoutExpired:
         return {
             "sent": True,
@@ -1650,20 +1895,22 @@ def launch(
         }
     except (ValueError, subprocess.SubprocessError):
         _recent.pop(session_id, None)
-        staged.unlink(missing_ok=True)
+        discard()
         raise
     # From here the command is typed: any trouble makes the outcome uncertain, never
     # "not sent", which would invite a second agent on the same session.
     deadline = time.monotonic() + RESUME_WAIT
     try:
         while time.monotonic() < deadline:
-            current = next((a for a in agents(workspace_id) if a["pane"] == pane), None)
+            current = next(
+                (a for a in agents(workspace_id, machine=machine) if a["pane"] == pane), None
+            )
             if (
                 current
                 and current.get("session") == session_id
                 and current.get("agent") == chosen["agent"]
             ):
-                staged.unlink(missing_ok=True)  # The shell has read it by now.
+                discard()  # The shell has read it by now.
                 # A recognized agent guards the session from here on.
                 _recent.pop(session_id, None)
                 return {"sent": True, "pane": pane, "resumed": chosen["id"], "warning": None}

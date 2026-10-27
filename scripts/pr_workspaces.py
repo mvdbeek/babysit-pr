@@ -2764,11 +2764,10 @@ class Workspaces:
         try:
             machine = machines.resolve(self.home, op["machine"], placing=True)
             assert machine is not None
-            lock_dir = self.home / "workspace-locks"
-            lock_dir.mkdir(mode=0o700, exist_ok=True)
-            # The worker's clone, never a same-named one here.
-            key = hashlib.sha256(f"{machine.id}\0{op['clone']}".encode()).hexdigest()
-            with (lock_dir / key).open("a") as lock:
+            # The worker's clone by its real path there, as its cleanup locks it; never a
+            # same-named one here.
+            real = cron_agents.probe(self.home, machine, "realpath", 30, path=op["clone"])["path"]
+            with machines.clone_lock(self.home, machine, real).open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 self.save_operation(
                     op, status="running", message=f"Checking babysit-pr on {machine.label}"

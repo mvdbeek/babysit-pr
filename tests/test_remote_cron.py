@@ -4,6 +4,7 @@ The worker is a directory under ``<tmp>/hosts/<ssh target>`` that the fake ssh u
 HOME; its herdr state lives in the fake herdr's per-label store.
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -304,6 +305,40 @@ def settled(jobs, statuses=("starting",)):
 
 def store(state):
     return json.loads(Path(state).read_text())
+
+
+def test_a_workers_job_checkout_holds_its_clones_lock(remote, monkeypatch):
+    """The lock cleanup and launches on that worker take, by the clone's real path there."""
+    jobs, manager, git_local, state, host = remote
+    held = []
+    real_checkout, real_run = cron_agents.remote_checkout, cron_agents.run
+
+    def locked(home, machine):
+        lock = machines.clone_lock(home, machine, str((host / "src/repo").resolve()))
+        with lock.open("a") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(other, fcntl.LOCK_UN)
+            return False
+
+    def checkout(job, home, machine):
+        held.append(("checkout", locked(home, machine)))
+        return real_checkout(job, home, machine)
+
+    def run(*args, **kwargs):
+        if args[2:4] == ("pane", "run"):
+            # Until its agent is typed, a cleanup must not take the new checkout away.
+            held.append(("typed", locked(manager.home, machines.load(manager.home)["mini"])))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(cron_agents, "remote_checkout", checkout)
+    monkeypatch.setattr(cron_agents, "run", run)
+    saved = jobs.save(job_request(manager))
+    jobs.run_now(saved["id"])
+    assert settled(jobs)["status"] == "running"
+    assert held == [("checkout", True), ("typed", True)]
 
 
 def test_a_job_on_a_worker_starts_its_agent_there(remote):
@@ -667,6 +702,33 @@ def test_bwrap_trusts_the_config_its_sandboxed_claude_reads(host):
     assert found["claude_env"] is None
     outer = json.loads((home / ".claude.json").read_text())["projects"]
     assert outer[found["path"]] == {"hasTrustDialogAccepted": True}
+
+
+def test_the_trust_writer_leaves_an_oversized_config_alone(tmp_path, monkeypatch):
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")  # Only ever this test's own config.
+    monkeypatch.setattr(remote_probe, "MAX_CLAUDE_CONFIG", 64)
+    config = tmp_path / ".claude.json"
+    original = json.dumps({"projects": {}, "pad": "x" * 64})
+    config.write_text(original)
+    remote_probe._host_trust(str(config), str(tmp_path / "repo"))
+    assert config.read_text() == original
+    # One within the cap is trusted as before.
+    config.write_text("{}")
+    remote_probe._host_trust(str(config), str(tmp_path / "repo"))
+    projects = json.loads(config.read_text())["projects"]
+    assert projects == {str(tmp_path / "repo"): {"hasTrustDialogAccepted": True}}
+
+
+def test_the_trust_writer_keeps_only_the_configs_permission_bits(tmp_path, monkeypatch):
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")  # Only ever this test's own config.
+    config = tmp_path / ".claude.json"
+    config.write_text("{}")
+    # The sticky bit stands in for setuid and setgid, which a write here clears anyway.
+    config.chmod(0o1640)
+    assert config.stat().st_mode & 0o7777 == 0o1640
+    remote_probe._host_trust(str(config), str(tmp_path / "repo"))
+    assert config.stat().st_mode & 0o7777 == 0o640
+    assert json.loads(config.read_text())["projects"]
 
 
 def test_a_named_account_keeps_its_literal_path_for_claude(host, tmp_path):

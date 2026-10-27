@@ -256,9 +256,9 @@ def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, w
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, width):
+def test_worker_rows_show_their_machine_and_are_not_opened_from_here(page, site, width):
     url, plugin, _ = site
-    remote = {"machine": "mini", "machine_label": "Mac mini", "removable": False}
+    remote = {"machine": "mini", "machine_label": "Mac mini"}
     plugin.value["workspaces"] = [
         row("local-work"),
         row(
@@ -292,9 +292,8 @@ def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, w
     # Its diff and transcripts are read on the worker.
     for name in ("Diff", "Transcript"):
         expect(line.get_by_role("button", name=name, exact=True)).to_be_enabled()
-    box = line.get_by_role("checkbox", name="Select remote-work")
-    expect(box).to_be_disabled()
-    expect(box).to_have_attribute("title", unavailable)
+    # Cleanup runs on the worker.
+    expect(line.get_by_role("checkbox", name="Select remote-work")).to_be_enabled()
     stale = page.locator("#ws-list tr").filter(has=page.get_by_text("stale-work", exact=True))
     expect(stale.get_by_role("button", name="Create workspace", exact=True)).to_be_disabled()
     expect(stale.locator(".ws-machine")).to_have_class(re.compile(r"\bamber\b"))
@@ -307,14 +306,14 @@ def test_worker_rows_show_their_machine_and_offer_only_their_views(page, site, w
     page.get_by_role("searchbox", name="Search workspaces").fill("mac mini")
     expect(page.locator("#ws-list tr")).to_have_count(2)
     page.get_by_role("searchbox", name="Search workspaces").fill("")
-    # Selecting everything shown never sweeps a worker's row into a cleanup.
+    # A worker's removable rows are selected with this machine's.
     page.get_by_role("checkbox", name="Select all shown").check()
-    expect(page.locator("#ws-selected")).to_have_text("1 selected")
+    expect(page.locator("#ws-selected")).to_have_text("3 selected")
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     assert not errors
 
 
-def test_a_worker_transcript_names_its_machine_and_cannot_quit_its_agent_yet(page, site):
+def test_a_worker_transcript_shows_its_agent_there_and_cannot_quit_it_yet(page, site):
     url, plugin, _ = site
     plugin.value["workspaces"] = [
         row(
@@ -328,22 +327,43 @@ def test_a_worker_transcript_names_its_machine_and_cannot_quit_its_agent_yet(pag
         )
     ]
     page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
-    asked = []
-    page.on("request", lambda request: asked.append(request.url))
+    # The worker's agents are read there; its Docker access is not this Mac's to show.
+    agent = {
+        "pane": "w3:p2",
+        "agent": "claude",
+        "status": "working",
+        "title": None,
+        "session": "s1",
+        "docker": None,
+        "docker_supported": False,
+    }
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "agents": [agent],
+                "sessions": [],
+                "path": "/src/worktrees/repo/remote-work",
+                "workspace": "mini/w3",
+                "url": None,
+            }
+        ),
+    )
     page.goto(url + "/#workspaces")
     line = page.locator("#ws-list tr").filter(has=page.get_by_text("remote-work", exact=True))
     line.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
     strip = live.locator(".ws-live-state")
-    expect(strip).to_have_attribute("data-live", "unknown")
-    expect(strip).to_contain_text("Status unknownon Mac mini")
-    quit_button = strip.get_by_role("button", name="Quit agent")
+    expect(strip).to_have_attribute("data-live", "true")
+    expect(strip).to_contain_text("on Mac mini")
+    expect(strip.get_by_role("button", name="Stop the turn of Claude in w3:p2")).to_be_enabled()
+    quit_button = strip.get_by_role("button", name="Quit Claude in w3:p2")
     expect(quit_button).to_be_disabled()
     expect(quit_button).to_have_attribute(
         "title", "Agents on Mac mini cannot be quit from this dashboard yet"
     )
+    expect(page.locator("#ws-docker")).to_be_hidden()
     live.screenshot(path="reports/viewer-strip-worker.png")
-    assert not any("/api/workspace-agents" in url for url in asked)
 
 
 def test_selection_confirmation_override_and_cleanup_progress(page, site):
@@ -831,7 +851,7 @@ def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
         "href", "https://collie.example.ts.net/space/w4"
     )
     dialog.get_by_label("Message the agent").fill("And add a test")
-    dialog.get_by_role("button", name="Send to agent").click()
+    dialog.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w4:p1.")
     assert sent[-1] == {"workspace": "w4", "pane": "w4:p1", "text": "And add a test"}
 

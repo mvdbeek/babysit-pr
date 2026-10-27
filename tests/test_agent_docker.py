@@ -72,11 +72,11 @@ def rig(request, tmp_path, monkeypatch):
         "inspect",
         lambda pane: (copy.deepcopy(info), copy.deepcopy(procs), copy.deepcopy(state)),
     )
-    monkeypatch.setattr(docker.handoff, "read_screen", lambda pane: rig.screen)
+    monkeypatch.setattr(docker.handoff, "read_screen", lambda pane, machine=None: rig.screen)
     monkeypatch.setattr(docker, "has_access", lambda pid: rig.access)
     monkeypatch.setattr(docker, "EXIT_WAIT", 0)
 
-    def send(*args):
+    def send(*args, machine=None):
         calls.append(args)
         if args[:3] == ("herdr", "pane", "run"):
             procs["foreground_processes"] = [safehouse, proc]
@@ -110,7 +110,7 @@ def rig(request, tmp_path, monkeypatch):
     monkeypatch.setattr(
         messages,
         "agents",
-        lambda wid, interactions=False, live=None: [
+        lambda wid, interactions=False, live=None, machine=None: [
             {"pane": "w1:p1", "session": SID, "agent": kind}
         ],
     )
@@ -340,7 +340,9 @@ def test_an_unverified_replacement_is_uncertain_and_cannot_be_relaunched(
     rig, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
-        messages, "agents", lambda wid: [{"pane": "w1:p1", "session": "wrong", "agent": rig.kind}]
+        messages,
+        "agents",
+        lambda wid, machine=None: [{"pane": "w1:p1", "session": "wrong", "agent": rig.kind}],
     )
     monkeypatch.setattr(messages, "RESUME_WAIT", 0.01)
     value = messages.change_docker(rig.target, True, tmp_path)
@@ -393,8 +395,8 @@ def test_uncontrolled_docker_grant_is_not_claimed_to_be_disabled(rig, tmp_path):
 
 def test_send_does_not_inspect_or_change_docker(rig, tmp_path, monkeypatch):
     rig.target["status"] = "working"
-    monkeypatch.setattr(messages, "agents", lambda wid: [rig.target])
-    monkeypatch.setattr(messages, "herdr", lambda *args: rig.calls.append(args))
+    monkeypatch.setattr(messages, "agents", lambda wid, machine=None: [rig.target])
+    monkeypatch.setattr(messages, "herdr", lambda *args, machine=None: rig.calls.append(args))
     result = messages.send({"workspace": "w1", "pane": "w1:p1", "text": "go"}, tmp_path)
     assert result["sent"]
     assert len(rig.calls) == 1 and rig.calls[0][:2] == ("agent", "prompt")

@@ -1337,11 +1337,10 @@ def test_qualified_workspace_ids_name_a_registered_machine(site, tmp_path, monke
             status, value = request(port, "/api/workspace-diff?workspace=w1")
             assert status == 200 and value["base"] == "origin/main"
             for route in ("workspace-diff", "workspace-transcript", "workspace-agents"):
-                # Views read a worker's workspace there; nothing else acts on it yet.
-                remote = "not open" if route != "workspace-agents" else "cannot be opened"
+                # A worker's workspace is read and messaged there.
                 for workspace, error in [
                     ("unknown%2Fw1", "Unknown machine unknown"),
-                    ("mini%2Fw1", remote),
+                    ("mini%2Fw1", "not open"),
                 ]:
                     path = f"/api/{route}?workspace={workspace}"
                     status, value = request(port, path)
@@ -1561,7 +1560,7 @@ def test_a_failed_wait_reports_only_an_agent_still_working(working, monkeypatch,
 
     real = agent_messages.herdr
 
-    def herdr(*args):
+    def herdr(*args, **kwargs):
         if args[:2] == ("agent", "wait"):
             if exits:
                 # The agent quit on Esc, so herdr has nothing left to wait on.
@@ -1569,7 +1568,7 @@ def test_a_failed_wait_reports_only_an_agent_still_working(working, monkeypatch,
                 data["agents"] = data["agents"][:1]
                 working.write_text(json.dumps(data))
             raise ValueError('{"code":"timeout","message":"timed out waiting for agent status"}')
-        return real(*args)
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(agent_messages, "herdr", herdr)
     value = agent_messages.interrupt(stop_request())
@@ -3472,8 +3471,8 @@ def test_an_agent_that_stops_waiting_mid_answer_stops_the_typing(asking, monkeyp
     state, sid, _ = asking
     real = agent_messages.herdr
 
-    def herdr(*args):
-        value = real(*args)
+    def herdr(*args, **kwargs):
+        value = real(*args, **kwargs)
         if args[:2] == ("agent", "send-keys"):
             # The first key lands, then the agent is no longer waiting.
             data = read(state)
@@ -3766,20 +3765,20 @@ def test_codex_delivery_stops_when_the_agent_exits_or_io_is_uncertain(
         real = agent_messages.agents
         count = 0
 
-        def agents(workspace):
+        def agents(workspace, **kwargs):
             nonlocal count
             count += 1
-            return real(workspace) if count == 1 else []
+            return real(workspace, **kwargs) if count == 1 else []
 
         monkeypatch.setattr(agent_messages, "agents", agents)
         error = "agent stopped waiting"
     else:
         real_herdr = agent_messages.herdr
 
-        def herdr(*args):
+        def herdr(*args, **kwargs):
             if args[:2] == ("agent", "send-keys"):
                 raise subprocess.TimeoutExpired("herdr", 1)
-            return real_herdr(*args)
+            return real_herdr(*args, **kwargs)
 
         monkeypatch.setattr(agent_messages, "herdr", herdr)
         error = "Answer attempted"
@@ -3948,7 +3947,7 @@ def test_a_message_whose_agent_cannot_be_found_says_it_will_not_quit(site, monke
     monkeypatch.setattr(
         agent_messages,
         "prompt",
-        lambda target, text: {"sent": True, "pane": "w1:p9", "warning": None},
+        lambda target, text, machine=None: {"sent": True, "pane": "w1:p9", "warning": None},
     )
     body = {"workspace": "w1", "text": "Approve and merge", "exit_when_done": True}
     value = agent_messages.send(body, plugin.home)
@@ -3978,12 +3977,12 @@ def test_a_typed_message_is_never_reported_unsent_when_its_watch_fails(site, mon
     plugin, *_ = site
     real_herdr, real_prompt, typed = agent_messages.herdr, agent_messages.prompt, []
 
-    def prompt(target, text):
+    def prompt(target, text, machine=None):
         typed.append(text)
-        return real_prompt(target, text)
+        return real_prompt(target, text, machine)
 
-    def herdr(*args):
-        value = real_herdr(*args)
+    def herdr(*args, **kwargs):
+        value = real_herdr(*args, **kwargs)
         if typed and args[:2] == ("agent", "list"):
             # After delivery herdr lists the agent without its workspace.
             value["agents"] = [

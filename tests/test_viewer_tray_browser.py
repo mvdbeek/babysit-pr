@@ -343,7 +343,7 @@ def test_the_tray_fits_a_phone_and_both_schemes(page, dashboard_site, tray_route
     assert footer["y"] + footer["height"] <= tray.bounding_box()["y"]
     page.screenshot(path=f"reports/viewer-tray-crowded-{width}.png")
     chips(page).filter(has_text="Renamed workspace").click()
-    send = viewer.get_by_role("button", name="Send to agent")
+    send = viewer.get_by_role("button", name="Send", exact=True)
     viewer.locator("#ws-message").scroll_into_view_if_needed()
     expect(send).to_be_in_viewport()
     assert send.evaluate("""el => {
@@ -407,9 +407,8 @@ def test_a_worker_entry_round_trips(page, dashboard_site, tray_routes):
     offline["down"] = False
     chips(page).first.click()
     expect(viewer.locator("#ws-viewer-title")).to_have_text("Worker checkout")
-    expect(page.locator("#ws-message-readonly")).to_have_text(
-        "Not available for workspaces on chonk yet"
-    )
+    # Its composer reaches the worker, without the quit and attachments kept here.
+    expect(page.locator("#ws-message-quit-label")).to_be_hidden()
     expect(chips(page)).to_have_count(0)
     assert tray_routes[-1] == {"key": "m:chonk:/srv/w5", "session": "s-old"}
     viewer.get_by_role("button", name="Minimize workspace viewer").click()

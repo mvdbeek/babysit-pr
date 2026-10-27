@@ -45,7 +45,9 @@ def test_cancel_watch_and_send_resumes_the_session(page, owned):
         "href", "/?item=https%3A%2F%2Fgithub.com%2Fbase%2Frepo%2Fpull%2F7#watcher"
     )
     dialog.get_by_label("Message the agent").fill("Address review comment")
-    dialog.get_by_role("button", name="Cancel watch and send…").click()
+    # Shift+Enter in the message is the button's click: it asks first too.
+    expect(dialog.get_by_role("button", name="Cancel watch and send…")).to_be_visible()
+    dialog.get_by_label("Message the agent").press("Shift+Enter")
     # Nothing happens before the reader confirms.
     expect(notice).to_contain_text("Cancel babysit watch w-1 (blocked)?")
     assert load_watch(home)["status"] == "blocked"
@@ -69,6 +71,9 @@ def test_a_watch_in_a_repair_is_cancelled_after_it_and_nothing_resumes(page, own
     expect(notice).to_contain_text("It is running a repair now, which finishes first.")
     expect(dialog.get_by_role("button", name="Resume and send")).to_be_disabled()
     dialog.get_by_label("Message the agent").fill("Address review comment")
+    dialog.get_by_label("Message the agent").press("Shift+Enter")
+    expect(dialog.get_by_label("Message the agent")).to_have_value("Address review comment")
+    assert not read(state).get("runs")
     notice.get_by_role("button", name="Cancel watch after this repair").click()
     expect(notice).to_contain_text("stops monitoring this pull request once its current repair")
     notice.get_by_role("button", name="Cancel watch", exact=True).click()
@@ -104,5 +109,5 @@ def test_a_watch_transcript_offers_to_cancel_it_and_reopen_the_session(page, own
     # Resumed with no prompt: the session waits for the reader.
     assert read(state)["agents"][0]["argv"] == ["--resume", sid]
     # The viewer follows the workspace now open there, with its agent to message.
-    expect(dialog.get_by_role("button", name="Send to agent")).to_be_visible()
+    expect(dialog.get_by_role("button", name="Send", exact=True)).to_be_visible()
     expect(dialog.get_by_role("button", name="Reopen in Collie")).to_be_hidden()

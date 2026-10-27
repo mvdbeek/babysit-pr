@@ -19,6 +19,7 @@ import math
 import os
 import re
 import selectors
+import shutil
 import signal
 import stat
 import subprocess
@@ -112,6 +113,8 @@ MAX_TURN = 20000  # Characters of an agent's final response a ``turn`` answer ca
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # A session listing reads at most this much of each transcript, and skips longer lines.
 MAX_SCAN = 32 * 1024 * 1024
+# The largest Claude config the trust writer reads; an agent can write that file.
+MAX_CLAUDE_CONFIG = 64 * 1024 * 1024
 MAX_SCAN_LINE = 4 * 1024 * 1024
 
 
@@ -1532,15 +1535,27 @@ def _host_trust(config, directory):
     """Accept Claude's folder trust dialog for ``directory``, as claude_accounts.trust does.
 
     ``--dangerously-skip-permissions`` does not skip that dialog. A missing or unreadable
-    config is left alone; ``BABYSIT_CLAUDE_TRUST=0`` turns it off.
+    config is left alone, as is one over ``MAX_CLAUDE_CONFIG``; ``BABYSIT_CLAUDE_TRUST=0``
+    turns it off. Unlike this machine's,
+    a config that is a symlink is left alone too: a sandboxed agent can write its Claude
+    home, and a link it planted would have another file of this user rewritten.
     """
     if os.environ.get("BABYSIT_CLAUDE_TRUST") == "0":
         return
-    path = Path(os.path.realpath(config))
+    path = Path(os.path.realpath(os.path.dirname(config))) / os.path.basename(config)
     temporary = None
     try:
-        mode = path.stat().st_mode & 0o7777
-        value = json.loads(path.read_text())
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            found = os.fstat(descriptor)
+            if not stat.S_ISREG(found.st_mode) or found.st_size > MAX_CLAUDE_CONFIG:
+                return
+            # Never the setuid, setgid or sticky bits of a file an agent controls.
+            mode = found.st_mode & 0o777
+            data = stream.read(MAX_CLAUDE_CONFIG + 1)
+            if len(data) > MAX_CLAUDE_CONFIG:
+                return
+            value = json.loads(data)
         projects = value.setdefault("projects", {})
         if not isinstance(projects, dict):
             return
@@ -2017,8 +2032,189 @@ def _host_tail(file, inode, offset, limit):
     }
 
 
+def _host_resolve(src, repo_roots, opened, path=None, root=None):
+    """One listed row's clone read again for cleanup, never wider than ``inventory`` reads.
+
+    ``path`` names a checkout, whose clone is found from its common dir; ``root`` names
+    the clone of a herdr workspace with no known checkout. Only a clone among the scanned
+    roots is read; the answer names the clone either way, for the controller to refuse.
+    ``opened`` are herdr's checkout paths, resolved as ``inventory`` resolves them.
+    """
+    if src != "~":
+        _arg_paths([src], home=True)
+    _arg_paths(repo_roots)
+    _arg_paths(opened)
+    if (path is None) == (root is None):
+        raise ValueError("Expected a checkout or a clone")
+    _arg_paths([path or root])
+    roots = scanned_roots(Path(os.path.expanduser(src)), [], repo_roots)
+    paths = {}
+    for named in opened:
+        real = os.path.realpath(named)
+        paths[named] = {"path": real, "exists": os.path.exists(real)}
+    answer: dict[str, Any] = {
+        "roots": sorted(str(found) for found in roots),
+        "root": None,
+        "clones": [],
+        "states": {},
+        "paths": paths,
+    }
+    if path is not None:
+        try:
+            common = host_git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return answer  # Gone, or no longer a checkout: nothing to act on.
+        clone = Path(common).resolve().parent
+    else:
+        clone = Path(root).resolve()
+    answer["root"] = str(clone)
+    if clone not in roots:
+        return answer
+    config = repo_config(host_git, clone)
+    found = clone_worktrees(host_git, clone, None, config)
+    if found:
+        main, items = found
+        answer["clones"] = [{"main": main, "items": items, "config": config}]
+        item = next((item for item in items if item["path"] == path), None)
+        if item:
+            answer["states"][path] = local_state(host_git, path, item.get("branch"))
+    return answer
+
+
+# A branch cleanup deletes: a name Git accepts that no command line takes for an option.
+BRANCH_NAME = re.compile(r"^(?!-)[^\s:^~?*\\[]{1,255}$")
+
+
+def _host_remove(root, path, force, branch, safe):
+    """Remove a worktree of the clone ``root`` and delete its branch, as cleanup does here.
+
+    ``path`` must be a worktree ``git worktree list`` names for that clone: neither the
+    clone's own checkout nor inside its common dir. Unless ``force``, the clean check Git
+    would run in the worktree, under config the clone's listing never saw, runs hardened
+    here, and Git is told to skip its own. ``branch`` goes only while it is the one that
+    worktree had checked out: forced when ``safe`` (nothing can be lost), else ``-d``
+    decides, and a branch Git keeps is reported rather than raised.
+    """
+    _arg_paths([root, path])
+    if not all(isinstance(flag, bool) for flag in (force, safe)):
+        raise ValueError("Expected force and safe flags")
+    if branch is not None and (not isinstance(branch, str) or not BRANCH_NAME.fullmatch(branch)):
+        raise ValueError("Expected a branch name")
+    root = os.path.realpath(root)
+    if os.path.realpath(host_git(root, "rev-parse", "--show-toplevel")) != root:
+        raise ValueError(f"{root} is not the top of a clone")
+    common = os.path.realpath(
+        host_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    if os.path.dirname(common) != root:
+        raise ValueError(f"{root} is not the top of a clone")
+    listed, records = {}, {}
+    listing = host_git(root, "worktree", "list", "--porcelain", "-z", strip=False)
+    for record in listing.split("\0\0"):
+        fields = dict(
+            line.split(" ", 1) if " " in line else (line, "") for line in record.split("\0") if line
+        )
+        if "worktree" in fields:
+            listed[fields["worktree"]] = fields.get("branch")
+            records[fields["worktree"]] = fields
+    real = os.path.realpath(path)
+    named = next((entry for entry in listed if os.path.realpath(entry) == real), None)
+    if named is None:
+        raise ValueError(f"{path} is not a worktree of {root}")
+    # Git lists the main worktree first.
+    if real == root or named == next(iter(listed)):
+        raise ValueError(f"{path} is the clone's own checkout; kept")
+    if real == common or real.startswith(common + os.sep):
+        raise ValueError(f"{path} lies inside {root}'s Git directory; kept")
+    # Git refuses to remove a locked worktree only once asked to; nothing is deleted first.
+    if "locked" in records[named]:
+        raise ValueError(f"{path} is locked ({records[named]['locked'] or 'no reason'}); kept")
+    worktree = "missing"
+    if os.path.lexists(path):
+        if not force:
+            if host_git(
+                path, "status", "--porcelain", "-z", "--untracked-files=normal", timeout=300
+            ):
+                raise ValueError(f"{path} has uncommitted changes or untracked files; kept")
+            modules = host_git(path, "rev-parse", "--path-format=absolute", "--git-path", "modules")
+            staged = host_git(path, "ls-files", "--stage", "-z", timeout=300, strip=False)
+            if os.path.isdir(modules) or any(
+                entry.startswith("160000 ") for entry in staged.split("\0")
+            ):
+                raise ValueError(f"{path} contains submodules; kept")
+        # Git's own recursive delete goes by path, so a directory swapped for a symlink
+        # meanwhile would be followed out of the tree; this one never follows one. Git
+        # then only drops the registration of a tree already gone.
+        if shutil.rmtree.avoids_symlink_attacks:
+            shutil.rmtree(real)
+        host_git(root, "worktree", "remove", "--force", named, timeout=300)
+        worktree = "removed"
+    result = {"worktree": worktree, "branch": None, "detail": None}
+    if branch is None:
+        return result
+    if listed[named] != f"refs/heads/{branch}":
+        return {**result, "branch": "kept", "detail": f"{branch} was not checked out there"}
+    try:
+        host_git(root, "branch", "-D" if safe else "-d", "--", branch)
+    except ValueError as exc:
+        return {**result, "branch": "kept", "detail": (str(exc).splitlines() or [""])[0][:160]}
+    return {**result, "branch": "deleted"}
+
+
+def _host_realpath(path):
+    """A path's real spelling here, for a lock the controller names after it."""
+    _arg_paths([path], home=True)
+    return {"path": os.path.realpath(os.path.expanduser(path))}
+
+
+def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
+    """What the line resuming a session in the checkout ``root`` needs on this machine.
+
+    ``cwd`` is the directory the session recorded, which must lie in the checkout and
+    is reported with whether it still exists. The rest is what ``cron_checkout``
+    reports for a launch: the checkout's common dir, the agent's configuration (Claude's
+    home, and the ``CLAUDE_CONFIG_DIR`` to type, literal, for ``account``), Codex's home
+    and babysit-bwrap here. Claude is trusted for the checkout in the config its sandbox
+    reads, as launches trust it, so the resume never stops at the trust dialog.
+    """
+    _arg_paths([root, cwd])
+    _arg_paths([babysit_root], home=True)
+    path = _host_checkout(root)
+    dot = os.path.join(path, ".git")
+    if os.path.isdir(dot) and not os.path.islink(dot):
+        common = os.path.realpath(dot)
+    else:
+        common = _host_common_dir(path)
+    real = os.path.realpath(cwd)
+    if real != path and not real.startswith(path + os.sep):
+        raise ValueError("The session's directory is outside its checkout")
+    claude_home, claude_env, config = _host_claude(agent, account, sandbox)
+    if config is not None:
+        _host_trust(config, path)
+    home = os.path.realpath(os.path.expanduser("~"))
+    launcher = os.path.join(
+        os.path.realpath(os.path.expanduser(babysit_root)), "scripts", "babysit-bwrap"
+    )
+    return {
+        "path": path,
+        "common": common,
+        "cwd": real,
+        "cwd_exists": os.path.isdir(real),
+        "claude_home": claude_home,
+        "claude_env": claude_env,
+        "codex_home": os.path.realpath(
+            os.environ.get("CODEX_HOME") or os.path.join(home, ".codex")
+        ),
+        "launcher": launcher if os.access(launcher, os.X_OK) else None,
+    }
+
+
 OPS: dict[str, Callable[..., Any]] = {
     "inventory": _host_inventory,
+    "resolve": _host_resolve,
+    "remove": _host_remove,
+    "resume": _host_resume,
+    "realpath": _host_realpath,
     "diff": _host_diff,
     "bases": _host_bases,
     "sessions": _host_sessions,
@@ -2466,6 +2662,52 @@ def validate_wt_checkout(value):
     return value
 
 
+def validate_resolve(value):
+    """A worker's re-read of one clone: an inventory of at most that clone, and its root."""
+    _expect(isinstance(value, dict) and "root" in value, "fields")
+    _expect(value["root"] is None or _absolute(value["root"]), "root")
+    rest = {k: v for k, v in value.items() if k != "root"}
+    _expect(isinstance(rest.get("clones"), list) and len(rest["clones"]) <= 1, "clones")
+    validate_inventory({**rest, "updates": {}})
+    return {k: v for k, v in value.items() if k != "updates"}
+
+
+def validate_remove(value):
+    _expect(isinstance(value, dict) and set(value) == {"worktree", "branch", "detail"}, "fields")
+    _expect(value["worktree"] in {"removed", "missing"}, "worktree")
+    _expect(value["branch"] in {None, "deleted", "kept"}, "branch")
+    _expect(_optional_text(value["detail"]), "detail")
+    return value
+
+
+def validate_realpath(value):
+    _expect(isinstance(value, dict) and set(value) == {"path"} and _absolute(value["path"]), "path")
+    return value
+
+
+def validate_resume(value):
+    """Check the paths a worker's resume line will carry: a control character is a keystroke."""
+    fields = {
+        "path",
+        "common",
+        "cwd",
+        "cwd_exists",
+        "claude_home",
+        "claude_env",
+        "codex_home",
+        "launcher",
+    }
+    _expect(isinstance(value, dict) and set(value) == fields, "fields")
+    for key in ("path", "common", "cwd", "codex_home"):
+        _expect(_absolute(value[key]) and not CONTROL.search(value[key]), key)
+    for key in ("claude_home", "claude_env", "launcher"):
+        _expect(
+            value[key] is None or (_absolute(value[key]) and not CONTROL.search(value[key])), key
+        )
+    _expect(isinstance(value["cwd_exists"], bool), "cwd_exists")
+    return value
+
+
 def _shown_path(value):
     # Recorded on a watch, and typed into a worker's shell by pane repairs.
     return _absolute(value) and not CONTROL.search(value)
@@ -2538,6 +2780,10 @@ def validate_session_info(value):
 
 VALIDATORS = {
     "inventory": validate_inventory,
+    "resolve": validate_resolve,
+    "remove": validate_remove,
+    "resume": validate_resume,
+    "realpath": validate_realpath,
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,
