@@ -786,14 +786,60 @@ def codex_turn(lines, session_id):
     return turn, complete
 
 
-def claude_turn(lines, session_id):
-    """A turn is the last typed prompt; it is complete once its turn_duration record lands.
+def task_notification(item):
+    """The text of a background task's notification record, else None.
 
-    The completed text is the assistant text after the turn's final tool result, i.e. the
-    response the user sees, which must carry the handoff marker.
+    Claude delivers one as a prompt of its own between turns, or as a queued command
+    inside a running turn; either way the agent, not the user, resumes the turn.
+    """
+    attachment = item.get("attachment") or {}
+    if item.get("type") == "attachment" and attachment.get("type") == "queued_command":
+        origin, content = attachment.get("origin"), attachment.get("prompt")
+    elif item.get("type") == "user":
+        origin, content = item.get("origin"), (item.get("message") or {}).get("content")
+    else:
+        return None
+    if (origin or {}).get("kind") != "task-notification":
+        return None
+    return block_text(content)
+
+
+def background_launch(item):
+    """The task id a tool result started in the background: a Bash command, an async
+    agent or a monitor. A persistent monitor never ends, so it is not waited for."""
+    result = item.get("toolUseResult")
+    if not isinstance(result, dict):
+        return None
+    if result.get("backgroundTaskId"):
+        return result["backgroundTaskId"]
+    if result.get("isAsync") and result.get("agentId"):
+        return result["agentId"]
+    if result.get("taskId") and result.get("persistent") is False:
+        return result["taskId"]
+    return None
+
+
+def background_end(text):
+    """The task id a notification reports finished, else None: a monitor's events
+    carry no status until it ends or expires."""
+    outer = {m.group(1): m.group(2) for m in CLAUDE_TAG.finditer(text)}
+    inner = outer.get("task-notification", "")
+    tags = {m.group(1): m.group(2).strip() for m in CLAUDE_TAG.finditer(inner)}
+    if "status" in tags or "[Monitor expired" in tags.get("event", ""):
+        return tags.get("task-id")
+    return None
+
+
+def claude_turn(lines, session_id):
+    """A turn is the last typed prompt; it is complete once its turn_duration record lands
+    and no background task it started is still running.
+
+    The completed text is the assistant text after the turn's final tool result or task
+    notification, i.e. the response the user sees, which must carry the handoff marker.
     """
     turn, complete, seen = None, None, False
     texts: list[str] = []
+    running: set[str] = set()
     for line in lines:
         try:
             item = json.loads(line)
@@ -809,14 +855,27 @@ def claude_turn(lines, session_id):
             complete = None
         content = (item.get("message") or {}).get("content")
         blocks = content if isinstance(content, list) else []
-        if kind == "user":
+        notification = task_notification(item)
+        if notification is not None:
+            running.discard(background_end(notification))
+            if kind == "user":
+                texts = []  # the agent resumes its turn: its final response restarts
+        elif kind == "user":
             if any(b.get("type") == "tool_result" for b in blocks):
                 texts = []  # tool output: the final response restarts after it
+                launched = background_launch(item)
+                if launched:
+                    running.add(launched)
             elif not item.get("isMeta"):  # injected context is not a new prompt
-                turn, complete, texts = item.get("uuid"), None, []
+                turn, complete, texts, running = item.get("uuid"), None, [], set()
         elif kind == "assistant":
             texts.extend(b.get("text", "") for b in blocks if b.get("type") == "text")
-        elif kind == "system" and item.get("subtype") == "turn_duration" and turn:
+            running.difference_update(
+                (b.get("input") or {}).get("task_id")
+                for b in blocks
+                if b.get("type") == "tool_use" and b.get("name") == "TaskStop"
+            )
+        elif kind == "system" and item.get("subtype") == "turn_duration" and turn and not running:
             complete = "\n".join(texts)
     if not seen or not turn:
         raise RuntimeError("Cannot identify the current turn in the registered transcript")
