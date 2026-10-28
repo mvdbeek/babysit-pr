@@ -51,6 +51,22 @@ def test_empty_claude_composer(screen, expected):
     assert handoff.empty_composer(screen, "claude") is expected
 
 
+@pytest.mark.parametrize(
+    "screen,expected",
+    [
+        (CLAUDE_EMPTY, ""),
+        # A suggested next prompt, as Claude draws it: faint, after an unstyled prompt.
+        (RULE + "\n❯\xa0\x1b[0m\x1b[2mmark #1 ready for review\x1b[0m\n" + RULE, ""),
+        (RULE + "\n❯\xa0/exit\n" + RULE, "/exit"),
+        (RULE + "\n❯\xa0my draft\n  \x1b[1mwrapped\x1b[0m line\n" + RULE, "my draft wrapped line"),
+        (RULE + "\n❯\xa0my draft", None),
+        (EMPTY, None),
+    ],
+)
+def test_claude_composer(screen, expected):
+    assert handoff.claude_composer(screen) == expected
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch, request):
     agent = getattr(request, "param", "codex")

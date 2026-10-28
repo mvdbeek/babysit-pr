@@ -204,16 +204,24 @@ def empty_claude_composer(screen):
 
 
 def claude_composer(screen):
-    """The text in Claude's composer, between its rules; None for any other layout."""
-    lines = [SGR.sub("", line) for line in screen.splitlines()]
+    """The text in Claude's composer, between its rules; None for any other layout.
+
+    Faint text is Claude's placeholder or a suggested next prompt, never typed input.
+    """
+    styled = screen.splitlines()
+    lines = [SGR.sub("", line) for line in styled]
     prompts = [index for index, line in enumerate(lines) if line.lstrip().startswith("❯")]
     if not prompts or prompts[-1] == 0 or not RULE.fullmatch(lines[prompts[-1] - 1]):
         return None
-    text = [lines[prompts[-1]].lstrip()[1:].strip()]
-    for line in lines[prompts[-1] + 1 :]:
-        if RULE.match(line):
+
+    def typed(line):
+        return "".join(c for c, dim in styled_chars(line) if not dim).strip()
+
+    text = [typed(styled[prompts[-1]]).lstrip()[1:].strip()]
+    for index in range(prompts[-1] + 1, len(lines)):
+        if RULE.match(lines[index]):
             return " ".join(part for part in text if part)
-        text.append(line.strip())
+        text.append(typed(styled[index]))
     return None
 
 
