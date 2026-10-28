@@ -246,6 +246,71 @@ def test_left_open_when_the_turn_ends_without_confirming(rig):
     assert not state["sent"]
 
 
+def background_turn(*notes, final=DONE):
+    """The brief's turn ends waiting on a background command; its notification resumes it."""
+    return [
+        {"type": "user", "uuid": "u1", "sessionId": SID, "message": {"content": BRIEF}},
+        {
+            "type": "user",
+            "sessionId": SID,
+            "message": {"content": [{"type": "tool_result", "content": "started"}]},
+            "toolUseResult": {"backgroundTaskId": "b1"},
+        },
+        {
+            "type": "assistant",
+            "sessionId": SID,
+            "message": {"content": [{"type": "text", "text": "Waiting for CI."}]},
+        },
+        {"type": "system", "subtype": "turn_duration"},
+        *(
+            item
+            for note in notes
+            for item in (
+                {
+                    "type": "user",
+                    "uuid": f"note-{note}",
+                    "sessionId": SID,
+                    "origin": {"kind": "task-notification"},
+                    "message": {
+                        "content": f"<task-notification><task-id>{note}</task-id>"
+                        "<status>completed</status></task-notification>"
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": SID,
+                    "message": {"content": [{"type": "text", "text": final}]},
+                },
+                {"type": "system", "subtype": "turn_duration"},
+            )
+        ),
+    ]
+
+
+@pytest.mark.parametrize("rig", ["claude"], indirect=True)
+def test_a_turn_waiting_on_background_work_is_followed_to_its_end(rig, tmp_path):
+    op, record, state, step, _ = rig
+    write_jsonl(tmp_path / "rollout.jsonl", *background_turn())
+    step()
+    assert record["state"] == "watching" and "working" in record["message"]
+    write_jsonl(tmp_path / "rollout.jsonl", *background_turn("b1"))
+    step()
+    step()
+    assert state["sent"] == ["w1:p1"] and record["state"] == "exited"
+
+
+@pytest.mark.parametrize("rig", ["claude"], indirect=True)
+def test_a_message_s_turn_resumed_by_background_work_is_still_its_own(rig, tmp_path):
+    op, record, state, step, _ = rig
+    follow_up(op)
+    turn = background_turn("b1")
+    turn[0]["message"]["content"] = MESSAGE
+    write_jsonl(tmp_path / "rollout.jsonl", *turn)
+    step()
+    step()
+    assert state["sent"] == ["w1:p1"] and record["state"] == "exited"
+
+
 def test_a_later_turn_is_never_exited_even_when_first_seen(rig):
     op, record, state, step, turns = rig
     # The watch first looks after the user already answered a question: the confirmed
