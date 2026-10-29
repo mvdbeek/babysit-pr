@@ -92,6 +92,63 @@ This clears that item locally without starting a repair or changing GitHub; it
 requires the displayed batch to still be current. Blocked repairs retain their
 feedback until handled successfully or explicitly marked addressed.
 
+## Voice assistant
+
+The microphone in the header (or **Alt+V**, **Option+V** on a Mac) listens for a
+request in your own words: "walk me through what needs me", "why is CI failing on
+galaxy 1234?", "tell the agent to rebase on main", "set this one aside". (Option+V
+types a character in text fields, so it does nothing there.) The field beside it
+takes the same requests typed, which is the way in on browsers without speech
+recognition, or by the phone keyboard's own microphone. The bar follows you into open
+dialogs and the workspace viewer.
+
+Claude Sonnet answers, aloud unless **Speak replies** under **Help** is off, and then
+listens for your reply, so a walkthrough goes on item by item ("next", "what did the
+agent say?", "tell it to fix the lint error"). **Keep listening** keeps the microphone
+on between requests. Each answer takes a few seconds; the bar shows what Claude is
+reading meanwhile.
+
+A request goes once you have been quiet for a moment, shown by a line under your words
+that runs out; any word starts it again, and a sentence left on "and", "to", "the" and
+the like waits longer. Tap the microphone to send at once. **Wait after I stop talking**
+under **Help** sets how long: a moment, a little (1.6 seconds) or longer.
+
+- **What it can read**: the Needs you list, a pull request's checks, a failed check's
+  annotations and the end of its job log, reviews and open threads, issues, an
+  agent's recent conversation and its checkout's changes. These are read-only tools
+  over this dashboard's own API; Claude gets no other tools.
+- **What it can do**: show a tab, an item's row or an agent's conversation; message
+  an agent; and run the dashboard's own commands, such as filtering, sorting and
+  searching lists, pressing a row's button, answering an agent's question, and
+  opening New task filled in.
+- **What you confirm**: anything that changes something (sending a message, answering
+  an agent, pressing a button that starts, stops or removes something, changing a
+  setting) waits, outlined, until you say "confirm" or "cancel". Only you can
+  confirm: the bar handles "confirm", "cancel", "start over" and "stop listening"
+  itself, and they never go to Claude. You have 45 seconds, counted from when the
+  question has been read out; a long message is read out by its first words, and shown
+  whole.
+
+Every exchange is kept in a transcript, to see later where talking to the assistant
+goes wrong: what the microphone heard (with the recognizer's other guesses, how long
+you spoke and whether the pause or a tap sent it), what Claude looked up and with what,
+what it answered and proposed, what each action did, what was read out and for how
+long, and what became of each confirmation. It is one JSON line per event in
+`~/.local/state/babysit-pr/voice/transcripts/<date>.jsonl` (mode 0600), kept for 30
+days. Read it back as a conversation with
+
+```sh
+uv run python scripts/voice_assistant.py transcript             # the last day
+uv run python scripts/voice_assistant.py transcript --days 7    # the last week
+uv run python scripts/voice_assistant.py transcript --json      # the raw events
+```
+
+The supervisor answers each request with your Claude login, because the dashboard
+service cannot read it from the Keychain, so the watcher service must be running.
+Requests use your Claude subscription. Chrome sends speech to Google for recognition;
+Safari recognizes it on the device or with Apple. The microphone needs the dashboard
+over HTTPS (or localhost).
+
 ## What needs you
 
 The dashboard opens on the **Needs you** tab: one list of everything waiting on you,

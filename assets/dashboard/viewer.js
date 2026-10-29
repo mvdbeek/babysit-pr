@@ -2577,5 +2577,10 @@
   function listChanged() {
     if (viewer) renderNav();
   }
-  window.workspaceViewer = { open: openViewer, buttons, listChanged };
+  // Who the open viewer shows, for the voice assistant: none while it is closed.
+  function current() {
+    if (!viewer || !byId("ws-viewer").open) return null;
+    return { ...where(viewer.entry), name: viewer.entry.name || null, mode: viewer.mode };
+  }
+  window.workspaceViewer = { open: openViewer, buttons, listChanged, current };
 })();

@@ -1,0 +1,184 @@
+/* Voice assistant: the header microphone and the bar it talks through. */
+/* Shaped like its neighbour, Settings. */
+#voice-toggle {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+#voice-toggle.voice-on {
+  border-color: var(--red);
+  color: var(--red);
+}
+/* The first header row is full on a phone: the mic ends the connection status row instead. */
+@media (max-width: 440px) {
+  #voice-toggle {
+    order: 3;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+  }
+  .header-tools .connection {
+    flex-basis: calc(100% - 44px);
+    min-width: 0;
+  }
+}
+.voice-bar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  z-index: 20;
+  box-sizing: border-box;
+  width: min(640px, calc(100% - 2 * max(16px, env(safe-area-inset-left))));
+  margin: 0;
+  padding: 10px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--raised);
+  color: var(--ink);
+  box-shadow: var(--shadow-float);
+}
+.voice-bar[hidden] {
+  display: none;
+}
+/* Floating controls make way for the bar while it is open. */
+body.voice-open .ws-tray {
+  bottom: calc(28px + var(--voice-bar-height, 120px) + env(safe-area-inset-bottom));
+}
+@media (max-width: 540px) {
+  body.voice-open #new-task {
+    bottom: calc(28px + var(--voice-bar-height, 120px) + env(safe-area-inset-bottom));
+  }
+}
+.voice-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#voice-form {
+  flex: 1;
+  min-width: 0;
+}
+#voice-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 40px;
+  /* Below 16px, iOS zooms the page in on focus. */
+  font-size: 16px;
+}
+#voice-mic {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+#voice-mic[aria-pressed="true"] {
+  border-color: var(--red);
+  color: var(--on-brand);
+  background: var(--red);
+}
+@media (prefers-reduced-motion: no-preference) {
+  #voice-mic[aria-pressed="true"] {
+    animation: voice-pulse 1.6s ease-in-out infinite;
+  }
+}
+@keyframes voice-pulse {
+  50% {
+    box-shadow: 0 0 0 6px var(--red-bg);
+  }
+}
+#voice-close {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  flex-shrink: 0;
+  font-size: 20px;
+}
+#voice-heard,
+#voice-status {
+  margin: 6px 4px 0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+#voice-heard {
+  color: var(--muted);
+}
+#voice-heard.voice-interim {
+  font-style: italic;
+}
+/* The quiet spell after speaking, before the request goes: a line that runs out. A tap on
+   the microphone sends it sooner; another word starts it again. */
+.voice-settling #voice-heard::after {
+  content: "";
+  display: block;
+  height: 2px;
+  margin-top: 4px;
+  border-radius: 1px;
+  background: var(--red);
+  transform-origin: left;
+  animation: voice-settle var(--voice-pause, 1.6s) linear forwards;
+}
+@keyframes voice-settle {
+  to {
+    transform: scaleX(0);
+  }
+}
+.voice-thinking #voice-status {
+  color: var(--muted);
+}
+#voice-heard:empty,
+#voice-status:empty {
+  display: none;
+}
+#voice-status.voice-problem {
+  color: var(--red);
+}
+#voice-help {
+  max-height: min(50vh, 420px);
+  margin-top: 8px;
+  padding-top: 8px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+}
+.voice-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+#voice-examples {
+  margin: 0;
+}
+#voice-examples dt {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+#voice-examples dd {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 0;
+}
+.voice-example {
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: var(--chip);
+  font-size: 13px;
+}
+@media (pointer: coarse) {
+  .voice-example {
+    min-height: 32px;
+  }
+}
+/* The control a spoken press is waiting to have confirmed. */
+.voice-pending {
+  outline: 3px dashed var(--red);
+  outline-offset: 2px;
+}

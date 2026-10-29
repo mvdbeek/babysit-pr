@@ -31,6 +31,7 @@ import safe_git
 import sandbox
 import sentry_llm
 import session_locks
+import voice_assistant
 
 SCRIPT = Path(__file__).resolve()
 SKILL = SCRIPT.parent.parent
@@ -885,6 +886,10 @@ def serve(home, max_workers):
         # Subscription usage for the dashboard, read only while a dashboard asks for it.
         usage_worker = llm_usage.Worker(home)
         usage_error: str | None = None
+        # Spoken requests from the dashboard, answered with the user's Claude login.
+        voice_worker = voice_assistant.Worker(home)
+        voice_worker.stop_on_terminate()
+        voice_error: str | None = None
         checking: dict[str, concurrent.futures.Future] = {}
         next_check: dict[str, float] = {}
         # Remote sessions left held by a lost worker, each asked about once a minute.
@@ -1011,6 +1016,13 @@ def serve(home, max_workers):
                     if str(exc) != usage_error:
                         usage_error = str(exc)
                         print(f"Usage reader failed: {exc}", flush=True)
+                try:
+                    voice_worker.tick()
+                    voice_error = None
+                except Exception as exc:  # The voice assistant must never stop the supervisor.
+                    if str(exc) != voice_error:
+                        voice_error = str(exc)
+                        print(f"Voice assistant failed: {exc}", flush=True)
                 watch.save_state(home / "heartbeat.json", {"time": time.time(), "pid": os.getpid()})
                 time.sleep(1)
 

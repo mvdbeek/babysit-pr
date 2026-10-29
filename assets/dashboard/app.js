@@ -3471,6 +3471,18 @@ window.dashboardTasks = {
     );
     return { missing: items.filter((item) => !found.includes(item)) };
   },
+  // The New task dialog, with its task text already filled in (voice commands).
+  create: (prefill) => newTaskDialog(prefill),
+};
+// The rows other views (voice commands) can name by number: overviews load on first ask.
+window.dashboardOverview = {
+  async items(kind) {
+    const table = kind === "issues" ? issueTable : prTable;
+    if (!table.data?.synced_at) await table.refresh();
+    if (!table.data?.synced_at && table.error) throw Error(`Cannot load the list: ${table.error}`);
+    return table.items();
+  },
+  watches: () => data?.jobs || [],
 };
 // The project a batch launches in, or mixed when its items span several.
 function projects(items) {
