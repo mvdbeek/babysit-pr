@@ -1559,7 +1559,11 @@ def test_wti_default_naming_reattach_and_explicit_name_rules(repo):
     assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "issue-12-crash-on-start"
     assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "main")
     data = state_of(state)
-    assert data["gh"] == [["-R", "base/repo", "issue", "view", "12", "--json", "number,title"]]
+    assert data["gh"] == [
+        ["-R", "base/repo", "issue", "view", "12", "--json", "number,title"],
+        # The clone records no origin/HEAD, so the issue's repository names its default.
+        ["api", "repos/base/repo", "--jq", ".default_branch"],
+    ]
     assert data["agents"][0]["agent"] == "codex" and data["agents"][0]["task"] == "Fix"
     # Reattaching an existing directory warns about the prompt and starts nothing.
     result = run_tool("wri", "-r", "repo", "-p", "again", "12")
@@ -1682,6 +1686,94 @@ def test_with_checks_the_branch_out_in_other_clones_for_the_agent(repo, monkeypa
     assert result.stderr.strip() == f"wt: --with: no main clone at {home}/src/missing"
     result = run_tool("wt", "-r", "repo", "--with", "a b", "main", check=False)
     assert "--with needs a repository name or a clone path" in result.stderr
+
+
+def test_with_starts_from_each_clones_own_default_or_named_base(repo, monkeypatch):
+    home, git, state = repo
+    other = home / "src/other"
+    git("init", "-q", "-b", "master", str(other), cwd=home)
+
+    def commit(message):
+        git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            message,
+            cwd=other,
+        )
+
+    commit("master")
+    # No origin/HEAD, as after `git remote add`: the clone's only one of main and master.
+    result = run_tool("wt", "-r", "repo", "--with", "other", "--name", "first")
+    also = home / "src/worktrees/other/first"
+    assert git("rev-parse", "HEAD", cwd=also) == git("rev-parse", "master", cwd=other)
+    assert f"wt: {other.resolve()} records no default branch; starting from master" in (
+        result.stderr
+    )
+    # With both, the one committed to last.
+    git("branch", "main", cwd=other)
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z")
+    commit("newer")
+    monkeypatch.delenv("GIT_COMMITTER_DATE")
+    run_tool("wt", "-r", "repo", "--with", "other", "--name", "second")
+    also = home / "src/worktrees/other/second"
+    assert git("rev-parse", "HEAD", cwd=also) == git("rev-parse", "master", cwd=other)
+    # A base named for the clone wins over its default.
+    run_tool("wt", "-r", "repo", "--with", "other:main", "--name", "third")
+    also = home / "src/worktrees/other/third"
+    assert git("rev-parse", "HEAD", cwd=also) == git("rev-parse", "main", cwd=other)
+    assert git("rev-parse", "main", cwd=other) != git("rev-parse", "master", cwd=other)
+    # A base named for a branch that already exists is reported, not silently dropped.
+    result = run_tool("wt", "-r", "repo", "--with", "other:master", "main", "third")
+    assert f"wt: third already exists in {other.resolve()}; ignoring the base master" in (
+        result.stderr
+    )
+    # A HEAD the agent pointed at an option is no default branch.
+    git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/--checkout", cwd=other)
+    result = run_tool("wt", "-r", "repo", "--with", "other", "--name", "fourth")
+    assert "records no default branch; starting from master" in result.stderr
+    also = home / "src/worktrees/other/fourth"
+    assert git("rev-parse", "HEAD", cwd=also) == git("rev-parse", "master", cwd=other)
+    result = run_tool("wt", "-r", "repo", "--with", "other:a..b", "--name", "x", check=False)
+    assert result.stderr.strip() == "wt: --with other:a..b: not a valid base branch"
+    result = run_tool(
+        "wt",
+        "-r",
+        "repo",
+        "--with",
+        "other:main",
+        "--with",
+        f"{other}:master",
+        "--name",
+        "x",
+        check=False,
+    )
+    assert result.stderr.strip() == f"wt: --with names two bases for {other.resolve()}"
+    assert not (home / "src/worktrees/repo/x").exists()
+
+
+def test_wt_asks_github_for_the_default_of_the_repository_it_was_asked_for(repo, monkeypatch):
+    home, git, state = repo
+    monkeypatch.setenv("FAKE_GH_DEFAULT_BRANCH", "feature")
+    run_tool("wt", "-r", "repo", "--github-repo", "base/repo", "--name", "from-github")
+    path = home / "src/worktrees/repo/from-github"
+    assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "feature")
+    assert state_of(state)["gh"] == [["api", "repos/base/repo", "--jq", ".default_branch"]]
+    # Never a reply that is not a branch name; origin/HEAD, once recorded, is asked first.
+    monkeypatch.setenv("FAKE_GH_DEFAULT_BRANCH", "--upload-pack=x")
+    run_tool("wt", "-r", "repo", "--github-repo", "base/repo", "--name", "not-a-branch")
+    path = home / "src/worktrees/repo/not-a-branch"
+    assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "main")
+    git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feature")
+    run_tool("wt", "-r", "repo", "--github-repo", "base/repo", "--name", "from-head")
+    path = home / "src/worktrees/repo/from-head"
+    assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "feature")
+    assert len(state_of(state)["gh"]) == 2
 
 
 def test_with_refuses_a_line_too_long_to_type_before_making_any_checkout(repo):

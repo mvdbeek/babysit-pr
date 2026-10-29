@@ -128,8 +128,9 @@ options:
   --permission-mode auto  run Claude in its auto permission mode inside the sandbox,
                 instead of bypassing its permission checks (Claude only)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
-  --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
-                the sandboxed agent write there (repeatable)
+  --with <repo>[:<base>]  also check the branch out in ~/src/<repo> (or a clone path),
+                new from <base> or that clone's default branch, and let the
+                sandboxed agent write there (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of ~/src/galaxy
@@ -182,8 +183,9 @@ options:
   --permission-mode auto  run Claude in its auto permission mode inside the sandbox,
                 instead of bypassing its permission checks (Claude only)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
-  --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
-                the sandboxed agent write there (repeatable)
+  --with <repo>[:<base>]  also check the branch out in ~/src/<repo> (or a clone path),
+                new from <base> or that clone's default branch, and let the
+                sandboxed agent write there (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
@@ -219,8 +221,9 @@ options:
   --permission-mode auto  run Claude in its auto permission mode inside the sandbox,
                 instead of bypassing its permission checks (Claude only)
   --docker      let the sandboxed agent use Docker (SAFE_ENABLE=docker for safehouse)
-  --with <repo> also check the branch out in ~/src/<repo> (or a clone path) and let
-                the sandboxed agent write there (repeatable)
+  --with <repo>[:<base>]  also check the branch out in ~/src/<repo> (or a clone path),
+                new from <base> or that clone's default branch, and let the
+                sandboxed agent write there (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy
@@ -291,6 +294,7 @@ class Options:
         "focus",
         "agent_args",
         "also",
+        "also_bases",
         "also_checkouts",
         "exit_when_done",
         "exit_watch_json",
@@ -317,6 +321,8 @@ class Options:
         self.agent_args: list[str] = []
         # `--with` clones, then the checkouts open_session makes in them for the agent.
         self.also: list[str] = []
+        # A new branch's base in a `--with` clone (`--with <clone>:<base>`), by clone.
+        self.also_bases: dict[str, str] = {}
         self.also_checkouts: list[AlsoCheckout] = []
         self.exit_when_done = False
         # On a worker: print the exit watch for the controller instead of recording it.
@@ -337,6 +343,25 @@ def read_prompt_file(path: str, command: str = "wt") -> str:
             return stream.read().rstrip("\n")
     except OSError:
         raise WtError(f"{command}: cannot read prompt file: {path}") from None
+
+
+def fetch_source(
+    remotes: Mapping[str, str | None], slug: str, trust: bool
+) -> tuple[str, bool, str] | None:
+    """Where a base is fetched from: the GitHub repository, whether it gets the token,
+    and the remote whose refs it lands in.
+
+    ``slug``, the repository this run was asked for, with the token; failing that,
+    origin's repository, with the token only when ``trust`` says so. Either must be
+    tracked by a remote; with neither, the base is a local branch.
+    """
+    for target, token in ((slug, True), (remotes.get("origin") or "", trust)):
+        tracking = [
+            n for n in ("origin", "upstream", *sorted(remotes)) if remotes.get(n) == target.lower()
+        ]
+        if target and tracking:
+            return target, token, tracking[0]
+    return None
 
 
 def parse_args(
@@ -1004,28 +1029,20 @@ class Tool:
         os.makedirs(os.path.dirname(directory), exist_ok=True)
         remotes = self.remote_slugs(repo_path)
         start_point = base
-        sources = [(slug, True), (remotes.get("origin") or "", trust)]
-        for target, token in sources:
-            tracking = [
-                n
-                for n in ("origin", "upstream", *sorted(remotes))
-                if remotes.get(n) == target.lower()
-            ]
-            if target and tracking:
-                remote = tracking[0]
-                self.git_action(
-                    repo_path,
-                    "fetch",
-                    safe_git.github_url(target),
-                    f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
-                    credentials=token,
-                )
-                # In full, so no local branch or tag named <remote>/<base> wins.
-                start_point = f"refs/remotes/{remote}/{base}"
-                break
-        else:
-            if "origin" in remotes:
-                self.warn(f"wt: origin is not a GitHub repository; starting from the local {base}")
+        source = fetch_source(remotes, slug, trust)
+        if source:
+            target, token, remote = source
+            self.git_action(
+                repo_path,
+                "fetch",
+                safe_git.github_url(target),
+                f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
+                credentials=token,
+            )
+            # In full, so no local branch or tag named <remote>/<base> wins.
+            start_point = f"refs/remotes/{remote}/{base}"
+        elif "origin" in remotes:
+            self.warn(f"wt: origin is not a GitHub repository; starting from the local {base}")
         if self.branch_exists(repo_path, branch):
             self.checkout_worktree(repo_path, directory, branch)
         else:
@@ -1040,7 +1057,16 @@ class Tool:
         the files are written by a reset that lists config where it runs.
         """
         create = ["-b", new_branch] if new_branch else []
-        self.git_action(repo_path, "worktree", "add", "--no-checkout", *create, directory, commit)
+        self.git_action(
+            repo_path,
+            "worktree",
+            "add",
+            "--no-checkout",
+            *create,
+            "--end-of-options",
+            directory,
+            commit,
+        )
         try:
             self.git_action(directory, "reset", "--hard", "--quiet")
         except Exception:
@@ -1050,12 +1076,72 @@ class Tool:
                 self.git_action(repo_path, "branch", "-D", new_branch)
             raise
 
-    def default_branch(self, repo_path: str) -> str:
-        """The branch ``origin/HEAD`` names, else ``main``."""
-        head = self.git_query(
-            repo_path, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"
+    def default_branch(self, repo_path: str, slug: str = "", trust: bool = False) -> str:
+        """The branch a new one starts from when no base is named.
+
+        The ``HEAD`` of the remote the base is fetched into, which ``git clone``
+        records but ``git remote add`` does not; else the default GitHub reports for
+        that repository, asked only when its fetch would get the token (see
+        ``add_worktree``); else origin's ``HEAD``, a fork's when origin is not the
+        remote fetched into; else whichever of ``main`` and ``master`` those remotes,
+        or failing them the clone itself, committed to last; else ``main``.
+        """
+        remotes = self.remote_slugs(repo_path)
+        source = fetch_source(remotes, slug, trust)
+        remote = source[2] if source else "origin"
+        branch = self.remote_head(repo_path, remote)
+        if not branch and source and source[1]:
+            reply = self.runner.run(["gh", "api", f"repos/{source[0]}", "--jq", ".default_branch"])
+            if not reply.returncode and self.valid_branch(repo_path, reply.stdout.strip()):
+                branch = reply.stdout.strip()
+        if not branch and remote != "origin":
+            branch = self.remote_head(repo_path, "origin")
+        if branch:
+            return branch
+        for prefix in dict.fromkeys(
+            (f"refs/remotes/{remote}/", "refs/remotes/origin/", "refs/heads/")
+        ):
+            newest = self.git_query(
+                repo_path,
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--count=1",
+                "--format=%(refname)",
+                f"{prefix}main",
+                f"{prefix}master",
+            )
+            if not newest.returncode and newest.stdout.strip():
+                branch = newest.stdout.strip().removeprefix(prefix)
+                hint = f" (git remote set-head {remote} --auto records it)"
+                self.warn(
+                    f"wt: {repo_path} records no default branch; starting from {branch}"
+                    + (hint if remote in remotes else "")
+                )
+                return branch
+        return "main"
+
+    def remote_head(self, repo_path: str, remote: str) -> str:
+        """The branch ``refs/remotes/<remote>/HEAD`` names, if it names one.
+
+        The agent writes the clone's refs, so the target is checked like any other
+        name that reaches a refspec or Git's command line.
+        """
+        prefix = f"refs/remotes/{remote}/"
+        head = self.git_query(repo_path, "symbolic-ref", "--quiet", f"{prefix}HEAD")
+        target = head.stdout.strip()
+        branch = target.removeprefix(prefix)
+        if head.returncode or not target.startswith(prefix):
+            return ""
+        return branch if self.valid_branch(repo_path, branch) else ""
+
+    def valid_branch(self, repo_path: str, branch: str) -> bool:
+        """A branch name a fetch refspec can carry: never an option or a revision."""
+        return (
+            bool(branch)
+            and not branch.startswith("-")
+            and "@" not in branch
+            and not self.git_query(repo_path, "check-ref-format", "--branch", branch).returncode
         )
-        return head.stdout.strip().removeprefix("origin/") if not head.returncode else "main"
 
     def also_clone(self, value: str, command: str) -> str:
         """A ``--with`` value: a repository under ``~/src`` or a clone path."""
@@ -1074,7 +1160,8 @@ class Tool:
         """Check ``branch`` out in each ``--with`` clone, next to the main worktree root.
 
         A worktree that already holds the branch is used where it is, like ``wt``; a
-        local branch is reused, else the branch starts from the clone's default branch.
+        local branch is reused, else the branch starts from the base ``--with`` named for
+        the clone, or from its default branch.
         Every clone is checked before any checkout is made, and a clone's own working
         tree is never handed to the agent.
         """
@@ -1083,9 +1170,13 @@ class Tool:
         root = os.path.dirname(options.worktree_root) if options.worktree_root else ""
         root = root or os.path.join(self.home, "src", "worktrees")
         main = os.path.realpath(repo_path)
+        trust = self.trusts_origin(options)
         planned: list[tuple[AlsoCheckout, str]] = []
         for clone in dict.fromkeys(options.also):
+            named = options.also_bases.get(clone)
             if clone == main:
+                if named:
+                    self.warn(f"wt: {clone} is the task's own clone; ignoring the base {named}")
                 continue
             directory = self.existing_checkout(clone, branch)
             if directory and os.path.realpath(directory) == clone:
@@ -1106,7 +1197,10 @@ class Tool:
             checkout = AlsoCheckout(clone, directory, common)
             if ":" in checkout.path + checkout.common:
                 raise WtError(f"wt: Safehouse cannot grant a path containing ':': {directory}")
-            planned.append((checkout, self.default_branch(clone) if create else ""))
+            if named and (not create or self.branch_exists(clone, branch)):
+                self.warn(f"wt: {branch} already exists in {clone}; ignoring the base {named}")
+            base = (named or self.default_branch(clone, trust=trust)) if create else ""
+            planned.append((checkout, base))
         # The typed line must fit before anything is made; staged paths look like this.
         sample = os.path.join(self.env.get("TMPDIR") or "/tmp", "wt-prompt.XXXXXXXX")
         trial = Options()
@@ -1116,9 +1210,7 @@ class Tool:
         self.command_for(trial, lambda _: sample)
         for checkout, base in planned:
             if base:
-                self.add_worktree(
-                    checkout.clone, checkout.path, branch, base, trust=self.trusts_origin(options)
-                )
+                self.add_worktree(checkout.clone, checkout.path, branch, base, trust=trust)
             else:
                 self.warn(f"wt: {branch} is already checked out at {checkout.path}; using that")
             options.also_checkouts.append(checkout._replace(path=os.path.realpath(checkout.path)))
@@ -1449,14 +1541,15 @@ class Tool:
             raise WtError(f"wt: explicit worktree destination already exists: {directory}")
         if self.branch_exists(repo_path, branch):
             raise WtError(f"wt: explicit branch already exists: {branch}")
-        base = args[0] if args else self.default_branch(repo_path)
+        trust = self.trusts_origin(options)
+        base = args[0] if args else self.default_branch(repo_path, options.github_repo, trust)
         self.add_worktree(
             repo_path,
             directory,
             branch,
             base,
             options.github_repo,
-            trust=self.trusts_origin(options),
+            trust=trust,
         )
         self.open_session(options, directory, branch, repo_path)
 
@@ -1505,13 +1598,14 @@ class Tool:
             return
         if options.name and self.branch_exists(repo_path, branch):
             raise WtError(f"wti: explicit branch already exists: {branch}")
+        trust = self.trusts_origin(options)
         self.add_worktree(
             repo_path,
             directory,
             branch,
-            self.default_branch(repo_path),
+            self.default_branch(repo_path, host, trust),
             host,
-            trust=self.trusts_origin(options),
+            trust=trust,
         )
         self.open_session(options, directory, branch, repo_path)
 
@@ -1680,7 +1774,18 @@ class Tool:
             raise UsageError(command, f"{command}: --exit-watch-json needs --exit-when-done")
         if options.exit_when_done:
             self.check_exit_when_done(options, command)
-        options.also = [self.also_clone(value, command) for value in options.also]
+        also = []
+        for value in options.also:
+            # A clone path never holds ':', which Safehouse refuses; a branch never does.
+            name, _, base = value.partition(":")
+            clone = self.also_clone(name, command)
+            if base:
+                if not self.valid_branch(clone, base):
+                    raise WtError(f"{command}: --with {value}: not a valid base branch")
+                if options.also_bases.setdefault(clone, base) != base:
+                    raise WtError(f"{command}: --with names two bases for {clone}")
+            also.append(clone)
+        options.also = also
         getattr(self, f"run_{command}")(options)
 
 

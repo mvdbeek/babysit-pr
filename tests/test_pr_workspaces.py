@@ -765,7 +765,10 @@ def test_issue_creation_uses_wti_with_dashboard_flags_and_allocates_suffixes(loc
         ]
     ]
     data = json.loads(state.read_text())
-    assert data["gh"] == [["-R", "base/repo", "issue", "view", "12", "--json", "number,title"]]
+    assert data["gh"] == [
+        ["-R", "base/repo", "issue", "view", "12", "--json", "number,title"],
+        ["api", "repos/base/repo", "--jq", ".default_branch"],
+    ]
     assert len(data["agents"]) == 1 and data["agents"][0]["agent"] == "claude"
     assert data["agents"][0]["task"] == "Fix 'it'\n\nIssue: https://github.com/base/repo/issues/12"
     assert "--no-focus" in next(c for c in data["calls"] if c[:2] == ["worktree", "open"])

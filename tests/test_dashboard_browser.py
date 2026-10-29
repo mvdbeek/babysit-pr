@@ -5178,6 +5178,9 @@ def test_new_task_can_also_work_in_other_clones(page, dashboard_site, viewer_rou
     expect(dialog.get_by_label("up/gamma · /fixture/gamma")).to_be_checked()
     choose_option(picker, "0")
     expect(dialog.get_by_label("up/delta · /fixture/delta")).not_to_be_checked()
+    # Each chosen clone takes its own base; an unchosen one offers none.
+    expect(dialog.get_by_label("Base branch in /fixture/delta")).to_be_hidden()
+    dialog.get_by_label("Base branch in /fixture/gamma").fill(" master ")
     dialog.get_by_label("New branch").fill("both")
     dialog.get_by_label("Task", exact=True).fill("Change both")
     dialog.get_by_role("button", name="Start task").click()
@@ -5186,6 +5189,7 @@ def test_new_task_can_also_work_in_other_clones(page, dashboard_site, viewer_rou
     )
     assert sent[0]["clone"] == "/fixture/alpha"
     assert sent[0]["also"] == ["/fixture/gamma"]
+    assert sent[0]["also_bases"] == {"/fixture/gamma": "master"}
 
 
 def test_new_task_floats_on_a_phone_without_zooming(page, dashboard_site, viewer_routes):

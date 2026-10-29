@@ -597,7 +597,10 @@ operation records `exit_when_done`.
 **Also work in other repositories**, in New task, lists the other local clones (those
 the repository picker offers). Each one chosen is passed to the helper as
 `--with <clone>` (the request field is `also: [clone paths]`, at most 4, never the
-task's own clone or a clone named like its repository, which the picker leaves out). The branch name is picked so it
+task's own clone or a clone named like its repository, which the picker leaves out).
+Each chosen clone also offers a base branch field; one filled in is passed as
+`--with <clone>:<base>` (the request field is `also_bases: {clone path: base}`), and an
+empty one leaves the clone's default branch. The branch name is picked so it
 is free in every chosen clone, the branch is checked out beside the task's worktree in
 each, and the agent's Safehouse sandbox may write and commit there (see the worktree
 helper below). The operation records `also` and, once ready, `also_paths`, which the
@@ -836,7 +839,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo[:base]]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
@@ -847,6 +850,14 @@ For branch worktrees, `wt` fetches the base from `origin` when that remote exist
 Without `origin`, it uses the requested local base instead: for example,
 `wt -r repo main my-feature` creates `my-feature` from local `main` without network
 access. Existing local branches are reused, and existing worktrees are reopened.
+
+Without a base (`wt --name`, `wti`, `--with` clones), a new branch starts from the
+clone's default branch: the `HEAD` of the remote the base is fetched into, or
+`origin/HEAD`. `git clone` records that, but `git remote add` does not, so without it
+`wt` asks GitHub (`gh api repos/<repo>`) for the default of the repository it fetches
+from, when that fetch would get the token. Failing that, it uses whichever of `main`
+and `master` the remote, or else the clone, committed to last, and says so on stderr;
+`git remote set-head origin --auto` records the real default for next time.
 
 A branch that is already checked out is opened where it already lives -- the main
 clone for `wt main`, or a worktree created under a different directory name --
@@ -859,7 +870,9 @@ repository's git directory, so it could edit another clone's worktree but not co
 there. With `--with`, the same branch is checked out in each other clone too, under
 `~/src/worktrees/<clone>/<branch>`: a linked worktree already holding the branch is used
 where it is, an existing local branch is reused, and otherwise the branch starts from
-that clone's `origin/HEAD` (or `main`). A branch checked out in the other clone's own
+the base after a colon (`--with other:master`) or that clone's own default branch,
+found as above, so clones whose defaults differ (`main` beside `master`) can share a
+task. A clone path containing `:` cannot be named; Safehouse refuses one anyway. A branch checked out in the other clone's own
 working tree is refused, so main checkouts are never handed to the agent. Every clone is
 checked before any of their checkouts is made. The grant list is staged in a private
 `$TMPDIR` file like the prompt, and the agent line is typed as
