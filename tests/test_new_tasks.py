@@ -325,6 +325,42 @@ def test_new_task_can_also_work_in_other_clones(local, monkeypatch):  # noqa: F8
     assert f"you can write and commit there:\n- {also.resolve()}" in agent["task"]
 
 
+def test_new_task_names_a_base_for_another_clone(local):  # noqa: F811
+    manager, _, git, _, _ = local
+    calls = helper_calls(manager)
+    other = other_clone(manager, git)
+    git("branch", "dev", cwd=other)
+    git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "main only",
+        cwd=other,
+    )
+    value = manager.new_task(
+        request(manager, name="based", also=[str(other)], also_bases={str(other): " dev "})
+    )
+    op = finish(manager, value["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert op["also_bases"] == {str(other): "dev"}
+    assert calls[0][:4] == ["wt", "--codex", "--with", f"{other}:dev"]
+    also = manager.src / "worktrees/other/based"
+    assert git("rev-parse", "HEAD", cwd=also) == git("rev-parse", "dev", cwd=other)
+    for bases, error in [
+        ({str(other): "a..b"}, "base branch for other is not a valid"),
+        ({str(other): "@{-1}"}, "base branch for other is not a valid"),
+        ({"/elsewhere": "dev"}, "only for a chosen other repository"),
+        ({str(other): 1}, "Invalid new task"),
+        ([], "Invalid new task"),
+    ]:
+        with pytest.raises(ValueError, match=error):
+            manager.new_task(request(manager, name="x", also=[str(other)], also_bases=bases))
+
+
 @pytest.mark.parametrize(
     "also",
     ["/x", [1], ["main"], ["/elsewhere"], ["other", "other"], ["named-repo"], ["other"] * 5],

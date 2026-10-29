@@ -3203,6 +3203,8 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     // Other clones the task also covers: the branch is checked out in each and the
     // agent's sandbox may write there (`wt --with`).
     const also = new Set();
+    // A base branch typed for a chosen clone, by clone; empty means its default branch.
+    const alsoBases = new Map();
     // Filing an issue or adding clones keeps the task off workers; set once the
     // Machine select exists, below.
     let placementChanged = () => {};
@@ -3229,24 +3231,41 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
           const box = el("input");
           box.type = "checkbox";
           box.checked = also.has(clone);
+          const base = el("input");
+          base.placeholder = "Base: the clone’s default branch";
+          base.setAttribute("aria-label", `Base branch in ${clone}`);
+          base.value = alsoBases.get(clone) || "";
+          base.autocapitalize = "off";
+          base.spellcheck = false;
+          base.hidden = !box.checked;
+          base.oninput = () => alsoBases.set(clone, base.value);
           box.onchange = () => {
             if (box.checked) also.add(clone);
             else also.delete(clone);
+            base.hidden = !box.checked;
             limitAlso();
             placementChanged();
           };
           const label = el("label", undefined, "workspace-later");
           label.append(box, ` ${slug} · ${clone}`);
-          return label;
+          const row = el("div", undefined, "new-task-also-clone");
+          row.append(label, base);
+          return row;
         }),
       );
       if (!clones.size) alsoList.append(el("small", "No other local clones are listed."));
       limitAlso();
     }
     function limitAlso() {
-      for (const box of alsoList.querySelectorAll("input"))
+      for (const box of alsoList.querySelectorAll("input[type=checkbox]"))
         box.disabled = !box.checked && also.size >= ALSO_LIMIT;
       alsoSummary.textContent = alsoText();
+    }
+    function alsoBaseChoice() {
+      const bases = [...also]
+        .map((clone) => [clone, (alsoBases.get(clone) || "").trim()])
+        .filter(([, base]) => base);
+      return bases.length ? { also_bases: Object.fromEntries(bases) } : {};
     }
     function alsoText() {
       return `Also work in other repositories${also.size ? ` (${also.size})` : " (optional)"}`;
@@ -3377,6 +3396,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
             ...machineChoice(),
             ...(quit.checked ? { exit_when_done: true } : {}),
             ...(also.size ? { also: [...also] } : {}),
+            ...alsoBaseChoice(),
             task: task.value,
             ...attached(files),
           }),

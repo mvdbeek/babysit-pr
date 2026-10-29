@@ -472,7 +472,11 @@ rewrote origin to another private GitHub repository the token reads has it fetch
 into the common dir it reads, the next time the user runs `wt` in that clone. Any other
 run (dashboard, cron, agents) fetches it without the token, so a redirected origin
 reaches nothing private there and a private origin fails to fetch. An origin that is no
-GitHub repository is never fetched, and the worktree starts from the local base. The user's own
+GitHub repository is never fetched, and the worktree starts from the local base. With
+no base named and no recorded remote `HEAD`, `wt` asks `gh api repos/<repo>` for the
+default branch only of a repository whose fetch would get the token, and checks the
+reply, like a remote `HEAD` the agent may have planted, as a branch name; `git worktree
+add` takes its positionals after `--end-of-options` either way. The user's own
 URL rewrites still apply (to ssh, or a local mirror), so https, ssh and local paths stay
 allowed during a fetch. System and global config stay trusted.
 

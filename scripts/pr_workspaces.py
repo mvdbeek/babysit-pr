@@ -1571,16 +1571,24 @@ class Workspaces:
             "docker",
             "exit_when_done",
             "also",
+            "also_bases",
             "machine",
         }
         flags = {"docker", "exit_when_done"}
         also = request.get("also", [])
+        bases = request.get("also_bases", {})
         if (
             set(request) - allowed
-            or any(not isinstance(v, str) for k, v in request.items() if k not in {*flags, "also"})
+            or any(
+                not isinstance(v, str)
+                for k, v in request.items()
+                if k not in {*flags, "also", "also_bases"}
+            )
             or any(not isinstance(request.get(flag, False), bool) for flag in flags)
             or not isinstance(also, list)
             or any(not isinstance(path, str) for path in also)
+            or not isinstance(bases, dict)
+            or any(not isinstance(base, str) for base in bases.values())
         ):
             raise ValueError("Invalid new task parameters")
         repo = request.get("repo", "")
@@ -1620,6 +1628,15 @@ class Workspaces:
         # wt checks each one out under worktrees/<clone name>, beside worktrees/<repo>.
         if repo.split("/")[1].lower() in {Path(path).name.lower() for path in also}:
             raise ValueError(f"A clone named {repo.split('/')[1]} would share the task's worktrees")
+        bases = {path: base.strip() for path, base in bases.items() if base.strip()}
+        if not set(bases) <= set(also):
+            raise ValueError("Name a base branch only for a chosen other repository")
+        for path, base in bases.items():
+            # wt fetches each base from that clone's origin, so it names a branch too.
+            if base.startswith("-") or "@" in base or not self.valid_branch(path, base):
+                raise ValueError(
+                    f"The base branch for {Path(path).name} is not a valid branch name"
+                )
         agent = request.get("agent", "codex")
         if agent not in {"codex", "claude"}:
             raise ValueError("Select Codex or Claude")
@@ -1668,6 +1685,7 @@ class Workspaces:
             "docker": request.get("docker", False),
             "exit_when_done": request.get("exit_when_done", False),
             "also": also,
+            **({"also_bases": bases} if bases else {}),
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
             "message": "Queued",
             "log": "",
@@ -2569,6 +2587,8 @@ class Workspaces:
                     also = [
                         (Path(c), self.src / "worktrees" / Path(c).name) for c in op.get("also", [])
                     ]
+                    # A new branch's base in each other clone, when one was named.
+                    bases = op.get("also_bases", {})
                     n = 1
                     while any(
                         os.path.lexists(root / name) or self.branch_exists(c, name)
@@ -2629,7 +2649,14 @@ class Workspaces:
                         *overrides,
                         *(["--docker"] if op.get("docker") else []),
                         *(["--exit-when-done"] if op.get("exit_when_done") else []),
-                        *(word for c, _ in also for word in ("--with", str(c))),
+                        *(
+                            word
+                            for c, _ in also
+                            for word in (
+                                "--with",
+                                f"{c}:{bases[str(c)]}" if str(c) in bases else str(c),
+                            )
+                        ),
                         "--no-focus",
                         "--name",
                         name,

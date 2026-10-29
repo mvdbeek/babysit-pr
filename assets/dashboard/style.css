@@ -1527,6 +1527,15 @@ button:disabled {
 .new-task-also-list label {
   overflow-wrap: anywhere;
 }
+.new-task-also-clone {
+  display: grid;
+  gap: 4px;
+}
+.new-task-also-clone input:not([type="checkbox"]) {
+  margin-left: 24px;
+  min-width: 0;
+  font: inherit;
+}
 .workspace-later {
   display: flex;
   align-items: center;
