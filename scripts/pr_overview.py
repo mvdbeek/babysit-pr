@@ -74,19 +74,21 @@ query($query: String!, $cursor: String, $first: Int!) {
 DISCUSSION = {"IssueComment", "PullRequestReview", "ContentEdited"}
 
 
-def discussed_after_close(node, login):
-    """Whether another person commented or reviewed after this PR closed or merged.
+def discussed_after_close(node, login, since=""):
+    """Whether another person commented or reviewed after this PR closed or merged, and
+    no earlier than `since` (an ISO date).
 
     Deleting a head branch or relabelling bumps `updatedAt` on every PR it touches,
-    which brings back years of finished PRs that merely mention the user. Bots
-    comment on merged PRs routinely, so they do not count either.
+    which brings back years of finished PRs that merely mention the user, some with
+    a reply from the week they merged. Bots comment on merged PRs routinely, so they
+    do not count either.
     """
     closed = node.get("closedAt")
     if not closed:
         return False
     for event in (node.get("timelineItems") or {}).get("nodes") or []:
         found = timeline_activity(event) if event else None
-        if not found or found["type"] not in DISCUSSION or found["at"] <= closed:
+        if not found or found["type"] not in DISCUSSION or found["at"] <= max(closed, since):
             continue
         actor = found["actor"] or ""
         if actor and actor != login and not actor.endswith("[bot]"):
@@ -206,8 +208,8 @@ def collect(kind: Kind = PRS, mentions=True):
     searches = [
         (role, f"{kind.search} {qualifier}:@me", {"OPEN"}) for role, qualifier in searched.items()
     ]
+    since = (datetime.now(UTC) - timedelta(days=CLOSED_MENTION_DAYS)).date().isoformat()
     if mentions and kind.mention_search:
-        since = (datetime.now(UTC) - timedelta(days=CLOSED_MENTION_DAYS)).date().isoformat()
         searches.append(
             (
                 "mentioned",
@@ -242,7 +244,7 @@ def collect(kind: Kind = PRS, mentions=True):
                 key = node["id"]
                 # Only discussion after closure makes a finished PR a mention again; the
                 # search still refreshes the state of a PR that merged during this refresh.
-                counts = "OPEN" in states or discussed_after_close(node, login)
+                counts = "OPEN" in states or discussed_after_close(node, login, since)
                 if not counts and key not in items:
                     continue
                 roles = items[key]["roles"] if key in items else []

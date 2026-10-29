@@ -296,7 +296,9 @@ def message_turn(rollout, agent, marker):
                 # The same prompt test as latest_claude_turn; a pasted prompt may be plain.
                 content = (item.get("message") or {}).get("content")
                 attachment = item.get("attachment") or {}
-                if item.get("type") == "user" and not item.get("isMeta"):
+                if remote_probe.task_notification(item) is not None:
+                    pass  # a background task resuming the agent; no one wrote to it
+                elif item.get("type") == "user" and not item.get("isMeta"):
                     if isinstance(content, str) or not any(
                         b.get("type") == "tool_result" for b in content or []
                     ):

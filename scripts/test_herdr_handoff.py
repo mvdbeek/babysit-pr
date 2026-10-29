@@ -51,6 +51,22 @@ def test_empty_claude_composer(screen, expected):
     assert handoff.empty_composer(screen, "claude") is expected
 
 
+@pytest.mark.parametrize(
+    "screen,expected",
+    [
+        (CLAUDE_EMPTY, ""),
+        # A suggested next prompt, as Claude draws it: faint, after an unstyled prompt.
+        (RULE + "\n❯\xa0\x1b[0m\x1b[2mmark #1 ready for review\x1b[0m\n" + RULE, ""),
+        (RULE + "\n❯\xa0/exit\n" + RULE, "/exit"),
+        (RULE + "\n❯\xa0my draft\n  \x1b[1mwrapped\x1b[0m line\n" + RULE, "my draft wrapped line"),
+        (RULE + "\n❯\xa0my draft", None),
+        (EMPTY, None),
+    ],
+)
+def test_claude_composer(screen, expected):
+    assert handoff.claude_composer(screen) == expected
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch, request):
     agent = getattr(request, "param", "codex")
@@ -479,6 +495,71 @@ def test_claude_transcript_turn_completes_at_turn_duration(tmp_path):
         handoff.latest_turn(path, "other", "claude")
     append(row("user", uuid="turn-2", message=dict(content="thanks")))
     assert handoff.latest_turn(path, "session", "claude") == ("turn-2", None)
+
+
+def test_claude_turn_waits_for_the_background_tasks_it_started(tmp_path):
+    path = tmp_path / "transcript.jsonl"
+
+    def row(kind, **extra):
+        return dict(type=kind, sessionId="session", **extra)
+
+    def said(value):
+        return row("assistant", message=dict(content=[dict(type="text", text=value)]))
+
+    def launched(**result):
+        content = [dict(type="tool_result", content="running in background")]
+        return row("user", message=dict(content=content), toolUseResult=result)
+
+    def notice(task, status="completed", event=None, queued=False):
+        text = f"<task-notification>\n<task-id>{task}</task-id>\n"
+        text += f"<status>{status}</status>\n" if status else f"<event>{event}</event>\n"
+        text += "</task-notification>"
+        origin = dict(kind="task-notification", producer="session-task")
+        if queued:  # delivered inside a running turn
+            return row(
+                "attachment", attachment=dict(type="queued_command", prompt=text, origin=origin)
+            )
+        return row("user", uuid=f"note-{task}", origin=origin, message=dict(content=text))
+
+    def ended():
+        return row("system", subtype="turn_duration", durationMs=5)
+
+    def append(*items):
+        with path.open("a") as stream:
+            stream.write("".join(json.dumps(item) + "\n" for item in items))
+
+    def latest():
+        return handoff.latest_turn(path, "session", "claude")
+
+    stop = dict(type="tool_use", name="TaskStop", input=dict(task_id="tail"))
+    append(
+        row("user", uuid="turn-1", message=dict(content="fix CI")),
+        launched(backgroundTaskId="bash"),
+        launched(isAsync=True, status="async_launched", agentId="agent"),
+        launched(taskId="monitor", timeoutMs=1000, persistent=False),
+        launched(taskId="forever", timeoutMs=1000, persistent=True),
+        launched(backgroundTaskId="tail"),
+        launched(backgroundTaskId="early"),
+        notice("early", queued=True),
+        row("assistant", message=dict(content=[stop])),
+        said("Waiting for CI"),
+        ended(),
+    )
+    assert latest() == ("turn-1", None)
+    # A notification resumes the same turn; a monitor's event does not end it.
+    append(notice("bash"), said("bash done"), ended())
+    append(notice("monitor", status=None, event="CI went red"), said("still red"), ended())
+    assert latest() == ("turn-1", None)
+    append(notice("agent", status="failed"), said("agent done"), ended())
+    assert latest() == ("turn-1", None)
+    expired = "[Monitor expired after 30m with 1 events delivered.]"
+    append(notice("monitor", status=None, event=expired), said("All green [receipt]"), ended())
+    assert latest() == ("turn-1", "All green [receipt]")
+    # Only the turn's own tasks hold it open.
+    append(launched(backgroundTaskId="left"), said("asked"), ended())
+    assert latest() == ("turn-1", None)
+    append(row("user", uuid="turn-2", message=dict(content="thanks")), said("ok"), ended())
+    assert latest() == ("turn-2", "ok")
 
 
 @pytest.mark.parametrize("rig", ["claude"], indirect=True)
