@@ -162,6 +162,8 @@
   // The last request was spoken, so a reply's reading listens for "stop".
   let voiced = false;
   let hushedAt = 0;
+  // The reply last read aloud, whose echo the microphone may still be hearing.
+  let lastReading = "";
   // Asked to listen while a session runs (a reading's): the next session takes over.
   let keepOn = false;
   // The session runs only to hear "stop" during a reading.
@@ -556,6 +558,7 @@
     setTimeout(finish, cap);
     // Held, or Chrome may collect it before it ends.
     speaking = utterance;
+    lastReading = text;
     speechSynthesis.speak(utterance);
     if (voiced && Recognition && !bar.hidden) listen(true);
   }
@@ -575,6 +578,26 @@
     // Its end runs whatever follows the reply, as if it had finished.
     speechSynthesis.cancel();
     report("Stopped reading.", false, false);
+  }
+  // The words of a reading, to tell its echo from the user talking over it.
+  function readingWords(text) {
+    return new Set(normalize(text).split(" "));
+  }
+  // Words the reading never said, two of them or all of a short phrase: the user talking.
+  function talksOver(event, said) {
+    for (let index = event.resultIndex; index < event.results.length; index += 1) {
+      const words = normalize(event.results[index][0].transcript).split(" ").filter(Boolean);
+      const fresh = words.filter((word) => !said.has(word));
+      if (fresh.length >= 2 || (fresh.length && fresh.length === words.length)) return true;
+    }
+    return false;
+  }
+  // What the user said after the echo of the reading that was heard with it.
+  function unecho(transcript, said) {
+    const words = transcript.trim().split(/\s+/);
+    let start = 0;
+    while (start < words.length && said.has(normalize(words[start]))) start += 1;
+    return words.slice(start).join(" ");
   }
   function notificationsText() {
     const history = Object.values(window.dashboardNotifications?.history() || {})
@@ -1306,6 +1329,10 @@
     let interim = "";
     // Results heard during a reading are its echo; those before a sent request are spent.
     const muted = new Set();
+    // Results that talked over a reading, heard with its echo in front.
+    const over = new Set();
+    let overWords = new Set();
+    const heard = (index, text) => (over.has(index) ? unecho(text, overWords) : text);
     let spent = 0;
     let seen = 0;
     let began = 0;
@@ -1354,12 +1381,28 @@
       render();
     };
     session.onresult = (event) => {
-      // Our own spoken replies are not requests, but "stop" during one cuts it short.
+      // Our own spoken replies are not requests: "stop" during one cuts it short, and
+      // anything else the user says over it stops it and is heard as the next request.
       if (window.speechSynthesis?.speaking || Date.now() < mutedUntil) {
-        for (let index = event.resultIndex; index < event.results.length; index += 1)
-          muted.add(index);
-        if (speaking && interrupts(event)) hush();
-        return;
+        const said = readingWords(speaking?.text ?? lastReading);
+        if ((speaking && interrupts(event)) || !talksOver(event, said)) {
+          for (let index = event.resultIndex; index < event.results.length; index += 1)
+            muted.add(index);
+          if (speaking && interrupts(event)) hush();
+          return;
+        }
+        // A result still forming keeps its index: heard as echo, it now holds the user too.
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          muted.delete(index);
+          over.add(index);
+        }
+        overWords = said;
+        hushedAt = Date.now();
+        // This session now hears a request: it outlives the reading, unmuted.
+        readingOnly = false;
+        keepOn = true;
+        mutedUntil = 0;
+        window.speechSynthesis?.cancel();
       }
       seen = event.results.length;
       interim = "";
@@ -1370,9 +1413,9 @@
         if (result.isFinal)
           finals.set(
             index,
-            [...result].map((guess) => guess.transcript.trim()),
+            [...result].map((guess) => heard(index, guess.transcript).trim()),
           );
-        else interim += ` ${result[0].transcript}`;
+        else interim += ` ${heard(index, result[0].transcript)}`;
       }
       const text = sofar();
       if (!text) return;
