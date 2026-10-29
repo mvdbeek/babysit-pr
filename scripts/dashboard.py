@@ -27,6 +27,7 @@ import dashboard_settings
 import llm_usage
 import machines
 import service_control
+import voice_assistant
 import worker_api
 import workspace_agents
 import workspace_viewer
@@ -667,6 +668,8 @@ class Handler(BaseHTTPRequestHandler):
                 "settings",
                 "codex-update",
                 "service-restart",
+                "voice-turn",
+                "voice-log",
             }
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
@@ -700,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
                         "settings",
                         "sentry-action",
                         "cron-action",
+                        "voice-turn",
+                        "voice-log",
                     }
                     else 1024
                 )
@@ -854,6 +859,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if action == "settings":
                 self.send_json(200, dashboard_settings.save(self.server.home, request))
+                return
+            if action == "voice-log":
+                self.send_json(200, voice_assistant.log(self.server.home, request))
+                return
+            if action == "voice-turn":
+                if "cancel" in request:
+                    self.send_json(200, voice_assistant.cancel(self.server.home, request["cancel"]))
+                    return
+                # The supervisor answers; its tools read this dashboard on loopback.
+                self.send_json(
+                    200,
+                    voice_assistant.enqueue(
+                        self.server.home, request, f"http://127.0.0.1:{self.server.server_port}"
+                    ),
+                )
                 return
             if action == "effort-default":
                 self.send_json(
@@ -1354,6 +1374,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif route.path == "/api/settings":
                 self.send_json(200, dashboard_settings.settings(self.server.home))
+            elif route.path == "/api/voice-turn":
+                query = parse_qs(route.query)
+                self.send_json(
+                    200, voice_assistant.status(self.server.home, query.get("id", [""])[0])
+                )
             elif route.path == "/api/workspace-prompts":
                 self.send_json(
                     200,
@@ -1410,6 +1435,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/cron.css": ("cron.css", "text/css"),
                     "/attention.js": ("attention.js", "text/javascript"),
                     "/attention.css": ("attention.css", "text/css"),
+                    "/voice.js": ("voice.js", "text/javascript"),
+                    "/voice.css": ("voice.css", "text/css"),
                     "/style.css": ("style.css", "text/css"),
                 }
                 if route.path not in files:

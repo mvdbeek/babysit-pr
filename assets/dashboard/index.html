@@ -36,6 +36,8 @@
     <link rel="stylesheet" href="/cron.css" />
     <script src="/attention.js" defer></script>
     <link rel="stylesheet" href="/attention.css" />
+    <script src="/voice.js" defer></script>
+    <link rel="stylesheet" href="/voice.css" />
   </head>
   <body>
     <header>
@@ -80,6 +82,29 @@
             <path d="M4 18a8 8 0 1 1 16 0M12 18l4-6" />
           </svg>
           <span id="usage-value" aria-hidden="true">–</span>
+        </button>
+        <button
+          id="voice-toggle"
+          type="button"
+          aria-label="Voice assistant"
+          aria-controls="voice-bar"
+          aria-expanded="false"
+          title="Voice assistant (Alt+V)"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="18"
+            height="18"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="9" y="3" width="6" height="11" rx="3" />
+            <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" />
+          </svg>
         </button>
         <button
           id="settings-toggle"
@@ -543,7 +568,9 @@
         <div class="ws-batch">
           <label><input id="ws-all" type="checkbox" /> Select all shown</label>
           <span id="ws-selected">0 selected</span>
-          <button id="ws-cleanup" type="button" disabled>Clean up selected</button>
+          <button id="ws-cleanup" type="button" aria-haspopup="dialog" disabled>
+            Clean up selected
+          </button>
         </div>
         <div class="pr-table-wrap">
           <table class="pr-table ws-table">
@@ -1221,6 +1248,63 @@
         <button id="ws-confirm" type="button">Clean up</button>
       </div>
     </dialog>
+    <section id="voice-bar" class="voice-bar" aria-label="Voice assistant" hidden>
+      <div class="voice-row">
+        <button id="voice-mic" type="button" aria-pressed="false" aria-label="Start listening">
+          <svg
+            viewBox="0 0 24 24"
+            width="20"
+            height="20"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="9" y="3" width="6" height="11" rx="3" />
+            <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" />
+          </svg>
+        </button>
+        <form id="voice-form">
+          <input
+            id="voice-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            enterkeyhint="go"
+            aria-label="Ask or say what to do"
+            placeholder="Ask or say what to do"
+          />
+        </form>
+        <button
+          id="voice-help-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="voice-help"
+        >
+          Help
+        </button>
+        <button id="voice-close" type="button" aria-label="Close the voice assistant">×</button>
+      </div>
+      <p id="voice-heard"></p>
+      <p id="voice-status" role="status"></p>
+      <div id="voice-help" hidden>
+        <div class="voice-options">
+          <label><input id="voice-continuous" type="checkbox" /> Keep listening</label>
+          <label><input id="voice-speak" type="checkbox" /> Speak replies</label>
+          <label
+            >Wait after I stop talking
+            <select id="voice-pause">
+              <option value="short">A moment</option>
+              <option value="normal">A little</option>
+              <option value="long">Longer</option>
+            </select>
+          </label>
+        </div>
+        <dl id="voice-examples"></dl>
+      </div>
+    </section>
     <section id="ws-tray" class="ws-tray" aria-label="Minimized viewers" hidden>
       <p id="ws-tray-note" role="status"></p>
       <div id="ws-tray-chips" class="ws-tray-chips"></div>
