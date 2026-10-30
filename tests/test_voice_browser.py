@@ -625,6 +625,33 @@ def test_saying_stop_cuts_a_reply_short_and_the_conversation_goes_on(
     expect(status).to_have_text("Nothing else.")
 
 
+def test_talking_over_a_reply_stops_it_and_is_the_next_request(
+    page: Page, dashboard_site, assistant
+):
+    url, _ = dashboard_site
+    reply = "Galaxy pull request 9 waits on two reviews, and its tests are still running."
+    assistant.reply("what needs me", reply)
+    assistant.reply("what about issue 30", "It crashes on start.")
+    page.add_init_script(FAKE_SPEECH)
+    page.add_init_script(HELD_SPEECH)
+    page.add_init_script('localStorage.setItem("babysit-pr:voice:v1", \'{"speak": true}\')')
+    page.goto(url)
+    expect(page.locator("#updated")).to_contain_text("Refreshed")
+    page.locator("#voice-toggle").click()
+    hear(page, "what needs me")
+    expect(page.locator("#voice-status")).to_have_text(reply)
+    eventually(page, lambda: page.evaluate("window.speechSynthesis.speaking"))
+    # Its own echo goes on being ignored; words it never said are the user.
+    hear(page, "two reviews and", interim=True)
+    assert page.evaluate("window.speechSynthesis.speaking")
+    hear(page, "two reviews and what about issue 30", interim=True)
+    eventually(page, lambda: not page.evaluate("window.speechSynthesis.speaking"))
+    # Sent once the user pauses, without the echo heard in front of it.
+    hear(page, "two reviews and what about issue 30")
+    expect(page.locator("#voice-status")).to_have_text("It crashes on start.")
+    assert assistant.last()["text"] == "what about issue 30"
+
+
 def test_a_typed_request_never_turns_the_microphone_on_to_read(
     page: Page, dashboard_site, assistant
 ):
