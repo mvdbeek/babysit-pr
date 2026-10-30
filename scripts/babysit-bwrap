@@ -254,6 +254,27 @@ for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   fi
   grant "$real"
 done
+# Codex's trust dialog persists its answer in config.toml, which is deliberately
+# read-only below. The caller already selected and granted this checkout: trust only
+# that exact working directory for this invocation. Codex checks its cwd before the
+# main repository's path, so this also covers linked worktrees without reading git
+# files or granting trust to their siblings. Never infer trust from mere visibility.
+cwd=$(pwd -P)
+if [[ $config_var == CODEX_HOME && ${command[0]##*/} == codex ]]; then
+  for path in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
+    if [[ $path == "$cwd" ]]; then
+      command -v python3 >/dev/null || die "python3 is not installed"
+      # Override a whole TOML table: Codex splits dotted override keys on every dot,
+      # including dots inside quoted paths. JSON string escaping is also valid TOML.
+      trust=$(python3 -I -c '
+import json, sys
+print("projects={" + json.dumps(sys.argv[1], ensure_ascii=False) + "={trust_level=\"trusted\"}}")
+' "$cwd") || die "cannot encode the Codex project trust setting"
+      command=("${command[0]}" -c "$trust" "${command[@]:1}")
+      break
+    fi
+  done
+fi
 if [[ $config_var == CLAUDE_CONFIG_DIR ]]; then
   # The default account's directory holds the named accounts: hide them, always, or its
   # agent could create accounts as a link that a later account launch resolves through.
@@ -439,7 +460,7 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
 [[ ! -e $home/.config/babysit-pr/worker.json ]] || argv+=(--setenv BABYSIT_WORKER 1)
 [[ -z $broker ]] || argv+=(--setenv BABYSIT_REGISTER_SOCKET "$broker/register.sock")
 
-argv+=(--chdir "$(pwd -P)" -- "${command[@]}")
+argv+=(--chdir "$cwd" -- "${command[@]}")
 if ((print)); then
   printf '%s\0' "${argv[@]}"
   exit 0
