@@ -35,6 +35,7 @@ import machines
 import placement
 import remote_probe
 import safe_git
+import worker_updates
 import workspace_agents
 import workspace_exit
 import wt
@@ -619,6 +620,9 @@ class Workspaces:
         self.flight_lock = threading.Lock()
         self.compute_lock = threading.Lock()
         self.loads = MachineLoads(self.home, lambda: self.inventory)
+        self.worker_updates = worker_updates.WorkerUpdates(
+            self.home, functools.partial(git, APP_ROOT)
+        )
         self.home.mkdir(parents=True, exist_ok=True)
         self.path = self.home / "pr-workspaces.sqlite"
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -1125,16 +1129,25 @@ class Workspaces:
         """This machine then the registry's, each with its last known load.
 
         ``available`` and ``reason`` are placement's verdict for any launch: whether a
-        person may choose the machine, and why not or what holds Auto back.
+        person may choose the machine, and why not or what holds Auto back. A worker also
+        says whether its babysit-pr can be updated from here, and its last update.
         """
         config, loads = self.loads.snapshot()
+        updates = self.worker_updates.snapshot()
         found = placement.exclusions(
             {"sandboxed": False}, config["machines"], loads, self.reservations(), time.time()
         )
         listed = [{"id": placement.LOCAL, "label": placement.label(None, {}), "local": True}]
         for m in config["machines"].values():
             fields = ("id", "label", "os", "max_agents", "labels", "enabled", "auto")
-            listed.append({**{k: getattr(m, k) for k in fields}, "local": False})
+            listed.append(
+                {
+                    **{k: getattr(m, k) for k in fields},
+                    "local": False,
+                    "updatable": worker_updates.updatable(m),
+                    "update": updates.get(m.id),
+                }
+            )
         return [
             {
                 **loads[m["id"]],
@@ -2802,11 +2815,14 @@ class Workspaces:
                 deployed = cron_agents.probe(
                     self.home, machine, "version", 30, babysit_root=machine.babysit_root
                 )["head"]
-                if deployed != app_head():
+                wanted = app_head()
+                if deployed != wanted:
+                    # The dashboard offers to update the worker to it where it shows this.
+                    self.save_operation(op, stale_worker={"machine": machine.id, "sha": wanted})
                     raise ValueError(
                         f"{machine.label} runs babysit-pr {deployed[:12]}, this machine "
-                        f"{app_head()[:12]}: update babysit-pr on {machine.label} "
-                        f"(provision_worker.sh --user-step --sha {app_head()})"
+                        f"{wanted[:12]}: update babysit-pr on {machine.label} "
+                        f"(provision_worker.sh --user-step --sha {wanted})"
                     )
                 owner, repo = pr["repo"].split("/")
                 scratch = is_scratch(pr)

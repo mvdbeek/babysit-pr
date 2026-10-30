@@ -803,7 +803,12 @@ Sentry issues, new tasks that file an issue and new tasks with other clones (`--
 are refused with the reason. The launch first compares the worker's deployed
 babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
 refuses a mismatch, naming the `provision_worker.sh --user-step --sha <sha>` that fixes
-it. It works in the worker's clone `<src>/<repo name>`, which must name the repository
+it. For a Linux worker whose `babysit_root` is the copy that script deploys
+(`~/.local/share/babysit-pr/app`), the refusal also offers **Update <worker>**: the
+dashboard runs that user step, from this machine's commit, over the worker's ssh
+(`/api/worker-update`, one update per worker at a time), then reads the worker's commit
+back; a checkout the script left alone (local changes) is reported with its output. Start
+the task again once it reports the new commit. It works in the worker's clone `<src>/<repo name>`, which must name the repository
 in a remote; nothing clones on a worker, so a missing clone is refused. A probe op names
 the new checkout under `<src>/worktrees/<repo name>` and trusts it for Claude in the
 config its sandbox reads (a config that is a symlink or over 64 MiB is left alone, and

@@ -667,6 +667,7 @@ class Handler(BaseHTTPRequestHandler):
                 "effort-default",
                 "settings",
                 "codex-update",
+                "worker-update",
                 "service-restart",
                 "voice-turn",
                 "voice-log",
@@ -856,6 +857,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Codex update checks are not enabled")
                 self.server.codex_updates.update()
                 self.send_json(200, self.server.codex_updates.snapshot())
+                return
+            if action == "worker-update":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(
+                    200, self.server.workspaces.worker_updates.update(request.get("machine"))
+                )
                 return
             if action == "settings":
                 self.send_json(200, dashboard_settings.save(self.server.home, request))
