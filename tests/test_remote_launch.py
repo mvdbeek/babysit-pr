@@ -336,6 +336,8 @@ def test_a_worker_running_another_babysit_pr_is_refused(remote, tmp_path):
     assert op["message"].endswith(
         f"update babysit-pr on Mac mini (provision_worker.sh --user-step --sha {head.strip()})"
     )
+    # The dashboard offers the update where it shows the refusal.
+    assert op["stale_worker"] == {"machine": "mini", "sha": head.strip()}
     assert not [c for c in remote_commands(state) if "wt.py" in c]
 
 

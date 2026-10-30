@@ -134,6 +134,9 @@ def site(page, dashboard_site):
     return dashboard_site[0], snapshot, previews, sent, calls
 
 
+SHA = "b" * 40
+
+
 def register_workers(site_home):
     """The watcher status names workers, which is what lets the badges poll at all."""
     worker = {"id": "mini", "label": "Mac mini", "ssh": "mini", "os": "darwin"}
@@ -313,3 +316,104 @@ def test_new_task_previews_again_when_it_files_an_issue(page, site):
         issue.check()
     with page.expect_request(preview("scratch")):
         issue.uncheck()
+
+
+def test_a_refusal_for_a_stale_worker_offers_to_update_it(page, site):
+    url, snapshot, _, sent, calls = site
+    chonk = {**BOX, "id": "chonk", "label": "chonk", "os": "linux", "error": None}
+    chonk.update(available=True, reason=None, updatable=True, update=None)
+    snapshot["machines"] = [LOCAL, MINI, chonk]
+    page.route(
+        "**/api/placement?*",
+        lambda route: route.fulfill(
+            json={
+                "machine": "local",
+                "label": "This machine",
+                "reason": "auto",
+                "options": [{"id": "chonk", "label": "chonk", "note": "", "disabled": False}],
+            }
+        ),
+    )
+
+    def start(route):
+        sent.append(route.request.post_data_json)
+        message = "chonk runs babysit-pr 735c74d406ac, this machine b8583a4112d7: update"
+        op = {"id": "op1", "pr": "new:1", "status": "failed", "machine": "chonk"}
+        op.update(message=message, log=message, stale_worker={"machine": "chonk", "sha": SHA})
+        op["subject"] = {"kind": "scratch", "repo": "up/alpha", "branch": "try"}
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    posted = []
+    running = {"running": True, "sha": SHA, "ok": None, "error": None, "finished_at": None}
+
+    def update(route):
+        posted.append((route.request.headers, route.request.post_data_json))
+        chonk["update"] = running
+        route.fulfill(json=running)
+
+    page.route("**/api/worker-update", update)
+    dialog = open_new_task(page, url)
+    dialog.get_by_label("Machine", exact=True).select_option("chonk")
+    dialog.get_by_label("New branch").fill("try")
+    dialog.get_by_label("Task", exact=True).fill("Explore")
+    dialog.get_by_role("button", name="Start task").click()
+    notice = dialog.locator(".worker-update")
+    expect(notice).to_contain_text("chonk runs another babysit-pr commit than this machine.")
+    notice.get_by_role("button", name="Update chonk").click()
+    expect(notice).to_contain_text("Updating babysit-pr on chonk to bbbbbbbbbbbb…")
+    expect(notice.get_by_role("button", name="Update chonk")).to_be_disabled()
+    [(headers, body)] = posted
+    assert headers["x-babysit-action"] == "worker-update" and body == {"machine": "chonk"}
+    chonk["update"] = {**running, "running": False, "ok": True, "finished_at": 1300}
+    expect(notice).to_have_text(
+        "chonk now runs babysit-pr bbbbbbbbbbbb. Start the task again.", timeout=10000
+    )
+    expect(notice.get_by_role("button")).to_have_count(0)
+    # The failed launch filed nothing, so it can be started again.
+    expect(dialog.get_by_role("button", name="Start task")).to_be_enabled()
+
+
+def test_an_update_to_an_older_commit_offers_the_update_again(page, site):
+    url, snapshot, *_ = site
+    chonk = {**BOX, "id": "chonk", "label": "chonk", "os": "linux", "error": None}
+    older = {"running": False, "sha": "a" * 40, "ok": True, "error": None, "finished_at": 1}
+    chonk.update(available=True, reason=None, updatable=True, update=older)
+    snapshot["machines"] = [LOCAL, chonk]
+
+    def start(route):
+        op = {"id": "op1", "pr": "new:1", "status": "failed", "machine": "chonk"}
+        op.update(message="chonk runs babysit-pr aaaaaaaaaaaa", log="")
+        op["stale_worker"] = {"machine": "chonk", "sha": SHA}
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    dialog = open_new_task(page, url)
+    dialog.get_by_label("Machine", exact=True).select_option("chonk")
+    dialog.get_by_label("New branch").fill("try")
+    dialog.get_by_label("Task", exact=True).fill("Explore")
+    dialog.get_by_role("button", name="Start task").click()
+    notice = dialog.locator(".worker-update")
+    expect(notice).to_contain_text("chonk runs another babysit-pr commit than this machine.")
+    expect(notice.get_by_role("button", name="Update chonk")).to_be_enabled()
+
+
+def test_a_worker_provisioning_does_not_manage_gets_no_update_button(page, site):
+    url, snapshot, *_ = site
+    mini = {**MINI, "updatable": False, "update": None}
+    snapshot["machines"] = [LOCAL, mini]
+
+    def start(route):
+        op = {"id": "op1", "pr": "new:1", "status": "failed", "machine": "mini"}
+        op.update(message="Mac mini runs babysit-pr 735c74d406ac", log="")
+        op["stale_worker"] = {"machine": "mini", "sha": SHA}
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    dialog = open_new_task(page, url)
+    dialog.get_by_label("Machine", exact=True).select_option("mini")
+    dialog.get_by_label("New branch").fill("try")
+    dialog.get_by_label("Task", exact=True).fill("Explore")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Mac mini runs babysit-pr")
+    expect(dialog.locator(".worker-update")).to_have_count(0)

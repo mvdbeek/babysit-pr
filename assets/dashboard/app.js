@@ -3768,6 +3768,8 @@ function updateWorkspaceOperation() {
   $("workspace-progress").textContent =
     `${op.status}: ${op.message}` + (op.machine ? ` · On ${machineName(op.machine)}` : "");
   $("workspace-log").textContent = op.log || "";
+  if (op.status === "failed" && op.stale_worker)
+    $("workspace-result").replaceChildren(...workerUpdateNotice(op.stale_worker));
   if (op.result?.url)
     $("workspace-result").replaceChildren(
       link("Open in Collie", op.result.url),
@@ -3788,6 +3790,69 @@ function updateWorkspaceOperation() {
         (op.status !== "failed" || Boolean(op.subject?.url)) &&
         !(submit.dataset.handling === "true" && op.status === "complete"));
   syncWorkspacePolling();
+}
+// A launch refused for the worker's other babysit-pr commit offers to deploy this
+// machine's there; the person then starts the task again. A finished update to an
+// older commit than the launch wanted (this machine moved on since) does not count.
+function workerUpdateNotice(stale) {
+  const id = stale.machine;
+  const machine = workspaceData.machines?.find((entry) => entry.id === id);
+  if (!machine?.updatable) return [];
+  const update =
+    machine.update?.running || machine.update?.sha === stale.sha ? machine.update : null;
+  const notice = el("div", undefined, "alert worker-update");
+  notice.append(
+    el(
+      "span",
+      update?.running
+        ? `Updating babysit-pr on ${machine.label} to ${update.sha.slice(0, 12)}…`
+        : update?.ok
+          ? `${machine.label} now runs babysit-pr ${update.sha.slice(0, 12)}. Start the task again.`
+          : update?.ok === false
+            ? `Updating ${machine.label} failed: ${update.error}`
+            : `${machine.label} runs another babysit-pr commit than this machine.`,
+    ),
+  );
+  if (!update?.ok) {
+    const button = el("button", `Update ${machine.label}`);
+    button.type = "button";
+    button.disabled = Boolean(update?.running);
+    button.onclick = async () => {
+      button.disabled = true;
+      $("workspace-error").textContent = "";
+      try {
+        const response = await fetch("/api/worker-update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Babysit-Action": "worker-update" },
+          body: JSON.stringify({ machine: id }),
+        });
+        const value = await response.json();
+        if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+        machine.update = value;
+        updateWorkspaceOperation();
+      } catch (error) {
+        workspaceError(error);
+        button.disabled = false;
+      }
+    };
+    notice.append(button);
+  }
+  if (update?.running) pollWorkerUpdate();
+  return [notice];
+}
+let workerUpdatePoll = null;
+function pollWorkerUpdate() {
+  if (workerUpdatePoll) return;
+  workerUpdatePoll = setTimeout(async () => {
+    try {
+      workspaceData.machines = (await get("/api/machines")).machines;
+      renderMachines();
+    } catch {
+      // The notice keeps its state; it asks again while the update runs.
+    }
+    workerUpdatePoll = null;
+    updateWorkspaceOperation();
+  }, 3000);
 }
 let workspacePoll = null;
 function syncWorkspacePolling() {
