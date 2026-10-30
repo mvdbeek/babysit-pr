@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from pathlib import Path
 
 import agent_docker
@@ -804,6 +805,62 @@ def test_wrapper_starts_a_granted_claude_without_mcp_servers(checkout, docker_so
     assert "run claude itself" in message
     argv = printed(worktree, env, f"--codex-home={config}", "--enable=docker", "codex")
     assert argv[-1] == "codex"
+
+
+@pytest.mark.parametrize("name", ["worktree", 'work tree.1-"quoted"-\\-café'])
+@pytest.mark.parametrize("agent", ["codex", "/usr/bin/codex"])
+def test_wrapper_trusts_only_the_explicit_codex_checkout_for_this_launch(checkout, name, agent):
+    worktree, common, home = checkout
+    checkout_path = worktree.parent / name
+    worktree.rename(checkout_path)
+    config = home / ".codex"
+    config.mkdir()
+    original = 'model = "fixture"\n'
+    (config / "config.toml").write_text(original)
+    argv = printed(
+        checkout_path,
+        environment(home),
+        f"--codex-home={config}",
+        f"--add-dirs={checkout_path}:{common}",
+        "--",
+        agent,
+        "resume",
+        "session-id",
+        "message",
+    )
+    command = argv[argv.index("--") + 1 :]
+    assert command[:2] == [agent, "-c"]
+    assert tomllib.loads(command[2]) == {
+        "projects": {str(checkout_path): {"trust_level": "trusted"}}
+    }
+    assert command[3:] == ["resume", "session-id", "message"]
+    assert (str(config / "config.toml"),) * 2 in pairs(argv, "--ro-bind")
+    assert (config / "config.toml").read_text() == original
+
+
+@pytest.mark.parametrize("grant", ["none", "parent", "sibling", "common"])
+def test_wrapper_does_not_trust_a_codex_directory_without_an_exact_grant(checkout, grant):
+    worktree, common, home = checkout
+    config = home / ".codex"
+    config.mkdir()
+    sibling = worktree.parent / "sibling"
+    sibling.mkdir()
+    cwd = worktree
+    if grant == "parent":
+        cwd = worktree / "nested"
+        cwd.mkdir()
+    path = {"none": None, "parent": worktree, "sibling": sibling, "common": common}[grant]
+    argv = printed(
+        cwd,
+        environment(home),
+        f"--codex-home={config}",
+        *([f"--add-dirs={path}"] if path else []),
+        "--",
+        "codex",
+        "resume",
+        "session-id",
+    )
+    assert argv[argv.index("--") + 1 :] == ["codex", "resume", "session-id"]
 
 
 @fd_bash

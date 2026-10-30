@@ -311,7 +311,13 @@ missing one is first created empty (`{}` for JSON), since an agent could otherwi
 create it for the next launch; a link there is refused, since binding it would
 follow it outside the sandbox (copy a shared `settings.json` into each account
 instead of linking it). Install plugins and skills, and change these settings,
-outside the sandbox. Claude's `.claude.json` stays writable, since Claude rewrites
+outside the sandbox. When launching `codex` directly with its working directory
+explicitly included in `--add-dirs`, the wrapper passes that exact directory as a
+trusted project in a launch-only `-c` override. This avoids Codex's folder-trust
+dialog trying to save to the read-only `config.toml`, including for linked
+worktrees whose main repository has not been trusted. It does not persist trust
+or trust sibling checkouts; other settings still need to be changed outside the
+sandbox. Claude's `.claude.json` stays writable, since Claude rewrites
 it constantly, and any agent of the account can add MCP servers to it: a launch
 with `--enable=docker` and a Claude configuration must run `claude` itself, which
 babysit-bwrap gives `--strict-mcp-config`, so it starts no MCP servers at all.
