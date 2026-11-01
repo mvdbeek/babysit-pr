@@ -425,8 +425,7 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    `claude-account:<name>` for each named Claude login on that machine. Paths are the
    worker's own; never copy `/Users/...` paths into worker records. Add
    `"skills": ["merge-forward", "wt-task"]` to keep those personal skills from the Mac's
-   `~/.claude/skills` in sync on the worker: each launch there installs this machine's
-   copies into every `~/.claude/accounts/<name>/skills`, `~/.claude/skills` and
+   chezmoi source in sync on the worker: each launch there installs them into every `~/.claude/accounts/<name>/skills`, `~/.claude/skills` and
    `~/.codex/skills` first (Skills on workers in the supervisor reference). Do not copy
    or link skills there by hand under the same names: the sync leaves folders it did not
    make alone.

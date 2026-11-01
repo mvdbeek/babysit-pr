@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -36,23 +37,87 @@ def fresh_sync(monkeypatch):
     monkeypatch.setattr(skill_sync, "_syncing", {})
 
 
+FAKE_CHEZMOI = """import io, json, os, stat, sys, tarfile, time
+STATE, LOG = {state!r}, {log!r}
+args = sys.argv[1:]
+with open(LOG, "a") as log:
+    stdin = stat.S_ISCHR(os.fstat(0).st_mode)
+    log.write(json.dumps({{"argv": args, "env": dict(os.environ), "devnull": stdin}}) + "\\n")
+if os.path.exists(os.path.join(STATE, ".slow")):
+    time.sleep(10)
+if os.path.exists(os.path.join(STATE, ".fail")):
+    print("chezmoi: template: dot_x.tmpl: error calling onepasswordRead", file=sys.stderr)
+    sys.exit(1)
+override = os.path.join(STATE, ".override.tar")
+if os.path.exists(override):
+    sys.stdout.buffer.write(open(override, "rb").read())
+    sys.exit(0)
+target = args[-1]
+rel = os.path.relpath(target, os.environ["HOME"])
+path = os.path.join(STATE, rel)
+if rel.startswith("..") or not os.path.lexists(path):
+    print(f"chezmoi: {{target}}: not managed", file=sys.stderr)
+    sys.exit(1)
+buffer = io.BytesIO()
+with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+    def add(path, name):
+        info = archive.gettarinfo(path, name)  # lstat: a link is a link entry, as chezmoi's
+        if info.isreg():
+            with open(path, "rb") as stream:
+                archive.addfile(info, stream)
+        else:
+            archive.addfile(info)
+        if info.isdir():
+            for child in sorted(os.listdir(path)):
+                add(os.path.join(path, child), name + "/" + child)
+    add(path, rel)
+sys.stdout.buffer.write(buffer.getvalue())
+"""
+
+
 @pytest.fixture
-def skills(tmp_path, monkeypatch):
-    """This machine's skills folder: merge-forward with a script, and wt-task by a link."""
-    source = tmp_path / "controller-skills"
-    merge = source / "merge-forward"
+def chezmoi(tmp_path, monkeypatch):
+    """A fake chezmoi rendering the target state under ``state`` (a link there is a
+    chezmoi symlink entry), logging each call; never the real one or its source."""
+    state = tmp_path / "chezmoi-state"
+    state.mkdir()
+    log = tmp_path / "chezmoi.log"
+    log.touch()
+    fake = tmp_path / "chezmoi-bin" / "chezmoi"
+    fake.parent.mkdir()
+    fake.write_text(
+        f"#!{sys.executable} -S\n" + FAKE_CHEZMOI.format(state=str(state), log=str(log))
+    )
+    fake.chmod(0o700)
+    home = tmp_path / "controller-home"
+    home.mkdir()
+    monkeypatch.setattr(skill_sync, "CHEZMOI", str(fake))
+    monkeypatch.setattr(skill_sync, "HOME", str(home))
+
+    def calls():
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    return state, calls
+
+
+@pytest.fixture
+def skills(chezmoi):
+    """The chezmoi source's skills, as ~/.claude/skills: wt-task a folder there, and
+    merge-forward (with a script) a link to its folder in ~/.codex/skills, as chezmoi
+    keeps them. Writes through the link land in merge-forward's own folder."""
+    state, _ = chezmoi
+    merge = state / ".codex/skills/merge-forward"
     (merge / "scripts").mkdir(parents=True)
     (merge / "SKILL.md").write_text("---\nname: merge-forward\n---\nMerge.\n")
     (merge / "scripts" / "hop.sh").write_text("#!/bin/sh\necho hop\n")
     (merge / "scripts" / "hop.sh").chmod(0o755)
     (merge / "__pycache__").mkdir()
     (merge / "__pycache__" / "x.pyc").write_bytes(b"cache")
-    managed = tmp_path / "dotfiles" / "wt-task"
-    managed.mkdir(parents=True)
-    (managed / "SKILL.md").write_text("---\nname: wt-task\n---\nHand off.\n")
-    (source / "wt-task").symlink_to(managed)
-    monkeypatch.setattr(skill_sync, "SOURCE", str(source))
-    return source
+    claude = state / ".claude/skills"
+    (claude / "wt-task").mkdir(parents=True)
+    (claude / "wt-task" / "SKILL.md").write_text("---\nname: wt-task\n---\nHand off.\n")
+    (claude / "merge-forward").symlink_to("../../.codex/skills/merge-forward")
+    return claude
 
 
 @pytest.fixture
@@ -197,65 +262,136 @@ def test_a_launch_burst_packs_once(skills):
 
 
 def test_skills_holding_anything_but_folders_and_files_are_refused(skills, tmp_path):
-    with pytest.raises(ValueError, match="No skill gone"):
+    with pytest.raises(
+        ValueError, match="gone is not in your chezmoi source .*add it with chezmoi add"
+    ):
         skill_sync.pack(["gone"])
     (skills / "plain").mkdir()
-    with pytest.raises(ValueError, match="not a skill folder with a SKILL.md"):
+    with pytest.raises(ValueError, match="plain is not a skill folder with a SKILL.md"):
         skill_sync.pack(["plain"])
     (skills / "plain" / "SKILL.md").symlink_to(skills / "merge-forward" / "SKILL.md")
     with pytest.raises(ValueError, match="plain/SKILL.md is a symbolic link"):
         skill_sync.pack(["plain"])
     (skills / "merge-forward" / "secret").symlink_to(tmp_path / "secret")
-    with pytest.raises(ValueError, match="merge-forward/secret is a symbolic link"):
+    with pytest.raises(ValueError, match="codex/skills/merge-forward/secret is a symbolic link"):
         skill_sync.pack(["merge-forward"])
     (skills / "merge-forward" / "secret").unlink()
-    # A FIFO is refused, never waited on.
     os.mkfifo(skills / "merge-forward" / "pipe")
     with pytest.raises(ValueError, match="merge-forward/pipe is neither a folder nor a regular"):
         skill_sync.pack(["merge-forward"])
     (skills / "merge-forward" / "pipe").unlink()
-    # A hard link could name any file of this user's.
-    token = tmp_path / "token"
-    token.write_text("secret\n")
-    os.link(token, skills / "merge-forward" / "token")
-    with pytest.raises(ValueError, match="merge-forward/token has other names"):
-        skill_sync.pack(["merge-forward"])
-    (skills / "merge-forward" / "token").unlink()
     (skills / "merge-forward" / "bad\x1bname").write_text("x")
     with pytest.raises(ValueError, match="Refusing skill bundle entry"):
         skill_sync.pack(["merge-forward"])
 
 
-def test_a_skill_folder_swapped_after_it_was_resolved_is_refused(skills, monkeypatch):
-    monkeypatch.setattr(skill_sync, "_fd_path", lambda fd: "/Users/someone/.ssh")
-    with pytest.raises(ValueError, match="merge-forward moved while it was read"):
-        skill_sync.pack(["merge-forward"])
+def test_a_skill_link_is_followed_through_chezmoi_only_to_another_skill(skills, chezmoi):
+    _, calls = chezmoi
+    home = skill_sync.HOME
+    skill_sync.pack(["merge-forward"])
+    assert [c["argv"][-1] for c in calls()] == [
+        f"{home}/.claude/skills/merge-forward",
+        f"{home}/.codex/skills/merge-forward",
+    ]
+    (skills / "keys").symlink_to("../../.ssh")
+    with pytest.raises(ValueError, match="links to ../../.ssh, which is not a skill in your"):
+        skill_sync.pack(["keys"])
+    assert not [c for c in calls() if ".ssh" in c["argv"][-1]]
+    (skills / "dangling").symlink_to("../../.codex/skills/nowhere")
+    with pytest.raises(ValueError, match="links to ../../.codex/skills/nowhere, which is not in"):
+        skill_sync.pack(["dangling"])
+    (skills / "loop").symlink_to("../../.claude/skills/loop")
+    with pytest.raises(ValueError, match="loop links to ../../.claude/skills/loop, which is not"):
+        skill_sync.pack(["loop"])
 
 
-def test_the_folder_packed_is_the_one_its_path_names(skills):
-    # The real path, as the kernel reports the descriptor: nothing moved, nothing refused.
-    fd = os.open(os.path.realpath(skills / "wt-task"), os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        assert skill_sync._fd_path(fd) == os.path.realpath(skills / "wt-task")
-    finally:
-        os.close(fd)
+def test_a_skill_only_in_codexs_folder_is_found_there(skills):
+    data, _ = skill_sync.pack(["merge-forward"])
+    (skills / "merge-forward").unlink()
+    assert skill_sync.pack(["merge-forward"])[0] == data
 
 
-def test_skills_over_the_size_limit_are_refused_before_they_are_read(skills, monkeypatch):
+def test_chezmoi_runs_by_its_path_with_nothing_of_the_dashboards(skills, chezmoi, monkeypatch):
+    state, calls = chezmoi
+    monkeypatch.setenv("BABYSIT_SECRET_FOR_TEST", "1")
+    skill_sync.pack(["wt-task"])
+    [call] = calls()
+    assert call["argv"][:2] == ["archive", "--format=tar"]
+    assert "--refresh-externals=never" in call["argv"] and "--no-tty" in call["argv"]
+    assert call["devnull"] is True
+    environment = {k: v for k, v in call["env"].items() if not k.startswith("__CF")}
+    assert environment == {
+        "HOME": skill_sync.HOME,
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LC_ALL": "C",
+    }
+    monkeypatch.setattr(skill_sync, "CHEZMOI", "chezmoi")
+    with pytest.raises(ValueError, match="absolute path"):
+        skill_sync.pack(["wt-task"])
+
+
+def test_a_chezmoi_that_fails_or_hangs_refuses_the_bundle(skills, chezmoi, monkeypatch):
+    state, _ = chezmoi
+    (state / ".fail").touch()
+    with pytest.raises(
+        ValueError, match="chezmoi could not render .*error calling onepasswordRead"
+    ):
+        skill_sync.pack(["wt-task"])
+    (state / ".fail").unlink()
+    (state / ".slow").touch()
+    monkeypatch.setattr(skill_sync, "CHEZMOI_TIMEOUT", 1)
+    with pytest.raises(ValueError, match="did not render .* within 1 seconds"):
+        skill_sync.pack(["wt-task"])
+    (state / ".slow").unlink()
+    monkeypatch.setattr(skill_sync, "CHEZMOI", str(state / "missing"))
+    with pytest.raises(ValueError, match="Cannot run chezmoi at"):
+        skill_sync.pack(["wt-task"])
+
+
+def test_an_archive_with_anything_else_is_refused(skills, chezmoi):
+    state, _ = chezmoi
+    prefix = ".claude/skills/wt-task"
+    cases = [
+        (
+            [
+                folder(prefix),
+                file(f"{prefix}/SKILL.md"),
+                (
+                    {
+                        "name": f"{prefix}/h",
+                        "type": tarfile.LNKTYPE,
+                        "linkname": f"{prefix}/SKILL.md",
+                    },
+                    None,
+                ),
+            ],
+            "neither a folder nor a regular file",
+        ),
+        (
+            [
+                folder(prefix),
+                file(f"{prefix}/SKILL.md"),
+                ({"name": f"{prefix}/d", "type": tarfile.CHRTYPE}, None),
+            ],
+            "neither a folder nor a regular file",
+        ),
+        (
+            [folder(prefix), file(f"{prefix}/SKILL.md"), file(".ssh/id_ed25519")],
+            "holds '.ssh/id_ed25519'",
+        ),
+        ([file(prefix)], "is not a folder in your chezmoi source"),
+    ]
+    for members, message in cases:
+        (state / ".override.tar").write_bytes(tar(*members))
+        with pytest.raises(ValueError, match=message):
+            skill_sync.pack(["wt-task"])
+
+
+def test_skills_over_the_size_limit_are_refused(skills, monkeypatch):
     monkeypatch.setattr(remote_probe, "MAX_SKILL_BYTES", 64)
     (skills / "merge-forward" / "big").write_bytes(b"x" * 65)
-    read = []
-    real_open = os.open
-
-    def opened(path, *args, **kwargs):
-        read.append(path)
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "open", opened)
     with pytest.raises(ValueError, match="merge-forward exceeds 64 bytes"):
         skill_sync.pack(["merge-forward"])
-    assert "big" not in read
-    monkeypatch.setattr(os, "open", real_open)
     (skills / "merge-forward" / "big").unlink()
     monkeypatch.setattr(remote_probe, "MAX_SKILL_ENTRIES", 3)
     with pytest.raises(ValueError, match="more than 3 entries"):
@@ -648,10 +784,12 @@ def test_a_sync_that_cannot_happen_says_why(skills, worker_home, in_process, mon
     controller, _ = in_process
     write(controller, skills=["gone"])
     m = machines.load(controller)["chonk"]
-    with pytest.raises(ValueError, match="^Cannot sync skills to chonk: No skill gone in"):
+    with pytest.raises(
+        ValueError, match="^Cannot sync skills to chonk: gone is not in your chezmoi source"
+    ):
         skill_sync.ensure(controller, m)
     shown = skill_sync.status(m)
-    assert shown["state"] == "error" and "No skill gone" in shown["error"]
+    assert shown["state"] == "error" and "gone is not in your chezmoi source" in shown["error"]
 
     def unreachable(home, m, op, timeout, **args):
         raise subprocess.TimeoutExpired(["ssh"], timeout)
@@ -759,7 +897,9 @@ def test_a_review_a_person_starts_warns_when_its_skills_cannot_sync(remote, skil
     manager.action({"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"})
     op = finish(manager, pr["id"])
     assert op["status"] == "complete", op
-    assert op["skills_warning"].startswith("Cannot sync skills to Mac mini: No skill gone in")
+    assert op["skills_warning"].startswith(
+        "Cannot sync skills to Mac mini: gone is not in your chezmoi source"
+    )
     machine = next(m for m in manager.machine_list() if m["id"] == "mini")
     assert machine["skills"]["state"] == "error"
 
@@ -774,5 +914,7 @@ def test_a_scheduled_review_whose_skills_cannot_sync_never_starts(remote, skills
     manager.run_due(now=start)
     op = finish(manager, pr["id"])
     assert op["status"] == "failed"
-    assert op["message"].startswith("Cannot sync skills to Mac mini: No skill gone in")
+    assert op["message"].startswith(
+        "Cannot sync skills to Mac mini: gone is not in your chezmoi source"
+    )
     assert not [c for c in remote_commands(state) if "wt.py" in c]

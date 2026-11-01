@@ -998,20 +998,30 @@ enabled worker's worktrees read-only (see the workspaces reference).
 
 ### Skills on workers
 
-A worker with `skills` gets this machine's copy of each, from this user's
-`~/.claude/skills/<name>` (a top-level link, as chezmoi makes, is followed; the folder
-must hold a `SKILL.md`). `scripts/skill_sync.py` packs them into one tar of folders and
-regular files only, sorted, dated 1970, owned by nobody and keeping only the executable
-bit, so the same skills always give the same bytes; at most 8 MiB of files and 2000
-entries. `.DS_Store`, `__pycache__` and `.git` are left out. The dashboard runs outside
-any sandbox, but agents here may write these folders (Safehouse grants `~/.claude` and
-`~/.codex`), so a skill is read as the worker reads its copies: its folder is opened by
-its real path without following a link and checked to be the folder that path names
-(`F_GETPATH` on macOS, `/proc/self/fd` on Linux), everything below it through
-descriptors relative to its parent; a link, FIFO, device, file with other names (a hard
-link) or file that grew while it was read refuses the whole bundle, and the limits are
-checked before a file is read. The bundle's SHA-256 is its version, and a packing is
-reused for 30 s, so a burst of launches packs once.
+A worker with `skills` gets each from this user's chezmoi source, never from the applied
+copies in `~/.claude/skills` or `~/.codex/skills`: the dashboard runs outside any
+sandbox, but agents here may write those (Safehouse grants `~/.claude` and `~/.codex`),
+while `~/.local/share/chezmoi` is read-only to them. So a skill edited in place reaches
+workers only once it is in the chezmoi source (`chezmoi add` or `chezmoi re-add`, or a
+commit pulled there). A skill is the target `~/.claude/skills/<name>`, else
+`~/.codex/skills/<name>`, which `chezmoi archive --format=tar` renders (`dot_`,
+`executable_` and other source prefixes resolved, templates executed). chezmoi runs by
+absolute path (`/opt/homebrew/bin/chezmoi`, or `BABYSIT_CHEZMOI` in the dashboard's
+environment), with stdin closed, only this user's home (from the password database) and
+the system `PATH` in its environment, no TTY or pager, externals never refreshed
+(nothing is fetched; a template needing the network or a password manager fails) and a
+30 s deadline. A target chezmoi does not manage is refused: "not in your chezmoi source;
+add it with chezmoi add". A target that is a chezmoi symlink (as `~/.claude/skills/merge-forward`
+links to `~/.codex/skills/merge-forward`) is followed by asking chezmoi for the target
+it names, at most twice and only to another skill target, never through the file system.
+
+`scripts/skill_sync.py` takes only the target's folders and regular files (a link,
+hard link, device or entry outside the target refuses the whole bundle; `.DS_Store`,
+`__pycache__` and `.git` are left out) and re-packs them into one tar, sorted, dated
+1970, owned by nobody and keeping only the executable bit, so the same skills always give
+the same bytes; at most 8 MiB of files and 2000 entries, and the folder must hold a
+`SKILL.md`. The bundle's SHA-256 is its version, and a packing is reused for 30 s, so a
+burst of launches packs once.
 
 Before every launch on such a worker (a scheduled launch or cron run, Handle, Create, a
 new task, batch review, a sub-task, a resume, a watch's repair there) and after

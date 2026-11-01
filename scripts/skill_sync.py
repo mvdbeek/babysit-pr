@@ -1,37 +1,47 @@
 """This machine's personal agent skills, kept the same on the workers that name them.
 
-A worker's ``skills`` in machines.json names skills under this user's
-``~/.claude/skills`` (a top-level link is followed, as chezmoi makes them). They are
-packed into one deterministic tar of folders and regular files, whose SHA-256 is the
-bundle's version. Before every launch on such a worker, and after the dashboard updates
-its babysit-pr, the worker's manifest (probe op ``skills_status``) is compared with it;
-a differing hash or a missing or changed copy there stages the bundle and installs it
-(``skills_install``) into every skills folder there. The probe runs this machine's own
-copy of ``remote_probe.py``, so what installs is never the worker's.
+A worker's ``skills`` in machines.json names skills in this user's chezmoi source:
+each is the target ``~/.claude/skills/<name>`` or ``~/.codex/skills/<name>`` there, and
+``chezmoi archive`` renders it (a chezmoi symlink entry is followed to its own target in
+the source, never through the file system). The files are re-packed into one
+deterministic tar of folders and regular files, whose SHA-256 is the bundle's version.
+Before every launch on such a worker, and after the dashboard updates its babysit-pr,
+the worker's manifest (probe op ``skills_status``) is compared with it; a differing hash
+or a missing or changed copy there stages the bundle and installs it (``skills_install``)
+into every skills folder there. The probe runs this machine's own copy of
+``remote_probe.py``, so what installs is never the worker's.
 
-The dashboard runs outside any sandbox, but agents here may write the skills it packs
-(Safehouse grants ``~/.claude`` and ``~/.codex``), so packing reads them as the worker
-reads its copies: through descriptors, following no link, refusing hard links, FIFOs
-and files that change while read.
+The chezmoi source (``~/.local/share/chezmoi``) is read-only to agents here, unlike
+``~/.claude`` and ``~/.codex``, which Safehouse may grant them: so a skill reaches
+workers only once it is in that source, and nothing an agent writes to an applied copy
+does.
 """
 
 import hashlib
 import io
 import os
+import posixpath
+import pwd
 import subprocess
-import sys
 import tarfile
 import threading
 import time
 import uuid
-from pathlib import Path
 
 import machines
+import owned_process
 import remote_probe
 
-# Where this machine's skills are; tests point it elsewhere.
-SOURCE = "~/.claude/skills"
-# A launch burst reuses one packing; a skill edited meanwhile goes out after this.
+# chezmoi by absolute path: the dashboard runs under launchd with a minimal PATH.
+CHEZMOI = os.environ.get("BABYSIT_CHEZMOI") or "/opt/homebrew/bin/chezmoi"
+CHEZMOI_TIMEOUT = 30
+# Where chezmoi's targets are: this user's home from the password database, not $HOME.
+HOME = None
+# The skills folders a skill's target may be in, under the home.
+TARGETS = (".claude/skills", ".codex/skills")
+# A link from one skill target to another is followed this many times at most.
+MAX_LINKS = 2
+# A launch burst reuses one packing; a skill changed meanwhile goes out after this.
 CACHE_SECONDS = 30
 STAGE = remote_probe.SKILL_BUNDLES
 STATUS_TIMEOUT = 30
@@ -47,57 +57,138 @@ _syncing: dict[str, threading.Lock] = {}
 _results: dict[str, dict] = {}
 
 
-def _fd_path(fd):
-    """The path the kernel has for an open folder; None where it cannot tell."""
-    if sys.platform == "darwin":
-        import fcntl
-
-        named = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-        return os.fsdecode(named.split(b"\0", 1)[0])
-    try:
-        return os.readlink(f"/proc/self/fd/{fd}")
-    except OSError:
-        return None
+class NotManaged(ValueError):
+    """chezmoi's source has no such target."""
 
 
-def _read_skill(source, name):
-    """Skill ``name`` as tar entries, parents first; ValueError naming what is refused.
+def _home():
+    return HOME or pwd.getpwuid(os.getuid()).pw_dir
 
-    Its folder is the real path of ``source/name``, opened without following a link and
-    checked to be the folder that path names, so a link swapped in after it was resolved
-    is never followed; ``remote_probe.read_skill_tree`` reads the rest.
+
+def _archive(target):
+    """``chezmoi archive`` of one target, as tar members with their contents.
+
+    chezmoi runs by absolute path, with stdin closed, a fixed environment (this user's
+    home and the system PATH, nothing from the dashboard's), no TTY, no pager, externals
+    never refreshed and a deadline: a template needing a password manager or the network
+    fails, and so does the sync.
     """
-    real = os.path.realpath(source / name)
+    if not os.path.isabs(CHEZMOI):
+        raise ValueError(f"chezmoi must be named by an absolute path, not {CHEZMOI}")
+    argv = [CHEZMOI, "archive", "--format=tar", "--no-tty"]
+    argv += ["--no-pager", "--refresh-externals=never", "--", target]
+    environment = {"HOME": _home(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
     try:
-        fd = os.open(real, remote_probe.NO_FOLLOW_DIR)
-    except OSError:
-        raise ValueError(f"No skill {name} in {source}") from None
-    try:
-        now = _fd_path(fd)
-        if now is not None and now != real:
-            raise ValueError(f"{source / name} moved while it was read")
-        entries = remote_probe.read_skill_tree(fd, str(source / name))
+        done = owned_process.run(
+            argv,
+            timeout=CHEZMOI_TIMEOUT,
+            max_output=remote_probe.MAX_SKILL_BUNDLE,
+            stdin=subprocess.DEVNULL,
+            env=environment,
+            cwd="/",
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(
+            f"chezmoi did not render {target} within {CHEZMOI_TIMEOUT} seconds"
+        ) from None
+    except owned_process.OutputLimitExceeded:
+        raise ValueError(
+            f"chezmoi's {target} exceeds {remote_probe.MAX_SKILL_BUNDLE} bytes"
+        ) from None
     except OSError as exc:
-        raise ValueError(f"Cannot read {source / name}: {exc.strerror or exc}") from None
-    finally:
-        os.close(fd)
-    if ("SKILL.md", False) not in {(path, is_dir) for path, is_dir, *_ in entries}:
-        raise ValueError(f"{source / name} is not a skill folder with a SKILL.md")
-    return [(name, True, False, b"")] + [
-        (f"{name}/{path}", is_dir, executable, data) for path, is_dir, executable, data in entries
-    ]
+        raise ValueError(f"Cannot run chezmoi at {CHEZMOI}: {exc.strerror or exc}") from None
+    said = remote_probe.CONTROL.sub(" ", done.stderr.decode(errors="replace")).strip()[-300:]
+    if done.returncode and "not managed" in said:
+        raise NotManaged(target)
+    if done.returncode:
+        raise ValueError(f"chezmoi could not render {target}: {said or f'exit {done.returncode}'}")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(done.stdout), mode="r:") as archive:
+            members = []
+            for member in archive.getmembers():
+                stream = archive.extractfile(member) if member.isreg() else None
+                members.append((member, stream.read() if stream else b""))
+    except (tarfile.TarError, EOFError) as exc:
+        raise ValueError(f"chezmoi gave no tar for {target}: {exc}") from None
+    return members
 
 
-def pack(names, source=None):
+def _read_skill(name):
+    """Skill ``name`` from the chezmoi source as tar entries; ValueError naming why not."""
+    home = _home()
+    for folder in TARGETS:
+        target = posixpath.join(home, folder, name)
+        try:
+            return _rendered(name, target, _archive(target), MAX_LINKS)
+        except NotManaged:
+            continue
+    raise ValueError(
+        f"{name} is not in your chezmoi source (as ~/.claude/skills/{name} or "
+        f"~/.codex/skills/{name}); add it with chezmoi add"
+    )
+
+
+def _rendered(name, target, members, links):
+    """Skill ``name`` from chezmoi's archive of ``target``: its folders and regular files,
+    a link to another skill target followed through chezmoi again; ValueError otherwise."""
+    home = _home()
+    prefix = posixpath.relpath(target, home)
+    shown = f"~/{prefix}"
+    if len(members) == 1 and members[0][0].name == prefix and members[0][0].issym():
+        link = members[0][0].linkname
+        path = posixpath.normpath(posixpath.join(posixpath.dirname(target), link))
+        if not links or not any(path.startswith(f"{home}/{f}/") for f in TARGETS):
+            raise ValueError(
+                f"{shown} links to {link}, which is not a skill in your chezmoi source"
+            )
+        try:
+            return _rendered(name, path, _archive(path), links - 1)
+        except NotManaged:
+            raise ValueError(
+                f"{shown} links to {link}, which is not in your chezmoi source"
+            ) from None
+    entries = [(name, True, False, b"")]
+    budget = {"entries": remote_probe.MAX_SKILL_ENTRIES, "bytes": remote_probe.MAX_SKILL_BYTES}
+    for member, content in members:
+        if member.name == prefix:
+            if not member.isdir():
+                raise ValueError(f"{shown} is not a folder in your chezmoi source")
+            continue
+        if not member.name.startswith(prefix + "/"):
+            raise ValueError(f"chezmoi's archive of {shown} holds {member.name!r}")
+        path = member.name[len(prefix) + 1 :]
+        if set(path.split("/")) & remote_probe.SKILL_IGNORED:
+            continue  # As the worker skips them when it reads its copies.
+        label = f"{shown}/{path}"
+        budget["entries"] -= 1
+        if budget["entries"] < 0:
+            raise ValueError(f"{shown} holds more than {remote_probe.MAX_SKILL_ENTRIES} entries")
+        if member.issym():
+            raise ValueError(f"{label} is a symbolic link; skills are synced without links")
+        if member.isdir():
+            entries.append((f"{name}/{path}", True, False, b""))
+            continue
+        if not member.isreg():
+            raise ValueError(f"{label} is neither a folder nor a regular file")
+        budget["bytes"] -= len(content)
+        if budget["bytes"] < 0:
+            raise ValueError(f"{shown} exceeds {remote_probe.MAX_SKILL_BYTES} bytes")
+        entries.append((f"{name}/{path}", False, bool(member.mode & 0o100), content))
+    if (f"{name}/SKILL.md", False) not in {(path, is_dir) for path, is_dir, *_ in entries}:
+        raise ValueError(f"{shown} is not a skill folder with a SKILL.md")
+    return entries
+
+
+def pack(names):
     """The bundle of skills ``names`` and its SHA-256; ValueError naming what is wrong.
 
-    Entries are sorted, owned by nobody, dated 1970 and keep only the executable bit, so
-    the same skills always give the same bytes.
+    Entries are sorted (each folder before its contents), owned by nobody, dated 1970
+    and keep only the executable bit, so the same skills always give the same bytes.
     """
-    source = Path(source or SOURCE).expanduser()
     entries = []
     for name in sorted(names):
-        entries += _read_skill(source, name)
+        entries += _read_skill(name)
+    entries.sort(key=lambda entry: entry[0].split("/"))
     if len(entries) > remote_probe.MAX_SKILL_ENTRIES:
         raise ValueError(f"The skills hold more than {remote_probe.MAX_SKILL_ENTRIES} entries")
     if sum(len(data) for *_, data in entries) > remote_probe.MAX_SKILL_BYTES:
@@ -125,7 +216,7 @@ def pack(names, source=None):
 
 def bundle(names, now=time.monotonic):
     """``pack(names)``, reused for ``CACHE_SECONDS``."""
-    key = (str(Path(SOURCE).expanduser()), tuple(sorted(names)))
+    key = (CHEZMOI, _home(), tuple(sorted(names)))
     with _lock:
         cached = _bundles.get(key)
         if cached and now() - cached[0] < CACHE_SECONDS:
