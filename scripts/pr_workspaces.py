@@ -94,7 +94,7 @@ LAUNCH_HISTORY = 100
 BATCH_INTERVAL_LIMIT = 86400
 BATCH_URL = "{url}"
 # New tasks: a git branch name wt accepts, an issue title, and how long they stay listed.
-BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+BRANCH_NAME = wt.LAUNCH_BRANCH  # `wt --machine` checks a worker launch with it too.
 NEW_PREFIX = "new:"
 NEW_LISTED = 86400
 NEW_LIMIT = 20

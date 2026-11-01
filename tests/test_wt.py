@@ -2024,7 +2024,7 @@ class FakeDashboard:
                 )
                 answer = dashboard.answers.get(path, (404, {"error": "Not found"}))
                 status, value = answer if isinstance(answer, tuple) else (200, answer)
-                data = json.dumps(value).encode()
+                data = value if isinstance(value, bytes) else json.dumps(value).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -2044,7 +2044,9 @@ class FakeDashboard:
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def launch(self, machine="chonk", status="complete", message="Workspace ready on Chonk"):
+    def launch(
+        self, machine="chonk", status="complete", message="Workspace ready on Chonk", now=False
+    ):
         op = {"pr": "new:1", "status": "queued", "message": "Queued", "machine": machine}
         done = {
             **op,
@@ -2057,7 +2059,8 @@ class FakeDashboard:
                 "url": None,
             },
         }
-        self.answers["/api/workspace-new"] = {"operation": op}
+        # `now`: the launch has finished by the time it is answered, so nothing polls.
+        self.answers["/api/workspace-new"] = {"operation": done if now else op}
         self.answers["/api/workspaces"] = {"new": {"new:1": {"operation": done}}}
 
     def paths(self):
@@ -2091,7 +2094,8 @@ def controller(tmp_path, dashboard=None, **env):
     t = tool(
         env={"HOME": str(tmp_path), "BABYSIT_HOME": str(home), "BABYSIT_DASHBOARD_URL": url, **env}
     )
-    t.repo_slug = lambda path, command: "base/repo"
+    t.remote_slugs = lambda path: {"origin": "base/repo"}
+    t.branch_exists = lambda path, branch: False
     return t
 
 
@@ -2149,13 +2153,16 @@ def test_machine_is_refused_on_a_worker_and_beside_dashboard_options(tmp_path):
         ("wt", {"positional": ["https://github.com/a/b/pull/7"]}, "for a pull request"),
         ("wt", {"also": ["other"]}, "other repositories (--with) yet"),
         ("wt", {"prompt": ""}, "needs a prompt (-p or -F)"),
+        ("wt", {"positional": ["main"]}, "only a new branch from a base (wt <base> <branch>)"),
     ],
 )
 def test_runs_a_worker_cannot_start_stay_here_under_auto_and_are_refused_by_name(
     command, values, refusal, tmp_path, dashboard
 ):
     t = controller(tmp_path, dashboard)
-    parsed = options(**{"prompt": "go", "positional": ["main", "feat"], **values})
+    parsed = options(
+        **{"prompt": "go", "positional": ["main", "feat"], "machine": "auto", **values}
+    )
     assert wt.worker_refusal(command, parsed).endswith(refusal)
     assert t.launch_elsewhere(command, parsed, "auto") is False
     assert t.stderr.getvalue().endswith(f"{refusal}; running here\n")
@@ -2163,6 +2170,43 @@ def test_runs_a_worker_cannot_start_stay_here_under_auto_and_are_refused_by_name
         t.launch_elsewhere(command, parsed, "chonk")
     assert dashboard.requests == []
     assert wt.worker_refusal("wt", options(prompt="go", positional=["main", "feat"])) == ""
+
+
+def test_docker_alone_keeps_a_run_without_a_brief_here_quietly(tmp_path, dashboard):
+    t = controller(tmp_path, dashboard)
+    assert t.launch_elsewhere("wt", options(docker=True, positional=["main", "f"]), "auto") is False
+    assert t.stderr.getvalue() == "" and dashboard.requests == []
+
+
+@pytest.mark.parametrize(
+    ("change", "positional", "refusal"),
+    [
+        ({}, ["main", "fix/foo"], "not a valid new branch for a worker"),
+        ({}, ["me@main", "feat"], "not a valid base branch for a worker"),
+        ({"remote_slugs": lambda path: {"origin": None}}, ["main", "feat"], "no GitHub upstream"),
+        (
+            {"branch_exists": lambda path, branch: True},
+            ["main", "feat"],
+            "feat already exists here",
+        ),
+        ({"worktree": True}, ["main", "feat"], "feat already exists here"),
+    ],
+)
+def test_a_branch_a_worker_cannot_make_stays_here_under_auto(
+    change, positional, refusal, tmp_path, dashboard
+):
+    t = controller(tmp_path, dashboard)
+    if change.pop("worktree", False):
+        (tmp_path / "src/worktrees/galaxy/feat").mkdir(parents=True)
+    for name, value in change.items():
+        setattr(t, name, value)
+    parsed = options(prompt="go", positional=positional, machine="auto")
+    assert t.launch_elsewhere("wt", parsed, "auto") is False
+    said = t.stderr.getvalue()
+    assert said.startswith(f"wt: {refusal}") and said.endswith("; running here\n")
+    with pytest.raises(wt.WtError, match=f"^wt: --machine chonk: .*{re.escape(refusal)}"):
+        t.launch_elsewhere("wt", parsed, "chonk")
+    assert dashboard.requests == []
 
 
 def test_auto_starts_on_the_worker_the_dashboard_places_it_on(tmp_path, dashboard):
@@ -2227,7 +2271,7 @@ def test_auto_runs_here_when_the_dashboard_places_it_here(tmp_path, dashboard):
     }
     t = controller(tmp_path, dashboard)
     parsed = options(
-        agent="claude", claude_account="work", docker=True, prompt="go", positional=["main"]
+        agent="claude", claude_account="work", docker=True, prompt="go", positional=["main", "f"]
     )
     assert t.launch_elsewhere("wt", parsed, "auto") is False
     assert dashboard.paths() == [("GET", "/api/placement")]
@@ -2241,23 +2285,23 @@ def test_auto_runs_here_when_the_dashboard_places_it_here(tmp_path, dashboard):
 def test_a_named_worker_goes_straight_to_the_dashboard(tmp_path, dashboard):
     dashboard.launch()
     t = controller(tmp_path, dashboard)
-    assert t.launch_elsewhere("wt", options(prompt="go", positional=["feat"]), "chonk") is True
+    new = ["main", "feat"]
+    assert t.launch_elsewhere("wt", options(prompt="go", positional=new), "chonk") is True
     assert dashboard.paths() == [("POST", "/api/workspace-new"), ("GET", "/api/workspaces")]
-    # One positional is both the base and the new branch, as `wt feat` reads it.
     body = dashboard.requests[0]["body"]
     assert (body["base"], body["name"], body["machine"], body["docker"]) == (
-        "feat",
+        "main",
         "feat",
         "chonk",
         False,
     )
     assert body["permission_mode"] == ""
     # Claude's auto permission mode goes along; Codex has none, as here.
-    careful = options(prompt="go", positional=["feat"], permission_mode="auto")
+    careful = options(prompt="go", positional=new, permission_mode="auto")
     assert t.launch_elsewhere("wt", careful, "chonk") is True
     assert dashboard.requests[-2]["body"]["permission_mode"] == "auto"
     with pytest.raises(wt.WtError, match="for Claude only"):
-        codex = options(prompt="go", positional=["feat"], permission_mode="auto", agent="codex")
+        codex = options(prompt="go", positional=new, permission_mode="auto", agent="codex")
         t.launch_elsewhere("wt", codex, "chonk")
 
 
@@ -2287,6 +2331,19 @@ def test_refused_failed_and_unreachable_launches_name_the_reason(tmp_path, dashb
     with pytest.raises(wt.WtError, match="lost track of the launch .*before retrying$") as lost:
         t.launch_elsewhere("wt", parsed, "chonk")
     assert "--machine local" not in str(lost.value)
+    dashboard.launch()
+    dashboard.answers["/api/workspaces"] = {"new": {}}
+    with pytest.raises(wt.WtError, match="no longer lists the launch; check it before retrying"):
+        t.launch_elsewhere("wt", parsed, "chonk")
+    # An answer to the launch it cannot read may follow a launch the dashboard took.
+    for answer in (b"<html>", {"error": None}):
+        dashboard.answers["/api/workspace-new"] = answer
+        with pytest.raises(wt.WtError, match="may have started.*before retrying$") as unread:
+            t.launch_elsewhere("wt", parsed, "chonk")
+        assert "--machine local" not in str(unread.value)
+    dashboard.answers["/api/placement"] = {"reason": "?"}
+    with pytest.raises(wt.WtError, match="answered the placement unexpectedly"):
+        t.launch_elsewhere("wt", parsed, "auto")
     # Never silently here: a worker was asked for.
     away = controller(tmp_path)
     with pytest.raises(
@@ -2304,7 +2361,7 @@ def test_wt_docker_starts_on_the_docker_worker_end_to_end(repo, tmp_path, monkey
         "label": "Chonk",
         "reason": "auto: Docker prefers Chonk, 6/6 free",
     }
-    dashboard.launch()
+    dashboard.launch(now=True)
     result = run_tool("-r", "repo", "--docker", "-p", "Run the containers", "main", "feat")
     assert result.stdout == ""
     assert "wt: feat at /home/w/src/worktrees/repo/feat on Chonk" in result.stderr
@@ -2327,13 +2384,23 @@ def test_wt_docker_starts_on_the_docker_worker_end_to_end(repo, tmp_path, monkey
     run_tool("-r", "repo", "--docker", "--machine", "local", "-p", "again", "main", "other")
     assert dashboard.requests == []
     assert (home / "src/worktrees/repo/other").is_dir()
+    # A branch that exists here, or one a worker cannot name, stays with this clone.
+    for branch in ("feature", "fix/foo"):
+        result = run_tool("-r", "repo", "--docker", "-p", "go", "main", branch)
+        assert "; running here" in result.stderr
+        assert (
+            git("symbolic-ref", "--short", "HEAD", cwd=home / "src/worktrees/repo" / branch)
+            == branch
+        )
+    assert dashboard.requests == []
 
 
 @pytest.mark.parametrize(
     ("values", "slug", "message"),
     [
-        ({"positional": ["main", "-x"]}, "base/repo", "branch name"),
-        ({"positional": ["main", "a/b"]}, "base/repo", "branch name"),
+        ({"positional": ["main", "-x"]}, "base/repo", "new branch"),
+        ({"positional": ["main", "a/b"]}, "base/repo", "new branch"),
+        ({"positional": ["main"]}, "base/repo", "wt <base> <branch>"),
         ({"positional": ["-main", "feat"]}, "base/repo", "base branch"),
         ({"positional": ["a..b", "feat"]}, "base/repo", "base branch"),
         ({"prompt": "   "}, "base/repo", "brief"),
@@ -2347,12 +2414,15 @@ def test_wt_docker_starts_on_the_docker_worker_end_to_end(repo, tmp_path, monkey
 )
 def test_a_launch_request_is_checked_before_any_transport_sees_it(values, slug, message):
     parsed = options(**{"prompt": "go", "positional": ["main", "feat"], **values})
-    with pytest.raises(wt.WtError, match=re.escape(message)):
+    with pytest.raises((wt.WtError, wt.NotForWorker), match=re.escape(message)):
         wt.launch_request("wt", parsed, slug, "chonk")
-    with pytest.raises(wt.WtError, match="invalid machine"):
-        wt.launch_request("wt", options(prompt="go", positional=["feat"]), "base/repo", "Chonk")
-    request = wt.launch_request(
-        "wt", options(prompt="go", positional=["feat"]), "base/repo", "auto"
-    )
+    new = ["release/26.1", "feat"]
+    with pytest.raises(wt.NotForWorker, match="not a valid machine"):
+        wt.launch_request("wt", options(prompt="go", positional=new), "base/repo", "Chonk")
+    request = wt.launch_request("wt", options(prompt="go", positional=new), "base/repo", "auto")
     assert tuple(request) == wt.LAUNCH_FIELDS
-    assert (request["base"], request["name"], request["machine"]) == ("feat", "feat", "auto")
+    assert (request["base"], request["name"], request["machine"]) == (
+        "release/26.1",
+        "feat",
+        "auto",
+    )

@@ -958,18 +958,26 @@ task** does (`POST /api/workspace-new` with the worker chosen) and follows that
 operation until the workspace is ready, printing its progress and the worker's checkout
 on stderr and nothing on stdout. `--exit-when-done` is passed on, so the dashboard
 follows the agent there, and so is `--permission-mode auto` (the request field
-`permission_mode: "auto"`, which New task otherwise leaves out). Without `--machine`,
+`permission_mode: "auto"`, which New task otherwise leaves empty). Without `--machine`,
 `--docker` means `auto` when the registry has a `docker` `prefer` worker, so Docker work
 an agent here starts with `wt` runs on that worker; with no such preference `wt` runs
-here as before. A worker takes only what New task starts there: a new branch from a base
-(`wt <base> <branch>`; a single name is both, as `wt feat` reads it) with a prompt, in
-the worker's own clone; the branch must not exist there yet. Issues, pull requests and
-`--with` stay here under `auto`, with a note on stderr, and are refused when a worker is
-named. A run that cannot reach the dashboard fails, naming `--machine local`, rather
-than running here. Runs the dashboard makes (any dashboard option) never move, and on a
-worker `--machine` is refused unless it is `local`. Safehouse leaves the network and the
-state home open to agents, so this works from inside their sandbox. The dashboard's
-**Docker access** toggle for a running agent still applies only to agents on this Mac.
+here as before. A worker takes only what New task starts there: a new branch from a
+base, `wt <base> <branch>`, with a prompt, in the worker's own clone of the repository
+the local clone's GitHub `upstream` (else `origin`) names. The branch is a simple name
+(letters, digits, `.`, `_`, `-`) and must not exist there yet. Under `auto` everything
+else runs here, with a note on stderr: issues, pull requests, `--with`, `wt <branch>`
+alone, a branch with a `/`, a base a worker cannot name, a clone without a GitHub
+remote, and a branch that already exists here, as a branch or under
+`~/src/worktrees/<repo>/`, which a worker would only duplicate. A run without a prompt
+stays here quietly when only `--docker` chose `auto`. Named outright, a worker refuses
+all of these. A run that cannot reach the dashboard fails, naming `--machine local`,
+rather than running here; once the dashboard may have taken the launch (an answer cut
+short or unreadable, or the operation no longer listed) `wt` says to check the dashboard
+before retrying instead. Runs the dashboard makes (any dashboard option) never move, and
+on a worker `--machine` is refused unless it is `local`. Safehouse leaves the network
+and the state home open to agents, so this works from inside their sandbox. The
+dashboard's **Docker access** toggle for a running agent still applies only to agents on
+this Mac.
 
 Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
 the planning code without processes and the whole tool against temporary
@@ -1043,7 +1051,9 @@ With a machine registry (`--home/machines.json`, see `references/supervisor.md`)
 agent task also has a **Machine**: **Auto** (resolved once when the job is saved, and
 kept; Auto keeps a job on this machine, which has its clone, until it is full, except
 that a job allowed Docker goes to the registry's `docker` `prefer` worker when that
-worker can take it), this machine, or a worker. A job on a
+worker can take it, which the dialog's Auto note says before the job is saved), this
+machine, or a worker. Nothing checks the worker's clone when the job is saved; a run
+there without one fails, naming it. A job on a
 worker works in that worker's clone, `<src>/<repo name>` from its registry entry, which
 must be a clone of the job's repository (one of its remotes names it), and
 everything a run does happens there: the probe makes the checkout with the worker's own

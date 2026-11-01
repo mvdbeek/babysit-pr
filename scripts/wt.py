@@ -52,10 +52,10 @@ HERDR_RUNNING = re.compile(r'"running"\s*:\s*true')
 MACHINE = re.compile(r"[a-z][a-z0-9-]{0,23}")
 DASHBOARD = "http://127.0.0.1:8765"
 # How often, and for how long, a launch on a worker is followed through the dashboard.
-LAUNCH_POLL = 2.0
+LAUNCH_POLL = 5.0
 LAUNCH_WAIT = 900
-# What a launch on a worker asks the controller for (see launch_request), and the branch
-# names its New task takes.
+# What a launch on a worker asks the controller for (see launch_request), and the new
+# branch names its New task takes (pr_workspaces.BRANCH_NAME is this one).
 LAUNCH_FIELDS = (
     "repo",
     "base",
@@ -71,7 +71,8 @@ LAUNCH_FIELDS = (
     "machine",
 )
 LAUNCH_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
-LAUNCH_BASE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+# Why `wt` without a brief stays here: said only when a worker was asked for by name or auto.
+NO_PROMPT = "a launch on a worker needs a prompt (-p or -F)"
 
 VALUE_OPTIONS = {
     "-r": "repo",
@@ -293,6 +294,10 @@ class UsageError(WtError):
         self.command = command
 
 
+class NotForWorker(ValueError):
+    """Why a run cannot start on a worker: Auto runs it here, a named worker refuses it."""
+
+
 class HelpRequested(Exception):
     def __init__(self, command: str):
         super().__init__(command)
@@ -500,7 +505,8 @@ def worker_refusal(command: str, options: Options) -> str:
     """Why this run cannot start on a worker, or empty when it can.
 
     The dashboard starts a new task there: a new branch from a base, with a brief. Issues,
-    pull requests and other clones it does not start on workers yet.
+    pull requests and other clones it does not start on workers yet, and ``wt <branch>``
+    opens a branch that exists.
     """
     first = options.positional[0] if options.positional else ""
     if command == "wti" or first in ("issue", "i"):
@@ -510,7 +516,9 @@ def worker_refusal(command: str, options: Options) -> str:
     if options.also:
         return "workers cannot check out other repositories (--with) yet"
     if not options.prompt:
-        return "a launch on a worker needs a prompt (-p or -F)"
+        return NO_PROMPT
+    if len(options.positional) < 2:
+        return "a worker takes only a new branch from a base (wt <base> <branch>)"
     return ""
 
 
@@ -969,31 +977,41 @@ def launch_request(command: str, options: Options, repo: str, machine: str) -> d
 
     Every field is checked here as the controller checks it, so any transport (the local
     dashboard's API, or a sandbox's broker) carries one shape: ``repo`` (``owner/name``),
-    ``base`` and ``name`` (the new branch), ``agent``, ``model``, ``effort``,
-    ``claude_account``, ``task`` (the brief), ``docker``, ``exit_when_done``,
+    ``base`` and ``name`` (the new branch: ``options.positional``), ``agent``, ``model``,
+    ``effort``, ``claude_account``, ``task`` (the brief), ``docker``, ``exit_when_done``,
     ``permission_mode`` (empty or ``auto``) and ``machine`` (a registry id or ``auto``).
+    A field a worker launch cannot take raises NotForWorker; agent options that are
+    wrong anywhere raise WtError.
     """
+    import remote_probe  # The branch names a worker's probe takes, as New task checks them.
+
     validate_agent_options(options.agent, options.model, options.effort, options.permission_mode)
     if options.agent not in ("codex", "claude"):
         raise WtError(f"{command}: unknown agent {options.agent}")
-    base = options.positional[0]
-    name = options.positional[1] if len(options.positional) > 1 else base
+    if len(options.positional) < 2:
+        raise NotForWorker("a worker takes only a new branch from a base (wt <base> <branch>)")
+    base, name = options.positional[:2]
     checks = [
         (REPO_SLUG.fullmatch(repo) and repo.split("/")[1] not in (".", ".."), "repository"),
-        (LAUNCH_BRANCH.fullmatch(name), "branch name: letters, digits, '.', '_' and '-'"),
-        (LAUNCH_BASE.fullmatch(base) and ".." not in base, "base branch"),
+        (
+            LAUNCH_BRANCH.fullmatch(name) and ".." not in name,
+            "new branch for a worker (letters, digits, '.', '_' and '-')",
+        ),
+        (remote_probe.BRANCH.fullmatch(base) and ".." not in base, "base branch for a worker"),
         (
             not options.claude_account or claude_accounts.NAME.fullmatch(options.claude_account),
-            "Claude account",
+            "Claude account for a worker",
         ),
-        (0 < len(options.prompt.strip()) and len(options.prompt) <= 32000, "brief (1-32,000)"),
-        ("\0" not in options.prompt, "brief"),
+        (
+            options.prompt.strip() and len(options.prompt) <= 32000 and "\0" not in options.prompt,
+            "brief for a worker (1-32,000 characters)",
+        ),
         (machine == "auto" or MACHINE.fullmatch(machine), "machine"),
     ]
     for ok, field in checks:
         if not ok:
-            raise WtError(f"{command}: invalid {field} for a launch on a worker")
-    request: dict[str, object] = {
+            raise NotForWorker(f"not a valid {field}")
+    return {
         "repo": repo,
         "base": base,
         "name": name,
@@ -1007,8 +1025,6 @@ def launch_request(command: str, options: Options, repo: str, machine: str) -> d
         "permission_mode": options.permission_mode,
         "machine": machine,
     }
-    assert tuple(request) == LAUNCH_FIELDS
-    return request
 
 
 class DashboardTransport:
@@ -1034,11 +1050,19 @@ class DashboardTransport:
         return self.call("/api/placement?" + urllib.parse.urlencode(query))
 
     def start(self, request: Mapping[str, object]) -> dict[str, object]:
-        return self.call("/api/workspace-new", dict(request))["operation"]
+        op = self.call("/api/workspace-new", dict(request)).get("operation")
+        if not isinstance(op, dict) or not isinstance(op.get("pr"), str):
+            raise WtError(
+                f"{self.command}: the dashboard answered the launch unexpectedly; it may "
+                "have started, so check the dashboard before retrying"
+            )
+        return op
 
-    def status(self, op: Mapping[str, object]) -> dict[str, object]:
+    def status(self, op: Mapping[str, object]) -> dict[str, object] | None:
+        """The operation now, None once the dashboard no longer lists it."""
         listed = self.call("/api/workspaces").get("new") or {}
-        return (listed.get(op["pr"]) or {}).get("operation") or dict(op)
+        found = (listed.get(op["pr"]) or {}).get("operation")
+        return found if isinstance(found, dict) else None
 
     def call(self, path: str, body: dict[str, object] | None = None):
         """One JSON request to the dashboard; refusals carry its reason."""
@@ -1069,6 +1093,14 @@ class DashboardTransport:
                 f"{self.command}: the dashboard refused: {detail or f'HTTP {exc.code}'}"
             ) from None
         except (OSError, ValueError) as exc:
+            # urllib wraps what fails while connecting and sending in URLError; anything
+            # after (a read timeout, a reset, an answer that is not JSON) may follow a
+            # launch the dashboard already took.
+            if body is not None and not isinstance(exc, urllib.error.URLError):
+                raise WtError(
+                    f"{self.command}: the launch may have started ({exc or type(exc).__name__}); "
+                    "check the dashboard before retrying"
+                ) from None
             reason = getattr(exc, "reason", None) or exc
             raise WtError(
                 f"{self.command}: cannot reach the dashboard at {self.base} ({reason}), which "
@@ -2002,21 +2034,22 @@ class Tool:
         ``auto`` asks the controller's placement first and runs here when it says so, or
         when a worker cannot start this kind of run; a worker named outright refuses it.
         """
-        refusal = worker_refusal(command, options)
-        if refusal:
+        try:
+            request = self.worker_request(command, options, machine)
+        except NotForWorker as exc:
             if machine != "auto":
-                raise WtError(f"{command}: --machine {machine}: {refusal}")
-            self.warn(f"{command}: {refusal}; running here")
+                raise WtError(f"{command}: --machine {machine}: {exc}") from None
+            # `--docker` alone asked for no worker: a run without a brief stays quietly.
+            if options.machine or str(exc) != NO_PROMPT:
+                self.warn(f"{command}: {exc}; running here")
             return False
-        if not options.positional:
-            raise UsageError(command, f"{command}: expected a branch, PR number or 'issue'")
-        slug = self.repo_slug(os.path.join(self.home, "src", options.repo), command)
-        request = launch_request(command, options, slug, machine)
         transport = self.transport(command)
         if machine == "auto":
             placed = transport.place(request)
             if placed.get("error"):
                 raise WtError(f"{command}: {placed['error']}")
+            if not isinstance(placed.get("machine"), str):
+                raise WtError(f"{command}: the dashboard answered the placement unexpectedly")
             if placed.get("machine") == "local":
                 self.warn(f"{command}: {placed.get('reason')}; running here")
                 return False
@@ -2024,6 +2057,26 @@ class Tool:
             self.warn(f"{command}: {placed.get('reason')}; starting on {placed.get('label')}")
         self.follow_launch(command, transport, transport.start(request))
         return True
+
+    def worker_request(self, command: str, options: Options, machine: str) -> dict[str, object]:
+        """This run's launch_request, or NotForWorker when it belongs here.
+
+        A new branch that already exists here, as a branch or a worktree directory, stays
+        with its clone: on a worker it would become a second, diverging branch.
+        """
+        refusal = worker_refusal(command, options)
+        if refusal:
+            raise NotForWorker(refusal)
+        repo_path = os.path.join(self.home, "src", options.repo)
+        remotes = self.remote_slugs(repo_path)
+        slug = remotes.get("upstream") or remotes.get("origin")
+        if not slug:
+            raise NotForWorker(f"no GitHub upstream or origin remote in {repo_path}")
+        branch = options.positional[1]
+        directory = os.path.join(self.home, "src", "worktrees", options.repo, branch)
+        if os.path.lexists(directory) or self.branch_exists(repo_path, branch):
+            raise NotForWorker(f"{branch} already exists here")
+        return launch_request(command, options, slug, machine)
 
     def follow_launch(
         self, command: str, transport: DashboardTransport, op: dict[str, object]
@@ -2052,13 +2105,18 @@ class Tool:
                 raise WtError(f"{command}: still launching; follow it in the dashboard")
             time.sleep(LAUNCH_POLL)
             try:
-                op = transport.status(op)
+                found = transport.status(op)
             except WtError as exc:
                 # The launch was handed over: never suggest starting it a second time here.
                 raise WtError(
                     f"{command}: lost track of the launch ({exc}); check the dashboard "
                     "before retrying"
                 ) from None
+            if found is None:
+                raise WtError(
+                    f"{command}: the dashboard no longer lists the launch; check it before retrying"
+                )
+            op = found
 
     def on_worker(self) -> bool:
         """Whether this is a worker machine: provisioning marks it, and launches say so."""
