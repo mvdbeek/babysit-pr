@@ -781,7 +781,7 @@ New task only when:
   now";
 - that machine runs fewer than 4 working sub-task agents: launches under way, and
   earlier sub-tasks whose checkout herdr lists with a working or blocked agent (an idle
-  one left open does not count; operations are kept a day);
+  one left open does not count; sub-task operations are kept a week);
 - the repository has a clone there (this machine's: `<src>/<name>` if it is one, else
   the first listed; a worker's: its own, checked by its probe).
 

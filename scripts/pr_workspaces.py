@@ -108,6 +108,8 @@ SUBTASK_WINDOW = 3600
 SUBTASK_AGENTS = 4
 SUBTASK_DEPTH = 2
 SUBTASK_WAIT = 240
+# How long a sub-task's operation is kept for its lineage and Workspaces row.
+SUBTASK_KEPT = 7 * 86400
 # The agent states a sub-task agent counts in: an idle one left open does not.
 SUBTASK_BUSY = {"working", "blocked"}
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -550,7 +552,7 @@ def started_by(parent):
 
 def subtask_parents(home):
     """The launch that asked for each sub-task's checkout (see ``Workspaces.subtask``), by
-    machine (None for this one) and path, resolved here; operations are kept a day."""
+    machine (None for this one) and path, resolved here; they are kept a week."""
     path = Path(home) / "pr-workspaces.sqlite"
     if not path.exists():
         return {}
@@ -1963,8 +1965,9 @@ class Workspaces:
 
     def subtask_agents(self, machine_id, ops):
         """Working sub-task agents on a machine: launches under way, and those whose
-        checkout herdr lists with a working or blocked agent there (operations are kept a
-        day). An idle agent left open does not count; the machine's capacity still does."""
+        checkout herdr lists with a working or blocked agent there (sub-task operations
+        are kept a week). An idle agent left open does not count; the machine's capacity
+        still does."""
         if machine_id == placement.LOCAL:
             live = {
                 path
@@ -2075,9 +2078,12 @@ class Workspaces:
         if now - self.pruned_at >= PRUNE_SECONDS:
             self.pruned_at = now
             with self.db() as db:
+                # A sub-task's record stays longer: later sub-tasks find their lineage in it.
                 db.execute(
-                    "DELETE FROM operations WHERE pr LIKE ? AND json_extract(data,'$.created_at') < ?",
-                    (f"{NEW_PREFIX}%", now - NEW_LISTED),
+                    "DELETE FROM operations WHERE pr LIKE ? AND json_extract(data,'$.created_at') < ?"
+                    " AND (json_extract(data,'$.parent') IS NULL"
+                    " OR json_extract(data,'$.created_at') < ?)",
+                    (f"{NEW_PREFIX}%", now - NEW_LISTED, now - SUBTASK_KEPT),
                 )
         found.sort(key=lambda op: op["created_at"], reverse=True)
         return {op["pr"]: {"operation": op} for op in found[:NEW_LIMIT]}

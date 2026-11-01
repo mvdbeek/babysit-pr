@@ -632,3 +632,17 @@ def test_a_failing_controller_leaves_a_launch_uncertain_never_refused(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_a_subtasks_record_outlives_the_day_new_tasks_are_listed(local):  # noqa: F811
+    manager, *_ = local
+    old = time.time() - pw.NEW_LISTED - 60
+    kept = record(manager, "/p/kept", created=old)
+    gone = record(manager, "/p/gone", created=time.time() - pw.SUBTASK_KEPT - 60)
+    plain = {"id": "y", "pr": f"{pw.NEW_PREFIX}plain", "status": "complete", "created_at": old}
+    with manager.db() as db:
+        db.execute("INSERT INTO operations VALUES (?,?)", (plain["pr"], json.dumps(plain)))
+    manager.pruned_at = 0
+    manager.new_operations(manager.state())
+    left = manager.state()["operations"]
+    assert kept["pr"] in left and gone["pr"] not in left and plain["pr"] not in left
