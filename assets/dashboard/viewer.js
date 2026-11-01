@@ -1623,7 +1623,7 @@
       "Quit agent",
       "ws-quit",
       `Quit ${name}`,
-      "End the agent's process; its pane's shell stays open and its session can be resumed",
+      "End the agent's process; its session can be resumed. A pane babysit opened for it closes; any other keeps its shell",
     );
     const worker = workerLabel(viewer.entry);
     if (worker) {

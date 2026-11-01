@@ -1742,6 +1742,25 @@ def test_quit_types_exit_into_an_idle_claude_and_sees_it_leave(quitting):
     assert calls(quitting, ["agent", "wait"]) == []
     # The pane stays, its shell alone in the foreground.
     assert read(quitting)["process_info"]["w1:p2"]["foreground_processes"] == [{"pid": 100}]
+    assert calls(quitting, ["pane", "close"]) == []
+
+
+def test_quit_closes_the_shell_left_in_a_pane_split_off_for_an_agent(quitting):
+    import agent_messages
+    import cron_agents
+
+    data = read(quitting)
+    marked = {"workspace_id": "w1", "label": cron_agents.RUN_PANE_LABEL}
+    data["panes"] = [
+        {"pane_id": "w1:p1", "workspace_id": "w1"},
+        {"pane_id": "w1:p2", **marked},
+        # Another such shell, which its user may have taken up again, is not this quit's.
+        {"pane_id": "w1:p3", **marked},
+    ]
+    quitting.write_text(json.dumps(data))
+    assert agent_messages.exit_agent(stop_request())["quit"]
+    # Left behind, each such shell would halve the width of the next agent's pane.
+    assert calls(quitting, ["pane", "close"]) == [["pane", "close", "w1:p2"]]
 
 
 def test_an_idle_codex_gets_ctrl_d(quitting):
