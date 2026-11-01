@@ -1232,7 +1232,7 @@ class Workspaces:
                     "local": False,
                     "updatable": worker_updates.updatable(m),
                     "update": updates.get(m.id),
-                    "skills": skill_sync.status(m),
+                    "skills": skill_sync.status(m, self.home),
                     # Without both addresses the dashboard cannot keep it to /api/worker/.
                     "fenced": machines.fenced(m),
                 }

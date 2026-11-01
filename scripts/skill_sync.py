@@ -22,6 +22,7 @@ import io
 import os
 import posixpath
 import pwd
+import stat
 import subprocess
 import tarfile
 import threading
@@ -65,18 +66,52 @@ def _home():
     return HOME or pwd.getpwuid(os.getuid()).pw_dir
 
 
-def _archive(target):
-    """``chezmoi archive`` of one target, as tar members with their contents.
+def _chezmoi(state):
+    """chezmoi's command line up to its targets, pinned to this user's source.
 
-    chezmoi runs by absolute path, with stdin closed, a fixed environment (this user's
-    home and the system PATH, nothing from the dashboard's), no TTY, no pager, externals
-    never refreshed and a deadline: a template needing a password manager or the network
-    fails, and so does the sync.
+    ``~/.config/chezmoi`` is left out: its config could name another source or add
+    hooks, so chezmoi gets an empty one the dashboard keeps in ``<state>/chezmoi``
+    (private, with chezmoi's state and cache), and the source ``~/.local/share/chezmoi``
+    under this user's home from the password database.
     """
     if not os.path.isabs(CHEZMOI):
         raise ValueError(f"chezmoi must be named by an absolute path, not {CHEZMOI}")
-    argv = [CHEZMOI, "archive", "--format=tar", "--no-tty"]
-    argv += ["--no-pager", "--refresh-externals=never", "--", target]
+    folder = os.path.join(os.path.abspath(state), "chezmoi")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    config = os.path.join(folder, "chezmoi.toml")
+    try:
+        os.close(os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except FileExistsError:
+        pass
+    info = os.lstat(config)
+    if not stat.S_ISREG(info.st_mode) or info.st_size or info.st_uid != os.getuid():
+        raise ValueError(f"{config} must be an empty file of this user's")
+    return [
+        CHEZMOI,
+        f"--config={config}",
+        "--config-format=toml",
+        f"--source={posixpath.join(_home(), '.local/share/chezmoi')}",
+        f"--persistent-state={os.path.join(folder, 'chezmoistate.boltdb')}",
+        f"--cache={os.path.join(folder, 'cache')}",
+        "archive",
+        "--format=tar",
+        "--no-tty",
+        "--no-pager",
+        "--refresh-externals=never",
+        "--",
+    ]
+
+
+def _archive(command, target):
+    """``chezmoi archive`` of one target (``command`` from ``_chezmoi``), as tar members
+    with their contents.
+
+    chezmoi runs by absolute path, with stdin closed, a fixed environment (this user's
+    home and the system PATH, nothing from the dashboard's), no TTY, no pager, externals
+    not refreshed and a deadline: a template needing a password manager fails, and so
+    does the sync.
+    """
+    argv = [*command, target]
     environment = {"HOME": _home(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
     try:
         done = owned_process.run(
@@ -113,13 +148,13 @@ def _archive(target):
     return members
 
 
-def _read_skill(name):
+def _read_skill(command, name):
     """Skill ``name`` from the chezmoi source as tar entries; ValueError naming why not."""
     home = _home()
     for folder in TARGETS:
         target = posixpath.join(home, folder, name)
         try:
-            return _rendered(name, target, _archive(target), MAX_LINKS)
+            return _rendered(command, name, target, _archive(command, target), MAX_LINKS)
         except NotManaged:
             continue
     raise ValueError(
@@ -128,7 +163,7 @@ def _read_skill(name):
     )
 
 
-def _rendered(name, target, members, links):
+def _rendered(command, name, target, members, links):
     """Skill ``name`` from chezmoi's archive of ``target``: its folders and regular files,
     a link to another skill target followed through chezmoi again; ValueError otherwise."""
     home = _home()
@@ -142,7 +177,7 @@ def _rendered(name, target, members, links):
                 f"{shown} links to {link}, which is not a skill in your chezmoi source"
             )
         try:
-            return _rendered(name, path, _archive(path), links - 1)
+            return _rendered(command, name, path, _archive(command, path), links - 1)
         except NotManaged:
             raise ValueError(
                 f"{shown} links to {link}, which is not in your chezmoi source"
@@ -179,15 +214,16 @@ def _rendered(name, target, members, links):
     return entries
 
 
-def pack(names):
+def pack(names, state):
     """The bundle of skills ``names`` and its SHA-256; ValueError naming what is wrong.
 
     Entries are sorted (each folder before its contents), owned by nobody, dated 1970
     and keep only the executable bit, so the same skills always give the same bytes.
     """
+    command = _chezmoi(state)
     entries = []
     for name in sorted(names):
-        entries += _read_skill(name)
+        entries += _read_skill(command, name)
     entries.sort(key=lambda entry: entry[0].split("/"))
     if len(entries) > remote_probe.MAX_SKILL_ENTRIES:
         raise ValueError(f"The skills hold more than {remote_probe.MAX_SKILL_ENTRIES} entries")
@@ -214,14 +250,14 @@ def pack(names):
     return data, hashlib.sha256(data).hexdigest()
 
 
-def bundle(names, now=time.monotonic):
-    """``pack(names)``, reused for ``CACHE_SECONDS``."""
+def bundle(names, state, now=time.monotonic):
+    """``pack(names, state)``, reused for ``CACHE_SECONDS``."""
     key = (CHEZMOI, _home(), tuple(sorted(names)))
     with _lock:
         cached = _bundles.get(key)
         if cached and now() - cached[0] < CACHE_SECONDS:
             return cached[1], cached[2]
-    data, digest = pack(names)
+    data, digest = pack(names, state)
     with _lock:
         _bundles[key] = (now(), data, digest)
     return data, digest
@@ -258,9 +294,10 @@ def ensure(home, m, agent=None, account=None):
         syncing = _syncing.setdefault(m.id, threading.Lock())
     with syncing:
         try:
-            data, digest = bundle(m.skills)
+            data, digest = bundle(m.skills, home)
             state = _probe(home, m, "skills_status", STATUS_TIMEOUT)
-            if state["bundle"] != digest or any(state["roots"].values()):
+            # A folder that cannot be opened or made is not helped by installing again.
+            if state["bundle"] != digest or state["stale"]:
                 staged = machines.put_file(
                     home,
                     m,
@@ -289,7 +326,7 @@ def ensure(home, m, agent=None, account=None):
         return state
 
 
-def status(m):
+def status(m, home):
     """Worker ``m``'s skills as last seen, for the machine listing; None without ``skills``.
 
     ``state`` is ``in_sync`` (its last answer has this machine's current bundle in every
@@ -310,7 +347,7 @@ def status(m):
         "checked_at": last.get("checked_at"),
     }
     try:
-        _, digest = bundle(m.skills)
+        _, digest = bundle(m.skills, home)
     except (OSError, ValueError) as exc:
         return {**shown, "state": "error", "error": f"Cannot pack skills here: {exc}"}
     if last.get("error"):

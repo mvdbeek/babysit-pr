@@ -1005,12 +1005,18 @@ while `~/.local/share/chezmoi` is read-only to them. So a skill edited in place 
 workers only once it is in the chezmoi source (`chezmoi add` or `chezmoi re-add`, or a
 commit pulled there). A skill is the target `~/.claude/skills/<name>`, else
 `~/.codex/skills/<name>`, which `chezmoi archive --format=tar` renders (`dot_`,
-`executable_` and other source prefixes resolved, templates executed). chezmoi runs by
-absolute path (`/opt/homebrew/bin/chezmoi`, or `BABYSIT_CHEZMOI` in the dashboard's
-environment), with stdin closed, only this user's home (from the password database) and
-the system `PATH` in its environment, no TTY or pager, externals never refreshed
-(nothing is fetched; a template needing the network or a password manager fails) and a
-30 s deadline. A target chezmoi does not manage is refused: "not in your chezmoi source;
+`executable_` and other source prefixes resolved, templates executed; a `run_` script
+inside a skill's target is synced as a plain file, never run). chezmoi runs by absolute
+path (`/opt/homebrew/bin/chezmoi`, or `BABYSIT_CHEZMOI` in the dashboard's environment),
+with stdin closed, only this user's home (from the password database) and the system
+`PATH` in its environment, no TTY or pager, externals not refreshed and a 30 s deadline;
+a template needing a password manager fails. `~/.config/chezmoi` is not read, since its
+config could name another source or add hooks: chezmoi gets `--source` set to
+`~/.local/share/chezmoi` under that home, and an empty `--config`, its persistent state
+and its cache in `--home/chezmoi/` (private), so neither the user's config nor a cache
+an agent could write here steers what is rendered. Templates therefore see no `data` from
+the user's config, and an external under a skill's target would be downloaded into that
+cache rather than taken from the user's. A target chezmoi does not manage is refused: "not in your chezmoi source;
 add it with chezmoi add". A target that is a chezmoi symlink (as `~/.claude/skills/merge-forward`
 links to `~/.codex/skills/merge-forward`) is followed by asking chezmoi for the target
 it names, at most twice and only to another skill target, never through the file system.
@@ -1053,11 +1059,10 @@ Claude account's `~/.claude/accounts/<name>/skills`, the default configuration's
 babysit-bwrap binds an account's `skills` read-only and refuses a link there, and a link
 inside it to `~/.claude/skills` would dangle in the sandbox, so each gets real folders.
 A missing `skills` folder is made private (0700). `~/.claude` and Codex's home may be
-links a dotfile manager made; nothing below them is followed. babysit-bwrap binds a
-Claude configuration writable with only its own code (`skills` among it) read-only, and
-the default account's configuration is all of `~/.claude`, so a default-account agent can
-write every other account's folder, `skills` included (and on a Mac worker Safehouse may
-grant `~/.claude` and `~/.codex`): an account folder or `skills` folder that is a link is
+links a dotfile manager made; nothing below them is followed. babysit-bwrap binds each
+skills folder read-only and hides `~/.claude/accounts` from a default-account agent under
+a tmpfs, but on a Mac worker Safehouse may grant `~/.claude` and `~/.codex`, and an agent
+given Docker reaches every file of the user (see Residual below): an account folder or `skills` folder that is a link is
 left alone and reported, and every file is created and renamed relative to opened
 folders, without following links. Each skill is written as a new private copy beside the
 old one; on Linux the two are exchanged in one step (`renameat2` with

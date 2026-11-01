@@ -2293,11 +2293,11 @@ SKILL_DIGEST = re.compile(r"[0-9a-f]{64}")
 # or ``claude:<account>``.
 SKILL_ROOT = re.compile(r"codex|claude(:[A-Za-z0-9][A-Za-z0-9_-]{0,63})?")
 # The manifest of what the sync manages, and the bundles staged for it, live in the
-# state directory babysit-bwrap never lets an agent write. The skills folders are not
-# safe from agents: babysit-bwrap binds a Claude configuration writable with only its
-# own ``skills`` (among its code) read-only, and the default account's configuration is
-# all of ``~/.claude``, so its agents can write every other account's folder there,
-# ``skills`` included; on a Mac worker Safehouse may grant ``~/.claude`` and ``~/.codex``.
+# state directory babysit-bwrap never lets an agent write. babysit-bwrap binds each
+# skills folder read-only and hides ``~/.claude/accounts`` from a default-account agent
+# under a tmpfs, but the folders are still not the sync's alone: on a Mac worker
+# Safehouse may grant ``~/.claude`` and ``~/.codex``, and an agent given Docker reaches
+# every file of the user. So nothing below them is followed.
 SKILL_STATE = "~/.local/state/babysit-pr"
 SKILL_BUNDLES = SKILL_STATE + "/skill-bundles"
 SKILL_MANIFEST = "skills.json"
@@ -2510,6 +2510,8 @@ def _open_skill_root(shown, base, parts, create):
                 os.mkdir("skills", 0o700, dir_fd=fd)
             except FileExistsError:
                 pass
+            except OSError as exc:
+                raise ValueError(f"Cannot create {shown}: {exc.strerror}") from None
         try:
             root = os.open("skills", NO_FOLLOW_DIR, dir_fd=fd)
         except FileNotFoundError:
@@ -2765,19 +2767,24 @@ def _host_skills_status():
     """Whether the skills installed here are the bundle last installed.
 
     Answers the manifest's bundle hash; by skills folder (``SKILL_ROOT``) None when it
-    holds every skill as installed, else why not (missing, changed, unreadable); and
-    notes on folders left alone.
+    holds every skill as installed, else why not; the folders an install would mend
+    (``stale``: a copy missing, changed or not recorded yet, never a folder that cannot
+    be opened or made); and notes on folders left alone.
     """
     with _skill_lock(exclusive=False):
         manifest = _read_skill_manifest()
         roots, notes = _skill_roots()
         problems: dict[str, str | None] = {}
+        stale = []
         for key, shown, base, parts in roots:
             problems[key] = None
             try:
                 root = _open_skill_root(shown, base, parts, create=False)
             except ValueError as exc:
                 problems[key] = str(exc)
+                continue
+            if root is None and not os.access(os.path.dirname(shown), os.W_OK):
+                problems[key] = f"Cannot create {shown}: Permission denied"
                 continue
             recorded = set(manifest["roots"].get(shown, []))
             try:
@@ -2797,8 +2804,11 @@ def _host_skills_status():
             finally:
                 if root is not None:
                     os.close(root)
+            if problems[key]:
+                stale.append(key)
         return {
             "bundle": manifest["bundle"],
+            "stale": stale,
             "roots": {
                 key: None if said is None else _bounded_notes([said])[0]
                 for key, said in problems.items()
@@ -3332,7 +3342,10 @@ def validate_version(value):
 def validate_skills(value):
     """A worker's skills sync answer: the bundle installed, each skills folder's state
     (None, or why it lacks the bundle) and short notes on folders left alone."""
-    _expect(isinstance(value, dict) and set(value) == {"bundle", "roots", "skipped"}, "fields")
+    _expect(
+        isinstance(value, dict) and set(value) == {"bundle", "roots", "stale", "skipped"},
+        "fields",
+    )
     _expect(
         value["bundle"] is None
         or (isinstance(value["bundle"], str) and SKILL_DIGEST.fullmatch(value["bundle"])),
@@ -3351,6 +3364,11 @@ def validate_skills(value):
             for k, v in roots.items()
         ),
         "roots",
+    )
+    _expect(
+        isinstance(value["stale"], list)
+        and all(isinstance(k, str) and k in roots and roots[k] for k in value["stale"]),
+        "stale",
     )
     _expect(
         isinstance(value["skipped"], list)

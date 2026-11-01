@@ -40,6 +40,11 @@ def fresh_sync(monkeypatch):
 FAKE_CHEZMOI = """import io, json, os, stat, sys, tarfile, time
 STATE, LOG = {state!r}, {log!r}
 args = sys.argv[1:]
+planted = os.path.join(os.environ["HOME"], ".config/chezmoi/chezmoi.toml")
+if not any(a.startswith("--config=") for a in args) and os.path.exists(planted):
+    for line in open(planted):
+        if line.startswith("sourceDir"):
+            STATE = line.split("=", 1)[1].strip().strip('"')  # The user's config redirects.
 with open(LOG, "a") as log:
     stdin = stat.S_ISCHR(os.fstat(0).st_mode)
     log.write(json.dumps({{"argv": args, "env": dict(os.environ), "devnull": stdin}}) + "\\n")
@@ -93,6 +98,10 @@ def chezmoi(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setattr(skill_sync, "CHEZMOI", str(fake))
     monkeypatch.setattr(skill_sync, "HOME", str(home))
+    # The dashboard's own state home, where chezmoi's pinned config lives.
+    dashboard = tmp_path / "dashboard-home"
+    packing = skill_sync.pack
+    monkeypatch.setattr(skill_sync, "pack", lambda names, state=dashboard: packing(names, state))
 
     def calls():
         return [json.loads(line) for line in log.read_text().splitlines()]
@@ -252,13 +261,13 @@ def test_the_bundle_is_the_same_bytes_for_the_same_skills(skills):
     assert skill_sync.pack(["merge-forward", "wt-task"])[1] != digest
 
 
-def test_a_launch_burst_packs_once(skills):
+def test_a_launch_burst_packs_once(skills, tmp_path):
     clock = [100.0]
-    first = skill_sync.bundle(["merge-forward"], now=lambda: clock[0])
+    first = skill_sync.bundle(["merge-forward"], tmp_path, now=lambda: clock[0])
     (skills / "merge-forward" / "SKILL.md").write_text("changed\n")
-    assert skill_sync.bundle(["merge-forward"], now=lambda: clock[0]) == first
+    assert skill_sync.bundle(["merge-forward"], tmp_path, now=lambda: clock[0]) == first
     clock[0] += skill_sync.CACHE_SECONDS
-    assert skill_sync.bundle(["merge-forward"], now=lambda: clock[0]) != first
+    assert skill_sync.bundle(["merge-forward"], tmp_path, now=lambda: clock[0]) != first
 
 
 def test_skills_holding_anything_but_folders_and_files_are_refused(skills, tmp_path):
@@ -311,12 +320,25 @@ def test_a_skill_only_in_codexs_folder_is_found_there(skills):
     assert skill_sync.pack(["merge-forward"])[0] == data
 
 
-def test_chezmoi_runs_by_its_path_with_nothing_of_the_dashboards(skills, chezmoi, monkeypatch):
+def test_chezmoi_runs_by_its_path_with_nothing_of_the_dashboards(
+    skills, chezmoi, monkeypatch, tmp_path
+):
     state, calls = chezmoi
     monkeypatch.setenv("BABYSIT_SECRET_FOR_TEST", "1")
     skill_sync.pack(["wt-task"])
     [call] = calls()
-    assert call["argv"][:2] == ["archive", "--format=tar"]
+    folder = tmp_path / "dashboard-home" / "chezmoi"
+    assert call["argv"][:6] == [
+        f"--config={folder / 'chezmoi.toml'}",
+        "--config-format=toml",
+        f"--source={skill_sync.HOME}/.local/share/chezmoi",
+        f"--persistent-state={folder / 'chezmoistate.boltdb'}",
+        f"--cache={folder / 'cache'}",
+        "archive",
+    ]
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    assert (folder / "chezmoi.toml").read_text() == ""
+    assert stat.S_IMODE((folder / "chezmoi.toml").stat().st_mode) == 0o600
     assert "--refresh-externals=never" in call["argv"] and "--no-tty" in call["argv"]
     assert call["devnull"] is True
     environment = {k: v for k, v in call["env"].items() if not k.startswith("__CF")}
@@ -327,6 +349,23 @@ def test_chezmoi_runs_by_its_path_with_nothing_of_the_dashboards(skills, chezmoi
     }
     monkeypatch.setattr(skill_sync, "CHEZMOI", "chezmoi")
     with pytest.raises(ValueError, match="absolute path"):
+        skill_sync.pack(["wt-task"])
+
+
+def test_the_users_chezmoi_config_never_redirects_the_source(skills, chezmoi, tmp_path):
+    evil = tmp_path / "evil-state"
+    (evil / ".claude/skills/wt-task").mkdir(parents=True)
+    (evil / ".claude/skills/wt-task/SKILL.md").write_text("planted\n")
+    planted = Path(skill_sync.HOME) / ".config/chezmoi/chezmoi.toml"
+    planted.parent.mkdir(parents=True)
+    planted.write_text(f'sourceDir = "{evil}"\n')
+    data, _ = skill_sync.pack(["wt-task"])
+    skills_found = remote_probe.skill_entries(data)
+    [content] = [c for path, _, _, c in skills_found["wt-task"] if path == "SKILL.md"]
+    assert content.endswith(b"Hand off.\n")
+    # The pinned config stays empty: one with content is refused, not used.
+    (tmp_path / "dashboard-home/chezmoi/chezmoi.toml").write_text('sourceDir = "/x"\n')
+    with pytest.raises(ValueError, match="must be an empty file"):
         skill_sync.pack(["wt-task"])
 
 
@@ -445,8 +484,13 @@ ROOT_KEYS = {"claude": None, "claude:oss": None, "claude:psu": None, "codex": No
 
 def test_a_worker_gets_the_skills_in_every_skills_folder(skills, worker_home):
     data, digest = skill_sync.pack(["merge-forward", "wt-task"])
-    assert status() == {"bundle": None, "roots": ROOT_KEYS, "skipped": []}
-    assert install(worker_home, data) == {"bundle": digest, "roots": ROOT_KEYS, "skipped": []}
+    assert status() == {"bundle": None, "roots": ROOT_KEYS, "stale": [], "skipped": []}
+    assert install(worker_home, data) == {
+        "bundle": digest,
+        "roots": ROOT_KEYS,
+        "stale": [],
+        "skipped": [],
+    }
     for root in ROOTS:
         copy = worker_home / root
         assert stat.S_IMODE(copy.stat().st_mode) == 0o700
@@ -560,11 +604,32 @@ def test_an_unwritable_skills_folder_says_why(skills, worker_home):
         assert answer["bundle"] == digest
         assert (
             answer["roots"]["claude:psu"]
-            == f"Cannot open {psu.resolve()}/skills: Permission denied"
+            == f"Cannot create {psu.resolve()}/skills: Permission denied"
         )
         assert answer["roots"]["claude:oss"] is None
     finally:
         psu.chmod(0o700)
+
+
+def test_an_installed_copy_holding_a_hard_link_is_replaced_not_read(skills, worker_home):
+    data, _ = skill_sync.pack(["merge-forward"])
+    install(worker_home, data)
+    token = worker_home / "token"
+    token.write_text("secret\n")
+    installed = worker_home / ".codex/skills/merge-forward/SKILL.md"
+    installed.unlink()
+    os.link(token, installed)
+    fd = os.open(installed.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ValueError, match="SKILL.md has other names"):
+            remote_probe.read_skill_tree(fd, "merge-forward")
+    finally:
+        os.close(fd)
+    assert status()["roots"]["codex"].endswith("merge-forward was changed")
+    assert "codex" in status()["stale"]
+    install(worker_home, data)
+    assert installed.read_text().endswith("Merge.\n") and installed.stat().st_nlink == 1
+    assert token.read_text() == "secret\n"
 
 
 def test_a_sync_interrupted_midway_is_cleaned_up_by_the_next(skills, worker_home):
@@ -691,11 +756,13 @@ def test_a_damaged_manifest_stops_the_sync(skills, worker_home):
 @pytest.mark.parametrize(
     "answer",
     [
-        {"bundle": "main", "roots": {}, "skipped": []},
-        {"bundle": None, "roots": {"codex": "a\x1b[2Jb"}, "skipped": []},
-        {"bundle": None, "roots": {"claude:../x": None}, "skipped": []},
-        {"bundle": None, "roots": {"elsewhere": None}, "skipped": []},
-        {"bundle": None, "roots": {}, "skipped": ["x"] * 33},
+        {"bundle": "main", "roots": {}, "stale": [], "skipped": []},
+        {"bundle": None, "roots": {"codex": "a\x1b[2Jb"}, "stale": [], "skipped": []},
+        {"bundle": None, "roots": {"claude:../x": None}, "stale": [], "skipped": []},
+        {"bundle": None, "roots": {"elsewhere": None}, "stale": [], "skipped": []},
+        {"bundle": None, "roots": {}, "stale": [], "skipped": ["x"] * 33},
+        {"bundle": None, "roots": {"codex": None}, "stale": ["codex"], "skipped": []},
+        {"bundle": None, "roots": {}, "stale": ["claude"], "skipped": []},
         {"bundle": None, "roots": {}},
     ],
 )
@@ -734,29 +801,32 @@ def test_a_worker_is_synced_only_when_its_skills_differ(skills, worker_home, in_
     controller, calls = in_process
     write(controller, skills=["merge-forward", "wt-task"])
     m = machines.load(controller)["chonk"]
-    assert skill_sync.status(m)["state"] == "unknown"
-    _, digest = skill_sync.bundle(m.skills)
+    assert skill_sync.status(m, controller)["state"] == "unknown"
+    _, digest = skill_sync.bundle(m.skills, controller)
     assert skill_sync.ensure(controller, m, "claude", "oss")["bundle"] == digest
     assert calls == ["skills_status", "put_file", "skills_install"]
-    assert skill_sync.status(m)["state"] == "in_sync"
+    assert skill_sync.status(m, controller)["state"] == "in_sync"
     calls.clear()
     skill_sync.ensure(controller, m, "codex")
     assert calls == ["skills_status"]
     # A skill edited here goes out once the packing is due again.
     (skills / "merge-forward" / "SKILL.md").write_text("new\n")
     skill_sync._bundles.clear()
-    assert skill_sync.status(m)["state"] == "out_of_date"
+    assert skill_sync.status(m, controller)["state"] == "out_of_date"
     skill_sync.ensure(controller, m)
     assert (worker_home / ".codex/skills/merge-forward/SKILL.md").read_text() == "new\n"
     # Without the key nothing is asked of the worker.
     calls.clear()
     plain = m._replace(skills=None)
-    assert skill_sync.ensure(controller, plain) is None and skill_sync.status(plain) is None
+    assert (
+        skill_sync.ensure(controller, plain) is None
+        and skill_sync.status(plain, controller) is None
+    )
     assert calls == []
 
 
 def test_only_the_launchs_own_unwritable_folder_stops_it(skills, worker_home, in_process):
-    controller, _ = in_process
+    controller, calls = in_process
     write(controller, skills=["merge-forward"])
     m = machines.load(controller)["chonk"]
     psu = worker_home / ".claude/accounts/psu"
@@ -764,14 +834,18 @@ def test_only_the_launchs_own_unwritable_folder_stops_it(skills, worker_home, in
     try:
         # Another account's folder is reported, not fatal.
         skill_sync.ensure(controller, m, "claude", "oss")
-        shown = skill_sync.status(m)
+        # Nor installed again at every launch: installing cannot mend it.
+        calls.clear()
+        skill_sync.ensure(controller, m, "claude", "oss")
+        assert calls == ["skills_status"]
+        shown = skill_sync.status(m, controller)
         assert shown["state"] == "partial"
         assert shown["problems"] == {
-            "claude:psu": f"Cannot open {psu.resolve()}/skills: Permission denied"
+            "claude:psu": f"Cannot create {psu.resolve()}/skills: Permission denied"
         }
         with pytest.raises(
             ValueError,
-            match="^Cannot sync skills to chonk: Cannot open .*psu/skills: Permission denied$",
+            match="^Cannot sync skills to chonk: Cannot create .*psu/skills: Permission denied$",
         ):
             skill_sync.ensure(controller, m, "claude", "psu")
         with pytest.raises(ValueError, match="has no skills folder for claude:gone"):
@@ -788,7 +862,7 @@ def test_a_sync_that_cannot_happen_says_why(skills, worker_home, in_process, mon
         ValueError, match="^Cannot sync skills to chonk: gone is not in your chezmoi source"
     ):
         skill_sync.ensure(controller, m)
-    shown = skill_sync.status(m)
+    shown = skill_sync.status(m, controller)
     assert shown["state"] == "error" and "gone is not in your chezmoi source" in shown["error"]
 
     def unreachable(home, m, op, timeout, **args):
@@ -798,7 +872,7 @@ def test_a_sync_that_cannot_happen_says_why(skills, worker_home, in_process, mon
     m = m._replace(skills=("merge-forward",))
     with pytest.raises(ValueError, match="chonk did not answer within 30 seconds"):
         skill_sync.ensure(controller, m)
-    assert skill_sync.status(m)["state"] == "error"
+    assert skill_sync.status(m, controller)["state"] == "error"
 
 
 def test_a_worker_cron_run_syncs_skills_before_anything_else(tmp_path, monkeypatch):
@@ -917,4 +991,20 @@ def test_a_scheduled_review_whose_skills_cannot_sync_never_starts(remote, skills
     assert op["message"].startswith(
         "Cannot sync skills to Mac mini: gone is not in your chezmoi source"
     )
+    assert not [c for c in remote_commands(state) if "wt.py" in c]
+
+
+def test_a_subtask_whose_skills_cannot_sync_never_starts(remote, chezmoi):  # noqa: F811
+    from test_machine_loads import settle
+    from test_subtasks import launch, parent
+
+    manager, _, state, _ = remote
+    register(manager.home, skills=["gone"])
+    manager.loads.snapshot()
+    settle(manager.loads)
+    asked = parent(machine="mini", machine_label="Mac mini", sandbox="bwrap")
+    op = manager.subtask(launch(machine="mini"), asked)["operation"]
+    op = manager.await_operation(op, 30)
+    assert op["status"] == "failed", op
+    assert op["message"].startswith("Cannot sync skills to Mac mini: gone is not in your")
     assert not [c for c in remote_commands(state) if "wt.py" in c]
