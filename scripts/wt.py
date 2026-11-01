@@ -48,6 +48,31 @@ PR_URL = re.compile(GITHUB + r"pull/([0-9]+)")
 UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 CONFIG_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 HERDR_RUNNING = re.compile(r'"running"\s*:\s*true')
+# A worker's registry id (machines.ID), and the dashboard that places launches on one.
+MACHINE = re.compile(r"[a-z][a-z0-9-]{0,23}")
+DASHBOARD = "http://127.0.0.1:8765"
+# How often, and for how long, a launch on a worker is followed through the dashboard.
+LAUNCH_POLL = 5.0
+LAUNCH_WAIT = 900
+# What a launch on a worker asks the controller for (see launch_request), and the new
+# branch names its New task takes (pr_workspaces.BRANCH_NAME is this one).
+LAUNCH_FIELDS = (
+    "repo",
+    "base",
+    "name",
+    "agent",
+    "model",
+    "effort",
+    "claude_account",
+    "task",
+    "docker",
+    "exit_when_done",
+    "permission_mode",
+    "machine",
+)
+LAUNCH_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+# Why `wt` without a brief stays here: said only when a worker was asked for by name or auto.
+NO_PROMPT = "a launch on a worker needs a prompt (-p or -F)"
 
 VALUE_OPTIONS = {
     "-r": "repo",
@@ -66,6 +91,7 @@ VALUE_OPTIONS = {
     "--worktree-root": "worktree_root",
     "--agent-arg": "agent_args",
     "--with": "also",
+    "--machine": "machine",
 }
 WT_OPTIONS = frozenset(
     {
@@ -83,6 +109,7 @@ WT_OPTIONS = frozenset(
         "--prompt-file",
         "--with",
         "--exit-when-done",
+        "--machine",
     }
 )
 DASHBOARD_OPTIONS = frozenset(
@@ -137,6 +164,10 @@ options:
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --exit-when-done  have the dashboard exit the agent once it says the task is done
+  --machine <id>|auto|local  start the agent on a worker of the dashboard's machine
+                registry (auto: where the dashboard's Auto places it) instead of
+                here; --docker alone means auto when the registry prefers a Docker
+                worker. A worker takes only a new <branch> from <base> with a prompt
   -h, --help    show this help
 
 dashboard options (a new branch from the remote default branch unless <base> is given):
@@ -193,6 +224,8 @@ options:
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --exit-when-done  have the dashboard exit the agent once it says the task is done
                 (see wt --help)
+  --machine <id>|auto|local  only this machine: workers take new branches from wt
+                (see wt --help), so auto runs here and a worker is refused
   --name <name>           reserve a new worktree and branch with this explicit name
   --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
@@ -231,6 +264,8 @@ options:
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --exit-when-done  have the dashboard exit the agent once it says the task is done
                 (see wt --help)
+  --machine <id>|auto|local  only this machine: workers take new branches from wt
+                (see wt --help), so auto runs here and a worker is refused
   --name <name>           reserve a new worktree and branch with this explicit name
   --label <label>         herdr workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
@@ -257,6 +292,10 @@ class UsageError(WtError):
     def __init__(self, command: str, message: str):
         super().__init__(message)
         self.command = command
+
+
+class NotForWorker(ValueError):
+    """Why a run cannot start on a worker: Auto runs it here, a named worker refuses it."""
 
 
 class HelpRequested(Exception):
@@ -299,6 +338,7 @@ class Options:
         "exit_when_done",
         "exit_watch_json",
         "gpg",
+        "machine",
         "positional",
     )
 
@@ -328,6 +368,8 @@ class Options:
         # On a worker: print the exit watch for the controller instead of recording it.
         self.exit_watch_json = False
         self.gpg = False
+        # `--machine`: a worker's registry id, auto or local; empty when not given.
+        self.machine = ""
         self.positional: list[str] = []
 
 
@@ -442,6 +484,42 @@ def validate_agent_options(agent: str, model: str, effort: str, permission_mode:
 def validate_name(name: str, command: str) -> None:
     if name and (not NAME.fullmatch(name) or ".." in name):
         raise WtError(f"{command}: --name must be a simple worktree name")
+
+
+def dashboard_run(options: Options) -> bool:
+    """Whether the dashboard runs this ``wt``: it always passes some dashboard option."""
+    return bool(
+        options.name
+        or options.label
+        or options.repo_path
+        or options.github_repo
+        or options.worktree_root
+        or options.agent_args
+        or options.gpg
+        or options.exit_watch_json
+        or not options.focus
+    )
+
+
+def worker_refusal(command: str, options: Options) -> str:
+    """Why this run cannot start on a worker, or empty when it can.
+
+    The dashboard starts a new task there: a new branch from a base, with a brief. Issues,
+    pull requests and other clones it does not start on workers yet, and ``wt <branch>``
+    opens a branch that exists.
+    """
+    first = options.positional[0] if options.positional else ""
+    if command == "wti" or first in ("issue", "i"):
+        return "workers do not take issue work yet"
+    if command == "wtpr" or DIGITS.fullmatch(first) or parse_pr_url(first):
+        return "wt starts only new branches on a worker; use Handle in the dashboard for a pull request"
+    if options.also:
+        return "workers cannot check out other repositories (--with) yet"
+    if not options.prompt:
+        return NO_PROMPT
+    if len(options.positional) < 2:
+        return "a worker takes only a new branch from a base (wt <base> <branch>)"
+    return ""
 
 
 def parse_issue_url(value: str) -> tuple[str, str, str] | None:
@@ -889,6 +967,145 @@ class SubprocessRunner:
 
     def which(self, name: str) -> str | None:
         return find_executable(name, self.env)
+
+
+# --- launches on worker machines ----------------------------------------------------
+
+
+def launch_request(command: str, options: Options, repo: str, machine: str) -> dict[str, object]:
+    """The New task a launch on a worker asks the controller for: exactly LAUNCH_FIELDS.
+
+    Every field is checked here as the controller checks it, so any transport (the local
+    dashboard's API, or a sandbox's broker) carries one shape: ``repo`` (``owner/name``),
+    ``base`` and ``name`` (the new branch: ``options.positional``), ``agent``, ``model``,
+    ``effort``, ``claude_account``, ``task`` (the brief), ``docker``, ``exit_when_done``,
+    ``permission_mode`` (empty or ``auto``) and ``machine`` (a registry id or ``auto``).
+    A field a worker launch cannot take raises NotForWorker; agent options that are
+    wrong anywhere raise WtError.
+    """
+    import remote_probe  # The branch names a worker's probe takes, as New task checks them.
+
+    validate_agent_options(options.agent, options.model, options.effort, options.permission_mode)
+    if options.agent not in ("codex", "claude"):
+        raise WtError(f"{command}: unknown agent {options.agent}")
+    if len(options.positional) < 2:
+        raise NotForWorker("a worker takes only a new branch from a base (wt <base> <branch>)")
+    base, name = options.positional[:2]
+    checks = [
+        (REPO_SLUG.fullmatch(repo) and repo.split("/")[1] not in (".", ".."), "repository"),
+        (
+            LAUNCH_BRANCH.fullmatch(name) and ".." not in name,
+            "new branch for a worker (letters, digits, '.', '_' and '-')",
+        ),
+        (remote_probe.BRANCH.fullmatch(base) and ".." not in base, "base branch for a worker"),
+        (
+            not options.claude_account or claude_accounts.NAME.fullmatch(options.claude_account),
+            "Claude account for a worker",
+        ),
+        (
+            options.prompt.strip() and len(options.prompt) <= 32000 and "\0" not in options.prompt,
+            "brief for a worker (1-32,000 characters)",
+        ),
+        (machine == "auto" or MACHINE.fullmatch(machine), "machine"),
+    ]
+    for ok, field in checks:
+        if not ok:
+            raise NotForWorker(f"not a valid {field}")
+    return {
+        "repo": repo,
+        "base": base,
+        "name": name,
+        "agent": options.agent,
+        "model": options.model,
+        "effort": options.effort,
+        "claude_account": options.claude_account,
+        "task": options.prompt,
+        "docker": options.docker,
+        "exit_when_done": options.exit_when_done,
+        "permission_mode": options.permission_mode,
+        "machine": machine,
+    }
+
+
+class DashboardTransport:
+    """A launch through this machine's dashboard API: ``$BABYSIT_DASHBOARD_URL`` or
+    127.0.0.1:8765, reachable unsandboxed and from inside Safehouse.
+
+    A transport offers ``place`` (where Auto would put a ``launch_request``), ``start``
+    (the New task's operation) and ``status`` (that operation now).
+    """
+
+    def __init__(self, tool: Tool, command: str):
+        self.command = command
+        self.base = (tool.env.get("BABYSIT_DASHBOARD_URL") or DASHBOARD).rstrip("/")
+
+    def place(self, request: Mapping[str, object]) -> dict[str, object]:
+        import urllib.parse
+
+        query = {"kind": "scratch", "repo": request["repo"], "agent": request["agent"]}
+        if request["docker"]:
+            query["docker"] = "1"
+        if request["agent"] == "claude" and request["claude_account"]:
+            query["account"] = request["claude_account"]
+        return self.call("/api/placement?" + urllib.parse.urlencode(query))
+
+    def start(self, request: Mapping[str, object]) -> dict[str, object]:
+        op = self.call("/api/workspace-new", dict(request)).get("operation")
+        if not isinstance(op, dict) or not isinstance(op.get("pr"), str):
+            raise WtError(
+                f"{self.command}: the dashboard answered the launch unexpectedly; it may "
+                "have started, so check the dashboard before retrying"
+            )
+        return op
+
+    def status(self, op: Mapping[str, object]) -> dict[str, object] | None:
+        """The operation now, None once the dashboard no longer lists it."""
+        listed = self.call("/api/workspaces").get("new") or {}
+        found = (listed.get(op["pr"]) or {}).get("operation")
+        return found if isinstance(found, dict) else None
+
+    def call(self, path: str, body: dict[str, object] | None = None):
+        """One JSON request to the dashboard; refusals carry its reason."""
+        import urllib.error
+        import urllib.request
+
+        headers = {}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            # The dashboard's own guard against browsers: a custom header and no Origin.
+            headers = {
+                "Content-Type": "application/json",
+                "X-Babysit-Action": path.rsplit("/", 1)[1],
+            }
+        request = urllib.request.Request(self.base + path, data=data, headers=headers)
+        # No proxy from the environment: the dashboard is on this machine.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=120) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error")
+            except (ValueError, AttributeError):
+                detail = None
+            raise WtError(
+                f"{self.command}: the dashboard refused: {detail or f'HTTP {exc.code}'}"
+            ) from None
+        except (OSError, ValueError) as exc:
+            # urllib wraps what fails while connecting and sending in URLError; anything
+            # after (a read timeout, a reset, an answer that is not JSON) may follow a
+            # launch the dashboard already took.
+            if body is not None and not isinstance(exc, urllib.error.URLError):
+                raise WtError(
+                    f"{self.command}: the launch may have started ({exc or type(exc).__name__}); "
+                    "check the dashboard before retrying"
+                ) from None
+            reason = getattr(exc, "reason", None) or exc
+            raise WtError(
+                f"{self.command}: cannot reach the dashboard at {self.base} ({reason}), which "
+                "starts launches on workers; start it, or pass --machine local to run here"
+            ) from None
 
 
 # --- the tool ------------------------------------------------------------------------
@@ -1763,6 +1980,144 @@ class Tool:
                 f"{command}: --exit-when-done cannot record its watch in {self.babysit_home}: {exc}"
             ) from None
 
+    def chosen_machine(self, command: str, options: Options) -> str:
+        """Where this run starts: ``local``, ``auto`` or a worker's registry id.
+
+        Without ``--machine``, ``--docker`` means ``auto`` on the controller when its
+        registry prefers a Docker worker. Runs the dashboard makes, and runs on a worker,
+        always stay where they are.
+        """
+        machine = options.machine
+        if machine not in ("", "auto", "local") and not MACHINE.fullmatch(machine):
+            raise UsageError(command, f"{command}: --machine takes a machine id, auto or local")
+        if machine in ("", "local"):
+            implicit = (
+                not machine
+                and options.docker
+                and not dashboard_run(options)
+                and not self.on_worker()
+                and self.docker_worker(command)
+            )
+            return "auto" if implicit else "local"
+        if self.on_worker():
+            raise WtError(
+                f"{command}: --machine {machine}: this is a worker; only the controller "
+                "starts launches on other machines"
+            )
+        if dashboard_run(options):
+            raise UsageError(
+                command, f"{command}: --machine cannot be combined with the dashboard options"
+            )
+        return machine
+
+    def docker_worker(self, command: str) -> str | None:
+        """The worker the controller's registry prefers for Docker, if any."""
+        path = os.path.join(self.babysit_home, "machines.json")
+        if not os.path.exists(path):
+            return None
+        import machines
+
+        try:
+            config = machines.load_config(self.babysit_home)
+        except (OSError, ValueError) as exc:
+            self.warn(f"{command}: cannot read {path} ({exc}); --docker runs here")
+            return None
+        return config["docker"]["prefer"] if config else None
+
+    def transport(self, command: str) -> DashboardTransport:
+        """How this run reaches the controller's placement and New task."""
+        return DashboardTransport(self, command)
+
+    def launch_elsewhere(self, command: str, options: Options, machine: str) -> bool:
+        """Start this run on a worker through the controller's New task; False to run it here.
+
+        ``auto`` asks the controller's placement first and runs here when it says so, or
+        when a worker cannot start this kind of run; a worker named outright refuses it.
+        """
+        try:
+            request = self.worker_request(command, options, machine)
+        except NotForWorker as exc:
+            if machine != "auto":
+                raise WtError(f"{command}: --machine {machine}: {exc}") from None
+            # `--docker` alone asked for no worker: a run without a brief stays quietly.
+            if options.machine or str(exc) != NO_PROMPT:
+                self.warn(f"{command}: {exc}; running here")
+            return False
+        transport = self.transport(command)
+        if machine == "auto":
+            placed = transport.place(request)
+            if placed.get("error"):
+                raise WtError(f"{command}: {placed['error']}")
+            if not isinstance(placed.get("machine"), str):
+                raise WtError(f"{command}: the dashboard answered the placement unexpectedly")
+            if placed.get("machine") == "local":
+                self.warn(f"{command}: {placed.get('reason')}; running here")
+                return False
+            request["machine"] = str(placed["machine"])
+            self.warn(f"{command}: {placed.get('reason')}; starting on {placed.get('label')}")
+        self.follow_launch(command, transport, transport.start(request))
+        return True
+
+    def worker_request(self, command: str, options: Options, machine: str) -> dict[str, object]:
+        """This run's launch_request, or NotForWorker when it belongs here.
+
+        A new branch that already exists here, as a branch or a worktree directory, stays
+        with its clone: on a worker it would become a second, diverging branch.
+        """
+        refusal = worker_refusal(command, options)
+        if refusal:
+            raise NotForWorker(refusal)
+        repo_path = os.path.join(self.home, "src", options.repo)
+        remotes = self.remote_slugs(repo_path)
+        slug = remotes.get("upstream") or remotes.get("origin")
+        if not slug:
+            raise NotForWorker(f"no GitHub upstream or origin remote in {repo_path}")
+        branch = options.positional[1]
+        directory = os.path.join(self.home, "src", "worktrees", options.repo, branch)
+        if os.path.lexists(directory) or self.branch_exists(repo_path, branch):
+            raise NotForWorker(f"{branch} already exists here")
+        return launch_request(command, options, slug, machine)
+
+    def follow_launch(
+        self, command: str, transport: DashboardTransport, op: dict[str, object]
+    ) -> None:
+        """Wait for the controller's launch to finish, reporting its progress on stderr."""
+        import time
+
+        deadline = time.monotonic() + LAUNCH_WAIT
+        said = None
+        while True:
+            if op.get("message") != said:
+                said = op.get("message")
+                self.warn(f"{command}: {said}")
+            status = op.get("status")
+            if status == "complete":
+                result = op.get("result")
+                if isinstance(result, dict):
+                    where = f"{result.get('branch')} at {result.get('path')}"
+                    url = f" ({result['url']})" if result.get("url") else ""
+                    self.warn(f"{command}: {where} on {result.get('machine_label')}{url}")
+                return
+            if status in ("failed", "uncertain"):
+                note = "" if status == "failed" else "; check the dashboard before retrying"
+                raise WtError(f"{command}: the launch {status}: {said}{note}")
+            if time.monotonic() >= deadline:
+                raise WtError(f"{command}: still launching; follow it in the dashboard")
+            time.sleep(LAUNCH_POLL)
+            try:
+                found = transport.status(op)
+            except WtError as exc:
+                # The launch was handed over: never suggest starting it a second time here.
+                raise WtError(
+                    f"{command}: lost track of the launch ({exc}); check the dashboard "
+                    "before retrying"
+                ) from None
+            if found is None:
+                raise WtError(
+                    f"{command}: the dashboard no longer lists the launch; check it before retrying"
+                )
+            op = found
+
     def on_worker(self) -> bool:
         """Whether this is a worker machine: provisioning marks it, and launches say so."""
         marker = os.path.join(self.home, ".config", "babysit-pr", "worker.json")
@@ -1772,6 +2127,9 @@ class Tool:
         options = parse_args(command, argv)
         if options.exit_watch_json and not options.exit_when_done:
             raise UsageError(command, f"{command}: --exit-watch-json needs --exit-when-done")
+        machine = self.chosen_machine(command, options)
+        if machine != "local" and self.launch_elsewhere(command, options, machine):
+            return
         if options.exit_when_done:
             self.check_exit_when_done(options, command)
         also = []

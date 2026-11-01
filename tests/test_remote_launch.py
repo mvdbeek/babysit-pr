@@ -317,6 +317,15 @@ def test_a_new_task_on_a_worker_branches_in_its_clone(remote):
     assert op["status"] == "complete" and op["path"].endswith("/try-2")
 
 
+def test_a_new_task_on_a_worker_keeps_claudes_auto_permission_mode(remote):
+    manager, _, state, _ = remote
+    task = new_request(manager, name="careful", agent="claude", permission_mode="auto")
+    # Typed as `safe claude …`, which the fake worker cannot run: only the launch counts.
+    finish(manager, manager.new_task({**task, "machine": "mini"})["operation"]["pr"])
+    [launch] = [c for c in remote_commands(state) if "wt.py" in c]
+    assert " --claude --permission-mode auto " in launch
+
+
 def test_a_worker_with_gpg_lets_its_agent_sign(remote):
     manager, pr, state, _ = remote
     register(manager.home, labels=["safehouse", "gpg"])
