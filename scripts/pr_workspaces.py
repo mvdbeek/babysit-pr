@@ -1588,6 +1588,8 @@ class Workspaces:
             "also",
             "also_bases",
             "machine",
+            # `wt --permission-mode auto`, from a `wt` that hands its launch here.
+            "permission_mode",
         }
         flags = {"docker", "exit_when_done"}
         also = request.get("also", [])
@@ -1658,6 +1660,10 @@ class Workspaces:
         workspace_agents.validate(
             agent, request.get("model", ""), request.get("effort", ""), self.home
         )
+        if request.get("permission_mode", "") not in {"", "auto"} or (
+            request.get("permission_mode") and agent != "claude"
+        ):
+            raise ValueError("Only Claude takes a permission mode, and only auto")
         validate_account(agent, request.get("claude_account"), remote)
         task = request.get("task", "")
         if not task.strip() or len(task) > 32000 or "\0" in task:
@@ -1698,6 +1704,7 @@ class Workspaces:
             "effort": request.get("effort") or None,
             "claude_account": request.get("claude_account") or None,
             "docker": request.get("docker", False),
+            "permission_mode": request.get("permission_mode") or None,
             "exit_when_done": request.get("exit_when_done", False),
             "also": also,
             **({"also_bases": bases} if bases else {}),
@@ -2663,6 +2670,7 @@ class Workspaces:
                         f"--{op['agent']}",
                         *overrides,
                         *(["--docker"] if op.get("docker") else []),
+                        *(["--permission-mode", "auto"] if op.get("permission_mode") else []),
                         *(["--exit-when-done"] if op.get("exit_when_done") else []),
                         *(
                             word
@@ -2898,6 +2906,7 @@ class Workspaces:
                     f"--{op['agent']}",
                     *overrides,
                     *(["--docker"] if op.get("docker") else []),
+                    *(["--permission-mode", "auto"] if op.get("permission_mode") else []),
                     *(["--gpg"] if "gpg" in machine.labels else []),
                     *(
                         ["--exit-when-done", "--exit-watch-json"]
