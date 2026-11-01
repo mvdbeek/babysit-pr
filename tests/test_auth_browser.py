@@ -7,6 +7,7 @@ here contacts a real identity provider or the live dashboard.
 import threading
 
 import dashboard
+import dashboard_auth
 import pytest
 from dashboard_auth import Auth, OidcConfig
 from oidc_provider import CLIENT_ID, CLIENT_SECRET, Provider
@@ -16,7 +17,9 @@ pytestmark = pytest.mark.browser
 
 
 @pytest.fixture
-def signed_site(tmp_path):
+def signed_site(tmp_path, monkeypatch):
+    # Enforce refuses to start before Phase 2; this exercises the page under it anyway.
+    monkeypatch.setenv(dashboard_auth.ALLOW_OWN_ROUTES_ENV, "1")
     state = tmp_path / "state"
     state.mkdir()
     with Provider() as provider:

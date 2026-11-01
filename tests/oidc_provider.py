@@ -61,6 +61,8 @@ class Provider(ThreadingHTTPServer):
         self.sign_with: str | None = None  # "none" or "HS256" to forge a token.
         self.discovery_issuer: str | None = None
         self.user = {"sub": "user-1", "preferred_username": "alice", "roles": [ROLE]}
+        self.extra_jwks: list = []  # Served before the real keys.
+        self.discovery_requests = 0
         self.jwks_requests = 0
         self.token_requests = 0
         self.thread = threading.Thread(target=self.serve_forever, args=(0.05,), daemon=True)
@@ -133,6 +135,7 @@ class _Handler(BaseHTTPRequestHandler):
         base = provider.issuer
         query = {k: v[0] for k, v in parse_qs(route.query).items()}
         if route.path == "/realms/test/.well-known/openid-configuration":
+            provider.discovery_requests += 1
             self.reply(
                 200,
                 {
@@ -145,7 +148,8 @@ class _Handler(BaseHTTPRequestHandler):
             )
         elif route.path == "/realms/test/certs":
             provider.jwks_requests += 1
-            self.reply(200, {"keys": [jwk(kid, key) for kid, key in provider.keys.items()]})
+            keys = [jwk(kid, key) for kid, key in provider.keys.items()]
+            self.reply(200, {"keys": provider.extra_jwks + keys})
         elif route.path == "/realms/test/auth":
             # Signs the user straight in, as a provider with a live SSO session does.
             if (

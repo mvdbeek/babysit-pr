@@ -111,6 +111,89 @@ WORKER_ACTIONS = {
 }
 
 
+# The browser actions post() accepts, each at /api/<action>.
+ACTIONS = frozenset(
+    {
+        "cancel",
+        "feedback",
+        "feedback-addressed",
+        "workspace-action",
+        "workspace-batch",
+        "workspace-new",
+        "workspace-subtask",
+        "schedule-cancel",
+        "workspace-cleanup",
+        "workspace-open",
+        "workspace-message",
+        "workspace-answer",
+        "workspace-choose",
+        "workspace-docker",
+        "workspace-interrupt",
+        "workspace-quit",
+        "workspace-prompt-forget",
+        "attachment-upload",
+        "sentry-action",
+        "cron-action",
+        "push-subscribe",
+        "push-unsubscribe",
+        "push-read",
+        "push-seen",
+        "notification-silence",
+        "notification-focus",
+        "attention-triage",
+        "extension-pair",
+        "effort-default",
+        "settings",
+        "codex-update",
+        "worker-update",
+        "service-restart",
+        "voice-turn",
+        "voice-log",
+    }
+)
+# Every API route this dashboard answers: the report names only these, so anonymous
+# requests cannot grow it.
+API_ROUTES = frozenset(
+    {
+        "/api/attention",
+        "/api/auth-report",
+        "/api/codex-update",
+        "/api/cron",
+        "/api/cron-log",
+        "/api/issues",
+        "/api/llm-usage",
+        "/api/log",
+        "/api/machines",
+        "/api/notification-preferences",
+        "/api/placement",
+        "/api/pr-ci",
+        "/api/pr-ci-log",
+        "/api/pr-reviews",
+        "/api/prs",
+        "/api/push-config",
+        "/api/scheduled-tasks",
+        "/api/sentry",
+        "/api/service",
+        "/api/session",
+        "/api/settings",
+        "/api/status",
+        "/api/upstream-tests",
+        "/api/voice-turn",
+        "/api/watch",
+        "/api/workspace-agents",
+        "/api/workspace-diff",
+        "/api/workspace-overview",
+        "/api/workspace-prompts",
+        "/api/workspace-repos",
+        "/api/workspace-transcript",
+        "/api/workspaces",
+    }
+    | {f"/api/{action}" for action in ACTIONS}
+    | {f"/api/worker/{action}" for action in worker_api.ACTIONS}
+    | {"/api/extension"}
+)
+
+
 def viewed_workspace(home, value):
     """A workspace ID from a view request as (machine, ID): ``w1`` on this machine, or
     ``<machine>/w1`` on a registered worker, whose checkout its views read there."""
@@ -692,10 +775,10 @@ class Handler(BaseHTTPRequestHandler):
         if path is not None and (path.startswith("/auth/") or path == "/api/session"):
             self.auth_request(path)
             return False
-        decision = auth.decide(self.command, self.path, self.headers)
+        decision = auth.decide(self.command, self.path, self.headers, self.secure_host())
         if decision.allowed:
             return True
-        auth.report.record(self.command, path, decision, refused=auth.enforce)
+        auth.report.record(self.command, path, decision, refused=auth.enforce, routes=API_ROUTES)
         if not auth.enforce:
             return True
         self.send_json(
@@ -739,20 +822,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         query = parse_qs(urlsplit(self.path).query)
         secure = self.secure_host()
+        login_name = dashboard_auth.login_cookie_name(secure)
         # The login cookie is cleared by the callback, whatever its outcome.
-        cleared = dashboard_auth.cookie(
-            dashboard_auth.LOGIN_COOKIE, "", secure=secure, max_age=0, path="/auth/"
-        )
+        cleared = dashboard_auth.cookie(login_name, "", secure=secure, max_age=0, path="/auth/")
         try:
             if self.command == "GET" and path == "/api/session":
                 if self.headers.get("Sec-Fetch-Site") == "cross-site":
                     self.send_json(403, {"error": "Cross-site access is disabled"})
                     return
-                self.send_json(200, auth.view(self.headers))
+                self.send_json(200, auth.view(self.headers, secure))
             elif self.command == "GET" and path == "/auth/login":
-                url, state = auth.begin_login(host, query.get("next", ["/"])[0])
+                forwarded = self.headers.get_all("X-Forwarded-For") or []
+                source = forwarded[0] if len(forwarded) == 1 else self.client_address[0]
+                url, state = auth.begin_login(host, query.get("next", ["/"])[0], source)
                 login = dashboard_auth.cookie(
-                    dashboard_auth.LOGIN_COOKIE,
+                    login_name,
                     state,
                     secure=secure,
                     max_age=dashboard_auth.LOGIN_TTL,
@@ -765,14 +849,15 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif self.command == "GET" and path == "/auth/callback":
                 if "error" in query:
-                    raise dashboard_auth.AuthError(
-                        f"The identity provider refused: {query['error'][0][:100]}", 403
-                    )
-                bound = dashboard_auth.read_cookie(
-                    self.headers.get("Cookie"), dashboard_auth.LOGIN_COOKIE
-                )
+                    error = dashboard_auth.provider_error(query["error"][0])
+                    raise dashboard_auth.AuthError(f"The identity provider refused: {error}", 403)
+                bound = dashboard_auth.read_cookie(self.headers.get("Cookie"), login_name)
                 token, result = auth.finish_login(
-                    host, query.get("state", [None])[0], query.get("code", [None])[0], bound
+                    host,
+                    query.get("state", [None])[0],
+                    query.get("code", [None])[0],
+                    bound,
+                    secure,
                 )
                 self.send_body(
                     302,
@@ -788,15 +873,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.same_origin_action("logout"):
                     self.send_json(403, {"error": "Sign out from the dashboard page"})
                     return
-                redirect = auth.logout(self.headers, f"{'https' if secure else 'http'}://{host}")
+                redirect = auth.logout(
+                    self.headers, f"{'https' if secure else 'http'}://{host}", secure
+                )
+                name = dashboard_auth.session_cookie_name(secure)
                 self.send_body(
                     200,
                     json.dumps({"redirect": redirect}).encode(),
                     "application/json; charset=utf-8",
                     headers=[
                         ("Set-Cookie", dashboard_auth.cookie(name, "", secure=secure, max_age=0))
-                        for name in dashboard_auth.SESSION_COOKIES
-                        if secure or not name.startswith("__Host-")
                     ],
                 )
             elif self.command == "GET" and path == "/auth/break-glass":
@@ -813,14 +899,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(403, {"error": "Open the sign-in link in a browser"})
                     return
                 request = json.loads(self.read_body(length, 5))
-                token = auth.redeem_link(
-                    request.get("token") if isinstance(request, dict) else None
+                token, max_age = auth.redeem_link(
+                    request.get("token") if isinstance(request, dict) else None, secure
                 )
                 self.send_body(
                     200,
                     b'{"ok": true}',
                     "application/json; charset=utf-8",
-                    headers=[self.session_cookie(token, dashboard_auth.BREAK_GLASS_LIFETIME)],
+                    headers=[self.session_cookie(token, max_age)],
                 )
             else:
                 self.send_json(404, {"error": "Not found"})
@@ -865,44 +951,7 @@ class Handler(BaseHTTPRequestHandler):
         # are allowed. Check Origin too, including for trusted tailnet proxies.
         if (
             host not in allowed
-            or action
-            not in {
-                "cancel",
-                "feedback",
-                "feedback-addressed",
-                "workspace-action",
-                "workspace-batch",
-                "workspace-new",
-                "workspace-subtask",
-                "schedule-cancel",
-                "workspace-cleanup",
-                "workspace-open",
-                "workspace-message",
-                "workspace-answer",
-                "workspace-choose",
-                "workspace-docker",
-                "workspace-interrupt",
-                "workspace-quit",
-                "workspace-prompt-forget",
-                "attachment-upload",
-                "sentry-action",
-                "cron-action",
-                "push-subscribe",
-                "push-unsubscribe",
-                "push-read",
-                "push-seen",
-                "notification-silence",
-                "notification-focus",
-                "attention-triage",
-                "extension-pair",
-                "effort-default",
-                "settings",
-                "codex-update",
-                "worker-update",
-                "service-restart",
-                "voice-turn",
-                "voice-log",
-            }
+            or action not in ACTIONS
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
         ):

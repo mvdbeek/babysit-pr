@@ -12,14 +12,27 @@ The code is `scripts/dashboard_auth.py`. The dashboard hooks it into
 
 ## Modes
 
-| `--auth`           | Effect                                                                                                                                                                                                          |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `report` (default) | On only once `oidc.json` exists, so deploying is a no-op until it is configured. Every request is classified. Requests enforce would refuse are counted and logged, then answered as before                     |
-| `enforce`          | Always on. A request without a valid credential gets `401 {"login": "/auth/login"}`; a key whose scope does not cover the route gets 403. A broken `oidc.json` stops the dashboard from starting (fails closed) |
-| `off`              | No checks                                                                                                                                                                                                       |
+| `--auth`           | Effect                                                                                                                                                                                                                                                                                                                          |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `report` (default) | On only once `oidc.json` exists, so deploying is a no-op until it is configured. Every request is classified. Requests enforce would refuse are counted and logged, then answered as before                                                                                                                                     |
+| `enforce`          | Not usable yet: the dashboard refuses to start in it until Phase 2 and Phase 3 land (below). Once usable, it is always on. A request without a valid credential gets `401 {"login": "/auth/login"}`; a key whose scope does not cover the route gets 403. A broken `oidc.json` stops the dashboard from starting (fails closed) |
+| `off`              | No checks                                                                                                                                                                                                                                                                                                                       |
 
 In report mode, a broken `oidc.json` is reported on stderr and auth stays off, so the
-dashboard keeps serving. `dashboard.py` and `pr_supervisor.py dashboard` both take
+dashboard keeps serving.
+
+**Enforce needs Phase 2 and Phase 3.** Worker, extension and push-device routes still
+check their own tokens. Those tokens are stored in the state home
+(`worker-tokens.json`, `browser-extension.sqlite`, `dashboard-push.json`), which
+Safehouse sandboxes can still write. A Mac sandbox could therefore mint its own
+worker token and call `/api/worker/launch` over loopback, whatever enforce says.
+Enforce becomes meaningful only once:
+
+- Phase 2 has moved those credentials into the auth store, and
+- Phase 3 has taken the state home out of Safehouse's write grants.
+
+Until then, enforce refuses to start. The environment variable
+`BABYSIT_AUTH_TEST_ALLOW_OWN_ROUTES=1` overrides this for tests only. `dashboard.py` and `pr_supervisor.py dashboard` both take
 `--auth`, `--auth-home DIR` (default `~/.config/babysit-pr-auth`) and
 `--oidc-config FILE` (default `AUTH_HOME/oidc.json`). The startup banner prints which
 mode is active.
@@ -115,10 +128,20 @@ signing in again on the phone takes one tap.
 
 1. `GET /auth/login?next=/path` makes a random state, nonce and PKCE verifier. They
    are kept in memory, single use, for 10 minutes.
-2. The browser is bound to the attempt with the cookie `babysit_login=<state>`
-   (`HttpOnly; SameSite=Lax; Path=/auth/; Max-Age=600`, plus `Secure` on https). It
-   is then sent to Keycloak's authorization endpoint with `code_challenge_method=S256`.
-   `next` is honoured only as a local path, never `//…`.
+2. The browser is bound to the attempt with a login cookie holding the state:
+   - on https, `__Secure-babysit_login` (`Secure`);
+   - on plain-http loopback, `babysit_login`.
+
+   Both are `HttpOnly; SameSite=Lax; Path=/auth/; Max-Age=600`, and only the one
+   matching the request's scheme is read. The browser is then sent to Keycloak's
+   authorization endpoint with `code_challenge_method=S256`.
+
+   `next` is honoured only as an ASCII path on this dashboard: never `//…`, never an
+   `/api/` route (some GETs start work), never an `/auth/` route.
+
+   At most 8 pending sign-ins are kept per source address, so a flood of `/auth/login`
+   from one source evicts only its own.
+
 3. `GET /auth/callback`:
    - The cookie must equal `state`, and the state must still be pending.
    - The code is exchanged with the client secret (`client_secret_basic`) and the verifier.
@@ -136,21 +159,40 @@ signing in again on the phone takes one tap.
 4. The browser receives the session cookie and is redirected to `next`.
 
 Requests to the identity provider verify TLS, ignore proxy environment variables and
-do not follow redirects. Discovery is cached for 24 h, and its `issuer` must equal the
-configured one. The JWKS is cached. A token signed with an unknown `kid` makes the
-dashboard fetch the JWKS again, at most once a minute.
+do not follow redirects.
+
+Discovery is cached for 24 h, and its `issuer` must equal the configured one. A failed
+discovery is not retried for 30 s, so a Keycloak outage does not stall every request.
+
+The JWKS is cached. A malformed or short key in it is skipped without affecting the
+others. A token signed with an unknown `kid` makes the dashboard fetch the JWKS again,
+at most once a minute.
+
+A provider `error` is shown only when it is a plain error code (`[a-z_]{1,40}`);
+otherwise the page shows a fixed message.
 
 ## Sessions
 
 - The cookie holds 32 random bytes. `auth.sqlite` stores only their SHA-256.
-- On the https host, the cookie is `__Host-babysit_session` (`Secure`). On plain-http loopback it is `babysit_session`. Both are `HttpOnly; SameSite=Strict; Path=/`.
-- Lifetimes:
+- On the https host, the cookie is `__Host-babysit_session` (`Secure`). On plain-http loopback it is `babysit_session`. Both are `HttpOnly; SameSite=Strict; Path=/`. Only the cookie matching the request's scheme is read.
+- Lifetimes on the https host:
   - 7 days idle, extended by use; `last_seen` is written at most every 5 minutes.
   - 30 days absolute.
   - 12 hours for break-glass sessions.
-- Session rows are cached for 60 s, so a revocation from the CLI takes effect within a minute.
+- Lifetimes on plain-http loopback: 1 hour idle and 8 hours absolute, for break-glass sessions too.
+- Live session rows are cached for 60 s; a miss is never cached. A revocation from the CLI therefore takes effect within a minute, or at once when the session's idle time is next renewed.
 - No refresh tokens are kept. Removing the role takes effect at the next sign-in; `pr_supervisor.py auth sessions revoke --all` makes it immediate.
-- **Sign out** in the header POSTs `/auth/logout` (with `X-Babysit-Action: logout`). This deletes the session and clears the cookie. The page then goes to Keycloak's end-session endpoint, which ends the SSO session and returns to the dashboard.
+- **Sign out** in the header POSTs `/auth/logout` (with `X-Babysit-Action: logout`). This deletes the session and clears the cookie. The page then goes to Keycloak's end-session endpoint. No ID token is stored to pass as `id_token_hint`, so Keycloak shows its own logout confirmation page. Confirming there ends the SSO session and returns to the dashboard.
+
+**Loopback is for the mini's own browser only.** Browsers send cookies to every port of
+a host, so a plain-http `127.0.0.1` session cookie also goes to any other local server
+the same browser visits, such as a dev server or an agent's preview. That is why
+loopback sessions are short.
+
+The residual risk: within those 8 hours, a malicious local server visited in the same
+browser can read the cookie and use the session. Use the tailnet https host wherever
+possible. If you need loopback access without Keycloak, a break-glass link is the
+fallback.
 
 SameSite=Strict works because the page shell is public and all data comes from
 same-origin `fetch`. A link from Matrix opens `/` without the cookie, and the page's
@@ -173,7 +215,16 @@ most every 5 minutes) and `revoked_at`.
 | `push`               | `POST /api/push-read`, `POST /api/push-seen`  |
 
 A scope is `[GET|POST|OPTIONS ]/path`, or a prefix ending in `*`.
-`keys create --scope` can narrow a key, for example to `GET /api/status`.
+`keys create --scope` can narrow a key, for example to `GET /api/status`. It warns when
+a prefix does not end in `/*`, because `/api/push*` also covers `/api/push-subscribe`.
+
+`read` is broad. `GET /api/*` covers:
+
+- agent transcripts and diffs (`workspace-transcript`, `workspace-diff`);
+- settings, logs and CI logs;
+- the GETs whose `?refresh=1` starts work (`llm-usage`, `attention`, `sentry`, `workspace-overview`).
+
+Give a narrower scope when a client needs less.
 
 **Public**, answering anyone:
 
@@ -206,12 +257,14 @@ needs no Keycloak.
 
 - The token sits in the URL fragment (`/auth/break-glass#t=…`), so link previews never send it and proxies never log it.
 - The page removes it from the address bar and POSTs it with `X-Babysit-Action: break-glass`.
-- The result is a 12-hour session with `via=break-glass`.
+- The result is a session with `via=break-glass`: 12 hours on https, 8 hours on loopback.
 - A link works once.
 
 ## Report
 
-- Each would-refuse request is counted in `auth.sqlite` by method, route (without its query string) and credential kind (`anonymous`, `invalid`, or a key kind).
+- Each would-refuse request is counted in `auth.sqlite` by method, route and credential kind (`anonymous`, `invalid`, or a key kind).
+  - The route is one of the dashboard's own routes (`dashboard.API_ROUTES`); any other path counts as `/api/(other)` or `/(other)`. Made-up paths therefore cannot grow the table or the log.
+  - Query strings are never recorded.
 - A line goes to the dashboard's stderr log at most once a minute per route and kind. No key, cookie or query string is ever recorded.
 - In enforce mode the same counter records actual refusals.
 
@@ -247,9 +300,13 @@ pr_supervisor.py auth report [--reset]
 Use a throwaway dashboard, never the live one on 8765:
 
 ```sh
+BABYSIT_AUTH_TEST_ALLOW_OWN_ROUTES=1 \
 pr_supervisor.py --home "$(mktemp -d)" dashboard --port 8799 --auth enforce \
   --auth-home "$(mktemp -d)" --oidc-config ~/staging-oidc.json
 ```
+
+The override is acceptable here only because the state home is a throwaway one.
+Without it, use `--auth report`.
 
 The staging `oidc.json` maps `127.0.0.1:8799` to `http://127.0.0.1:8799/auth/callback`,
 which must be registered temporarily in Keycloak.
@@ -262,6 +319,7 @@ which must be registered temporarily in Keycloak.
   - Voice tools get `read` keys.
   - Push device tokens move into the store hashed, as `push` keys.
   - Worker tokens become `worker` keys.
+  - With those three moved, the own-credential list is empty, and enforce no longer refuses to start.
   - A `safe()` zshrc snippet runs `auth launch-key`.
 - **Phase 3:**
   - Switch to `--auth enforce`.

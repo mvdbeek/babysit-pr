@@ -19,6 +19,7 @@ import re
 import secrets
 import sqlite3
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -46,7 +47,16 @@ JWKS_MIN_REFETCH = 60
 SESSION_IDLE = 7 * 86400
 SESSION_ABSOLUTE = 30 * 86400
 BREAK_GLASS_LIFETIME = 12 * 3600
+# Plain-http loopback cookies are sent to every port on 127.0.0.1 (cookies are not
+# port-isolated), so a local dev server the browser visits could read them: short.
+LOOPBACK_IDLE = 3600
+LOOPBACK_ABSOLUTE = 8 * 3600
 LINK_TTL = 600
+# Pending sign-ins per source address; a flood from one source evicts only its own.
+PENDING_PER_SOURCE = 8
+# A failed discovery is not retried for this long, so an outage does not hold the lock
+# on every request.
+DISCOVERY_RETRY = 30
 LAUNCH_KEY_LIFETIME = 7 * 86400
 # last_seen and last_used are written at most this often, and a session row is cached
 # this long, so polling does not reach sqlite on every request.
@@ -55,7 +65,7 @@ CACHE_SECONDS = 60
 REPORT_LOG_EVERY = 60
 HTTP_TIMEOUT = 10
 HTTP_MAX = 1024 * 1024
-LOGIN_COOKIE = "babysit_login"
+LOGIN_COOKIES = ("__Secure-babysit_login", "babysit_login")
 SESSION_COOKIES = ("__Host-babysit_session", "babysit_session")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 KINDS = ("admin", "launch", "read", "worker", "ext", "push")
@@ -95,8 +105,12 @@ LAUNCH_FIELDS = {
     "depth",
 }
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-ROUTE = re.compile(r"/api/[a-z0-9-]+(?:/[a-z0-9-]+)?")
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+PROVIDER_ERROR = re.compile(r"[a-z_]{1,40}")
+REPORT_KEYS_MAX = 1000
+# Enforce mode would let anything that can write the state home through these routes,
+# since their tokens live there; tests set this to exercise enforce before Phase 2.
+ALLOW_OWN_ROUTES_ENV = "BABYSIT_AUTH_TEST_ALLOW_OWN_ROUTES"
 
 
 class AuthError(Exception):
@@ -125,9 +139,18 @@ def unb64url(text: str) -> bytes:
 
 
 def ensure_home(home: Path) -> Path:
-    """The auth home, created 0700, its mode narrowed if anything widened it."""
+    """The auth home, created 0700, its mode narrowed if anything widened it.
+
+    A symlink, or a directory someone else owns, is refused: whoever controls it
+    controls every credential.
+    """
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if home.stat().st_mode & 0o077:
+    info = os.lstat(home)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"{home} must be a real directory, not a symlink")
+    if info.st_uid != os.getuid():
+        raise ValueError(f"{home} is owned by another user")
+    if info.st_mode & 0o077:
         os.chmod(home, 0o700)
     return home
 
@@ -180,11 +203,13 @@ def public(method: str, path: str) -> bool:
 
 
 def safe_next(value) -> str:
-    """A local path to return to after sign-in; never another origin."""
+    """A page of the dashboard to return to after sign-in: never another origin, an API
+    route (some GETs start work) or a sign-in route."""
     if (
         isinstance(value, str)
+        and value.isascii()
         and value.startswith("/")
-        and not value.startswith(("//", "/\\"))
+        and not value.startswith(("//", "/\\", "/api/", "/auth/"))
         and len(value) <= 2000
         and not CONTROL.search(value)
     ):
@@ -225,6 +250,15 @@ def cookie(name, value, *, secure, max_age, path="/", same_site="Strict") -> str
 def session_cookie_name(secure: bool) -> str:
     # __Host- requires Secure, Path=/ and no Domain: only the https host can set it.
     return SESSION_COOKIES[0] if secure else SESSION_COOKIES[1]
+
+
+def login_cookie_name(secure: bool) -> str:
+    return LOGIN_COOKIES[0] if secure else LOGIN_COOKIES[1]
+
+
+def provider_error(value) -> str:
+    """The provider's error code, if it is one; never text an attacker chose."""
+    return value if isinstance(value, str) and PROVIDER_ERROR.fullmatch(value) else "an error"
 
 
 def clean_text(value, limit=200) -> str | None:
@@ -351,6 +385,7 @@ class Oidc:
         self.lock = threading.RLock()
         self.discovered: dict | None = None
         self.discovered_at = 0.0
+        self.failed: tuple[float, AuthError] | None = None
         self.keys: dict[str | None, Any] = {}
         self.keys_at: float | None = None
         self.jwks_fetches = 0
@@ -360,18 +395,29 @@ class Oidc:
         with self.lock:
             if self.discovered and self.clock() - self.discovered_at < DISCOVERY_TTL:
                 return self.discovered
-            url = self.config.issuer.rstrip("/") + "/.well-known/openid-configuration"
-            value = http_json(url)
-            if not isinstance(value, dict) or value.get("issuer") != self.config.issuer:
-                raise AuthError("The identity provider names another issuer", 503)
-            for name in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-                if not allowed_url(value.get(name)):
-                    raise AuthError(f"The identity provider's {name} is not https", 503)
-            end = value.get("end_session_endpoint")
-            if end is not None and not allowed_url(end):
-                value = {k: v for k, v in value.items() if k != "end_session_endpoint"}
+            if self.failed and self.clock() - self.failed[0] < DISCOVERY_RETRY:
+                raise self.failed[1]
+            try:
+                value = self._discover()
+            except AuthError as exc:
+                self.failed = (self.clock(), exc)
+                raise
+            self.failed = None
             self.discovered, self.discovered_at = value, self.clock()
             return value
+
+    def _discover(self) -> dict:
+        url = self.config.issuer.rstrip("/") + "/.well-known/openid-configuration"
+        value = http_json(url)
+        if not isinstance(value, dict) or value.get("issuer") != self.config.issuer:
+            raise AuthError("The identity provider names another issuer", 503)
+        for name in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            if not allowed_url(value.get(name)):
+                raise AuthError(f"The identity provider's {name} is not https", 503)
+        end = value.get("end_session_endpoint")
+        if end is not None and not allowed_url(end):
+            value = {k: v for k, v in value.items() if k != "end_session_endpoint"}
+        return value
 
     def authorize_url(self, redirect_uri, state, nonce, verifier) -> str:
         query = urlencode(
@@ -432,7 +478,11 @@ class Oidc:
             ):
                 continue
             kid = jwk.get("kid") if isinstance(jwk.get("kid"), str) else None
-            keys[kid] = _rsa_key(jwk)
+            # One malformed or short key never takes the others down with it.
+            try:
+                keys[kid] = _rsa_key(jwk)
+            except (AuthError, ValueError):
+                continue
         self.keys = keys
 
     def _select(self, kid):
@@ -540,9 +590,15 @@ class Store:
         self.path = home / "auth.sqlite"
         self.clock = clock
         self.lock = threading.Lock()
-        self.cache: dict[str, tuple[dict | None, float]] = {}
+        # Live sessions only: a miss is never cached, so nothing waits on a stale miss.
+        self.cache: dict[str, tuple[dict, float]] = {}
         if not self.path.exists():
             os.close(os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600))
+        info = os.lstat(self.path)
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError(f"{self.path} must be a regular file of this user")
+        if info.st_mode & 0o077:
+            os.chmod(self.path, 0o600)
         with self.db() as db:
             db.executescript(self.SCHEMA)
 
@@ -569,7 +625,11 @@ class Store:
         return token
 
     def session(self, token: str | None) -> dict | None:
-        """The live session ``token`` names; idle time restarts at most every few minutes."""
+        """The live session ``token`` names; idle time restarts at most every few minutes.
+
+        A row is cached for a minute, so a revocation by another process (the CLI) takes
+        effect within a minute, or at once when the session's idle time is next renewed.
+        """
         if not isinstance(token, str) or not TOKEN.fullmatch(token):
             return None
         key, now = digest(token), self.clock()
@@ -580,13 +640,15 @@ class Store:
         else:
             with self.db() as db:
                 found = db.execute("SELECT * FROM sessions WHERE digest=?", (key,)).fetchone()
-            row = dict(found) if found else None
+            if found is None:
+                with self.lock:
+                    self.cache.pop(key, None)
+                return None
+            row = dict(found)
             with self.lock:
                 if len(self.cache) > 1000:
                     self.cache = {k: v for k, v in self.cache.items() if now - v[1] < CACHE_SECONDS}
                 self.cache[key] = (row, now)
-        if row is None:
-            return None
         if now >= row["idle_expiry"] or now >= row["absolute_expiry"]:
             self.forget_session(key)
             return None
@@ -594,12 +656,18 @@ class Store:
             idle = row["idle_expiry"] - row["last_seen"]
             row = {**row, "last_seen": now, "idle_expiry": min(now + idle, row["absolute_expiry"])}
             with self.db() as db:
-                db.execute(
+                changed = db.execute(
                     "UPDATE sessions SET last_seen=?, idle_expiry=? WHERE digest=?",
                     (row["last_seen"], row["idle_expiry"], key),
-                )
+                ).rowcount
             with self.lock:
-                self.cache[key] = (row, now)
+                if changed:
+                    self.cache[key] = (row, now)
+                else:
+                    # Revoked since it was cached.
+                    self.cache.pop(key, None)
+            if not changed:
+                return None
         return row
 
     def forget_session(self, key: str) -> None:
@@ -759,14 +827,27 @@ class Decision:
         return self.credential == "session" or self.credential in KINDS
 
 
-def bucket(method: str, path: str | None) -> tuple[str, str]:
-    """A report row's method and route, of bounded variety and without query strings."""
+def bucket(method: str, path: str | None, routes=frozenset()) -> tuple[str, str]:
+    """A report row's method and route: one of the dashboard's own ``routes``, else a
+    fixed name, so anonymous requests cannot grow the report; never a query string."""
     method = method if method in {"GET", "POST", "OPTIONS"} else "other"
     if path is None:
         return method, "(unexpected target)"
-    if path.startswith("/api/"):
-        return method, path if ROUTE.fullmatch(path) and len(path) <= 80 else "/api/(other)"
-    return method, "/(other)"
+    if path in routes:
+        return method, path
+    return method, "/api/(other)" if path.startswith("/api/") else "/(other)"
+
+
+def lifetimes(via: str, secure: bool) -> tuple[float, float]:
+    """A new session's idle and absolute lifetimes."""
+    idle, absolute = (
+        (BREAK_GLASS_LIFETIME, BREAK_GLASS_LIFETIME)
+        if via == "break-glass"
+        else (SESSION_IDLE, SESSION_ABSOLUTE)
+    )
+    if not secure:
+        idle, absolute = min(idle, LOOPBACK_IDLE), min(absolute, LOOPBACK_ABSOLUTE)
+    return idle, absolute
 
 
 class Report:
@@ -784,11 +865,17 @@ class Report:
         self.pending: dict[tuple[str, str, str], dict] = {}
         self.logged: dict[tuple[str, str, str], float] = {}
 
-    def record(self, method: str, path: str | None, decision: Decision, refused=False) -> None:
-        method, route = bucket(method, path)
+    def record(
+        self, method: str, path: str | None, decision: Decision, refused=False, routes=frozenset()
+    ) -> None:
+        method, route = bucket(method, path, routes)
         key = (method, route, decision.credential)
         now = self.clock()
         with self.lock:
+            if len(self.logged) > REPORT_KEYS_MAX:
+                self.logged.clear()
+            if len(self.pending) > REPORT_KEYS_MAX:
+                self._flush()
             entry = self.pending.setdefault(
                 key, {"count": 0, "first": now, "reason": decision.reason}
             )
@@ -854,6 +941,7 @@ class Pending:
     next: str
     host: str
     expires: float
+    source: str = ""
 
 
 class Auth:
@@ -869,6 +957,12 @@ class Auth:
     ):
         if mode not in ("report", "enforce"):
             raise ValueError(f"Auth mode must be report or enforce, not {mode!r}")
+        if mode == "enforce" and SELF_AUTHENTICATED and not os.environ.get(ALLOW_OWN_ROUTES_ENV):
+            raise ValueError(
+                "Enforce mode needs Phase 2 (worker, extension and push tokens in the auth "
+                "store) and Phase 3 (the state home out of Safehouse's write grants): until "
+                "then anything that can write the state home can mint those tokens"
+            )
         self.mode = mode
         self.clock = clock or time.time
         self.store = Store(home, lambda: self.clock())
@@ -881,14 +975,11 @@ class Auth:
     def enforce(self) -> bool:
         return self.mode == "enforce"
 
-    def session_token(self, headers) -> str | None:
-        header = headers.get("Cookie")
-        for name in SESSION_COOKIES:
-            if (value := read_cookie(header, name)) is not None:
-                return value
-        return None
+    def session_token(self, headers, secure: bool) -> str | None:
+        """The session cookie of this scheme only: on https, never a plain-http one."""
+        return read_cookie(headers.get("Cookie"), session_cookie_name(secure))
 
-    def decide(self, method: str, target: str, headers) -> Decision:
+    def decide(self, method: str, target: str, headers, secure: bool = False) -> Decision:
         path = request_path(target)
         if path is None:
             return Decision("invalid", False, "unexpected request target")
@@ -907,7 +998,7 @@ class Auth:
                 subject=key["id"],
                 key=key,
             )
-        session = self.store.session(self.session_token(headers))
+        session = self.store.session(self.session_token(headers, secure))
         if session is not None:
             return Decision("session", True, subject=session["username"], session=session)
         if any(scope_allows(scope, method, path) for scope in SELF_AUTHENTICATED):
@@ -923,7 +1014,7 @@ class Auth:
             raise AuthError("Sign-in is not configured for this host", 403)
         return uri
 
-    def begin_login(self, host: str | None, next_path) -> tuple[str, str]:
+    def begin_login(self, host: str | None, next_path, source: str = "") -> tuple[str, str]:
         """The identity provider URL to send the browser to, and the state to bind it."""
         if self.oidc is None:
             raise AuthError(
@@ -936,14 +1027,22 @@ class Auth:
         now = self.clock()
         with self.lock:
             self.pending = {k: v for k, v in self.pending.items() if v.expires > now}
+            # A flood evicts its own source's sign-ins first, never a quiet user's.
+            mine = [k for k, v in self.pending.items() if v.source == source]
+            while len(mine) >= PENDING_PER_SOURCE:
+                self.pending.pop(mine.pop(0))
             while len(self.pending) >= PENDING_MAX:
-                self.pending.pop(next(iter(self.pending)))
+                counts: dict[str, int] = {}
+                for v in self.pending.values():
+                    counts[v.source] = counts.get(v.source, 0) + 1
+                busiest = max(counts, key=lambda k: counts[k])
+                self.pending.pop(next(k for k, v in self.pending.items() if v.source == busiest))
             self.pending[state] = Pending(
-                nonce, verifier, safe_next(next_path), host or "", now + LOGIN_TTL
+                nonce, verifier, safe_next(next_path), host or "", now + LOGIN_TTL, source
             )
         return url, state
 
-    def finish_login(self, host, state, code, bound_state) -> tuple[str, dict]:
+    def finish_login(self, host, state, code, bound_state, secure=False) -> tuple[str, dict]:
         """A new session's cookie value and row for a callback; each state works once."""
         if self.oidc is None:
             raise AuthError("OIDC sign-in is not configured", 404)
@@ -974,25 +1073,28 @@ class Auth:
             or clean_text(claims.get("email"))
             or clean_text(claims["sub"])
         )
-        token = self.store.create_session(claims["sub"], username, "oidc")
-        return token, {"next": pending.next, "username": username, "max_age": SESSION_ABSOLUTE}
+        idle, absolute = lifetimes("oidc", secure)
+        token = self.store.create_session(claims["sub"], username, "oidc", idle, absolute)
+        return token, {"next": pending.next, "username": username, "max_age": absolute}
 
-    def redeem_link(self, token) -> str:
-        """A break-glass session's cookie value for an unused link."""
+    def redeem_link(self, token, secure=False) -> tuple[str, float]:
+        """A break-glass session's cookie value and lifetime for an unused link."""
         if not self.store.redeem_link(token):
             raise AuthError("This sign-in link has expired or was already used", 403)
-        return self.store.create_session(
-            "break-glass", "break-glass", "break-glass", BREAK_GLASS_LIFETIME, BREAK_GLASS_LIFETIME
+        idle, absolute = lifetimes("break-glass", secure)
+        value = self.store.create_session(
+            "break-glass", "break-glass", "break-glass", idle, absolute
         )
+        return value, absolute
 
-    def logout(self, headers, origin: str) -> str:
+    def logout(self, headers, origin: str, secure=False) -> str:
         """End the request's session; where the page goes next."""
-        self.store.end_session(self.session_token(headers))
+        self.store.end_session(self.session_token(headers, secure))
         return self.oidc.logout_url(origin) if self.oidc else "/"
 
-    def view(self, headers) -> dict:
+    def view(self, headers, secure=False) -> dict:
         """What /api/session tells the page."""
-        decision = self.decide("GET", "/api/status", headers)
+        decision = self.decide("GET", "/api/status", headers, secure)
         session = decision.session
         return {
             "enabled": True,
@@ -1228,7 +1330,18 @@ def cli(args) -> Any:
             label=args.label,
             lifetime=args.expires_days * 86400 if args.expires_days else None,
         )
-        return {"id": key_id, "key": token, "note": "Shown once; only its digest is stored"}
+        answer = {"id": key_id, "key": token, "note": "Shown once; only its digest is stored"}
+        loose = [
+            scope
+            for scope in args.scope or []
+            if scope.endswith("*") and not scope.endswith("/*") and scope.rpartition(" ")[2] != "*"
+        ]
+        if loose:
+            answer["warning"] = (
+                f"{', '.join(loose)}: a prefix not ending in /* also matches longer route "
+                "names (/api/push* covers /api/push-subscribe)"
+            )
+        return answer
     if command == "sessions":
         if args.sessions_command == "list":
             return store.sessions()

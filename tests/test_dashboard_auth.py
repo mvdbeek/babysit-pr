@@ -20,7 +20,15 @@ import dashboard_auth
 import pr_supervisor
 import pytest
 import sandbox
-from dashboard_auth import SESSION_ABSOLUTE, SESSION_IDLE, Auth, AuthError, OidcConfig
+from dashboard_auth import (
+    LOOPBACK_ABSOLUTE,
+    LOOPBACK_IDLE,
+    SESSION_ABSOLUTE,
+    SESSION_IDLE,
+    Auth,
+    AuthError,
+    OidcConfig,
+)
 from oidc_provider import CLIENT_ID, CLIENT_SECRET, Provider
 
 PUBLIC_HOST = "babysitter.example.ts.net"
@@ -35,6 +43,12 @@ class Clock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+@pytest.fixture(autouse=True)
+def allow_enforce(monkeypatch):
+    """Enforce refuses to start before Phase 2; these tests exercise it anyway."""
+    monkeypatch.setenv(dashboard_auth.ALLOW_OWN_ROUTES_ENV, "1")
 
 
 @pytest.fixture
@@ -133,14 +147,19 @@ def start_login(server, provider, next_path="/", host=None):
     """The callback path the provider sends the browser to, and the bound state."""
     status, headers, _ = call(server, f"/auth/login?next={quote(next_path)}", host=host)
     assert status == 302, status
-    state = set_cookies(headers)[dashboard_auth.LOGIN_COOKIE][0]
+    state = set_cookies(headers)[login_name(host)][0]
     callback = urlsplit(follow_provider(provider, header(headers, "Location")))
     return f"{callback.path}?{callback.query}", state
 
 
+def login_name(host):
+    """Tests name a Host only for the https one."""
+    return dashboard_auth.login_cookie_name(host is not None)
+
+
 def login(server, provider, next_path="/", host=None):
     callback, state = start_login(server, provider, next_path, host)
-    return call(server, callback, headers={"Cookie": f"babysit_login={state}"}, host=host)
+    return call(server, callback, headers={"Cookie": f"{login_name(host)}={state}"}, host=host)
 
 
 def session_cookie(headers):
@@ -149,14 +168,16 @@ def session_cookie(headers):
     return f"{name}={cookies[name][0]}"
 
 
-def signed_in(server, provider):
-    status, headers, _ = login(server, provider)
+def signed_in(server, provider, host=None):
+    status, headers, _ = login(server, provider, host=host)
     assert status == 302
     return session_cookie(headers)
 
 
-def session(server, cookie=None):
-    status, _, body = call(server, "/api/session", headers={"Cookie": cookie} if cookie else None)
+def session(server, cookie=None, host=None):
+    status, _, body = call(
+        server, "/api/session", headers={"Cookie": cookie} if cookie else None, host=host
+    )
     assert status == 200
     return json.loads(body)
 
@@ -199,7 +220,7 @@ def test_login_creates_a_strict_http_only_session_and_drops_provider_tokens(
     cookies = set_cookies(headers)
     assert cookies["babysit_login"][0] == "" and "Max-Age=0" in cookies["babysit_login"][1]
     value, attributes = cookies["babysit_session"]
-    assert {"Path=/", "HttpOnly", "SameSite=Strict", f"Max-Age={SESSION_ABSOLUTE}"} <= set(
+    assert {"Path=/", "HttpOnly", "SameSite=Strict", f"Max-Age={LOOPBACK_ABSOLUTE}"} <= set(
         attributes
     )
     view = session(server, f"babysit_session={value}")
@@ -214,19 +235,35 @@ def test_https_host_gets_secure_host_prefixed_cookies(site, provider):
     server = site(allowed_hosts=(PUBLIC_HOST,))
     status, headers, _ = call(server, "/auth/login", host=PUBLIC_HOST)
     assert status == 302
-    assert "Secure" in set_cookies(headers)["babysit_login"][1]
+    assert "Secure" in set_cookies(headers)["__Secure-babysit_login"][1]
     assert parse_qs(urlsplit(header(headers, "Location")).query)["redirect_uri"] == [
         f"https://{PUBLIC_HOST}/auth/callback"
     ]
     # The provider redirects to the https host; replay that callback on its Host.
     callback, state = start_login(server, provider, host=PUBLIC_HOST)
-    status, headers, _ = call(
+    # A plain-http login cookie is not the https one.
+    status, _, body = call(
         server, callback, headers={"Cookie": f"babysit_login={state}"}, host=PUBLIC_HOST
+    )
+    assert status == 400 and b"not started in this browser" in body
+    callback, state = start_login(server, provider, host=PUBLIC_HOST)
+    status, headers, _ = call(
+        server, callback, headers={"Cookie": f"__Secure-babysit_login={state}"}, host=PUBLIC_HOST
     )
     assert status == 302
     value, attributes = set_cookies(headers)["__Host-babysit_session"]
-    assert {"Secure", "HttpOnly", "SameSite=Strict", "Path=/"} <= set(attributes)
-    assert session(server, f"__Host-babysit_session={value}")["authenticated"]
+    assert {
+        "Secure",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Path=/",
+        f"Max-Age={SESSION_ABSOLUTE}",
+    } <= set(attributes)
+    assert session(server, f"__Host-babysit_session={value}", PUBLIC_HOST)["authenticated"]
+    # On https only the __Host- cookie counts: a plain one set by any 127.0.0.1 port
+    # (cookies are not port-isolated) is ignored, and so is the https one on loopback.
+    assert not session(server, f"babysit_session={value}", PUBLIC_HOST)["authenticated"]
+    assert not session(server, f"__Host-babysit_session={value}")["authenticated"]
 
 
 def test_redirect_uri_comes_from_config_never_from_the_request(site):
@@ -238,7 +275,17 @@ def test_redirect_uri_comes_from_config_never_from_the_request(site):
     assert status == 403 and b"not configured for this host" in body
 
 
-@pytest.mark.parametrize("target", ["//evil.example/x", "https://evil.example/", "/\\evil"])
+@pytest.mark.parametrize(
+    "target",
+    [
+        "//evil.example/x",
+        "https://evil.example/",
+        "/\\evil",
+        "/caf\u00e9",
+        "/api/llm-usage?refresh=1",
+        "/auth/logout",
+    ],
+)
 def test_next_must_be_a_local_path(site, provider, target):
     server = site()
     status, headers, _ = login(server, provider, target)
@@ -294,6 +341,9 @@ def test_provider_error_is_shown_without_a_session(site):
     assert status == 403 and b"access_denied" in body
     assert header(headers, "Content-Type").startswith("text/html")
     assert "babysit_session" not in set_cookies(headers)
+    # Anything but an error code is never echoed.
+    status, _, body = call(server, "/auth/callback?error=Call+0800+to+verify&state=x")
+    assert status == 403 and b"0800" not in body and b"refused: an error" in body
 
 
 @pytest.mark.parametrize(
@@ -386,6 +436,54 @@ def test_discovery_must_name_the_configured_issuer(site, provider):
     assert "babysit_login" not in set_cookies(headers)
 
 
+def test_malformed_or_short_jwks_entries_are_skipped(site, provider):
+    server = site()
+    provider.extra_jwks = [
+        {"kty": "RSA", "kid": "short", "n": "AQAB", "e": "AQAB"},
+        {"kty": "RSA", "kid": "bad", "n": "!!", "e": "AQAB"},
+        {"kty": "RSA", "kid": "padding", "n": "A", "e": "AQAB"},
+        {"kty": "EC", "kid": "ec", "crv": "P-256"},
+    ]
+    signed_in(server, provider)
+    assert set(server.auth.oidc.keys) == {"key-1"}
+
+
+def test_failed_discovery_is_not_retried_for_half_a_minute(site, provider, clock):
+    server = site()
+    provider.discovery_issuer = "https://evil.example/realms/test"
+    for _ in range(3):
+        assert call(server, "/auth/login")[0] == 503
+    assert provider.discovery_requests == 1
+    provider.discovery_issuer = None
+    clock.advance(dashboard_auth.DISCOVERY_RETRY + 1)
+    assert call(server, "/auth/login")[0] == 302
+    assert provider.discovery_requests == 2
+
+
+def test_a_sign_in_flood_from_one_source_cannot_evict_another_users(site, provider):
+    server = site()
+    auth = server.auth
+    url, state = auth.begin_login(f"127.0.0.1:{server.server_port}", "/", "100.64.0.9")
+    for _ in range(dashboard_auth.PENDING_MAX * 2):
+        auth.begin_login(f"127.0.0.1:{server.server_port}", "/", "127.0.0.1")
+    assert state in auth.pending
+    assert sum(p.source == "127.0.0.1" for p in auth.pending.values()) == (
+        dashboard_auth.PENDING_PER_SOURCE
+    )
+
+
+def test_auth_home_must_be_a_private_real_directory(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    with pytest.raises(ValueError, match="symlink"):
+        dashboard_auth.Store(tmp_path / "link")
+    store = dashboard_auth.Store(real)
+    os.chmod(store.path, 0o644)
+    dashboard_auth.Store(real)
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+
+
 def test_oidc_config_validation(tmp_path):
     path = tmp_path / "oidc.json"
     good = {
@@ -415,23 +513,47 @@ def test_oidc_config_validation(tmp_path):
 
 
 def test_session_idles_out_after_seven_days(site, provider, clock):
-    server = site()
-    cookie = signed_in(server, provider)
+    server = site(allowed_hosts=(PUBLIC_HOST,))
+    cookie = signed_in(server, provider, PUBLIC_HOST)
     clock.advance(SESSION_IDLE - 10)
-    assert session(server, cookie)["authenticated"]
+    assert session(server, cookie, PUBLIC_HOST)["authenticated"]
     clock.advance(SESSION_IDLE + 1)
-    assert not session(server, cookie)["authenticated"]
+    assert not session(server, cookie, PUBLIC_HOST)["authenticated"]
 
 
 def test_use_extends_idle_time_but_not_past_the_absolute_lifetime(site, provider, clock):
-    server = site()
-    cookie = signed_in(server, provider)
+    server = site(allowed_hosts=(PUBLIC_HOST,))
+    cookie = signed_in(server, provider, PUBLIC_HOST)
     for _ in range(4):
         clock.advance(6 * 86400)
-        assert session(server, cookie)["authenticated"]
+        assert session(server, cookie, PUBLIC_HOST)["authenticated"]
     clock.advance(6 * 86400)  # Day 30.
-    assert not session(server, cookie)["authenticated"]
+    assert not session(server, cookie, PUBLIC_HOST)["authenticated"]
     assert server.auth.store.sessions() == []
+
+
+def test_loopback_sessions_are_short(site, provider, clock):
+    """Plain-http cookies reach every 127.0.0.1 port, so they live 1 h idle, 8 h at most."""
+    server = site()
+    idle, kept = signed_in(server, provider), signed_in(server, provider)
+    for _ in range(7):
+        clock.advance(LOOPBACK_IDLE - 60)
+        assert session(server, kept)["authenticated"]
+    assert not session(server, idle)["authenticated"]  # Unused for over an hour.
+    clock.advance(LOOPBACK_ABSOLUTE - 7 * (LOOPBACK_IDLE - 60))
+    assert not session(server, kept)["authenticated"]
+
+
+def test_revocation_seen_when_idle_time_is_renewed(site, provider, clock):
+    server = site()
+    cookie = signed_in(server, provider)
+    assert session(server, cookie)["authenticated"]  # Cached now.
+    dashboard_auth.Store(server.auth.store.home).revoke_sessions()
+    # Still cached, but renewing the idle time finds the row gone.
+    clock.advance(dashboard_auth.TOUCH_EVERY)
+    server.auth.store.cache = {k: (row, clock()) for k, (row, _) in server.auth.store.cache.items()}
+    assert not session(server, cookie)["authenticated"]
+    assert server.auth.store.cache == {}
 
 
 def test_logout_ends_the_session_and_the_providers(site, provider):
@@ -590,16 +712,56 @@ def test_break_glass_link_works_once_without_oidc(site, clock):
     status, headers, _ = post(server, "/auth/break-glass", "break-glass", {"token": token})
     assert status == 200
     value, attributes = set_cookies(headers)["babysit_session"]
-    assert f"Max-Age={dashboard_auth.BREAK_GLASS_LIFETIME}" in attributes
+    assert f"Max-Age={LOOPBACK_ABSOLUTE}" in attributes  # Loopback: shorter than 12 h.
     view = session(server, f"babysit_session={value}")
     assert view["authenticated"] and view["via"] == "break-glass" and view["login"] is None
     assert call(server, "/api/status", headers={"Cookie": f"babysit_session={value}"})[0] == 200
     status, _, body = post(server, "/auth/break-glass", "break-glass", {"token": token})
     assert status == 403 and b"already used" in body
-    clock.advance(dashboard_auth.BREAK_GLASS_LIFETIME + 1)
+    clock.advance(LOOPBACK_IDLE + 1)
     assert not session(server, f"babysit_session={value}")["authenticated"]
     # OIDC sign-in is simply unavailable.
     assert call(server, "/auth/login")[0] == 404
+
+
+def test_break_glass_on_https_lasts_twelve_hours(site, clock):
+    server = site("enforce", oidc=False, allowed_hosts=(PUBLIC_HOST,))
+    token = server.auth.store.create_link()
+    status, headers, _ = call(
+        server,
+        "/auth/break-glass",
+        "POST",
+        {"Content-Type": "application/json", "X-Babysit-Action": "break-glass"},
+        json.dumps({"token": token}),
+        host=PUBLIC_HOST,
+    )
+    assert status == 200
+    value, attributes = set_cookies(headers)["__Host-babysit_session"]
+    assert f"Max-Age={dashboard_auth.BREAK_GLASS_LIFETIME}" in attributes
+    cookie = f"__Host-babysit_session={value}"
+    clock.advance(dashboard_auth.BREAK_GLASS_LIFETIME - 10)
+    assert session(server, cookie, PUBLIC_HOST)["via"] == "break-glass"
+    clock.advance(11)
+    assert not session(server, cookie, PUBLIC_HOST)["authenticated"]
+
+
+def test_concurrent_redemptions_of_one_link_yield_one_session(tmp_path):
+    store = dashboard_auth.Store(tmp_path / "auth")
+    token = store.create_link()
+    results = []
+    barrier = threading.Barrier(8)
+
+    def redeem():
+        other = dashboard_auth.Store(tmp_path / "auth")
+        barrier.wait()
+        results.append(other.redeem_link(token))
+
+    threads = [threading.Thread(target=redeem) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert sorted(results) == [False] * 7 + [True]
 
 
 def test_break_glass_link_expires_after_ten_minutes(site, clock):
@@ -657,6 +819,55 @@ def test_report_mode_refuses_nothing_and_counts_what_enforce_would(site, provide
     before = server.auth.report.total()
     assert call(server, "/api/status", headers={"Cookie": cookie})[0] == 200
     assert server.auth.report.total() == before
+
+
+def test_report_rows_stay_bounded_for_made_up_routes(site):
+    server = site("report")
+    for n in range(40):
+        call(server, f"/api/made-up-{n}")
+        post(server, f"/api/also-{n}/x", "x", {})
+        call(server, f"/elsewhere-{n}", "POST")
+    routes = {r["route"] for r in server.auth.report.rows()}
+    assert routes == {"/api/(other)", "/(other)"}
+    assert len(server.auth.report.logged) <= 4
+
+
+def test_every_get_route_is_a_known_report_route():
+    import re
+    from pathlib import Path
+
+    source = Path(dashboard.__file__).read_text()
+    for route in re.findall(r'"(/api/[a-z0-9-]+)"', source):
+        if not route.startswith("/api/worker"):
+            assert route in dashboard.API_ROUTES or route == "/api/", route
+
+
+def test_enforce_refuses_to_start_while_routes_check_their_own_tokens(tmp_path, monkeypatch):
+    monkeypatch.delenv(dashboard_auth.ALLOW_OWN_ROUTES_ENV)
+    with pytest.raises(ValueError, match="Phase 2"):
+        Auth(tmp_path / "auth", "enforce")
+    with pytest.raises(ValueError, match="Phase 2"):
+        dashboard_auth.load("enforce", tmp_path / "auth")
+    assert Auth(tmp_path / "auth", "report").mode == "report"
+
+
+def test_own_routes_reach_their_handlers_under_enforce(site):
+    """Extension and push routes keep their own token checks until Phase 2."""
+    server = site("enforce")
+    status, _, body = call(
+        server,
+        "/api/extension",
+        "POST",
+        {"Content-Type": "application/json", "Authorization": "Bearer nope"},
+        "{}",
+    )
+    assert status == 403 and b"Pair this extension" in body
+    assert call(server, "/api/extension", "OPTIONS")[0] == 403
+    for action in ("push-read", "push-seen", "push-unsubscribe"):
+        status, _, body = post(server, f"/api/{action}", action, {"token": "x"})
+        assert status != 401 and b"Sign in to use" not in body, (action, body)
+    # Other push actions need a session.
+    assert post(server, "/api/push-subscribe", "push-subscribe", {})[0] == 401
 
 
 # Configuration and the off switch
@@ -768,6 +979,10 @@ def test_cli_keys_create_list_and_revoke(cli):
     assert code == 1 and "No live key" in error["error"]
     code, error = cli("keys", "create", "--kind", "read", "--scope", "rm -rf")
     assert code == 1 and "Invalid scope" in error["error"]
+    code, loose = cli("keys", "create", "--kind", "push", "--scope", "POST /api/push*")
+    assert code == 0 and "/api/push*" in loose["warning"]
+    code, tidy = cli("keys", "create", "--kind", "read", "--scope", "GET /api/*")
+    assert "warning" not in tidy
 
 
 def test_cli_login_link_and_sessions(cli):
