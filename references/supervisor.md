@@ -769,8 +769,9 @@ workspaces open through this machine's Collie, or the lead `collie_url` names, a
 at all, since this machine's Collie cannot open them.
 Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (`user@host` and `host`) are not detected. The top-level `docker`, optional, is
-`{"prefer": "<id>"}`: a registered machine with the `docker` label, where Auto sends
-launches that use Docker (see below).
+`{"prefer": "<id>"}`: a registered machine, where Auto sends launches that use Docker
+(see below). One that lacks the `docker` label, is disabled or is not used by Auto
+keeps the registry valid; Auto passes it over and its reason says why.
 Disabled machines stay valid for records already pinned to them.
 
 Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, agent and port

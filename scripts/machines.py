@@ -254,8 +254,9 @@ def _docker(raw, machines):
         raise ValueError("Invalid prefer for docker")
     if prefer is not None and prefer not in machines:
         raise ValueError(f"docker prefers unknown machine {prefer}")
-    if prefer is not None and "docker" not in machines[prefer].labels:
-        raise ValueError(f"docker prefers {prefer}, which lacks the docker label")
+    # A preferred machine without the docker label, disabled or not used by Auto stays
+    # valid: placement passes it over and its reason says why, while records pinned to
+    # the registry keep resolving.
     return {"prefer": prefer}
 
 

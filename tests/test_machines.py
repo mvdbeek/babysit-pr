@@ -598,6 +598,10 @@ def test_docker_preference_names_a_registered_docker_machine(tmp_path):
     assert machines.load_config(tmp_path)["docker"] == {"prefer": None}
     write(tmp_path, MINI, box, docker={"prefer": "mini"})
     assert machines.load_config(tmp_path)["docker"] == {"prefer": "mini"}
+    # One that lost its docker label keeps the registry valid; placement passes it over.
+    write(tmp_path, MINI, box, docker={"prefer": "box"})
+    assert machines.load_config(tmp_path)["docker"] == {"prefer": "box"}
+    assert machines.resolve(tmp_path, "box").label == "Linux box"
 
 
 @pytest.mark.parametrize(
@@ -607,7 +611,6 @@ def test_docker_preference_names_a_registered_docker_machine(tmp_path):
         ({"prefer": ["mini"]}, "Invalid prefer for docker"),
         ({"prefer": "nowhere"}, "docker prefers unknown machine nowhere"),
         ({"prefer": "local"}, "docker prefers unknown machine local"),
-        ({"prefer": "box"}, "docker prefers box, which lacks the docker label"),
         ({"prefer": "mini", "workers": True}, "Unknown keys for docker: workers"),
     ],
 )
