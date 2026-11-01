@@ -805,8 +805,8 @@ for another launch (the directory is babysit-bwrap's, the session must be in its
 store). Anything unsandboxed as the worker user can read `worker.json` and claim any
 parent. These limits hold only for requests that come through the broker: a worker
 sandbox that reaches the dashboard's other actions over the tailnet directly is not held
-to them until the separate worker fence (the change that keeps worker machines off the
-dashboard's local actions) is in place.
+to them until the worker fence of #130 (which keeps worker machines off the dashboard's
+local actions) is in place.
 
 Residual, on this machine: the parent a run inside Safehouse names cannot be checked.
 Safehouse leaves the network open, and this user's Safehouse grants (`safe.env`) make
