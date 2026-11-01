@@ -390,18 +390,24 @@ def attach_handling(value, workspaces):
 
 
 def address(value):
-    """An IP address in one canonical form (an IPv4-mapped IPv6 one as IPv4); None if not one."""
+    """An IP address as `tailscale serve` reports one, an IPv4-mapped one as IPv4; else None.
+
+    Nothing else is accepted: no port, brackets, zone, list or surrounding space.
+    """
     try:
-        ip = ipaddress.ip_address(value.strip())
+        ip = ipaddress.ip_address(value)
     except ValueError:
+        return None
+    if "%" in value:
         return None
     return getattr(ip, "ipv4_mapped", None) or ip
 
 
 def unfenced_workers(home):
-    """Registered machines without a ``tailnet_ip``: their requests cannot be told apart."""
+    """Registered machines missing an IPv4 or IPv6 ``tailnet_ip``: not every request of
+    theirs can be told apart."""
     try:
-        return sorted(m.id for m in machines.load(home).values() if m.tailnet_ip is None)
+        return sorted(m.id for m in machines.load(home).values() if not machines.fenced(m))
     except (OSError, ValueError):
         return []
 
@@ -642,8 +648,15 @@ class Handler(BaseHTTPRequestHandler):
         never the Host. A request without the header came from this machine directly.
         """
         forwarded = self.headers.get_all("X-Forwarded-For")
-        if not forwarded or self.path.startswith("/api/worker/"):
+        if not forwarded or (
+            self.command == "POST"
+            and self.path in {f"/api/worker/{action}" for action in worker_api.ACTIONS}
+        ):
             return None
+        # The proxy sends exactly one, a bare address: anything else did not come from it.
+        source = address(forwarded[0]) if len(forwarded) == 1 else None
+        if source is None:
+            return "Unexpected X-Forwarded-For; only tailscale serve may proxy the dashboard"
         # The proxy names the user of a user-owned device, never of a tagged node, and
         # drops any name the client sent.
         if self.server.require_tailscale_user and not self.headers.get("Tailscale-User-Login"):
@@ -653,7 +666,7 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             return "machines.json cannot be read, so no tailnet request may use the dashboard"
         workers = {address(ip) for m in registered for ip in m.tailnet_ip or ()}
-        if any(address(part) in workers for value in forwarded for part in value.split(",")):
+        if source in workers:
             return "A worker machine may only use /api/worker/"
         return None
 
@@ -1580,8 +1593,8 @@ def serve(
         )
         if unfenced := unfenced_workers(home):
             print(
-                f"Warning: worker machines without tailnet_ip in machines.json can use the whole "
-                f"dashboard through the tailnet: {', '.join(unfenced)}",
+                "Warning: worker machines without an IPv4 and an IPv6 tailnet_ip in "
+                f"machines.json can use the whole dashboard through the tailnet: {', '.join(unfenced)}",
                 file=sys.stderr,
                 flush=True,
             )

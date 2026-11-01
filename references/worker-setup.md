@@ -446,11 +446,12 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    before recording the watch. Sandboxed agents never see the token; their launch's
    registration broker forwards only their own sessions in their own worktrees (the
    supervisor reference's "Watches on workers" has the details). Issue a new token to
-   replace it, or `worker-token ubuntu-1 --revoke`. Then add the worker's tailnet
-   addresses as `"tailnet_ip"` to its `machines.json` entry (one address or a list;
-   `--controller` prints the line, or use `tailscale ip <box>`). Registrations then
+   replace it, or `worker-token ubuntu-1 --revoke`. Then add both of the worker's
+   tailnet addresses, IPv4 and IPv6, as `"tailnet_ip"` to its `machines.json` entry
+   (`--controller` prints the line, or use `tailscale ip <box>`). Registrations then
    must come through `tailscale serve` from one of them, and the dashboard refuses
-   that address everything but `/api/worker/`. Without it the worker, and every
+   those addresses everything but `/api/worker/`. With one family missing, the worker
+   can come in through the other. Without them the worker, and every
    sandboxed agent on it (the sandbox shares the network), can use the whole
    dashboard: launch and type into agents, run cron jobs unsandboxed on the Mac, read
    transcripts. The dashboard warns at startup about workers without it.

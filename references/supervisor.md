@@ -126,13 +126,18 @@ workers"). The Host check is no boundary against them: `tailscale serve` picks t
 service by TLS server name and passes the client's Host through. What it does replace
 is `X-Forwarded-For`, which it sets to the tailnet address the request came from. A
 request whose `X-Forwarded-For` is any registered machine's `tailnet_ip` (enabled or
-not) may use only `/api/worker/` (GET, POST and OPTIONS); every other route, static
-files included, answers 403. When `machines.json` cannot be read, every request
-carrying `X-Forwarded-For` is refused the same way. Requests without that header come
-from this machine directly (the controller's own tools) and are not fenced. A worker
-registered without `tailnet_ip` cannot be told apart: the dashboard prints a warning
-naming such machines at startup, `/api/machines` shows them with `fenced: false`, and
-`worker-token` warns when it issues them a token.
+not) may only POST `/api/worker/register` or `/api/worker/handoff`, exactly those
+paths; every other method and route, static files included, answers 403. A request
+with more than one `X-Forwarded-For`, or one that is not a bare address (a port,
+brackets, a zone, a list), did not come from the proxy and is refused the same way.
+When `machines.json` cannot be read, every request carrying `X-Forwarded-For` is
+refused too, except those two worker POSTs, which the token and address checks below
+then refuse. Requests without that header come from this machine directly (the
+controller's own tools) and are not fenced. `tailscale serve` answers on IPv4 and
+IPv6, so record both of a worker's addresses: one recorded without the other leaves
+the other family unrecognised. The dashboard prints a warning at startup naming
+workers without an IPv4 and an IPv6 `tailnet_ip`, `/api/machines` shows them with
+`fenced: false`, and `worker-token` warns when it issues them a token.
 
 `--require-tailscale-user` (off by default) also refuses, through the proxy, every
 request but `/api/worker/` that lacks `Tailscale-User-Login`. `tailscale serve`

@@ -1421,10 +1421,11 @@ def main():
                 emit({"machine": args.machine, "revoked": True})
             else:
                 worker_api.print_token(worker_api.issue(home, args.machine))
-                if machines.load(home)[args.machine].tailnet_ip is None:
+                if not machines.fenced(machines.load(home)[args.machine]):
                     print(
-                        f"Warning: add {args.machine}'s tailnet_ip to machines.json; until "
-                        "then it can use the whole dashboard through the tailnet",
+                        f"Warning: add {args.machine}'s IPv4 and IPv6 tailnet_ip to "
+                        "machines.json; until then it can use the whole dashboard through "
+                        "the tailnet",
                         file=sys.stderr,
                     )
         except (OSError, ValueError) as exc:

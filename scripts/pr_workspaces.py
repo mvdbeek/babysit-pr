@@ -1146,8 +1146,8 @@ class Workspaces:
                     "local": False,
                     "updatable": worker_updates.updatable(m),
                     "update": updates.get(m.id),
-                    # Without it the dashboard cannot keep it to /api/worker/.
-                    "fenced": m.tailnet_ip is not None,
+                    # Without both addresses the dashboard cannot keep it to /api/worker/.
+                    "fenced": machines.fenced(m),
                 }
             )
         return [
