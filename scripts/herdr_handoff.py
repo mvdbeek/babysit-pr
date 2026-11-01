@@ -207,21 +207,25 @@ def claude_composer(screen):
     """The text in Claude's composer, between its rules; None for any other layout.
 
     Faint text is Claude's placeholder or a suggested next prompt, never typed input.
+    The composer is the last "❯" line with a rule just above it and another below, past
+    any wrapped lines: the slash-command menu Claude may draw under it ("❯ /exit  Exit
+    the CLI") marks its selection with "❯" too, right below the composer's lower rule.
     """
     styled = screen.splitlines()
     lines = [SGR.sub("", line) for line in styled]
-    prompts = [index for index, line in enumerate(lines) if line.lstrip().startswith("❯")]
-    if not prompts or prompts[-1] == 0 or not RULE.fullmatch(lines[prompts[-1] - 1]):
-        return None
 
     def typed(line):
         return "".join(c for c, dim in styled_chars(line) if not dim).strip()
 
-    text = [typed(styled[prompts[-1]]).lstrip()[1:].strip()]
-    for index in range(prompts[-1] + 1, len(lines)):
-        if RULE.match(lines[index]):
-            return " ".join(part for part in text if part)
-        text.append(typed(styled[index]))
+    prompts = [index for index, line in enumerate(lines) if line.lstrip().startswith("❯")]
+    for prompt in reversed(prompts):
+        if prompt == 0 or not RULE.fullmatch(lines[prompt - 1]):
+            continue
+        text = [typed(styled[prompt]).lstrip()[1:].strip()]
+        for index in range(prompt + 1, len(lines)):
+            if RULE.match(lines[index]):
+                return " ".join(part for part in text if part)
+            text.append(typed(styled[index]))
     return None
 
 
