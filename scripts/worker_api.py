@@ -7,9 +7,11 @@ the controller's dashboard URL. The controller stores only the token's SHA-256, 
 shared. The token decides the machine: a request cannot name another one.
 
 What the token allows is registering watches on its own machine, for sessions and
-checkouts the controller then reads there itself (``remote_probe``), and handing off a
+checkouts the controller then reads there itself (``remote_probe``), handing off a
 watch registered there: the controller then exits that watch's agent through the
-worker's herdr, as ``herdr_handoff`` does here. Any process on the worker that can read
+worker's herdr, as ``herdr_handoff`` does here, and starting a sub-task for one of its
+launches (``launch``): a New task, sandboxed, under the controller's sub-task rules
+(``pr_workspaces.Workspaces.subtask``). Any process on the worker that can read
 ``worker.json`` can do that: the worker's user, not its sandboxed agents, whose home
 babysit-bwrap replaces and who reach the controller only through their launch's broker
 (``worker_broker``).
@@ -38,7 +40,7 @@ MAX_BODY = 65536
 MAX_ANSWER = 65536
 # Reading the worker's checkout and session, and GitHub, can take a while over ssh.
 FORWARD_TIMEOUT = 300
-ACTIONS = {"register", "handoff"}
+ACTIONS = {"register", "handoff", "launch"}
 # Set by babysit-bwrap inside a worker's sandbox: its registration broker's socket.
 SOCKET_ENV = "BABYSIT_REGISTER_SOCKET"
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -288,14 +290,80 @@ def handoff_args(machine, request):
     )
 
 
-def handle(home, machine, action, request):
+LAUNCH = {"launch", "parent"}
+# What a broker says about the launch asking: its directory (babysit-bwrap's), the
+# conversation and the transcript it found for it, and whether it has Docker.
+PARENT = {"cwd", "session", "agent", "config_dir", "rollout", "docker"}
+
+
+def launch_args(machine, request):
+    """A sub-task's launch fields, as sent, and its parent, from a broker's request.
+
+    The token decides the machine; ``Workspaces.subtask`` checks the launch fields.
+    """
+    if not isinstance(request, dict) or set(request) != LAUNCH:
+        raise ValueError("Expected exactly the launch and parent fields")
+    parent = request["parent"]
+    if not isinstance(parent, dict) or set(parent) != PARENT:
+        raise ValueError("Expected exactly the parent fields")
+    if parent["agent"] not in {"codex", "claude"}:
+        raise ValueError("Invalid parent agent")
+    if type(parent["docker"]) is not bool:
+        raise ValueError("Invalid parent Docker grant")
+    return request["launch"], {
+        "machine": machine.id,
+        "machine_label": machine.label,
+        "cwd": _absolute(parent["cwd"], "parent cwd"),
+        "session": _text(parent["session"], "parent session", 36, UUID).lower(),
+        "agent": parent["agent"],
+        "config_dir": _absolute(parent["config_dir"], "parent configuration"),
+        "rollout": _absolute(parent["rollout"], "parent transcript"),
+        "docker": parent["docker"],
+        "sandbox": "bwrap",
+    }
+
+
+def local_parent(parent):
+    """What a ``wt`` inside Safehouse on this machine says about its launch: claims, which
+    nothing here can check (any local process reaches the dashboard)."""
+    if not isinstance(parent, dict) or set(parent) != {
+        "cwd",
+        "session",
+        "agent",
+        "config_dir",
+        "docker",
+    }:
+        raise ValueError("Expected exactly the parent fields")
+    if parent["agent"] not in {"codex", "claude"}:
+        raise ValueError("Invalid parent agent")
+    if type(parent["docker"]) is not bool:
+        raise ValueError("Invalid parent Docker grant")
+    session = _optional(parent["session"], "parent session", 36, UUID)
+    return {
+        "machine": None,
+        "machine_label": None,
+        "cwd": _absolute(parent["cwd"], "parent cwd"),
+        "session": session.lower() if session else None,
+        "agent": parent["agent"],
+        "config_dir": _absolute(parent["config_dir"], "parent configuration"),
+        "rollout": None,
+        "docker": parent["docker"],
+        "sandbox": "safehouse",
+    }
+
+
+def handle(home, machine, action, request, launch=None):
     """Answer one worker request for ``machine``, the one its token names.
 
-    Limits apply per machine and worktree, so one sandbox cannot hold up the others.
+    Limits apply per machine and worktree (a launch's: its parent's directory), so one
+    sandbox cannot hold up the others. ``launch`` starts a sub-task (``Workspaces.subtask``
+    with its parent); without it, launches are refused.
     """
     import pr_supervisor
 
     cwd = request.get("cwd") if isinstance(request, dict) else None
+    if action == "launch" and isinstance(request, dict) and isinstance(request.get("parent"), dict):
+        cwd = request["parent"].get("cwd")
     key = f"{machine.id}\0{cwd if isinstance(cwd, str) and len(cwd) <= 4096 else ''}"
     with _busy_lock:
         if len(_busy) > MAX_KEYS:
@@ -310,6 +378,10 @@ def handle(home, machine, action, request):
         if not _take(machine.id, machine=True) or not _take(key):
             raise RateLimited(f"Too many requests from {machine.label}; wait a minute")
         try:
+            if action == "launch":
+                if launch is None:
+                    raise ValueError("This dashboard does not start tasks")
+                return launch(*launch_args(machine, request))
             if action == "handoff":
                 args = handoff_args(machine, request)
             else:
@@ -396,10 +468,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def forward(action, payload, timeout=FORWARD_TIMEOUT):
+def forward(action, payload, timeout=FORWARD_TIMEOUT, path=None):
     """The controller's answer to ``payload``: through this sandbox's registration broker
-    (``worker_broker``) inside babysit-bwrap, else posted with ``worker.json``'s token."""
-    path = os.environ.get(SOCKET_ENV)
+    (``worker_broker``, at ``path`` or ``$BABYSIT_REGISTER_SOCKET``) inside babysit-bwrap,
+    else posted with ``worker.json``'s token.
+
+    A refusal raises ValueError; RuntimeError means the controller may have acted.
+    """
+    path = path or os.environ.get(SOCKET_ENV)
     if not path:
         return post(action, payload, timeout)
     try:
@@ -421,7 +497,9 @@ def forward(action, payload, timeout=FORWARD_TIMEOUT):
     if not isinstance(answer, dict):
         raise RuntimeError("The registration broker answered no JSON object")
     if "error" in answer:
-        raise ValueError(str(answer["error"])[:2000])
+        # The broker could not tell whether the controller took it (a timeout, say).
+        failure = RuntimeError if answer.get("uncertain") is True else ValueError
+        raise failure(str(answer["error"])[:2000])
     return answer
 
 
@@ -444,6 +522,9 @@ def post(action, payload, timeout=FORWARD_TIMEOUT):
             detail = str(json.loads(exc.read(MAX_ANSWER))["error"])
         except (OSError, ValueError, KeyError, TypeError):
             detail = f"HTTP {exc.code}"
+        if action == "launch" and exc.code >= 500:
+            # A proxy's 502 or the dashboard's 503 may follow a launch it recorded.
+            raise RuntimeError(f"The controller failed: {detail[:1000]}") from exc
         raise ValueError(f"The controller refused: {detail[:1000]}") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         reason = getattr(exc, "reason", exc)

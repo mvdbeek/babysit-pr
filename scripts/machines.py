@@ -121,6 +121,16 @@ def _ip(value):
         return False
 
 
+def fenced(m: Machine) -> bool:
+    """Whether the dashboard can tell all its requests apart: an IPv4 and an IPv6 address.
+
+    `tailscale serve` answers on both families, so a machine with only one recorded can
+    reach the dashboard through the other unrecognised.
+    """
+    versions = {ipaddress.ip_address(ip).version for ip in m.tailnet_ip or ()}
+    return versions == {4, 6}
+
+
 def _remote_path(value):
     return (
         isinstance(value, str)
@@ -266,6 +276,23 @@ def _repos(raw, ids):
     return repos
 
 
+def _docker(raw, machines):
+    # Where Auto sends launches that use Docker, ahead of a clone here; see placement.
+    if not isinstance(raw, dict):
+        raise ValueError("Configure docker as {prefer: machine id}")
+    if unknown := set(raw) - {"prefer"}:
+        raise ValueError(f"Unknown keys for docker: {', '.join(sorted(unknown))}")
+    prefer = raw.get("prefer")
+    if prefer is not None and not isinstance(prefer, str):
+        raise ValueError("Invalid prefer for docker")
+    if prefer is not None and prefer not in machines:
+        raise ValueError(f"docker prefers unknown machine {prefer}")
+    # A preferred machine without the docker label, disabled or not used by Auto stays
+    # valid: placement passes it over and its reason says why, while records pinned to
+    # the registry keep resolving.
+    return {"prefer": prefer}
+
+
 def load_config(home):
     """Validated registry, None when absent. Raises ValueError when malformed.
 
@@ -280,7 +307,7 @@ def load_config(home):
     raw = json.loads(path.read_text())
     if not isinstance(raw, dict):
         raise ValueError("Machine registry must be a JSON object")
-    if unknown := set(raw) - {"version", "machines", "repos"}:
+    if unknown := set(raw) - {"version", "machines", "repos", "docker"}:
         raise ValueError(f"Unknown registry keys: {', '.join(sorted(unknown))}")
     if type(raw.get("version")) is not int or raw["version"] != 1:
         raise ValueError("Machine registry version must be 1")
@@ -301,7 +328,11 @@ def load_config(home):
         machines[machine.id] = machine
         labels.add(machine.label)
         targets.add(machine.ssh)
-    return {"machines": machines, "repos": _repos(raw.get("repos", {}), machines)}
+    return {
+        "machines": machines,
+        "repos": _repos(raw.get("repos", {}), machines),
+        "docker": _docker(raw.get("docker", {}), machines),
+    }
 
 
 def load(home) -> dict[str, Machine]:

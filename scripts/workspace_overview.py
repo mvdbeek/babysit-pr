@@ -37,6 +37,8 @@ from pr_workspaces import (
     herdr,
     remote_slugs,
     repo_config,
+    started_by,
+    subtask_parents,
 )
 
 INTERVAL = 300  # Local rescan cadence; GitHub state has its own freshness window.
@@ -373,6 +375,8 @@ class WorkspaceOverview:
         self.links: dict = {}
         self.bases: dict = {}
         self.live: set[str] = set()  # Link cache keys the latest scan looked up.
+        # The launch each sub-task's checkout was asked for from, by machine and path.
+        self.parents: dict = {}
         self.job: dict | None = None
         self.value: dict = {"workspaces": [], "warnings": [], "synced_at": None}
         self.partial: dict | None = None
@@ -744,6 +748,7 @@ class WorkspaceOverview:
         That part keeps each worker's last rows and status until its scan answers.
         """
         warnings: list[str] = []
+        self.parents = subtask_parents(self.home)
         # Workers scan in their own threads while this machine scans as it always has.
         scans = self.start_scans(self.remote_machines(warnings))
         clones, checkouts, spaces, agents = self.inventory(warnings)
@@ -1245,6 +1250,9 @@ class WorkspaceOverview:
             "remove_worktree": not main,
             "removable": (not main or bool(found)) and not watch,
         }
+        parent = self.parents.get((machine.id if machine else None, item["path"]))
+        if parent:
+            row["started_by"] = started_by(parent)
         row["status"] = row_status(row)
         return self.on_machine(row, machine) if machine else row
 

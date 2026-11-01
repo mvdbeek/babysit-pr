@@ -8,6 +8,7 @@ import http.client
 import http.server
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -484,6 +485,8 @@ def test_worker_tokens_are_printed_only_into_a_pipe(box):
     assert done.returncode == 0, done.stdout
     token = done.stdout.strip()
     assert worker_api.authenticate(box["home"], f"Bearer {token}").id == "box"
+    # Until its tailnet_ip is recorded, the dashboard cannot keep it to /api/worker/.
+    assert "add box's IPv4 and IPv6 tailnet_ip to machines.json" in done.stderr
     unknown = subprocess.run(
         [sys.executable, str(supervisor.SCRIPT), "--home", str(box["home"]), "worker-token", "x"],
         text=True,
@@ -659,3 +662,236 @@ def test_one_worktrees_registrations_never_use_up_another_worktrees_rate(box, se
     assert codes[-1] == 429
     status, answer = post(served, "/api/worker/register", request_body(box), auth)
     assert status == 200, answer
+
+
+TAILNET = "babysitter.test"
+FENCE = "A worker machine may only use /api/worker/"
+
+
+@pytest.fixture
+def tailnet(box):
+    """A dashboard served as `tailscale serve` would front it, with a worker's addresses."""
+    registry(box["home"], tailnet_ip=["100.64.0.5", "fd7a:115c:a1e0::5"])
+    servers = []
+
+    def start(**options):
+        server = dashboard.DashboardServer(box["home"], 0, allowed_hosts=[TAILNET], **options)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return server
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def call(server, method, path, headers=None, body=None):
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=60)
+    data = None if body is None else json.dumps(body).encode()
+    try:
+        conn.request(
+            method,
+            path,
+            data,
+            {
+                "Host": TAILNET,
+                **({"Content-Type": "application/json"} if data else {}),
+                **(headers or {}),
+            },
+        )
+        response = conn.getresponse()
+        raw = response.read()
+        try:
+            return response.status, json.loads(raw)
+        except ValueError:
+            return response.status, {}
+    finally:
+        conn.close()
+
+
+ACTIONS = [
+    ("GET", "/api/status", None, None),
+    ("GET", "/api/workspace-transcript?id=w1", None, None),
+    ("GET", "/api/settings", None, None),
+    ("GET", "/", None, None),
+    ("GET", "/app.js", None, None),
+    ("POST", "/api/cron-action", "cron-action", {"action": "run", "id": "x"}),
+    ("POST", "/api/workspace-new", "workspace-new", {"repo": "base/repo"}),
+    ("POST", "/api/workspace-message", "workspace-message", {"id": "w1", "text": "hi"}),
+    ("POST", "/api/settings", "settings", {"prompts": []}),
+    ("POST", "/api/extension", None, {"type": "task"}),
+    ("OPTIONS", "/api/extension", None, None),
+]
+
+
+@pytest.mark.parametrize(("method", "path", "action", "body"), ACTIONS)
+def test_a_worker_reaches_nothing_but_the_worker_api_through_the_tailnet(
+    tailnet, method, path, action, body
+):
+    server = tailnet()
+    headers = {"X-Babysit-Action": action} if action else {}
+    for worker in ("100.64.0.5", "fd7a:115c:a1e0::5", "::ffff:100.64.0.5"):
+        status, answer = call(server, method, path, {**headers, "X-Forwarded-For": worker}, body)
+        assert (status, answer) == (403, {"error": FENCE}), worker
+    # The proxy passes the client's Host through: a loopback Host changes nothing.
+    loopback = {"Host": f"127.0.0.1:{server.server_port}", "X-Forwarded-For": "100.64.0.5"}
+    assert call(server, method, path, {**headers, **loopback}, body) == (403, {"error": FENCE})
+    # Another tailnet device, and this machine directly, are answered as before.
+    for other in ({"X-Forwarded-For": "100.64.0.9"}, {}):
+        status, answer = call(server, method, path, {**headers, **other}, body)
+        assert answer.get("error") != FENCE, (other, status, answer)
+
+
+def test_a_worker_still_reaches_its_own_api_and_its_checks(box, tailnet):
+    server = tailnet()
+    via_worker = {"X-Forwarded-For": "100.64.0.5"}
+    for path in ("/api/worker/register", "//api/worker/register"):
+        # http.server collapses leading slashes: the second is the same endpoint.
+        status, answer = call(server, "POST", path, via_worker, request_body(box))
+        assert (status, answer["error"]) == (
+            403,
+            "This needs a worker token issued by the controller",
+        )
+    auth = {**via_worker, "Authorization": f"Bearer {worker_api.issue(box['home'], 'box')}"}
+    status, answer = call(server, "POST", "/api/worker/register", auth, request_body(box))
+    assert status == 200 and answer["machine"] == "box", answer
+    # A disabled worker is still kept to it.
+    registry(box["home"], tailnet_ip="100.64.0.5", enabled=False)
+    assert call(server, "GET", "/api/status", via_worker) == (403, {"error": FENCE})
+
+
+def test_an_unreadable_registry_refuses_the_tailnet_but_not_this_machine(box, tailnet):
+    server = tailnet()
+    (box["home"] / "machines.json").write_text("{")
+    status, answer = call(server, "GET", "/api/status", {"X-Forwarded-For": "100.64.0.9"})
+    assert status == 403 and "machines.json" in answer["error"]
+    assert call(server, "GET", "/api/status")[0] == 200
+
+
+def test_tailscale_users_only_mode_refuses_tagged_nodes_but_the_worker_api(box, tailnet):
+    registry(box["home"])  # No tailnet_ip: only the missing user login gives it away.
+    server = tailnet(require_tailscale_user=True)
+    tagged = {"X-Forwarded-For": "100.64.0.5"}
+    status, answer = call(server, "GET", "/api/status", tagged)
+    assert status == 403 and "tailnet user" in answer["error"]
+    user = {**tagged, "Tailscale-User-Login": "someone@example.com"}
+    assert call(server, "GET", "/api/status", user)[0] == 200
+    assert call(server, "GET", "/api/status")[0] == 200
+    auth = {**tagged, "Authorization": f"Bearer {worker_api.issue(box['home'], 'box')}"}
+    status, answer = call(server, "POST", "/api/worker/register", auth, request_body(box))
+    assert status == 200, answer
+    # Off by default.
+    assert call(tailnet(), "GET", "/api/status", tagged)[0] == 200
+
+
+def test_workers_without_both_tailnet_addresses_are_named(box):
+    assert dashboard.unfenced_workers(box["home"]) == ["box"]
+    # The proxy answers on both families: one alone leaves the other open.
+    for one in ("100.64.0.5", ["fd7a:115c:a1e0::5"]):
+        registry(box["home"], tailnet_ip=one)
+        assert dashboard.unfenced_workers(box["home"]) == ["box"]
+    registry(box["home"], tailnet_ip=["fd7a:115c:a1e0::5", "100.64.0.5"])
+    assert dashboard.unfenced_workers(box["home"]) == []
+
+
+UNEXPECTED = "Unexpected X-Forwarded-For; only tailscale serve may proxy the dashboard"
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/worker/register"),
+        ("OPTIONS", "/api/worker/register"),
+        ("GET", "/api/worker/../api/status"),
+        ("POST", "/api/worker/../api/settings"),
+        ("POST", "/api/worker/%2e%2e/api/settings"),
+        ("POST", "/api/worker/register/"),
+        ("POST", "/api/worker/register?x=1"),
+        ("POST", "/api/worker/nope"),
+    ],
+)
+def test_only_the_exact_worker_posts_pass_the_fence(box, tailnet, method, path):
+    server = tailnet()
+    body = request_body(box) if method == "POST" else None
+    assert call(server, method, path, {"X-Forwarded-For": "100.64.0.5"}, body) == (
+        403,
+        {"error": FENCE},
+    )
+
+
+def raw(server, lines, body=b"", wait=1.5):
+    """Every status line the dashboard sends back on one connection within ``wait``."""
+    head = "".join(f"{line}\r\n" for line in lines) + f"Content-Length: {len(body)}\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", server.server_port), timeout=wait) as conn:
+        conn.sendall(head.encode() + body)
+        data = b""
+        try:
+            while chunk := conn.recv(65536):
+                data += chunk
+        except TimeoutError:
+            pass
+    return [
+        line for line in data.decode(errors="replace").split("\r\n") if line.startswith("HTTP/")
+    ]
+
+
+@pytest.mark.parametrize(
+    "forwarded",
+    [
+        ["100.64.0.9:1234"],
+        ["[fd7a:115c:a1e0::9]"],
+        ["fe80::1%eth0"],
+        [""],
+        ["100.64.0.9, 100.64.0.5"],
+        ["100.64.0.9,100.64.0.9"],
+        ["100.64.0.9", "100.64.0.9"],
+    ],
+)
+def test_a_forwarded_address_the_proxy_would_never_send_is_refused(tailnet, forwarded):
+    server = tailnet()
+    lines = ["GET /api/status HTTP/1.1", f"Host: {TAILNET}", "Connection: close"]
+    lines += [f"X-Forwarded-For: {value}" for value in forwarded]
+    head = "".join(f"{line}\r\n" for line in lines) + "\r\n"
+    with socket.create_connection(("127.0.0.1", server.server_port), timeout=10) as conn:
+        conn.sendall(head.encode())
+        data = b""
+        while chunk := conn.recv(65536):
+            data += chunk
+    status, _, body = data.partition(b"\r\n\r\n")
+    assert status.startswith(b"HTTP/1.1 403")
+    assert json.loads(body) == {"error": UNEXPECTED}
+
+
+def test_a_request_hidden_in_a_worker_body_is_never_answered(tailnet):
+    server = tailnet()
+    hidden = f"GET /api/settings HTTP/1.1\r\nHost: {TAILNET}\r\n\r\n".encode()
+    for method, path in [
+        ("POST", "/api/worker/register"),
+        ("POST", "/api/worker/nope"),
+        ("GET", "/api/worker/register"),
+    ]:
+        lines = [
+            f"{method} {path} HTTP/1.1",
+            f"Host: {TAILNET}",
+            "X-Forwarded-For: 100.64.0.5",
+            "Content-Type: application/json",
+        ]
+        assert [s.split()[1] for s in raw(server, lines, hidden)] == ["403"], (method, path)
+
+
+def test_other_methods_from_a_worker_are_not_implemented(tailnet):
+    server = tailnet()
+    for method in ("HEAD", "PUT", "DELETE"):
+        lines = [
+            f"{method} /api/status HTTP/1.1",
+            f"Host: {TAILNET}",
+            "X-Forwarded-For: 100.64.0.5",
+        ]
+        assert [s.split()[1] for s in raw(server, lines, wait=1)][:1] == ["501"], method
+
+
+def test_a_worker_sending_a_user_login_is_still_fenced(tailnet):
+    server = tailnet(require_tailscale_user=True)
+    login = {"X-Forwarded-For": "100.64.0.5", "Tailscale-User-Login": "someone@example.com"}
+    assert call(server, "GET", "/api/status", login) == (403, {"error": FENCE})

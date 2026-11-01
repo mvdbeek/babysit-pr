@@ -7,6 +7,8 @@ dashboard's settings) Auto prefers a worker, and comes back here when none can t
 launch. ``loads`` are ``MachineLoads`` entries by id, ``history`` a stickiness level by
 id (2: a prior workspace for the same target, 1: a clone of its repository is there),
 and ``reservations`` the launches placed on each machine that herdr does not list yet.
+A launch that uses Docker goes to the registry's ``docker`` ``prefer`` machine ahead of
+a clone here, when Auto may place launches there and it can take this one.
 """
 
 import time
@@ -38,8 +40,9 @@ class Exclusion(NamedTuple):
     soft: bool
 
 
-def request(fields, repos):
-    """A placement request from launch ``fields`` plus the registry's per-repo rules.
+def request(fields, repos, docker=None):
+    """A placement request from launch ``fields`` plus the registry's per-repo rules and
+    its ``docker`` preference.
 
     ``fields``: ``kind`` (``pr``, ``issue``, ``sentry``, ``scratch`` or ``cron``),
     ``repo``, ``agent``, ``claude_account``, ``docker``, ``sandboxed`` (default true),
@@ -48,7 +51,12 @@ def request(fields, repos):
     """
     rules = {slug.lower(): rule for slug, rule in repos.items()}
     rule = rules.get((fields.get("repo") or "").lower(), {})
-    return {**fields, "requires": list(rule.get("requires", [])), "prefer": rule.get("prefer")}
+    return {
+        **fields,
+        "requires": list(rule.get("requires", [])),
+        "prefer": rule.get("prefer"),
+        "docker_prefer": (docker or {}).get("prefer") if fields.get("docker") else None,
+    }
 
 
 def requirements(req, machine):
@@ -123,14 +131,16 @@ def free(machine_id, machines, loads, reservations):
     return f"{max(0, total - busy(machine_id, loads, reservations))}/{total} free"
 
 
-def choose(req, machines, loads, history, reservations, *, now=None):
+def choose(req, machines, loads, history, reservations, *, now=None, local=True):
     """The machine ``req`` runs on, or ValueError naming why each machine could not take it.
 
     An explicit choice (``override``) wins, then a pin, and the two must agree; Auto
-    ranks what is left by stickiness, the repository's preferred machine, load, then
-    this machine first and label, so equal candidates always resolve the same way.
+    ranks what is left by a prior workspace, the machine Docker prefers, a clone, the
+    repository's preferred machine, load, then this machine first and label, so equal
+    candidates always resolve the same way.
     Auto only considers workers registered with ``auto``, and this machine when it is
-    full only if nothing else can take the launch.
+    full only if nothing else can take the launch. Without ``local`` this machine is
+    never chosen, by name or by Auto.
     """
     now = time.time() if now is None else now
     found = exclusions(req, machines, loads, reservations, now)
@@ -151,6 +161,8 @@ def choose(req, machines, loads, history, reservations, *, now=None):
 
     override = req.get("override")
     pin = req.get("pin")
+    if not local and LOCAL in (override, pin):
+        raise ValueError(f"{label(LOCAL, machines)} cannot take this launch")
     if override not in (None, "auto"):
         known(override)
         if pin is not None and override != pin:
@@ -160,10 +172,10 @@ def choose(req, machines, loads, history, reservations, *, now=None):
         return named(override, "chosen")
     if pin is not None:
         return named(pin, "existing workspace")
-    offered = {LOCAL, *(m for m, machine in machines.items() if machine.auto)}
+    offered = {*([LOCAL] if local else []), *(m for m, machine in machines.items() if machine.auto)}
     candidates = [machine_id for machine_id in offered if machine_id not in found]
-    local = found.get(LOCAL)
-    if not candidates and local and local.soft:
+    here = found.get(LOCAL)
+    if not candidates and local and here and here.soft:
         # Full, not unable: as before workers existed, it still takes the launch.
         return Placement(
             None,
@@ -172,11 +184,17 @@ def choose(req, machines, loads, history, reservations, *, now=None):
             excluded,
         )
     if not candidates:
-        reasons = "; ".join(f"{label(m, machines)}: {why}" for m, why in sorted(excluded.items()))
+        reasons = "; ".join(
+            f"{label(m, machines)}: {why}"
+            for m, why in sorted(excluded.items())
+            if local or m != LOCAL
+        )
         raise ValueError(f"No machine can take this launch ({reasons})")
 
     def rank(machine_id):
         return (
+            history.get(machine_id, 0) < 2,
+            machine_id != req.get("docker_prefer"),
             -history.get(machine_id, 0),
             machine_id != req.get("prefer"),
             busy(machine_id, loads, reservations) / slots(machine_id, machines, loads),
@@ -187,7 +205,14 @@ def choose(req, machines, loads, history, reservations, *, now=None):
 
     best = min(candidates, key=rank)
     why = {2: "prior workspace", 1: "clone present"}.get(history.get(best, 0))
+    if best == req.get("docker_prefer") and history.get(best, 0) < 2:
+        why = f"Docker prefers {label(best, machines)}"
     if why is None and best == req.get("prefer"):
         why = "preferred for the repository"
     reason = f"auto: {why or 'least busy'}, {free(best, machines, loads, reservations)}"
+    docker = req.get("docker_prefer")
+    if docker in machines and best != docker:
+        # Why the machine Docker prefers was passed over, which the dialog shows.
+        passed = excluded.get(docker) or ("" if machines[docker].auto else "not used by Auto")
+        reason += f"; {label(docker, machines)}: {passed or 'ranked lower'}"
     return Placement(None if best == LOCAL else best, reason, excluded)

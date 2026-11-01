@@ -590,3 +590,32 @@ def test_put_file_writes_a_private_file_on_the_worker(tmp_path, fake_tools, shor
     for name in ("../x", "a/b", "", "-n", ".hidden"):
         with pytest.raises(ValueError, match="file name"):
             machines.put_file(home, mini, folder, name, b"x")
+
+
+def test_docker_preference_names_a_registered_docker_machine(tmp_path):
+    box = {"id": "box", "label": "Linux box", "ssh": "box", "os": "linux", "labels": ["bwrap"]}
+    write(tmp_path, MINI, box)
+    assert machines.load_config(tmp_path)["docker"] == {"prefer": None}
+    write(tmp_path, MINI, box, docker={"prefer": "mini"})
+    assert machines.load_config(tmp_path)["docker"] == {"prefer": "mini"}
+    # One that lost its docker label keeps the registry valid; placement passes it over.
+    write(tmp_path, MINI, box, docker={"prefer": "box"})
+    assert machines.load_config(tmp_path)["docker"] == {"prefer": "box"}
+    assert machines.resolve(tmp_path, "box").label == "Linux box"
+
+
+@pytest.mark.parametrize(
+    ("docker", "message"),
+    [
+        (["mini"], "Configure docker as"),
+        ({"prefer": ["mini"]}, "Invalid prefer for docker"),
+        ({"prefer": "nowhere"}, "docker prefers unknown machine nowhere"),
+        ({"prefer": "local"}, "docker prefers unknown machine local"),
+        ({"prefer": "mini", "workers": True}, "Unknown keys for docker: workers"),
+    ],
+)
+def test_invalid_docker_preference(tmp_path, docker, message):
+    box = {"id": "box", "label": "Linux box", "ssh": "box", "os": "linux", "labels": ["bwrap"]}
+    write(tmp_path, MINI, box, docker=docker)
+    with pytest.raises(ValueError, match=message):
+        machines.load_config(tmp_path)

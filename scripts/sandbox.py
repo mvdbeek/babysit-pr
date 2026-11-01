@@ -124,6 +124,70 @@ def claude_launcher(name: str | None = None, features: Sequence[str] = ()) -> li
     return wrap(argv, Grants(env_pass=REPAIR_ENV, features=("playwright", *features)), name)
 
 
+# The Docker sockets Safehouse's docker integration grants (agent_docker inspects them too).
+DOCKER_SOCKETS = ("/private/var/run/docker.sock", "~/.docker/run/docker.sock")
+
+
+def _seatbelt():
+    """libsandbox and its ``sandbox_check``; OSError or AttributeError off macOS."""
+    import ctypes
+
+    library = ctypes.CDLL("/usr/lib/libsandbox.dylib")
+    check = library.sandbox_check
+    # Three fixed arguments, then the filter's (WebKit's SandboxSPI.h).
+    check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    check.restype = ctypes.c_int
+    return library, check
+
+
+def confined() -> bool:
+    """Whether this process runs in a macOS Seatbelt sandbox, as agents in Safehouse do.
+
+    It tells ``wt`` that it cannot make worktrees here; nothing trusts the answer.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        _, check = _seatbelt()
+    except (OSError, AttributeError):
+        return False
+    return check(os.getpid(), None, 0) == 1
+
+
+def writable(path: str) -> bool:
+    """Whether this process's Seatbelt sandbox lets it write in ``path``, which exists."""
+    if sys.platform != "darwin":
+        return os.access(path, os.W_OK)
+    import ctypes
+
+    try:
+        library, check = _seatbelt()
+        quiet = ctypes.c_int.in_dll(library, "SANDBOX_CHECK_NO_REPORT").value
+    except (OSError, AttributeError, ValueError):
+        return False
+    # A path that does not exist is never allowed, whatever the profile says.
+    return check(os.getpid(), b"file-write-create", 1 | quiet, os.fsencode(path)) == 0
+
+
+def docker_granted() -> bool:
+    """Whether this process's Seatbelt sandbox lets it read and write Docker's sockets."""
+    if sys.platform != "darwin":
+        return False
+    import ctypes
+
+    try:
+        library, check = _seatbelt()
+        quiet = ctypes.c_int.in_dll(library, "SANDBOX_CHECK_NO_REPORT").value
+    except (OSError, AttributeError, ValueError):
+        return False
+    return all(
+        # 1: the filter is a path.
+        check(os.getpid(), operation, 1 | quiet, os.fsencode(os.path.expanduser(path))) == 0
+        for path in DOCKER_SOCKETS
+        for operation in (b"file-read-data", b"file-write-data")
+    )
+
+
 def launcher_backend(word: str) -> str | None:
     """The backend whose launcher executable ``word`` names, if any."""
     return LAUNCHERS.get(Path(word).name)

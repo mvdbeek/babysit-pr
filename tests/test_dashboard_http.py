@@ -16,6 +16,7 @@ import time
 import dashboard
 import pytest
 import service_control
+import wt
 from pr_overview import Overview
 from pr_supervisor import open_db, save_job
 
@@ -579,3 +580,50 @@ def test_a_long_prompt_is_accepted_over_the_small_action_limit(serve):
     assert len(prompt) > 1024
     status, _, body = post_settings(server, {"task": "prReview", "prompt": prompt})
     assert status == 200 and json.loads(body)["task_prompts"]["prReview"] == prompt
+
+
+def test_wt_hands_a_worker_launch_through_the_dashboards_guard(serve, tmp_path):
+    class Workspaces:
+        """The three answers `wt --machine` reads; the dashboard's own guard is real."""
+
+        def __init__(self):
+            self.previews, self.launched = [], []
+
+        def preview(self, query):
+            self.previews.append(query)
+            return {"machine": "chonk", "label": "Chonk", "reason": "auto: Docker prefers Chonk"}
+
+        def new_task(self, request):
+            self.launched.append(request)
+            return {"operation": {"pr": "new:1", "status": "queued", "message": "Queued"}}
+
+        def snapshot(self):
+            done = {"pr": "new:1", "status": "complete", "message": "Workspace ready on Chonk"}
+            return {"new": {"new:1": {"operation": done}}}
+
+    workspaces = Workspaces()
+    server = serve(workspaces=workspaces)
+    url = f"http://127.0.0.1:{server.server_port}"
+    tool = wt.Tool(wt.SubprocessRunner({}), {"HOME": str(tmp_path), "BABYSIT_DASHBOARD_URL": url})
+    transport = wt.DashboardTransport(tool, "wt")
+    parsed = wt.Options()
+    parsed.prompt, parsed.positional, parsed.docker = "Run the containers", ["main", "feat"], True
+    request = wt.launch_request("wt", parsed, "base/repo", "auto")
+    assert transport.place(request)["machine"] == "chonk"
+    assert workspaces.previews == [
+        {"kind": "scratch", "repo": "base/repo", "agent": "claude", "docker": "1"}
+    ]
+    op = transport.start({**request, "machine": "chonk"})
+    assert workspaces.launched == [{**request, "machine": "chonk"}]
+    assert transport.status(op)["status"] == "complete"
+    # The same request from a browser, or for another Host, never reaches New task.
+    body = json.dumps({**request, "machine": "chonk"}).encode()
+    headers = {"Content-Type": "application/json", "X-Babysit-Action": "workspace-new"}
+    for extra in (
+        {"Origin": "https://evil.example"},
+        {"Host": "evil.example"},
+        {"X-Babysit-Action": "x"},
+    ):
+        status, _, _ = get(server, "/api/workspace-new", {**headers, **extra}, "POST", body)
+        assert status == 403
+    assert len(workspaces.launched) == 1

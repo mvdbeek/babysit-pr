@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Watch registration and handoff for one sandbox: only its own worktrees and sessions.
+"""Watch registration, handoff and sub-tasks for one sandbox: only its own worktrees and
+sessions.
 
-    worker_broker.py LISTEN AGENT CONFIG_DIR [WORKTREE...]
+    worker_broker.py [--cwd=DIR] [--granted=FEATURES] LISTEN AGENT CONFIG_DIR [WORKTREE...]
 
 On a worker, babysit-bwrap starts this outside the sandbox and binds LISTEN inside,
 naming it in ``BABYSIT_REGISTER_SOCKET``; the sandbox never sees ``worker.json``, whose
@@ -18,6 +19,14 @@ names the launch's own conversation only, with the transcript found for it, and 
 controller acts only on a watch of that machine, worktree and session whose transcript
 is exactly that one.
 
+A launch (``action: launch``) asks for a sub-task: exactly ``wt.LAUNCH_FIELDS`` under
+``launch``, and the conversations it may run in under ``sessions``. The broker keeps its
+launch's agent's session, checked as a handoff's, and tells the controller, as the
+sub-task's parent, what the sandbox cannot forge: the launch's working directory
+(``--cwd``, babysit-bwrap's), its agent and CONFIG_DIR, that transcript, and whether the
+launch was granted Docker (``docker`` in ``--granted``). The controller decides the rest; a launch without
+``--cwd`` starts nothing.
+
 "Its own sessions" means every session in that configuration directory, which other
 launches of the same Claude account or Codex home share and can write: an agent can
 register such a session (one recorded in its own worktree) or plant one there, so a
@@ -25,7 +34,8 @@ repair may resume a conversation another launch of that account started. That gi
 it no access beyond what the account and its worktree already have.
 
 One request is forwarded at a time, at most one of each action per MIN_INTERVAL
-seconds, so one sandbox cannot use up its worker's requests at the controller.
+seconds, so one sandbox cannot use up its worker's requests at the controller. A
+launch's answer waits for the task to start, a few minutes at most.
 
 Prints ``ready`` once LISTEN accepts connections, then runs until its parent exits
 (babysit-bwrap execs bwrap, so that is the sandbox), and removes LISTEN and its
@@ -47,12 +57,13 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import worker_api  # noqa: E402
+import wt  # noqa: E402
 
 READ_TIMEOUT = 30  # For a whole request, however slowly it arrives.
 MIN_INTERVAL = 20
 CONNECTIONS = 4
 _forwarding = threading.Lock()
-_last = {"register": 0.0, "handoff": 0.0}
+_last = {"register": 0.0, "handoff": 0.0, "launch": 0.0}
 _slots = threading.BoundedSemaphore(CONNECTIONS)
 
 
@@ -74,10 +85,37 @@ def transcript(agent, config_dir, session):
     return str(found[0])
 
 
-def check(request, agent, config_dir, worktrees):
+def check(request, agent, config_dir, worktrees, launch=None):
     """The action and request to forward, or ValueError: this launch's own session and
-    checkout."""
+    checkout. ``launch`` is this launch's ``cwd`` and ``docker`` grant."""
     action = request.pop("action", "register") if isinstance(request, dict) else None
+    if action == "launch":
+        sessions = request.get("sessions")
+        fields = request.get("launch")
+        if (
+            set(request) != {"launch", "sessions"}
+            or not isinstance(sessions, dict)
+            or not isinstance(fields, dict)
+            or set(fields) != set(wt.LAUNCH_FIELDS)
+        ):
+            raise ValueError("Expected exactly the launch fields")
+        if not launch or not launch.get("cwd"):
+            raise ValueError("This sandbox's launch cannot start tasks")
+        try:
+            session = str(uuid.UUID(sessions.get(agent)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError(f"Start tasks from this sandbox's own {agent} conversation") from exc
+        return action, {
+            "launch": fields,
+            "parent": {
+                "cwd": launch["cwd"],
+                "session": session,
+                "agent": agent,
+                "config_dir": os.path.realpath(config_dir),
+                "rollout": transcript(agent, config_dir, session),
+                "docker": launch["docker"],
+            },
+        }
     if action == "handoff":
         sessions = request.get("sessions")
         if set(request) != worker_api.HANDOFF or not isinstance(sessions, dict):
@@ -114,8 +152,9 @@ def check(request, agent, config_dir, worktrees):
     }
 
 
-def answer(client, agent, config_dir, worktrees):
+def answer(client, agent, config_dir, worktrees, launch=None):
     with client:
+        action = None
         try:
             deadline = time.monotonic() + READ_TIMEOUT
             data = b""
@@ -130,10 +169,13 @@ def answer(client, agent, config_dir, worktrees):
                 data += chunk
             if len(data) > worker_api.MAX_BODY:
                 raise ValueError("Request too large")
-            action, request = check(json.loads(data), agent, config_dir, worktrees)
+            action, request = check(json.loads(data), agent, config_dir, worktrees, launch)
             client.settimeout(None)
             result = forward(action, request)
-        except (ValueError, RuntimeError, OSError) as exc:
+        except RuntimeError as exc:
+            # Sent, but unanswered: a launch may have started.
+            result = {"error": str(exc), **({"uncertain": True} if action == "launch" else {})}
+        except (ValueError, OSError) as exc:
             result = {"error": str(exc)}
         with contextlib.suppress(OSError):
             client.sendall(json.dumps(result).encode())
@@ -152,14 +194,24 @@ def forward(action, request):
         _forwarding.release()
 
 
-def serve(client, agent, config_dir, worktrees):
+def serve(client, agent, config_dir, worktrees, launch=None):
     try:
-        answer(client, agent, config_dir, worktrees)
+        answer(client, agent, config_dir, worktrees, launch)
     finally:
         _slots.release()
 
 
 def main(argv):
+    argv = list(argv)
+    launch = {"cwd": None, "docker": False}
+    while argv and argv[0].startswith("--"):
+        name, _, value = argv.pop(0).partition("=")
+        if name == "--cwd" and value.startswith("/"):
+            launch["cwd"] = os.path.realpath(value)
+        elif name == "--granted":
+            launch["docker"] = "docker" in value.split(",")
+        else:
+            raise SystemExit(f"worker_broker: unknown option {name}")
     listen, agent, config_dir, *worktrees = argv
     if agent not in {"claude", "codex"}:
         raise SystemExit(f"worker_broker: unknown agent {agent}")
@@ -190,7 +242,7 @@ def main(argv):
                 client.close()  # Enough connections already.
                 continue
             threading.Thread(
-                target=serve, args=(client, agent, config_dir, granted), daemon=True
+                target=serve, args=(client, agent, config_dir, granted, launch), daemon=True
             ).start()
     finally:
         server.close()

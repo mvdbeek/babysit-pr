@@ -165,6 +165,8 @@
       name.append(" ", chip);
     }
     if (entry.path) name.append(node("small", entry.path, "pr-meta"));
+    // A sub-task an agent started from its sandbox names the launch that asked for it.
+    if (entry.started_by) name.append(node("small", entry.started_by, "pr-meta"));
     name.append(
       node("small", `Updated ${entry.updated_at ? date(entry.updated_at) : "unknown"}`, "pr-meta"),
       node("small", `Created ${entry.created_at ? date(entry.created_at) : "unknown"}`, "pr-meta"),

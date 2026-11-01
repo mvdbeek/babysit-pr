@@ -264,6 +264,24 @@ def test_new_task_can_let_the_agent_use_docker(local):  # noqa: F811
     assert off["docker"] is False and "--docker" not in calls[1]
 
 
+def test_new_task_passes_claudes_auto_permission_mode_on(local):  # noqa: F811
+    manager, _, _, _, _ = local
+    calls = helper_calls(manager)
+    value = manager.new_task(
+        request(manager, name="careful", agent="claude", permission_mode="auto")
+    )
+    # The fake tools have no `safe` function for the typed line to call, so only the
+    # launch is checked here.
+    op = finish(manager, value["operation"]["pr"])
+    assert op["permission_mode"] == "auto"
+    assert calls[0][:4] == ["wt", "--claude", "--permission-mode", "auto"]
+    plain = finish(manager, manager.new_task(request(manager, name="plain"))["operation"]["pr"])
+    assert plain["permission_mode"] is None and "--permission-mode" not in calls[1]
+    for change in ({"permission_mode": "auto"}, {"agent": "claude", "permission_mode": "plan"}):
+        with pytest.raises(ValueError, match="Only Claude takes a permission mode, and only auto"):
+            manager.new_task(request(manager, name="nope", **change))
+
+
 @pytest.mark.parametrize("flag", ["docker", "exit_when_done"])
 @pytest.mark.parametrize("value", ["true", 1, None])
 def test_new_task_options_must_be_flags(local, flag, value):  # noqa: F811

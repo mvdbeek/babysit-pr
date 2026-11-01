@@ -277,3 +277,55 @@ def test_reservations_spread_a_batch():
         rest.machine is None
         and rest.reason == "auto: this machine is full and no other machine can take it, 0/20 free"
     )
+
+
+def test_docker_prefers_its_worker_over_a_clone_here():
+    chonk = machine("chonk", "Chonk", os="linux", max_agents=6, labels=("bwrap", "docker"))
+    fleet = {"box": BOX, "chonk": chonk}
+    loads = {"local": load(agents=3)}
+    here = {"local": 1}
+
+    def docker(**fields):
+        return pl.request({"docker": True, **fields}, {}, {"prefer": "chonk"})
+
+    chosen = choose(docker(), fleet, loads, here)
+    assert chosen == pl.Placement(
+        "chonk", "auto: Docker prefers Chonk, 6/6 free", {"box": "lacks docker"}
+    )
+    # Without Docker, or without the preference, the clone here keeps it here.
+    assert choose(pl.request({}, {}, {"prefer": "chonk"}), fleet, loads, here).machine is None
+    assert choose(pl.request({"docker": True}, {}, None), fleet, loads, here).machine is None
+    # It also outranks the repository's preferred machine and load.
+    twin = machine("twin", "Twin", os="linux", max_agents=6, labels=("bwrap", "docker"))
+    busy = {**loads, "chonk": load(agents=5)}
+    chosen = choose(docker(prefer="twin"), {**fleet, "twin": twin}, busy, here)
+    assert chosen.machine == "chonk" and chosen.reason == "auto: Docker prefers Chonk, 1/6 free"
+    # A pin, an explicit choice and a prior workspace still win.
+    assert choose(docker(pin="local"), fleet, loads, here).machine is None
+    assert choose(docker(override="local"), fleet, loads, here).machine is None
+    chosen = choose(docker(), fleet, loads, {"local": 2})
+    assert chosen.machine is None
+    assert chosen.reason == "auto: prior workspace, 17/20 free; Chonk: ranked lower"
+
+
+@pytest.mark.parametrize(
+    ("change", "loads", "why"),
+    [
+        ({"auto": False}, {}, "not used by Auto"),
+        ({}, {"chonk": load(agents=6)}, "full (6/6)"),
+        ({}, {"chonk": load(unreachable_since=NOW - 120)}, "unreachable 2m"),
+        ({}, {"chonk": load(pending=True)}, "checking…"),
+        ({"labels": ("bwrap",)}, {}, "lacks docker"),
+        ({"enabled": False}, {}, "disabled"),
+    ],
+)
+def test_docker_falls_back_here_when_its_worker_cannot_take_the_launch(change, loads, why):
+    chonk = machine("chonk", "Chonk", os="linux", max_agents=6, labels=("bwrap", "docker"))
+    fleet = {"chonk": chonk._replace(**change)}
+    req = pl.request({"docker": True}, {}, {"prefer": "chonk"})
+    chosen = choose(req, fleet, {"local": load(agents=3), **loads}, {"local": 1})
+    assert chosen.machine is None
+    assert chosen.reason == f"auto: clone present, 17/20 free; Chonk: {why}"
+    # Chosen by name, a worker Auto does not use still takes it.
+    if change == {"auto": False}:
+        assert choose({**req, "override": "chonk"}, fleet).machine == "chonk"

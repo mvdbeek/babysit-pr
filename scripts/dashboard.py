@@ -5,6 +5,7 @@ import argparse
 import errno
 import gzip
 import hashlib
+import ipaddress
 import json
 import re
 import signal
@@ -36,7 +37,7 @@ from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
 from pr_ci_logs import BackgroundLogs
 from pr_overview import Overview
-from pr_workspaces import Workspaces, collie_url
+from pr_workspaces import SUBTASK_WAIT, Workspaces, collie_url
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
@@ -388,6 +389,29 @@ def attach_handling(value, workspaces):
         group["handling"] = state.get(f"sentry:{group['key']}")
 
 
+def address(value):
+    """An IP address as `tailscale serve` reports one, an IPv4-mapped one as IPv4; else None.
+
+    Nothing else is accepted: no port, brackets, zone, list or surrounding space.
+    """
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if "%" in value:
+        return None
+    return getattr(ip, "ipv4_mapped", None) or ip
+
+
+def unfenced_workers(home):
+    """Registered machines missing an IPv4 or IPv6 ``tailnet_ip``: not every request of
+    theirs can be told apart."""
+    try:
+        return sorted(m.id for m in machines.load(home).values() if not machines.fenced(m))
+    except (OSError, ValueError):
+        return []
+
+
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     # Connections wait here while the accept loop is busy; the default of 5 overflows
@@ -411,8 +435,11 @@ class DashboardServer(ThreadingHTTPServer):
         cron=None,
         attachments: Path | None = None,
         codex_updates=None,
+        require_tailscale_user=False,
     ) -> None:
         self.home = home
+        # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.
+        self.require_tailscale_user = require_tailscale_user
         # Set when the dashboard stops to be started again on the checkout's code.
         self.restart = False
         self.attachments = attachments or home / "attachments"
@@ -601,12 +628,47 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Transfer-Encoding") or (self.unread or 0) < 0:
             self.unread = None  # Chunked bodies are not read: never mistaken for a request.
         try:
+            if refusal := self.fenced():
+                self.send_json(403, {"error": refusal})
+                return
             handler()
         except Exception as exc:
             traceback.print_exc()
             # A response it interrupted may be incomplete: never send another after it.
             self.close_connection = True
             self.fail(500, f"Unexpected dashboard error: {type(exc).__name__}: {exc}")
+
+    def fenced(self):
+        """Why a request from the tailnet may not use this route; None when it may.
+
+        Worker machines reach the dashboard through `tailscale serve` for /api/worker/
+        and nothing else: their agents, sandboxed or not, share their network. The proxy
+        sets X-Forwarded-For to the tailnet address a request came from, replacing any
+        the client sent, but passes the client's Host through, so the address decides,
+        never the Host. A request without the header came from this machine directly.
+        """
+        forwarded = self.headers.get_all("X-Forwarded-For")
+        if not forwarded or (
+            self.command == "POST"
+            and self.path in {f"/api/worker/{action}" for action in worker_api.ACTIONS}
+        ):
+            return None
+        # The proxy sends exactly one, a bare address: anything else did not come from it.
+        source = address(forwarded[0]) if len(forwarded) == 1 else None
+        if source is None:
+            return "Unexpected X-Forwarded-For; only tailscale serve may proxy the dashboard"
+        # The proxy names the user of a user-owned device, never of a tagged node, and
+        # drops any name the client sent.
+        if self.server.require_tailscale_user and not self.headers.get("Tailscale-User-Login"):
+            return "Only a tailnet user's device may use the dashboard"
+        try:
+            registered = machines.load(self.server.home).values()
+        except (OSError, ValueError):
+            return "machines.json cannot be read, so no tailnet request may use the dashboard"
+        workers = {address(ip) for m in registered for ip in m.tailnet_ip or ()}
+        if source in workers:
+            return "A worker machine may only use /api/worker/"
+        return None
 
     def do_GET(self):
         self.guarded(self.get)
@@ -643,6 +705,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-action",
                 "workspace-batch",
                 "workspace-new",
+                "workspace-subtask",
                 "schedule-cancel",
                 "workspace-cleanup",
                 "workspace-open",
@@ -696,6 +759,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-action",
                         "workspace-batch",
                         "workspace-new",
+                        "workspace-subtask",
                         "workspace-cleanup",
                         "workspace-open",
                         "workspace-message",
@@ -908,6 +972,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Workspace actions are not enabled")
                 self.send_json(200, self.server.workspaces.new_task(request))
                 return
+            if action == "workspace-subtask":
+                # From a `wt` inside Safehouse here: its parent is what it claims.
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                if set(request) != worker_api.LAUNCH:
+                    raise ValueError("Expected exactly the launch and parent fields")
+                self.send_json(
+                    200,
+                    self.server.workspaces.subtask(
+                        request["launch"], worker_api.local_parent(request["parent"])
+                    ),
+                )
+                return
             if action == "extension-pair":
                 self.send_json(200, self.server.extension.pair(request))
                 return
@@ -1048,13 +1125,43 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 raise ValueError("Send one JSON request body")
             request = json.loads(self.read_body(length, 10))
-            self.send_json(200, worker_api.handle(self.server.home, machine, action, request))
+            answer = worker_api.handle(
+                self.server.home, machine, action, request, launch=self.worker_launch
+            )
+            if action == "launch":
+                # Recorded: from here nothing is a refusal, which would invite a retry.
+                answer = self.worker_launched(answer["operation"])
+            self.send_json(200, answer)
         except worker_api.RateLimited as exc:
             self.fail(429, str(exc))
         except (ValueError, RuntimeError) as exc:
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.fail(503, f"Cannot answer the worker: {exc}")
+
+    def worker_launch(self, launch, parent):
+        """A sub-task a worker's sandbox asked for, as soon as it is recorded: the worker's
+        request limits are released before ``worker_launched`` waits for it."""
+        if not self.server.workspaces:
+            raise ValueError("Workspace actions are not enabled")
+        return self.server.workspaces.subtask(launch, parent)
+
+    def worker_launched(self, op):
+        """A worker's sub-task once started or a few minutes on, without its log, which
+        may be long."""
+        op = self.server.workspaces.await_operation(op, SUBTASK_WAIT)
+        result = op.get("result") or {}
+        return {
+            "operation": {
+                "pr": op["pr"],
+                "status": op["status"],
+                "message": str(op.get("message") or "")[:2000],
+                "machine": op.get("machine"),
+                "result": {k: result.get(k) for k in ("branch", "path", "machine_label", "url")}
+                if result
+                else None,
+            }
+        }
 
     def get(self):
         port = self.server.server_port
@@ -1461,7 +1568,14 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(503, f"Cannot read watcher data: {exc}")
 
 
-def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir=None):
+def serve(
+    home,
+    port=8765,
+    open_browser=False,
+    allowed_hosts=(),
+    attachments_dir=None,
+    require_tailscale_user=False,
+):
     """Run the dashboard; the exit status asks launchd for a restart, or not."""
     from codex_updates import CodexUpdates
     from cron_jobs import CronJobs
@@ -1508,6 +1622,7 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
         cron=cron,
         attachments=attachments_dir,
         codex_updates=CodexUpdates(home),
+        require_tailscale_user=require_tailscale_user,
     ) as server:
         # Pushes and the Home Screen badge can follow what needs the user.
         push.attention = server.attention.get
@@ -1521,6 +1636,13 @@ def serve(home, port=8765, open_browser=False, allowed_hosts=(), attachments_dir
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",
             flush=True,
         )
+        if unfenced := unfenced_workers(home):
+            print(
+                "Warning: worker machines without an IPv4 and an IPv6 tailnet_ip in "
+                f"machines.json can use the whole dashboard through the tailnet: {', '.join(unfenced)}",
+                file=sys.stderr,
+                flush=True,
+            )
         if open_browser:
             webbrowser.open(url)
 
@@ -1555,5 +1677,18 @@ if __name__ == "__main__":
         default=[],
         help="Exact Host header accepted through a trusted local proxy",
     )
+    parser.add_argument(
+        "--require-tailscale-user",
+        action="store_true",
+        help="Through tailscale serve, refuse all but /api/worker/ without Tailscale-User-Login",
+    )
     args = parser.parse_args()
-    raise SystemExit(serve(args.home.expanduser().resolve(), args.port, args.open, args.allow_host))
+    raise SystemExit(
+        serve(
+            args.home.expanduser().resolve(),
+            args.port,
+            args.open,
+            args.allow_host,
+            require_tailscale_user=args.require_tailscale_user,
+        )
+    )

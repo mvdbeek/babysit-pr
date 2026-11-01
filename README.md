@@ -839,7 +839,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo[:base]]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo[:base]]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] [--machine id|auto|local] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
@@ -949,6 +949,58 @@ prompt, with a warning, and records nothing. The Scheduled tab lists these watch
 with their outcome and an **Open in Collie** link; finished ones are kept for a
 month, at most the latest 100.
 
+`--machine <id>|auto|local` starts the run on a worker of this machine's registry
+(`machines.json` in the state home, see the Worker machines section of
+`references/supervisor.md`) instead of here. `wt` hands it to this machine's dashboard,
+`http://127.0.0.1:8765` or `$BABYSIT_DASHBOARD_URL`: with `auto` it first asks `GET
+/api/placement` where Auto places the launch, then starts it as the dashboard's **New
+task** does (`POST /api/workspace-new` with the worker chosen) and follows that
+operation until the workspace is ready, printing its progress and the worker's checkout
+on stderr and nothing on stdout. `--exit-when-done` is passed on, so the dashboard
+follows the agent there, and so is `--permission-mode auto` (the request field
+`permission_mode: "auto"`, which New task otherwise leaves empty). Without `--machine`,
+`--docker` means `auto` when the registry has a `docker` `prefer` worker, so Docker work
+an agent here starts with `wt` runs on that worker; with no such preference `wt` runs
+here as before. A worker takes only what New task starts there: a new branch from a
+base, `wt <base> <branch>`, with a prompt, in the worker's own clone of the repository
+the local clone's GitHub `upstream` (else `origin`) names. The branch is a simple name
+(letters, digits, `.`, `_`, `-`) and must not exist there yet. Under `auto` everything
+else runs here, with a note on stderr: issues, pull requests, `--with`, `wt <branch>`
+alone, a branch with a `/`, a base a worker cannot name, a clone without a GitHub
+remote, and a branch that already exists here, as a branch or under
+`~/src/worktrees/<repo>/`, which a worker would only duplicate. A run without a prompt
+stays here quietly when only `--docker` chose `auto`. Named outright, a worker refuses
+all of these. A run that cannot reach the dashboard fails, naming `--machine local`,
+rather than running here; once the dashboard may have taken the launch (an answer cut
+short or unreadable, or the operation no longer listed) `wt` says to check the dashboard
+before retrying instead. Runs the dashboard makes (any dashboard option) never move, and
+on a worker `--machine` is refused unless it is `local` (inside a sandbox, see below). Safehouse leaves the network
+and the state home open to agents, so this works from inside their sandbox. The
+dashboard's **Docker access** toggle for a running agent still applies only to agents on
+this Mac.
+
+Inside an agent's sandbox that cannot write the clone `wt` makes no worktree: it hands
+a new task to the controller as a sub-task, and runs nothing itself. Inside a worker's
+babysit-bwrap (which names its launch's broker in `BABYSIT_REGISTER_SOCKET`) the request
+goes through that broker; inside Safehouse here, when its grants do not cover
+`~/src/<repo>/.git` (`wt` asks macOS's sandbox about itself; `WT_SANDBOXED=0` or `1`
+decides instead), to `POST /api/workspace-subtask`. With a grant for the clone (this
+user's `safe.env` grants `~/src/galaxy`, `~/src/worktrees` and herdr) `wt` works in
+Safehouse as it always has. The controller places it, Auto unless
+`--machine` names a machine (`local` is refused), and starts it as **New task** does,
+always sandboxed, under the sub-task rules of the supervisor reference: the asking
+launch's agent and Claude account, Docker only when that launch has it, at most two
+levels deep and a few an hour per lineage, never on a full machine or one already
+running 4 working sub-task agents, a worker's never on this machine, only in a
+repository cloned there. Only
+`wt <base> <branch>` with a prompt is handed over; anything else is refused rather than
+run here. `-r` there also takes `owner/name`, which a sandbox that cannot read the
+clone (a worker's) needs. `wt` prints the controller's progress on stderr; from a worker
+it waits up to four minutes for the launch, then says it is still launching there and
+not to start it again. The
+dashboard shows "Started by …" (the asking agent, its directory, machine and session)
+in the operation and on the sub-task's Workspaces row.
+
 Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
 the planning code without processes and the whole tool against temporary
 repositories with fake `gh`, `herdr`, `tmux`, `cmux` and agent executables.
@@ -1019,7 +1071,11 @@ restarts, and the restarted dashboard keeps following them.
 
 With a machine registry (`--home/machines.json`, see `references/supervisor.md`), an
 agent task also has a **Machine**: **Auto** (resolved once when the job is saved, and
-kept; Auto still always means this machine), this machine, or a worker. A job on a
+kept; Auto keeps a job on this machine, which has its clone, until it is full, except
+that a job allowed Docker goes to the registry's `docker` `prefer` worker when that
+worker can take it, which the dialog's Auto note says before the job is saved), this
+machine, or a worker. Nothing checks the worker's clone when the job is saved; a run
+there without one fails, naming it. A job on a
 worker works in that worker's clone, `<src>/<repo name>` from its registry entry, which
 must be a clone of the job's repository (one of its remotes names it), and
 everything a run does happens there: the probe makes the checkout with the worker's own
@@ -1101,8 +1157,12 @@ over the same directory shows them without running them.
 
 Jobs and run history are stored in `cron.sqlite` and output in `cron-logs/` under the
 state directory, both private to your user. Anyone who can use the dashboard can run
-commands as you through this tab, just as they can launch agents; only expose the
-dashboard through `--allow-host` to devices you trust.
+commands as you through this tab, just as they can launch agents. `--allow-host`
+checks a Host header that `tailscale serve` passes through from the client; it says
+nothing about which device is asking. Limit the service to devices you trust in the
+tailnet policy, record each worker's `tailnet_ip` so the dashboard keeps it to its
+worker API, and consider `--require-tailscale-user` to refuse every tagged node (see
+the supervisor reference).
 
 ## GitHub credentials and prompts
 

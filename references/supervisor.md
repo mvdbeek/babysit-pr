@@ -120,6 +120,34 @@ and `svc:collie` for `tag:server`; a service must be defined on the admin consol
 Services page before the host advertisement registers. Remove the route with
 `tailscale serve clear svc:babysitter`. The dashboard process must remain running.
 
+Every device the tailnet policy lets reach the service can use the whole dashboard,
+including worker machines, which reach it for `/api/worker/` (see "Watches on
+workers"). The Host check is no boundary against them: `tailscale serve` picks the
+service by TLS server name and passes the client's Host through. What it does replace
+is `X-Forwarded-For`, which it sets to the tailnet address the request came from. A
+request whose `X-Forwarded-For` is any registered machine's `tailnet_ip` (enabled or
+not) may only POST `/api/worker/register` or `/api/worker/handoff`, exactly those
+paths; every other method and route, static files included, answers 403. A request
+with more than one `X-Forwarded-For`, or one that is not a bare address (a port,
+brackets, a zone, a list), did not come from the proxy and is refused the same way.
+When `machines.json` cannot be read, every request carrying `X-Forwarded-For` is
+refused too, except those two worker POSTs, which the token and address checks below
+then refuse. Requests without that header come from this machine directly (the
+controller's own tools) and are not fenced. `tailscale serve` answers on IPv4 and
+IPv6, so record both of a worker's addresses: one recorded without the other leaves
+the other family unrecognised. The dashboard prints a warning at startup naming
+workers without an IPv4 and an IPv6 `tailnet_ip`, `/api/machines` shows them with
+`fenced: false`, and `worker-token` warns when it issues them a token.
+
+`--require-tailscale-user` (off by default) also refuses, through the proxy, every
+request but `/api/worker/` that lacks `Tailscale-User-Login`. `tailscale serve`
+(checked against 1.102.4, `ipn/ipnlocal/serve.go`) deletes any `Tailscale-User-*`
+header the client sent, then sets them only for a device owned by a user, never for
+a tagged node, so this keeps every tagged node out, a worker without `tailnet_ip`
+included. It also keeps out tagged browsers, such as the controller's own browser
+when it opens the tailnet URL (it is `tag:server`); use `http://127.0.0.1:8765`
+there.
+
 Collie can be published the same way as `svc:collie` at `https://collie.TAILNET.ts.net/`
 (`tailscale serve --service=svc:collie --https=443 http://127.0.0.1:8787`), with
 `COLLIE_PUBLIC_HOSTS=collie.TAILNET.ts.net`, `COLLIE_SKIP_SERVE=1`, and
@@ -688,15 +716,32 @@ stopped or backgrounded agent has not exited. Failures to start on the controlle
 the worker without this machine's paths. A local `handoff` refuses a worker's watch,
 and a worker's refuses a local one.
 
-The dashboard's `/api/worker/register` and `/api/worker/handoff` take only that: the Host must be one the
+`wt` inside a worker's sandbox starts a sub-task the same way (`action: launch`, see
+Sub-tasks from a sandbox below): exactly `wt`'s launch fields (`LAUNCH_FIELDS`: repo,
+base, new branch name, agent, model, effort, Claude account, brief, Docker, exit when
+done, permission mode, machine) under `launch`, and both conversations it may run in
+under `sessions`. The broker keeps its launch's agent's session, checked as a handoff's,
+and adds, as the sub-task's parent, what the sandbox cannot forge: the launch's working
+directory (babysit-bwrap passes its own `pwd -P` as `--cwd`), its agent and
+configuration directory, the transcript it found, and whether the launch was granted
+Docker (`--granted`, babysit-bwrap's `--enable`
+grants). At most one launch every 20 s per sandbox; the answer waits for the task to
+start. A launch whose broker was not given `--cwd` starts nothing.
+
+The dashboard's `/api/worker/register`, `/api/worker/handoff` and `/api/worker/launch` take only that: the Host must be one the
 dashboard accepts (`--allow-host`, for the tailnet name), and a request carrying
-`Origin` or `Sec-Fetch-Site` (a browser) is refused. The token decides the machine; the
+`Origin` or `Sec-Fetch-Site` (a browser) is refused. They are all a worker with
+`tailnet_ip` may reach: the dashboard refuses it every other route (see the tailnet
+dashboard section). The token decides the machine; the
 body is exactly the registration fields (PR, repo, CI repo or branch, absolute `cwd`,
 session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
 poll interval, budget and timeout), checked by type, form and length, with no control
 characters (the instructions may span lines); a handoff's body is exactly the watch
 ID, pane, timeout (at most an hour), a session or none per agent, absolute `cwd` and
-transcript or none. One request per machine runs at a time per worktree, at most 6 a
+transcript or none; a launch's is exactly `launch` (checked by `Workspaces.subtask`) and
+`parent`: absolute `cwd`, configuration directory and transcript, session UUID, agent,
+Docker as a boolean. For
+a launch the worktree is the parent's directory. One request per machine runs at a time per worktree, at most 6 a
 minute per machine and worktree and 30 a minute per machine (a failed one costs 2
 more, so repeated failures back off; answered 429), so one sandbox cannot hold up the
 others; at most 256 worktree buckets are kept, a new one refused while that many are
@@ -725,7 +770,86 @@ worktree and session there; a later release turns that into repairs of the sessi
 that worktree's sandbox. Neither can name another machine or choose a launcher. A
 worker watch awaiting release shows its machine, worktree and session id in the
 dashboard and its attention item: release only the session you handed off. Revoke a
-lost worker's token with `worker-token ID --revoke`.
+lost worker's token with `worker-token ID --revoke`. Record every worker's
+`tailnet_ip`: without it, any process there, a sandboxed agent included (the sandbox
+shares the network), can use the rest of the dashboard through the tailnet, from
+launching and typing into agents to saving and running cron jobs unsandboxed on the
+controller, and read every transcript and diff.
+
+### Sub-tasks from a sandbox
+
+`wt` inside an agent's sandbox cannot make worktrees (other clones' Git directories and
+herdr's socket are outside it), so it hands a new task to the controller instead
+(README, `wt`). Inside a worker's babysit-bwrap (it names `BABYSIT_REGISTER_SOCKET`) the
+request goes through the launch's broker to `/api/worker/launch`, above. Inside a
+macOS Seatbelt sandbox (Safehouse; `wt` asks libsandbox about itself) that cannot write
+`~/src/<repo>/.git` it goes to this machine's dashboard as `POST /api/workspace-subtask` (the usual Host, Origin and
+`X-Babysit-Action` guard) with the same `launch` and a `parent` the run claims: its
+directory, its conversation (`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`, without
+which it asks for nothing), its agent's configuration directory (`CLAUDE_CONFIG_DIR` or
+`~/.claude`, `CODEX_HOME` or `~/.codex`) and whether Seatbelt lets it use Docker's
+sockets. With a grant for the clone, `wt` works in
+Safehouse as it always has, outside these rules. Runs the dashboard makes (any dashboard
+option) never take this path.
+
+Both end in `Workspaces.subtask`, which records the parent on the operation with its
+lineage (shown as "Started by …" in its dialog and on its Workspaces row) and starts a
+New task only when:
+
+- the fields are exactly the launch fields, of their types, without control characters
+  outside the brief; New task then checks them as for a person;
+- it runs the parent's agent and, for Claude, the parent's account, named by the
+  parent's configuration directory (`.claude` is `default`, `.claude/accounts/<name>`
+  that name; filled in when the request names none). A Codex sub-task uses its machine's
+  own Codex home;
+- Docker is asked for only by a parent that has it;
+- it lies at most 2 levels below the launch that started its lineage (a parent running
+  in a sub-task's checkout continues that sub-task's lineage), the lineage started fewer
+  than 6 sub-tasks in the last hour, and launches on the parent's machine fewer than 24
+  (answered 429 from a worker);
+- placement (Auto, sticking to the parent's machine, or the machine named) lands on a
+  machine Auto would use now: never a full one, one whose load is not known yet, or this
+  machine past its capacity, which a person's launch still gets. A worker's parent never
+  gets this machine, whose own agents' sandboxes reach the dashboard and herdr: named,
+  it is refused, and Auto that finds no worker answers "No worker can take this sub-task
+  now";
+- that machine runs fewer than 4 working sub-task agents: launches under way, and
+  earlier sub-tasks whose checkout herdr lists with a working or blocked agent (an idle
+  one left open does not count; sub-task operations are kept a week);
+- the repository has a clone there (this machine's: `<src>/<name>` if it is one, else
+  the first listed; a worker's: its own, checked by its probe).
+
+A sub-task always runs sandboxed: New task has no other launch, here or on a worker.
+A worker's request is answered once the operation is recorded and the worker's request
+limits are released, after waiting up to 240 s for the launch; it gets the operation
+without its log. From then on nothing is a refusal: an operation that cannot be read is
+answered as uncertain, and a 5xx from the controller or a proxy, or a timeout, reaches
+`wt` as "may have started; do not start it again", as does "still launching". From
+Safehouse `wt` follows the operation through `/api/workspaces`.
+
+Residual, on a worker: a sandboxed agent can now start sandboxed agents of its own agent
+and account, up to those limits, with briefs, branches and models of its choosing, in
+any repository cloned on a worker placement may use, including workers its own launch
+does not run on, and with Docker when its own launch has it. Each runs as a New task
+would, with its own grants, so it gets no access a person's New task with that brief
+would not; but it is code of the agent's choosing in another sandbox. It cannot start
+an unsandboxed agent, choose a launcher, command or working directory outside New
+task's, add `--with` clones, reach this machine, name the machine it asks from, or ask
+for another launch (the directory is babysit-bwrap's, the session must be in its own
+store). Anything unsandboxed as the worker user can read `worker.json` and claim any
+parent. These limits hold only for requests that come through the broker: a worker
+sandbox that reaches the dashboard's other actions over the tailnet directly is not held
+to them until the worker fence of #130 (which keeps worker machines off the dashboard's
+local actions) is in place.
+
+Residual, on this machine: the parent a run inside Safehouse names cannot be checked.
+Safehouse leaves the network open, and this user's Safehouse grants (`safe.env`) make
+the state home and herdr's configuration and socket writable, so any sandboxed agent
+here can already reach every dashboard action (`/api/workspace-new`,
+a cron job outside its sandbox) and type into unsandboxed panes; nothing at the
+dashboard can tell it from the person. The sub-task rules here only hold for `wt`'s own
+requests: they keep a well-behaved agent's sub-tasks sandboxed, counted and labelled,
+not a hostile one.
 
 Watches record `machine` (null for this machine), and a worktree path is a
 duplicate only on the same machine. The dashboard reads the diff and
@@ -750,7 +874,8 @@ watches recorded on another machine.
       "enabled": true
     }
   ],
-  "repos": { "owner/repo": { "requires": ["docker"], "prefer": "mini" } }
+  "repos": { "owner/repo": { "requires": ["docker"], "prefer": "mini" } },
+  "docker": { "prefer": "mini" }
 }
 ```
 
@@ -767,7 +892,10 @@ workspaces open through this machine's Collie, or the lead `collie_url` names, a
 `<lead>/space/<id>?h=<collie_host>`. With neither, a worker's workspaces link no Collie
 at all, since this machine's Collie cannot open them.
 Ids, labels and `ssh` targets must be unique, though two spellings of one host
-(`user@host` and `host`) are not detected.
+(`user@host` and `host`) are not detected. The top-level `docker`, optional, is
+`{"prefer": "<id>"}`: a registered machine, where Auto sends launches that use Docker
+(see below). One that lacks the `docker` label, is disabled or is not used by Auto
+keeps the registry valid; Auto passes it over and its reason says why.
 Disabled machines stay valid for records already pinned to them.
 `skills`, optional, lists personal skills the worker keeps in sync with this machine's
 (see Skills on workers): up to 64 unique folder names (letters, digits, `.`, `_`, `-`,
@@ -798,7 +926,16 @@ refresh has not finished for 30 s, shows "checking…" and is left out of Auto. 
 the machines that can take a launch by stickiness first: a prior workspace for the same
 target, then a clone of its repository. New tasks and cron jobs always count this
 machine's clone, and pull request and issue work count it when this machine has one, so
-those launches stay here until it is full. Then come the repo's `prefer`, then load:
+those launches stay here until it is full. A launch that uses Docker is the exception:
+with `"docker": {"prefer": "<id>"}` it goes to that worker ahead of a clone here ("auto:
+Docker prefers <label>"), so Docker runs on the worker rather than on this machine. Only
+a prior workspace, a pin (Handle on a verified checkout) or a machine chosen by name
+beats it. The preferred worker must be registered with `"auto": true`, since `auto:
+false` promises that it runs only what is sent to it by name; one that cannot take the
+launch (not used by Auto, full, unreachable, checking, a kind it cannot start) leaves
+it to the usual ranking, and the reason says why ("…; <label>: full (6/6)"). Nothing
+checks that the worker has the repository's clone; a launch there without one is
+refused when it starts. Then come the repo's `prefer`, then load:
 agents plus launches placed but not yet listed, over the machine's capacity. This
 machine's capacity is **Agents on this machine** in Settings (default 20, shown once
 workers are registered): at that many agents Auto prefers a worker, and comes back here
@@ -807,9 +944,10 @@ job outside its sandbox never runs on a worker. The preview uses the same sticki
 dialog's issue, other-repository and sandbox choices, but cannot see a Handle's verified
 checkout, which pins the launch to its machine.
 
-A launch placed on a worker (Handle or Create on a pull request, a new task, batch
-review, a scheduled launch) starts there. Until repairs run on workers, only work that
-never needs them goes there: pull request reviews and new tasks on a branch. Issues,
+A launch placed on a worker (Handle or Create on a pull request, a new task, from the
+dialog or from `wt --machine` on this machine, batch review, a scheduled launch) starts
+there. Until repairs run on workers, only work that never needs them goes there: pull
+request reviews and new tasks on a branch. Issues,
 Sentry issues, new tasks that file an issue and new tasks with other clones (`--with`)
 are refused with the reason. The launch first compares the worker's deployed
 babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
