@@ -217,6 +217,26 @@ result or its worker half is gone. A worker's sshd with `ClientAliveInterval 15`
 and `ClientAliveCountMax 4` (provisioning sets it) ends a partitioned session's
 lifeline within about a minute.
 
+### Dashboard sign-in
+
+`dashboard` takes `--auth report|enforce|off` (default `report`), `--auth-home DIR`
+(default `~/.config/babysit-pr-auth`) and `--oidc-config FILE`. Report mode turns on
+only once `AUTH_HOME/oidc.json` exists, and it refuses nothing. It counts each request
+that enforce mode would refuse, by method, route and credential kind, and logs a line
+at most once a minute per route and kind, never with a key, cookie or query string.
+Enforce answers 401 without a credential and 403 when a key's scope does not cover
+the route. The static shell, `/auth/*` and `/api/session` stay public. Worker,
+extension and push-device routes keep checking their own tokens.
+
+- **Login:** `GET /auth/login` → Keycloak (confidential client, PKCE S256, state and nonce) → `GET /auth/callback`. The callback validates the RS256 ID token and requires the `babysitter-admin` client role. It then sets an `HttpOnly; SameSite=Strict` session cookie, `Secure` everywhere but plain-http loopback. Sessions last 7 days idle and 30 days absolute. `POST /auth/logout` with `X-Babysit-Action: logout` ends the session and returns Keycloak's end-session URL.
+- **Keys:** `bsk_<kind>_…`, stored as SHA-256 with scopes, sent as `Authorization: Bearer`. Manage them with `auth keys create --kind read|admin|worker|ext|push [--scope …] [--expires-days N]`, `auth keys list` and `auth keys revoke ID`. `auth admin-key [--rotate]` writes `AUTH_HOME/admin-key` (0600). `auth launch-key --agent A --cwd D [--origin user|cron|subtask]` mints a 7-day launch key whose binding records who started the agent.
+- **Break-glass:** `auth login-link [--port 8765]` prints `…/auth/break-glass#t=…` links. Each is valid once for 10 minutes and gives a 12-hour session, with Keycloak up or down.
+- **Report:** `auth report [--reset]`, `GET /api/auth-report` and `auth` in `/api/status`.
+- **Sessions:** `auth sessions list` and `auth sessions revoke ID|--all`. A revocation reaches a running dashboard within a minute.
+
+Every `auth` command refuses to run inside a Seatbelt sandbox. The Keycloak client
+settings and `oidc.json` format are in [auth.md](auth.md).
+
 ## Fork and branch CI
 
 To continue the original task after green CI, add `--on-green 'AUTHORIZED_TASK'`
