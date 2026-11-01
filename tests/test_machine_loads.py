@@ -470,3 +470,31 @@ def test_this_machines_capacity_comes_from_the_settings(local):  # noqa: F811
     register(manager.home, {**MINI, "auto": True})
     assert manager.preview({"repo": "base/repo"})["machine"] == "mini"
     settle(manager.loads)
+
+
+def test_docker_launches_go_to_the_worker_the_registry_prefers(synced):  # noqa: F811
+    manager, *_ = synced
+    worker = {**MINI, "auto": True, "labels": ["safehouse", "docker"]}
+    (manager.home / "machines.json").write_text(
+        json.dumps({"version": 1, "machines": [worker], "docker": {"prefer": "mini"}})
+    )
+    manager.loads.snapshot()
+    settle(manager.loads)
+    manager.scan()
+    busy_here(manager, 3)
+    # The clone here keeps a new task here, unless it uses Docker.
+    assert manager.preview({"repo": "base/repo"})["machine"] == "local"
+    preview = manager.preview({"repo": "base/repo", "docker": "1"})
+    assert (preview["machine"], preview["reason"]) == (
+        "mini",
+        "auto: Docker prefers Mac mini, 4/4 free",
+    )
+    fields = {"kind": "scratch", "repo": "base/repo", "docker": True}
+    assert manager.place({"machine": "auto"}, fields, {"local": 1}) == "mini"
+    request = {"machine": "auto", "agent": "codex", "unsandboxed": False, "docker": True}
+    assert cron_agents.place(request, manager, "base/repo").id == "mini"
+    # An issue cannot start there, so Auto starts it here and says why.
+    preview = manager.preview({"repo": "base/repo", "docker": "1", "kind": "issue"})
+    assert preview["machine"] == "local"
+    assert preview["reason"].endswith("; Mac mini: only takes pull request work and new tasks")
+    settle(manager.loads)

@@ -750,7 +750,8 @@ watches recorded on another machine.
       "enabled": true
     }
   ],
-  "repos": { "owner/repo": { "requires": ["docker"], "prefer": "mini" } }
+  "repos": { "owner/repo": { "requires": ["docker"], "prefer": "mini" } },
+  "docker": { "prefer": "mini" }
 }
 ```
 
@@ -767,7 +768,9 @@ workspaces open through this machine's Collie, or the lead `collie_url` names, a
 `<lead>/space/<id>?h=<collie_host>`. With neither, a worker's workspaces link no Collie
 at all, since this machine's Collie cannot open them.
 Ids, labels and `ssh` targets must be unique, though two spellings of one host
-(`user@host` and `host`) are not detected.
+(`user@host` and `host`) are not detected. The top-level `docker`, optional, is
+`{"prefer": "<id>"}`: a registered machine with the `docker` label, where Auto sends
+launches that use Docker (see below).
 Disabled machines stay valid for records already pinned to them.
 
 Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, agent and port
@@ -793,7 +796,16 @@ refresh has not finished for 30 s, shows "checking…" and is left out of Auto. 
 the machines that can take a launch by stickiness first: a prior workspace for the same
 target, then a clone of its repository. New tasks and cron jobs always count this
 machine's clone, and pull request and issue work count it when this machine has one, so
-those launches stay here until it is full. Then come the repo's `prefer`, then load:
+those launches stay here until it is full. A launch that uses Docker is the exception:
+with `"docker": {"prefer": "<id>"}` it goes to that worker ahead of a clone here ("auto:
+Docker prefers <label>"), so Docker runs on the worker rather than on this machine. Only
+a prior workspace, a pin (Handle on a verified checkout) or a machine chosen by name
+beats it. The preferred worker must be registered with `"auto": true`, since `auto:
+false` promises that it runs only what is sent to it by name; one that cannot take the
+launch (not used by Auto, full, unreachable, checking, a kind it cannot start) leaves
+it to the usual ranking, and the reason says why ("…; <label>: full (6/6)"). Nothing
+checks that the worker has the repository's clone; a launch there without one is
+refused when it starts. Then come the repo's `prefer`, then load:
 agents plus launches placed but not yet listed, over the machine's capacity. This
 machine's capacity is **Agents on this machine** in Settings (default 20, shown once
 workers are registered): at that many agents Auto prefers a worker, and comes back here

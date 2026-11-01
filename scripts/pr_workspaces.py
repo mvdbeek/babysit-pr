@@ -1181,7 +1181,9 @@ class Workspaces:
         if "machine" not in request:
             return None
         config, loads = self.loads.snapshot()
-        req = placement.request({**fields, "override": request["machine"]}, config["repos"])
+        req = placement.request(
+            {**fields, "override": request["machine"]}, config["repos"], config.get("docker")
+        )
         return placement.choose(
             req, config["machines"], loads, history or {}, self.reservations()
         ).machine
@@ -1204,7 +1206,7 @@ class Workspaces:
             # Which other clones does not matter here: workers take none yet.
             "also": ["other"] if query.get("also") == "1" else [],
         }
-        req = placement.request(fields, config["repos"])
+        req = placement.request(fields, config["repos"], config.get("docker"))
         reservations = self.reservations()
         # Choosing a worker for a cron job unticks running it outside its sandbox, so each
         # machine is offered as the sandboxed job it would become; Auto keeps the choice.

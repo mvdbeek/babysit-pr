@@ -1019,7 +1019,9 @@ restarts, and the restarted dashboard keeps following them.
 
 With a machine registry (`--home/machines.json`, see `references/supervisor.md`), an
 agent task also has a **Machine**: **Auto** (resolved once when the job is saved, and
-kept; Auto still always means this machine), this machine, or a worker. A job on a
+kept; Auto keeps a job on this machine, which has its clone, until it is full, except
+that a job allowed Docker goes to the registry's `docker` `prefer` worker when that
+worker can take it), this machine, or a worker. A job on a
 worker works in that worker's clone, `<src>/<repo name>` from its registry entry, which
 must be a clone of the job's repository (one of its remotes names it), and
 everything a run does happens there: the probe makes the checkout with the worker's own
