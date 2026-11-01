@@ -259,6 +259,11 @@ def claude_target(watched, **changes):
         "─" * 20 + "\n❯ /exit\n" + "─" * 20 + "\n  /exit  Exit the REPL",
         # A pane seven columns wide wraps it mid-word.
         "─" * 7 + "\n❯ /ex\n  it\n" + "─" * 7,
+        # The slash-command menu drawn under the composer marks its selection with ❯ too.
+        "─" * 20
+        + "\n❯ /exit\n"
+        + "─" * 20
+        + "\n  ❯ /exit      Exit the CLI\n    /context   Visualize current context usage",
     ],
 )
 def test_a_claude_on_a_worker_is_asked_to_exit_with_a_typed_line(watched, fake_tools, typed):
