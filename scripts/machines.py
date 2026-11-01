@@ -113,6 +113,16 @@ def _ip(value):
         return False
 
 
+def fenced(m: Machine) -> bool:
+    """Whether the dashboard can tell all its requests apart: an IPv4 and an IPv6 address.
+
+    `tailscale serve` answers on both families, so a machine with only one recorded can
+    reach the dashboard through the other unrecognised.
+    """
+    versions = {ipaddress.ip_address(ip).version for ip in m.tailnet_ip or ()}
+    return versions == {4, 6}
+
+
 def _remote_path(value):
     return (
         isinstance(value, str)

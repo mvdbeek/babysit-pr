@@ -120,6 +120,34 @@ and `svc:collie` for `tag:server`; a service must be defined on the admin consol
 Services page before the host advertisement registers. Remove the route with
 `tailscale serve clear svc:babysitter`. The dashboard process must remain running.
 
+Every device the tailnet policy lets reach the service can use the whole dashboard,
+including worker machines, which reach it for `/api/worker/` (see "Watches on
+workers"). The Host check is no boundary against them: `tailscale serve` picks the
+service by TLS server name and passes the client's Host through. What it does replace
+is `X-Forwarded-For`, which it sets to the tailnet address the request came from. A
+request whose `X-Forwarded-For` is any registered machine's `tailnet_ip` (enabled or
+not) may only POST `/api/worker/register` or `/api/worker/handoff`, exactly those
+paths; every other method and route, static files included, answers 403. A request
+with more than one `X-Forwarded-For`, or one that is not a bare address (a port,
+brackets, a zone, a list), did not come from the proxy and is refused the same way.
+When `machines.json` cannot be read, every request carrying `X-Forwarded-For` is
+refused too, except those two worker POSTs, which the token and address checks below
+then refuse. Requests without that header come from this machine directly (the
+controller's own tools) and are not fenced. `tailscale serve` answers on IPv4 and
+IPv6, so record both of a worker's addresses: one recorded without the other leaves
+the other family unrecognised. The dashboard prints a warning at startup naming
+workers without an IPv4 and an IPv6 `tailnet_ip`, `/api/machines` shows them with
+`fenced: false`, and `worker-token` warns when it issues them a token.
+
+`--require-tailscale-user` (off by default) also refuses, through the proxy, every
+request but `/api/worker/` that lacks `Tailscale-User-Login`. `tailscale serve`
+(checked against 1.102.4, `ipn/ipnlocal/serve.go`) deletes any `Tailscale-User-*`
+header the client sent, then sets them only for a device owned by a user, never for
+a tagged node, so this keeps every tagged node out, a worker without `tailnet_ip`
+included. It also keeps out tagged browsers, such as the controller's own browser
+when it opens the tailnet URL (it is `tag:server`); use `http://127.0.0.1:8765`
+there.
+
 Collie can be published the same way as `svc:collie` at `https://collie.TAILNET.ts.net/`
 (`tailscale serve --service=svc:collie --https=443 http://127.0.0.1:8787`), with
 `COLLIE_PUBLIC_HOSTS=collie.TAILNET.ts.net`, `COLLIE_SKIP_SERVE=1`, and
@@ -690,7 +718,9 @@ and a worker's refuses a local one.
 
 The dashboard's `/api/worker/register` and `/api/worker/handoff` take only that: the Host must be one the
 dashboard accepts (`--allow-host`, for the tailnet name), and a request carrying
-`Origin` or `Sec-Fetch-Site` (a browser) is refused. The token decides the machine; the
+`Origin` or `Sec-Fetch-Site` (a browser) is refused. They are all a worker with
+`tailnet_ip` may reach: the dashboard refuses it every other route (see the tailnet
+dashboard section). The token decides the machine; the
 body is exactly the registration fields (PR, repo, CI repo or branch, absolute `cwd`,
 session UUID, agent, Claude account, pane or none, rollout, instructions, continuation,
 poll interval, budget and timeout), checked by type, form and length, with no control
@@ -725,7 +755,11 @@ worktree and session there; a later release turns that into repairs of the sessi
 that worktree's sandbox. Neither can name another machine or choose a launcher. A
 worker watch awaiting release shows its machine, worktree and session id in the
 dashboard and its attention item: release only the session you handed off. Revoke a
-lost worker's token with `worker-token ID --revoke`.
+lost worker's token with `worker-token ID --revoke`. Record every worker's
+`tailnet_ip`: without it, any process there, a sandboxed agent included (the sandbox
+shares the network), can use the rest of the dashboard through the tailnet, from
+launching and typing into agents to saving and running cron jobs unsandboxed on the
+controller, and read every transcript and diff.
 
 Watches record `machine` (null for this machine), and a worktree path is a
 duplicate only on the same machine. The dashboard reads the diff and
