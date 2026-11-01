@@ -472,6 +472,54 @@ def test_a_sign_in_flood_from_one_source_cannot_evict_another_users(site, provid
     )
 
 
+def test_sign_ins_are_refused_rather_than_evicted_once_every_source_holds_one(site):
+    """X-Forwarded-For can be forged on loopback, so fake sources never evict a real one."""
+    server = site()
+    auth = server.auth
+    host = f"127.0.0.1:{server.server_port}"
+    _, real = auth.begin_login(host, "/", "100.64.0.9")
+    for n in range(dashboard_auth.PENDING_MAX - 1):
+        auth.begin_login(host, "/", f"10.0.{n // 250}.{n % 250}")
+    with pytest.raises(AuthError, match="Too many sign-ins") as refused:
+        auth.begin_login(host, "/", "10.9.9.9")
+    assert refused.value.status == 503 and real in auth.pending
+    status, _, body = call(server, "/auth/login", headers={"X-Forwarded-For": "10.9.9.8"})
+    assert status == 503 and b"Too many sign-ins" in body
+    assert real in auth.pending
+
+
+def test_unusable_auth_home_leaves_report_off_and_stops_enforce(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "oidc.json").write_text(
+        json.dumps(
+            {
+                "issuer": "https://auth.example.org/realms/magmahome",
+                "client_id": "babysitter",
+                "client_secret": "s",
+                "redirect_uris": {"127.0.0.1:8765": "http://127.0.0.1:8765/auth/callback"},
+            }
+        )
+    )
+    os.chmod(real / "oidc.json", 0o600)
+    (tmp_path / "link").symlink_to(real)
+    lines = []
+    assert dashboard_auth.load("report", tmp_path / "link", log=lines.append) is None
+    assert lines[-1].startswith("Error: dashboard auth stays off") and "symlink" in lines[-1]
+    with pytest.raises(ValueError, match="symlink"):
+        dashboard_auth.load("enforce", tmp_path / "link", log=lines.append)
+
+
+def test_store_never_creates_through_a_dangling_symlink(tmp_path):
+    home = tmp_path / "auth"
+    home.mkdir(mode=0o700)
+    target = tmp_path / "elsewhere.sqlite"
+    (home / "auth.sqlite").symlink_to(target)
+    with pytest.raises((ValueError, OSError)):
+        dashboard_auth.Store(home)
+    assert not target.exists()
+
+
 def test_auth_home_must_be_a_private_real_directory(tmp_path):
     real = tmp_path / "real"
     real.mkdir()

@@ -18,8 +18,10 @@ The code is `scripts/dashboard_auth.py`. The dashboard hooks it into
 | `enforce`          | Not usable yet: the dashboard refuses to start in it until Phase 2 and Phase 3 land (below). Once usable, it is always on. A request without a valid credential gets `401 {"login": "/auth/login"}`; a key whose scope does not cover the route gets 403. A broken `oidc.json` stops the dashboard from starting (fails closed) |
 | `off`              | No checks                                                                                                                                                                                                                                                                                                                       |
 
-In report mode, a broken `oidc.json` is reported on stderr and auth stays off, so the
-dashboard keeps serving.
+In report mode, a broken `oidc.json` or an unusable auth home is reported on stderr and
+auth stays off, so the dashboard keeps serving. An unusable auth home is a symlink, a
+directory owned by another user, or an `auth.sqlite` that is a symlink. In enforce mode
+either problem stops the dashboard from starting.
 
 **Enforce needs Phase 2 and Phase 3.** Worker, extension and push-device routes still
 check their own tokens. Those tokens are stored in the state home
@@ -140,7 +142,9 @@ signing in again on the phone takes one tap.
    `/api/` route (some GETs start work), never an `/auth/` route.
 
    At most 8 pending sign-ins are kept per source address, so a flood of `/auth/login`
-   from one source evicts only its own.
+   from one source evicts only its own. Source addresses can be forged on loopback, so
+   once all 256 slots are held by sources with one sign-in each, a new sign-in is
+   refused with 503 rather than evicting one in progress.
 
 3. `GET /auth/callback`:
    - The cookie must equal `state`, and the state must still be pending.

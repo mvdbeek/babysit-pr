@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import signal
 import sqlite3
@@ -1878,6 +1879,11 @@ def serve(
         print(
             f"Dashboard auth: {auth.mode} ({auth_home}"
             + (f", OIDC {auth.oidc.config.issuer}" if auth.oidc else ", no OIDC")
+            + (
+                ", own routes allowed (test override)"
+                if os.environ.get(dashboard_auth.ALLOW_OWN_ROUTES_ENV)
+                else ""
+            )
             + ")"
             if auth
             else f"Dashboard auth: off (no {auth_home / dashboard_auth.OIDC_FILE})"

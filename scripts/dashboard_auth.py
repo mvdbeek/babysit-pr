@@ -592,8 +592,13 @@ class Store:
         self.lock = threading.Lock()
         # Live sessions only: a miss is never cached, so nothing waits on a stale miss.
         self.cache: dict[str, tuple[dict, float]] = {}
-        if not self.path.exists():
-            os.close(os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600))
+        # Never through a symlink, dangling or not: an existing file is checked below.
+        try:
+            os.close(
+                os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+            )
+        except FileExistsError:
+            pass
         info = os.lstat(self.path)
         if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError(f"{self.path} must be a regular file of this user")
@@ -1036,6 +1041,10 @@ class Auth:
                 for v in self.pending.values():
                     counts[v.source] = counts.get(v.source, 0) + 1
                 busiest = max(counts, key=lambda k: counts[k])
+                # Sources can be forged (X-Forwarded-For on loopback): once every source
+                # holds one sign-in, refuse rather than evict someone's.
+                if counts[busiest] <= 1:
+                    raise AuthError("Too many sign-ins are in progress; try again shortly", 503)
                 self.pending.pop(next(k for k, v in self.pending.items() if v.source == busiest))
             self.pending[state] = Pending(
                 nonce, verifier, safe_next(next_path), host or "", now + LOGIN_TTL, source
@@ -1154,7 +1163,15 @@ def load(mode: str, home: Path, oidc_path: Path | None = None, log=None) -> Auth
             if mode == "enforce":
                 raise RuntimeError("Dashboard sign-in needs the cryptography package") from None
             say("Warning: the cryptography package is missing, so OIDC sign-in will fail")
-    return Auth(home, mode, config, log=log)
+    try:
+        return Auth(home, mode, config, log=log)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        # An unusable auth home (a symlink, another user's, unreadable): enforce refuses
+        # to start; report says so loudly and serves with auth off, as before Phase 1.
+        if mode == "enforce":
+            raise
+        say(f"Error: dashboard auth stays off: {exc}")
+        return None
 
 
 def add_arguments(parser) -> None:
