@@ -1149,8 +1149,12 @@ over the same directory shows them without running them.
 
 Jobs and run history are stored in `cron.sqlite` and output in `cron-logs/` under the
 state directory, both private to your user. Anyone who can use the dashboard can run
-commands as you through this tab, just as they can launch agents; only expose the
-dashboard through `--allow-host` to devices you trust.
+commands as you through this tab, just as they can launch agents. `--allow-host`
+checks a Host header that `tailscale serve` passes through from the client; it says
+nothing about which device is asking. Limit the service to devices you trust in the
+tailnet policy, record each worker's `tailnet_ip` so the dashboard keeps it to its
+worker API, and consider `--require-tailscale-user` to refuse every tagged node (see
+the supervisor reference).
 
 ## GitHub credentials and prompts
 
