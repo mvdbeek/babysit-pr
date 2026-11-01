@@ -988,13 +988,16 @@ decides instead), to `POST /api/workspace-subtask`. With a grant for the clone (
 user's `safe.env` grants `~/src/galaxy`, `~/src/worktrees` and herdr) `wt` works in
 Safehouse as it always has. The controller places it, Auto unless
 `--machine` names a machine (`local` is refused), and starts it as **New task** does,
-always sandboxed, under the sub-task rules of the supervisor reference: Docker only when
-the asking launch has it, a few sub-tasks per launch an hour, never on a full machine
-or one already running 4 sub-task agents, only in a repository cloned there. Only
+always sandboxed, under the sub-task rules of the supervisor reference: the asking
+launch's agent and Claude account, Docker only when that launch has it, at most two
+levels deep and a few an hour per lineage, never on a full machine or one already
+running 4 working sub-task agents, a worker's never on this machine, only in a
+repository cloned there. Only
 `wt <base> <branch>` with a prompt is handed over; anything else is refused rather than
 run here. `-r` there also takes `owner/name`, which a sandbox that cannot read the
 clone (a worker's) needs. `wt` prints the controller's progress on stderr; from a worker
-it waits up to four minutes for the launch, then says to follow it in the dashboard. The
+it waits up to four minutes for the launch, then says it is still launching there and
+not to start it again. The
 dashboard shows "Started by …" (the asking agent, its directory, machine and session)
 in the operation and on the sub-task's Workspaces row.
 

@@ -627,9 +627,12 @@ def test_a_workers_broker_is_told_the_launchs_directory_and_grants(checkout, tmp
     options = [f"--claude-config-dir={account}", f"--add-dirs={worktree}", "--enable=docker"]
     # The fake bwrap never runs anything; without a rootless Docker socket the wrapper
     # stops after starting the broker, whose argv is what this test is about.
+    # Started through a link to the worktree: the broker is told the real directory.
+    link = tmp_path / "link"
+    link.symlink_to(worktree)
     subprocess.run(
         ["bash", WRAPPER, *options, "--", "claude"],
-        cwd=worktree,
+        cwd=link,
         env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,

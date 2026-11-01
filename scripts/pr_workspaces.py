@@ -100,13 +100,16 @@ NEW_PREFIX = "new:"
 NEW_LISTED = 86400
 NEW_LIMIT = 20
 # Sub-tasks agents start from their sandbox (`wt` there, see Workspaces.subtask): per
-# parent launch and per machine asking, in an hour; at once on one machine; and how long
-# a worker's request waits for its launch.
+# lineage and per machine asking, in an hour; working at once on one machine; levels
+# below the first launch; and how long a worker's request waits for its launch.
 SUBTASK_RATE = 6
 SUBTASK_MACHINE_RATE = 24
 SUBTASK_WINDOW = 3600
 SUBTASK_AGENTS = 4
+SUBTASK_DEPTH = 2
 SUBTASK_WAIT = 240
+# The agent states a sub-task agent counts in: an idle one left open does not.
+SUBTASK_BUSY = {"working", "blocked"}
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Other clones a new task may also work in (`wt --with`).
 # Each one lengthens the agent line wt types, which has a ceiling.
@@ -516,6 +519,28 @@ AGENT_STATES = {"working", "blocked", "idle", "done"}
 LOAD_TIMEOUT = 5
 
 
+def parent_account(parent):
+    """The Claude account a sub-task's parent runs as, from its configuration directory:
+    ``default`` for ``.claude``, a name for ``.claude/accounts/<name>``."""
+    path = Path(parent["config_dir"])
+    if path.parent.name == "accounts" and path.parent.parent.name == ".claude":
+        if claude_accounts.NAME.fullmatch(path.name):
+            return path.name
+    elif path.name == ".claude":
+        return "default"
+    if parent["machine"] is None:
+        # Here an account may be a link to a directory of its own.
+        found = claude_accounts.account_name(path)
+        if found:
+            return found
+    raise ValueError("The launch asking runs Claude outside its accounts; it starts no sub-task")
+
+
+def lineage_root(parent):
+    """The launch a sub-task's lineage started from; older records name their parent."""
+    return parent.get("root") or f"{parent.get('machine') or placement.LOCAL}:{parent.get('cwd')}"
+
+
 def started_by(parent):
     """The line the dashboard shows for a sub-task: the launch that asked for it."""
     where = f" on {parent.get('machine_label') or parent['machine']}" if parent["machine"] else ""
@@ -573,7 +598,8 @@ class MachineLoads:
         self.lock = threading.Lock()
         self.entries: dict[str, dict] = {}
         self.refreshing: set[str] = set()
-        # Checkouts herdr lists with an agent, by machine, as its last refresh saw them.
+        # Checkouts herdr lists with a working or blocked agent, by machine, as its last
+        # refresh saw them (sub-tasks count them).
         self.agent_paths: dict[str, set[str]] = {}
 
     def snapshot(self, now=None):
@@ -626,7 +652,7 @@ class MachineLoads:
             paths = {
                 w["worktree"]["checkout_path"]
                 for w in listed
-                if w.get("agent_status") in AGENT_STATES
+                if w.get("agent_status") in SUBTASK_BUSY
                 and isinstance(w.get("worktree"), dict)
                 and isinstance(w["worktree"].get("checkout_path"), str)
             }
@@ -1792,20 +1818,22 @@ class Workspaces:
         except ValueError:
             return False
 
-    def subtask(self, launch, parent, wait=0):
+    def subtask(self, launch, parent):
         """A New task an agent asked for from its sandbox (`wt` there), under stricter rules.
 
         ``launch`` is exactly ``wt.LAUNCH_FIELDS``. ``parent`` is the launch asking, as a
         worker's broker reports it (``worker_api.launch_args``: that machine, its sandbox's
-        directory and Docker grant, the conversation's transcript) or as a `wt` inside
-        Safehouse here claims it (``worker_api.local_parent``); it is recorded on the
-        operation. New task always starts its agent sandboxed. On top of that: Docker only
-        for a parent that has it; at most SUBTASK_RATE an hour per parent launch (machine and
-        directory) and SUBTASK_MACHINE_RATE per machine asking; placed as Auto places it
-        (sticking to the parent's machine), or on the machine named, but never on one Auto
-        would not use now (full, unchecked, lacking what it needs) or that already runs
-        SUBTASK_AGENTS sub-task agents; and only in a clone of the repository there. A worker
-        request waits up to ``wait`` seconds for the launch to finish.
+        directory, Docker grant and agent configuration, the conversation's transcript) or
+        as a `wt` inside Safehouse here claims it (``worker_api.local_parent``); it is
+        recorded on the operation with its lineage. New task always starts its agent
+        sandboxed. On top of that: the parent's agent and Claude account (filled in when
+        none is named); Docker only for a parent that has it; at most SUBTASK_DEPTH levels
+        below the launch that started the lineage, SUBTASK_RATE an hour per lineage and
+        SUBTASK_MACHINE_RATE per machine asking; placed as Auto places it (sticking to the
+        parent's machine), or on the machine named, but never on one Auto would not use now
+        (full, unchecked, lacking what it needs) or that already runs SUBTASK_AGENTS working
+        sub-task agents, never on this machine for a worker's parent, and only in a clone
+        of the repository there. Answers the operation as soon as it is recorded.
         """
         flags = {"docker", "exit_when_done"}
         if not isinstance(launch, dict) or set(launch) != set(wt.LAUNCH_FIELDS):
@@ -1820,8 +1848,21 @@ class Workspaces:
             raise ValueError("Name a machine, or auto")
         if not SLUG.fullmatch(launch["repo"]):
             raise ValueError("Choose a repository")
+        if launch["agent"] != parent["agent"]:
+            raise ValueError(f"A sub-task runs {parent['agent']}, as the launch asking does")
+        request = dict(launch)
+        if launch["agent"] == "claude":
+            account = parent_account(parent)
+            if (launch["claude_account"] or account) != account:
+                raise ValueError(
+                    f"A sub-task runs as Claude account {account}, as the launch asking does"
+                )
+            request["claude_account"] = "" if account == "default" else account
         if launch["docker"] and not parent["docker"]:
             raise ValueError("Only a launch with Docker starts sub-tasks with Docker")
+        worker = parent["machine"] is not None
+        if worker and launch["machine"] == placement.LOCAL:
+            raise ValueError("A worker's sub-task runs on a worker, never on the controller")
         origin = parent["machine"] or placement.LOCAL
         with self.subtask_lock:
             now = time.time()
@@ -1830,17 +1871,35 @@ class Workspaces:
                 for key, op in self.state()["operations"].items()
                 if key.startswith(NEW_PREFIX) and isinstance(op.get("parent"), dict)
             ]
-            asked = [
-                op["parent"]
-                for op in ops
-                if now - op.get("created_at", 0) < SUBTASK_WINDOW
-                and (op["parent"].get("machine") or placement.LOCAL) == origin
-            ]
-            if sum(other.get("cwd") == parent["cwd"] for other in asked) >= SUBTASK_RATE:
-                raise worker_api.RateLimited(
-                    f"This launch started {SUBTASK_RATE} sub-tasks in the last hour; wait"
+            # The parent's own launch, when it was a sub-task: the lineage goes on.
+            own = next(
+                (
+                    op
+                    for op in ops
+                    if (op.get("machine") or placement.LOCAL) == origin
+                    and isinstance(op.get("path"), str)
+                    and (op["path"] if worker else str(Path(op["path"]).resolve())) == parent["cwd"]
+                ),
+                None,
+            )
+            root, depth = (
+                (own["parent"].get("root"), own["parent"].get("depth", 1) + 1)
+                if own and own["parent"].get("root")
+                else (f"{origin}:{parent['cwd']}", 1)
+            )
+            if depth > SUBTASK_DEPTH:
+                raise ValueError(
+                    f"Sub-tasks start at most {SUBTASK_DEPTH} levels below the first launch"
                 )
-            if len(asked) >= SUBTASK_MACHINE_RATE:
+            recent = [op["parent"] for op in ops if now - op.get("created_at", 0) < SUBTASK_WINDOW]
+            if sum(lineage_root(other) == root for other in recent) >= SUBTASK_RATE:
+                raise worker_api.RateLimited(
+                    f"This lineage started {SUBTASK_RATE} sub-tasks in the last hour; wait"
+                )
+            if (
+                sum((other.get("machine") or placement.LOCAL) == origin for other in recent)
+                >= SUBTASK_MACHINE_RATE
+            ):
                 raise worker_api.RateLimited(
                     f"Launches there started {SUBTASK_MACHINE_RATE} sub-tasks in the last hour; wait"
                 )
@@ -1849,41 +1908,68 @@ class Workspaces:
                 "kind": "scratch",
                 "repo": launch["repo"],
                 "agent": launch["agent"],
-                "claude_account": launch["claude_account"] or None,
+                "claude_account": request["claude_account"] or None,
                 "docker": launch["docker"],
                 "also": [],
                 "override": launch["machine"],
             }
             req = placement.request(fields, config["repos"], config.get("docker"))
             reservations = self.reservations()
-            chosen = placement.choose(
-                req, config["machines"], loads, {origin: 1}, reservations, now=now
-            )
+            try:
+                chosen = placement.choose(
+                    req,
+                    config["machines"],
+                    loads,
+                    {origin: 1},
+                    reservations,
+                    now=now,
+                    local=not worker,
+                )
+            except ValueError as exc:
+                if worker and launch["machine"] == "auto":
+                    raise ValueError(f"No worker can take this sub-task now: {exc}") from None
+                raise
             target = chosen.machine or placement.LOCAL
             name = placement.label(target, config["machines"])
             excluded = placement.exclusions(req, config["machines"], loads, reservations, now)
             if target in excluded:
                 raise ValueError(f"{name}: {excluded[target].why}; a sub-task waits for room")
             if self.subtask_agents(target, ops) >= SUBTASK_AGENTS:
-                raise ValueError(f"{name} already runs {SUBTASK_AGENTS} sub-task agents")
-            request = {**launch, "machine": target}
+                raise ValueError(f"{name} already runs {SUBTASK_AGENTS} working sub-task agents")
+            request["machine"] = target
             if target == placement.LOCAL:
                 request.update(self.subtask_clone(launch["repo"]))
-            op = self.new_task(request, parent=parent)["operation"]
+            recorded = {**parent, "root": root, "depth": depth}
+            return self.new_task(request, parent=recorded)
+
+    def await_operation(self, op, wait):
+        """The operation once it finished, or as last read after ``wait`` seconds.
+
+        It exists, so this never fails: an unreadable one is answered as uncertain, and
+        nobody is told to start it again.
+        """
         deadline = time.monotonic() + wait
-        while op["status"] in {"queued", "running"} and time.monotonic() < deadline:
-            time.sleep(1)
-            op = self.operation(op["pr"]) or op
-        return {"operation": op}
+        try:
+            while op["status"] in {"queued", "running"} and time.monotonic() < deadline:
+                time.sleep(1)
+                op = self.operation(op["pr"]) or op
+        except (OSError, sqlite3.Error) as exc:
+            return {
+                **op,
+                "status": "uncertain",
+                "message": f"It started, but its progress could not be read ({exc})",
+            }
+        return op
 
     def subtask_agents(self, machine_id, ops):
-        """Sub-task agents on a machine: launches under way, and those whose checkout
-        herdr lists with an agent there (operations are kept a day)."""
+        """Working sub-task agents on a machine: launches under way, and those whose
+        checkout herdr lists with a working or blocked agent there (operations are kept a
+        day). An idle agent left open does not count; the machine's capacity still does."""
         if machine_id == placement.LOCAL:
             live = {
                 path
                 for path, spaces in workspaces_by_path(self.inventory).items()
-                if any(space.get("agent_status") in AGENT_STATES for space in spaces)
+                if any(space.get("agent_status") in SUBTASK_BUSY for space in spaces)
             }
         else:
             with self.loads.lock:

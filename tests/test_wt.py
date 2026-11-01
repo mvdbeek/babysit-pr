@@ -2461,7 +2461,13 @@ def test_a_sandbox_is_told_apart_and_the_dashboards_runs_never_are(tmp_path, mon
     # With a grant for it, wt works there as it always has.
     assert t.sandboxed(galaxy) == ""
     assert t.sandboxed(options(repo="planemo")) == "safehouse"
-    assert asked == [str(tmp_path / "src/galaxy/.git"), str(tmp_path / "src/planemo/.git")]
+    # `-r owner/name` is the clone named after the repository.
+    assert t.sandboxed(options(repo="galaxyproject/galaxy")) == ""
+    assert asked == [
+        str(tmp_path / "src/galaxy/.git"),
+        str(tmp_path / "src/planemo/.git"),
+        str(tmp_path / "src/galaxy/.git"),
+    ]
     assert (
         tool(env={"HOME": "/h", "WT_SANDBOXED": "0"}, confined=lambda: True).sandboxed(galaxy) == ""
     )
@@ -2479,6 +2485,7 @@ def test_a_sandbox_is_told_apart_and_the_dashboards_runs_never_are(tmp_path, mon
         raise Here
 
     t.chosen_machine = here
+    t.env["CODEX_THREAD_ID"] = SID
     with pytest.raises(Here):
         t.run("wt", ["--name", "n", "-p", "go", "main"])
     monkeypatch.chdir(tmp_path)
@@ -2494,7 +2501,9 @@ def test_safehouse_hands_a_new_task_to_the_dashboard_with_what_it_says_of_its_la
     dashboard.answers["/api/workspace-subtask"] = dashboard.answers.pop("/api/workspace-new")
     # Placed on the controller itself: its result names no machine.
     del dashboard.answers["/api/workspace-subtask"]["operation"]["result"]["machine_label"]
-    t = sandboxed(tmp_path, dashboard, CLAUDE_CODE_SESSION_ID=SID)
+    account = tmp_path / ".claude/accounts/oss"
+    account.mkdir(parents=True)
+    t = sandboxed(tmp_path, dashboard, CLAUDE_CODE_SESSION_ID=SID, CLAUDE_CONFIG_DIR=str(account))
     t.run("wt", ["--docker", "--exit-when-done", "-p", "Rebase it", "main", "feat"])
     [launch] = dashboard.requests
     assert launch["path"] == "/api/workspace-subtask"
@@ -2519,6 +2528,7 @@ def test_safehouse_hands_a_new_task_to_the_dashboard_with_what_it_says_of_its_la
         "cwd": str(tmp_path.resolve()),
         "session": SID,
         "agent": "claude",
+        "config_dir": str(account.resolve()),
         "docker": True,
     }
     said = t.stderr.getvalue().splitlines()
@@ -2532,14 +2542,20 @@ def test_safehouse_hands_a_new_task_to_the_dashboard_with_what_it_says_of_its_la
     t.docker_granted = lambda: False
     t.env.pop("CLAUDE_CODE_SESSION_ID")
     t.env["CODEX_THREAD_ID"] = "not-a-session"
+    # Not from a conversation it can name: nothing is asked.
+    with pytest.raises(wt.WtError, match="from a Claude or Codex conversation"):
+        t.run("wt", ["-r", "a/b", "-p", "go", "main", "x"])
+    assert dashboard.requests == []
+    t.env["CODEX_THREAD_ID"] = SID.upper()
     t.run("wt", ["--machine", "chonk", "-r", "galaxyproject/planemo", "-p", "go", "main", "x"])
     assert dashboard.paths() == [("POST", "/api/workspace-subtask"), ("GET", "/api/workspaces")]
     body = dashboard.requests[0]["body"]
     assert (body["launch"]["machine"], body["launch"]["repo"]) == ("chonk", "galaxyproject/planemo")
     assert body["parent"] == {
         "cwd": str(tmp_path.resolve()),
-        "session": None,
-        "agent": None,
+        "session": SID.upper(),
+        "agent": "codex",
+        "config_dir": str((tmp_path / ".codex").resolve()),
         "docker": False,
     }
 
@@ -2656,9 +2672,16 @@ def test_a_worker_sandbox_hands_a_new_task_to_its_launchs_broker(tmp_path, socke
         ({"error": "Docker is not granted"}, "^wt: the controller refused: Docker is not granted$"),
         (
             {"error": "Cannot reach the controller: timed out", "uncertain": True},
-            "may have started .*timed out.*check the dashboard before retrying$",
+            "may have started .*timed out.*do not start it again$",
         ),
-        ({"operation": {"pr": "new:1", "status": "running", "message": "Branching"}}, "still"),
+        (
+            {"operation": {"pr": "new:1", "status": "running", "message": "Branching"}},
+            "still launching on the controller, which finishes it; do not start it again$",
+        ),
+        (
+            {"operation": {"pr": "new:1", "status": "uncertain", "message": "Unread"}},
+            "uncertain: Unread; do not start it again$",
+        ),
         ({"operation": {"pr": "new:1", "status": "failed", "message": "No clone"}}, "failed"),
         ({"operation": "?"}, "answered the launch unexpectedly"),
     ],

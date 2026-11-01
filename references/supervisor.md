@@ -694,8 +694,9 @@ base, new branch name, agent, model, effort, Claude account, brief, Docker, exit
 done, permission mode, machine) under `launch`, and both conversations it may run in
 under `sessions`. The broker keeps its launch's agent's session, checked as a handoff's,
 and adds, as the sub-task's parent, what the sandbox cannot forge: the launch's working
-directory (babysit-bwrap passes its own `pwd -P` as `--cwd`), the transcript it found,
-and whether the launch was granted Docker (`--granted`, babysit-bwrap's `--enable`
+directory (babysit-bwrap passes its own `pwd -P` as `--cwd`), its agent and
+configuration directory, the transcript it found, and whether the launch was granted
+Docker (`--granted`, babysit-bwrap's `--enable`
 grants). At most one launch every 20 s per sandbox; the answer waits for the task to
 start. A launch whose broker was not given `--cwd` starts nothing.
 
@@ -708,7 +709,8 @@ poll interval, budget and timeout), checked by type, form and length, with no co
 characters (the instructions may span lines); a handoff's body is exactly the watch
 ID, pane, timeout (at most an hour), a session or none per agent, absolute `cwd` and
 transcript or none; a launch's is exactly `launch` (checked by `Workspaces.subtask`) and
-`parent`: absolute `cwd` and transcript, session UUID, agent, Docker as a boolean. For
+`parent`: absolute `cwd`, configuration directory and transcript, session UUID, agent,
+Docker as a boolean. For
 a launch the worktree is the parent's directory. One request per machine runs at a time per worktree, at most 6 a
 minute per machine and worktree and 30 a minute per machine (a failed one costs 2
 more, so repeated failures back off; answered 429), so one sandbox cannot hold up the
@@ -749,44 +751,62 @@ request goes through the launch's broker to `/api/worker/launch`, above. Inside 
 macOS Seatbelt sandbox (Safehouse; `wt` asks libsandbox about itself) that cannot write
 `~/src/<repo>/.git` it goes to this machine's dashboard as `POST /api/workspace-subtask` (the usual Host, Origin and
 `X-Babysit-Action` guard) with the same `launch` and a `parent` the run claims: its
-directory, its conversation (`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`) and
-whether Seatbelt lets it use Docker's sockets. With a grant for the clone, `wt` works in
+directory, its conversation (`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`, without
+which it asks for nothing), its agent's configuration directory (`CLAUDE_CONFIG_DIR` or
+`~/.claude`, `CODEX_HOME` or `~/.codex`) and whether Seatbelt lets it use Docker's
+sockets. With a grant for the clone, `wt` works in
 Safehouse as it always has, outside these rules. Runs the dashboard makes (any dashboard
 option) never take this path.
 
-Both end in `Workspaces.subtask`, which records the parent on the operation (shown as
-"Started by …" in its dialog and on its Workspaces row) and starts a New task only when:
+Both end in `Workspaces.subtask`, which records the parent on the operation with its
+lineage (shown as "Started by …" in its dialog and on its Workspaces row) and starts a
+New task only when:
 
 - the fields are exactly the launch fields, of their types, without control characters
   outside the brief; New task then checks them as for a person;
+- it runs the parent's agent and, for Claude, the parent's account, named by the
+  parent's configuration directory (`.claude` is `default`, `.claude/accounts/<name>`
+  that name; filled in when the request names none). A Codex sub-task uses its machine's
+  own Codex home;
 - Docker is asked for only by a parent that has it;
-- the parent launch (machine and directory) started fewer than 6 sub-tasks in the last
-  hour, and launches on its machine fewer than 24 (answered 429 from a worker);
+- it lies at most 2 levels below the launch that started its lineage (a parent running
+  in a sub-task's checkout continues that sub-task's lineage), the lineage started fewer
+  than 6 sub-tasks in the last hour, and launches on the parent's machine fewer than 24
+  (answered 429 from a worker);
 - placement (Auto, sticking to the parent's machine, or the machine named) lands on a
   machine Auto would use now: never a full one, one whose load is not known yet, or this
-  machine past its capacity, which a person's launch still gets;
-- that machine runs fewer than 4 sub-task agents: launches under way, and earlier
-  sub-tasks whose checkout herdr lists with an agent (operations are kept a day);
+  machine past its capacity, which a person's launch still gets. A worker's parent never
+  gets this machine, whose own agents' sandboxes reach the dashboard and herdr: named,
+  it is refused, and Auto that finds no worker answers "No worker can take this sub-task
+  now";
+- that machine runs fewer than 4 working sub-task agents: launches under way, and
+  earlier sub-tasks whose checkout herdr lists with a working or blocked agent (an idle
+  one left open does not count; operations are kept a day);
 - the repository has a clone there (this machine's: `<src>/<name>` if it is one, else
   the first listed; a worker's: its own, checked by its probe).
 
 A sub-task always runs sandboxed: New task has no other launch, here or on a worker.
-A worker's request waits up to 240 s for the launch and gets the operation without its
-log; `wt` then reports it, or says it is still launching. From Safehouse `wt` follows the
-operation through `/api/workspaces`.
+A worker's request is answered once the operation is recorded and the worker's request
+limits are released, after waiting up to 240 s for the launch; it gets the operation
+without its log. From then on nothing is a refusal: an operation that cannot be read is
+answered as uncertain, and a 5xx from the controller or a proxy, or a timeout, reaches
+`wt` as "may have started; do not start it again", as does "still launching". From
+Safehouse `wt` follows the operation through `/api/workspaces`.
 
-Residual, on a worker: a sandboxed agent can now start sandboxed agents, up to those
-limits, with briefs, branches, models and Claude accounts of its choosing, in any
-repository cloned on a machine placement may use, including this one and workers its
-own launch does not run on, and with Docker when its own launch has it. Each runs as a
-New task would, with its own grants, so it gets no access a person's New task with
-that brief would not; but it is code of the agent's choosing in another sandbox, and
-another Claude account's sandbox shares that account's transcripts and memory. It
-cannot start an unsandboxed agent, choose a launcher, command or working directory
-outside New task's, add `--with` clones, name the machine it asks from, or ask for
-another launch (the directory is babysit-bwrap's, the session must be in its own
+Residual, on a worker: a sandboxed agent can now start sandboxed agents of its own agent
+and account, up to those limits, with briefs, branches and models of its choosing, in
+any repository cloned on a worker placement may use, including workers its own launch
+does not run on, and with Docker when its own launch has it. Each runs as a New task
+would, with its own grants, so it gets no access a person's New task with that brief
+would not; but it is code of the agent's choosing in another sandbox. It cannot start
+an unsandboxed agent, choose a launcher, command or working directory outside New
+task's, add `--with` clones, reach this machine, name the machine it asks from, or ask
+for another launch (the directory is babysit-bwrap's, the session must be in its own
 store). Anything unsandboxed as the worker user can read `worker.json` and claim any
-parent.
+parent. These limits hold only for requests that come through the broker: a worker
+sandbox that reaches the dashboard's other actions over the tailnet directly is not held
+to them until the separate worker fence (the change that keeps worker machines off the
+dashboard's local actions) is in place.
 
 Residual, on this machine: the parent a run inside Safehouse names cannot be checked.
 Safehouse leaves the network open, and this user's Safehouse grants (`safe.env`) make

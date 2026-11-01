@@ -23,8 +23,8 @@ A launch (``action: launch``) asks for a sub-task: exactly ``wt.LAUNCH_FIELDS`` 
 ``launch``, and the conversations it may run in under ``sessions``. The broker keeps its
 launch's agent's session, checked as a handoff's, and tells the controller, as the
 sub-task's parent, what the sandbox cannot forge: the launch's working directory
-(``--cwd``, babysit-bwrap's), that transcript, and whether the launch was granted Docker
-(``docker`` in ``--granted``). The controller decides the rest; a launch without
+(``--cwd``, babysit-bwrap's), its agent and CONFIG_DIR, that transcript, and whether the
+launch was granted Docker (``docker`` in ``--granted``). The controller decides the rest; a launch without
 ``--cwd`` starts nothing.
 
 "Its own sessions" means every session in that configuration directory, which other
@@ -111,6 +111,7 @@ def check(request, agent, config_dir, worktrees, launch=None):
                 "cwd": launch["cwd"],
                 "session": session,
                 "agent": agent,
+                "config_dir": os.path.realpath(config_dir),
                 "rollout": transcript(agent, config_dir, session),
                 "docker": launch["docker"],
             },

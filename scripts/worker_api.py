@@ -293,7 +293,7 @@ def handoff_args(machine, request):
 LAUNCH = {"launch", "parent"}
 # What a broker says about the launch asking: its directory (babysit-bwrap's), the
 # conversation and the transcript it found for it, and whether it has Docker.
-PARENT = {"cwd", "session", "agent", "rollout", "docker"}
+PARENT = {"cwd", "session", "agent", "config_dir", "rollout", "docker"}
 
 
 def launch_args(machine, request):
@@ -316,6 +316,7 @@ def launch_args(machine, request):
         "cwd": _absolute(parent["cwd"], "parent cwd"),
         "session": _text(parent["session"], "parent session", 36, UUID).lower(),
         "agent": parent["agent"],
+        "config_dir": _absolute(parent["config_dir"], "parent configuration"),
         "rollout": _absolute(parent["rollout"], "parent transcript"),
         "docker": parent["docker"],
         "sandbox": "bwrap",
@@ -325,9 +326,15 @@ def launch_args(machine, request):
 def local_parent(parent):
     """What a ``wt`` inside Safehouse on this machine says about its launch: claims, which
     nothing here can check (any local process reaches the dashboard)."""
-    if not isinstance(parent, dict) or set(parent) != {"cwd", "session", "agent", "docker"}:
+    if not isinstance(parent, dict) or set(parent) != {
+        "cwd",
+        "session",
+        "agent",
+        "config_dir",
+        "docker",
+    }:
         raise ValueError("Expected exactly the parent fields")
-    if parent["agent"] not in {None, "codex", "claude"}:
+    if parent["agent"] not in {"codex", "claude"}:
         raise ValueError("Invalid parent agent")
     if type(parent["docker"]) is not bool:
         raise ValueError("Invalid parent Docker grant")
@@ -338,6 +345,7 @@ def local_parent(parent):
         "cwd": _absolute(parent["cwd"], "parent cwd"),
         "session": session.lower() if session else None,
         "agent": parent["agent"],
+        "config_dir": _absolute(parent["config_dir"], "parent configuration"),
         "rollout": None,
         "docker": parent["docker"],
         "sandbox": "safehouse",
@@ -514,6 +522,9 @@ def post(action, payload, timeout=FORWARD_TIMEOUT):
             detail = str(json.loads(exc.read(MAX_ANSWER))["error"])
         except (OSError, ValueError, KeyError, TypeError):
             detail = f"HTTP {exc.code}"
+        if action == "launch" and exc.code >= 500:
+            # A proxy's 502 or the dashboard's 503 may follow a launch it recorded.
+            raise RuntimeError(f"The controller failed: {detail[:1000]}") from exc
         raise ValueError(f"The controller refused: {detail[:1000]}") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         reason = getattr(exc, "reason", exc)

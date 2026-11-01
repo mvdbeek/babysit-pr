@@ -131,7 +131,7 @@ def free(machine_id, machines, loads, reservations):
     return f"{max(0, total - busy(machine_id, loads, reservations))}/{total} free"
 
 
-def choose(req, machines, loads, history, reservations, *, now=None):
+def choose(req, machines, loads, history, reservations, *, now=None, local=True):
     """The machine ``req`` runs on, or ValueError naming why each machine could not take it.
 
     An explicit choice (``override``) wins, then a pin, and the two must agree; Auto
@@ -139,7 +139,8 @@ def choose(req, machines, loads, history, reservations, *, now=None):
     repository's preferred machine, load, then this machine first and label, so equal
     candidates always resolve the same way.
     Auto only considers workers registered with ``auto``, and this machine when it is
-    full only if nothing else can take the launch.
+    full only if nothing else can take the launch. Without ``local`` this machine is
+    never chosen, by name or by Auto.
     """
     now = time.time() if now is None else now
     found = exclusions(req, machines, loads, reservations, now)
@@ -160,6 +161,8 @@ def choose(req, machines, loads, history, reservations, *, now=None):
 
     override = req.get("override")
     pin = req.get("pin")
+    if not local and LOCAL in (override, pin):
+        raise ValueError(f"{label(LOCAL, machines)} cannot take this launch")
     if override not in (None, "auto"):
         known(override)
         if pin is not None and override != pin:
@@ -169,10 +172,10 @@ def choose(req, machines, loads, history, reservations, *, now=None):
         return named(override, "chosen")
     if pin is not None:
         return named(pin, "existing workspace")
-    offered = {LOCAL, *(m for m, machine in machines.items() if machine.auto)}
+    offered = {*([LOCAL] if local else []), *(m for m, machine in machines.items() if machine.auto)}
     candidates = [machine_id for machine_id in offered if machine_id not in found]
-    local = found.get(LOCAL)
-    if not candidates and local and local.soft:
+    here = found.get(LOCAL)
+    if not candidates and local and here and here.soft:
         # Full, not unable: as before workers existed, it still takes the launch.
         return Placement(
             None,
@@ -181,7 +184,11 @@ def choose(req, machines, loads, history, reservations, *, now=None):
             excluded,
         )
     if not candidates:
-        reasons = "; ".join(f"{label(m, machines)}: {why}" for m, why in sorted(excluded.items()))
+        reasons = "; ".join(
+            f"{label(m, machines)}: {why}"
+            for m, why in sorted(excluded.items())
+            if local or m != LOCAL
+        )
         raise ValueError(f"No machine can take this launch ({reasons})")
 
     def rank(machine_id):

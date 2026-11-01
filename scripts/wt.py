@@ -1164,14 +1164,13 @@ class BrokerTransport:
             raise WtError(f"{self.command}: the controller refused: {exc}") from None
         except RuntimeError as exc:
             raise WtError(
-                f"{self.command}: the launch may have started ({exc}); "
-                "check the dashboard before retrying"
+                f"{self.command}: the launch may have started ({exc}); do not start it again"
             ) from None
         op = answer.get("operation")
         if not isinstance(op, dict) or not isinstance(op.get("status"), str):
             raise WtError(
                 f"{self.command}: the controller answered the launch unexpectedly; it may "
-                "have started, so check the dashboard before retrying"
+                "have started, so do not start it again"
             )
         return op
 
@@ -2171,11 +2170,18 @@ class Tool:
                     machine = result.get("machine_label") or "the controller"
                     self.warn(f"{command}: {where} on {machine}{url}")
                 return
-            if status in ("failed", "uncertain"):
-                note = "" if status == "failed" else "; check the dashboard before retrying"
-                raise WtError(f"{command}: the launch {status}: {said}{note}")
             poll = transport.status
-            if poll is None or time.monotonic() >= deadline:
+            # From a worker's sandbox there is no dashboard to look at: never retry.
+            check = "check the dashboard before retrying" if poll else "do not start it again"
+            if status in ("failed", "uncertain"):
+                note = "" if status == "failed" else f"; {check}"
+                raise WtError(f"{command}: the launch {status}: {said}{note}")
+            if poll is None:
+                raise WtError(
+                    f"{command}: still launching on the controller, which finishes it; "
+                    "do not start it again"
+                )
+            if time.monotonic() >= deadline:
                 raise WtError(f"{command}: still launching; follow it in the dashboard")
             time.sleep(LAUNCH_POLL)
             try:
@@ -2208,7 +2214,9 @@ class Tool:
             return "safehouse" if forced == "1" else ""
         if not self.confined():
             return ""
-        git_dir = os.path.join(self.home, "src", options.repo, ".git")
+        # `-r owner/name` names the clone `~/src/<name>`.
+        name = options.repo.split("/")[1] if REPO_SLUG.fullmatch(options.repo) else options.repo
+        git_dir = os.path.join(self.home, "src", name, ".git")
         return "" if os.path.isdir(git_dir) and self.writable(git_dir) else "safehouse"
 
     def sandbox_repo(self, command: str, options: Options) -> str:
@@ -2238,11 +2246,21 @@ class Tool:
             for agent, name in SESSION_ENV
             if SESSION.fullmatch(value := self.env.get(name) or "")
         ]
-        agent, session = sessions[0] if sessions else (None, None)
+        if not sessions:
+            raise WtError(
+                "wt: start sub-tasks from a Claude or Codex conversation "
+                "(CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID names it)"
+            )
+        agent, session = sessions[0]
+        homes = {
+            "claude": self.env.get("CLAUDE_CONFIG_DIR") or os.path.join(self.home, ".claude"),
+            "codex": self.env.get("CODEX_HOME") or os.path.join(self.home, ".codex"),
+        }
         return {
             "cwd": os.path.realpath(os.getcwd()),
             "session": session,
             "agent": agent,
+            "config_dir": os.path.realpath(homes[agent]),
             "docker": self.docker_granted(),
         }
 

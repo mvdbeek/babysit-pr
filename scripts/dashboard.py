@@ -1063,12 +1063,13 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 raise ValueError("Send one JSON request body")
             request = json.loads(self.read_body(length, 10))
-            self.send_json(
-                200,
-                worker_api.handle(
-                    self.server.home, machine, action, request, launch=self.worker_launch
-                ),
+            answer = worker_api.handle(
+                self.server.home, machine, action, request, launch=self.worker_launch
             )
+            if action == "launch":
+                # Recorded: from here nothing is a refusal, which would invite a retry.
+                answer = self.worker_launched(answer["operation"])
+            self.send_json(200, answer)
         except worker_api.RateLimited as exc:
             self.fail(429, str(exc))
         except (ValueError, RuntimeError) as exc:
@@ -1077,11 +1078,16 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(503, f"Cannot answer the worker: {exc}")
 
     def worker_launch(self, launch, parent):
-        """A sub-task a worker's sandbox asked for, once started or a few minutes on; the
-        answer leaves out the log, which may be long."""
+        """A sub-task a worker's sandbox asked for, as soon as it is recorded: the worker's
+        request limits are released before ``worker_launched`` waits for it."""
         if not self.server.workspaces:
             raise ValueError("Workspace actions are not enabled")
-        op = self.server.workspaces.subtask(launch, parent, wait=SUBTASK_WAIT)["operation"]
+        return self.server.workspaces.subtask(launch, parent)
+
+    def worker_launched(self, op):
+        """A worker's sub-task once started or a few minutes on, without its log, which
+        may be long."""
+        op = self.server.workspaces.await_operation(op, SUBTASK_WAIT)
         result = op.get("result") or {}
         return {
             "operation": {
