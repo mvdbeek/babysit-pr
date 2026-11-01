@@ -419,6 +419,17 @@ def test_controller_step_records_the_token_without_showing_it(tmp_path):
     assert controller("https://x", stdin="").returncode == 2
     assert controller("https://x", stdin="short\n").returncode == 2
     assert json.loads(marker.read_text())["token"] == token
+    assert "record this machine's tailnet_ip" in done.stderr
+    # With Tailscale up, it prints the machines.json line for the controller.
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    (fakes / "tailscale").write_text("#!/bin/sh\nprintf '100.64.0.5\\nfd7a:115c:a1e0::5\\n'\n")
+    (fakes / "tailscale").chmod(0o755)
+    env["PATH"] = f"{fakes}:/usr/bin:/bin"
+    done = controller("https://babysitter.example.ts.net")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert '"tailnet_ip": ["100.64.0.5", "fd7a:115c:a1e0::5"]' in done.stdout
+    assert "tailnet_ip" not in done.stderr
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="as root --check inspects the host instead")

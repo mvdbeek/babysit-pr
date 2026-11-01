@@ -446,10 +446,14 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    before recording the watch. Sandboxed agents never see the token; their launch's
    registration broker forwards only their own sessions in their own worktrees (the
    supervisor reference's "Watches on workers" has the details). Issue a new token to
-   replace it, or `worker-token ubuntu-1 --revoke`. Optionally add the worker's
-   tailnet addresses as `"tailnet_ip"` to its `machines.json` entry (one address or a
-   list, from `tailscale ip <box>`): registrations then must come through
-   `tailscale serve` from one of them.
+   replace it, or `worker-token ubuntu-1 --revoke`. Then add the worker's tailnet
+   addresses as `"tailnet_ip"` to its `machines.json` entry (one address or a list;
+   `--controller` prints the line, or use `tailscale ip <box>`). Registrations then
+   must come through `tailscale serve` from one of them, and the dashboard refuses
+   that address everything but `/api/worker/`. Without it the worker, and every
+   sandboxed agent on it (the sandbox shares the network), can use the whole
+   dashboard: launch and type into agents, run cron jobs unsandboxed on the Mac, read
+   transcripts. The dashboard warns at startup about workers without it.
 
 **Migrating a worker provisioned before the deployed copy** (babysit-pr in
 `~/src/babysit-pr`, for example chonk pinned at `d55bebe`): rerun the user step with
@@ -498,7 +502,10 @@ From the Linux sandbox section of the supervisor reference, restated for operato
   hooks, plugins, skills and the like) is read-only in every sandbox, a granted
   Claude starts no MCP servers, and each set of grants has its own package cache.
 - **bubblewrap 0.9.0** keeps the bind-by-path race unless upgraded (above).
-- **Egress is unrestricted**; network isolation is a later step.
+- **Egress is unrestricted**; network isolation is a later step. The controller's
+  dashboard keeps a worker to `/api/worker/` only by its `tailnet_ip`; record it
+  (step 5), or serve the dashboard with `--require-tailscale-user`, which refuses
+  every tagged node the rest.
 
 ## 7. Known gaps and follow-ups
 

@@ -1345,6 +1345,11 @@ def main():
         help="Exact Host header accepted through a trusted local proxy",
     )
     dashboard_parser.add_argument(
+        "--require-tailscale-user",
+        action="store_true",
+        help="Through tailscale serve, refuse all but /api/worker/ without Tailscale-User-Login",
+    )
+    dashboard_parser.add_argument(
         "--open", action="store_true", help="Open the dashboard in your browser"
     )
     dashboard_parser.add_argument(
@@ -1416,6 +1421,12 @@ def main():
                 emit({"machine": args.machine, "revoked": True})
             else:
                 worker_api.print_token(worker_api.issue(home, args.machine))
+                if machines.load(home)[args.machine].tailnet_ip is None:
+                    print(
+                        f"Warning: add {args.machine}'s tailnet_ip to machines.json; until "
+                        "then it can use the whole dashboard through the tailnet",
+                        file=sys.stderr,
+                    )
         except (OSError, ValueError) as exc:
             emit({"error": str(exc)})
             return 1
@@ -1431,6 +1442,7 @@ def main():
                 args.open,
                 args.allow_host,
                 args.attachments.expanduser().resolve() if args.attachments else None,
+                require_tailscale_user=args.require_tailscale_user,
             )
         except OSError as exc:
             emit({"error": str(exc)})

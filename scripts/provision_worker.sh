@@ -1092,6 +1092,14 @@ sys.exit(0 if ok else 1)' "$controller" 2>/dev/null || {
       "$(python3 -c 'import json, sys; print(json.dumps({"controller": sys.argv[1].rstrip("/")}))' "$controller")" token
     ok "controller $controller and its token recorded"
   fi
+  # The dashboard keeps a worker to /api/worker/ only by the address it comes from.
+  local addresses
+  if addresses=$(tailscale ip 2>/dev/null) && [[ -n $addresses ]]; then
+    printf '  add to this machine'\''s machines.json entry on the controller:\n    "tailnet_ip": %s\n' \
+      "$(printf '%s' "$addresses" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read().split()))')"
+  else
+    warn "no tailscale address found; record this machine's tailnet_ip in machines.json on the controller"
+  fi
   finish
 }
 
