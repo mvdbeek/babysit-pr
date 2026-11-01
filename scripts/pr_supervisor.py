@@ -114,15 +114,46 @@ def checkout_state(home, machine_id, cwd):
     return remote_probe.call(home, worker, "worktree", PROBE_TIMEOUT, path=cwd, root=root)
 
 
+def checkout_upstream(cwd, branch):
+    """``[slug, branch]`` that local ``branch`` tracks, read as remote_probe.provenance
+    reads it for a worker's checkout and the Workspaces tab; None when unset."""
+
+    def config_git(path, *args):
+        try:
+            return git(path, *args)
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+
+    config = remote_probe.repo_config(config_git, cwd)
+    found = remote_probe.provenance(
+        cwd, None, branch, None, config, remote_probe.remote_slugs(config)
+    )
+    return found["upstream"]
+
+
+def tracks_head(upstream, pr):
+    """Whether a checkout's upstream is the PR's head branch on its head repository.
+
+    A review checkout keeps its own branch name (``review-repo-pr-123``, which links it
+    on the dashboard) while tracking the PR branch, as pr_workspaces.verified_head
+    accepts. The upstream is repository config the agent can write, as it can rename a
+    branch: the name was never more than a guard against the wrong checkout, and HEAD
+    must still be the PR's head commit.
+    """
+    head_repo = (pr.get("head_repo") or "").lower()
+    return bool(head_repo) and upstream == [head_repo, pr["head_branch"]]
+
+
 def verify_worktree(job, pr, home=None, state=None):
     """The watched branch at the PR's head, clean. A worker's checkout is read there, or
-    taken from ``state`` (``checkout_state``) when the caller just read it."""
+    taken from ``state`` (``checkout_state``) when the caller just read it. A branch of
+    another name passes when it tracks the PR's head branch (``tracks_head``)."""
     machine = job.get("machine")
     if machine is not None:
         state = state or checkout_state(home, machine, job["cwd"])
         if state["path"] != job["cwd"]:
             raise RuntimeError("Worktree is no longer at the registered path")
-        if state["branch"] != pr["head_branch"]:
+        if state["branch"] != pr["head_branch"] and not tracks_head(state.get("upstream"), pr):
             raise RuntimeError(
                 "Worktree branch differs from the watched branch; intervention required"
             )
@@ -133,7 +164,8 @@ def verify_worktree(job, pr, home=None, state=None):
         if state["dirty"]:
             raise RuntimeError("Worktree has uncommitted changes; repair was not started")
         return
-    if git(job["cwd"], "symbolic-ref", "--short", "HEAD", machine=machine) != pr["head_branch"]:
+    branch = git(job["cwd"], "symbolic-ref", "--short", "HEAD", machine=machine)
+    if branch != pr["head_branch"] and not tracks_head(checkout_upstream(job["cwd"], branch), pr):
         raise RuntimeError("Worktree branch differs from the watched branch; intervention required")
     if git(job["cwd"], "rev-parse", "HEAD", machine=machine) != pr["head_sha"]:
         raise RuntimeError(
@@ -521,9 +553,11 @@ the fork while pr.repo identifies the upstream PR for reviews and conflicts.
 If pr.kind is 'branch', there is no PR: recheck that remote branch and SHA,
 handle only its CI, and do not create a PR or fetch reviews.
 Diagnose branch failures versus unrelated flakes. After any authorized fix,
-test, commit and push to the watched branch, then RETURN. The external Python
-watcher owns all waiting. Do not poll/sleep, launch another watcher, register
-another job, or stop this watch from inside the repair agent.
+test, commit and push to the watched branch, then RETURN. A local branch named
+otherwise tracks it: push HEAD to pr.head_branch on its remote, never a new
+branch. The external Python watcher owns all waiting. Do not poll/sleep, launch
+another watcher, register another job, or stop this watch from inside the repair
+agent.
 For a transient failure, at most one authorized rerun in this wake; otherwise
 return blocked when operator input is required. Return JSON with status 'waiting'
 or 'blocked' and a concise summary. Acknowledgements or already-addressed review

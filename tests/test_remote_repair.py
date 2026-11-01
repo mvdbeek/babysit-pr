@@ -22,7 +22,13 @@ import remote_repair
 import session_locks
 from processes import wait_gone
 from test_remote_cron import git, short_tmp  # noqa: F401 (fixture)
-from test_remote_registration import box, claude_transcript, register, registry  # noqa: F401
+from test_remote_registration import (  # noqa: F401
+    box,
+    claude_transcript,
+    register,
+    registry,
+    track_feature,
+)
 
 SCRIPTS = Path(supervisor.__file__).resolve().parent
 CHECK_VERSION = remote_repair.check_version
@@ -159,6 +165,15 @@ def test_a_codex_repair_runs_on_the_worker_and_returns_here(worker, tmp_path):
     assert not session_locks.held("codex", worker["sid"], None, "box")
     # The worker half never keeps a queue.
     assert not (worker["worker"] / ".local/state/babysit-pr/queue.sqlite").exists()
+
+
+def test_a_worker_repair_runs_in_a_checkout_tracking_the_pr_branch(worker, tmp_path):
+    track_feature(worker)
+    job, folder = dispatch(worker)
+    supervisor.run_repair(worker["home"], job["id"], job["attempt"])
+    assert result(folder) == {"status": "waiting", "summary": "Fixed on the worker"}
+    [call] = calls(tmp_path)
+    assert "push HEAD to pr.head_branch" in call["prompt"]
 
 
 def test_a_claude_repair_on_the_worker_uses_its_account(worker, tmp_path):

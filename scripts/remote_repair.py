@@ -107,6 +107,7 @@ def spec_for(worker, job, attempt, prompt, pr):
         # The worker half builds its own launcher, never one the job names.
         "features": ["gpg"] if "gpg" in worker.labels else [],
         "head_branch": pr["head_branch"],
+        "head_repo": pr.get("head_repo"),
         "head_sha": pr["head_sha"],
         "prompt": prompt,
         # The worker's own herdr binding: the worker half checks it runs in that pane.
@@ -459,7 +460,12 @@ def worker_main(spec_path):
             print(f"\nBabysitter: resuming {job['session_id']}\n", flush=True)
         pr_supervisor.verify_worktree(
             {"cwd": job["cwd"], "machine": None},
-            {"head_branch": spec["head_branch"], "head_sha": spec["head_sha"]},
+            {
+                "head_branch": spec["head_branch"],
+                # Absent from an older controller's spec: then the branch name must match.
+                "head_repo": spec.get("head_repo"),
+                "head_sha": spec["head_sha"],
+            },
         )
         pr_supervisor.watch.save_state(folder / "schema.json", pr_supervisor.RESULT_SCHEMA)
         prompt_path = folder / "prompt.txt"

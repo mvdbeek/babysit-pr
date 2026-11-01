@@ -550,6 +550,50 @@ def test_worktree_git_never_reads_worker_paths_here_and_keeps_local_argv(harness
     assert calls[0] == supervisor.safe_git.prepare(cwd, "symbolic-ref", "--short", "HEAD")[0]
 
 
+def test_a_checkout_of_another_name_passes_while_it_tracks_the_pr_branch(harness):
+    # wtpr's review checkouts keep the name that links them on the dashboard.
+    cwd = str(harness["worktree"])
+
+    def config(*args):
+        subprocess.run(["git", "-C", cwd, "config", *args], check=True)
+
+    subprocess.run(["git", "-C", cwd, "switch", "-q", "-c", "review-x"], check=True)
+    config("remote.up.url", "https://github.com/Owner/fork.git")
+    config("branch.review-x.remote", "up")
+    config("branch.review-x.merge", "refs/heads/feature")
+    job = {"cwd": cwd, "machine": None}
+    sha = supervisor.git(cwd, "rev-parse", "HEAD")
+    pr = {"head_branch": "feature", "head_repo": "owner/fork", "head_sha": sha}
+    supervisor.verify_worktree(job, pr)
+    differs = "Worktree branch differs"
+    for other in ({"head_repo": "owner/other"}, {"head_repo": None}, {"head_branch": "main"}):
+        with pytest.raises(RuntimeError, match=differs):
+            supervisor.verify_worktree(job, {**pr, **other})
+    config("branch.review-x.merge", "refs/heads/elsewhere")
+    with pytest.raises(RuntimeError, match=differs):
+        supervisor.verify_worktree(job, pr)
+    config("branch.review-x.merge", "refs/heads/feature")
+    config("remote.up.url", "https://example.com/owner/fork.git")
+    with pytest.raises(RuntimeError, match=differs):
+        supervisor.verify_worktree(job, pr)
+    config("--unset", "branch.review-x.remote")
+    with pytest.raises(RuntimeError, match=differs):
+        supervisor.verify_worktree(job, pr)
+    # Tracking stands in for the name only: the head and a clean tree still count.
+    config("branch.review-x.remote", "up")
+    config("remote.up.url", "git@github.com:owner/fork.git")
+    supervisor.verify_worktree(job, pr)
+    with pytest.raises(RuntimeError, match="Local HEAD differs"):
+        supervisor.verify_worktree(job, {**pr, "head_sha": "0" * 40})
+    (harness["worktree"] / "new").write_text("x")
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        supervisor.verify_worktree(job, pr)
+    # So does a same-named checkout, with no upstream at all.
+    subprocess.run(["git", "-C", cwd, "switch", "-q", "feature"], check=True)
+    (harness["worktree"] / "new").unlink()
+    supervisor.verify_worktree(job, {"head_branch": "feature", "head_sha": sha})
+
+
 @pytest.mark.parametrize(
     "command",
     [["register", "--headless", "--instructions", "x"], ["handoff", "w1", "--pane", "p1"]],
