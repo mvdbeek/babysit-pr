@@ -95,7 +95,8 @@ elif a[:2] == ['pane','list']:
  result={'panes':[x for x in data.get('panes',[]) if wid is None or x['workspace_id']==wid]}
 elif a[:2] == ['pane','get']:
  agent=next((g for g in data['agents'] if g.get('pane_id')==a[2]),{})
- result={'pane':dict(agent,terminal_id='terminal',scroll={'offset_from_bottom':0})}
+ pane=next((x for x in data.get('panes',[]) if x['pane_id']==a[2]),{})
+ result={'pane':dict(pane,**agent,terminal_id='terminal',scroll={'offset_from_bottom':0})}
 elif a[:2] == ['agent','get']:
  result={'agent':{'state_change_seq':1}}
 elif a[:2] == ['pane','process-info']:
@@ -110,6 +111,9 @@ elif a[:2] == ['pane','split']:
  data['panes'].append({'pane_id':pid,'workspace_id':wid,'cwd':a[a.index('--cwd')+1]})
  data.setdefault('splits',[]).append(a[2:])
  result={'pane':{'pane_id':pid}}
+elif a[:2] == ['pane','rename']:
+ for x in data.get('panes',[]):
+  if x['pane_id']==a[2]: x['label']=' '.join(a[3:])
 elif a[:2] == ['pane','run']:
  w=next(w for w in data['workspaces'] if a[2].startswith(w['workspace_id']+':'))
  data.setdefault('runs',[]).append(a[2:])

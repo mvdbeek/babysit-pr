@@ -616,7 +616,10 @@ def interrupt(request, machine=None):
 
 
 def exit_agent(request, home=None):
-    """Quit the agent of a pane as its own exit does, keeping the pane's shell and session.
+    """Quit the agent of a pane as its own exit does, keeping its session.
+
+    The pane's shell stays, unless babysit split the pane off for the agent
+    (``cron_agents.mark_run_pane``): then the pane closes with it.
 
     Only one Claude or Codex process the pane's interactive shell started, still on the
     named session, is quit: exiting the pane's root process, or a command that ends with
@@ -792,6 +795,9 @@ def exit_agent(request, home=None):
                 )
             except RuntimeError as exc:
                 return {"quit": False, "pane": pane, "warning": f"{exc}; check the pane in Collie."}
+            # Exited: a shell left in a pane split off for it would narrow the next one's.
+            if info.get("label") == cron_agents.RUN_PANE_LABEL and info.get("workspace_id"):
+                cron_agents.sweep_run_panes(info["workspace_id"], only=pane)
         except (OSError, subprocess.SubprocessError) as exc:
             if not sent:
                 raise
@@ -1656,6 +1662,7 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
                     "An agent is already running in this workspace; send to it instead"
                 )
         if pane is None:
+            cron_agents.sweep_run_panes(live, machine)
             anchor = next(
                 (
                     p.get("pane_id")
@@ -1687,6 +1694,7 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
                 worktree=root,
                 machine=machine,
                 found=found,
+                mark=True,
             )
         # A reopened workspace's shell starts in the checkout, not the session's directory.
         return launch(
@@ -1821,11 +1829,14 @@ def launch(
     worktree=None,
     machine=None,
     found=None,
+    mark=False,
 ):
     """Resume once into a fresh or verified empty shell pane, optionally with a prompt.
 
     ``worktree`` is the workspace checkout, which the agent may write. On a worker the
-    prompt is staged there and the line names the paths its probe ``found``.
+    prompt is staged there and the line names the paths its probe ``found``. ``mark``
+    labels a pane split off for it, once the session shows there, as one whose shell may
+    be closed later (``cron_agents.sweep_run_panes``).
     """
     session_id = chosen["id"]
     # The prompt is read back from a private file, as launches do: a typed line has
@@ -1913,6 +1924,8 @@ def launch(
                 discard()  # The shell has read it by now.
                 # A recognized agent guards the session from here on.
                 _recent.pop(session_id, None)
+                if mark:
+                    cron_agents.mark_run_pane(pane, machine)
                 return {"sent": True, "pane": pane, "resumed": chosen["id"], "warning": None}
             time.sleep(0.5)
     except (OSError, ValueError, subprocess.SubprocessError):

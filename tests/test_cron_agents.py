@@ -319,6 +319,46 @@ def test_a_reused_workspace_gets_a_fresh_pane_for_the_next_run(setup, monkeypatc
     assert data["splits"][-1][0] == "w1:p1"
 
 
+def test_a_shell_an_earlier_run_left_is_closed_before_the_next_split(setup, monkeypatch):
+    jobs, manager, _, state = setup
+    saved = jobs.save(request(manager))
+    jobs.run_now(saved["id"])
+    first = settle(jobs, saved["id"])
+    left = first["agent_run"]["pane"]
+    # Marked once its agent showed up, as the pane a later launch may close.
+    [pane] = [p for p in herdr_state(state)["panes"] if p["pane_id"] == left]
+    assert pane["label"] == cron_agents.RUN_PANE_LABEL
+    monkeypatch.setattr(
+        workspace_exit,
+        "step",
+        lambda record, *a: {**record, "state": "left_open", "message": "Asked a question"},
+    )
+    jobs.watch()
+    # Quit by hand later: only its shell is left, beside the workspace's own first pane.
+    data = herdr_state(state)
+    data["agents"] = []
+    data["panes"].insert(0, {"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/"})
+    state.write_text(json.dumps(data))
+    jobs.run_now(saved["id"])
+    second = settle(jobs, saved["id"])
+    assert second["status"] == "running"
+    data = herdr_state(state)
+    closed = [c for c in data["calls"] if c[:2] == ["pane", "close"]]
+    assert closed == [["pane", "close", left]]
+    assert data["splits"][-1][0] == "w1:p1"
+
+
+def test_the_last_pane_of_a_workspace_is_never_swept(setup):
+    _, _, _, state = setup
+    data = herdr_state(state)
+    data["panes"] = [
+        {"pane_id": "w1:p5", "workspace_id": "w1", "label": cron_agents.RUN_PANE_LABEL}
+    ]
+    state.write_text(json.dumps(data))
+    cron_agents.sweep_run_panes("w1")
+    assert not any(c[:2] == ["pane", "close"] for c in herdr_state(state)["calls"])
+
+
 def test_the_time_limit_leaves_a_working_agent_open(setup, monkeypatch):
     clock = [time.time()]
     jobs, manager, _, _ = setup

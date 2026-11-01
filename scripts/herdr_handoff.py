@@ -225,6 +225,16 @@ def claude_composer(screen):
     return None
 
 
+def unwrapped_composer(screen):
+    """Claude's composer text without whitespace, or None for any other layout.
+
+    A narrow pane wraps a line mid-word ("❯ /ex", then "it"), which claude_composer
+    joins with a space; a check for an exact typed command must not see it.
+    """
+    shown = claude_composer(screen)
+    return None if shown is None else "".join(shown.split())
+
+
 def verify_identity(target, info, procs):
     agent = target.get("agent", "codex")
     label = AGENTS[agent]["label"]
@@ -482,7 +492,7 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None, *,
     if typed:
         herdr("pane", "send-text", pane, sandbox.typed("/exit"), machine=machine)
         typed_by = time.monotonic() + TYPED_EXIT_WAIT
-        while (shown := claude_composer(read_screen(pane, machine))) != "/exit":
+        while (shown := unwrapped_composer(read_screen(pane, machine))) != "/exit":
             if time.monotonic() >= typed_by:
                 # Only the /exit typed here is taken back, and only from the composer: a
                 # draft beside it stays, and no key goes to a dialog.

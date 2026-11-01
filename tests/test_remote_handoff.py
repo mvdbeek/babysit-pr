@@ -253,9 +253,16 @@ def claude_target(watched, **changes):
     }
 
 
-def test_a_claude_on_a_worker_is_asked_to_exit_with_a_typed_line(watched, fake_tools):
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "─" * 20 + "\n❯ /exit\n" + "─" * 20 + "\n  /exit  Exit the REPL",
+        # A pane seven columns wide wraps it mid-word.
+        "─" * 7 + "\n❯ /ex\n  it\n" + "─" * 7,
+    ],
+)
+def test_a_claude_on_a_worker_is_asked_to_exit_with_a_typed_line(watched, fake_tools, typed):
     worker_herdr(fake_tools, watched["tree"], "claude")
-    typed = "─" * 20 + "\n❯ /exit\n" + "─" * 20 + "\n  /exit  Exit the REPL"
     screens(fake_tools, CLAUDE_EMPTY, typed)
     machine = supervisor.machines.resolve(watched["home"], "box")
     herdr_handoff.send_exit(
@@ -279,6 +286,8 @@ def test_a_claude_on_a_worker_is_asked_to_exit_with_a_typed_line(watched, fake_t
         ("Allow this command?\n❯ 1. Yes\n  2. No", False),
         # Someone typed too: only the /exit typed here is taken back.
         ("─" * 20 + "\n❯ draft/exit\n" + "─" * 20, True),
+        # The same, wrapped in a narrow pane.
+        ("─" * 7 + "\n❯ draft\n  /ex\n  it\n" + "─" * 7, True),
     ],
 )
 def test_enter_follows_a_typed_exit_only_once_the_composer_holds_exactly_it(

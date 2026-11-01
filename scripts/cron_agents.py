@@ -55,6 +55,8 @@ REMOTE_WATCH = 60
 # A worker's sandbox follows its operating system.
 BACKENDS = {"darwin": "safehouse", "linux": "bwrap"}
 FENCE = re.compile(r"`{3,}\w*")
+# The label of a pane split off for an agent, which its shell may be closed by later.
+RUN_PANE_LABEL = "babysit agent"
 
 
 class Busy(Exception):
@@ -413,6 +415,7 @@ def started(job, run_id, home, src, machine):
         # Two agents in one checkout would trip over each other's changes.
         raise Busy("An agent is still open in the job's workspace")
     else:
+        sweep_run_panes(workspace, machine)
         anchor = next(
             (
                 p["pane_id"]
@@ -497,6 +500,7 @@ def started(job, run_id, home, src, machine):
                 a.get("pane_id") == pane and a.get("agent") == job["agent"]
                 for a in herdr("agent", "list", machine=machine)["agents"]
             ):
+                mark_run_pane(pane, machine)
                 return launched
             time.sleep(1)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -584,3 +588,40 @@ def close_pane(pane, machine=None, shell=None):
         return True
     except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError):
         return False
+
+
+def mark_run_pane(pane, machine=None):
+    """Label a pane split off for an agent, once the agent shows in it, as one
+    ``sweep_run_panes`` may close. A pane still starting its agent stays unmarked, as do
+    a workspace's root pane and the user's own."""
+    try:
+        herdr("pane", "rename", pane, RUN_PANE_LABEL, machine=machine)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        pass  # Unmarked, the pane is only left for the user to close.
+
+
+def sweep_run_panes(workspace, machine=None, only=None):
+    """Close the marked panes of ``workspace`` (or just pane ``only``) that only their
+    shell is left in.
+
+    Every launch splits a pane in two; the shells its agents leave would otherwise
+    narrow each later agent's pane until its composer wraps a typed /exit. The last pane
+    stays, so the workspace does.
+    """
+    try:
+        panes = [
+            p
+            for p in herdr("pane", "list", "--workspace", workspace, machine=machine)["panes"]
+            if isinstance(p, dict) and p.get("pane_id")
+        ]
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return
+    left = len(panes)
+    for p in panes:
+        if (
+            p.get("label") == RUN_PANE_LABEL
+            and only in (None, p["pane_id"])
+            and left > 1
+            and close_pane(p["pane_id"], machine)
+        ):
+            left -= 1
