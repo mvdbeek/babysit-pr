@@ -54,6 +54,24 @@ DASHBOARD = "http://127.0.0.1:8765"
 # How often, and for how long, a launch on a worker is followed through the dashboard.
 LAUNCH_POLL = 2.0
 LAUNCH_WAIT = 900
+# What a launch on a worker asks the controller for (see launch_request), and the branch
+# names its New task takes.
+LAUNCH_FIELDS = (
+    "repo",
+    "base",
+    "name",
+    "agent",
+    "model",
+    "effort",
+    "claude_account",
+    "task",
+    "docker",
+    "exit_when_done",
+    "permission_mode",
+    "machine",
+)
+LAUNCH_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+LAUNCH_BASE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 
 VALUE_OPTIONS = {
     "-r": "repo",
@@ -941,6 +959,121 @@ class SubprocessRunner:
 
     def which(self, name: str) -> str | None:
         return find_executable(name, self.env)
+
+
+# --- launches on worker machines ----------------------------------------------------
+
+
+def launch_request(command: str, options: Options, repo: str, machine: str) -> dict[str, object]:
+    """The New task a launch on a worker asks the controller for: exactly LAUNCH_FIELDS.
+
+    Every field is checked here as the controller checks it, so any transport (the local
+    dashboard's API, or a sandbox's broker) carries one shape: ``repo`` (``owner/name``),
+    ``base`` and ``name`` (the new branch), ``agent``, ``model``, ``effort``,
+    ``claude_account``, ``task`` (the brief), ``docker``, ``exit_when_done``,
+    ``permission_mode`` (empty or ``auto``) and ``machine`` (a registry id or ``auto``).
+    """
+    validate_agent_options(options.agent, options.model, options.effort, options.permission_mode)
+    if options.agent not in ("codex", "claude"):
+        raise WtError(f"{command}: unknown agent {options.agent}")
+    base = options.positional[0]
+    name = options.positional[1] if len(options.positional) > 1 else base
+    checks = [
+        (REPO_SLUG.fullmatch(repo) and repo.split("/")[1] not in (".", ".."), "repository"),
+        (LAUNCH_BRANCH.fullmatch(name), "branch name: letters, digits, '.', '_' and '-'"),
+        (LAUNCH_BASE.fullmatch(base) and ".." not in base, "base branch"),
+        (
+            not options.claude_account or claude_accounts.NAME.fullmatch(options.claude_account),
+            "Claude account",
+        ),
+        (0 < len(options.prompt.strip()) and len(options.prompt) <= 32000, "brief (1-32,000)"),
+        ("\0" not in options.prompt, "brief"),
+        (machine == "auto" or MACHINE.fullmatch(machine), "machine"),
+    ]
+    for ok, field in checks:
+        if not ok:
+            raise WtError(f"{command}: invalid {field} for a launch on a worker")
+    request: dict[str, object] = {
+        "repo": repo,
+        "base": base,
+        "name": name,
+        "agent": options.agent,
+        "model": options.model,
+        "effort": options.effort,
+        "claude_account": options.claude_account,
+        "task": options.prompt,
+        "docker": options.docker,
+        "exit_when_done": options.exit_when_done,
+        "permission_mode": options.permission_mode,
+        "machine": machine,
+    }
+    assert tuple(request) == LAUNCH_FIELDS
+    return request
+
+
+class DashboardTransport:
+    """A launch through this machine's dashboard API: ``$BABYSIT_DASHBOARD_URL`` or
+    127.0.0.1:8765, reachable unsandboxed and from inside Safehouse.
+
+    A transport offers ``place`` (where Auto would put a ``launch_request``), ``start``
+    (the New task's operation) and ``status`` (that operation now).
+    """
+
+    def __init__(self, tool: Tool, command: str):
+        self.command = command
+        self.base = (tool.env.get("BABYSIT_DASHBOARD_URL") or DASHBOARD).rstrip("/")
+
+    def place(self, request: Mapping[str, object]) -> dict[str, object]:
+        import urllib.parse
+
+        query = {"kind": "scratch", "repo": request["repo"], "agent": request["agent"]}
+        if request["docker"]:
+            query["docker"] = "1"
+        if request["agent"] == "claude" and request["claude_account"]:
+            query["account"] = request["claude_account"]
+        return self.call("/api/placement?" + urllib.parse.urlencode(query))
+
+    def start(self, request: Mapping[str, object]) -> dict[str, object]:
+        return self.call("/api/workspace-new", dict(request))["operation"]
+
+    def status(self, op: Mapping[str, object]) -> dict[str, object]:
+        listed = self.call("/api/workspaces").get("new") or {}
+        return (listed.get(op["pr"]) or {}).get("operation") or dict(op)
+
+    def call(self, path: str, body: dict[str, object] | None = None):
+        """One JSON request to the dashboard; refusals carry its reason."""
+        import urllib.error
+        import urllib.request
+
+        headers = {}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            # The dashboard's own guard against browsers: a custom header and no Origin.
+            headers = {
+                "Content-Type": "application/json",
+                "X-Babysit-Action": path.rsplit("/", 1)[1],
+            }
+        request = urllib.request.Request(self.base + path, data=data, headers=headers)
+        # No proxy from the environment: the dashboard is on this machine.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=120) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error")
+            except (ValueError, AttributeError):
+                detail = None
+            raise WtError(
+                f"{self.command}: the dashboard refused: {detail or f'HTTP {exc.code}'}"
+            ) from None
+        except (OSError, ValueError) as exc:
+            reason = getattr(exc, "reason", None) or exc
+            raise WtError(
+                f"{self.command}: cannot reach the dashboard at {self.base} ({reason}), which "
+                "starts launches on workers; start it, or pass --machine local to run here"
+            ) from None
 
 
 # --- the tool ------------------------------------------------------------------------
@@ -1859,46 +1992,14 @@ class Tool:
             return None
         return config["docker"]["prefer"] if config else None
 
-    def dashboard(self, command: str, path: str, body: dict[str, object] | None = None):
-        """One JSON request to this machine's dashboard; refusals carry its reason."""
-        import urllib.error
-        import urllib.request
-
-        base = (self.env.get("BABYSIT_DASHBOARD_URL") or DASHBOARD).rstrip("/")
-        headers = {}
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode()
-            # The dashboard's own guard against browsers: a custom header and no Origin.
-            headers = {
-                "Content-Type": "application/json",
-                "X-Babysit-Action": path.rsplit("/", 1)[1],
-            }
-        request = urllib.request.Request(base + path, data=data, headers=headers)
-        # No proxy from the environment: the dashboard is on this machine.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(request, timeout=120) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = json.load(exc).get("error")
-            except (ValueError, AttributeError):
-                detail = None
-            raise WtError(
-                f"{command}: the dashboard refused: {detail or f'HTTP {exc.code}'}"
-            ) from None
-        except (OSError, ValueError) as exc:
-            reason = getattr(exc, "reason", None) or exc
-            raise WtError(
-                f"{command}: cannot reach the dashboard at {base} ({reason}), which starts "
-                "launches on workers; start it, or pass --machine local to run here"
-            ) from None
+    def transport(self, command: str) -> DashboardTransport:
+        """How this run reaches the controller's placement and New task."""
+        return DashboardTransport(self, command)
 
     def launch_elsewhere(self, command: str, options: Options, machine: str) -> bool:
-        """Start this run on a worker through the dashboard's New task; False to run it here.
+        """Start this run on a worker through the controller's New task; False to run it here.
 
-        ``auto`` asks the dashboard's placement first and runs here when it says so, or
+        ``auto`` asks the controller's placement first and runs here when it says so, or
         when a worker cannot start this kind of run; a worker named outright refuses it.
         """
         refusal = worker_refusal(command, options)
@@ -1909,51 +2010,25 @@ class Tool:
             return False
         if not options.positional:
             raise UsageError(command, f"{command}: expected a branch, PR number or 'issue'")
-        validate_agent_options(
-            options.agent, options.model, options.effort, options.permission_mode
-        )
-        base = options.positional[0]
-        branch = options.positional[1] if len(options.positional) > 1 else base
         slug = self.repo_slug(os.path.join(self.home, "src", options.repo), command)
+        request = launch_request(command, options, slug, machine)
+        transport = self.transport(command)
         if machine == "auto":
-            query = {"kind": "scratch", "repo": slug, "agent": options.agent}
-            if options.docker:
-                query["docker"] = "1"
-            if options.agent == "claude" and options.claude_account:
-                query["account"] = options.claude_account
-            import urllib.parse
-
-            preview = self.dashboard(command, "/api/placement?" + urllib.parse.urlencode(query))
-            if preview.get("error"):
-                raise WtError(f"{command}: {preview['error']}")
-            if preview.get("machine") == "local":
-                self.warn(f"{command}: {preview.get('reason')}; running here")
+            placed = transport.place(request)
+            if placed.get("error"):
+                raise WtError(f"{command}: {placed['error']}")
+            if placed.get("machine") == "local":
+                self.warn(f"{command}: {placed.get('reason')}; running here")
                 return False
-            machine = str(preview["machine"])
-            self.warn(f"{command}: {preview.get('reason')}; starting on {preview.get('label')}")
-        reply = self.dashboard(
-            command,
-            "/api/workspace-new",
-            {
-                "repo": slug,
-                "base": base,
-                "name": branch,
-                "agent": options.agent,
-                "model": options.model,
-                "effort": options.effort,
-                "claude_account": options.claude_account,
-                "task": options.prompt,
-                "docker": options.docker,
-                "exit_when_done": options.exit_when_done,
-                "machine": machine,
-                **({"permission_mode": options.permission_mode} if options.permission_mode else {}),
-            },
-        )
-        self.follow_launch(command, reply["operation"])
+            request["machine"] = str(placed["machine"])
+            self.warn(f"{command}: {placed.get('reason')}; starting on {placed.get('label')}")
+        self.follow_launch(command, transport, transport.start(request))
         return True
 
-    def follow_launch(self, command: str, op: dict[str, object]) -> None:
-        """Wait for the dashboard's launch to finish, reporting its progress on stderr."""
+    def follow_launch(
+        self, command: str, transport: DashboardTransport, op: dict[str, object]
+    ) -> None:
+        """Wait for the controller's launch to finish, reporting its progress on stderr."""
         import time
 
         deadline = time.monotonic() + LAUNCH_WAIT
@@ -1977,14 +2052,13 @@ class Tool:
                 raise WtError(f"{command}: still launching; follow it in the dashboard")
             time.sleep(LAUNCH_POLL)
             try:
-                listed = self.dashboard(command, "/api/workspaces").get("new") or {}
+                op = transport.status(op)
             except WtError as exc:
                 # The launch was handed over: never suggest starting it a second time here.
                 raise WtError(
                     f"{command}: lost track of the launch ({exc}); check the dashboard "
                     "before retrying"
                 ) from None
-            op = (listed.get(op["pr"]) or {}).get("operation") or op
 
     def on_worker(self) -> bool:
         """Whether this is a worker machine: provisioning marks it, and launches say so."""

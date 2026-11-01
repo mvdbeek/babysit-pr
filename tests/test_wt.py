@@ -2201,6 +2201,7 @@ def test_auto_starts_on_the_worker_the_dashboard_places_it_on(tmp_path, dashboar
         "task": "Fix it",
         "docker": True,
         "exit_when_done": True,
+        "permission_mode": "",
         "machine": "chonk",
     }
     # What the dashboard asks of a request that is not a browser's.
@@ -2250,7 +2251,7 @@ def test_a_named_worker_goes_straight_to_the_dashboard(tmp_path, dashboard):
         "chonk",
         False,
     )
-    assert "permission_mode" not in body
+    assert body["permission_mode"] == ""
     # Claude's auto permission mode goes along; Codex has none, as here.
     careful = options(prompt="go", positional=["feat"], permission_mode="auto")
     assert t.launch_elsewhere("wt", careful, "chonk") is True
@@ -2326,3 +2327,32 @@ def test_wt_docker_starts_on_the_docker_worker_end_to_end(repo, tmp_path, monkey
     run_tool("-r", "repo", "--docker", "--machine", "local", "-p", "again", "main", "other")
     assert dashboard.requests == []
     assert (home / "src/worktrees/repo/other").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("values", "slug", "message"),
+    [
+        ({"positional": ["main", "-x"]}, "base/repo", "branch name"),
+        ({"positional": ["main", "a/b"]}, "base/repo", "branch name"),
+        ({"positional": ["-main", "feat"]}, "base/repo", "base branch"),
+        ({"positional": ["a..b", "feat"]}, "base/repo", "base branch"),
+        ({"prompt": "   "}, "base/repo", "brief"),
+        ({"prompt": "x" * 32001}, "base/repo", "brief"),
+        ({"prompt": "a\0b"}, "base/repo", "brief"),
+        ({"claude_account": "-x"}, "base/repo", "Claude account"),
+        ({}, "base/..", "repository"),
+        ({}, "not-a-slug", "repository"),
+        ({"agent": "codex", "permission_mode": "auto"}, "base/repo", "for Claude only"),
+    ],
+)
+def test_a_launch_request_is_checked_before_any_transport_sees_it(values, slug, message):
+    parsed = options(**{"prompt": "go", "positional": ["main", "feat"], **values})
+    with pytest.raises(wt.WtError, match=re.escape(message)):
+        wt.launch_request("wt", parsed, slug, "chonk")
+    with pytest.raises(wt.WtError, match="invalid machine"):
+        wt.launch_request("wt", options(prompt="go", positional=["feat"]), "base/repo", "Chonk")
+    request = wt.launch_request(
+        "wt", options(prompt="go", positional=["feat"]), "base/repo", "auto"
+    )
+    assert tuple(request) == wt.LAUNCH_FIELDS
+    assert (request["base"], request["name"], request["machine"]) == ("feat", "feat", "auto")
