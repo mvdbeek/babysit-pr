@@ -373,8 +373,9 @@ def start(job, run_id, home, src):
     machine = machines.resolve(home, job["machine"], placing=True) if job.get("machine") else None
     if machine is None:
         return started(job, run_id, home, src, None)
-    # The job's prompt may name a skill: no run starts with the worker's copies stale.
-    skill_sync.ensure(home, machine)
+    # The job's prompt may name a skill, and nobody watches the run: none starts with the
+    # worker's copies stale or missing.
+    skill_sync.ensure(home, machine, job["agent"], job.get("claude_account") or None)
     real = probe(home, machine, "realpath", 30, path=job["clone"])["path"]
     with machines.clone_lock(home, machine, real).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

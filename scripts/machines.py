@@ -37,7 +37,8 @@ COMMAND = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 COLLIE_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # A personal skill a worker gets a copy of (skill_sync): a folder name in a skills folder.
 SKILL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-# claude.ai's own bucket, and babysit-pr, which a worker's deployed copy provides.
+# claude.ai's own bucket, and babysit-pr, which a worker's deployed copy provides, in any
+# case (macOS's file system does not tell them apart).
 RESERVED_SKILLS = {"synced", "babysit-pr"}
 MAX_SKILLS = 64
 OSES = {"darwin", "linux"}
@@ -232,7 +233,9 @@ def _machine(raw):
                 isinstance(machine.skills, list)
                 and len(machine.skills) <= MAX_SKILLS
                 and all(
-                    isinstance(x, str) and SKILL.fullmatch(x) and x not in RESERVED_SKILLS
+                    isinstance(x, str)
+                    and SKILL.fullmatch(x)
+                    and x.casefold() not in RESERVED_SKILLS
                     for x in machine.skills
                 )
                 and len(set(machine.skills)) == len(machine.skills)

@@ -1100,8 +1100,8 @@ worker too. List those skills in the worker's `"skills"` in `machines.json`: bef
 run, and every other launch there, the dashboard compares the worker's copies with this
 machine's `~/.claude/skills/<name>` and installs what differs into every Claude account,
 the default Claude configuration and Codex there. A run whose skills cannot be synced
-fails with the reason instead of starting without them. Skills the sync did not install
-are left alone. See Skills on workers in `references/supervisor.md`.
+fails with the reason instead of starting without them (a launch you start yourself goes
+ahead with a warning). Skills the sync did not install are left alone. See Skills on workers in `references/supervisor.md`.
 
 **Run outside Safehouse (can write anywhere)**, off by default, is for jobs that
 orchestrate work in other repositories, for example by making worktrees in other

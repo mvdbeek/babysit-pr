@@ -8,11 +8,18 @@ its babysit-pr, the worker's manifest (probe op ``skills_status``) is compared w
 a differing hash or a missing or changed copy there stages the bundle and installs it
 (``skills_install``) into every skills folder there. The probe runs this machine's own
 copy of ``remote_probe.py``, so what installs is never the worker's.
+
+The dashboard runs outside any sandbox, but agents here may write the skills it packs
+(Safehouse grants ``~/.claude`` and ``~/.codex``), so packing reads them as the worker
+reads its copies: through descriptors, following no link, refusing hard links, FIFOs
+and files that change while read.
 """
 
 import hashlib
 import io
+import os
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -26,8 +33,6 @@ import remote_probe
 SOURCE = "~/.claude/skills"
 # A launch burst reuses one packing; a skill edited meanwhile goes out after this.
 CACHE_SECONDS = 30
-# Left out of a bundle: caches and metadata that change without the skill changing.
-IGNORED = {".DS_Store", "__pycache__", ".git"}
 STAGE = remote_probe.SKILL_BUNDLES
 STATUS_TIMEOUT = 30
 STAGE_TIMEOUT = 120
@@ -42,28 +47,45 @@ _syncing: dict[str, threading.Lock] = {}
 _results: dict[str, dict] = {}
 
 
-def _entries(name, top):
-    """Skill ``name`` (at ``top``, its real folder) as tar entries, parents first."""
-    found = [(name, True, False, b"")]
+def _fd_path(fd):
+    """The path the kernel has for an open folder; None where it cannot tell."""
+    if sys.platform == "darwin":
+        import fcntl
 
-    def walk(folder, prefix):
-        for child in sorted(folder.iterdir(), key=lambda path: path.name):
-            if child.name in IGNORED:
-                continue
-            shown = f"{prefix}/{child.name}"
-            info = child.lstat()
-            if child.is_symlink():
-                raise ValueError(f"{shown} is a symbolic link; skills are synced without links")
-            if child.is_dir():
-                found.append((shown, True, False, b""))
-                walk(child, shown)
-            elif child.is_file():
-                found.append((shown, False, bool(info.st_mode & 0o100), child.read_bytes()))
-            else:
-                raise ValueError(f"{shown} is neither a folder nor a regular file")
+        named = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+        return os.fsdecode(named.split(b"\0", 1)[0])
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return None
 
-    walk(top, name)
-    return found
+
+def _read_skill(source, name):
+    """Skill ``name`` as tar entries, parents first; ValueError naming what is refused.
+
+    Its folder is the real path of ``source/name``, opened without following a link and
+    checked to be the folder that path names, so a link swapped in after it was resolved
+    is never followed; ``remote_probe.read_skill_tree`` reads the rest.
+    """
+    real = os.path.realpath(source / name)
+    try:
+        fd = os.open(real, remote_probe.NO_FOLLOW_DIR)
+    except OSError:
+        raise ValueError(f"No skill {name} in {source}") from None
+    try:
+        now = _fd_path(fd)
+        if now is not None and now != real:
+            raise ValueError(f"{source / name} moved while it was read")
+        entries = remote_probe.read_skill_tree(fd, str(source / name))
+    except OSError as exc:
+        raise ValueError(f"Cannot read {source / name}: {exc.strerror or exc}") from None
+    finally:
+        os.close(fd)
+    if ("SKILL.md", False) not in {(path, is_dir) for path, is_dir, *_ in entries}:
+        raise ValueError(f"{source / name} is not a skill folder with a SKILL.md")
+    return [(name, True, False, b"")] + [
+        (f"{name}/{path}", is_dir, executable, data) for path, is_dir, executable, data in entries
+    ]
 
 
 def pack(names, source=None):
@@ -75,14 +97,7 @@ def pack(names, source=None):
     source = Path(source or SOURCE).expanduser()
     entries = []
     for name in sorted(names):
-        try:
-            top = (source / name).resolve(strict=True)
-        except OSError:
-            raise ValueError(f"No skill {name} in {source}") from None
-        manual = top / "SKILL.md"
-        if not top.is_dir() or manual.is_symlink() or not manual.is_file():
-            raise ValueError(f"{source / name} is not a skill folder with a SKILL.md")
-        entries += _entries(name, top)
+        entries += _read_skill(source, name)
     if len(entries) > remote_probe.MAX_SKILL_ENTRIES:
         raise ValueError(f"The skills hold more than {remote_probe.MAX_SKILL_ENTRIES} entries")
     if sum(len(data) for *_, data in entries) > remote_probe.MAX_SKILL_BYTES:
@@ -121,6 +136,13 @@ def bundle(names, now=time.monotonic):
     return data, digest
 
 
+def root_key(agent, account=None):
+    """The worker's skills folder a launch reads (``remote_probe.SKILL_ROOT``)."""
+    if agent == "codex":
+        return "codex"
+    return "claude" if account in (None, "", "default") else f"claude:{account}"
+
+
 def _probe(home, m, op, timeout, **args):
     try:
         return remote_probe.call(home, m, op, timeout, **args)
@@ -130,21 +152,24 @@ def _probe(home, m, op, timeout, **args):
         raise ValueError(f"{m.label} could not be reached: {exc}") from exc
 
 
-def ensure(home, m):
+def ensure(home, m, agent=None, account=None):
     """Bring worker ``m``'s skills to this machine's; its answer, None without ``skills``.
 
-    Raises ValueError, naming the worker, when it cannot: a launch then fails rather
-    than run an agent whose skills are missing or stale.
+    Raises ValueError, naming the worker, when the sync fails, or when it leaves the
+    skills folder the launch reads (``agent`` and Claude ``account``) without the
+    bundle; another folder it could not write is only reported. Callers decide whether
+    that stops the launch.
     """
     if m is None or m.skills is None:
         return None
+    own = None if agent is None else root_key(agent, account)
     with _lock:
         syncing = _syncing.setdefault(m.id, threading.Lock())
     with syncing:
         try:
             data, digest = bundle(m.skills)
             state = _probe(home, m, "skills_status", STATUS_TIMEOUT)
-            if state["bundle"] != digest or state["stale"]:
+            if state["bundle"] != digest or any(state["roots"].values()):
                 staged = machines.put_file(
                     home,
                     m,
@@ -157,8 +182,12 @@ def ensure(home, m):
                 state = _probe(
                     home, m, "skills_install", INSTALL_TIMEOUT, path=staged, sha256=digest
                 )
-                if state["bundle"] != digest or state["stale"]:
-                    raise ValueError("; ".join(state["stale"][:3]) or "the bundle did not install")
+            if state["bundle"] != digest:
+                raise ValueError("the bundle did not install")
+            if own is not None and own not in state["roots"]:
+                raise ValueError(f"it has no skills folder for {own}")
+            if own is not None and state["roots"][own]:
+                raise ValueError(state["roots"][own])
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             error = f"Cannot sync skills to {m.label}: {exc}"
             with _lock:
@@ -172,7 +201,8 @@ def ensure(home, m):
 def status(m):
     """Worker ``m``'s skills as last seen, for the machine listing; None without ``skills``.
 
-    ``state`` is ``in_sync`` (its last answer has this machine's current bundle),
+    ``state`` is ``in_sync`` (its last answer has this machine's current bundle in every
+    skills folder), ``partial`` (some folders lack it: ``problems`` says why),
     ``out_of_date``, ``error`` (the last sync failed, or the skills cannot be packed
     here) or ``unknown`` (not checked since the dashboard started).
     """
@@ -180,9 +210,11 @@ def status(m):
         return None
     with _lock:
         last = dict(_results.get(m.id) or {})
+    problems = {key: said for key, said in (last.get("roots") or {}).items() if said}
     shown = {
         "state": "unknown",
         "error": last.get("error"),
+        "problems": problems,
         "skipped": last.get("skipped", []),
         "checked_at": last.get("checked_at"),
     }
@@ -193,6 +225,6 @@ def status(m):
     if last.get("error"):
         shown["state"] = "error"
     elif last:
-        current = last.get("bundle") == digest and not last.get("stale")
-        shown["state"] = "in_sync" if current else "out_of_date"
+        current = last.get("bundle") == digest
+        shown["state"] = "out_of_date" if not current else "partial" if problems else "in_sync"
     return shown

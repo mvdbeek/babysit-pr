@@ -1608,8 +1608,13 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
         raise ValueError(f"That session's Claude home is not an account on {machine.label}")
     # A worker's own paths, its probe's: the checkout's real one names its lock there.
     found = None
+    skills_warning = None
     if machine is not None:
-        skill_sync.ensure(home, machine)
+        try:
+            skill_sync.ensure(home, machine, chosen["agent"], chosen.get("claude_account"))
+        except ValueError as exc:
+            # A person resumes a conversation in view: warned, it goes ahead.
+            skills_warning = f"{exc}; the session resumed with the skills it had."
         found = remote_resume(home, machine, root, chosen)
         root = found["path"]
     real = os.path.realpath(root) if machine is None else root
@@ -1634,7 +1639,7 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
             # Already running in another workspace: talk to that agent, never a second one.
             if not text:
                 raise ValueError(f"This session is already running in {elsewhere['pane']}")
-            return prompt(elsewhere, text, machine)
+            return warned(prompt(elsewhere, text, machine), skills_warning)
         # A session resumes from the directory it was recorded in (Claude looks its ID up
         # in that directory's project folder).
         if found is None:
@@ -1687,29 +1692,42 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
                 "--no-focus",
                 machine=machine,
             )
-            return launch(
+            return warned(
+                launch(
+                    workspace_id,
+                    chosen,
+                    pane_id(split["pane"]["pane_id"], machine),
+                    text,
+                    home,
+                    worktree=root,
+                    machine=machine,
+                    found=found,
+                    mark=True,
+                ),
+                skills_warning,
+            )
+        # A reopened workspace's shell starts in the checkout, not the session's directory.
+        return warned(
+            launch(
                 workspace_id,
                 chosen,
-                pane_id(split["pane"]["pane_id"], machine),
+                pane,
                 text,
                 home,
+                cwd=None if cwd == root else cwd,
                 worktree=root,
                 machine=machine,
                 found=found,
-                mark=True,
-            )
-        # A reopened workspace's shell starts in the checkout, not the session's directory.
-        return launch(
-            workspace_id,
-            chosen,
-            pane,
-            text,
-            home,
-            cwd=None if cwd == root else cwd,
-            worktree=root,
-            machine=machine,
-            found=found,
+            ),
+            skills_warning,
         )
+
+
+def warned(result, warning):
+    """``result`` with ``warning`` ahead of its own."""
+    if not warning:
+        return result
+    return {**result, "warning": " ".join(filter(None, [warning, result.get("warning")]))}
 
 
 @contextlib.contextmanager

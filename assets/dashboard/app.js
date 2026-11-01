@@ -2164,11 +2164,12 @@ function skillsText(skills) {
   if (!skills) return "";
   const states = {
     in_sync: "Skills in sync",
+    partial: "Skills in sync except:",
     out_of_date: "Skills out of date; the next launch syncs them",
     unknown: "Skills not checked yet; the next launch syncs them",
   };
   const text = skills.state === "error" ? skills.error : states[skills.state];
-  return [text, ...(skills.skipped ?? [])].join("\n");
+  return [text, ...Object.values(skills.problems ?? {}), ...(skills.skipped ?? [])].join("\n");
 }
 // Health and capacity beside the Workspaces heading.
 function renderMachines() {
@@ -3780,7 +3781,8 @@ function updateWorkspaceOperation() {
   $("workspace-progress").textContent =
     `${op.status}: ${op.message}` +
     (op.machine ? ` · On ${machineName(op.machine)}` : "") +
-    (op.started_by ? ` · ${op.started_by}` : "");
+    (op.started_by ? ` · ${op.started_by}` : "") +
+    (op.skills_warning ? ` · ${op.skills_warning}` : "");
   $("workspace-log").textContent = op.log || "";
   if (op.status === "failed" && op.stale_worker)
     $("workspace-result").replaceChildren(...workerUpdateNotice(op.stale_worker));

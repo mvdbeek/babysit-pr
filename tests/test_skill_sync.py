@@ -5,9 +5,12 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tarfile
+import threading
+import time
 from pathlib import Path
 
 import agent_messages
@@ -15,6 +18,7 @@ import cron_agents
 import machines
 import pytest
 import remote_probe
+import remote_repair
 import skill_sync
 from test_new_tasks import request as new_request  # noqa: F401
 from test_pr_workspaces import finish, local  # noqa: F401 (fixture)
@@ -199,26 +203,60 @@ def test_skills_holding_anything_but_folders_and_files_are_refused(skills, tmp_p
     with pytest.raises(ValueError, match="not a skill folder with a SKILL.md"):
         skill_sync.pack(["plain"])
     (skills / "plain" / "SKILL.md").symlink_to(skills / "merge-forward" / "SKILL.md")
-    with pytest.raises(ValueError, match="not a skill folder with a SKILL.md"):
+    with pytest.raises(ValueError, match="plain/SKILL.md is a symbolic link"):
         skill_sync.pack(["plain"])
     (skills / "merge-forward" / "secret").symlink_to(tmp_path / "secret")
     with pytest.raises(ValueError, match="merge-forward/secret is a symbolic link"):
         skill_sync.pack(["merge-forward"])
     (skills / "merge-forward" / "secret").unlink()
+    # A FIFO is refused, never waited on.
     os.mkfifo(skills / "merge-forward" / "pipe")
     with pytest.raises(ValueError, match="merge-forward/pipe is neither a folder nor a regular"):
         skill_sync.pack(["merge-forward"])
     (skills / "merge-forward" / "pipe").unlink()
+    # A hard link could name any file of this user's.
+    token = tmp_path / "token"
+    token.write_text("secret\n")
+    os.link(token, skills / "merge-forward" / "token")
+    with pytest.raises(ValueError, match="merge-forward/token has other names"):
+        skill_sync.pack(["merge-forward"])
+    (skills / "merge-forward" / "token").unlink()
     (skills / "merge-forward" / "bad\x1bname").write_text("x")
     with pytest.raises(ValueError, match="Refusing skill bundle entry"):
         skill_sync.pack(["merge-forward"])
 
 
-def test_skills_over_the_size_limit_are_refused(skills, monkeypatch):
+def test_a_skill_folder_swapped_after_it_was_resolved_is_refused(skills, monkeypatch):
+    monkeypatch.setattr(skill_sync, "_fd_path", lambda fd: "/Users/someone/.ssh")
+    with pytest.raises(ValueError, match="merge-forward moved while it was read"):
+        skill_sync.pack(["merge-forward"])
+
+
+def test_the_folder_packed_is_the_one_its_path_names(skills):
+    # The real path, as the kernel reports the descriptor: nothing moved, nothing refused.
+    fd = os.open(os.path.realpath(skills / "wt-task"), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert skill_sync._fd_path(fd) == os.path.realpath(skills / "wt-task")
+    finally:
+        os.close(fd)
+
+
+def test_skills_over_the_size_limit_are_refused_before_they_are_read(skills, monkeypatch):
     monkeypatch.setattr(remote_probe, "MAX_SKILL_BYTES", 64)
     (skills / "merge-forward" / "big").write_bytes(b"x" * 65)
-    with pytest.raises(ValueError, match="exceed 64 bytes"):
+    read = []
+    real_open = os.open
+
+    def opened(path, *args, **kwargs):
+        read.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", opened)
+    with pytest.raises(ValueError, match="merge-forward exceeds 64 bytes"):
         skill_sync.pack(["merge-forward"])
+    assert "big" not in read
+    monkeypatch.setattr(os, "open", real_open)
+    (skills / "merge-forward" / "big").unlink()
     monkeypatch.setattr(remote_probe, "MAX_SKILL_ENTRIES", 3)
     with pytest.raises(ValueError, match="more than 3 entries"):
         skill_sync.pack(["merge-forward"])
@@ -248,6 +286,8 @@ def test_skills_over_the_size_limit_are_refused(skills, monkeypatch):
         ([file("s/SKILL.md")], "comes before its folder"),
         ([file("loose")], "not a skill folder"),
         ([folder("synced"), file("synced/SKILL.md")], "not a skill folder"),
+        ([folder("Synced"), file("Synced/SKILL.md")], "not a skill folder"),
+        ([folder("BABYSIT-PR"), file("BABYSIT-PR/SKILL.md")], "not a skill folder"),
         ([folder("s"), file("s/notes.md")], "Skill s has no SKILL.md"),
         ([folder("s"), folder("s/SKILL.md")], "Skill s has no SKILL.md"),
     ],
@@ -264,11 +304,13 @@ def test_a_bundle_that_is_no_tar_is_refused():
 
 # The worker's install -----------------------------------------------------------------
 
+ROOT_KEYS = {"claude": None, "claude:oss": None, "claude:psu": None, "codex": None}
+
 
 def test_a_worker_gets_the_skills_in_every_skills_folder(skills, worker_home):
     data, digest = skill_sync.pack(["merge-forward", "wt-task"])
-    assert status() == {"bundle": None, "stale": [], "skipped": []}
-    assert install(worker_home, data) == {"bundle": digest, "stale": [], "skipped": []}
+    assert status() == {"bundle": None, "roots": ROOT_KEYS, "skipped": []}
+    assert install(worker_home, data) == {"bundle": digest, "roots": ROOT_KEYS, "skipped": []}
     for root in ROOTS:
         copy = worker_home / root
         assert stat.S_IMODE(copy.stat().st_mode) == 0o700
@@ -290,18 +332,31 @@ def test_a_worker_gets_the_skills_in_every_skills_folder(skills, worker_home):
     assert not list((worker_home / ".local/state/babysit-pr/skill-bundles").iterdir())
 
 
+def test_codex_home_is_where_codex_reads_its_skills(skills, worker_home, monkeypatch):
+    codex = worker_home / "codex-home"
+    codex.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    data, _ = skill_sync.pack(["wt-task"])
+    assert install(worker_home, data)["roots"]["codex"] is None
+    assert (codex / "skills/wt-task/SKILL.md").exists()
+    assert not (worker_home / ".codex/skills").exists()
+
+
 def test_a_changed_or_missing_copy_is_stale_and_put_back(skills, worker_home):
     data, digest = skill_sync.pack(["merge-forward"])
     install(worker_home, data)
     hop = worker_home / ".claude/accounts/oss/skills/merge-forward/scripts/hop.sh"
     hop.write_text("#!/bin/sh\necho tampered\n")
     (worker_home / ".codex/skills/merge-forward/SKILL.md").chmod(0o700)
-    stale = status()["stale"]
-    assert len(stale) == 2 and all("merge-forward is missing or changed" in s for s in stale)
+    roots = status()["roots"]
+    assert roots["claude:oss"].endswith("oss/skills/merge-forward was changed")
+    assert roots["codex"].endswith(".codex/skills/merge-forward was changed")
+    assert roots["claude"] is None and roots["claude:psu"] is None
     # A new account has none yet.
     (worker_home / ".claude/accounts/work").mkdir()
-    assert any(s.endswith("work/skills/merge-forward is missing") for s in status()["stale"])
-    assert install(worker_home, data) == {"bundle": digest, "stale": [], "skipped": []}
+    assert status()["roots"]["claude:work"].endswith("work/skills/merge-forward is missing")
+    answer = install(worker_home, data)
+    assert answer["bundle"] == digest and not any(answer["roots"].values())
     assert hop.read_text() == "#!/bin/sh\necho hop\n"
     assert (worker_home / ".claude/accounts/work/skills/merge-forward/SKILL.md").exists()
 
@@ -316,7 +371,7 @@ def test_a_skill_the_sync_did_not_make_is_left_alone(skills, worker_home):
     (worker_home / ".codex/skills/wt-task").symlink_to(elsewhere)
     data, digest = skill_sync.pack(["merge-forward", "wt-task"])
     answer = install(worker_home, data)
-    assert answer["bundle"] == digest and answer["stale"] == []
+    assert answer["bundle"] == digest and not any(answer["roots"].values())
     real = worker_home.resolve()
     assert sorted(answer["skipped"]) == [
         f"{real}/.claude/accounts/psu/skills/wt-task is not babysit's copy; left alone",
@@ -325,8 +380,8 @@ def test_a_skill_the_sync_did_not_make_is_left_alone(skills, worker_home):
     assert (own / "SKILL.md").read_text() == "mine\n"
     assert (worker_home / ".codex/skills/wt-task").is_symlink() and not list(elsewhere.iterdir())
     assert (worker_home / ".codex/skills/merge-forward/SKILL.md").exists()
-    # Reported, not stale: a launch is not held up by it.
-    assert status()["stale"] == [] and len(status()["skipped"]) == 2
+    # Reported, not a problem: a launch is not held up by it.
+    assert not any(status()["roots"].values()) and len(status()["skipped"]) == 2
     # Dropping the skill removes only the copies the sync made.
     data, _ = skill_sync.pack(["merge-forward"])
     install(worker_home, data)
@@ -335,7 +390,7 @@ def test_a_skill_the_sync_did_not_make_is_left_alone(skills, worker_home):
     assert not (worker_home / ".claude/accounts/oss/skills/wt-task").exists()
     assert not (worker_home / ".claude/skills/wt-task").exists()
     data, _ = skill_sync.pack([])
-    assert install(worker_home, data)["stale"] == []
+    assert not any(install(worker_home, data)["roots"].values())
     assert not (worker_home / ".claude/skills/merge-forward").exists()
     assert manifest(worker_home)["roots"] == {}
 
@@ -349,14 +404,31 @@ def test_linked_skills_folders_and_accounts_are_never_followed(skills, worker_ho
     (worker_home / ".claude/accounts/linked").symlink_to(account)
     data, digest = skill_sync.pack(["merge-forward"])
     answer = install(worker_home, data)
-    assert answer["bundle"] == digest and answer["stale"] == []
     accounts = (worker_home / ".claude/accounts").resolve()
-    assert sorted(answer["skipped"]) == [
-        f"{accounts}/linked is a symbolic link; its skills are left alone",
-        f"{accounts}/oss/skills is a symbolic link or no folder; left alone",
-    ]
+    assert answer["bundle"] == digest
+    assert answer["roots"]["claude:oss"] == (
+        f"{accounts}/oss/skills is a symbolic link or no folder; left alone"
+    )
+    assert "claude:linked" not in answer["roots"]
+    assert answer["skipped"] == [f"{accounts}/linked is a symbolic link; its skills are left alone"]
     assert not list(target.iterdir()) and not list(account.iterdir())
     assert (worker_home / ".claude/accounts/psu/skills/merge-forward/SKILL.md").exists()
+
+
+def test_an_unwritable_skills_folder_says_why(skills, worker_home):
+    psu = worker_home / ".claude/accounts/psu"
+    psu.chmod(0o500)
+    try:
+        data, digest = skill_sync.pack(["merge-forward"])
+        answer = install(worker_home, data)
+        assert answer["bundle"] == digest
+        assert (
+            answer["roots"]["claude:psu"]
+            == f"Cannot open {psu.resolve()}/skills: Permission denied"
+        )
+        assert answer["roots"]["claude:oss"] is None
+    finally:
+        psu.chmod(0o700)
 
 
 def test_a_sync_interrupted_midway_is_cleaned_up_by_the_next(skills, worker_home):
@@ -365,6 +437,90 @@ def test_a_sync_interrupted_midway_is_cleaned_up_by_the_next(skills, worker_home
     (leftover / "half").mkdir(parents=True)
     assert install(worker_home, data)["bundle"] == digest
     assert not leftover.exists()
+
+
+def test_an_install_cut_short_before_its_manifest_is_finished_by_the_next(
+    skills, worker_home, monkeypatch
+):
+    data, _ = skill_sync.pack(["merge-forward"])
+    writes = []
+    real = remote_probe._write_skill_manifest
+
+    def cut(manifest):
+        writes.append(manifest)
+        if len(writes) == 2:
+            raise OSError("killed")  # After the swaps, before the bundle is recorded.
+        real(manifest)
+
+    monkeypatch.setattr(remote_probe, "_write_skill_manifest", cut)
+    with pytest.raises(OSError, match="killed"):
+        install(worker_home, data)
+    monkeypatch.setattr(remote_probe, "_write_skill_manifest", real)
+    # Every name it touched is recorded, and no bundle, so the next launch installs again.
+    assert manifest(worker_home)["bundle"] is None
+    assert (worker_home / ".codex/skills/merge-forward/SKILL.md").exists()
+    (skills / "merge-forward" / "SKILL.md").write_text("changed\n")
+    data, digest = skill_sync.pack(["merge-forward"])
+    answer = install(worker_home, data)
+    assert answer["bundle"] == digest and not any(answer["roots"].values())
+    assert answer["skipped"] == []
+    for root in ROOTS:
+        assert (worker_home / root / "merge-forward/SKILL.md").read_text() == "changed\n"
+
+
+def test_an_unrecorded_copy_of_the_bundle_is_adopted(skills, worker_home):
+    data, digest = skill_sync.pack(["merge-forward"])
+    install(worker_home, data)
+    (worker_home / ".local/state/babysit-pr/skills.json").unlink()
+    remote_probe._write_skill_manifest(
+        {"version": 1, "bundle": digest, "skills": manifest_digests(data), "roots": {}}
+    )
+    roots = status()["roots"]
+    assert all(said.endswith("merge-forward is not recorded yet") for said in roots.values())
+    assert not any(install(worker_home, data)["roots"].values())
+    assert len(manifest(worker_home)["roots"]) == len(ROOTS)
+
+
+def manifest_digests(data):
+    skills = remote_probe.skill_entries(data)
+    return {name: remote_probe.skill_digest(entries) for name, entries in skills.items()}
+
+
+def test_concurrent_installs_take_turns(skills, worker_home):
+    first, _ = skill_sync.pack(["merge-forward"])
+    second, digest = skill_sync.pack(["merge-forward", "wt-task"])
+    paths = [stage(worker_home, first), stage(worker_home, second)]
+    errors = []
+
+    def run(path, data):
+        try:
+            remote_probe._host_skills_install(path, hashlib.sha256(data).hexdigest())
+        except Exception as exc:  # noqa: BLE001 (reported below)
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run, args=(paths[0], first)),
+        threading.Thread(target=run, args=(paths[1], second)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    # Whichever went last, its bundle is whole everywhere and nothing is left half done.
+    state = status()
+    assert state["bundle"] in {hashlib.sha256(first).hexdigest(), digest}
+    assert not any(state["roots"].values())
+    for root in ROOTS:
+        assert not [p for p in (worker_home / root).iterdir() if p.name.startswith(".")]
+
+
+def test_manifest_records_of_folders_gone_are_dropped(skills, worker_home):
+    data, _ = skill_sync.pack(["merge-forward"])
+    install(worker_home, data)
+    shutil.rmtree(worker_home / ".claude/accounts/psu")
+    install(worker_home, data)
+    assert not [root for root in manifest(worker_home)["roots"] if "/psu/" in root]
 
 
 def test_a_bundle_is_taken_only_from_its_staging_folder_and_by_its_hash(skills, worker_home):
@@ -399,10 +555,12 @@ def test_a_damaged_manifest_stops_the_sync(skills, worker_home):
 @pytest.mark.parametrize(
     "answer",
     [
-        {"bundle": "main", "stale": [], "skipped": []},
-        {"bundle": None, "stale": ["a\x1b[2Jb"], "skipped": []},
-        {"bundle": None, "stale": [], "skipped": ["x"] * 33},
-        {"bundle": None, "stale": []},
+        {"bundle": "main", "roots": {}, "skipped": []},
+        {"bundle": None, "roots": {"codex": "a\x1b[2Jb"}, "skipped": []},
+        {"bundle": None, "roots": {"claude:../x": None}, "skipped": []},
+        {"bundle": None, "roots": {"elsewhere": None}, "skipped": []},
+        {"bundle": None, "roots": {}, "skipped": ["x"] * 33},
+        {"bundle": None, "roots": {}},
     ],
 )
 def test_a_malformed_skills_answer_is_refused(answer):
@@ -442,11 +600,11 @@ def test_a_worker_is_synced_only_when_its_skills_differ(skills, worker_home, in_
     m = machines.load(controller)["chonk"]
     assert skill_sync.status(m)["state"] == "unknown"
     _, digest = skill_sync.bundle(m.skills)
-    assert skill_sync.ensure(controller, m)["bundle"] == digest
+    assert skill_sync.ensure(controller, m, "claude", "oss")["bundle"] == digest
     assert calls == ["skills_status", "put_file", "skills_install"]
     assert skill_sync.status(m)["state"] == "in_sync"
     calls.clear()
-    skill_sync.ensure(controller, m)
+    skill_sync.ensure(controller, m, "codex")
     assert calls == ["skills_status"]
     # A skill edited here goes out once the packing is due again.
     (skills / "merge-forward" / "SKILL.md").write_text("new\n")
@@ -459,6 +617,31 @@ def test_a_worker_is_synced_only_when_its_skills_differ(skills, worker_home, in_
     plain = m._replace(skills=None)
     assert skill_sync.ensure(controller, plain) is None and skill_sync.status(plain) is None
     assert calls == []
+
+
+def test_only_the_launchs_own_unwritable_folder_stops_it(skills, worker_home, in_process):
+    controller, _ = in_process
+    write(controller, skills=["merge-forward"])
+    m = machines.load(controller)["chonk"]
+    psu = worker_home / ".claude/accounts/psu"
+    psu.chmod(0o500)
+    try:
+        # Another account's folder is reported, not fatal.
+        skill_sync.ensure(controller, m, "claude", "oss")
+        shown = skill_sync.status(m)
+        assert shown["state"] == "partial"
+        assert shown["problems"] == {
+            "claude:psu": f"Cannot open {psu.resolve()}/skills: Permission denied"
+        }
+        with pytest.raises(
+            ValueError,
+            match="^Cannot sync skills to chonk: Cannot open .*psu/skills: Permission denied$",
+        ):
+            skill_sync.ensure(controller, m, "claude", "psu")
+        with pytest.raises(ValueError, match="has no skills folder for claude:gone"):
+            skill_sync.ensure(controller, m, "claude", "gone")
+    finally:
+        psu.chmod(0o700)
 
 
 def test_a_sync_that_cannot_happen_says_why(skills, worker_home, in_process, monkeypatch):
@@ -484,31 +667,72 @@ def test_a_worker_cron_run_syncs_skills_before_anything_else(tmp_path, monkeypat
     write(tmp_path, skills=["merge-forward"])
     asked = []
 
-    def ensure(home, m):
-        asked.append(m.id)
+    def ensure(home, m, agent=None, account=None):
+        asked.append((m.id, agent, account))
         raise ValueError("Cannot sync skills to chonk: no")
 
     monkeypatch.setattr(skill_sync, "ensure", ensure)
     monkeypatch.setattr(cron_agents, "probe", lambda *a, **k: pytest.fail("probed"))
+    job = {"machine": "chonk", "agent": "claude", "claude_account": "oss"}
     with pytest.raises(ValueError, match="Cannot sync skills to chonk"):
-        cron_agents.start({"machine": "chonk"}, 1, tmp_path, tmp_path)
-    assert asked == ["chonk"]
+        cron_agents.start(job, 1, tmp_path, tmp_path)
+    assert asked == [("chonk", "claude", "oss")]
 
 
-def test_a_resume_on_a_worker_syncs_skills_first(tmp_path, monkeypatch):
+def test_a_resume_on_a_worker_warns_when_its_skills_cannot_sync(tmp_path, monkeypatch):
     write(tmp_path, skills=["merge-forward"])
     m = machines.load(tmp_path)["chonk"]
     session = "0" * 8 + "-0000-0000-0000-" + "0" * 12
     chosen = {"id": session, "agent": "codex", "_cwd": "/w"}
     monkeypatch.setattr(agent_messages, "recorded", lambda root, home, machine: [chosen])
 
-    def ensure(home, machine):
+    def ensure(home, machine, agent=None, account=None):
         raise ValueError(f"Cannot sync skills to {machine.label}: no")
 
+    class Resumed(Exception):
+        pass
+
+    def remote_resume(*args):
+        raise Resumed  # It goes ahead.
+
     monkeypatch.setattr(skill_sync, "ensure", ensure)
-    monkeypatch.setattr(agent_messages, "remote_resume", lambda *a: pytest.fail("resumed"))
-    with pytest.raises(ValueError, match="Cannot sync skills to chonk"):
+    monkeypatch.setattr(agent_messages, "remote_resume", remote_resume)
+    with pytest.raises(Resumed):
         agent_messages.resume("w1", session, "go on", tmp_path, root="/w", machine=m)
+    shown = agent_messages.warned({"sent": True, "warning": "Not confirmed yet."}, "Skills: no.")
+    assert shown["warning"] == "Skills: no. Not confirmed yet."
+    assert agent_messages.warned({"warning": None}, None) == {"warning": None}
+
+
+def test_a_repair_on_a_worker_syncs_skills_and_goes_ahead(tmp_path, monkeypatch):
+    write(tmp_path, skills=["merge-forward"])
+    asked = []
+
+    def ensure(home, m, agent=None, account=None):
+        asked.append((agent, account))
+        raise ValueError("Cannot sync skills to chonk: no")
+
+    class Staged(Exception):
+        pass
+
+    def put_file(*args, **kwargs):
+        raise Staged
+
+    monkeypatch.setattr(skill_sync, "ensure", ensure)
+    monkeypatch.setattr(remote_repair, "check_version", lambda home, worker: None)
+    monkeypatch.setattr(machines, "put_file", put_file)
+    folder = tmp_path / "run"
+    folder.mkdir()
+    job = {
+        "machine": "chonk",
+        "agent": "claude",
+        "claude_config_dir": "/home/babysit/.claude/accounts/psu",
+    }
+    with pytest.raises(Staged):
+        remote_repair.run(tmp_path, job, folder, {"head_branch": "b", "head_sha": "0" * 40}, "go")
+    assert asked == [("claude", "psu")]
+    assert "Cannot sync skills to chonk: no" in (folder / "worker.log").read_text()
+    assert remote_repair.config_account("/home/babysit/.claude") is None
 
 
 def test_a_review_on_a_worker_brings_its_skills_first(remote, skills):  # noqa: F811
@@ -518,6 +742,7 @@ def test_a_review_on_a_worker_brings_its_skills_first(remote, skills):  # noqa: 
     manager.action({"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"})
     op = finish(manager, pr["id"])
     assert op["status"] == "complete", op
+    assert "skills_warning" not in op
     for root in (".claude/skills", ".claude/accounts/oss/skills", ".codex/skills"):
         assert (worker / root / "wt-task" / "SKILL.md").read_text().endswith("Hand off.\n")
     machine = next(m for m in manager.machine_list() if m["id"] == "mini")
@@ -528,13 +753,26 @@ def test_a_review_on_a_worker_brings_its_skills_first(remote, skills):  # noqa: 
     assert staged < next(i for i, c in enumerate(commands) if "wt.py" in c)
 
 
-def test_a_review_whose_skills_cannot_sync_never_starts(remote, skills):  # noqa: F811
+def test_a_review_a_person_starts_warns_when_its_skills_cannot_sync(remote, skills):  # noqa: F811
     manager, pr, state, worker = remote
     register(manager.home, skills=["gone"])
     manager.action({"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"})
     op = finish(manager, pr["id"])
+    assert op["status"] == "complete", op
+    assert op["skills_warning"].startswith("Cannot sync skills to Mac mini: No skill gone in")
+    machine = next(m for m in manager.machine_list() if m["id"] == "mini")
+    assert machine["skills"]["state"] == "error"
+
+
+def test_a_scheduled_review_whose_skills_cannot_sync_never_starts(remote, skills):  # noqa: F811
+    manager, pr, state, worker = remote
+    register(manager.home, skills=["gone"])
+    manager.overview.value["synced_at"] = time.time()
+    start = time.time() + 3600
+    request = {"id": pr["id"], "action": "handle", "task": "Later", "machine": "mini"}
+    manager.action({**request, "start_at": start})
+    manager.run_due(now=start)
+    op = finish(manager, pr["id"])
     assert op["status"] == "failed"
     assert op["message"].startswith("Cannot sync skills to Mac mini: No skill gone in")
     assert not [c for c in remote_commands(state) if "wt.py" in c]
-    machine = next(m for m in manager.machine_list() if m["id"] == "mini")
-    assert machine["skills"]["state"] == "error"

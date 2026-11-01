@@ -3082,7 +3082,8 @@ class Workspaces:
         exit watch of the agent it typed, which is recorded here with the machine. The
         checkout and agent are verified through probe ops and the worker's herdr: nothing
         on this machine reads a worker's paths. The worker's skills are brought to this
-        machine's first (``skill_sync``).
+        machine's first (``skill_sync``): a failure stops a scheduled launch or a sub-task,
+        and is a warning on the operation of one a person started.
         """
         import cron_agents
 
@@ -3112,7 +3113,14 @@ class Workspaces:
                     )
                 if machine.skills is not None:
                     self.save_operation(op, message=f"Syncing skills to {machine.label}")
-                    skill_sync.ensure(self.home, machine)
+                    try:
+                        skill_sync.ensure(self.home, machine, op["agent"], op.get("claude_account"))
+                    except ValueError as exc:
+                        # Nobody watches a scheduled launch or a sub-task start; a person
+                        # who started one sees the warning and can stop the agent.
+                        if op.get("exit_marker") or op.get("parent"):
+                            raise
+                        self.save_operation(op, skills_warning=str(exc))
                 owner, repo = pr["repo"].split("/")
                 scratch = is_scratch(pr)
                 if scratch:

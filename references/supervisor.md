@@ -1001,48 +1001,78 @@ enabled worker's worktrees read-only (see the workspaces reference).
 A worker with `skills` gets this machine's copy of each, from this user's
 `~/.claude/skills/<name>` (a top-level link, as chezmoi makes, is followed; the folder
 must hold a `SKILL.md`). `scripts/skill_sync.py` packs them into one tar of folders and
-regular files only (a link, FIFO or device inside a skill refuses the whole bundle;
-`.DS_Store`, `__pycache__` and `.git` are left out), sorted, dated 1970, owned by nobody
-and keeping only the executable bit, so the same skills always give the same bytes; at
-most 8 MiB of files and 2000 entries. Its SHA-256 is the bundle's version, and a packing
-is reused for 30 s, so a burst of launches packs once.
+regular files only, sorted, dated 1970, owned by nobody and keeping only the executable
+bit, so the same skills always give the same bytes; at most 8 MiB of files and 2000
+entries. `.DS_Store`, `__pycache__` and `.git` are left out. The dashboard runs outside
+any sandbox, but agents here may write these folders (Safehouse grants `~/.claude` and
+`~/.codex`), so a skill is read as the worker reads its copies: its folder is opened by
+its real path without following a link and checked to be the folder that path names
+(`F_GETPATH` on macOS, `/proc/self/fd` on Linux), everything below it through
+descriptors relative to its parent; a link, FIFO, device, file with other names (a hard
+link) or file that grew while it was read refuses the whole bundle, and the limits are
+checked before a file is read. The bundle's SHA-256 is its version, and a packing is
+reused for 30 s, so a burst of launches packs once.
 
 Before every launch on such a worker (a scheduled launch or cron run, Handle, Create, a
-new task, batch review, a resume) and after **Update <worker>** deploys, the dashboard
-asks the worker (probe op `skills_status`) for the bundle its manifest records and
-whether every copy it manages is still that bundle's. Only when either differs does it
-stage the bundle in `~/.local/state/babysit-pr/skill-bundles/` there (`machines.put_file`)
-and install it (probe op `skills_install`). The probe is this machine's
-`remote_probe.py`, as for every op, so what installs never depends on the worker's
-deployed copy. A sync that fails (a skill missing here, the worker unreachable, an install
-error) fails the launch, with the reason: an unattended agent told to run `/merge-forward`
-without it, or with last week's copy, would improvise rather than stop. Workers without
-`skills` are never asked.
+new task, batch review, a sub-task, a resume, a watch's repair there) and after
+**Update <worker>** deploys, the dashboard asks the worker (probe op `skills_status`)
+for the bundle its manifest records and, for each skills folder, whether it still holds
+that bundle's copies. Only when the bundle differs or a folder does not does it stage the
+bundle in `~/.local/state/babysit-pr/skill-bundles/` there (`machines.put_file`) and
+install it (probe op `skills_install`). The probe is this machine's `remote_probe.py`, as
+for every op, so what installs never depends on the worker's deployed copy. Workers
+without `skills` are never asked.
+
+A sync fails when it cannot run (a skill missing or refused here, the worker unreachable,
+the install refused) or leaves the skills folder the launch's own agent reads (its Claude
+account's, the default one's or Codex's) without the bundle, with the reason the worker
+gave (`Permission denied`, say). Other folders it could not write are reported, not a
+failure. A failed sync stops cron runs, scheduled launches and sub-tasks: nobody watches
+those start, and an agent told to run `/merge-forward` without it, or with last week's
+copy, would improvise rather than stop. A launch a person starts (Handle, Create, a new
+task) and a resume go ahead with the reason shown on the operation or the resume's
+warning, where that person can stop the agent; a repair goes ahead with it in the run's
+`worker.log`, since it needs only babysit-pr's own skill.
 
 The install takes the staged file only from that folder, removes it whatever it holds,
 checks its SHA-256, and checks every entry again (no absolute path, `..`, control
 character, link or device; each skill's folder before its contents, with a `SKILL.md`;
-the same limits). Its targets are every Claude account's `~/.claude/accounts/<name>/skills`,
-the default configuration's `~/.claude/skills` and Codex's `$CODEX_HOME/skills` (or
-`~/.codex/skills`): babysit-bwrap binds an account's `skills` read-only and refuses a
-link there, and a link inside it to `~/.claude/skills` would dangle in the sandbox, so
-each gets real folders. A missing `skills` folder is made private (0700). `~/.claude`
-and Codex's home may be links a dotfile manager made; nothing below them is followed,
-since a default-account agent can write all of `~/.claude`: an account folder or
-`skills` folder that is a link is left alone and reported, and every file is created and
-renamed relative to opened folders, without following links. Each skill is written as a
-new private copy beside the old one and swapped in by rename (the old copy renamed aside
-first, then removed), so a reader sees one whole copy or the other; a copy that already
-matches is left as it is. Leftovers of an interrupted sync (`.babysit-skill-*`) go first.
+`synced` and `babysit-pr` refused in any case; the same limits). Its targets are every
+Claude account's `~/.claude/accounts/<name>/skills`, the default configuration's
+`~/.claude/skills` and Codex's `$CODEX_HOME/skills` (or `~/.codex/skills`):
+babysit-bwrap binds an account's `skills` read-only and refuses a link there, and a link
+inside it to `~/.claude/skills` would dangle in the sandbox, so each gets real folders.
+A missing `skills` folder is made private (0700). `~/.claude` and Codex's home may be
+links a dotfile manager made; nothing below them is followed. babysit-bwrap binds a
+Claude configuration writable with only its own code (`skills` among it) read-only, and
+the default account's configuration is all of `~/.claude`, so a default-account agent can
+write every other account's folder, `skills` included (and on a Mac worker Safehouse may
+grant `~/.claude` and `~/.codex`): an account folder or `skills` folder that is a link is
+left alone and reported, and every file is created and renamed relative to opened
+folders, without following links. Each skill is written as a new private copy beside the
+old one; on Linux the two are exchanged in one step (`renameat2` with
+`RENAME_EXCHANGE`), so a reader sees one whole copy or the other, and elsewhere (or on a
+kernel without it) the old copy is renamed aside and the new one renamed in, leaving the
+name missing for that moment. The old copy is then removed; a copy that already matches is
+left as it is. Leftovers of an interrupted sync (`.babysit-skill-*`) go first.
 
 `~/.local/state/babysit-pr/skills.json` there, in the state directory no sandbox can
 write, records the bundle, each skill's content digest and, per skills folder, the
-skills the sync put there. Only those are ever replaced or removed: a folder or link of
-the same name that it did not make is left alone and reported, and skills dropped from
-`skills` are removed only where it put them. `skills_status` digests the installed copies
-again, so a copy an agent or a person changed is reinstalled at the next launch; a damaged
-manifest stops the sync until it is moved aside. A folder left alone or one it could not
-write is reported, not a failure. `GET /api/machines` gives each worker's `skills` as last
-seen (`state`: `in_sync`, `out_of_date`, `error` with `error`, or `unknown` before the
-first check since the dashboard started; `skipped` lists folders left alone), and the
-Workspaces machine badge shows it in its tooltip.
+skills the sync put there. Only those are ever replaced or removed, plus names that are
+free or already hold exactly the bundle's copy, which it adopts: a folder or link of the
+same name that it did not make is left alone and reported, and skills dropped from
+`skills` are removed only where it put them. Before swapping anything the install records
+every name it may touch, with no bundle, so an install cut short (killed, or failing to
+write the manifest) leaves nothing unrecorded and the next launch finishes it; records of
+folders that no longer exist are dropped. The manifest is flushed to disk before it
+replaces the old one. `skills_status` digests the installed copies again, so a copy an
+agent or a person changed is reinstalled at the next launch; a damaged manifest stops the
+sync until it is moved aside. `GET /api/machines` gives each worker's `skills` as last
+seen (`state`: `in_sync`, `partial` with `problems` by folder, `out_of_date`, `error`
+with `error`, or `unknown` before the first check since the dashboard started; `skipped`
+lists folders left alone), and the Workspaces machine badge shows it in its tooltip.
+
+Residual: a worker agent granted Docker (`--enable=docker`) reaches every file of the
+worker's user, as the Linux sandbox section says, the skills, the manifest and the staged
+bundles included, so it can change what the next launch of every account runs from its
+skills and, by rewriting the manifest, which copies the sync treats as its own.
