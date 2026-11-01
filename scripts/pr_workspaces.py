@@ -35,6 +35,7 @@ import machines
 import placement
 import remote_probe
 import safe_git
+import worker_api
 import worker_updates
 import workspace_agents
 import workspace_exit
@@ -98,6 +99,15 @@ BRANCH_NAME = wt.LAUNCH_BRANCH  # `wt --machine` checks a worker launch with it 
 NEW_PREFIX = "new:"
 NEW_LISTED = 86400
 NEW_LIMIT = 20
+# Sub-tasks agents start from their sandbox (`wt` there, see Workspaces.subtask): per
+# parent launch and per machine asking, in an hour; at once on one machine; and how long
+# a worker's request waits for its launch.
+SUBTASK_RATE = 6
+SUBTASK_MACHINE_RATE = 24
+SUBTASK_WINDOW = 3600
+SUBTASK_AGENTS = 4
+SUBTASK_WAIT = 240
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Other clones a new task may also work in (`wt --with`).
 # Each one lengthens the agent line wt types, which has a ceiling.
 ALSO_LIMIT = 4
@@ -506,6 +516,39 @@ AGENT_STATES = {"working", "blocked", "idle", "done"}
 LOAD_TIMEOUT = 5
 
 
+def started_by(parent):
+    """The line the dashboard shows for a sub-task: the launch that asked for it."""
+    where = f" on {parent.get('machine_label') or parent['machine']}" if parent["machine"] else ""
+    session = f", session {parent['session'][:8]}" if parent.get("session") else ""
+    return f"Started by {parent.get('agent') or 'an agent'} in {parent['cwd']}{where}{session}"
+
+
+def subtask_parents(home):
+    """The launch that asked for each sub-task's checkout (see ``Workspaces.subtask``), by
+    machine (None for this one) and path, resolved here; operations are kept a day."""
+    path = Path(home) / "pr-workspaces.sqlite"
+    if not path.exists():
+        return {}
+    db = sqlite3.connect(path, timeout=10)
+    try:
+        rows = db.execute(
+            "SELECT data FROM operations WHERE pr LIKE ? AND json_extract(data,'$.parent') IS NOT NULL",
+            (f"{NEW_PREFIX}%",),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        db.close()
+    found = {}
+    for (data,) in rows:
+        op = json.loads(data)
+        if isinstance(op.get("path"), str) and isinstance(op.get("parent"), dict):
+            machine = op.get("machine")
+            where = op["path"] if machine else str(Path(op["path"]).resolve())
+            found[(machine, where)] = op["parent"]
+    return found
+
+
 def load_counts(spaces):
     statuses = [w.get("agent_status") for w in spaces]
     return {
@@ -530,6 +573,8 @@ class MachineLoads:
         self.lock = threading.Lock()
         self.entries: dict[str, dict] = {}
         self.refreshing: set[str] = set()
+        # Checkouts herdr lists with an agent, by machine, as its last refresh saw them.
+        self.agent_paths: dict[str, set[str]] = {}
 
     def snapshot(self, now=None):
         """The registry's machines and every machine's last known load, by id."""
@@ -578,6 +623,15 @@ class MachineLoads:
                 "unreachable_since": None,
                 "synced_at": time.time(),
             }
+            paths = {
+                w["worktree"]["checkout_path"]
+                for w in listed
+                if w.get("agent_status") in AGENT_STATES
+                and isinstance(w.get("worktree"), dict)
+                and isinstance(w["worktree"].get("checkout_path"), str)
+            }
+            with self.lock:
+                self.agent_paths[machine.id] = paths
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
             error = str(exc)[-300:] or type(exc).__name__
         finally:
@@ -603,6 +657,8 @@ class Workspaces:
         self.sentry = sentry
         self.jobs = jobs
         self.lock = threading.RLock()
+        # Sub-tasks are counted and started one at a time, so each sees the last.
+        self.subtask_lock = threading.Lock()
         self.inventory_lock = threading.Lock()
         self.inventory: dict = {
             "checkouts": [],
@@ -1561,14 +1617,15 @@ class Workspaces:
                 found.append({"repo": slug, "clone": str(root), "remote": name, "active": active})
         return {"repos": found, "idle": idle}
 
-    def new_task(self, request):
+    def new_task(self, request, parent=None):
         """Start an agent on a task with no PR or issue behind it, in a new workspace.
 
         With ``issue_title`` the task is first filed as a GitHub issue in ``repo`` and
         the workspace is made for that issue, as `wti` would; otherwise ``name`` is a new
         branch from ``base`` (the clone's default branch when empty), as `wt` would.
         ``also`` lists other local clones the task covers: the branch is checked out in
-        each and the agent's sandbox may write there (`wt --with`).
+        each and the agent's sandbox may write there (`wt --with`). ``parent``, the launch
+        a sub-task was asked for from (see ``subtask``), is recorded on the operation.
         """
         allowed = {
             "repo",
@@ -1709,6 +1766,7 @@ class Workspaces:
             "also": also,
             **({"also_bases": bases} if bases else {}),
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
+            **({"parent": parent, "started_by": started_by(parent)} if parent else {}),
             "message": "Queued",
             "log": "",
             "created_at": time.time(),
@@ -1733,6 +1791,126 @@ class Workspaces:
             return True
         except ValueError:
             return False
+
+    def subtask(self, launch, parent, wait=0):
+        """A New task an agent asked for from its sandbox (`wt` there), under stricter rules.
+
+        ``launch`` is exactly ``wt.LAUNCH_FIELDS``. ``parent`` is the launch asking, as a
+        worker's broker reports it (``worker_api.launch_args``: that machine, its sandbox's
+        directory and Docker grant, the conversation's transcript) or as a `wt` inside
+        Safehouse here claims it (``worker_api.local_parent``); it is recorded on the
+        operation. New task always starts its agent sandboxed. On top of that: Docker only
+        for a parent that has it; at most SUBTASK_RATE an hour per parent launch (machine and
+        directory) and SUBTASK_MACHINE_RATE per machine asking; placed as Auto places it
+        (sticking to the parent's machine), or on the machine named, but never on one Auto
+        would not use now (full, unchecked, lacking what it needs) or that already runs
+        SUBTASK_AGENTS sub-task agents; and only in a clone of the repository there. A worker
+        request waits up to ``wait`` seconds for the launch to finish.
+        """
+        flags = {"docker", "exit_when_done"}
+        if not isinstance(launch, dict) or set(launch) != set(wt.LAUNCH_FIELDS):
+            raise ValueError("Expected exactly the launch fields")
+        if any(type(launch[flag]) is not bool for flag in flags) or any(
+            not isinstance(value, str) or (key != "task" and CONTROL.search(value))
+            for key, value in launch.items()
+            if key not in flags
+        ):
+            raise ValueError("Invalid launch fields")
+        if launch["machine"] != "auto" and not wt.MACHINE.fullmatch(launch["machine"]):
+            raise ValueError("Name a machine, or auto")
+        if not SLUG.fullmatch(launch["repo"]):
+            raise ValueError("Choose a repository")
+        if launch["docker"] and not parent["docker"]:
+            raise ValueError("Only a launch with Docker starts sub-tasks with Docker")
+        origin = parent["machine"] or placement.LOCAL
+        with self.subtask_lock:
+            now = time.time()
+            ops = [
+                op
+                for key, op in self.state()["operations"].items()
+                if key.startswith(NEW_PREFIX) and isinstance(op.get("parent"), dict)
+            ]
+            asked = [
+                op["parent"]
+                for op in ops
+                if now - op.get("created_at", 0) < SUBTASK_WINDOW
+                and (op["parent"].get("machine") or placement.LOCAL) == origin
+            ]
+            if sum(other.get("cwd") == parent["cwd"] for other in asked) >= SUBTASK_RATE:
+                raise worker_api.RateLimited(
+                    f"This launch started {SUBTASK_RATE} sub-tasks in the last hour; wait"
+                )
+            if len(asked) >= SUBTASK_MACHINE_RATE:
+                raise worker_api.RateLimited(
+                    f"Launches there started {SUBTASK_MACHINE_RATE} sub-tasks in the last hour; wait"
+                )
+            config, loads = self.loads.snapshot()
+            fields = {
+                "kind": "scratch",
+                "repo": launch["repo"],
+                "agent": launch["agent"],
+                "claude_account": launch["claude_account"] or None,
+                "docker": launch["docker"],
+                "also": [],
+                "override": launch["machine"],
+            }
+            req = placement.request(fields, config["repos"], config.get("docker"))
+            reservations = self.reservations()
+            chosen = placement.choose(
+                req, config["machines"], loads, {origin: 1}, reservations, now=now
+            )
+            target = chosen.machine or placement.LOCAL
+            name = placement.label(target, config["machines"])
+            excluded = placement.exclusions(req, config["machines"], loads, reservations, now)
+            if target in excluded:
+                raise ValueError(f"{name}: {excluded[target].why}; a sub-task waits for room")
+            if self.subtask_agents(target, ops) >= SUBTASK_AGENTS:
+                raise ValueError(f"{name} already runs {SUBTASK_AGENTS} sub-task agents")
+            request = {**launch, "machine": target}
+            if target == placement.LOCAL:
+                request.update(self.subtask_clone(launch["repo"]))
+            op = self.new_task(request, parent=parent)["operation"]
+        deadline = time.monotonic() + wait
+        while op["status"] in {"queued", "running"} and time.monotonic() < deadline:
+            time.sleep(1)
+            op = self.operation(op["pr"]) or op
+        return {"operation": op}
+
+    def subtask_agents(self, machine_id, ops):
+        """Sub-task agents on a machine: launches under way, and those whose checkout
+        herdr lists with an agent there (operations are kept a day)."""
+        if machine_id == placement.LOCAL:
+            live = {
+                path
+                for path, spaces in workspaces_by_path(self.inventory).items()
+                if any(space.get("agent_status") in AGENT_STATES for space in spaces)
+            }
+        else:
+            with self.loads.lock:
+                live = set(self.loads.agent_paths.get(machine_id, ()))
+        count = 0
+        for op in ops:
+            if (op.get("machine") or placement.LOCAL) != machine_id:
+                continue
+            path = op.get("path")
+            if path and machine_id == placement.LOCAL:
+                path = str(Path(path).resolve())
+            count += op["status"] in {"queued", "running"} or path in live
+        return count
+
+    def subtask_clone(self, repo):
+        """This machine's clone for a sub-task: ``<src>/<name>`` when it is one, else the
+        first listed; a repository with no clone here is refused."""
+        found = [
+            r
+            for r in self.local_repositories(everything=True)["repos"]
+            if r["repo"].lower() == repo.lower()
+        ]
+        if not found:
+            raise ValueError(f"This machine has no clone of {repo}")
+        own = str((self.src / repo.split("/")[1]).resolve())
+        chosen = next((r for r in found if r["clone"] == own), found[0])
+        return {"repo": chosen["repo"], "clone": chosen["clone"]}
 
     def perform_new(self, target, op, task, files=""):
         try:

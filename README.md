@@ -974,10 +974,29 @@ all of these. A run that cannot reach the dashboard fails, naming `--machine loc
 rather than running here; once the dashboard may have taken the launch (an answer cut
 short or unreadable, or the operation no longer listed) `wt` says to check the dashboard
 before retrying instead. Runs the dashboard makes (any dashboard option) never move, and
-on a worker `--machine` is refused unless it is `local`. Safehouse leaves the network
+on a worker `--machine` is refused unless it is `local` (inside a sandbox, see below). Safehouse leaves the network
 and the state home open to agents, so this works from inside their sandbox. The
 dashboard's **Docker access** toggle for a running agent still applies only to agents on
 this Mac.
+
+Inside an agent's sandbox that cannot write the clone `wt` makes no worktree: it hands
+a new task to the controller as a sub-task, and runs nothing itself. Inside a worker's
+babysit-bwrap (which names its launch's broker in `BABYSIT_REGISTER_SOCKET`) the request
+goes through that broker; inside Safehouse here, when its grants do not cover
+`~/src/<repo>/.git` (`wt` asks macOS's sandbox about itself; `WT_SANDBOXED=0` or `1`
+decides instead), to `POST /api/workspace-subtask`. With a grant for the clone (this
+user's `safe.env` grants `~/src/galaxy`, `~/src/worktrees` and herdr) `wt` works in
+Safehouse as it always has. The controller places it, Auto unless
+`--machine` names a machine (`local` is refused), and starts it as **New task** does,
+always sandboxed, under the sub-task rules of the supervisor reference: Docker only when
+the asking launch has it, a few sub-tasks per launch an hour, never on a full machine
+or one already running 4 sub-task agents, only in a repository cloned there. Only
+`wt <base> <branch>` with a prompt is handed over; anything else is refused rather than
+run here. `-r` there also takes `owner/name`, which a sandbox that cannot read the
+clone (a worker's) needs. `wt` prints the controller's progress on stderr; from a worker
+it waits up to four minutes for the launch, then says to follow it in the dashboard. The
+dashboard shows "Started by …" (the asking agent, its directory, machine and session)
+in the operation and on the sub-task's Workspaces row.
 
 Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
 the planning code without processes and the whole tool against temporary

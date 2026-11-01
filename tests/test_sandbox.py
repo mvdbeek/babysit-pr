@@ -609,6 +609,42 @@ def test_wrapper_tells_a_workers_agent_it_is_on_a_worker(checkout):
     assert (socket, socket) in pairs(argv, "--bind")
 
 
+@fd_bash
+def test_a_workers_broker_is_told_the_launchs_directory_and_grants(checkout, tmp_path):
+    worktree, common, home = checkout
+    (home / ".config" / "babysit-pr").mkdir(parents=True)
+    (home / ".config" / "babysit-pr" / "worker.json").write_text("{}")
+    account = home / "acct"
+    account.mkdir()
+    # A stand-in broker: it records how it was started and says it is ready.
+    fake = tmp_path / "fake-python"
+    fake.mkdir()
+    started = tmp_path / "broker-argv"
+    (fake / "python3").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{started}"\necho ready\n')
+    (fake / "python3").chmod(0o755)
+    env = environment(home, XDG_RUNTIME_DIR=str(tmp_path))
+    env["PATH"] = f"{fake}:{env['PATH']}"
+    options = [f"--claude-config-dir={account}", f"--add-dirs={worktree}", "--enable=docker"]
+    # The fake bwrap never runs anything; without a rootless Docker socket the wrapper
+    # stops after starting the broker, whose argv is what this test is about.
+    subprocess.run(
+        ["bash", WRAPPER, *options, "--", "claude"],
+        cwd=worktree,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+    )
+    argv = started.read_text().splitlines()
+    assert argv[:4] == [
+        "-I",
+        str(SCRIPTS / "worker_broker.py"),
+        f"--cwd={worktree}",
+        "--granted=docker",
+    ]
+    assert argv[4].endswith("/register.sock")
+    assert argv[5:] == ["claude", str(account.resolve()), str(worktree)]
+
+
 def test_wrapper_ignores_the_working_directory_and_its_git_files(checkout):
     worktree, common, home = checkout
     # What an agent could leave for the next launch: git pointing outside its checkout.

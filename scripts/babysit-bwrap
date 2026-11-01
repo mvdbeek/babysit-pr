@@ -340,7 +340,9 @@ fi
 # On a worker, watch registration goes through a broker for this launch, outside the
 # sandbox, which holds the controller's token from worker.json (never shown inside) and
 # forwards only this launch's own sessions, from its configuration directory, in its
-# granted worktrees (worker_broker.py). Its socket is bound like the gpg proxy's.
+# granted worktrees (worker_broker.py); a sub-task it asks for carries this launch's
+# directory and grants, which the sandbox cannot change. Its socket is bound like the
+# gpg proxy's.
 broker=
 if [[ -f $home/.config/babysit-pr/worker.json && -n $config_var ]]; then
   agent=claude
@@ -350,8 +352,8 @@ if [[ -f $home/.config/babysit-pr/worker.json && -n $config_var ]]; then
   else
     command -v python3 >/dev/null || die "python3 is not installed"
     broker=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/babysit-register.XXXXXX") || die "cannot create a registration broker directory"
-    exec {ready}< <(exec python3 -I "${self%/*}/worker_broker.py" "$broker/register.sock" "$agent" \
-      "$config_dir" ${granted_dirs[@]+"${granted_dirs[@]}"} </dev/null)
+    exec {ready}< <(exec python3 -I "${self%/*}/worker_broker.py" --cwd="$cwd" --granted="$granted" \
+      "$broker/register.sock" "$agent" "$config_dir" ${granted_dirs[@]+"${granted_dirs[@]}"} </dev/null)
     if ! read -r -u "$ready" line || [[ $line != ready ]]; then
       rmdir "$broker" 2>/dev/null || true
       die "the registration broker did not start"

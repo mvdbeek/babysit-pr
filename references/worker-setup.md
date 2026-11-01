@@ -445,7 +445,8 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    it forwards to the dashboard, which reads the worktree and session on the worker
    before recording the watch. Sandboxed agents never see the token; their launch's
    registration broker forwards only their own sessions in their own worktrees (the
-   supervisor reference's "Watches on workers" has the details). Issue a new token to
+   supervisor reference's "Watches on workers" has the details), and the sub-tasks
+   their `wt` asks for ("Sub-tasks from a sandbox" there). Issue a new token to
    replace it, or `worker-token ubuntu-1 --revoke`. Optionally add the worker's
    tailnet addresses as `"tailnet_ip"` to its `machines.json` entry (one address or a
    list, from `tailscale ip <box>`): registrations then must come through

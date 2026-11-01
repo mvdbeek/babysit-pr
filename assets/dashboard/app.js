@@ -3766,7 +3766,9 @@ function updateWorkspaceOperation() {
   if (!op) return;
   // The result below links Collie once the workspace is ready.
   $("workspace-progress").textContent =
-    `${op.status}: ${op.message}` + (op.machine ? ` · On ${machineName(op.machine)}` : "");
+    `${op.status}: ${op.message}` +
+    (op.machine ? ` · On ${machineName(op.machine)}` : "") +
+    (op.started_by ? ` · ${op.started_by}` : "");
   $("workspace-log").textContent = op.log || "";
   if (op.status === "failed" && op.stale_worker)
     $("workspace-result").replaceChildren(...workerUpdateNotice(op.stale_worker));
