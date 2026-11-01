@@ -37,7 +37,7 @@ from issue_overview import Overview as IssueOverview
 from pr_ci import CiDetails
 from pr_ci_logs import BackgroundLogs
 from pr_overview import Overview
-from pr_workspaces import Workspaces, collie_url
+from pr_workspaces import SUBTASK_WAIT, Workspaces, collie_url
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets" / "dashboard"
 LOGS = {"agent": "agent.log", "guardian": "guardian.log", "result": "result.json"}
@@ -705,6 +705,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workspace-action",
                 "workspace-batch",
                 "workspace-new",
+                "workspace-subtask",
                 "schedule-cancel",
                 "workspace-cleanup",
                 "workspace-open",
@@ -758,6 +759,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-action",
                         "workspace-batch",
                         "workspace-new",
+                        "workspace-subtask",
                         "workspace-cleanup",
                         "workspace-open",
                         "workspace-message",
@@ -970,6 +972,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Workspace actions are not enabled")
                 self.send_json(200, self.server.workspaces.new_task(request))
                 return
+            if action == "workspace-subtask":
+                # From a `wt` inside Safehouse here: its parent is what it claims.
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                if set(request) != worker_api.LAUNCH:
+                    raise ValueError("Expected exactly the launch and parent fields")
+                self.send_json(
+                    200,
+                    self.server.workspaces.subtask(
+                        request["launch"], worker_api.local_parent(request["parent"])
+                    ),
+                )
+                return
             if action == "extension-pair":
                 self.send_json(200, self.server.extension.pair(request))
                 return
@@ -1110,13 +1125,43 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 raise ValueError("Send one JSON request body")
             request = json.loads(self.read_body(length, 10))
-            self.send_json(200, worker_api.handle(self.server.home, machine, action, request))
+            answer = worker_api.handle(
+                self.server.home, machine, action, request, launch=self.worker_launch
+            )
+            if action == "launch":
+                # Recorded: from here nothing is a refusal, which would invite a retry.
+                answer = self.worker_launched(answer["operation"])
+            self.send_json(200, answer)
         except worker_api.RateLimited as exc:
             self.fail(429, str(exc))
         except (ValueError, RuntimeError) as exc:
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.fail(503, f"Cannot answer the worker: {exc}")
+
+    def worker_launch(self, launch, parent):
+        """A sub-task a worker's sandbox asked for, as soon as it is recorded: the worker's
+        request limits are released before ``worker_launched`` waits for it."""
+        if not self.server.workspaces:
+            raise ValueError("Workspace actions are not enabled")
+        return self.server.workspaces.subtask(launch, parent)
+
+    def worker_launched(self, op):
+        """A worker's sub-task once started or a few minutes on, without its log, which
+        may be long."""
+        op = self.server.workspaces.await_operation(op, SUBTASK_WAIT)
+        result = op.get("result") or {}
+        return {
+            "operation": {
+                "pr": op["pr"],
+                "status": op["status"],
+                "message": str(op.get("message") or "")[:2000],
+                "machine": op.get("machine"),
+                "result": {k: result.get(k) for k in ("branch", "path", "machine_label", "url")}
+                if result
+                else None,
+            }
+        }
 
     def get(self):
         port = self.server.server_port

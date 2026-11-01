@@ -73,6 +73,9 @@ LAUNCH_FIELDS = (
 LAUNCH_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 # Why `wt` without a brief stays here: said only when a worker was asked for by name or auto.
 NO_PROMPT = "a launch on a worker needs a prompt (-p or -F)"
+# A conversation id as Claude and Codex give it to the commands they run.
+SESSION = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+SESSION_ENV = (("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"))
 
 VALUE_OPTIONS = {
     "-r": "repo",
@@ -169,6 +172,13 @@ options:
                 here; --docker alone means auto when the registry prefers a Docker
                 worker. A worker takes only a new <branch> from <base> with a prompt
   -h, --help    show this help
+
+Inside an agent's sandbox that cannot write the clone (a worker's babysit-bwrap, or
+Safehouse on macOS without a grant for ~/src/<repo>) wt makes no worktree: it hands a
+new <branch> from <base> with a prompt to the controller's dashboard, which places it
+(auto unless --machine names a machine) and starts it sandboxed. There -r also takes
+owner/name, which a sandbox that cannot read the clone needs; --docker needs a launch
+that has Docker itself.
 
 dashboard options (a new branch from the remote default branch unless <base> is given):
   wt --name <branch> [--repo-path <clone>] [--worktree-root <dir>] [--label <label>]
@@ -1032,12 +1042,15 @@ class DashboardTransport:
     127.0.0.1:8765, reachable unsandboxed and from inside Safehouse.
 
     A transport offers ``place`` (where Auto would put a ``launch_request``), ``start``
-    (the New task's operation) and ``status`` (that operation now).
+    (the New task's operation) and ``status`` (that operation now). With ``parent``
+    (what a run inside Safehouse says about its launch) ``start`` asks for a sub-task,
+    which the dashboard places itself, under its sub-task rules.
     """
 
-    def __init__(self, tool: Tool, command: str):
+    def __init__(self, tool: Tool, command: str, parent: dict[str, object] | None = None):
         self.command = command
         self.base = (tool.env.get("BABYSIT_DASHBOARD_URL") or DASHBOARD).rstrip("/")
+        self.parent = parent
 
     def place(self, request: Mapping[str, object]) -> dict[str, object]:
         import urllib.parse
@@ -1050,7 +1063,13 @@ class DashboardTransport:
         return self.call("/api/placement?" + urllib.parse.urlencode(query))
 
     def start(self, request: Mapping[str, object]) -> dict[str, object]:
-        op = self.call("/api/workspace-new", dict(request)).get("operation")
+        if self.parent is None:
+            answer = self.call("/api/workspace-new", dict(request))
+        else:
+            answer = self.call(
+                "/api/workspace-subtask", {"launch": dict(request), "parent": self.parent}
+            )
+        op = answer.get("operation")
         if not isinstance(op, dict) or not isinstance(op.get("pr"), str):
             raise WtError(
                 f"{self.command}: the dashboard answered the launch unexpectedly; it may "
@@ -1102,10 +1121,58 @@ class DashboardTransport:
                     "check the dashboard before retrying"
                 ) from None
             reason = getattr(exc, "reason", None) or exc
+            hint = (
+                "start it, or pass --machine local to run here"
+                if self.parent is None
+                else "nothing was started"
+            )
             raise WtError(
                 f"{self.command}: cannot reach the dashboard at {self.base} ({reason}), which "
-                "starts launches on workers; start it, or pass --machine local to run here"
+                f"starts launches on workers; {hint}"
             ) from None
+
+
+class BrokerTransport:
+    """A launch from inside a worker launch's babysit-bwrap, through that launch's broker
+    (``$BABYSIT_REGISTER_SOCKET``, see worker_broker).
+
+    The broker adds what the sandbox cannot forge (the launch's directory, its Docker
+    grant, the transcript of the conversation asking) and the controller's
+    ``/api/worker/launch`` places and starts the task, answering once it is ready or a
+    few minutes on. Nothing follows it after that answer (``status`` is None).
+    """
+
+    status = None
+
+    def __init__(self, tool: Tool, command: str):
+        self.command = command
+        self.socket = tool.env.get("BABYSIT_REGISTER_SOCKET") or ""
+        self.sessions = {agent: tool.env.get(name) or None for agent, name in SESSION_ENV}
+
+    def start(self, request: Mapping[str, object]) -> dict[str, object]:
+        import worker_api
+
+        if not os.path.exists(self.socket):
+            raise WtError(f"{self.command}: this sandbox's broker is gone; nothing was started")
+        try:
+            answer = worker_api.forward(
+                "launch",
+                {"launch": dict(request), "sessions": self.sessions},
+                path=self.socket,
+            )
+        except ValueError as exc:
+            raise WtError(f"{self.command}: the controller refused: {exc}") from None
+        except RuntimeError as exc:
+            raise WtError(
+                f"{self.command}: the launch may have started ({exc}); do not start it again"
+            ) from None
+        op = answer.get("operation")
+        if not isinstance(op, dict) or not isinstance(op.get("status"), str):
+            raise WtError(
+                f"{self.command}: the controller answered the launch unexpectedly; it may "
+                "have started, so do not start it again"
+            )
+        return op
 
 
 # --- the tool ------------------------------------------------------------------------
@@ -1123,8 +1190,12 @@ class Tool:
         stderr: TextIO | None = None,
         isatty: Callable[[], bool] | None = None,
         stage: Callable[[str], str] | None = None,
+        confined: Callable[[], bool] | None = None,
     ):
         self.runner = runner
+        self.confined = confined or sandbox.confined
+        self.writable = sandbox.writable
+        self.docker_granted = sandbox.docker_granted
         self.env = dict(env)
         self.stdout = stdout or sys.stdout
         self.stderr = stderr or sys.stderr
@@ -2079,7 +2150,7 @@ class Tool:
         return launch_request(command, options, slug, machine)
 
     def follow_launch(
-        self, command: str, transport: DashboardTransport, op: dict[str, object]
+        self, command: str, transport: DashboardTransport | BrokerTransport, op: dict[str, object]
     ) -> None:
         """Wait for the controller's launch to finish, reporting its progress on stderr."""
         import time
@@ -2096,16 +2167,25 @@ class Tool:
                 if isinstance(result, dict):
                     where = f"{result.get('branch')} at {result.get('path')}"
                     url = f" ({result['url']})" if result.get("url") else ""
-                    self.warn(f"{command}: {where} on {result.get('machine_label')}{url}")
+                    machine = result.get("machine_label") or "the controller"
+                    self.warn(f"{command}: {where} on {machine}{url}")
                 return
+            poll = transport.status
+            # From a worker's sandbox there is no dashboard to look at: never retry.
+            check = "check the dashboard before retrying" if poll else "do not start it again"
             if status in ("failed", "uncertain"):
-                note = "" if status == "failed" else "; check the dashboard before retrying"
+                note = "" if status == "failed" else f"; {check}"
                 raise WtError(f"{command}: the launch {status}: {said}{note}")
+            if poll is None:
+                raise WtError(
+                    f"{command}: still launching on the controller, which finishes it; "
+                    "do not start it again"
+                )
             if time.monotonic() >= deadline:
                 raise WtError(f"{command}: still launching; follow it in the dashboard")
             time.sleep(LAUNCH_POLL)
             try:
-                found = transport.status(op)
+                found = poll(op)
             except WtError as exc:
                 # The launch was handed over: never suggest starting it a second time here.
                 raise WtError(
@@ -2118,6 +2198,107 @@ class Tool:
                 )
             op = found
 
+    def sandboxed(self, options: Options) -> str:
+        """The sandbox this run is in, where it cannot make its worktree: ``bwrap`` (a
+        worker launch's, with its broker), ``safehouse`` (a macOS Seatbelt sandbox that
+        cannot write the clone's Git directory) or empty.
+
+        Safehouse may grant a clone (and herdr): there wt works as it always has.
+        ``WT_SANDBOXED=0`` or ``1`` decides instead of the macOS checks. Nothing trusts the
+        answer: it only picks the way to the controller, which decides what may start.
+        """
+        if self.env.get("BABYSIT_REGISTER_SOCKET"):
+            return "bwrap"
+        forced = self.env.get("WT_SANDBOXED")
+        if forced in ("0", "1"):
+            return "safehouse" if forced == "1" else ""
+        if not self.confined():
+            return ""
+        # `-r owner/name` names the clone `~/src/<name>`.
+        name = options.repo.split("/")[1] if REPO_SLUG.fullmatch(options.repo) else options.repo
+        git_dir = os.path.join(self.home, "src", name, ".git")
+        return "" if os.path.isdir(git_dir) and self.writable(git_dir) else "safehouse"
+
+    def sandbox_repo(self, command: str, options: Options) -> str:
+        """The GitHub repository a sandboxed run is for: ``-r owner/name``, else what its
+        clone's upstream (or origin) names, when the sandbox can read the clone."""
+        if REPO_SLUG.fullmatch(options.repo):
+            return options.repo
+        repo_path = os.path.join(self.home, "src", options.repo)
+        try:
+            remotes = self.remote_slugs(repo_path)
+        except WtError:
+            remotes = {}
+        slug = remotes.get("upstream") or remotes.get("origin")
+        if not slug:
+            raise WtError(
+                f"{command}: this sandbox cannot read the GitHub repository of {repo_path}; "
+                f"name it as -r owner/{options.repo}"
+            )
+        return slug
+
+    def parent_claims(self) -> dict[str, object]:
+        """What a run inside Safehouse says about the launch it runs in: its directory,
+        conversation and Docker grant, which the dashboard records and applies its
+        sub-task rules to. Nothing on this machine can check them."""
+        sessions = [
+            (agent, value)
+            for agent, name in SESSION_ENV
+            if SESSION.fullmatch(value := self.env.get(name) or "")
+        ]
+        if not sessions:
+            raise WtError(
+                "wt: start sub-tasks from a Claude or Codex conversation "
+                "(CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID names it)"
+            )
+        agent, session = sessions[0]
+        homes = {
+            "claude": self.env.get("CLAUDE_CONFIG_DIR") or os.path.join(self.home, ".claude"),
+            "codex": self.env.get("CODEX_HOME") or os.path.join(self.home, ".codex"),
+        }
+        return {
+            "cwd": os.path.realpath(os.getcwd()),
+            "session": session,
+            "agent": agent,
+            "config_dir": os.path.realpath(homes[agent]),
+            "docker": self.docker_granted(),
+        }
+
+    def launch_from_sandbox(self, command: str, options: Options, kind: str) -> None:
+        """Hand this run to the controller's dashboard: a sandbox makes no worktree.
+
+        From a worker launch's babysit-bwrap it goes through that launch's broker, from
+        Safehouse to this machine's dashboard. The controller places it (``auto`` unless
+        ``--machine`` names a machine), starts it sandboxed and applies its sub-task rules.
+        """
+        validate_agent_options(
+            options.agent, options.model, options.effort, options.permission_mode
+        )
+        machine = options.machine or "auto"
+        if machine == "local":
+            raise WtError(
+                f"{command}: --machine local: this sandbox cannot start a task here; "
+                "leave --machine out or name a machine"
+            )
+        if machine != "auto" and not MACHINE.fullmatch(machine):
+            raise UsageError(command, f"{command}: --machine takes a machine id, auto or local")
+        refusal = worker_refusal(command, options)
+        if refusal:
+            raise WtError(
+                f"{command}: inside a sandbox wt hands only new tasks to the dashboard: {refusal}"
+            )
+        try:
+            request = launch_request(command, options, self.sandbox_repo(command, options), machine)
+        except NotForWorker as exc:
+            raise WtError(f"{command}: {exc}") from None
+        transport: DashboardTransport | BrokerTransport
+        if kind == "bwrap":
+            transport = BrokerTransport(self, command)
+        else:
+            transport = DashboardTransport(self, command, parent=self.parent_claims())
+        self.warn(f"{command}: inside a sandbox: handing the task to the controller's dashboard")
+        self.follow_launch(command, transport, transport.start(request))
+
     def on_worker(self) -> bool:
         """Whether this is a worker machine: provisioning marks it, and launches say so."""
         marker = os.path.join(self.home, ".config", "babysit-pr", "worker.json")
@@ -2127,6 +2308,11 @@ class Tool:
         options = parse_args(command, argv)
         if options.exit_watch_json and not options.exit_when_done:
             raise UsageError(command, f"{command}: --exit-watch-json needs --exit-when-done")
+        # The dashboard's own runs always make their worktree where they run.
+        kind = "" if dashboard_run(options) else self.sandboxed(options)
+        if kind:
+            self.launch_from_sandbox(command, options, kind)
+            return
         machine = self.chosen_machine(command, options)
         if machine != "local" and self.launch_elsewhere(command, options, machine):
             return

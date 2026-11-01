@@ -51,6 +51,8 @@ def tool(runner=None, env=None, **kwargs):
     kwargs.setdefault("stderr", io.StringIO())
     kwargs.setdefault("isatty", lambda: False)
     kwargs.setdefault("stage", lambda prompt: "/tmp/wt-prompt.fixture")
+    # Never the host's own sandbox: these tests may run inside one.
+    kwargs.setdefault("confined", lambda: False)
     env = {"BABYSIT_DASHBOARD_URL": NO_DASHBOARD, **(env or {"HOME": "/home/u"})}
     return wt.Tool(runner or FakeRunner(), env, **kwargs)
 
@@ -1325,6 +1327,9 @@ def repo(tmp_path, fake_tools, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("WT_MULTIPLEXER", "herdr")
     monkeypatch.setenv("BABYSIT_DASHBOARD_URL", NO_DASHBOARD)
+    # Run as outside any sandbox, even when the tests run inside one.
+    monkeypatch.setenv("WT_SANDBOXED", "0")
+    monkeypatch.delenv("BABYSIT_REGISTER_SOCKET", raising=False)
     monkeypatch.delenv("BABYSIT_HOME", raising=False)
     monkeypatch.delenv("HERDR_ENV", raising=False)
     monkeypatch.delenv("TMUX", raising=False)
@@ -2426,3 +2431,271 @@ def test_a_launch_request_is_checked_before_any_transport_sees_it(values, slug, 
         "feat",
         "auto",
     )
+
+
+# --- sub-tasks from inside a sandbox ---------------------------------------------------
+
+SID = "0b6f3c1e-2d4a-4e5f-9a7b-8c9d0e1f2a3b"
+
+
+def sandboxed(tmp_path, dashboard=None, **env):
+    """A wt inside Safehouse on the controller: it may read clones but write none."""
+    t = controller(tmp_path, dashboard, **env)
+    t.confined = lambda: True
+    t.writable = lambda path: False
+    t.docker_granted = lambda: True
+    return t
+
+
+def test_a_sandbox_is_told_apart_and_the_dashboards_runs_never_are(tmp_path, monkeypatch):
+    t = tool(env={"HOME": str(tmp_path)})
+    galaxy = options()
+    assert t.sandboxed(galaxy) == ""
+    t.confined = lambda: True
+    asked = []
+    t.writable = lambda path: asked.append(path) or path.endswith("/src/galaxy/.git")
+    # Safehouse without the clone (or without a grant for it) cannot make the worktree.
+    assert t.sandboxed(galaxy) == "safehouse" and asked == []
+    (tmp_path / "src/galaxy/.git").mkdir(parents=True)
+    (tmp_path / "src/planemo/.git").mkdir(parents=True)
+    # With a grant for it, wt works there as it always has.
+    assert t.sandboxed(galaxy) == ""
+    assert t.sandboxed(options(repo="planemo")) == "safehouse"
+    # `-r owner/name` is the clone named after the repository.
+    assert t.sandboxed(options(repo="galaxyproject/galaxy")) == ""
+    assert asked == [
+        str(tmp_path / "src/galaxy/.git"),
+        str(tmp_path / "src/planemo/.git"),
+        str(tmp_path / "src/galaxy/.git"),
+    ]
+    assert (
+        tool(env={"HOME": "/h", "WT_SANDBOXED": "0"}, confined=lambda: True).sandboxed(galaxy) == ""
+    )
+    assert tool(env={"HOME": "/h", "WT_SANDBOXED": "1"}).sandboxed(galaxy) == "safehouse"
+    # A worker launch's broker is named by babysit-bwrap; it wins whatever else is said.
+    broker = {"HOME": "/h", "BABYSIT_REGISTER_SOCKET": "/s", "WT_SANDBOXED": "0"}
+    assert tool(env=broker).sandboxed(galaxy) == "bwrap"
+    t.writable = lambda path: False
+
+    # A run the dashboard makes (any dashboard option) works where it runs, as before.
+    class Here(Exception):
+        pass
+
+    def here(*args):
+        raise Here
+
+    t.chosen_machine = here
+    t.env["CODEX_THREAD_ID"] = SID
+    with pytest.raises(Here):
+        t.run("wt", ["--name", "n", "-p", "go", "main"])
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(wt.WtError, match="cannot reach the dashboard .*nothing was started"):
+        t.run("wt", ["-r", "a/b", "-p", "go", "main", "feat"])
+
+
+def test_safehouse_hands_a_new_task_to_the_dashboard_with_what_it_says_of_its_launch(
+    tmp_path, dashboard, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    dashboard.launch(machine=None, now=True)
+    dashboard.answers["/api/workspace-subtask"] = dashboard.answers.pop("/api/workspace-new")
+    # Placed on the controller itself: its result names no machine.
+    del dashboard.answers["/api/workspace-subtask"]["operation"]["result"]["machine_label"]
+    account = tmp_path / ".claude/accounts/oss"
+    account.mkdir(parents=True)
+    t = sandboxed(tmp_path, dashboard, CLAUDE_CODE_SESSION_ID=SID, CLAUDE_CONFIG_DIR=str(account))
+    t.run("wt", ["--docker", "--exit-when-done", "-p", "Rebase it", "main", "feat"])
+    [launch] = dashboard.requests
+    assert launch["path"] == "/api/workspace-subtask"
+    assert launch["headers"]["X-Babysit-Action"] == "workspace-subtask"
+    assert "Origin" not in launch["headers"]
+    assert launch["body"]["launch"] == {
+        "repo": "base/repo",
+        "base": "main",
+        "name": "feat",
+        "agent": "claude",
+        "model": "",
+        "effort": "",
+        "claude_account": "",
+        "task": "Rebase it",
+        "docker": True,
+        "exit_when_done": True,
+        "permission_mode": "",
+        # The dashboard places it; no placement is asked first.
+        "machine": "auto",
+    }
+    assert launch["body"]["parent"] == {
+        "cwd": str(tmp_path.resolve()),
+        "session": SID,
+        "agent": "claude",
+        "config_dir": str(account.resolve()),
+        "docker": True,
+    }
+    said = t.stderr.getvalue().splitlines()
+    assert said[0] == "wt: inside a sandbox: handing the task to the controller's dashboard"
+    # A task placed on the controller itself has no machine label.
+    assert said[-1] == "wt: feat at /home/w/src/worktrees/repo/feat on the controller"
+    # Followed through the dashboard's list like any other launch.
+    dashboard.requests.clear()
+    dashboard.launch(machine="chonk")
+    dashboard.answers["/api/workspace-subtask"] = dashboard.answers.pop("/api/workspace-new")
+    t.docker_granted = lambda: False
+    t.env.pop("CLAUDE_CODE_SESSION_ID")
+    t.env["CODEX_THREAD_ID"] = "not-a-session"
+    # Not from a conversation it can name: nothing is asked.
+    with pytest.raises(wt.WtError, match="from a Claude or Codex conversation"):
+        t.run("wt", ["-r", "a/b", "-p", "go", "main", "x"])
+    assert dashboard.requests == []
+    t.env["CODEX_THREAD_ID"] = SID.upper()
+    t.run("wt", ["--machine", "chonk", "-r", "galaxyproject/planemo", "-p", "go", "main", "x"])
+    assert dashboard.paths() == [("POST", "/api/workspace-subtask"), ("GET", "/api/workspaces")]
+    body = dashboard.requests[0]["body"]
+    assert (body["launch"]["machine"], body["launch"]["repo"]) == ("chonk", "galaxyproject/planemo")
+    assert body["parent"] == {
+        "cwd": str(tmp_path.resolve()),
+        "session": SID.upper(),
+        "agent": "codex",
+        "config_dir": str((tmp_path / ".codex").resolve()),
+        "docker": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--machine", "local", "-p", "go", "main", "f"], "--machine local: this sandbox cannot"),
+        (["-p", "go", "7"], "hands only new tasks to the dashboard: wt starts only new branches"),
+        (["-p", "go", "issue", "12"], "hands only new tasks to the dashboard: workers do not"),
+        (["main", "f"], "hands only new tasks to the dashboard: a launch on a worker needs a"),
+        (["-p", "go", "main"], "only new tasks to the dashboard: a worker takes only a new"),
+        (["-p", "go", "main", "a/b"], "not a valid new branch"),
+        (["--model", "$(x)", "-p", "go", "7"], "invalid model id"),
+    ],
+)
+def test_what_a_sandbox_cannot_hand_over_is_refused_not_run_here(
+    tmp_path, dashboard, argv, message
+):
+    t = sandboxed(tmp_path, dashboard)
+    with pytest.raises(wt.WtError, match=re.escape(message)):
+        t.run("wt", argv)
+    assert dashboard.requests == []
+
+
+def test_a_sandbox_names_the_repository_its_clone_names_or_is_told(tmp_path, dashboard):
+    t = sandboxed(tmp_path, dashboard)
+    del t.remote_slugs  # The real lookup, in clones this sandbox may not see.
+    with pytest.raises(wt.WtError, match=r"cannot read the GitHub repository of .*-r owner/galaxy"):
+        t.run("wt", ["-p", "go", "main", "feat"])
+    clone = tmp_path / "src/planemo"
+    clone.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(clone)], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "remote", "add", "upstream", "https://github.com/up/planemo"],
+        check=True,
+    )
+    t.runner = wt.SubprocessRunner(os.environ)
+    assert t.sandbox_repo("wt", options(repo="planemo")) == "up/planemo"
+    assert t.sandbox_repo("wt", options(repo="a/b")) == "a/b"
+    assert dashboard.requests == []
+
+
+def broker_answering(path, answer, received):
+    """A stand-in for a launch's broker on ``path``: records one request, sends ``answer``."""
+    import socket
+    import threading
+
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(path))
+    server.listen()
+
+    def serve():
+        client, _ = server.accept()
+        with client:
+            data = b""
+            while chunk := client.recv(65536):
+                data += chunk
+            received.append(json.loads(data))
+            client.sendall(json.dumps(answer).encode())
+        server.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+
+@pytest.fixture
+def socket_dir():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as path:  # Unix socket paths are short.
+        yield Path(path)
+
+
+def test_a_worker_sandbox_hands_a_new_task_to_its_launchs_broker(tmp_path, socket_dir):
+    path = socket_dir / "register.sock"
+    received = []
+    done = {
+        "pr": "new:1",
+        "status": "complete",
+        "message": "Workspace ready on Chonk",
+        "machine": "chonk",
+        "result": {"branch": "x", "path": "/w/x", "machine_label": "Chonk", "url": None},
+    }
+    broker_answering(path, {"operation": done}, received)
+    # Inside babysit-bwrap: an empty home, the broker named, no dashboard reachable.
+    env = {"HOME": str(tmp_path), "BABYSIT_WORKER": "1", "BABYSIT_REGISTER_SOCKET": str(path)}
+    t = tool(env={**env, "CODEX_THREAD_ID": SID})
+    t.run("wt", ["--codex", "-r", "galaxyproject/galaxy", "-p", "Find the flake", "dev", "x"])
+    [request] = received
+    assert request == {
+        "action": "launch",
+        "launch": {
+            "repo": "galaxyproject/galaxy",
+            "base": "dev",
+            "name": "x",
+            "agent": "codex",
+            "model": "",
+            "effort": "",
+            "claude_account": "",
+            "task": "Find the flake",
+            "docker": False,
+            "exit_when_done": False,
+            "permission_mode": "",
+            "machine": "auto",
+        },
+        "sessions": {"claude": None, "codex": SID},
+    }
+    assert t.stderr.getvalue().splitlines()[-1] == "wt: x at /w/x on Chonk"
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        ({"error": "Docker is not granted"}, "^wt: the controller refused: Docker is not granted$"),
+        (
+            {"error": "Cannot reach the controller: timed out", "uncertain": True},
+            "may have started .*timed out.*do not start it again$",
+        ),
+        (
+            {"operation": {"pr": "new:1", "status": "running", "message": "Branching"}},
+            "still launching on the controller, which finishes it; do not start it again$",
+        ),
+        (
+            {"operation": {"pr": "new:1", "status": "uncertain", "message": "Unread"}},
+            "uncertain: Unread; do not start it again$",
+        ),
+        ({"operation": {"pr": "new:1", "status": "failed", "message": "No clone"}}, "failed"),
+        ({"operation": "?"}, "answered the launch unexpectedly"),
+    ],
+)
+def test_a_broker_launch_reports_what_the_controller_said(tmp_path, socket_dir, answer, message):
+    path = socket_dir / "register.sock"
+    broker_answering(path, answer, [])
+    t = tool(env={"HOME": str(tmp_path), "BABYSIT_REGISTER_SOCKET": str(path)})
+    with pytest.raises(wt.WtError, match=message) as raised:
+        t.run("wt", ["-r", "a/b", "-p", "go", "main", "x"])
+    assert "--machine local" not in str(raised.value)
+
+
+def test_a_gone_broker_starts_nothing(tmp_path, socket_dir):
+    t = tool(env={"HOME": str(tmp_path), "BABYSIT_REGISTER_SOCKET": str(socket_dir / "gone")})
+    with pytest.raises(wt.WtError, match="broker is gone; nothing was started"):
+        t.run("wt", ["-r", "a/b", "-p", "go", "main", "x"])
