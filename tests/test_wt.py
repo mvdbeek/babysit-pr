@@ -42,12 +42,17 @@ class FakeRunner:
         return f"/fake/{name}" if name in self.executables else None
 
 
+# A closed port: no test reaches the live dashboard, even one that asks it by mistake.
+NO_DASHBOARD = "http://127.0.0.1:9"
+
+
 def tool(runner=None, env=None, **kwargs):
     kwargs.setdefault("stdout", io.StringIO())
     kwargs.setdefault("stderr", io.StringIO())
     kwargs.setdefault("isatty", lambda: False)
     kwargs.setdefault("stage", lambda prompt: "/tmp/wt-prompt.fixture")
-    return wt.Tool(runner or FakeRunner(), env or {"HOME": "/home/u"}, **kwargs)
+    env = {"BABYSIT_DASHBOARD_URL": NO_DASHBOARD, **(env or {"HOME": "/home/u"})}
+    return wt.Tool(runner or FakeRunner(), env, **kwargs)
 
 
 def options(**values):
@@ -1319,6 +1324,7 @@ def repo(tmp_path, fake_tools, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("WT_MULTIPLEXER", "herdr")
+    monkeypatch.setenv("BABYSIT_DASHBOARD_URL", NO_DASHBOARD)
     monkeypatch.delenv("BABYSIT_HOME", raising=False)
     monkeypatch.delenv("HERDR_ENV", raising=False)
     monkeypatch.delenv("TMUX", raising=False)
@@ -1985,3 +1991,338 @@ def test_herdr_open_error_is_reported(repo, monkeypatch):
         f"wt: herdr did not return a root pane for {home}/src/worktrees/repo/rootless"
     )
     assert state_of(state)["agents"] == []
+
+
+# --- launches on worker machines -----------------------------------------------------
+
+
+class FakeDashboard:
+    """The dashboard's placement, New task and workspaces endpoints on a temporary port.
+
+    ``answers`` maps a path to the JSON (or ``(status, JSON)``) it answers; every request
+    is recorded with its headers and body.
+    """
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        self.answers = {}
+        self.requests = []
+        dashboard = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def answer(self, body=None):
+                path = self.path.split("?")[0]
+                dashboard.requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "headers": dict(self.headers),
+                        "body": body,
+                    }
+                )
+                answer = dashboard.answers.get(path, (404, {"error": "Not found"}))
+                status, value = answer if isinstance(answer, tuple) else (200, answer)
+                data = json.dumps(value).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self.answer()
+
+            def do_POST(self):
+                self.answer(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def launch(self, machine="chonk", status="complete", message="Workspace ready on Chonk"):
+        op = {"pr": "new:1", "status": "queued", "message": "Queued", "machine": machine}
+        done = {
+            **op,
+            "status": status,
+            "message": message,
+            "result": {
+                "branch": "feat",
+                "path": "/home/w/src/worktrees/repo/feat",
+                "machine_label": "Chonk",
+                "url": None,
+            },
+        }
+        self.answers["/api/workspace-new"] = {"operation": op}
+        self.answers["/api/workspaces"] = {"new": {"new:1": {"operation": done}}}
+
+    def paths(self):
+        return [(r["method"], r["path"].split("?")[0]) for r in self.requests]
+
+
+@pytest.fixture
+def dashboard(monkeypatch):
+    fake = FakeDashboard()
+    monkeypatch.setattr(wt, "LAUNCH_POLL", 0)
+    yield fake
+    fake.server.shutdown()
+    fake.server.server_close()
+
+
+def registry(home, docker="chonk", labels=("bwrap", "docker")):
+    home.mkdir(parents=True, exist_ok=True)
+    chonk = {"id": "chonk", "label": "Chonk", "ssh": "chonk", "os": "linux", "labels": list(labels)}
+    config = {
+        "version": 1,
+        "machines": [chonk],
+        **({"docker": {"prefer": docker}} if docker else {}),
+    }
+    (home / "machines.json").write_text(json.dumps(config))
+    return home
+
+
+def controller(tmp_path, dashboard=None, **env):
+    home = registry(tmp_path / "state")
+    url = dashboard.url if dashboard else NO_DASHBOARD
+    t = tool(
+        env={"HOME": str(tmp_path), "BABYSIT_HOME": str(home), "BABYSIT_DASHBOARD_URL": url, **env}
+    )
+    t.repo_slug = lambda path, command: "base/repo"
+    return t
+
+
+def test_parse_machine_option():
+    assert (
+        wt.parse_args("wt", ["--machine", "chonk", "-p", "go", "main", "feat"]).machine == "chonk"
+    )
+    assert wt.parse_args("wtpr", ["7"]).machine == ""
+    with pytest.raises(wt.WtError, match="--machine needs a value"):
+        wt.parse_args("wt", ["--machine"])
+    assert "--machine <id>|auto|local" in wt.HELP["wt"] and "--machine" in wt.HELP["wti"]
+
+
+def test_docker_alone_means_auto_only_with_a_registry_preferring_a_docker_worker(tmp_path):
+    t = controller(tmp_path)
+    assert t.chosen_machine("wt", options(docker=True)) == "auto"
+    assert t.chosen_machine("wt", options()) == "local"
+    assert t.chosen_machine("wt", options(docker=True, machine="local")) == "local"
+    # The dashboard's own runs, and runs on a worker, stay where they are.
+    assert t.chosen_machine("wt", options(docker=True, name="n")) == "local"
+    assert t.chosen_machine("wt", options(docker=True, focus=False)) == "local"
+    worker = controller(tmp_path, BABYSIT_WORKER="chonk")
+    assert worker.chosen_machine("wt", options(docker=True)) == "local"
+    # Without a preference, or a registry, nothing changes.
+    registry(tmp_path / "state", docker=None)
+    assert t.chosen_machine("wt", options(docker=True)) == "local"
+    assert tool().chosen_machine("wt", options(docker=True)) == "local"
+    # A registry that cannot be read leaves it here, and says so.
+    (tmp_path / "state" / "machines.json").write_text("{")
+    assert t.chosen_machine("wt", options(docker=True)) == "local"
+    assert "--docker runs here" in t.stderr.getvalue()
+
+
+def test_machine_is_refused_on_a_worker_and_beside_dashboard_options(tmp_path):
+    t = controller(tmp_path)
+    assert t.chosen_machine("wt", options(machine="chonk")) == "chonk"
+    with pytest.raises(wt.UsageError, match="--machine takes a machine id, auto or local"):
+        t.chosen_machine("wt", options(machine="Chonk"))
+    with pytest.raises(wt.UsageError, match="cannot be combined with the dashboard options"):
+        t.chosen_machine("wt", options(machine="auto", repo_path="/clone"))
+    worker = controller(tmp_path, BABYSIT_WORKER="chonk")
+    for machine in ("auto", "chonk"):
+        with pytest.raises(wt.WtError, match="this is a worker; only the controller"):
+            worker.chosen_machine("wt", options(machine=machine))
+    assert worker.chosen_machine("wt", options(machine="local")) == "local"
+
+
+@pytest.mark.parametrize(
+    ("command", "values", "refusal"),
+    [
+        ("wti", {"positional": ["12"]}, "workers do not take issue work yet"),
+        ("wt", {"positional": ["issue", "12"]}, "workers do not take issue work yet"),
+        ("wtpr", {"positional": ["7"]}, "use Handle in the dashboard for a pull request"),
+        ("wt", {"positional": ["7"]}, "use Handle in the dashboard for a pull request"),
+        ("wt", {"positional": ["https://github.com/a/b/pull/7"]}, "for a pull request"),
+        ("wt", {"also": ["other"]}, "other repositories (--with) yet"),
+        ("wt", {"prompt": ""}, "needs a prompt (-p or -F)"),
+    ],
+)
+def test_runs_a_worker_cannot_start_stay_here_under_auto_and_are_refused_by_name(
+    command, values, refusal, tmp_path, dashboard
+):
+    t = controller(tmp_path, dashboard)
+    parsed = options(**{"prompt": "go", "positional": ["main", "feat"], **values})
+    assert wt.worker_refusal(command, parsed).endswith(refusal)
+    assert t.launch_elsewhere(command, parsed, "auto") is False
+    assert t.stderr.getvalue().endswith(f"{refusal}; running here\n")
+    with pytest.raises(wt.WtError, match=f"^{command}: --machine chonk: .*{re.escape(refusal)}$"):
+        t.launch_elsewhere(command, parsed, "chonk")
+    assert dashboard.requests == []
+    assert wt.worker_refusal("wt", options(prompt="go", positional=["main", "feat"])) == ""
+
+
+def test_auto_starts_on_the_worker_the_dashboard_places_it_on(tmp_path, dashboard):
+    dashboard.answers["/api/placement"] = {
+        "machine": "chonk",
+        "label": "Chonk",
+        "reason": "auto: Docker prefers Chonk, 6/6 free",
+    }
+    dashboard.launch()
+    t = controller(tmp_path, dashboard)
+    parsed = options(
+        agent="codex",
+        model="gpt-5",
+        effort="high",
+        docker=True,
+        exit_when_done=True,
+        prompt="Fix it",
+        positional=["main", "feat"],
+    )
+    assert t.launch_elsewhere("wt", parsed, "auto") is True
+    assert dashboard.paths() == [
+        ("GET", "/api/placement"),
+        ("POST", "/api/workspace-new"),
+        ("GET", "/api/workspaces"),
+    ]
+    placement, launch, _ = dashboard.requests
+    assert placement["path"] == "/api/placement?kind=scratch&repo=base%2Frepo&agent=codex&docker=1"
+    assert launch["body"] == {
+        "repo": "base/repo",
+        "base": "main",
+        "name": "feat",
+        "agent": "codex",
+        "model": "gpt-5",
+        "effort": "high",
+        "claude_account": "",
+        "task": "Fix it",
+        "docker": True,
+        "exit_when_done": True,
+        "machine": "chonk",
+    }
+    # What the dashboard asks of a request that is not a browser's.
+    headers = launch["headers"]
+    assert headers["X-Babysit-Action"] == "workspace-new"
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Host"] == dashboard.url.removeprefix("http://")
+    assert "Origin" not in headers and "Sec-Fetch-Site" not in headers
+    assert t.stderr.getvalue().splitlines() == [
+        "wt: auto: Docker prefers Chonk, 6/6 free; starting on Chonk",
+        "wt: Queued",
+        "wt: Workspace ready on Chonk",
+        "wt: feat at /home/w/src/worktrees/repo/feat on Chonk",
+    ]
+    assert t.stdout.getvalue() == ""
+
+
+def test_auto_runs_here_when_the_dashboard_places_it_here(tmp_path, dashboard):
+    dashboard.answers["/api/placement"] = {
+        "machine": "local",
+        "label": "This machine",
+        "reason": "auto: clone present, 17/20 free; Chonk: full (6/6)",
+    }
+    t = controller(tmp_path, dashboard)
+    parsed = options(
+        agent="claude", claude_account="work", docker=True, prompt="go", positional=["main"]
+    )
+    assert t.launch_elsewhere("wt", parsed, "auto") is False
+    assert dashboard.paths() == [("GET", "/api/placement")]
+    assert "account=work" in dashboard.requests[0]["path"]
+    assert (
+        t.stderr.getvalue()
+        == "wt: auto: clone present, 17/20 free; Chonk: full (6/6); running here\n"
+    )
+
+
+def test_a_named_worker_goes_straight_to_the_dashboard(tmp_path, dashboard):
+    dashboard.launch()
+    t = controller(tmp_path, dashboard)
+    assert t.launch_elsewhere("wt", options(prompt="go", positional=["feat"]), "chonk") is True
+    assert dashboard.paths() == [("POST", "/api/workspace-new"), ("GET", "/api/workspaces")]
+    # One positional is both the base and the new branch, as `wt feat` reads it.
+    body = dashboard.requests[0]["body"]
+    assert (body["base"], body["name"], body["machine"], body["docker"]) == (
+        "feat",
+        "feat",
+        "chonk",
+        False,
+    )
+    assert "permission_mode" not in body
+    # Claude's auto permission mode goes along; Codex has none, as here.
+    careful = options(prompt="go", positional=["feat"], permission_mode="auto")
+    assert t.launch_elsewhere("wt", careful, "chonk") is True
+    assert dashboard.requests[-2]["body"]["permission_mode"] == "auto"
+    with pytest.raises(wt.WtError, match="for Claude only"):
+        codex = options(prompt="go", positional=["feat"], permission_mode="auto", agent="codex")
+        t.launch_elsewhere("wt", codex, "chonk")
+
+
+def test_refused_failed_and_unreachable_launches_name_the_reason(tmp_path, dashboard):
+    t = controller(tmp_path, dashboard)
+    parsed = options(prompt="go", positional=["main", "feat"])
+    dashboard.answers["/api/workspace-new"] = (400, {"error": "Chonk: lacks docker"})
+    with pytest.raises(wt.WtError, match="^wt: the dashboard refused: Chonk: lacks docker$"):
+        t.launch_elsewhere("wt", parsed, "chonk")
+    dashboard.answers["/api/placement"] = {
+        "machine": None,
+        "error": "No machine can take this launch",
+    }
+    with pytest.raises(wt.WtError, match="^wt: No machine can take this launch$"):
+        t.launch_elsewhere("wt", parsed, "auto")
+    dashboard.launch(status="failed", message="Chonk has no clone of base/repo")
+    with pytest.raises(
+        wt.WtError, match="^wt: the launch failed: Chonk has no clone of base/repo$"
+    ):
+        t.launch_elsewhere("wt", parsed, "chonk")
+    dashboard.launch(status="uncertain", message="wt on Chonk timed out")
+    with pytest.raises(wt.WtError, match="uncertain: wt on Chonk timed out; check the dashboard"):
+        t.launch_elsewhere("wt", parsed, "chonk")
+    # A dashboard lost after the hand-over never suggests starting the launch again here.
+    dashboard.launch()
+    dashboard.answers["/api/workspaces"] = (503, {"error": "Workspace actions are not enabled"})
+    with pytest.raises(wt.WtError, match="lost track of the launch .*before retrying$") as lost:
+        t.launch_elsewhere("wt", parsed, "chonk")
+    assert "--machine local" not in str(lost.value)
+    # Never silently here: a worker was asked for.
+    away = controller(tmp_path)
+    with pytest.raises(
+        wt.WtError, match="cannot reach the dashboard at http://127.0.0.1:9 .*--machine local"
+    ):
+        away.launch_elsewhere("wt", parsed, "auto")
+
+
+def test_wt_docker_starts_on_the_docker_worker_end_to_end(repo, tmp_path, monkeypatch, dashboard):
+    home, git, state = repo
+    registry(home / ".local/state/babysit-pr")
+    monkeypatch.setenv("BABYSIT_DASHBOARD_URL", dashboard.url)
+    dashboard.answers["/api/placement"] = {
+        "machine": "chonk",
+        "label": "Chonk",
+        "reason": "auto: Docker prefers Chonk, 6/6 free",
+    }
+    dashboard.launch()
+    result = run_tool("-r", "repo", "--docker", "-p", "Run the containers", "main", "feat")
+    assert result.stdout == ""
+    assert "wt: feat at /home/w/src/worktrees/repo/feat on Chonk" in result.stderr
+    assert dashboard.requests[1]["body"]["repo"] == "base/repo"
+    # Nothing was made or started here.
+    assert not (home / "src/worktrees/repo/feat").exists()
+    assert not state_of(state).get("calls")
+    # Placed here, it runs here as before.
+    dashboard.requests.clear()
+    dashboard.answers["/api/placement"] = {
+        "machine": "local",
+        "label": "This machine",
+        "reason": "auto: clone present, 19/20 free",
+    }
+    result = run_tool("-r", "repo", "--docker", "-p", "Run the containers", "main", "feat")
+    assert (home / "src/worktrees/repo/feat").is_dir()
+    assert "auto: clone present, 19/20 free; running here" in result.stderr
+    # --machine local never asks the dashboard.
+    dashboard.requests.clear()
+    run_tool("-r", "repo", "--docker", "--machine", "local", "-p", "again", "main", "other")
+    assert dashboard.requests == []
+    assert (home / "src/worktrees/repo/other").is_dir()

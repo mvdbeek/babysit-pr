@@ -839,7 +839,7 @@ under `~/src/worktrees/<repo>/` for a branch, a GitHub issue or a pull request, 
 opens it in a multiplexer with the selected agent started in the left pane:
 
 ```sh
-wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo[:base]]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] <base> [branch]
+wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo[:base]]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] [--machine id|auto|local] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
@@ -948,6 +948,28 @@ sends the key. Reattaching to an existing session ignores the flag along with th
 prompt, with a warning, and records nothing. The Scheduled tab lists these watches
 with their outcome and an **Open in Collie** link; finished ones are kept for a
 month, at most the latest 100.
+
+`--machine <id>|auto|local` starts the run on a worker of this machine's registry
+(`machines.json` in the state home, see the Worker machines section of
+`references/supervisor.md`) instead of here. `wt` hands it to this machine's dashboard,
+`http://127.0.0.1:8765` or `$BABYSIT_DASHBOARD_URL`: with `auto` it first asks `GET
+/api/placement` where Auto places the launch, then starts it as the dashboard's **New
+task** does (`POST /api/workspace-new` with the worker chosen) and follows that
+operation until the workspace is ready, printing its progress and the worker's checkout
+on stderr and nothing on stdout. `--exit-when-done` is passed on, so the dashboard
+follows the agent there, and so is `--permission-mode auto` (the request field
+`permission_mode: "auto"`, which New task otherwise leaves out). Without `--machine`,
+`--docker` means `auto` when the registry has a `docker` `prefer` worker, so Docker work
+an agent here starts with `wt` runs on that worker; with no such preference `wt` runs
+here as before. A worker takes only what New task starts there: a new branch from a base
+(`wt <base> <branch>`; a single name is both, as `wt feat` reads it) with a prompt, in
+the worker's own clone; the branch must not exist there yet. Issues, pull requests and
+`--with` stay here under `auto`, with a note on stderr, and are refused when a worker is
+named. A run that cannot reach the dashboard fails, naming `--machine local`, rather
+than running here. Runs the dashboard makes (any dashboard option) never move, and on a
+worker `--machine` is refused unless it is `local`. Safehouse leaves the network and the
+state home open to agents, so this works from inside their sandbox. The dashboard's
+**Docker access** toggle for a running agent still applies only to agents on this Mac.
 
 Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
 the planning code without processes and the whole tool against temporary

@@ -814,9 +814,10 @@ job outside its sandbox never runs on a worker. The preview uses the same sticki
 dialog's issue, other-repository and sandbox choices, but cannot see a Handle's verified
 checkout, which pins the launch to its machine.
 
-A launch placed on a worker (Handle or Create on a pull request, a new task, batch
-review, a scheduled launch) starts there. Until repairs run on workers, only work that
-never needs them goes there: pull request reviews and new tasks on a branch. Issues,
+A launch placed on a worker (Handle or Create on a pull request, a new task, from the
+dialog or from `wt --machine` on this machine, batch review, a scheduled launch) starts
+there. Until repairs run on workers, only work that never needs them goes there: pull
+request reviews and new tasks on a branch. Issues,
 Sentry issues, new tasks that file an issue and new tasks with other clones (`--with`)
 are refused with the reason. The launch first compares the worker's deployed
 babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
