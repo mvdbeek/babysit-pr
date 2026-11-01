@@ -769,6 +769,11 @@ at all, since this machine's Collie cannot open them.
 Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (`user@host` and `host`) are not detected.
 Disabled machines stay valid for records already pinned to them.
+`skills`, optional, lists personal skills the worker keeps in sync with this machine's
+(see Skills on workers): up to 64 unique folder names (letters, digits, `.`, `_`, `-`,
+not starting with `.` or `-`), never `synced` (claude.ai's own bucket) or `babysit-pr`
+(the worker's deployed copy provides it). Without the key the worker's skills are left alone; an empty
+list removes the copies an earlier sync installed.
 
 Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, agent and port
 forwarding off whatever the ssh config says, and a shared
@@ -809,7 +814,7 @@ Sentry issues, new tasks that file an issue and new tasks with other clones (`--
 are refused with the reason. The launch first compares the worker's deployed
 babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
 refuses a mismatch, naming the `provision_worker.sh --user-step --sha <sha>` that fixes
-it. For a Linux worker whose `babysit_root` is the copy that script deploys
+it, then syncs the worker's skills when it has `skills` (see Skills on workers). For a Linux worker whose `babysit_root` is the copy that script deploys
 (`~/.local/share/babysit-pr/app`), the refusal also offers **Update <worker>**: the
 dashboard runs that user step, from this machine's commit, over the worker's ssh
 (`/api/worker-update`, one update per worker at a time), then reads the worker's commit
@@ -852,3 +857,54 @@ previews where Auto would place a launch and which machines can take it;
 which the Workspaces badges poll once `/api/status` reports `workers` (absent without
 a registry, so a single machine never asks). The experimental Workspaces tab lists each
 enabled worker's worktrees read-only (see the workspaces reference).
+
+### Skills on workers
+
+A worker with `skills` gets this machine's copy of each, from this user's
+`~/.claude/skills/<name>` (a top-level link, as chezmoi makes, is followed; the folder
+must hold a `SKILL.md`). `scripts/skill_sync.py` packs them into one tar of folders and
+regular files only (a link, FIFO or device inside a skill refuses the whole bundle;
+`.DS_Store`, `__pycache__` and `.git` are left out), sorted, dated 1970, owned by nobody
+and keeping only the executable bit, so the same skills always give the same bytes; at
+most 8 MiB of files and 2000 entries. Its SHA-256 is the bundle's version, and a packing
+is reused for 30 s, so a burst of launches packs once.
+
+Before every launch on such a worker (a scheduled launch or cron run, Handle, Create, a
+new task, batch review, a resume) and after **Update <worker>** deploys, the dashboard
+asks the worker (probe op `skills_status`) for the bundle its manifest records and
+whether every copy it manages is still that bundle's. Only when either differs does it
+stage the bundle in `~/.local/state/babysit-pr/skill-bundles/` there (`machines.put_file`)
+and install it (probe op `skills_install`). The probe is this machine's
+`remote_probe.py`, as for every op, so what installs never depends on the worker's
+deployed copy. A sync that fails (a skill missing here, the worker unreachable, an install
+error) fails the launch, with the reason: an unattended agent told to run `/merge-forward`
+without it, or with last week's copy, would improvise rather than stop. Workers without
+`skills` are never asked.
+
+The install takes the staged file only from that folder, removes it whatever it holds,
+checks its SHA-256, and checks every entry again (no absolute path, `..`, control
+character, link or device; each skill's folder before its contents, with a `SKILL.md`;
+the same limits). Its targets are every Claude account's `~/.claude/accounts/<name>/skills`,
+the default configuration's `~/.claude/skills` and Codex's `$CODEX_HOME/skills` (or
+`~/.codex/skills`): babysit-bwrap binds an account's `skills` read-only and refuses a
+link there, and a link inside it to `~/.claude/skills` would dangle in the sandbox, so
+each gets real folders. A missing `skills` folder is made private (0700). `~/.claude`
+and Codex's home may be links a dotfile manager made; nothing below them is followed,
+since a default-account agent can write all of `~/.claude`: an account folder or
+`skills` folder that is a link is left alone and reported, and every file is created and
+renamed relative to opened folders, without following links. Each skill is written as a
+new private copy beside the old one and swapped in by rename (the old copy renamed aside
+first, then removed), so a reader sees one whole copy or the other; a copy that already
+matches is left as it is. Leftovers of an interrupted sync (`.babysit-skill-*`) go first.
+
+`~/.local/state/babysit-pr/skills.json` there, in the state directory no sandbox can
+write, records the bundle, each skill's content digest and, per skills folder, the
+skills the sync put there. Only those are ever replaced or removed: a folder or link of
+the same name that it did not make is left alone and reported, and skills dropped from
+`skills` are removed only where it put them. `skills_status` digests the installed copies
+again, so a copy an agent or a person changed is reinstalled at the next launch; a damaged
+manifest stops the sync until it is moved aside. A folder left alone or one it could not
+write is reported, not a failure. `GET /api/machines` gives each worker's `skills` as last
+seen (`state`: `in_sync`, `out_of_date`, `error` with `error`, or `unknown` before the
+first check since the dashboard started; `skipped` lists folders left alone), and the
+Workspaces machine badge shows it in its tooltip.

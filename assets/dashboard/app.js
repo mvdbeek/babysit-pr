@@ -2159,6 +2159,17 @@ function machineText(entry) {
   if (entry.pending) return `${entry.label} · checking…`;
   return `${entry.label} · ${entry.agents}/${entry.max_agents} busy`;
 }
+// A worker's personal skills as its last sync left them; null when it keeps none in sync.
+function skillsText(skills) {
+  if (!skills) return "";
+  const states = {
+    in_sync: "Skills in sync",
+    out_of_date: "Skills out of date; the next launch syncs them",
+    unknown: "Skills not checked yet; the next launch syncs them",
+  };
+  const text = skills.state === "error" ? skills.error : states[skills.state];
+  return [text, ...(skills.skipped ?? [])].join("\n");
+}
 // Health and capacity beside the Workspaces heading.
 function renderMachines() {
   const machines = workspaceData.machines ?? [];
@@ -2176,7 +2187,8 @@ function renderMachines() {
               ? "amber"
               : "green";
       const badge = el("span", machineText(entry), `badge ${tone}`.trim());
-      if (entry.error) badge.title = entry.error;
+      const title = [entry.error, skillsText(entry.skills)].filter(Boolean).join("\n");
+      if (title) badge.title = title;
       return badge;
     }),
   );

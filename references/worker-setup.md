@@ -423,7 +423,13 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    works), `docker` (rootless Docker is set up and the agent may be given it), `gpg`
    (the signing subkey is set up and agents get `--enable=gpg`),
    `claude-account:<name>` for each named Claude login on that machine. Paths are the
-   worker's own; never copy `/Users/...` paths into worker records.
+   worker's own; never copy `/Users/...` paths into worker records. Add
+   `"skills": ["merge-forward", "wt-task"]` to keep those personal skills from the Mac's
+   `~/.claude/skills` in sync on the worker: each launch there installs this machine's
+   copies into every `~/.claude/accounts/<name>/skills`, `~/.claude/skills` and
+   `~/.codex/skills` first (Skills on workers in the supervisor reference). Do not copy
+   or link skills there by hand under the same names: the sync leaves folders it did not
+   make alone.
 
 4. Keep the worker's babysit-pr at the controller's SHA: rerun the user step with the
    new `--sha` after updating the controller. A mismatch blocks remote work.

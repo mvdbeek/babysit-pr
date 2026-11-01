@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import contextlib
+import errno
+import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -24,6 +28,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -2268,6 +2273,504 @@ def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
     }
 
 
+# Personal skills kept in sync with the controller's (skill_sync) ---------------------
+
+# A skill's folder name, as machines.SKILL, and the two folders never synced.
+SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+RESERVED_SKILLS = {"synced", "babysit-pr"}
+MAX_SKILL_BYTES = 8 * 1024 * 1024  # All of a bundle's files together.
+MAX_SKILL_ENTRIES = 2000  # Files and folders in a bundle.
+MAX_SKILL_DEPTH = 16
+# A bundle's tar headers and padding come on top of its files.
+MAX_SKILL_BUNDLE = 2 * MAX_SKILL_BYTES
+MAX_SKILL_NOTES = 32
+SKILL_DIGEST = re.compile(r"[0-9a-f]{64}")
+# The manifest of what the sync manages, and the bundles staged for it, live in the
+# state directory babysit-bwrap never lets an agent write; skills folders are only read
+# in a sandbox, but a default-account agent writes the other accounts' folders.
+SKILL_STATE = "~/.local/state/babysit-pr"
+SKILL_BUNDLES = SKILL_STATE + "/skill-bundles"
+SKILL_MANIFEST = "skills.json"
+# Copies being swapped in or out; no skill name starts with a dot.
+SKILL_SCRATCH = ".babysit-skill-"
+NO_FOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def skill_entries(data):
+    """A bundle's skills: ``{name: [(path, is_dir, executable, content)]}``.
+
+    The bundle is a plain tar of folders and regular files only, each beneath a skill's
+    own folder (a name ``SKILL_NAME`` allows, listed before its contents) holding its
+    ``SKILL.md``, within the size, count and depth limits. Anything else refuses it
+    whole: no link, device, absolute path, ``..`` or control character is extracted.
+    """
+    try:
+        archive = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
+        members = archive.getmembers()
+    except (tarfile.TarError, EOFError) as exc:
+        raise ValueError(f"Skill bundle is not a tar archive: {exc}") from None
+    if len(members) > MAX_SKILL_ENTRIES:
+        raise ValueError(f"Skill bundle holds more than {MAX_SKILL_ENTRIES} entries")
+    skills: dict[str, list] = {}
+    folders = set()
+    seen = set()
+    total = 0
+    for member in members:
+        name = member.name
+        parts = name.split("/")
+        if (
+            not name
+            or len(name) > MAX_TEXT
+            or CONTROL.search(name)
+            or any(part in {"", ".", ".."} for part in parts)
+            or len(parts) > MAX_SKILL_DEPTH
+        ):
+            raise ValueError(f"Refusing skill bundle entry {name!r}")
+        if not (member.isdir() or member.isreg()):
+            raise ValueError(f"Refusing skill bundle entry {name!r}: not a folder or file")
+        if name in seen:
+            raise ValueError(f"Skill bundle entry {name!r} appears twice")
+        seen.add(name)
+        if len(parts) == 1:
+            if not member.isdir() or not SKILL_NAME.fullmatch(name) or name in RESERVED_SKILLS:
+                raise ValueError(f"Refusing skill bundle entry {name!r}: not a skill folder")
+            skills[name] = []
+            folders.add(name)
+            continue
+        if "/".join(parts[:-1]) not in folders:
+            raise ValueError(f"Skill bundle entry {name!r} comes before its folder")
+        content = b""
+        if member.isreg():
+            total += member.size
+            if total > MAX_SKILL_BYTES:
+                raise ValueError(f"Skill bundle exceeds {MAX_SKILL_BYTES} bytes")
+            stream = archive.extractfile(member)
+            content = stream.read() if stream else b""
+            if len(content) != member.size:
+                raise ValueError(f"Skill bundle entry {name!r} is truncated")
+        else:
+            folders.add(name)
+        executable = member.isreg() and bool(member.mode & 0o100)
+        skills[parts[0]].append(("/".join(parts[1:]), member.isdir(), executable, content))
+    for skill, entries in skills.items():
+        if ("SKILL.md", False) not in {(path, is_dir) for path, is_dir, *_ in entries}:
+            raise ValueError(f"Skill {skill} has no SKILL.md")
+    return skills
+
+
+def skill_digest(entries):
+    """One skill's content, as its files' paths, kinds, executable bits and bytes."""
+    digest = hashlib.sha256()
+    for path, is_dir, executable, content in sorted(entries, key=lambda entry: entry[0]):
+        kind = b"d" if is_dir else b"x" if executable else b"f"
+        digest.update(kind + b"\0" + os.fsencode(path) + b"\0")
+        if not is_dir:
+            digest.update(hashlib.sha256(content).digest())
+    return digest.hexdigest()
+
+
+def _installed_skill(root, name):
+    """The entries of skill ``name`` installed in the open folder ``root``, as a bundle
+    lists them; None when it is missing, holds a link or anything but folders and
+    regular files, or exceeds the bundle limits."""
+    entries: list = []
+    budget = {"entries": MAX_SKILL_ENTRIES, "bytes": MAX_SKILL_BYTES}
+
+    def walk(fd, prefix, depth):
+        for child in sorted(os.listdir(fd)):
+            path = prefix + child
+            info = os.stat(child, dir_fd=fd, follow_symlinks=False)
+            budget["entries"] -= 1
+            if budget["entries"] < 0 or depth > MAX_SKILL_DEPTH:
+                raise ValueError(path)
+            if stat.S_ISDIR(info.st_mode):
+                entries.append((path, True, False, b""))
+                sub = os.open(child, NO_FOLLOW_DIR, dir_fd=fd)
+                try:
+                    walk(sub, path + "/", depth + 1)
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(info.st_mode):
+                budget["bytes"] -= info.st_size
+                if budget["bytes"] < 0:
+                    raise ValueError(path)
+                # Non-blocking: a FIFO swapped in meanwhile is refused, never waited on.
+                opened = os.open(child, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                with os.fdopen(opened, "rb") as stream:
+                    mode = os.fstat(stream.fileno()).st_mode
+                    if not stat.S_ISREG(mode):
+                        raise ValueError(path)
+                    content = stream.read(info.st_size + 1)
+                entries.append((path, False, bool(mode & 0o100), content))
+            else:
+                raise ValueError(path)
+
+    try:
+        fd = os.open(name, NO_FOLLOW_DIR, dir_fd=root)
+    except OSError:
+        return None
+    try:
+        walk(fd, "", 2)
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+    return entries
+
+
+def _skill_roots():
+    """The skills folders kept in sync here, as ``(shown, base, parts)``, and notes on
+    the ones left alone.
+
+    Every Claude account's (``~/.claude/accounts/<name>/skills``), the default Claude
+    configuration's and Codex's. ``~/.claude`` and Codex's home may be a dotfile
+    manager's links, which only this user makes; nothing below them is followed, since
+    an agent of the default account can write all of ``~/.claude``.
+    """
+    home = os.path.expanduser("~")
+    claude = os.path.realpath(os.path.join(home, ".claude"))
+    codex = os.path.realpath(os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"))
+    roots: list[tuple[str, str, tuple[str, ...]]] = []
+    notes: list[str] = []
+    for base in dict.fromkeys((claude, codex)):
+        if os.path.isdir(base):
+            roots.append((os.path.join(base, "skills"), base, ()))
+    accounts = os.path.join(claude, "accounts")
+    if os.path.islink(accounts):
+        notes.append(f"{accounts} is a symbolic link; its accounts' skills are left alone")
+        return roots, notes
+    try:
+        names = sorted(os.listdir(accounts))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(accounts, name)
+        if not ACCOUNT.fullmatch(name):
+            continue
+        if os.path.islink(path):
+            notes.append(f"{path} is a symbolic link; its skills are left alone")
+        elif os.path.isdir(path):
+            roots.append((os.path.join(path, "skills"), claude, ("accounts", name)))
+    return roots, notes
+
+
+def _open_skill_root(shown, base, parts, create):
+    """The skills folder ``base/parts/skills``, opened without following a link below
+    ``base``; made private when missing and ``create``, else None when missing."""
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            following = os.open(part, NO_FOLLOW_DIR, dir_fd=fd)
+            os.close(fd)
+            fd = following
+        if create:
+            try:
+                os.mkdir("skills", 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+        try:
+            root = os.open("skills", NO_FOLLOW_DIR, dir_fd=fd)
+        except FileNotFoundError:
+            if create:
+                raise
+            return None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError(f"{shown} is a symbolic link or no folder; left alone") from None
+        raise ValueError(f"Cannot open {shown}: {exc.strerror}") from None
+    finally:
+        os.close(fd)
+    if os.fstat(root).st_uid != os.getuid():
+        os.close(root)
+        raise ValueError(f"{shown} belongs to another user; left alone")
+    return root
+
+
+def _skill_exists(root, name):
+    try:
+        os.stat(name, dir_fd=root, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _remove_skill_tree(parent, name):
+    """Remove ``name`` in the open folder ``parent``, never following a link."""
+    if not stat.S_ISDIR(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+        os.unlink(name, dir_fd=parent)
+        return
+    fd = os.open(name, NO_FOLLOW_DIR, dir_fd=parent)
+    try:
+        for child in os.listdir(fd):
+            _remove_skill_tree(fd, child)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent)
+
+
+def _write_skill(top, entries):
+    """A skill's entries into the open, empty folder ``top``: private, new files only."""
+    for path, is_dir, executable, content in entries:
+        *folders, leaf = path.split("/")
+        parent = top
+        try:
+            for folder in folders:
+                following = os.open(folder, NO_FOLLOW_DIR, dir_fd=parent)
+                if parent != top:
+                    os.close(parent)
+                parent = following
+            if is_dir:
+                os.mkdir(leaf, 0o700, dir_fd=parent)
+                continue
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            out = os.open(leaf, flags, 0o700 if executable else 0o600, dir_fd=parent)
+            with os.fdopen(out, "wb") as stream:
+                stream.write(content)
+        finally:
+            if parent != top:
+                os.close(parent)
+
+
+def _swap_skill(root, name, entries):
+    """Put skill ``name`` in place in ``root`` (``entries``), or remove it (None).
+
+    The new copy is written beside it first and renamed in; the old one is renamed aside
+    before that and removed after, so a reader sees one whole copy or the other.
+    """
+    fresh = None
+    if entries is not None:
+        fresh = SKILL_SCRATCH + os.urandom(8).hex()
+        os.mkdir(fresh, 0o700, dir_fd=root)
+        try:
+            top = os.open(fresh, NO_FOLLOW_DIR, dir_fd=root)
+            try:
+                _write_skill(top, entries)
+            finally:
+                os.close(top)
+        except BaseException:
+            _remove_skill_tree(root, fresh)
+            raise
+    old = None
+    if _skill_exists(root, name):
+        old = SKILL_SCRATCH + os.urandom(8).hex()
+        os.rename(name, old, src_dir_fd=root, dst_dir_fd=root)
+    if fresh is not None:
+        os.rename(fresh, name, src_dir_fd=root, dst_dir_fd=root)
+    if old is not None:
+        _remove_skill_tree(root, old)
+
+
+def _sync_skill_root(root, shown, skills, digests, recorded, notes):
+    """Bring the open skills folder ``root`` to ``skills``; the names it now manages.
+
+    Only names ``recorded`` as this sync's in this folder are ever replaced or removed:
+    a folder or link of the same name that the sync did not make is left alone.
+    """
+    for leftover in os.listdir(root):
+        if leftover.startswith(SKILL_SCRATCH):
+            _remove_skill_tree(root, leftover)  # From a sync interrupted there.
+    managed = set()
+    for name in sorted(set(skills) | recorded):
+        exists = _skill_exists(root, name)
+        if name not in recorded and exists:
+            notes.append(f"{shown}/{name} is not babysit's copy; left alone")
+            continue
+        try:
+            if name not in skills:
+                if exists:
+                    _swap_skill(root, name, None)
+                continue
+            installed = _installed_skill(root, name) if exists else None
+            if installed is None or skill_digest(installed) != digests[name]:
+                _swap_skill(root, name, skills[name])
+            managed.add(name)
+        except OSError as exc:
+            notes.append(f"Cannot update {shown}/{name}: {exc.strerror or exc}")
+            if name in recorded:
+                managed.add(name)
+    return managed
+
+
+def _skill_state(create=False):
+    path = os.path.expanduser(SKILL_STATE)
+    if create:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+@contextlib.contextmanager
+def _skill_lock(exclusive):
+    """This machine's skills sync, one at a time; a status read shares it."""
+    path = os.path.join(_skill_state(create=True), "skills.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _empty_skill_manifest():
+    return {"version": 1, "bundle": None, "skills": {}, "roots": {}}
+
+
+def _read_skill_manifest():
+    """What the sync manages here: the bundle, each skill's digest, and by folder the
+    skills it put there. None yet is an empty manifest; a damaged one is an error."""
+    path = os.path.join(_skill_state(), SKILL_MANIFEST)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return _empty_skill_manifest()
+    except OSError as exc:
+        raise ValueError(f"Cannot read {path}: {exc.strerror}") from None
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        raw = stream.read(1024 * 1024 + 1) if stat.S_ISREG(info.st_mode) else b""
+    try:
+        manifest = json.loads(raw)
+        valid = (
+            info.st_uid == os.getuid()
+            and isinstance(manifest, dict)
+            and set(manifest) == {"version", "bundle", "skills", "roots"}
+            and manifest["version"] == 1
+            and (manifest["bundle"] is None or SKILL_DIGEST.fullmatch(manifest["bundle"]))
+            and isinstance(manifest["skills"], dict)
+            and all(
+                SKILL_NAME.fullmatch(name)
+                and isinstance(digest, str)
+                and SKILL_DIGEST.fullmatch(digest)
+                for name, digest in manifest["skills"].items()
+            )
+            and isinstance(manifest["roots"], dict)
+            and all(
+                isinstance(names, list)
+                and all(isinstance(name, str) and SKILL_NAME.fullmatch(name) for name in names)
+                for names in manifest["roots"].values()
+            )
+        )
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        raise ValueError(f"{path} is not a skills manifest babysit wrote; move it aside")
+    return manifest
+
+
+def _write_skill_manifest(manifest):
+    directory = _skill_state(create=True)
+    fd, temporary = tempfile.mkstemp(prefix=".skills-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(manifest, stream, sort_keys=True)
+        os.replace(temporary, os.path.join(directory, SKILL_MANIFEST))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def _skill_answer(bundle, stale, notes):
+    def bounded(items):
+        return [CONTROL.sub("?", item)[:512] for item in items[:MAX_SKILL_NOTES]]
+
+    return {"bundle": bundle, "stale": bounded(stale), "skipped": bounded(notes)}
+
+
+def _host_skills_status():
+    """Whether the skills installed here are the bundle last installed: its hash, the
+    copies that are missing or differ from it (``stale``), and folders left alone."""
+    with _skill_lock(exclusive=False):
+        manifest = _read_skill_manifest()
+        roots, notes = _skill_roots()
+        stale = []
+        for shown, base, parts in roots:
+            try:
+                root = _open_skill_root(shown, base, parts, create=False)
+            except ValueError as exc:
+                notes.append(str(exc))
+                continue
+            recorded = set(manifest["roots"].get(shown, []))
+            try:
+                for name, digest in sorted(manifest["skills"].items()):
+                    if name in recorded:
+                        installed = None if root is None else _installed_skill(root, name)
+                        if installed is None or skill_digest(installed) != digest:
+                            stale.append(f"{shown}/{name} is missing or changed")
+                    elif root is not None and _skill_exists(root, name):
+                        notes.append(f"{shown}/{name} is not babysit's copy; left alone")
+                    else:
+                        stale.append(f"{shown}/{name} is missing")
+            finally:
+                if root is not None:
+                    os.close(root)
+        return _skill_answer(manifest["bundle"], stale, notes)
+
+
+def _take_skill_bundle(path):
+    """The staged bundle's bytes; the file is removed whatever they hold."""
+    bundles = os.path.realpath(os.path.expanduser(SKILL_BUNDLES))
+    try:
+        if os.path.dirname(path) != bundles:
+            raise ValueError(f"Skill bundles are taken only from {bundles}")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError(f"{path} is not a bundle this user staged")
+            data = stream.read(MAX_SKILL_BUNDLE + 1)
+    finally:
+        if os.path.dirname(path) == bundles:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+    if len(data) > MAX_SKILL_BUNDLE:
+        raise ValueError(f"Skill bundle exceeds {MAX_SKILL_BUNDLE} bytes")
+    return data
+
+
+def _host_skills_install(path, sha256):
+    """Install the bundle staged at ``path`` in every skills folder here.
+
+    The bundle must hash to ``sha256``. Each skill is swapped in whole where this sync
+    put it before or the name is free; skills it put there that the bundle no longer
+    holds are removed. The manifest then records the bundle and, by folder, what it
+    manages. Answers as ``skills_status`` would.
+    """
+    _arg_paths([path])
+    if not isinstance(sha256, str) or not SKILL_DIGEST.fullmatch(sha256):
+        raise ValueError("Expected the bundle's SHA-256")
+    data = _take_skill_bundle(path)
+    if hashlib.sha256(data).hexdigest() != sha256:
+        raise ValueError("The skill bundle does not match its SHA-256")
+    skills = skill_entries(data)
+    digests = {name: skill_digest(entries) for name, entries in skills.items()}
+    with _skill_lock(exclusive=True):
+        manifest = _read_skill_manifest()
+        roots, notes = _skill_roots()
+        recorded_roots = dict(manifest["roots"])
+        for shown, base, parts in roots:
+            recorded = set(manifest["roots"].get(shown, []))
+            try:
+                root = _open_skill_root(shown, base, parts, create=True)
+            except ValueError as exc:
+                notes.append(str(exc))
+                continue
+            try:
+                managed = _sync_skill_root(root, shown, skills, digests, recorded, notes)
+            except OSError as exc:
+                notes.append(f"Cannot update {shown}: {exc.strerror or exc}")
+                continue
+            finally:
+                os.close(root)
+            if managed:
+                recorded_roots[shown] = sorted(managed)
+            else:
+                recorded_roots.pop(shown, None)
+        _write_skill_manifest(
+            {"version": 1, "bundle": sha256, "skills": digests, "roots": recorded_roots}
+        )
+    return _host_skills_status()
+
+
 OPS: dict[str, Callable[..., Any]] = {
     "inventory": _host_inventory,
     "resolve": _host_resolve,
@@ -2289,6 +2792,8 @@ OPS: dict[str, Callable[..., Any]] = {
     "wt_checkout": _host_wt_checkout,
     "worktree": _host_worktree,
     "session_info": _host_session_info,
+    "skills_status": _host_skills_status,
+    "skills_install": _host_skills_install,
 }
 
 
@@ -2689,6 +3194,26 @@ def validate_version(value):
     return value
 
 
+def validate_skills(value):
+    """A worker's skills sync answer: the bundle installed and short notes."""
+    _expect(isinstance(value, dict) and set(value) == {"bundle", "stale", "skipped"}, "fields")
+    _expect(
+        value["bundle"] is None
+        or (isinstance(value["bundle"], str) and SKILL_DIGEST.fullmatch(value["bundle"])),
+        "bundle",
+    )
+    for key in ("stale", "skipped"):
+        _expect(
+            isinstance(value[key], list)
+            and len(value[key]) <= MAX_SKILL_NOTES
+            and all(
+                isinstance(x, str) and len(x) <= 512 and not CONTROL.search(x) for x in value[key]
+            ),
+            key,
+        )
+    return value
+
+
 def validate_wt_prepare(value):
     """The paths and name a worker's ``wt`` gets on its command line, nothing else."""
     _expect(isinstance(value, dict) and set(value) == {"clone", "root", "name", "path"}, "fields")
@@ -2858,6 +3383,8 @@ VALIDATORS = {
     "wt_checkout": validate_wt_checkout,
     "worktree": validate_worktree,
     "session_info": validate_session_info,
+    "skills_status": validate_skills,
+    "skills_install": validate_skills,
 }
 
 

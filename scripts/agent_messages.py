@@ -40,6 +40,7 @@ import machines
 import remote_probe
 import sandbox
 import session_locks
+import skill_sync
 import workspace_viewer
 import wt
 from pr_workspaces import PANE, herdr, run
@@ -1608,6 +1609,7 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
     # A worker's own paths, its probe's: the checkout's real one names its lock there.
     found = None
     if machine is not None:
+        skill_sync.ensure(home, machine)
         found = remote_resume(home, machine, root, chosen)
         root = found["path"]
     real = os.path.realpath(root) if machine is None else root

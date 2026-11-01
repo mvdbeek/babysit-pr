@@ -35,6 +35,11 @@ CAPABILITY = re.compile(r"[a-z0-9][a-z0-9:._-]{0,63}")
 COMMAND = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 # A Collie crew member's name, as `collie crew status` lists it; it goes in a link's query.
 COLLIE_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# A personal skill a worker gets a copy of (skill_sync): a folder name in a skills folder.
+SKILL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# claude.ai's own bucket, and babysit-pr, which a worker's deployed copy provides.
+RESERVED_SKILLS = {"synced", "babysit-pr"}
+MAX_SKILLS = 64
 OSES = {"darwin", "linux"}
 FIELDS = {
     "id",
@@ -51,6 +56,7 @@ FIELDS = {
     "enabled",
     "tailnet_ip",
     "auto",
+    "skills",
 }
 REQUIRED = {"id", "label", "ssh", "os"}
 # sshd's MaxSessions defaults to 10; stay well below it on one multiplexed connection.
@@ -78,6 +84,8 @@ class Machine(NamedTuple):
     tailnet_ip: tuple[str, ...] | None = None
     # Whether Auto may place launches here; otherwise it only runs what is sent by name.
     auto: bool = False
+    # This machine's personal skills kept in sync there; None leaves its skills alone.
+    skills: tuple[str, ...] | None = None
 
 
 class RemotePath(str):
@@ -151,6 +159,7 @@ def _machine(raw):
         collie_host=raw.get("collie_host"),
         tailnet_ip=raw.get("tailnet_ip"),
         auto=raw.get("auto", False),
+        skills=raw.get("skills"),
     )
     name = machine.id if isinstance(machine.id, str) else "?"
     checks = [
@@ -207,6 +216,19 @@ def _machine(raw):
             ),
             "tailnet_ip",
         ),
+        (
+            machine.skills is None
+            or (
+                isinstance(machine.skills, list)
+                and len(machine.skills) <= MAX_SKILLS
+                and all(
+                    isinstance(x, str) and SKILL.fullmatch(x) and x not in RESERVED_SKILLS
+                    for x in machine.skills
+                )
+                and len(set(machine.skills)) == len(machine.skills)
+            ),
+            f"skills (unique names, at most {MAX_SKILLS}, not {' or '.join(sorted(RESERVED_SKILLS))})",
+        ),
     ]
     for ok, field in checks:
         if not ok:
@@ -217,6 +239,7 @@ def _machine(raw):
     return machine._replace(
         labels=tuple(machine.labels),
         tailnet_ip=None if addresses is None else tuple(addresses),
+        skills=None if machine.skills is None else tuple(machine.skills),
     )
 
 
