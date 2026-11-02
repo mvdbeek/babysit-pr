@@ -829,6 +829,23 @@ that launchd does not own cannot do this: `XPC_SERVICE_NAME` names its job and
 launchd is asked which pid holds that label, so a dashboard started by hand, or any
 process that merely inherited the variable, says so instead and keeps serving.
 
+## Sign-in
+
+The dashboard can require a sign-in through Keycloak (OIDC), with scoped keys for
+scripts and a one-time break-glass link that needs no Keycloak. It is off until
+`~/.config/babysit-pr-auth/oidc.json` exists. It then starts in **report** mode, which
+refuses nothing: every request is classified, and those that enforce mode would refuse
+are counted. The header shows a **Sign in** button or your name (click it to sign
+out), and in report mode the number of would-be refusals.
+
+- **Sign in:** the header button sends you to Keycloak and back. Sessions last 7 days idle and 30 days at most on the https host, and 1 hour idle and 8 hours at most on plain-http loopback (that cookie also reaches other local ports). Enforce mode refuses to start until Phase 2 and Phase 3 of the rollout land.
+- **Keys:** `pr_supervisor.py auth keys create --kind read` prints a `bsk_read_…` key once. Clients send it as `Authorization: Bearer …`. `auth admin-key` writes the local admin key file.
+- **Break-glass:** `pr_supervisor.py auth login-link` prints a link valid once, for 10 minutes. It gives a 12-hour session.
+- **Report:** `pr_supervisor.py auth report` lists what enforce mode would refuse, by route and credential kind. `/api/status` carries the total.
+
+Setup, the Keycloak client settings, the policy table and every command are in
+[the sign-in reference](references/auth.md).
+
 ## Worktree helper
 
 `scripts/wt.py` is a portable, stdlib-only Python implementation of the `wt`, `wti`

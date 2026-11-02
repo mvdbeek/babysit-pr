@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import signal
 import sqlite3
@@ -24,6 +25,7 @@ import agent_messages
 import attachments
 import attention
 import browser_extension
+import dashboard_auth
 import dashboard_settings
 import llm_usage
 import machines
@@ -108,6 +110,89 @@ WORKER_ACTIONS = {
     "workspace-answer",
     "workspace-choose",
 }
+
+
+# The browser actions post() accepts, each at /api/<action>.
+ACTIONS = frozenset(
+    {
+        "cancel",
+        "feedback",
+        "feedback-addressed",
+        "workspace-action",
+        "workspace-batch",
+        "workspace-new",
+        "workspace-subtask",
+        "schedule-cancel",
+        "workspace-cleanup",
+        "workspace-open",
+        "workspace-message",
+        "workspace-answer",
+        "workspace-choose",
+        "workspace-docker",
+        "workspace-interrupt",
+        "workspace-quit",
+        "workspace-prompt-forget",
+        "attachment-upload",
+        "sentry-action",
+        "cron-action",
+        "push-subscribe",
+        "push-unsubscribe",
+        "push-read",
+        "push-seen",
+        "notification-silence",
+        "notification-focus",
+        "attention-triage",
+        "extension-pair",
+        "effort-default",
+        "settings",
+        "codex-update",
+        "worker-update",
+        "service-restart",
+        "voice-turn",
+        "voice-log",
+    }
+)
+# Every API route this dashboard answers: the report names only these, so anonymous
+# requests cannot grow it.
+API_ROUTES = frozenset(
+    {
+        "/api/attention",
+        "/api/auth-report",
+        "/api/codex-update",
+        "/api/cron",
+        "/api/cron-log",
+        "/api/issues",
+        "/api/llm-usage",
+        "/api/log",
+        "/api/machines",
+        "/api/notification-preferences",
+        "/api/placement",
+        "/api/pr-ci",
+        "/api/pr-ci-log",
+        "/api/pr-reviews",
+        "/api/prs",
+        "/api/push-config",
+        "/api/scheduled-tasks",
+        "/api/sentry",
+        "/api/service",
+        "/api/session",
+        "/api/settings",
+        "/api/status",
+        "/api/upstream-tests",
+        "/api/voice-turn",
+        "/api/watch",
+        "/api/workspace-agents",
+        "/api/workspace-diff",
+        "/api/workspace-overview",
+        "/api/workspace-prompts",
+        "/api/workspace-repos",
+        "/api/workspace-transcript",
+        "/api/workspaces",
+    }
+    | {f"/api/{action}" for action in ACTIONS}
+    | {f"/api/worker/{action}" for action in worker_api.ACTIONS}
+    | {"/api/extension"}
+)
 
 
 def viewed_workspace(home, value):
@@ -436,8 +521,11 @@ class DashboardServer(ThreadingHTTPServer):
         attachments: Path | None = None,
         codex_updates=None,
         require_tailscale_user=False,
+        auth: dashboard_auth.Auth | None = None,
     ) -> None:
         self.home = home
+        # None while auth is off: every request is answered as before Phase 1.
+        self.auth = auth
         # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.
         self.require_tailscale_user = require_tailscale_user
         # Set when the dashboard stops to be started again on the checkout's code.
@@ -520,12 +608,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def send_body(self, code, body, content_type, etag=None, compressed=None):
+    def send_body(self, code, body, content_type, etag=None, compressed=None, headers=()):
         """Send a response; a client that has gone away is quietly sent nothing more.
 
         API data is never stored by the browser; static assets are revalidated by ETag.
         ``compressed`` is a precomputed gzip encoding of ``body``. A 304 sends the
-        headers a 200 would have, without the body.
+        headers a 200 would have, without the body. ``headers`` are added as given
+        (Location, Set-Cookie).
         """
         self.started = True
         if self.unread != 0:
@@ -578,6 +667,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if vary:
                 self.send_header("Vary", ", ".join(vary))
+            for name, value in headers:
+                self.send_header(name, value)
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
@@ -631,6 +722,8 @@ class Handler(BaseHTTPRequestHandler):
             if refusal := self.fenced():
                 self.send_json(403, {"error": refusal})
                 return
+            if self.server.auth is not None and not self.authorized():
+                return
             handler()
         except Exception as exc:
             traceback.print_exc()
@@ -670,6 +763,168 @@ class Handler(BaseHTTPRequestHandler):
             return "A worker machine may only use /api/worker/"
         return None
 
+    def authorized(self):
+        """Whether the route's handler may answer: sign-in routes are answered here.
+
+        In report mode every request goes on, and those enforce would refuse are
+        counted; in enforce mode they get 401 (no credential) or 403 (a key whose
+        scope does not cover the route).
+        """
+        auth = self.server.auth
+        assert auth is not None
+        path = dashboard_auth.request_path(self.path)
+        if path is not None and (path.startswith("/auth/") or path == "/api/session"):
+            self.auth_request(path)
+            return False
+        decision = auth.decide(self.command, self.path, self.headers, self.secure_host())
+        if decision.allowed:
+            return True
+        auth.report.record(self.command, path, decision, refused=auth.enforce, routes=API_ROUTES)
+        if not auth.enforce:
+            return True
+        self.send_json(
+            403 if decision.authenticated else 401,
+            {
+                "error": "This key may not use this route"
+                if decision.authenticated
+                else "Sign in to use the dashboard",
+                "login": "/auth/login" if auth.oidc else None,
+            },
+        )
+        return False
+
+    def secure_host(self):
+        """Every host but plain-http loopback is reached over https (tailscale serve)."""
+        port = self.server.server_port
+        return self.headers.get("Host") not in {f"127.0.0.1:{port}", f"localhost:{port}"}
+
+    def same_origin_action(self, action):
+        """The CSRF guard of post(), for a sign-in route's POST."""
+        host = self.headers.get("Host")
+        origin = self.headers.get("Origin")
+        return (
+            self.headers.get("X-Babysit-Action") == action
+            and self.headers.get("Sec-Fetch-Site") != "cross-site"
+            and (origin is None or origin in {f"http://{host}", f"https://{host}"})
+        )
+
+    def session_cookie(self, token, max_age):
+        secure = self.secure_host()
+        name = dashboard_auth.session_cookie_name(secure)
+        return ("Set-Cookie", dashboard_auth.cookie(name, token, secure=secure, max_age=max_age))
+
+    def auth_request(self, path):
+        """/auth/login, /auth/callback, /auth/logout, /auth/break-glass and /api/session."""
+        auth = self.server.auth
+        assert auth is not None
+        host = self.headers.get("Host")
+        if not self.extension_host():
+            self.send_json(403, {"error": "Use a configured dashboard URL"})
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        secure = self.secure_host()
+        login_name = dashboard_auth.login_cookie_name(secure)
+        # The login cookie is cleared by the callback, whatever its outcome.
+        cleared = dashboard_auth.cookie(login_name, "", secure=secure, max_age=0, path="/auth/")
+        try:
+            if self.command == "GET" and path == "/api/session":
+                if self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    self.send_json(403, {"error": "Cross-site access is disabled"})
+                    return
+                self.send_json(200, auth.view(self.headers, secure))
+            elif self.command == "GET" and path == "/auth/login":
+                forwarded = self.headers.get_all("X-Forwarded-For") or []
+                source = forwarded[0] if len(forwarded) == 1 else self.client_address[0]
+                url, state = auth.begin_login(host, query.get("next", ["/"])[0], source)
+                login = dashboard_auth.cookie(
+                    login_name,
+                    state,
+                    secure=secure,
+                    max_age=dashboard_auth.LOGIN_TTL,
+                    path="/auth/",
+                    # The callback arrives as a cross-site navigation from the provider.
+                    same_site="Lax",
+                )
+                self.send_body(
+                    302, b"", "text/plain", headers=[("Location", url), ("Set-Cookie", login)]
+                )
+            elif self.command == "GET" and path == "/auth/callback":
+                if "error" in query:
+                    error = dashboard_auth.provider_error(query["error"][0])
+                    raise dashboard_auth.AuthError(f"The identity provider refused: {error}", 403)
+                bound = dashboard_auth.read_cookie(self.headers.get("Cookie"), login_name)
+                token, result = auth.finish_login(
+                    host,
+                    query.get("state", [None])[0],
+                    query.get("code", [None])[0],
+                    bound,
+                    secure,
+                )
+                self.send_body(
+                    302,
+                    b"",
+                    "text/plain",
+                    headers=[
+                        ("Location", result["next"]),
+                        ("Set-Cookie", cleared),
+                        self.session_cookie(token, result["max_age"]),
+                    ],
+                )
+            elif self.command == "POST" and path == "/auth/logout":
+                if not self.same_origin_action("logout"):
+                    self.send_json(403, {"error": "Sign out from the dashboard page"})
+                    return
+                redirect = auth.logout(
+                    self.headers, f"{'https' if secure else 'http'}://{host}", secure
+                )
+                name = dashboard_auth.session_cookie_name(secure)
+                self.send_body(
+                    200,
+                    json.dumps({"redirect": redirect}).encode(),
+                    "application/json; charset=utf-8",
+                    headers=[
+                        ("Set-Cookie", dashboard_auth.cookie(name, "", secure=secure, max_age=0))
+                    ],
+                )
+            elif self.command == "GET" and path == "/auth/break-glass":
+                body, packed, etag = static_asset("break-glass.html", "text/html; charset=utf-8")
+                code = 304 if etag_matches(self.headers.get("If-None-Match"), etag) else 200
+                self.send_body(code, body, "text/html; charset=utf-8", etag=etag, compressed=packed)
+            elif self.command == "POST" and path == "/auth/break-glass":
+                length = int(self.headers.get("Content-Length", "0"))
+                if (
+                    not self.same_origin_action("break-glass")
+                    or not 0 < length <= 1024
+                    or self.headers.get("Content-Type") != "application/json"
+                ):
+                    self.send_json(403, {"error": "Open the sign-in link in a browser"})
+                    return
+                request = json.loads(self.read_body(length, 5))
+                token, max_age = auth.redeem_link(
+                    request.get("token") if isinstance(request, dict) else None, secure
+                )
+                self.send_body(
+                    200,
+                    b'{"ok": true}',
+                    "application/json; charset=utf-8",
+                    headers=[self.session_cookie(token, max_age)],
+                )
+            else:
+                self.send_json(404, {"error": "Not found"})
+        except dashboard_auth.AuthError as exc:
+            if self.command == "GET" and path in {"/auth/login", "/auth/callback"}:
+                # A browser navigation: a page, never JSON.
+                self.send_body(
+                    exc.status,
+                    dashboard_auth.login_page(str(exc), exc.status),
+                    "text/html; charset=utf-8",
+                    headers=[("Set-Cookie", cleared)] if path == "/auth/callback" else [],
+                )
+            else:
+                self.send_json(exc.status, {"error": str(exc)})
+        except ValueError as exc:
+            self.fail(400, str(exc))
+
     def do_GET(self):
         self.guarded(self.get)
 
@@ -697,44 +952,7 @@ class Handler(BaseHTTPRequestHandler):
         # are allowed. Check Origin too, including for trusted tailnet proxies.
         if (
             host not in allowed
-            or action
-            not in {
-                "cancel",
-                "feedback",
-                "feedback-addressed",
-                "workspace-action",
-                "workspace-batch",
-                "workspace-new",
-                "workspace-subtask",
-                "schedule-cancel",
-                "workspace-cleanup",
-                "workspace-open",
-                "workspace-message",
-                "workspace-answer",
-                "workspace-choose",
-                "workspace-docker",
-                "workspace-interrupt",
-                "workspace-quit",
-                "workspace-prompt-forget",
-                "attachment-upload",
-                "sentry-action",
-                "cron-action",
-                "push-subscribe",
-                "push-unsubscribe",
-                "push-read",
-                "push-seen",
-                "notification-silence",
-                "notification-focus",
-                "attention-triage",
-                "extension-pair",
-                "effort-default",
-                "settings",
-                "codex-update",
-                "worker-update",
-                "service-restart",
-                "voice-turn",
-                "voice-log",
-            }
+            or action not in ACTIONS
             or self.headers.get("Sec-Fetch-Site") == "cross-site"
             or (origin is not None and origin not in {f"http://{host}", f"https://{host}"})
         ):
@@ -1181,7 +1399,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if route.path == "/api/status":
-                self.send_json(200, status(self.server.home))
+                value = status(self.server.home)
+                if self.server.auth:
+                    value["auth"] = self.server.auth.summary()
+                self.send_json(200, value)
+            elif route.path == "/api/session":
+                # Reached only while auth is off; otherwise authorized() answers it.
+                self.send_json(200, {"enabled": False})
+            elif route.path == "/api/auth-report":
+                # What enforce mode would refuse; report mode counts it without refusing.
+                self.send_json(
+                    200,
+                    {"mode": self.server.auth.mode, "rows": self.server.auth.report.rows()}
+                    if self.server.auth
+                    else {"enabled": False},
+                )
             elif route.path == "/api/watch":
                 # One watch with all its CI details, which the status poll leaves out of
                 # ended watches.
@@ -1524,6 +1756,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/favicon.png": ("favicon.png", "image/png"),
                     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
                     "/app.js": ("app.js", "text/javascript"),
+                    "/auth.js": ("auth.js", "text/javascript"),
                     "/extension.html": ("extension.html", "text/html"),
                     "/extension.js": ("extension.js", "text/javascript"),
                     "/collie.js": ("collie.js", "text/javascript"),
@@ -1575,8 +1808,14 @@ def serve(
     allowed_hosts=(),
     attachments_dir=None,
     require_tailscale_user=False,
+    auth_mode="report",
+    auth_home=None,
+    oidc_config=None,
 ):
     """Run the dashboard; the exit status asks launchd for a restart, or not."""
+    auth_home = auth_home or dashboard_auth.DEFAULT_HOME
+    # Before anything starts: enforce with a broken configuration must not serve.
+    auth = dashboard_auth.load(auth_mode, auth_home, oidc_config)
     from codex_updates import CodexUpdates
     from cron_jobs import CronJobs
     from dashboard_push import PushInbox
@@ -1623,6 +1862,7 @@ def serve(
         attachments=attachments_dir,
         codex_updates=CodexUpdates(home),
         require_tailscale_user=require_tailscale_user,
+        auth=auth,
     ) as server:
         # Pushes and the Home Screen badge can follow what needs the user.
         push.attention = server.attention.get
@@ -1634,6 +1874,21 @@ def serve(
         url = f"http://127.0.0.1:{server.server_port}"
         print(
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",
+            flush=True,
+        )
+        print(
+            f"Dashboard auth: {auth.mode} ({auth_home}"
+            + (f", OIDC {auth.oidc.config.issuer}" if auth.oidc else ", no OIDC")
+            + (
+                ", own routes allowed (test override)"
+                if os.environ.get(dashboard_auth.ALLOW_OWN_ROUTES_ENV)
+                else ""
+            )
+            + ")"
+            if auth
+            else f"Dashboard auth: off (no {auth_home / dashboard_auth.OIDC_FILE})"
+            if auth_mode == "report"
+            else "Dashboard auth: off",
             flush=True,
         )
         if unfenced := unfenced_workers(home):
@@ -1682,6 +1937,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Through tailscale serve, refuse all but /api/worker/ without Tailscale-User-Login",
     )
+    dashboard_auth.add_arguments(parser)
     args = parser.parse_args()
     raise SystemExit(
         serve(
@@ -1690,5 +1946,8 @@ if __name__ == "__main__":
             args.open,
             args.allow_host,
             require_tailscale_user=args.require_tailscale_user,
+            auth_mode=args.auth,
+            auth_home=args.auth_home.expanduser(),
+            oidc_config=args.oidc_config.expanduser() if args.oidc_config else None,
         )
     )

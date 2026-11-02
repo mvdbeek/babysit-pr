@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import dashboard_auth
 import gh_pr_watch as watch
 import github_cli
 import llm_usage
@@ -1357,6 +1358,8 @@ def main():
         type=Path,
         help="Directory for files attached to agent messages (default: HOME/attachments)",
     )
+    dashboard_auth.add_arguments(dashboard_parser)
+    dashboard_auth.add_cli(sub)
     token = sub.add_parser(
         "worker-token",
         help="Issue a worker's registration token (printed for provision_worker.sh --controller)",
@@ -1432,6 +1435,17 @@ def main():
             emit({"error": str(exc)})
             return 1
         return 0
+    if args.command == "auth":
+        # The auth home is the trust root; nothing in a sandbox may change it.
+        if sandbox.confined():
+            emit({"error": "auth commands manage credentials; run them outside the sandbox"})
+            return 1
+        try:
+            emit(dashboard_auth.cli(args))
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            emit({"error": str(exc)})
+            return 1
+        return 0
     if args.command == "dashboard":
         import dashboard
 
@@ -1444,8 +1458,11 @@ def main():
                 args.allow_host,
                 args.attachments.expanduser().resolve() if args.attachments else None,
                 require_tailscale_user=args.require_tailscale_user,
+                auth_mode=args.auth,
+                auth_home=args.auth_home.expanduser(),
+                oidc_config=args.oidc_config.expanduser() if args.oidc_config else None,
             )
-        except OSError as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             emit({"error": str(exc)})
             return 1
     db = open_db(home)
