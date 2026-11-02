@@ -2444,3 +2444,46 @@ html:has(#ws-viewer.ws-viewer-full:modal) {
     margin-inline: auto;
   }
 }
+#auth-chip {
+  position: relative;
+  height: 32px;
+  max-width: 14ch;
+  padding: 0 10px;
+  overflow: hidden;
+  border-radius: 16px;
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+#auth-chip.signed-out {
+  border-color: var(--alert-line);
+  background: var(--alert-bg);
+  color: var(--alert-fg);
+}
+#auth-chip[data-count]:not([data-count=""])::after {
+  content: attr(data-count);
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 10px;
+  background: var(--amber-bg);
+  color: var(--amber-fg);
+  font-size: 11px;
+}
+#auth-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--alert-line);
+  background: var(--alert-bg);
+  color: var(--alert-fg);
+}
+#auth-banner[hidden] {
+  display: none;
+}
+.break-glass {
+  max-width: 36rem;
+  margin: 15vh auto 0;
+  padding: 0 16px;
+}

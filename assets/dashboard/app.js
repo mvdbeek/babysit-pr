@@ -2159,6 +2159,18 @@ function machineText(entry) {
   if (entry.pending) return `${entry.label} · checking…`;
   return `${entry.label} · ${entry.agents}/${entry.max_agents} busy`;
 }
+// A worker's personal skills as its last sync left them; null when it keeps none in sync.
+function skillsText(skills) {
+  if (!skills) return "";
+  const states = {
+    in_sync: "Skills in sync",
+    partial: "Skills in sync except:",
+    out_of_date: "Skills out of date; the next launch syncs them",
+    unknown: "Skills not checked yet; the next launch syncs them",
+  };
+  const text = skills.state === "error" ? skills.error : states[skills.state];
+  return [text, ...Object.values(skills.problems ?? {}), ...(skills.skipped ?? [])].join("\n");
+}
 // Health and capacity beside the Workspaces heading.
 function renderMachines() {
   const machines = workspaceData.machines ?? [];
@@ -2176,7 +2188,8 @@ function renderMachines() {
               ? "amber"
               : "green";
       const badge = el("span", machineText(entry), `badge ${tone}`.trim());
-      if (entry.error) badge.title = entry.error;
+      const title = [entry.error, skillsText(entry.skills)].filter(Boolean).join("\n");
+      if (title) badge.title = title;
       return badge;
     }),
   );
@@ -3768,7 +3781,8 @@ function updateWorkspaceOperation() {
   $("workspace-progress").textContent =
     `${op.status}: ${op.message}` +
     (op.machine ? ` · On ${machineName(op.machine)}` : "") +
-    (op.started_by ? ` · ${op.started_by}` : "");
+    (op.started_by ? ` · ${op.started_by}` : "") +
+    (op.skills_warning ? ` · ${op.skills_warning}` : "");
   $("workspace-log").textContent = op.log || "";
   if (op.status === "failed" && op.stale_worker)
     $("workspace-result").replaceChildren(...workerUpdateNotice(op.stale_worker));

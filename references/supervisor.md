@@ -217,6 +217,27 @@ result or its worker half is gone. A worker's sshd with `ClientAliveInterval 15`
 and `ClientAliveCountMax 4` (provisioning sets it) ends a partitioned session's
 lifeline within about a minute.
 
+### Dashboard sign-in
+
+`dashboard` takes `--auth report|enforce|off` (default `report`), `--auth-home DIR`
+(default `~/.config/babysit-pr-auth`) and `--oidc-config FILE`. Report mode turns on
+only once `AUTH_HOME/oidc.json` exists, and it refuses nothing. It counts each request
+that enforce mode would refuse, by method, route and credential kind, and logs a line
+at most once a minute per route and kind, never with a key, cookie or query string.
+Enforce answers 401 without a credential and 403 when a key's scope does not cover
+the route. It refuses to start until Phase 2 moves the worker, extension and push tokens
+out of the sandbox-writable state home. The static shell, `/auth/*` and `/api/session` stay public. Worker,
+extension and push-device routes keep checking their own tokens.
+
+- **Login:** `GET /auth/login` → Keycloak (confidential client, PKCE S256, state and nonce) → `GET /auth/callback`. The callback validates the RS256 ID token and requires the `babysitter-admin` client role. It then sets an `HttpOnly; SameSite=Strict` session cookie, `Secure` everywhere but plain-http loopback. Sessions last 7 days idle and 30 days absolute on https, and 1 h idle and 8 h absolute on plain-http loopback. `POST /auth/logout` with `X-Babysit-Action: logout` ends the session and returns Keycloak's end-session URL.
+- **Keys:** `bsk_<kind>_…`, stored as SHA-256 with scopes, sent as `Authorization: Bearer`. Manage them with `auth keys create --kind read|admin|worker|ext|push [--scope …] [--expires-days N]`, `auth keys list` and `auth keys revoke ID`. `auth admin-key [--rotate]` writes `AUTH_HOME/admin-key` (0600). `auth launch-key --agent A --cwd D [--origin user|cron|subtask]` mints a 7-day launch key whose binding records who started the agent.
+- **Break-glass:** `auth login-link [--port 8765]` prints `…/auth/break-glass#t=…` links. Each is valid once for 10 minutes and gives a 12-hour session, with Keycloak up or down.
+- **Report:** `auth report [--reset]`, `GET /api/auth-report` and `auth` in `/api/status`.
+- **Sessions:** `auth sessions list` and `auth sessions revoke ID|--all`. A revocation reaches a running dashboard within a minute, or at its next idle-time renewal.
+
+Every `auth` command refuses to run inside a Seatbelt sandbox. The Keycloak client
+settings and `oidc.json` format are in [auth.md](auth.md).
+
 ## Fork and branch CI
 
 To continue the original task after green CI, add `--on-green 'AUTHORIZED_TASK'`
@@ -897,6 +918,11 @@ Ids, labels and `ssh` targets must be unique, though two spellings of one host
 (see below). One that lacks the `docker` label, is disabled or is not used by Auto
 keeps the registry valid; Auto passes it over and its reason says why.
 Disabled machines stay valid for records already pinned to them.
+`skills`, optional, lists personal skills the worker keeps in sync with this machine's
+(see Skills on workers): up to 64 unique folder names (letters, digits, `.`, `_`, `-`,
+not starting with `.` or `-`), never `synced` (claude.ai's own bucket) or `babysit-pr`
+(the worker's deployed copy provides it). Without the key the worker's skills are left alone; an empty
+list removes the copies an earlier sync installed.
 
 Remote commands use `ssh` with `BatchMode`, a 5 s connect timeout, agent and port
 forwarding off whatever the ssh config says, and a shared
@@ -947,7 +973,7 @@ Sentry issues, new tasks that file an issue and new tasks with other clones (`--
 are refused with the reason. The launch first compares the worker's deployed
 babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
 refuses a mismatch, naming the `provision_worker.sh --user-step --sha <sha>` that fixes
-it. For a Linux worker whose `babysit_root` is the copy that script deploys
+it, then syncs the worker's skills when it has `skills` (see Skills on workers). For a Linux worker whose `babysit_root` is the copy that script deploys
 (`~/.local/share/babysit-pr/app`), the refusal also offers **Update <worker>**: the
 dashboard runs that user step, from this machine's commit, over the worker's ssh
 (`/api/worker-update`, one update per worker at a time), then reads the worker's commit
@@ -990,3 +1016,99 @@ previews where Auto would place a launch and which machines can take it;
 which the Workspaces badges poll once `/api/status` reports `workers` (absent without
 a registry, so a single machine never asks). The experimental Workspaces tab lists each
 enabled worker's worktrees read-only (see the workspaces reference).
+
+### Skills on workers
+
+A worker with `skills` gets each from this user's chezmoi source, never from the applied
+copies in `~/.claude/skills` or `~/.codex/skills`: the dashboard runs outside any
+sandbox, but agents here may write those (Safehouse grants `~/.claude` and `~/.codex`),
+while `~/.local/share/chezmoi` is read-only to them. So a skill edited in place reaches
+workers only once it is in the chezmoi source (`chezmoi add` or `chezmoi re-add`, or a
+commit pulled there). A skill is the target `~/.claude/skills/<name>`, else
+`~/.codex/skills/<name>`, which `chezmoi archive --format=tar` renders (`dot_`,
+`executable_` and other source prefixes resolved, templates executed; a `run_` script
+inside a skill's target is synced as a plain file, never run). chezmoi runs by absolute
+path (`/opt/homebrew/bin/chezmoi`, or `BABYSIT_CHEZMOI` in the dashboard's environment),
+with stdin closed, only this user's home (from the password database) and the system
+`PATH` in its environment, no TTY or pager, externals not refreshed and a 30 s deadline;
+a template needing a password manager fails. `~/.config/chezmoi` is not read, since its
+config could name another source or add hooks: chezmoi gets `--source` set to
+`~/.local/share/chezmoi` under that home, and an empty `--config`, its persistent state
+and its cache in `--home/chezmoi/` (private), so neither the user's config nor a cache
+an agent could write here steers what is rendered. Templates therefore see no `data` from
+the user's config, and an external under a skill's target would be downloaded into that
+cache rather than taken from the user's. A target chezmoi does not manage is refused: "not in your chezmoi source;
+add it with chezmoi add". A target that is a chezmoi symlink (as `~/.claude/skills/merge-forward`
+links to `~/.codex/skills/merge-forward`) is followed by asking chezmoi for the target
+it names, at most twice and only to another skill target, never through the file system.
+
+`scripts/skill_sync.py` takes only the target's folders and regular files (a link,
+hard link, device or entry outside the target refuses the whole bundle; `.DS_Store`,
+`__pycache__` and `.git` are left out) and re-packs them into one tar, sorted, dated
+1970, owned by nobody and keeping only the executable bit, so the same skills always give
+the same bytes; at most 8 MiB of files and 2000 entries, and the folder must hold a
+`SKILL.md`. The bundle's SHA-256 is its version, and a packing is reused for 30 s, so a
+burst of launches packs once.
+
+Before every launch on such a worker (a scheduled launch or cron run, Handle, Create, a
+new task, batch review, a sub-task, a resume, a watch's repair there) and after
+**Update <worker>** deploys, the dashboard asks the worker (probe op `skills_status`)
+for the bundle its manifest records and, for each skills folder, whether it still holds
+that bundle's copies. Only when the bundle differs or a folder does not does it stage the
+bundle in `~/.local/state/babysit-pr/skill-bundles/` there (`machines.put_file`) and
+install it (probe op `skills_install`). The probe is this machine's `remote_probe.py`, as
+for every op, so what installs never depends on the worker's deployed copy. Workers
+without `skills` are never asked.
+
+A sync fails when it cannot run (a skill missing or refused here, the worker unreachable,
+the install refused) or leaves the skills folder the launch's own agent reads (its Claude
+account's, the default one's or Codex's) without the bundle, with the reason the worker
+gave (`Permission denied`, say). Other folders it could not write are reported, not a
+failure. A failed sync stops cron runs, scheduled launches and sub-tasks: nobody watches
+those start, and an agent told to run `/merge-forward` without it, or with last week's
+copy, would improvise rather than stop. A launch a person starts (Handle, Create, a new
+task) and a resume go ahead with the reason shown on the operation or the resume's
+warning, where that person can stop the agent; a repair goes ahead with it in the run's
+`worker.log`, since it needs only babysit-pr's own skill.
+
+The install takes the staged file only from that folder, removes it whatever it holds,
+checks its SHA-256, and checks every entry again (no absolute path, `..`, control
+character, link or device; each skill's folder before its contents, with a `SKILL.md`;
+`synced` and `babysit-pr` refused in any case; the same limits). Its targets are every
+Claude account's `~/.claude/accounts/<name>/skills`, the default configuration's
+`~/.claude/skills` and Codex's `$CODEX_HOME/skills` (or `~/.codex/skills`):
+babysit-bwrap binds an account's `skills` read-only and refuses a link there, and a link
+inside it to `~/.claude/skills` would dangle in the sandbox, so each gets real folders.
+A missing `skills` folder is made private (0700). `~/.claude` and Codex's home may be
+links a dotfile manager made; nothing below them is followed. babysit-bwrap binds each
+skills folder read-only and hides `~/.claude/accounts` from a default-account agent under
+a tmpfs, but on a Mac worker Safehouse may grant `~/.claude` and `~/.codex`, and an agent
+given Docker reaches every file of the user (see Residual below): an account folder or `skills` folder that is a link is
+left alone and reported, and every file is created and renamed relative to opened
+folders, without following links. Each skill is written as a new private copy beside the
+old one; on Linux the two are exchanged in one step (`renameat2` with
+`RENAME_EXCHANGE`), so a reader sees one whole copy or the other, and elsewhere (or on a
+kernel without it) the old copy is renamed aside and the new one renamed in, leaving the
+name missing for that moment. The old copy is then removed; a copy that already matches is
+left as it is. Leftovers of an interrupted sync (`.babysit-skill-*`) go first.
+
+`~/.local/state/babysit-pr/skills.json` there, in the state directory no sandbox can
+write, records the bundle, each skill's content digest and, per skills folder, the
+skills the sync put there. Only those are ever replaced or removed, plus names that are
+free or already hold exactly the bundle's copy, which it adopts: a folder or link of the
+same name that it did not make is left alone and reported, and skills dropped from
+`skills` are removed only where it put them. Before swapping anything the install records
+every name it may touch, with no bundle, so an install cut short (killed, or failing to
+write the manifest) leaves nothing unrecorded and the next launch finishes it; records of
+folders that no longer exist are dropped. The manifest is flushed to disk before it
+replaces the old one. `skills_status` digests the installed copies again, so a copy an
+agent or a person changed is reinstalled at the next launch; a damaged manifest stops the
+sync until it is moved aside. `GET /api/machines` gives each worker's `skills` as last
+seen (`state`: `in_sync`, `partial` with `problems` by folder, `out_of_date`, `error`
+with `error`, or `unknown` before the first check since the dashboard started; `skipped`
+lists folders left alone), and the Workspaces machine badge shows it in its tooltip.
+
+Residual: a worker agent granted Docker (`--enable=docker`) reaches every file of the
+worker's user, as the Linux sandbox section says, the skills, the manifest and the staged
+bundles included, so it can change what the next launch of every account runs from its
+skills and, by rewriting the manifest, which copies the sync treats as its own.

@@ -35,6 +35,7 @@ import machines
 import placement
 import remote_probe
 import safe_git
+import skill_sync
 import worker_api
 import worker_updates
 import workspace_agents
@@ -1214,7 +1215,8 @@ class Workspaces:
 
         ``available`` and ``reason`` are placement's verdict for any launch: whether a
         person may choose the machine, and why not or what holds Auto back. A worker also
-        says whether its babysit-pr can be updated from here, and its last update.
+        says whether its babysit-pr can be updated from here, its last update, and how its
+        skills stand (``skill_sync.status``; None when it keeps none in sync).
         """
         config, loads = self.loads.snapshot()
         updates = self.worker_updates.snapshot()
@@ -1230,6 +1232,7 @@ class Workspaces:
                     "local": False,
                     "updatable": worker_updates.updatable(m),
                     "update": updates.get(m.id),
+                    "skills": skill_sync.status(m, self.home),
                     # Without both addresses the dashboard cannot keep it to /api/worker/.
                     "fenced": machines.fenced(m),
                 }
@@ -3078,7 +3081,9 @@ class Workspaces:
         wt runs in the worker's own environment, marked as a worker's, and hands back the
         exit watch of the agent it typed, which is recorded here with the machine. The
         checkout and agent are verified through probe ops and the worker's herdr: nothing
-        on this machine reads a worker's paths.
+        on this machine reads a worker's paths. The worker's skills are brought to this
+        machine's first (``skill_sync``): a failure stops a scheduled launch or a sub-task,
+        and is a warning on the operation of one a person started.
         """
         import cron_agents
 
@@ -3106,6 +3111,16 @@ class Workspaces:
                         f"{wanted[:12]}: update babysit-pr on {machine.label} "
                         f"(provision_worker.sh --user-step --sha {wanted})"
                     )
+                if machine.skills is not None:
+                    self.save_operation(op, message=f"Syncing skills to {machine.label}")
+                    try:
+                        skill_sync.ensure(self.home, machine, op["agent"], op.get("claude_account"))
+                    except ValueError as exc:
+                        # Nobody watches a scheduled launch or a sub-task start; a person
+                        # who started one sees the warning and can stop the agent.
+                        if op.get("exit_marker") or op.get("parent"):
+                            raise
+                        self.save_operation(op, skills_warning=str(exc))
                 owner, repo = pr["repo"].split("/")
                 scratch = is_scratch(pr)
                 if scratch:
