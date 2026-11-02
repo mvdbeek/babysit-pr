@@ -5,9 +5,11 @@ offers this update where it reports that: the user step of ``provision_worker.sh
 this machine's commit, over the worker's ssh, as references/worker-setup.md runs it by
 hand. It is offered only for the deployed copy that script manages, on Linux; the
 worker's commit is read back afterwards, so a checkout the script left alone (local
-changes) is reported rather than taken as updated.
+changes) is reported rather than taken as updated. A deployed update also syncs the
+worker's skills (``skill_sync``).
 """
 
+import contextlib
 import subprocess
 import threading
 import time
@@ -15,6 +17,7 @@ from pathlib import Path
 
 import machines
 import remote_probe
+import skill_sync
 
 DEPLOY_TIMEOUT = 600
 # The worker stops the script itself this long before the ssh client gives up, so a
@@ -93,6 +96,11 @@ class WorkerUpdates:
             # account): only the commit read back decides.
             ok = deployed == sha
             error = None if ok else (output[-ERROR_CHARS:] or f"{m.label} still runs {deployed}")
+            if ok:
+                # Its skills too, so a launch right after finds them current; a failure is
+                # the machine listing's to show, and the next launch tries again.
+                with contextlib.suppress(ValueError):
+                    skill_sync.ensure(self.home, m)
         except subprocess.TimeoutExpired:
             ok, error = False, f"{m.label} did not finish within {DEPLOY_TIMEOUT} seconds"
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:

@@ -11,6 +11,7 @@ import machines
 import pr_workspaces as pw
 import pytest
 import remote_probe
+import skill_sync
 import worker_updates
 
 APP = Path(pw.__file__).resolve().parent.parent
@@ -134,3 +135,22 @@ def test_unknown_machines_are_refused(worker):
         updates.update("box")
     with pytest.raises(ValueError, match="Name the worker"):
         updates.update(None)
+
+
+def test_a_deployed_update_also_syncs_the_workers_skills(worker, tmp_path, monkeypatch):
+    updates, *_ = worker
+    (tmp_path / "machines.json").write_text(
+        json.dumps({"version": 1, "machines": [{**CHONK, "skills": ["merge-forward"]}]})
+    )
+    synced = []
+
+    def ensure(home, m):
+        synced.append(m.skills)
+        raise ValueError("Cannot sync skills to chonk: no")
+
+    monkeypatch.setattr(skill_sync, "ensure", ensure)
+    updates.update("chonk")
+    done = wait(updates)
+    # The deploy still succeeded; the machine listing shows the skills' failure.
+    assert done["ok"] is True and done["error"] is None
+    assert synced == [("merge-forward",)]

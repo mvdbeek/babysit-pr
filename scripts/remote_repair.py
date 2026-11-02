@@ -31,7 +31,9 @@ from pathlib import Path
 
 import machines
 import owned_process
+import remote_probe
 import session_locks
+import skill_sync
 
 SPECS = "~/.local/state/babysit-pr/repair-specs"
 # Specs are read once, at start; older ones are removed when the next is staged.
@@ -84,6 +86,14 @@ def check_version(home, worker):
             f"{worker.label} runs babysit-pr {deployed[:12]}, this machine {own[:12]}: "
             f"update babysit-pr on {worker.label} (provision_worker.sh --user-step --sha {own})"
         )
+
+
+def config_account(config_dir):
+    """The Claude account a worker configuration directory is (None: the default)."""
+    parent, name = os.path.split(str(config_dir or "").rstrip("/"))
+    if os.path.basename(parent) == "accounts" and remote_probe.ACCOUNT.fullmatch(name):
+        return name
+    return None
 
 
 def spec_for(worker, job, attempt, prompt, pr):
@@ -197,6 +207,12 @@ def run(home, job, folder, pr, prompt):
     assert worker is not None
     attempt = folder.name
     check_version(home, worker)
+    try:
+        skill_sync.ensure(home, worker, job["agent"], config_account(job.get("claude_config_dir")))
+    except ValueError as exc:
+        # A repair needs only babysit-pr's own skill, which the deployed copy provides.
+        with (folder / "worker.log").open("a") as errors:
+            errors.write(f"{exc}; the repair runs with the skills it has\n")
     spec = machines.put_file(
         home,
         worker,
