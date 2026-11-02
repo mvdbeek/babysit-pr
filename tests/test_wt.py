@@ -1926,6 +1926,16 @@ def test_wt_does_not_hide_origin_fetch_failure(repo):
     assert not (home / "src/worktrees/repo/fetch-failed").exists()
 
 
+def test_wt_names_a_base_github_does_not_have_and_its_default(repo):
+    home, _, _ = repo
+    result = run_tool("wt", "-r", "repo", "master", "no-such-base", check=False)
+    assert result.returncode == 1
+    assert result.stderr.rstrip().endswith(
+        "wt: base/repo has no branch master; its default branch is main"
+    )
+    assert not (home / "src/worktrees/repo/no-such-base").exists()
+
+
 def test_auto_selects_running_herdr_then_tmux_then_none(repo, monkeypatch):
     home, git, state = repo
     monkeypatch.delenv("WT_MULTIPLEXER")
@@ -2156,7 +2166,7 @@ def test_machine_is_refused_on_a_worker_and_beside_dashboard_options(tmp_path):
         ("wtpr", {"positional": ["7"]}, "use Handle in the dashboard for a pull request"),
         ("wt", {"positional": ["7"]}, "use Handle in the dashboard for a pull request"),
         ("wt", {"positional": ["https://github.com/a/b/pull/7"]}, "for a pull request"),
-        ("wt", {"also": ["other"]}, "other repositories (--with) yet"),
+        ("wt", {"also": ["other"]}, "in the dashboard's New task"),
         ("wt", {"prompt": ""}, "needs a prompt (-p or -F)"),
         ("wt", {"positional": ["main"]}, "only a new branch from a base (wt <base> <branch>)"),
     ],

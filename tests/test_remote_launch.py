@@ -23,6 +23,7 @@ import pr_workspaces as pw
 import pytest
 import remote_probe
 import workspace_exit
+from test_new_tasks import other_clone
 from test_new_tasks import request as new_request
 from test_pr_workspaces import finish, helper_calls, local  # noqa: F401 (fixture)
 from test_remote_cron import bwrap, git, host, rollout, short_tmp  # noqa: F401 (fixtures)
@@ -358,6 +359,67 @@ def test_a_task_whose_attached_file_cannot_be_copied_is_not_started(remote):
     assert not any("wt.py" in c for c in remote_commands(state))
 
 
+def worker_clone(worker, name):
+    """The worker's own clone of base/<name>, with a ``dev`` branch one commit ahead."""
+    there = worker / "src" / name
+    there.mkdir(parents=True)
+    git("init", "-q", "-b", "main", cwd=there)
+    for branch in ("main", "dev"):
+        git("switch", "-q", "-C", branch, cwd=there)
+        git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            branch,
+            cwd=there,
+        )
+    git("remote", "add", "upstream", f"https://github.com/base/{name}.git", cwd=there)
+    return there.resolve()
+
+
+def test_a_new_task_on_a_worker_also_checks_out_its_other_clones(remote):
+    manager, _, state, worker = remote
+    other = other_clone(manager, git)
+    there = worker_clone(worker, "other")
+    # The name is taken in the worker's other clone, so every checkout gets the next one.
+    git("branch", "both", cwd=there)
+    task = new_request(
+        manager, name="both", also=[str(other)], also_bases={str(other): "dev"}, machine="mini"
+    )
+    op = finish(manager, manager.new_task(task)["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert op["also"] == ["~/src/other"] and op["also_repos"] == {"~/src/other": "base/other"}
+    assert op["also_bases"] == {"~/src/other": "dev"}
+    path = (worker / "src/worktrees/other/both-2").resolve()
+    assert op["branch"] == "both-2" and op["also_paths"] == [str(path)]
+    assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "both-2"
+    assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "dev", cwd=there)
+    [launch] = [c for c in remote_commands(state) if "wt.py" in c]
+    assert f" --with {there}:dev " in launch
+    [agent] = store(state)["machines"]["Mac mini"]["agents"]
+    assert f"you can write and commit there:\n- {path}" in agent["task"]
+
+
+def test_a_worker_without_an_other_clone_is_refused(remote):
+    manager, _, state, worker = remote
+    other = other_clone(manager, git)
+    task = new_request(manager, name="lonely", also=[str(other)], machine="mini")
+    op = finish(manager, manager.new_task(task)["operation"]["pr"])
+    assert op["status"] == "failed"
+    assert "No clone of base/other at" in op["message"]
+    assert not [c for c in remote_commands(state) if "wt.py" in c]
+    # A worker clone named like the task's own repository would share its checkouts.
+    named = other_clone(manager, git, "named")
+    git("remote", "set-url", "upstream", "https://github.com/base/Repo.git", cwd=named)
+    with pytest.raises(ValueError, match="share a clone name on Mac mini"):
+        manager.new_task(new_request(manager, name="x", also=[str(named)], machine="mini"))
+
+
 def test_a_new_task_on_a_worker_keeps_claudes_auto_permission_mode(remote):
     manager, _, state, _ = remote
     task = new_request(manager, name="careful", agent="claude", permission_mode="auto")
@@ -411,8 +473,6 @@ def test_work_that_may_need_repairs_stays_off_workers(remote):
     with pytest.raises(ValueError, match="^Mac mini: only takes pull request work and new tasks$"):
         manager.new_task(new_request(manager, issue_title="Remote issue", machine="mini"))
     assert not store(state).get("gh")
-    with pytest.raises(ValueError, match="Other repositories"):
-        manager.new_task(new_request(manager, name="x", also=["/elsewhere"], machine="mini"))
     assert not store(state).get("ssh")
 
 
@@ -525,6 +585,7 @@ def test_a_workers_launch_names_a_free_checkout_and_trusts_it(host):  # noqa: F8
         "root": str(root),
         "name": "pr-base-7",
         "path": str(root / "pr-base-7"),
+        "also": [],
     }
     projects = json.loads((home / ".claude.json").read_text())["projects"]
     assert projects[found["path"]] == {"hasTrustDialogAccepted": True}
@@ -539,6 +600,34 @@ def test_a_workers_launch_names_a_free_checkout_and_trusts_it(host):  # noqa: F8
     git("remote", "set-url", "origin", "https://github.com/bob/repo.git", cwd=clone)
     with pytest.raises(ValueError, match="is not a clone of base/repo"):
         prepare(home, clone)
+
+
+def test_a_workers_launch_names_a_checkout_free_in_its_other_clones(host):  # noqa: F811
+    home, clone, _ = host
+    other = worker_clone(home, "other")
+    git("branch", "pr-base-7", cwd=other)
+    found = prepare(home, clone, also=[[str(other), "base/other"]])
+    assert found["name"] == "pr-base-7-2"
+    path = (home / "src/worktrees/other/pr-base-7-2").resolve()
+    assert found["also"] == [{"clone": str(other), "path": str(path)}]
+    with pytest.raises(ValueError, match="is not a clone of base/else"):
+        prepare(home, clone, also=[[str(other), "base/else"]])
+    with pytest.raises(ValueError, match="share another repository"):
+        prepare(home, clone, also=[[str(clone), "base/repo"]])
+    # Checked out under worktrees/repo, beside the task's own.
+    named = worker_clone(home / "elsewhere", "repo")
+    with pytest.raises(ValueError, match="share another repository"):
+        prepare(home, clone, also=[[str(named), "base/repo"]])
+    (home / "src/worktrees").mkdir(parents=True, exist_ok=True)
+    (home / "src/worktrees/other").symlink_to(home)
+    with pytest.raises(ValueError, match="is a symbolic link"):
+        prepare(home, clone, also=[[str(other), "base/other"]])
+    (home / "src/worktrees/other").unlink()
+    for bad in ([["relative", "base/other"]], [[str(other)]], [[str(other), "x"]], "x"):
+        with pytest.raises(ValueError):
+            prepare(home, clone, also=bad)
+    with pytest.raises(ValueError, match="at most"):
+        prepare(home, clone, also=[[str(other), "base/other"]] * 5)
 
 
 def test_a_workers_checkout_is_read_from_its_own_layout(host, tmp_path):  # noqa: F811
@@ -567,10 +656,28 @@ def test_the_babysit_pr_a_worker_runs_is_its_deployed_commit(host):  # noqa: F81
 def test_worker_launch_paths_with_control_characters_are_refused(bad):
     found = {"clone": "/h/src/r", "root": "/h/src/worktrees/r", "name": "n"}
     found["path"] = "/h/src/worktrees/r/n"
-    remote_probe.validate_wt_prepare(found)
+    other = {"clone": "/h/src/o", "path": "/h/src/worktrees/o/n"}
+    remote_probe.validate_wt_prepare({**found, "also": [other]})
     for key in found:
         with pytest.raises(ValueError, match="Malformed probe answer"):
-            remote_probe.validate_wt_prepare({**found, key: f"{found[key]}{bad}"})
+            remote_probe.validate_wt_prepare({**found, key: f"{found[key]}{bad}", "also": []})
+    for key in other:
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_wt_prepare(
+                {**found, "also": [{**other, key: f"{other[key]}{bad}"}]}
+            )
+    # Never the task's own checkout, nor one clone twice, nor a clone named "..".
+    for others in (
+        [{"clone": "/h/src/r", "path": "/h/src/worktrees/r/n"}],
+        [other, other],
+        [{"clone": "/h/src/..", "path": "/h/src/worktrees/../n"}],
+    ):
+        with pytest.raises(ValueError, match="Malformed probe answer: also"):
+            remote_probe.validate_wt_prepare({**found, "also": others})
+    # Only ever beside the task's checkout, in the folder named after the clone.
+    for path in ("/h/src/worktrees/r/n", "/elsewhere/o/n", "/h/src/worktrees/o/m"):
+        with pytest.raises(ValueError, match="Malformed probe answer: also"):
+            remote_probe.validate_wt_prepare({**found, "also": [{**other, "path": path}]})
 
 
 def test_a_long_pr_branch_keeps_its_launch_and_exit_watch(remote, monkeypatch):

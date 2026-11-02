@@ -3218,8 +3218,8 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     const also = new Set();
     // A base branch typed for a chosen clone, by clone; empty means its default branch.
     const alsoBases = new Map();
-    // Filing an issue or adding clones keeps the task off workers; set once the
-    // Machine select exists, below.
+    // Filing an issue keeps the task off workers, and adding clones keeps Auto off them;
+    // set once the Machine select exists, below.
     let placementChanged = () => {};
     const alsoBox = el("details", undefined, "new-task-also");
     const alsoSummary = el("summary");

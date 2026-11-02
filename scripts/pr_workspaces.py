@@ -1296,7 +1296,7 @@ class Workspaces:
             "claude_account": query.get("account") or None,
             "docker": query.get("docker") == "1",
             "sandboxed": query.get("unsandboxed") != "1",
-            # Which other clones does not matter here: workers take none yet.
+            # Which other clones does not matter here: Auto keeps any off workers.
             "also": ["other"] if query.get("also") == "1" else [],
         }
         req = placement.request(fields, config["repos"], config.get("docker"))
@@ -1661,7 +1661,8 @@ class Workspaces:
         the workspace is made for that issue, as `wti` would; otherwise ``name`` is a new
         branch from ``base`` (the clone's default branch when empty), as `wt` would.
         ``also`` lists other local clones the task covers: the branch is checked out in
-        each and the agent's sandbox may write there (`wt --with`). ``parent``, the launch
+        each and the agent's sandbox may write there (`wt --with`); on a worker, in its
+        own clone of each one's repository, under its src. ``parent``, the launch
         a sub-task was asked for from (see ``subtask``), is recorded on the operation.
         """
         allowed = {
@@ -1724,8 +1725,6 @@ class Workspaces:
             if request.get("issue_title", "").strip():
                 # Refused before an issue is filed for a launch that cannot start.
                 raise ValueError(worker_refusal({"kind": "issue"}, remote))
-            if also:
-                raise ValueError(f"Other repositories cannot join a task on {remote.label} yet")
             # The worker's own clone, checked there; nothing clones on a worker.
             clone = f"{remote.src.rstrip('/')}/{repo.split('/')[1]}"
         elif not any(r["repo"] == repo and r["clone"] == clone for r in listed):
@@ -1748,6 +1747,23 @@ class Workspaces:
                 raise ValueError(
                     f"The base branch for {Path(path).name} is not a valid branch name"
                 )
+        also_repos = {}
+        if remote is not None and also:
+            # Each other repository in the worker's own clone of it, found as the task's
+            # is: by its name under the worker's src. A clone with an upstream is listed
+            # first as that repository.
+            slugs: dict[str, str] = {}
+            for listing in listed:
+                slugs.setdefault(listing["clone"], listing["repo"])
+            names = [slugs[path].split("/")[1] for path in also]
+            if len({n.lower() for n in [repo.split("/")[1], *names]}) != len(names) + 1:
+                raise ValueError(f"Two of the repositories share a clone name on {remote.label}")
+            there = {
+                path: f"{remote.src.rstrip('/')}/{n}" for path, n in zip(also, names, strict=True)
+            }
+            also_repos = {there[path]: slugs[path] for path in also}
+            bases = {there[path]: base for path, base in bases.items()}
+            also = [there[path] for path in also]
         agent = request.get("agent", "codex")
         if agent not in {"codex", "claude"}:
             raise ValueError("Select Codex or Claude")
@@ -1802,6 +1818,7 @@ class Workspaces:
             "exit_when_done": request.get("exit_when_done", False),
             "also": also,
             **({"also_bases": bases} if bases else {}),
+            **({"also_repos": also_repos} if also_repos else {}),
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
             **({"parent": parent, "started_by": started_by(parent)} if parent else {}),
             "message": "Queued",
@@ -3144,8 +3161,15 @@ class Workspaces:
                     agent=op["agent"],
                     account=op.get("claude_account"),
                     sandbox=cron_agents.BACKENDS[machine.os],
+                    also=[[c, op["also_repos"][c]] for c in op.get("also", [])],
                 )
                 name = found["name"]
+                # Each other clone's base, by the real path the probe found it at there.
+                bases = op.get("also_bases", {})
+                also = [
+                    (other["clone"], bases.get(c), other["path"])
+                    for c, other in zip(op.get("also", []), found["also"], strict=True)
+                ]
                 label = (
                     []
                     if scratch
@@ -3208,6 +3232,11 @@ class Workspaces:
                         if op.get("exit_when_done")
                         else []
                     ),
+                    *(
+                        word
+                        for c, base, _ in also
+                        for word in ("--with", f"{c}:{base}" if base else c)
+                    ),
                     "--no-focus",
                     "--name",
                     name,
@@ -3247,6 +3276,14 @@ class Workspaces:
                     )
                 if not scratch and made["upstream"] != self.expected_upstream(pr):
                     raise ValueError("Resulting checkout has unexpected PR head provenance")
+                for c, _, path in also:
+                    made = cron_agents.probe(
+                        self.home, machine, "wt_checkout", 30, clone=c, path=path
+                    )
+                    if made["path"] != path or made["branch"] != name:
+                        raise ValueError(f"No checkout of {name} appeared for {c}")
+                if also:
+                    self.save_operation(op, also_paths=[path for _, _, path in also])
                 for _ in range(30):
                     space = next(
                         (

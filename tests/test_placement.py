@@ -69,7 +69,7 @@ def test_hard_filter_reasons():
     req = {"agent": "codex", "docker": True, "also": ["base/other"]}
     found = pl.exclusions(req, fleet, loads, {"full": 1}, NOW)
     assert {k: tuple(v) for k, v in found.items()} == {
-        "mini": ("cannot check out other repositories yet", False),
+        "mini": ("takes other repositories only when chosen", True),
         "box": ("lacks docker", False),
         "off": ("disabled", False),
         "full": ("lacks docker", False),
@@ -111,11 +111,19 @@ def test_a_cron_job_outside_its_sandbox_stays_here():
     assert pl.exclusions({"kind": "scratch", "sandboxed": False}, FLEET, {}, {}, NOW) == {}
 
 
-def test_other_repositories_keep_a_task_here():
+def test_other_repositories_keep_auto_here_but_a_worker_may_be_chosen():
     req = {"sandboxed": False, "also": ["base/other"]}
-    refused = pl.Exclusion("cannot check out other repositories yet", False)
-    assert pl.exclusions(req, FLEET, {}, {}, NOW) == {"mini": refused, "box": refused}
+    soft = pl.Exclusion("takes other repositories only when chosen", True)
+    assert pl.exclusions(req, FLEET, {}, {}, NOW) == {"mini": soft, "box": soft}
     assert choose(req, loads={"local": load(agents=19)}).machine is None
+    # Even with this machine full: its clones are the ones the task was given.
+    assert choose(req, loads={"local": load(agents=20)}).machine is None
+    chosen = choose({**req, "override": "box"})
+    assert chosen.machine == "box"
+    assert chosen.reason == "chosen; takes other repositories only when chosen"
+    # Full or unreachable still says so first.
+    full = pl.exclusions(req, FLEET, {"box": load(agents=8)}, {}, NOW)
+    assert full["box"] == pl.Exclusion("full (8/8)", True)
     # A local entry describing this machine is never refused for them.
     fleet = {**FLEET, "local": machine("local", "This Mac", labels=())}
     assert "local" not in pl.exclusions(req, fleet, {}, {}, NOW)
