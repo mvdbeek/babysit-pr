@@ -77,7 +77,9 @@ An empty run list means waiting for CI, not success. Details and examples are in
 ## Hand off monitoring
 
 1. Finish authorized local changes, tests, commits, and pushes. The existing
-   worktree must be clean and match the watched remote branch and commit.
+   worktree must be clean and match the watched remote branch and commit; a
+   local branch of another name passes when it tracks that branch on the PR's
+   head repository.
 2. Identify the original agent kind and exact saved session. For Codex, use
    `CODEX_THREAD_ID` when available,
    otherwise corroborate an explicit UUID against its rollout. Never use `--last`

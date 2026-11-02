@@ -154,6 +154,7 @@ def test_a_workers_checkout_is_read_there(box):
     assert state == {
         "path": str(tree),
         "branch": "feature",
+        "upstream": None,
         "head": box["sha"],
         "dirty": False,
         "common": str((box["worker"] / "src/repo/.git").resolve()),
@@ -163,10 +164,21 @@ def test_a_workers_checkout_is_read_there(box):
     assert remote_probe._host_worktree(str(tree), root)["dirty"] is True
     main = remote_probe._host_worktree(str(box["worker"] / "src/repo"), root)
     assert main["common"] is None and main["branch"] == "main"
+    git("config", "remote.fork.url", "https://github.com/Base/repo.git", cwd=tree)
+    git("config", "branch.feature.remote", "fork", cwd=tree)
+    git("config", "branch.feature.merge", "refs/heads/feature", cwd=tree)
+    found = remote_probe.validate_worktree(remote_probe._host_worktree(str(tree), root))
+    assert found["upstream"] == ["base/repo", "feature"]
     (box["tree"] / "sub").mkdir()
     with pytest.raises(ValueError, match="top of a Git checkout"):
         remote_probe._host_worktree(str(box["tree"] / "sub"), root)
-    for bad in ({**state, "path": "/a\x1bb"}, {**state, "extra": 1}, {**state, "head": "x"}):
+    for bad in (
+        {**state, "path": "/a\x1bb"},
+        {**state, "extra": 1},
+        {**state, "head": "x"},
+        {**state, "upstream": ["base/repo"]},
+        {**state, "upstream": "feature"},
+    ):
         with pytest.raises(ValueError, match="Malformed"):
             remote_probe.validate_worktree(bad)
 
@@ -290,6 +302,26 @@ def test_a_worker_watch_is_refused_on_a_mac_or_disabled_worker(box):
         register(box)
     registry(box["home"], enabled=False)
     with pytest.raises(ValueError, match="disabled"):
+        register(box)
+
+
+def track_feature(box, name="review-repo-pr-7", repo="base/repo"):
+    """The worker's checkout on a branch of its own name, tracking the PR branch."""
+    tree = box["tree"]
+    git("branch", "-q", "-m", name, cwd=tree)
+    git("config", "remote.fork.url", f"https://github.com/{repo}.git", cwd=tree)
+    git("config", f"branch.{name}.remote", "fork", cwd=tree)
+    git("config", f"branch.{name}.merge", "refs/heads/feature", cwd=tree)
+
+
+def test_a_worker_checkout_of_another_name_is_watched_while_it_tracks_the_pr_branch(box):
+    track_feature(box)
+    assert register(box)["cwd"] == str(box["tree"])
+
+
+def test_a_worker_checkout_tracking_another_repository_is_refused(box):
+    track_feature(box, repo="someone/repo")
+    with pytest.raises(ValueError, match="not watchable from this worker"):
         register(box)
 
 

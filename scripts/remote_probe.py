@@ -1730,9 +1730,10 @@ def _host_version(babysit_root):
 
 
 def _host_worktree(path, root):
-    """A watched checkout here: its top, branch (None when detached), head, whether it has
-    changes, its Git common dir when it is a linked worktree (None otherwise), and the
-    real path of ``root``, where this machine's worktrees live."""
+    """A watched checkout here: its top, branch (None when detached), the ``[slug,
+    branch]`` it tracks (None when unset), head, whether it has changes, its Git common
+    dir when it is a linked worktree (None otherwise), and the real path of ``root``,
+    where this machine's worktrees live."""
     _arg_paths([root], home=True)
     real = _host_checkout(path)
     try:
@@ -1743,9 +1744,14 @@ def _host_worktree(path, root):
         common = _host_common_dir(real)
     except ValueError:
         common = None
+    upstream = None
+    if branch is not None:
+        config = repo_config(host_git, real)
+        upstream = provenance(real, common, branch, None, config, remote_slugs(config))["upstream"]
     return {
         "path": real,
         "branch": branch,
+        "upstream": upstream,
         "head": host_git(real, "rev-parse", "HEAD"),
         "dirty": bool(host_git(real, "status", "--porcelain")),
         "common": common,
@@ -3393,21 +3399,20 @@ def validate_wt_prepare(value):
     return value
 
 
+def _upstream(value):
+    return value is None or (
+        isinstance(value, list)
+        and len(value) == 2
+        and (value[0] is None or _text(value[0]))
+        and _text(value[1])
+    )
+
+
 def validate_wt_checkout(value):
     _expect(isinstance(value, dict) and set(value) == {"path", "branch", "upstream"}, "fields")
     _expect(_absolute(value["path"]), "path")
     _expect(_text(value["branch"]), "branch")
-    upstream = value["upstream"]
-    _expect(
-        upstream is None
-        or (
-            isinstance(upstream, list)
-            and len(upstream) == 2
-            and (upstream[0] is None or _text(upstream[0]))
-            and _text(upstream[1])
-        ),
-        "upstream",
-    )
+    _expect(_upstream(value["upstream"]), "upstream")
     return value
 
 
@@ -3466,11 +3471,12 @@ def validate_worktree(value):
     """A watched checkout's state on a worker: what registration and repairs compare."""
     _expect(
         isinstance(value, dict)
-        and set(value) == {"path", "branch", "head", "dirty", "common", "root"},
+        and set(value) == {"path", "branch", "upstream", "head", "dirty", "common", "root"},
         "fields",
     )
     _expect(_shown_path(value["path"]), "path")
     _expect(value["branch"] is None or (_text(value["branch"]) and value["branch"]), "branch")
+    _expect(_upstream(value["upstream"]), "upstream")
     _expect(
         isinstance(value["head"], str)
         and re.fullmatch("[0-9a-f]{40}([0-9a-f]{24})?", value["head"]),
