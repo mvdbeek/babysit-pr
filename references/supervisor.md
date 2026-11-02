@@ -983,7 +983,17 @@ in a remote; nothing clones on a worker, so a missing clone is refused. A probe 
 the new checkout under `<src>/worktrees/<repo name>` and trusts it for Claude in the
 config its sandbox reads (a config that is a symlink or over 64 MiB is left alone, and
 the rewritten one keeps only its permission bits); the brief is staged in `~/.local/state/babysit-pr/workspace-prompts`
-there. The worker's own `wt.py` then runs over ssh with `BABYSIT_WORKER=<id>`, `--gpg`
+there. Files attached in the dashboard are copied first, each under a new name, into
+`~/.local/state/babysit-pr/attachments` there (a private folder, pruned like the
+uploads here), and the brief names those copies; a failed copy fails the launch before
+anything is typed. Every agent on the worker can read every copy, as every agent here
+can read the uploads: babysit-bwrap makes the folder and binds it read-only, so on a
+Linux worker an agent started by an older babysit-bwrap cannot see it (start it again);
+Agent Safehouse grants all of `~/.local/state/babysit-pr`, so on a macOS worker any
+agent there can also change a copy. Only lines after the brief's last attached-files
+heading that name an upload in the attachments folder are copied, never any other file.
+Messages to a worker's agent copy theirs the same way, once the message is otherwise
+accepted. The worker's own `wt.py` then runs over ssh with `BABYSIT_WORKER=<id>`, `--gpg`
 when the machine has the `gpg` label, and `--exit-watch-json` for **Quit the agent when
 it is done**: it prints the exit watch instead of recording it, and the dashboard
 records it with the machine. Clone locks hash the machine with the clone. The checkout

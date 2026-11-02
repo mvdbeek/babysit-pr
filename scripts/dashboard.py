@@ -1085,14 +1085,24 @@ class Handler(BaseHTTPRequestHandler):
                 if "watch" in request:
                     # A watch's checkout, where its repairs run without a workspace.
                     checkout, _ = watch_checkout(self.server.home, request.pop("watch"))
+                prepare = None
                 if machine is not None and attached:
-                    # Uploads are kept on this machine, where the worker's agent cannot read.
-                    raise ValueError(f"Files cannot be attached for agents on {machine.label} yet")
+                    worker, home, folder = machine, self.server.home, self.server.attachments
+
+                    def copy_files(text):
+                        # Uploads are kept on this machine: its agent reads copies there.
+                        return attachments.for_worker(home, worker, text, folder)
+
+                    prepare = copy_files
                 try:
                     self.send_json(
                         200,
                         agent_messages.send(
-                            request, self.server.home, checkout=checkout, machine=machine
+                            request,
+                            self.server.home,
+                            checkout=checkout,
+                            machine=machine,
+                            prepare=prepare,
                         ),
                     )
                 except agent_messages.Refused as exc:
@@ -1836,6 +1846,7 @@ def serve(
         lambda: read_jobs(home),
         issues=issues,
         sentry=sentry if sentry.enabled else None,
+        attachments_dir=attachments_dir,
     )
     cron = CronJobs(home, workspaces=workspaces)
     ci = CiDetails(home, overview)

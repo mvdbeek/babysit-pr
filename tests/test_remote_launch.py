@@ -16,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
+import attachments
 import exit_watch
 import machines
 import pr_workspaces as pw
@@ -315,6 +316,46 @@ def test_a_new_task_on_a_worker_branches_in_its_clone(remote):
     value = manager.new_task(new_request(manager, name="try", machine="mini"))
     op = finish(manager, value["operation"]["pr"])
     assert op["status"] == "complete" and op["path"].endswith("/try-2")
+
+
+def test_a_task_on_a_worker_gets_its_attached_files_there(remote):
+    manager, pr, state, worker = remote
+    shot = attachments.save(manager.attachments, "shot.png", b"\x89PNG")["id"]
+    request = {**new_request(manager, name="look", machine="mini"), "attachments": [shot]}
+    attachments.attach(manager.attachments, "workspace-new", request)
+    op = finish(manager, manager.new_task(request)["operation"]["pr"])
+    assert op["status"] == "complete", op
+    folder = (worker / ".local/state/babysit-pr/attachments").resolve()
+    [copy] = folder.iterdir()
+    assert copy.name.endswith(f"-{shot}") and copy.read_bytes() == b"\x89PNG"
+    assert copy.stat().st_mode & 0o777 == 0o600
+    # The staged brief names the worker's copy, never this machine's upload.
+    [agent] = store(state)["machines"]["Mac mini"]["agents"]
+    assert agent["task"] == f"Explore the parser\n\n{attachments.HEADING}\n- {copy}"
+    assert str(manager.attachments) not in agent["task"]
+    # Work on a pull request gets a copy of its own: a worker never overwrites one.
+    review = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
+    review["attachments"] = [shot]
+    attachments.attach(manager.attachments, "workspace-action", review)
+    manager.action(review)
+    assert finish(manager, pr["id"])["status"] == "complete"
+    assert len(list(folder.iterdir())) == 2
+    tasks = [a["task"] for a in store(state)["machines"]["Mac mini"]["agents"]]
+    assert not any(str(manager.attachments) in task for task in tasks)
+    assert all(str(folder) in task for task in tasks)
+
+
+def test_a_task_whose_attached_file_cannot_be_copied_is_not_started(remote):
+    manager, _, state, worker = remote
+    shot = attachments.save(manager.attachments, "shot.png", b"\x89PNG")["id"]
+    request = {**new_request(manager, name="gone", machine="mini"), "attachments": [shot]}
+    attachments.attach(manager.attachments, "workspace-new", request)
+    (manager.attachments / shot).unlink()
+    op = finish(manager, manager.new_task(request)["operation"]["pr"])
+    assert op["status"] == "failed" and "attached file is missing" in op["message"], op
+    assert not store(state)["machines"]["Mac mini"].get("agents")
+    assert not (worker / ".local/state/babysit-pr/workspace-prompts").exists()
+    assert not any("wt.py" in c for c in remote_commands(state))
 
 
 def test_a_new_task_on_a_worker_keeps_claudes_auto_permission_mode(remote):

@@ -240,15 +240,26 @@ def checkout_sessions(root, home=None, machine=None):
     ]
 
 
-def send(request, home=None, *, expected_session=None, checkout=None, machine=None):
+def send(request, home=None, *, expected_session=None, checkout=None, machine=None, prepare=None):
     """Submit one message to one agent of a workspace; report what herdr saw.
 
     With a checkout instead of a workspace (a Workspaces-tab row listed while none was
     open), only a resume can be sent: it reopens a workspace there if none is open.
     With ``exit_when_done`` the agent is asked to mark the end of its answer, and the
     dashboard exits it and closes its pane once it has (`wt --exit-when-done`).
-    A ``machine`` names the worker the workspace or checkout is on.
+    A ``machine`` names the worker the workspace or checkout is on. ``prepare`` turns
+    the text into the one typed, once the request is checked and before anything is
+    typed or staged (a worker's attached files are copied there by it).
     """
+
+    def prepared(text):
+        if prepare is None or not text:
+            return text
+        text = prepare(text)
+        if len(text) > MAX_MESSAGE:
+            raise ValueError(f"Write a message of 1–{MAX_MESSAGE:,} characters")
+        return text
+
     if set(request) - {"workspace", "pane", "text", "resume", "stop_watch", "exit_when_done"}:
         raise ValueError("Invalid message parameters")
     quit_when_done = request.get("exit_when_done", False)
@@ -284,7 +295,7 @@ def send(request, home=None, *, expected_session=None, checkout=None, machine=No
         result = resume(
             request.get("workspace"),
             request["resume"],
-            text,
+            prepared(text),
             home,
             root=checkout,
             stop_watch=stop_watch,
@@ -306,7 +317,7 @@ def send(request, home=None, *, expected_session=None, checkout=None, machine=No
         raise ValueError("That agent is no longer running; refresh")
     if expected_session is not None and target.get("session") != expected_session:
         raise ValueError("The agent session changed; reload the agent list")
-    result = prompt(target, text, machine)
+    result = prompt(target, prepared(text), machine)
     return watch_until_done(result, home, marker, request["text"]) if marker else result
 
 

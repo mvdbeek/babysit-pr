@@ -439,6 +439,18 @@ for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .git
   .config/git .config/gh; do
   argv+=(--ro-bind-try "$home/$path" "$home/$path")
 done
+# Files attached in the dashboard, which copies them here for a worker's agents to read
+# (attachments.REMOTE), read-only: no agent can change one another is given. Made first,
+# private, so an agent started before the first copy still sees later ones; bound at its
+# real path, the one the dashboard names; never through a link, which could lead out.
+attached=$home/.local/state/babysit-pr/attachments
+((print)) || (umask 077 && mkdir -p -- "$attached") || die "cannot create $attached"
+[[ ! -L $attached ]] || die "refusing $attached, a link"
+if [[ -d $attached ]]; then
+  grant "$(realpath -- "$attached")" ro-
+elif [[ -e $attached ]]; then
+  die "refusing $attached, which is not a directory"
+fi
 # On a worker, the deployed babysit-pr this launcher runs from, read-only (it is
 # protected): its skill and scripts, so an agent can register a watch from inside.
 if [[ -f $home/.config/babysit-pr/worker.json && ${self%/*} == */scripts ]]; then
