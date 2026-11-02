@@ -41,6 +41,7 @@ MAX_STDOUT = 8 * 1024 * 1024
 MAX_STDERR = 4096
 MAX_CHANGES = 1000
 MAX_UNPUSHED = 100
+MAX_ALSO = 4  # Other clones a worker launch checks out (`wt --with`), as the dashboard allows.
 MAX_TEXT = 4096  # Longest path, branch or config value an answer may carry.
 MAX_DEADLINE = 3600
 GIT_TIMEOUT = 30  # Each Git a viewer op runs on a worker.
@@ -1908,31 +1909,60 @@ def _host_session_info(agent, session, cwd, rollout, account, expected_home=None
     raise ValueError("Expected claude or codex")
 
 
-def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox):
+def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox, also=()):
     """Where a dashboard launch's ``wt`` makes its checkout here, before it runs.
 
-    ``clone`` must be a clone of ``repo``, as for a cron job. The checkout is named
-    ``prefix``, or ``prefix-<n>`` while a directory or branch of that name exists, and
-    Claude is trusted for it in the config its sandbox reads.
+    ``clone`` must be a clone of ``repo``, as for a cron job, and so must each clone in
+    ``also`` (``[clone, repo]`` pairs) of its own repository: ``wt --with`` checks the
+    branch out in those too, under ``worktrees/<clone name>`` beside ``root``. The
+    checkout is named ``prefix``, or ``prefix-<n>`` while a directory or branch of that
+    name exists in any of them, and Claude is trusted for it in the config its sandbox
+    reads.
     """
     _arg_paths([clone, root], home=True)
     _repo(repo)
     _branch(prefix, "checkout")
     if "/" in prefix:
         raise ValueError("Expected a checkout name without '/'")
+    if not isinstance(also, (list, tuple)) or len(also) > MAX_ALSO:
+        raise ValueError(f"Expected at most {MAX_ALSO} other clones")
+    for pair in also:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError("Expected [clone, repo] pairs")
+        _arg_paths([pair[0]], home=True)
+        _repo(pair[1])
     _, _, config = _host_claude(agent, account, sandbox)
     clone, _, common = _host_clone(clone, repo)
     root = os.path.realpath(os.path.expanduser(root))
     if root == common or root.startswith(common + os.sep):
         raise ValueError(f"{root} lies inside {clone}'s .git")
+    # Each clone with the directory its checkout goes in, as wt lays them out.
+    places = [(clone, root)]
+    for other, other_repo in also:
+        other = _host_clone(other, other_repo)[0]
+        where = os.path.join(os.path.dirname(root), os.path.basename(other))
+        if other in (c for c, _ in places) or where in (r for _, r in places):
+            raise ValueError(f"{other} would share another repository's checkouts")
+        if os.path.islink(where):
+            raise ValueError(f"{where} is a symbolic link")
+        places.append((other, where))
     name, n = prefix, 1
-    while os.path.lexists(os.path.join(root, name)) or _host_branch_exists(clone, name):
+    while any(
+        os.path.lexists(os.path.join(where, name)) or _host_branch_exists(c, name)
+        for c, where in places
+    ):
         n += 1
         name = f"{prefix}-{n}"
     path = os.path.join(root, name)
     if config is not None:
         _host_trust(config, path)
-    return {"clone": clone, "root": root, "name": name, "path": path}
+    return {
+        "clone": clone,
+        "root": root,
+        "name": name,
+        "path": path,
+        "also": [{"clone": c, "path": os.path.join(where, name)} for c, where in places[1:]],
+    }
 
 
 def _host_branch_exists(clone, branch):
@@ -3387,7 +3417,10 @@ def validate_skills(value):
 
 def validate_wt_prepare(value):
     """The paths and name a worker's ``wt`` gets on its command line, nothing else."""
-    _expect(isinstance(value, dict) and set(value) == {"clone", "root", "name", "path"}, "fields")
+    _expect(
+        isinstance(value, dict) and set(value) == {"clone", "root", "name", "path", "also"},
+        "fields",
+    )
     for key in ("clone", "root", "path"):
         _expect(_absolute(value[key]) and not CONTROL.search(value[key]), key)
     _expect(
@@ -3396,6 +3429,21 @@ def validate_wt_prepare(value):
         and value["path"] == f"{value['root'].rstrip('/')}/{value['name']}",
         "name",
     )
+    also = value["also"]
+    _expect(isinstance(also, list) and len(also) <= MAX_ALSO, "also")
+    for other in also:
+        _expect(isinstance(other, dict) and set(other) == {"clone", "path"}, "also")
+        for key in ("clone", "path"):
+            _expect(_absolute(other[key]) and not CONTROL.search(other[key]), "also")
+        _expect(os.path.basename(other["clone"]) not in {"", ".", ".."}, "also")
+        # Beside the task's own checkouts, in the folder named after the clone.
+        beside = os.path.dirname(value["root"].rstrip("/"))
+        named = f"{beside}/{os.path.basename(other['clone'])}/{value['name']}"
+        _expect(other["path"] == named, "also")
+    # Each checkout its own, apart from the task's.
+    paths = [value["path"], *(other["path"] for other in also)]
+    _expect(len(set(paths)) == len(paths), "also")
+    _expect(len({other["clone"] for other in also}) == len(also), "also")
     return value
 
 

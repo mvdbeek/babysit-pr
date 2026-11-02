@@ -105,9 +105,6 @@ def exclusions(req, machines, loads, reservations, now):
             excluded[machine_id] = Exclusion(f"lacks {', '.join(lacking)}", False)
         elif machine_id != LOCAL and req.get("kind", "scratch") not in WORKER_KINDS:
             excluded[machine_id] = Exclusion("only takes pull request work and new tasks", False)
-        elif machine_id != LOCAL and req.get("also"):
-            # `wt --with` checks every clone out on one host, so far only this one.
-            excluded[machine_id] = Exclusion("cannot check out other repositories yet", False)
         elif machine_id != LOCAL and req.get("kind") == "cron" and not req.get("sandboxed", True):
             excluded[machine_id] = Exclusion("runs jobs only in their sandbox", False)
         elif machine_id != LOCAL and (stale or load.get("pending")):
@@ -115,6 +112,10 @@ def exclusions(req, machines, loads, reservations, now):
             excluded[machine_id] = Exclusion("checking…", True)
         elif machine_id != LOCAL and used >= machine.max_agents:
             excluded[machine_id] = Exclusion(f"full ({used}/{machine.max_agents})", True)
+        elif machine_id != LOCAL and req.get("also"):
+            # The other clones are picked from this machine's; a worker has them only
+            # where someone cloned them, so only a person sends the task there.
+            excluded[machine_id] = Exclusion("takes other repositories only when chosen", True)
     used, total = busy(LOCAL, loads, reservations), slots(LOCAL, machines, loads)
     if LOCAL not in excluded and used >= total:
         excluded[LOCAL] = Exclusion(f"full ({used}/{total})", True)

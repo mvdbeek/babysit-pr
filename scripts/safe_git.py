@@ -93,7 +93,7 @@ ENVIRONMENT = {"GIT_PROXY_COMMAND": ""}
 LAZY_FETCH_SWITCH = (2, 44)
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 # Subcommands that read working tree files through filters, or run a transport.
-CONTENT = {"diff", "fetch", "reset", "status", "switch"}
+CONTENT = {"diff", "fetch", "ls-remote", "reset", "status", "switch"}
 # Their checkout or clean check would run in a worktree whose config was not listed.
 WORKTREE = {"worktree add": "--no-checkout", "worktree remove": "--force"}
 # A fetch names https://github.com, so these are reached only through URL rewrites in the
@@ -113,8 +113,9 @@ GITHUB_REMOTE = re.compile(
 # Config that would send that URL elsewhere: a rewrite, or a remote named by a URL,
 # whose url, vcs or other settings Git applies to a fetch of that URL.
 REDIRECT = re.compile(r"url\..+\.insteadof|remote\..*://.*")
-# Subcommands that may need credentials; the rest run without the token.
-NETWORK = {"fetch"}
+# Subcommands that may need credentials; the rest run without the token. A host
+# ls-remote names its repository and refs just as a fetch does.
+NETWORK = {"fetch", "ls-remote"}
 DIFFS = {"diff", "log", "show"}
 # Commands that would otherwise run Git in each submodule to see whether it changed.
 SUBMODULES = {"diff", "log", "show", "status"}
@@ -298,6 +299,7 @@ def prepare(
     flags = {
         # FETCH_HEAD is opened without refusing a planted symlink; nothing here reads it.
         "fetch": ["--upload-pack=git-upload-pack", "--no-write-fetch-head"],
+        "ls-remote": ["--upload-pack=git-upload-pack"],
         **{diff: ["--no-ext-diff", "--no-textconv"] for diff in DIFFS},
     }.get(name, [])
     if name in SUBMODULES:

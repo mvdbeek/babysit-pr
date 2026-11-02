@@ -10,7 +10,6 @@ import dashboard
 import dashboard_settings
 import pr_workspaces as pw
 import pytest
-from test_new_tasks import other_clone
 from test_new_tasks import request as new_request
 from test_pr_workspaces import (  # noqa: F401 (fixture)
     finish,
@@ -270,17 +269,6 @@ def test_a_scheduled_launch_keeps_its_worker(synced):  # noqa: F811
     settle(manager.loads)
 
 
-def test_a_new_task_with_other_clones_is_refused_on_a_worker(local):  # noqa: F811
-    manager, _, git, state, _ = local
-    register(manager.home, MINI)
-    manager.loads.snapshot()
-    settle(manager.loads)
-    other = other_clone(manager, git)
-    with pytest.raises(ValueError, match="^Mac mini: cannot check out other repositories yet$"):
-        manager.new_task(new_request(manager, name="remote", also=[str(other)], machine="mini"))
-    assert not json.loads(state.read_text())["agents"]
-
-
 def test_reservations_count_only_launches_herdr_cannot_list_yet(local):  # noqa: F811
     manager, *_ = local
     ops = {
@@ -427,7 +415,7 @@ def test_auto_places_on_a_worker_registered_for_it_only_what_can_start_there(syn
     preview = manager.preview({"repo": "base/repo"})
     assert (preview["machine"], preview["reason"]) == ("mini", "auto: least busy, 4/4 free")
     assert manager.place({"machine": "auto"}, {"kind": "pr", "repo": "base/repo"}) == "mini"
-    # Filing an issue or adding other clones keeps a new task here.
+    # Filing an issue keeps a new task here, and so does Auto with other clones.
     assert manager.preview({"repo": "base/repo", "kind": "issue"})["machine"] == "local"
     assert manager.preview({"repo": "base/repo", "also": "1"})["machine"] == "local"
     for kind in ("issue", "sentry"):

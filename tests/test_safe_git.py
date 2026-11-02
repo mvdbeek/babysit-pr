@@ -633,6 +633,25 @@ def test_a_fetch_is_refused_where_the_repository_redirects_its_url(planted, tmp_
         safe_git.prepare(str(clone), *FETCH)
 
 
+def test_a_host_ls_remote_is_hardened_as_a_fetch(planted, hermetic_helper):
+    clone, _, git = planted
+    listing = ("ls-remote", "--symref", URL, "HEAD", "refs/heads/main")
+    argv, env = safe_git.prepare(str(clone), *listing, env={**os.environ, "GH_TOKEN": "t"})
+    assert "--upload-pack=git-upload-pack" in argv
+    assert env["GH_TOKEN"] == "t" and f"{safe_git.GITHUB}=!gh auth git-credential" in argv
+    assert "protocol.https.allow=always" in argv
+    argv, env = safe_git.prepare(
+        str(clone), *listing, env={**os.environ, "GH_TOKEN": "t"}, credentials=False
+    )
+    assert "GH_TOKEN" not in env and env["GIT_TERMINAL_PROMPT"] == "0"
+    for bad in (("ls-remote", "origin", "HEAD"), ("ls-remote", URL)):
+        with pytest.raises(ValueError, match="Git was not run"):
+            safe_git.prepare(str(clone), *bad)
+    git("config", "url./elsewhere.git.insteadOf", URL)
+    with pytest.raises(ValueError, match="redirects a fetch"):
+        safe_git.prepare(str(clone), *listing)
+
+
 def test_a_fetch_gets_github_credentials_from_gh_alone(planted, hermetic_helper):
     clone, _, _ = planted
     argv, env = safe_git.prepare(str(clone), *FETCH, env={**os.environ, "GH_TOKEN": "t"})

@@ -514,9 +514,10 @@ def dashboard_run(options: Options) -> bool:
 def worker_refusal(command: str, options: Options) -> str:
     """Why this run cannot start on a worker, or empty when it can.
 
-    The dashboard starts a new task there: a new branch from a base, with a brief. Issues,
-    pull requests and other clones it does not start on workers yet, and ``wt <branch>``
-    opens a branch that exists.
+    The dashboard starts a new task there: a new branch from a base, with a brief. Issues
+    and pull requests it does not start on workers from here yet, nor other clones, whose
+    paths here mean nothing there (the dashboard's New task maps them to the worker's),
+    and ``wt <branch>`` opens a branch that exists.
     """
     first = options.positional[0] if options.positional else ""
     if command == "wti" or first in ("issue", "i"):
@@ -524,7 +525,7 @@ def worker_refusal(command: str, options: Options) -> str:
     if command == "wtpr" or DIGITS.fullmatch(first) or parse_pr_url(first):
         return "wt starts only new branches on a worker; use Handle in the dashboard for a pull request"
     if options.also:
-        return "workers cannot check out other repositories (--with) yet"
+        return "wt hands no --with clones to a worker yet; choose the worker in the dashboard's New task"
     if not options.prompt:
         return NO_PROMPT
     if len(options.positional) < 2:
@@ -1228,8 +1229,8 @@ class Tool:
         except ValueError as exc:
             raise WtError(str(exc)) from exc
 
-    def git_query(self, cwd: str, *args: str) -> Completed:
-        argv, env = self.git_command(cwd, *args)
+    def git_query(self, cwd: str, *args: str, credentials: bool = True) -> Completed:
+        argv, env = self.git_command(cwd, *args, credentials=credentials)
         return self.runner.run(argv, env=env)
 
     def git_value(self, cwd: str, *args: str) -> str:
@@ -1320,13 +1321,17 @@ class Tool:
         source = fetch_source(remotes, slug, trust)
         if source:
             target, token, remote = source
-            self.git_action(
-                repo_path,
-                "fetch",
-                safe_git.github_url(target),
-                f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
-                credentials=token,
-            )
+            try:
+                self.git_action(
+                    repo_path,
+                    "fetch",
+                    safe_git.github_url(target),
+                    f"+refs/heads/{base}:refs/remotes/{remote}/{base}",
+                    credentials=token,
+                )
+            except WtError:
+                self.missing_base(repo_path, target, base, token)
+                raise
             # In full, so no local branch or tag named <remote>/<base> wins.
             start_point = f"refs/remotes/{remote}/{base}"
         elif "origin" in remotes:
@@ -1335,6 +1340,37 @@ class Tool:
             self.checkout_worktree(repo_path, directory, branch)
         else:
             self.checkout_worktree(repo_path, directory, start_point, new_branch=branch)
+
+    def missing_base(self, repo_path: str, target: str, base: str, token: bool) -> None:
+        """After a failed fetch of ``base``: refuse it by name when GitHub has no such branch.
+
+        GitHub is asked once more, as the fetch was, for the branch and its default
+        branch; if it cannot be asked, the fetch's own failure stands.
+        """
+        listed = self.git_query(
+            repo_path,
+            "ls-remote",
+            "--symref",
+            safe_git.github_url(target),
+            "HEAD",
+            f"refs/heads/{base}",
+            credentials=token,
+        )
+        if listed.returncode:
+            return
+        refs = [line.split("\t") for line in listed.stdout.splitlines()]
+        if any(ref[-1] == f"refs/heads/{base}" for ref in refs):
+            return
+        default = next(
+            (
+                ref[0].removeprefix("ref: refs/heads/")
+                for ref in refs
+                if ref[0].startswith("ref: refs/heads/") and ref[-1] == "HEAD"
+            ),
+            "",
+        )
+        hint = f"; its default branch is {default}" if default else ""
+        raise WtError(f"wt: {target} has no branch {base}{hint}")
 
     def checkout_worktree(
         self, repo_path: str, directory: str, commit: str, new_branch: str = ""
