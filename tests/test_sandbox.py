@@ -926,6 +926,27 @@ def test_wrapper_binds_checked_directories_by_descriptor_when_bwrap_can(checkout
     assert str(home / ".codex/rules") not in [target for _, target in pairs(by_fd, "--ro-bind")]
 
 
+def test_wrapper_lets_agents_read_the_copies_of_attached_files(checkout, tmp_path):
+    worktree, _, home = checkout
+    attached = home / ".local/state/babysit-pr/attachments"
+    # A dry run makes nothing; a launch makes the folder first, so later copies show.
+    argv = printed(worktree, environment(home), "--", "agent")
+    assert not any(str(attached.resolve()) in word for word in argv)
+    attached.mkdir(parents=True)
+    argv = printed(worktree, environment(home), "--", "agent")
+    real = str(attached.resolve())
+    assert (real, real) in pairs(argv, "--ro-bind")
+    assert not any(real in word for word in pairs(argv, "--bind"))
+    # Never through a link, which could lead anywhere, nor onto a file.
+    attached.rmdir()
+    (tmp_path / "keys").mkdir()
+    attached.symlink_to(tmp_path / "keys")
+    assert "a link" in refused(worktree, environment(home), "--", "agent")
+    attached.unlink()
+    attached.write_text("")
+    assert "not a directory" in refused(worktree, environment(home), "--", "agent")
+
+
 def test_wrapper_refuses_paths_that_expose_home_or_protected_files(checkout, tmp_path):
     worktree, _, home = checkout
     for path in (".ssh/keys", ".config/babysit-pr", ".local/bin", ".cache/babysit-sandbox"):

@@ -5,15 +5,22 @@ with another or leave the directory. A message or task names its attachments by 
 names, and the agent gets their full paths after its text, so it reads them itself.
 Nothing is ever overwritten. Saving prunes, at most hourly, the uploads saved here
 long ago; no other file in the directory is ever touched.
+
+An agent on a worker machine cannot read this machine's paths: before its task or
+message is staged there, for_worker copies each attached upload to a private folder on
+the worker (REMOTE) and names the copies instead.
 """
 
 import datetime
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 from pathlib import Path
+
+import machines
 
 HEADING = "Attached files (read them from these paths):"
 MAX_FILE = 25 * 1024 * 1024
@@ -28,6 +35,11 @@ KEEP_SECONDS = LATEST_START_SECONDS + 30 * 86400
 PRUNE_SECONDS = 3600
 _pruned: dict[Path, float] = {}
 _pruned_lock = threading.Lock()
+# Where a worker keeps the copies it gets: a private folder its agents read (Agent Safehouse
+# grants all of ~/.local/state/babysit-pr, writes too; babysit-bwrap binds it read-only).
+REMOTE = "~/.local/state/babysit-pr/attachments"
+# Seconds to copy one file there: 25 MB over a slow link.
+UPLOAD_TIMEOUT = 300
 # Fields holding the text an agent receives, by dashboard action.
 TEXT_FIELDS = {
     "workspace-message": "text",
@@ -122,3 +134,70 @@ def attach(directory: Path, action: str, request: dict) -> None:
         request["task_files"] = note(directory, ids)
         return
     request[field] = f"{text.rstrip()}\n\n{note(directory, ids)}".lstrip()
+
+
+def _read_upload(directory: Path, name: str) -> bytes:
+    """An upload's bytes: a regular file of its own in the directory, never a link."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        folder = os.open(directory, flags | os.O_DIRECTORY)
+        try:
+            fd = os.open(name, flags | getattr(os, "O_NONBLOCK", 0), dir_fd=folder)
+        finally:
+            os.close(folder)
+    except OSError:
+        raise ValueError("An attached file is missing; attach it again") from None
+    try:
+        info = os.fstat(fd)
+        # A second hard link could be a file this directory was never given.
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                data = stream.read(MAX_FILE + 1)
+        else:
+            data = b""
+    finally:
+        os.close(fd)
+    if not data or len(data) > MAX_FILE:
+        raise ValueError(f"The attached file {name} is not one this dashboard saved")
+    return data
+
+
+def for_worker(home, machine, text: str, directory: Path) -> str:
+    """``text`` with its attached files copied to ``machine``, naming the copies there.
+
+    Only the note attach() ends a text with counts: the lines after its last HEADING.
+    Each line naming an upload in ``directory`` (``- <directory>/<stored name>``) has the
+    file copied and its path swapped for the copy's; nothing else is ever copied, so a
+    heading typed by hand cannot send any other file of this machine. Other lines are
+    left as they are, as is a text without a note. Each copy gets a new name, since a
+    worker can be sent the same upload again (a batch, a retry, a later message) and
+    never overwrites a file. A failed copy raises, so nothing is typed with a dead path.
+    """
+    at = text.rfind(HEADING)
+    if at < 0:
+        return text
+    lines = text[at:].split("\n")
+    prefix = f"- {directory}/"
+    wanted = [
+        (n, line[len(prefix) :])
+        for n, line in enumerate(lines)
+        if line.startswith(prefix) and STORED.fullmatch(line[len(prefix) :])
+    ]
+    if not wanted:
+        return text
+    if len(wanted) > MAX_FILES:
+        raise ValueError(f"Attach at most {MAX_FILES} uploaded files")
+    folder = machines.remote_path(REMOTE)
+    for n, name in wanted:
+        data = _read_upload(directory, name)
+        copy = machines.put_file(
+            home,
+            machine,
+            folder,
+            f"{secrets.token_hex(4)}-{name}",
+            data,
+            keep=KEEP_SECONDS,
+            timeout=UPLOAD_TIMEOUT,
+        )
+        lines[n] = f"- {copy}"
+    return text[:at] + "\n".join(lines)

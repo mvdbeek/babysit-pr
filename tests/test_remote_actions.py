@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import agent_messages
+import attachments
 import dashboard
 import machines
 import pytest
@@ -809,16 +810,40 @@ def test_the_composer_routes_reach_the_worker(exited, site):
     docker = {"workspace": "mini/w1", "pane": "w1:p1", "session": CLAUDE_SID, "enabled": True}
     for action, payload, error in [
         ("workspace-docker", docker, "only for agents on this Mac"),
-        (
-            "workspace-message",
-            {"workspace": "mini/w1", "text": "x", "attachments": [attached]},
-            "cannot be attached for agents on Mac mini",
-        ),
         ("workspace-message", {"workspace": "ghost/w1", "text": "x"}, "Unknown machine ghost"),
     ]:
         status, value = request(port, f"/api/{action}", payload, action)
         assert status == 400 and error in value["error"], (action, value)
     assert "prompts" not in mini(exited)
+    # Attached files reach the worker's agent as copies there, never this Mac's paths,
+    # and only once the message is otherwise accepted.
+    folder = (exited.host / ".local/state/babysit-pr/attachments").resolve()
+    body = {"workspace": "mini/w1", "text": "Look", "attachments": [attached]}
+    mini_store(exited, agents=[])
+    status, value = request(port, "/api/workspace-message", body, "workspace-message")
+    assert status == 400 and "No agent is running" in value["error"], value
+    assert not folder.exists()
+    idle = {
+        "workspace_id": "w1",
+        "agent": "claude",
+        "agent_status": "idle",
+        "pane_id": "w1:p1",
+        "agent_session": {"value": CLAUDE_SID},
+    }
+    mini_store(exited, agents=[idle], prompts=[])
+    body = {"workspace": "mini/w1", "text": "Look", "attachments": [attached]}
+    status, value = request(port, "/api/workspace-message", body, "workspace-message")
+    assert status == 200 and value["sent"], value
+    [copied] = folder.iterdir()
+    assert copied.name.endswith(f"-{attached}") and copied.read_text() == "notes"
+    assert mini(exited)["prompts"] == [
+        [value["pane"], f"Look\n\n{attachments.HEADING}\n- {copied}"]
+    ]
+    # An upload that cannot be copied is refused, and nothing is typed.
+    (exited.home / "attachments" / attached).unlink()
+    status, value = request(port, "/api/workspace-message", body, "workspace-message")
+    assert status == 400 and "attached file is missing" in value["error"], value
+    assert len(mini(exited)["prompts"]) == 1
 
 
 @pytest.mark.browser

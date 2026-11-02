@@ -678,8 +678,12 @@ class MachineLoads:
 
 
 class Workspaces:
-    def __init__(self, home, overview, jobs, src=None, issues=None, sentry=None):
+    def __init__(
+        self, home, overview, jobs, src=None, issues=None, sentry=None, attachments_dir=None
+    ):
         self.home = Path(home)
+        # Where the dashboard saves uploads: a worker's launch copies its task's there.
+        self.attachments = Path(attachments_dir) if attachments_dir else self.home / "attachments"
         self.src = Path(src) if src else Path.home() / "src"
         self.overview = overview
         self.issues = issues
@@ -3168,6 +3172,10 @@ class Workspaces:
                         overrides.extend([f"--{option}", op[option]])
                 if op.get("claude_account"):
                     overrides.extend(["--claude-account", op["claude_account"]])
+                if attachments.HEADING in task:
+                    self.save_operation(op, message=f"Copying attached files to {machine.label}")
+                    # Its agent reads them there; a failed copy fails the launch untyped.
+                    task = attachments.for_worker(self.home, machine, task, self.attachments)
                 brief = f"{task}\n" if scratch else f"{task}\n\n{subject}: {canonical(pr)}\n"
                 if op.get("exit_marker"):
                     brief += workspace_exit.brief(op["exit_marker"])
