@@ -105,9 +105,13 @@ REBUILDABLE = {
 }
 LFS = re.compile(rb"\bfilter\s*=\s*lfs\b")
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-# An MCP server's command line: `npm exec @sentry/mcp-server`, `…/bridge/mcp-server.cjs`,
-# `sentry-mcp`.
-MCP = re.compile(r"(?i)mcp[-_]server|(?:^|[\s/@_-])mcp(?:$|[\s/._-])")
+# An MCP server's program or package name: `@sentry/mcp-server`, `mcp-server.cjs`,
+# `sentry-mcp`, `mcp_server_git`.
+MCP = re.compile(r"(?i)(?:^|[-_.@/])mcp(?:$|[-_.@])")
+# Programs that run the script, module or package named next on their command line.
+RUNNERS = {"node", "bun", "deno", "python", "python3", "uv", "uvx", "npx", "bunx", "pnpx"}
+PACKAGE_RUNNERS = {"npm", "pnpm", "yarn"}  # With exec, x or dlx.
+VALUED = {"-m", "-p", "--package", "--from", "--with", "-r", "--require", "--import"}
 KEPT_MOVES = 20
 
 
@@ -244,6 +248,17 @@ def base_branch(path):
     return None
 
 
+def history_size(path):
+    """Bytes of the clone's objects, packed and loose: what a bundle of its whole history
+    comes to at most."""
+    counts = dict(
+        line.split(": ", 1)
+        for line in git(path, "count-objects", "-v").splitlines()
+        if ": " in line
+    )
+    return sum(int(counts.get(key, 0) or 0) for key in ("size", "size-pack")) * 1024
+
+
 def bundle(path, state, move_id):
     """The bundle of ``state``: one ref, a commit of the working tree on a commit of the
     index on the branch's head, without the history of the repository's default branch
@@ -322,13 +337,47 @@ def descendants(listing, pid):
     return found
 
 
-def mcp_servers(found):
+def served(command):
+    """The name an agent's child runs by: its program's, or for a runner (node, npx,
+    `npm exec`, uvx, `python -m`) the script, module or package it runs."""
+    words = command.split()
+    if not words:
+        return ""
+    program = Path(words[0]).name
+    rest = words[1:]
+    if program in PACKAGE_RUNNERS:
+        if not rest or rest[0] not in {"exec", "x", "dlx"}:
+            return program
+        rest = rest[1:]
+    elif program not in RUNNERS:
+        return program
+    if program == "uv" and rest[:1] == ["run"]:
+        rest = rest[1:]
+    while rest:
+        word = rest.pop(0)
+        if word == "--":
+            continue
+        if word in {"-m", "--from"} and rest:
+            return Path(rest[0]).name  # The module or package run.
+        if word in VALUED and rest:
+            rest.pop(0)
+        elif not word.startswith("-"):
+            return Path(word).name if "/" in word and not word.startswith("@") else word
+    return program
+
+
+def mcp_servers(found, agent):
     """Split the agent's processes into those its exit stops for good and its MCP
-    servers (with what they started), which end and start again with the agent."""
+    servers (with what they started), which end and start again with the agent.
+
+    Only the agent's own children are servers, named so by what they run (``served``):
+    a test or build that merely mentions MCP in its arguments is listed as stopped."""
     servers: set[int] = set()
     stopped, restarting = [], []
     for process in found:
-        if process["ppid"] in servers or MCP.search(process["command"]):
+        if process["ppid"] in servers or (
+            process["ppid"] == agent and MCP.search(served(process["command"]))
+        ):
             servers.add(process["pid"])
             restarting.append(process)
         else:
@@ -336,9 +385,9 @@ def mcp_servers(found):
     return stopped, restarting
 
 
-def split(found):
+def split(found, agent):
     """``mcp_servers`` of a process listing that may be unknown (None)."""
-    return (None, None) if found is None else mcp_servers(found)
+    return (None, None) if found is None else mcp_servers(found, agent)
 
 
 def children(pid):
@@ -521,6 +570,14 @@ def source(home, request):
         raise Refused(f"A worker cannot name a checkout {Path(root).name!r}", "name")
     if kind == "codex" and not CODEX_DAY.fullmatch(Path(chosen["_file"]).parent.as_posix()):
         raise Refused("Its Codex rollout is not in a sessions/YYYY/MM/DD folder", "rollout")
+    if base_branch(root) is None and history_size(root) > remote_probe.MAX_MOVE_BUNDLE:
+        # Its whole history would have to travel: refused now, not after a stopped turn.
+        raise Refused(
+            "No default branch of its upstream or origin remote is known here, and its "
+            "whole history is more than a move takes; run `git remote set-head upstream "
+            "--auto` (or origin) in its clone first",
+            "base",
+        )
     config = repo_config(root)
     remotes = remote_slugs(config)
     slug = remotes.get("upstream") or remotes.get("origin")
@@ -536,7 +593,13 @@ def source(home, request):
         and remote_probe.BRANCH.fullmatch(merge.removeprefix("refs/heads/"))
         and ".." not in merge
     ):
-        upstream = [remote, merge.removeprefix("refs/heads/"), remotes[remote]]
+        merged = merge.removeprefix("refs/heads/")
+        try:
+            # Where this clone's remote-tracking ref has it, for a remote the worker adds.
+            tip = git(root, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{merged}")
+        except ValueError:
+            tip = None
+        upstream = [remote, merged, remotes[remote], tip or None]
     account = chosen.get("claude_account") if kind == "claude" else None
     if kind == "claude" and account is None:
         raise Refused("Its Claude home is not a named account here", "account")
@@ -570,7 +633,7 @@ def source(home, request):
         "upstream": upstream,
         "watch": watch,
         "docker": docker,
-        **dict(zip(("children", "mcp"), split(children(proc["pid"])), strict=True)),
+        **dict(zip(("children", "mcp"), split(children(proc["pid"]), proc["pid"]), strict=True)),
         "ignored_kept": ignored_kept(root),
         "suffix": project_suffix(kind, chosen, [root, spelled]),
         **settings(proc["argv"], kind, chosen.get("_file") if kind == "codex" else None),
@@ -786,16 +849,35 @@ def worker_paths(machine, src):
 
 def check_worker(home, machine, src):
     """Whether the worker can make the checkout (its clone, a free branch and path, the
-    Claude account): asked before any key, so a refusal there changes nothing here."""
+    Claude account) and which remote its branch would track there: asked before any key,
+    so a refusal there changes nothing here.
+
+    A babysit watch that follows the workspace needs that upstream (a review checkout
+    is matched to its pull request by it), so one the worker cannot set refuses here."""
     try:
-        return remote_probe.call(home, machine, "move_check", 60, **worker_paths(machine, src))
+        answer = remote_probe.call(
+            home,
+            machine,
+            "move_check",
+            60,
+            **worker_paths(machine, src),
+            upstream=src["upstream"],
+        )
     except subprocess.TimeoutExpired as exc:
         raise ValueError(f"{machine.label} did not answer within 60 seconds") from exc
     except OSError as exc:
         raise ValueError(f"{machine.label} could not be reached: {exc}") from exc
+    if src["watch"] is not None and src["upstream"] and answer["upstream"] is None:
+        raise Refused(
+            f"babysit watch {src['watch'].get('id')} follows this workspace and needs its "
+            f"branch's upstream, which cannot be set on {machine.label}: "
+            f"{answer['upstream_note']}; stop the watch first",
+            "watch",
+        )
+    return answer
 
 
-def message(src, machine, path, stopped, watch):
+def message(src, machine, path, stopped, watch, made=None):
     """The first message the agent reads on the worker."""
     state = src["state"]
     gone = "Background jobs, shells and other processes it ran before the move are gone"
@@ -811,6 +893,17 @@ def message(src, machine, path, stopped, watch):
         f"{gone}; re-run any you still need, and set up ignored dependencies again if a "
         "command needs them.",
     ]
+    if made is not None and made.get("upstream") is None:
+        # Said rather than discovered at the first push or pull.
+        if src["upstream"]:
+            lines.append(
+                f"Branch {state['branch']} tracked {src['upstream'][1]} of "
+                f"{src['upstream'][2]} before the move and has no upstream here "
+                f"({made.get('upstream_note') or 'it could not be set'}); add the remote "
+                "and set it before pushing or pulling."
+            )
+        else:
+            lines.append(f"Branch {state['branch']} has no upstream, as before the move.")
     if watch:
         lines.append(f"The babysit watch {watch} now follows this worktree on {machine.label}.")
     lines.append("Continue the task.")
@@ -1226,6 +1319,8 @@ class Move:
         # Before any key: what the worker would refuse is refused while nothing changed.
         try:
             check_worker(self.home, self.machine, src)
+        except Refused:
+            raise
         except ValueError as exc:
             raise Refused(str(exc), "worker") from exc
         # Its transcripts only travel once the agent left: one too large is refused first.
@@ -1326,7 +1421,7 @@ class Move:
             resumed = agent_messages.resume(
                 None,
                 src["session"],
-                message(src, self.machine, path, stopped, watch),
+                message(src, self.machine, path, stopped, watch, made),
                 self.home,
                 root=path,
                 machine=self.machine,
@@ -1363,10 +1458,10 @@ class Move:
         self.record(stage="resumed")
         warnings = []
         if src["upstream"] and made.get("upstream") is None:
-            remote, merge, slug = src["upstream"]
+            merge, slug = src["upstream"][1:3]
             warnings.append(
-                f"Its branch tracks {merge} of {slug}, which no remote names on "
-                f"{self.machine.label}, so it has no upstream there"
+                f"Its branch tracks {merge} of {slug}, but has no upstream on "
+                f"{self.machine.label}: {made.get('upstream_note') or 'it could not be set'}"
             )
         if resumed.get("warning"):
             warnings.append(resumed["warning"])

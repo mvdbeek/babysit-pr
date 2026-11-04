@@ -811,6 +811,7 @@ def test_the_receive_answer_is_validated():
         "work_tree": "c" * 40,
         "clone": "/w/repo",
         "upstream": None,
+        "upstream_note": None,
     }
     assert remote_probe.validate_move_receive(good) == good
     for change in ({"path": "/w/\nx"}, {"head": "HEAD"}, {"extra": 1}):
@@ -1234,11 +1235,52 @@ def test_a_review_of_a_fork_pr_moves_with_the_forks_commits(rig):
     # The fork's commit travelled in the bundle; head and trees were verified there.
     assert git("rev-parse", "HEAD", cwd=rig.target) == head
     assert git("log", "-1", "--format=%s", cwd=rig.target) == "Unpushed work"
-    # The worker has no remote for the fork: its branch is left without an upstream.
+    # The fork's remote is added there as wtpr names it, by its GitHub URL, and the
+    # branch tracks it as here: a watch's review checkout is matched by that upstream.
+    assert git("remote", "get-url", "wtpr-dannon-repo", cwd=there) == (
+        "https://github.com/dannon/repo.git"
+    )
+    assert git("config", "branch.feature.remote", cwd=rig.target) == "wtpr-dannon-repo"
+    assert git("config", "branch.feature.merge", cwd=rig.target) == "refs/heads/fix"
+    assert git("rev-parse", "refs/remotes/wtpr-dannon-repo/fix", cwd=there) == head
+    assert git("rev-parse", "--abbrev-ref", "@{upstream}", cwd=rig.target) == (
+        "wtpr-dannon-repo/fix"
+    )
+    assert not any("upstream" in w for w in result["warnings"])
+    assert "no upstream" not in worker_store(rig)["agents"][0]["task"]
+    assert result["source"]["removed"]
+
+
+def test_a_fork_remote_that_cannot_be_added_leaves_no_upstream_and_says_so(rig):
+    track_fork(rig)
+    there = rig.host / "src" / "repo"
+    # The name wtpr would give it is taken there by another repository.
+    git("remote", "add", "wtpr-dannon-repo", "https://github.com/else/where.git", cwd=there)
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert found["worker"]["upstream"] is None
+    assert "remote wtpr-dannon-repo names another" in found["worker"]["upstream_note"]
+    result = run_move(rig)
     with pytest.raises(subprocess.CalledProcessError):
         git("config", "branch.feature.remote", cwd=rig.target)
-    assert any("which no remote names on Mac mini" in w for w in result["warnings"])
-    assert result["source"]["removed"]
+    assert git("remote", "get-url", "wtpr-dannon-repo", cwd=there).endswith("else/where.git")
+    assert any("has no upstream on Mac mini" in w for w in result["warnings"])
+    # The agent is told in its first message, not at its first push.
+    task = worker_store(rig)["agents"][0]["task"]
+    assert "tracked fix of dannon/repo before the move and has no upstream here" in task
+
+
+def test_a_watch_is_refused_up_front_when_the_upstream_cannot_follow(clean_box):
+    rig = clean_box
+    track_fork(rig)
+    there = rig.host / "src" / "repo"
+    git("remote", "add", "wtpr-dannon-repo", "https://github.com/else/where.git", cwd=there)
+    set_agent(rig, agent_status="working")
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert found["machine"] is None and "needs its branch's upstream" in found["error"]
+    assert refusal(rig, confirm_working=True).details["code"] == "watch"
+    nothing_happened(rig)
+    assert "esc" not in json.dumps(read(rig.state)["calls"])
+    assert watch(rig)["status"] == "awaiting_release"
 
 
 def test_the_bundle_leaves_out_only_the_upstream_default_branch(tmp_path):
@@ -1352,12 +1394,22 @@ def test_mcp_servers_restart_with_the_agent_and_are_not_listed_as_stopped():
             "300 100 node /home/u/.claude/plugins/oh-my-claudecode/bridge/mcp-server.cjs",
             "400 100 /bin/zsh -c make test",
             "401 400 pytest -q",
+            "500 100 uvx mcp-server-git",
+            # The agent's own children that only mention MCP in their arguments.
+            "600 100 pytest tests/test_mcp.py",
+            "601 100 pytest /home/u/src/worktrees/galaxy/fix-mcp-tools/test",
+            "602 100 make test-mcp",
+            "603 100 npm run dev -- --mcp",
+            "604 100 docker compose up mcp",
+            "605 100 python -m pytest tests/test_mcp.py",
+            # A server shape started by a shell, not the agent: the move stops it.
+            "700 400 node /srv/mcp-server.cjs",
         ]
     )
-    stopped, restarting = workspace_move.mcp_servers(workspace_move.descendants(listing, 100))
-    assert [p["command"] for p in stopped] == ["/bin/zsh -c make test", "pytest -q"]
-    assert [p["pid"] for p in restarting] == [200, 300, 201]
-    assert workspace_move.split(None) == (None, None)
+    stopped, restarting = workspace_move.mcp_servers(workspace_move.descendants(listing, 100), 100)
+    assert [p["pid"] for p in restarting] == [200, 300, 500, 201]
+    assert [p["pid"] for p in stopped] == [400, 600, 601, 602, 603, 604, 605, 401, 700]
+    assert workspace_move.split(None, 100) == (None, None)
 
 
 def test_a_plan_shows_the_workers_own_check(rig):
@@ -1365,6 +1417,8 @@ def test_a_plan_shows_the_workers_own_check(rig):
     assert found["worker"] == {
         "clone": str(rig.host / "src" / "repo"),
         "path": str(rig.target),
+        "upstream": ["origin", "feature"],
+        "upstream_note": None,
     }
     assert found["mcp_count"] == 0
 
@@ -1471,3 +1525,16 @@ def test_the_command_line_exits_non_zero_on_a_failed_or_refused_move(tmp_path):
         },
     )
     assert planned.returncode == 1 and "Branch exists" in planned.stdout
+
+
+def test_a_large_clone_without_a_known_default_branch_is_refused_before_any_key(rig, monkeypatch):
+    for ref in ("refs/remotes/origin/main", "refs/remotes/origin/feature"):
+        git("update-ref", "-d", ref, cwd=rig.clone)
+    assert workspace_move.base_branch(str(rig.checkout)) is None
+    # Small enough, it travels whole.
+    assert workspace_move.plan(rig.home, request(), rig.placing)["error"] is None
+    monkeypatch.setattr(workspace_move, "history_size", lambda path: 1 << 40)
+    set_agent(rig, agent_status="working")
+    assert refusal(rig, confirm_working=True).details["code"] == "base"
+    nothing_happened(rig)
+    assert "esc" not in json.dumps(read(rig.state)["calls"])
