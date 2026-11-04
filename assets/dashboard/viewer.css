@@ -195,6 +195,26 @@
 #ws-live-status {
   margin: 0;
   font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.ws-move-confirm p {
+  margin: 6px 0;
+}
+.ws-move-target select {
+  max-width: 100%;
+}
+.ws-move-children {
+  margin: 4px 0;
+  padding-left: 20px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.ws-move-warning {
+  color: var(--amber);
+}
+.ws-move-error {
+  color: var(--red);
 }
 #ws-live-status:empty {
   display: none;
