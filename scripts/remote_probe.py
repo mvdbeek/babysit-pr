@@ -2352,6 +2352,8 @@ OBJECT = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 MOVE_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 MOVE_DEPTH = 6
 CODEX_DAY = re.compile(r"[0-9]{4}/[0-9]{2}/[0-9]{2}")
+# What Claude's project folder adds for a session started below the checkout: "-sub".
+MOVE_SUFFIX = re.compile(r"(-[A-Za-z0-9-]{1,200})?")
 MOVE_MARKER = "babysit-move"
 
 
@@ -2421,6 +2423,35 @@ def _move_marker(path):
         return None
 
 
+def _move_place(clone, repo, root, name, branch, agent, account, sandbox, move=None):
+    """Where a moved checkout goes here, checked: ``clone`` a clone of ``repo``, the
+    account known, and ``root/name`` and ``branch`` free, unless the checkout is the
+    move ``move``'s own. (clone, common, path, Claude's config, whether it is ours)."""
+    _arg_paths([clone, root], home=True)
+    _repo(repo)
+    _branch(branch, "moved")
+    if not isinstance(name, str) or not MOVE_PART.fullmatch(name):
+        raise ValueError("Expected a checkout name")
+    _, _, config = _host_claude(agent, account, sandbox)
+    clone, _, common = _host_clone(clone, repo)
+    root = os.path.realpath(os.path.expanduser(root))
+    if root == common or root.startswith(common + os.sep):
+        raise ValueError(f"{root} lies inside {clone}'s .git")
+    path = os.path.join(root, name)
+    ours = move is not None and os.path.lexists(path) and _move_marker(path) == move
+    if os.path.lexists(path) and not ours:
+        raise ValueError(f"{path} already exists here")
+    if not ours and _host_branch_exists(clone, branch):
+        raise ValueError(f"Branch {branch} already exists in {clone} here")
+    return clone, common, path, config, ours
+
+
+def _host_move_check(clone, repo, root, name, branch, agent, account, sandbox):
+    """Whether a move could make its checkout here (``_move_place``), changing nothing."""
+    clone, _, path, _, _ = _move_place(clone, repo, root, name, branch, agent, account, sandbox)
+    return {"clone": clone, "path": path}
+
+
 def _host_move_receive(
     clone,
     repo,
@@ -2456,12 +2487,7 @@ def _host_move_receive(
     checkout this op made and could not finish is taken back, and the bundle removed.
     """
     try:
-        _arg_paths([clone, root], home=True)
         _staged_move(bundle)
-        _repo(repo)
-        _branch(branch, "moved")
-        if not isinstance(name, str) or not MOVE_PART.fullmatch(name):
-            raise ValueError("Expected a checkout name")
         if not isinstance(move, str) or not MOVE_ID.fullmatch(move):
             raise ValueError("Expected a move ID")
         for value, what in ((head, "head"), (index_tree, "index"), (work_tree, "working tree")):
@@ -2480,17 +2506,10 @@ def _host_move_receive(
                 raise ValueError("Expected [repo, branch] pairs to fetch")
             _repo(pair[0])
             _branch(pair[1], "fetched")
-        _, _, config = _host_claude(agent, account, sandbox)
-        clone, _, common = _host_clone(clone, repo)
-        root = os.path.realpath(os.path.expanduser(root))
-        if root == common or root.startswith(common + os.sep):
-            raise ValueError(f"{root} lies inside {clone}'s .git")
-        path = os.path.join(root, name)
-        ours = os.path.lexists(path) and _move_marker(path) == move
-        if os.path.lexists(path) and not ours:
-            raise ValueError(f"{path} already exists here")
-        if not ours and _host_branch_exists(clone, branch):
-            raise ValueError(f"Branch {branch} already exists in {clone} here")
+        clone, _, path, config, ours = _move_place(
+            clone, repo, root, name, branch, agent, account, sandbox, move
+        )
+        root = os.path.dirname(path)
         remotes = remote_slugs(repo_config(host_git, clone))
 
         def verified():
@@ -2564,12 +2583,13 @@ def _host_move_receive(
             _discard(bundle)
 
 
-def _host_move_session(archive, agent, account, sandbox, path, day):
+def _host_move_session(archive, agent, account, sandbox, path, day, suffix=""):
     """Place the staged transcripts of a conversation moved to the checkout ``path`` here.
 
     ``archive`` is a tar of one session's files, as its agent stores them: Claude's
     ``<id>.jsonl`` and ``<id>/`` (subagents, tool results), which go in the project
-    folder Claude names after ``path`` in the account's home; Codex's one rollout, which
+    folder Claude names after ``path`` (and ``suffix``, for a session started in a
+    folder below it) in the account's home; Codex's one rollout, which
     goes in ``sessions/<day>`` of its home. A file already there is left only when it
     holds the same bytes, or the start of them (an earlier copy of the conversation).
     Answers the transcript's path; the archive is always removed.
@@ -2577,10 +2597,12 @@ def _host_move_session(archive, agent, account, sandbox, path, day):
     try:
         _arg_paths([path])
         _staged_move(archive)
+        if not isinstance(suffix, str) or not MOVE_SUFFIX.fullmatch(suffix):
+            raise ValueError("Expected a project folder suffix")
         claude_home, _, _ = _host_claude(agent, account, sandbox)
         if agent == "claude":
             store = Path(claude_home) / "projects"
-            folder = store / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(path))
+            folder = store / (re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(path)) + suffix)
         else:
             if not isinstance(day, str) or not CODEX_DAY.fullmatch(day):
                 raise ValueError("Expected the rollout's day as YYYY/MM/DD")
@@ -3308,6 +3330,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "session_info": _host_session_info,
     "skills_status": _host_skills_status,
     "skills_install": _host_skills_install,
+    "move_check": _host_move_check,
     "move_receive": _host_move_receive,
     "move_session": _host_move_session,
 }
@@ -3932,6 +3955,12 @@ def validate_move_receive(value):
     return value
 
 
+def validate_move_check(value):
+    _expect(isinstance(value, dict) and set(value) == {"clone", "path"}, "fields")
+    _expect(_shown_path(value["clone"]) and _shown_path(value["path"]), "paths")
+    return value
+
+
 def validate_move_session(value):
     _expect(isinstance(value, dict) and set(value) == {"transcript"}, "fields")
     _expect(
@@ -3963,6 +3992,7 @@ VALIDATORS = {
     "session_info": validate_session_info,
     "skills_status": validate_skills,
     "skills_install": validate_skills,
+    "move_check": validate_move_check,
     "move_receive": validate_move_receive,
     "move_session": validate_move_session,
 }
