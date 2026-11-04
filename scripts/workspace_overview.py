@@ -590,11 +590,14 @@ class WorkspaceOverview:
         spaces = self.spaces(warnings)
         agents = self.agents(warnings)
         roots = self.scanned_roots(spaces)
+        ordered = sorted(roots)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            found = list(pool.map(clone_worktrees, sorted(roots)))
+            found = list(pool.map(clone_worktrees, ordered))
         clones, checkouts = {}, {}
-        for result in found:
+        for root, result in zip(ordered, found, strict=True):
             if not result:
+                if remote_probe.bare_checkout(git, root):
+                    warnings.append(remote_probe.bare_warning(root))
                 continue
             main, items = result
             clones[main["path"]] = main
@@ -1002,6 +1005,7 @@ class WorkspaceOverview:
             opened=self.space_paths(spaces, "checkout_path"),
         )
         found = self.capped(found, notes, machine.label)
+        notes.extend(remote_probe.bare_warning(path, machine.label) for path in found["bare"])
         self.resolved_spaces(spaces, found["paths"])
         return spaces, agents, found, notes
 
