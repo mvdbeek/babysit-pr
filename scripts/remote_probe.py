@@ -90,7 +90,7 @@ HOST_ENV = {
 SUBMODULE_READS = {"status", "diff"}
 # Reads need no GitHub token, and a checkout's filters or hooks must not inherit one.
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
-# The one fetch a cron checkout makes: its job's repository by GitHub URL, the worker's
+# Worker clones and the one fetch a cron checkout makes: the repository by GitHub URL, the worker's
 # own gh login for credentials, and no transport but those (https, or what the worker's
 # own config rewrites it to); the repository's own rewrites and TLS settings refuse it.
 FETCH_CONFIG = [
@@ -1729,12 +1729,50 @@ def _host_claude(agent, account, sandbox):
     return claude_home, claude_env, config
 
 
-def _host_clone(clone, repo):
+def _host_clone(clone, repo, create=False):
     """``clone``'s real path, its remotes that name ``repo`` and its own ``.git``.
 
-    Nothing clones a repository on a worker: a missing clone is refused.
+    Dashboard launches may create a missing clone using the worker's GitHub login.
+    Other callers only verify existing clones. Existing destinations are never reused
+    for cloning, and a failed clone leaves no partial repository at the destination.
     """
+    missing = not os.path.lexists(os.path.expanduser(clone))
     clone = os.path.realpath(os.path.expanduser(clone))
+    if create and missing and not os.path.lexists(clone):
+        _repo(repo)
+        parent = os.path.dirname(clone)
+        os.makedirs(parent, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".babysit-clone-", dir=parent) as staging:
+            options = [arg for setting in FETCH_CONFIG for arg in ("-c", setting)]
+            result = _host_run(
+                [
+                    *HOST_GIT,
+                    *options,
+                    "-C",
+                    staging,
+                    "clone",
+                    "--no-checkout",
+                    "--no-recurse-submodules",
+                    "--template=",
+                    "--",
+                    f"https://github.com/{repo}.git",
+                    staging + "/repo",
+                ],
+                600,
+            )
+            if result.returncode:
+                raise ValueError((result.stderr or "git clone failed")[-4000:].strip())
+            # Populate files only with the probe's filter/hook overrides, never clone's
+            # normal checkout. Reserve the destination, then publish the complete clone.
+            ready = os.path.join(staging, "repo")
+            host_git(ready, "reset", "--hard", "HEAD", timeout=120)
+            os.mkdir(clone)
+            try:
+                os.rename(ready, clone)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.rmdir(clone)
+                raise
     if not os.path.isdir(clone):
         raise ValueError(f"No clone of {repo} at {clone}; clone it on this machine first")
     remotes = remote_slugs(repo_config(host_git, clone))
@@ -1962,14 +2000,14 @@ def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox, also=()
         _arg_paths([pair[0]], home=True)
         _repo(pair[1])
     _, _, config = _host_claude(agent, account, sandbox)
-    clone, _, common = _host_clone(clone, repo)
+    clone, _, common = _host_clone(clone, repo, create=True)
     root = os.path.realpath(os.path.expanduser(root))
     if root == common or root.startswith(common + os.sep):
         raise ValueError(f"{root} lies inside {clone}'s .git")
     # Each clone with the directory its checkout goes in, as wt lays them out.
     places = [(clone, root)]
     for other, other_repo in also:
-        other = _host_clone(other, other_repo)[0]
+        other = _host_clone(other, other_repo, create=True)[0]
         where = os.path.join(os.path.dirname(root), os.path.basename(other))
         if other in (c for c, _ in places) or where in (r for _, r in places):
             raise ValueError(f"{other} would share another repository's checkouts")
