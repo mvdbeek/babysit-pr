@@ -383,7 +383,7 @@ def test_a_linux_workers_command_line_is_read_whole_from_proc(monkeypatch):
     assert remote_probe._proc_arguments(9) is None  # Gone.
 
 
-def test_the_alive_probe_compares_the_process_command_line(watched):
+def test_the_alive_probe_compares_the_process_command_line():
     import hashlib
 
     import remote_probe
@@ -391,15 +391,19 @@ def test_the_alive_probe_compares_the_process_command_line(watched):
     def digest(argv):
         return hashlib.sha256("\0".join(argv).encode()).hexdigest()
 
-    alive = subprocess.Popen(["sleep", "60"])
+    argv = [sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(60)"]
+    alive = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
     try:
-        found = remote_probe._host_alive(alive.pid, digest(["sleep", "60"]))
+        # Wait until the child is running before reading its command line.
+        assert alive.stdout.readline() == "ready\n"
+        found = remote_probe._host_alive(alive.pid, digest(argv))
         assert remote_probe.validate_alive(found) == {"alive": True}
-        assert remote_probe._host_alive(alive.pid, digest(["sleep", "61"])) == {"alive": False}
+        assert remote_probe._host_alive(alive.pid, digest([*argv, "other"])) == {"alive": False}
     finally:
         alive.kill()
         alive.wait(timeout=10)
-    assert remote_probe._host_alive(alive.pid, digest(["sleep", "60"])) == {"alive": False}
+        alive.stdout.close()
+    assert remote_probe._host_alive(alive.pid, digest(argv)) == {"alive": False}
     for bad in ((1, digest(["x"])), ("2", digest(["x"])), (os.getpid(), "x"), (os.getpid(), None)):
         with pytest.raises(ValueError):
             remote_probe._host_alive(*bad)

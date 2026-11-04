@@ -355,7 +355,7 @@ def test_a_task_whose_attached_file_cannot_be_copied_is_not_started(remote):
     (manager.attachments / shot).unlink()
     op = finish(manager, manager.new_task(request)["operation"]["pr"])
     assert op["status"] == "failed" and "attached file is missing" in op["message"], op
-    assert not store(state)["machines"]["Mac mini"].get("agents")
+    assert not store(state).get("machines", {}).get("Mac mini", {}).get("agents")
     assert not (worker / ".local/state/babysit-pr/workspace-prompts").exists()
     assert not any("wt.py" in c for c in remote_commands(state))
 
@@ -406,14 +406,22 @@ def test_a_new_task_on_a_worker_also_checks_out_its_other_clones(remote):
     assert f"you can write and commit there:\n- {path}" in agent["task"]
 
 
-def test_a_worker_without_an_other_clone_is_refused(remote):
+def test_a_worker_clones_a_missing_other_repository(remote):
     manager, _, state, worker = remote
     other = other_clone(manager, git)
+    git(
+        "config",
+        "--global",
+        f"url.{other}.insteadOf",
+        "https://github.com/base/other.git",
+        cwd=other,
+    )
     task = new_request(manager, name="lonely", also=[str(other)], machine="mini")
     op = finish(manager, manager.new_task(task)["operation"]["pr"])
-    assert op["status"] == "failed"
-    assert "No clone of base/other at" in op["message"]
-    assert not [c for c in remote_commands(state) if "wt.py" in c]
+    assert op["status"] == "complete", op
+    there = worker / "src/other"
+    assert git("config", "remote.origin.url", cwd=there) == "https://github.com/base/other.git"
+    assert git("rev-parse", "HEAD", cwd=op["also_paths"][0]) == git("rev-parse", "HEAD", cwd=other)
     # A worker clone named like the task's own repository would share its checkouts.
     named = other_clone(manager, git, "named")
     git("remote", "set-url", "upstream", "https://github.com/base/Repo.git", cwd=named)
@@ -454,15 +462,24 @@ def test_a_worker_running_another_babysit_pr_is_refused(remote, tmp_path):
     assert not [c for c in remote_commands(state) if "wt.py" in c]
 
 
-def test_a_worker_without_the_clone_is_refused(remote):
+@pytest.mark.parametrize("kind", ["task", "pr"])
+def test_a_worker_clones_a_missing_repository_before_starting(remote, kind):
     manager, pr, state, worker = remote
-    shutil.rmtree(worker / "src" / "repo")
-    manager.action({"id": pr["id"], "action": "handle", "task": "Review", "machine": "mini"})
-    op = finish(manager, pr["id"])
-    assert op["status"] == "failed"
-    assert "No clone of base/repo at" in op["message"] and "clone it" in op["message"]
-    assert not [c for c in remote_commands(state) if "wt.py" in c]
-    assert not (worker / "src").exists() or not list((worker / "src").iterdir())
+    shutil.rmtree(worker / "src")
+    if kind == "task":
+        value = manager.new_task(new_request(manager, name="fresh", machine="mini"))
+        key, branch = value["operation"]["pr"], "main"
+    else:
+        manager.action({"id": pr["id"], "action": "handle", "task": "Review", "machine": "mini"})
+        key, branch = pr["id"], "feature"
+    op = finish(manager, key)
+    assert op["status"] == "complete", op
+    there = worker / "src/repo"
+    assert git("config", "remote.origin.url", cwd=there) == URL
+    expected = git("rev-parse", branch, cwd=os.environ["FAKE_HEAD"])
+    assert git("rev-parse", "HEAD", cwd=op["path"]) == expected
+    assert len(store(state)["machines"]["Mac mini"]["agents"]) == 1
+    assert not list((worker / "src").glob(".babysit-clone-*"))
 
 
 def test_work_that_may_need_repairs_stays_off_workers(remote):
@@ -575,6 +592,115 @@ def prepare(home, clone, prefix="pr-base-7", **changes):
         **changes,
     }
     return remote_probe.validate_wt_prepare(remote_probe._host_wt_prepare(**args))
+
+
+@pytest.mark.parametrize("occupied", ["directory", "file", "wrong-repository", "dangling-link"])
+def test_a_worker_never_clones_over_an_existing_destination(host, occupied):  # noqa: F811
+    home, clone, _ = host
+    shutil.rmtree(clone)
+    if occupied == "file":
+        clone.write_text("keep me")
+    elif occupied == "dangling-link":
+        clone.symlink_to(home / "not-created")
+    else:
+        clone.mkdir()
+        (clone / "keep").write_text("keep me")
+        if occupied == "wrong-repository":
+            git("init", "-q", cwd=clone)
+            git("remote", "add", "origin", "https://github.com/someone/else.git", cwd=clone)
+    with pytest.raises(ValueError, match="clone of base/repo"):
+        prepare(home, clone)
+    assert os.path.lexists(clone)
+    assert not (home / "not-created").exists()
+    if clone.is_dir():
+        assert (clone / "keep").read_text() == "keep me"
+    elif not clone.is_symlink():
+        assert clone.read_text() == "keep me"
+    assert not list(clone.parent.glob(".babysit-clone-*"))
+
+
+def test_a_failed_worker_clone_leaves_the_destination_available_for_retry(host):  # noqa: F811
+    home, clone, upstream = host
+    shutil.rmtree(clone)
+    config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    original = config.read_text()
+    config.write_text(
+        original.replace(str(home.parent.parent / "github.git"), str(home / "missing.git"))
+    )
+    with pytest.raises(ValueError, match="does not appear to be a git repository"):
+        prepare(home, clone)
+    assert not clone.exists()
+    assert not list(clone.parent.glob(".babysit-clone-*"))
+    config.write_text(original)
+    assert prepare(home, clone)["clone"] == str(clone.resolve())
+    assert git("rev-parse", "HEAD", cwd=clone) == upstream
+    assert git("status", "--porcelain", cwd=clone) == ""
+
+
+def test_a_worker_clone_timeout_removes_staging(host, monkeypatch):  # noqa: F811
+    home, clone, _ = host
+    shutil.rmtree(clone)
+    run = remote_probe._host_run
+
+    def timeout(argv, seconds, env=None):
+        if "clone" in argv:
+            raise subprocess.TimeoutExpired(argv, seconds)
+        return run(argv, seconds, env)
+
+    monkeypatch.setattr(remote_probe, "_host_run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        prepare(home, clone)
+    assert not clone.exists()
+    assert not list(clone.parent.glob(".babysit-clone-*"))
+
+
+def test_a_worker_clone_preserves_a_destination_created_while_cloning(host, monkeypatch):  # noqa: F811
+    home, clone, _ = host
+    shutil.rmtree(clone)
+    run = remote_probe._host_run
+
+    def appeared(argv, seconds, env=None):
+        result = run(argv, seconds, env)
+        if "clone" in argv:
+            clone.mkdir()
+            (clone / "keep").write_text("keep me")
+        return result
+
+    monkeypatch.setattr(remote_probe, "_host_run", appeared)
+    with pytest.raises(FileExistsError):
+        prepare(home, clone)
+    assert (clone / "keep").read_text() == "keep me"
+    assert not (clone / ".git").exists()
+    assert not list(clone.parent.glob(".babysit-clone-*"))
+
+
+def test_a_worker_clone_checks_out_without_filters_or_template_hooks(host):  # noqa: F811
+    home, clone, _ = host
+    work = home.parent.parent / "upstream-work"
+    (work / ".gitattributes").write_text("f filter=trip\n")
+    git("add", ".gitattributes", cwd=work)
+    git("commit", "-q", "-m", "filtered file", cwd=work)
+    git("push", "-q", "origin", "main", cwd=work)
+    marker = home / "ran-program"
+    script = f"touch {marker}"
+    template = home / "template"
+    (template / "hooks").mkdir(parents=True)
+    hook = template / "hooks/post-checkout"
+    hook.write_text(f"#!/bin/sh\n{script}\n")
+    hook.chmod(0o755)
+    for key, value in {
+        "init.templateDir": str(template),
+        "filter.trip.smudge": script,
+        "filter.trip.process": script,
+        "filter.trip.required": "true",
+    }.items():
+        git("config", "--global", key, value, cwd=clone)
+    shutil.rmtree(clone)
+    prepare(home, clone)
+    assert (clone / "f").read_text() == "a\n"
+    assert (clone / ".gitattributes").read_text() == "f filter=trip\n"
+    assert not (clone / ".git/hooks/post-checkout").exists()
+    assert not marker.exists()
 
 
 def test_a_workers_launch_names_a_free_checkout_and_trusts_it(host):  # noqa: F811

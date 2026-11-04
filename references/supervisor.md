@@ -837,8 +837,8 @@ New task only when:
 - that machine runs fewer than 4 working sub-task agents: launches under way, and
   earlier sub-tasks whose checkout herdr lists with a working or blocked agent (an idle
   one left open does not count; sub-task operations are kept a week);
-- the repository has a clone there (this machine's: `<src>/<name>` if it is one, else
-  the first listed; a worker's: its own, checked by its probe).
+- the repository has a clone on this machine (`<src>/<name>` if it is one, else the
+  first listed); a worker uses its own clone, creating it when missing as for New task.
 
 A sub-task always runs sandboxed: New task has no other launch, here or on a worker.
 A worker's request is answered once the operation is recorded and the worker's request
@@ -954,9 +954,10 @@ a prior workspace, a pin (Handle on a verified checkout) or a machine chosen by 
 beats it. The preferred worker must be registered with `"auto": true`, since `auto:
 false` promises that it runs only what is sent to it by name; one that cannot take the
 launch (not used by Auto, full, unreachable, checking, a kind it cannot start) leaves
-it to the usual ranking, and the reason says why ("…; <label>: full (6/6)"). Nothing
-checks that the worker has the repository's clone; a launch there without one is
-refused when it starts. Then come the repo's `prefer`, then load:
+it to the usual ranking, and the reason says why ("…; <label>: full (6/6)"). Placement
+does not require a clone on the worker: task and pull request launches clone a missing
+repository when they start (cron jobs still require an existing clone).
+Then come the repo's `prefer`, then load:
 agents plus launches placed but not yet listed, over the machine's capacity. This
 machine's capacity is **Agents on this machine** in Settings (default 20, shown once
 workers are registered): at that many agents Auto prefers a worker, and comes back here
@@ -968,9 +969,9 @@ checkout, which pins the launch to its machine.
 A launch placed on a worker (Handle or Create on a pull request, a new task, from the
 dialog or from `wt --machine` on this machine, batch review, a scheduled launch) starts
 there. Until repairs run on workers, only work that never needs them goes there: pull
-request reviews and new tasks on a branch. Issues,
-Sentry issues, new tasks that file an issue and new tasks with other clones (`--with`)
-are refused with the reason. The launch first compares the worker's deployed
+request reviews and new tasks on a branch, including tasks with other clones (`--with`).
+Issues, Sentry issues and new tasks that file an issue are refused with the reason.
+The launch first compares the worker's deployed
 babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
 refuses a mismatch, naming the `provision_worker.sh --user-step --sha <sha>` that fixes
 it, then syncs the worker's skills when it has `skills` (see Skills on workers). For a Linux worker whose `babysit_root` is the copy that script deploys
@@ -978,8 +979,13 @@ it, then syncs the worker's skills when it has `skills` (see Skills on workers).
 dashboard runs that user step, from this machine's commit, over the worker's ssh
 (`/api/worker-update`, one update per worker at a time), then reads the worker's commit
 back; a checkout the script left alone (local changes) is reported with its output. Start
-the task again once it reports the new commit. It works in the worker's clone `<src>/<repo name>`, which must name the repository
-in a remote; nothing clones on a worker, so a missing clone is refused. A probe op names
+the task again once it reports the new commit. It works in the worker's clone
+`<src>/<repo name>`, which must name the repository in a remote. If that path is missing,
+the probe clones `https://github.com/<owner>/<repo>.git` with the worker's own GitHub
+login before starting the task. This also applies to each missing `--with` clone.
+An existing destination belonging to another repository is refused. Clones are staged
+beside the destination, with hooks, filters and submodule recursion disabled; a failed
+clone leaves the destination available for retry. A probe op names
 the new checkout under `<src>/worktrees/<repo name>` and trusts it for Claude in the
 config its sandbox reads (a config that is a symlink or over 64 MiB is left alone, and
 the rewritten one keeps only its permission bits); the brief is staged in `~/.local/state/babysit-pr/workspace-prompts`

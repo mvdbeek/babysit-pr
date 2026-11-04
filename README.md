@@ -1050,8 +1050,8 @@ Safehouse as it always has. The controller places it, Auto unless
 always sandboxed, under the sub-task rules of the supervisor reference: the asking
 launch's agent and Claude account, Docker only when that launch has it, at most two
 levels deep and a few an hour per lineage, never on a full machine or one already
-running 4 working sub-task agents, a worker's never on this machine, only in a
-repository cloned there. Only
+running 4 working sub-task agents, a worker's never on this machine. A worker clones
+the repository there if it is missing, as it does for other new tasks. Only
 `wt <base> <branch>` with a prompt is handed over; anything else is refused rather than
 run here. `-r` there also takes `owner/name`, which a sandbox that cannot read the
 clone (a worker's) needs. `wt` prints the controller's progress on stderr; from a worker
