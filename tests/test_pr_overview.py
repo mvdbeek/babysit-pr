@@ -39,7 +39,9 @@ def event(kind, who, at, typename="User"):
 
 
 def days_ago(days):
-    return (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # To the hour: xdist workers collecting a second apart must name these tests alike.
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    return (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def finished(key, state="MERGED", *events):
