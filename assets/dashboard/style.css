@@ -2487,3 +2487,97 @@ html:has(#ws-viewer.ws-viewer-full:modal) {
   margin: 15vh auto 0;
   padding: 0 16px;
 }
+
+/* One focus tag follows the user between the three work inventories. */
+.view-navigation {
+  display: flex;
+  align-items: start;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+.view-navigation .page-tabs {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+.tag-focus-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  flex: 0 1 280px;
+  gap: 0.4rem;
+}
+.tag-focus-bar > .searchable-select {
+  flex: 1;
+  min-width: 0;
+}
+.tag-focus-bar label {
+  white-space: nowrap;
+}
+#tag-status:not(:empty) {
+  flex-basis: 100%;
+}
+@media (max-width: 540px) {
+  .view-navigation {
+    margin-bottom: 16px;
+    gap: 8px;
+  }
+  .tag-focus-bar {
+    flex-basis: 130px;
+  }
+  .tag-focus-bar label {
+    display: none;
+  }
+  .tag-focus-bar > .searchable-select {
+    width: 130px;
+  }
+  .tag-focus-bar .select-field input {
+    width: 100%;
+  }
+}
+.work-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+}
+.tag-edit {
+  font-size: 0.75rem;
+  padding: 0.1rem 0.4rem;
+}
+.tag-chip {
+  cursor: pointer;
+  max-width: min(20rem, 100%);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+#tag-dialog {
+  max-width: min(34rem, 95vw);
+}
+#tag-item,
+#tag-inherited,
+#tag-assigned span {
+  overflow-wrap: anywhere;
+}
+#tag-assigned {
+  padding-left: 1rem;
+}
+#tag-assigned li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0.5rem 0;
+}
+#tag-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+#tag-name {
+  min-width: 0;
+  max-width: 100%;
+}
+#tag-error {
+  color: var(--red);
+}

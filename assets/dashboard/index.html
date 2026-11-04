@@ -25,6 +25,7 @@
     <script src="/settings.js" defer></script>
     <script src="/attachments.js" defer></script>
     <script src="/viewer.js" defer></script>
+    <script src="/tags.js" defer></script>
     <script src="/app.js" defer></script>
     <script src="/upstream-tests.js" defer></script>
     <link rel="stylesheet" href="/upstream-tests.css" />
@@ -170,6 +171,23 @@
         </button>
       </div>
     </header>
+    <dialog id="tag-dialog" aria-labelledby="tag-title">
+      <div class="dialog-header dialog-heading">
+        <h2 id="tag-title">Tags</h2>
+        <button id="tag-close" type="button" aria-label="Close tags">×</button>
+      </div>
+      <p id="tag-item"></p>
+      <p>Tags group your work across repositories and are shared with wt.</p>
+      <ul id="tag-assigned"></ul>
+      <p id="tag-inherited"></p>
+      <form id="tag-form">
+        <label for="tag-name">Add tag</label>
+        <input id="tag-name" list="tag-suggestions" maxlength="64" required autocomplete="off" />
+        <datalist id="tag-suggestions"></datalist>
+        <button id="tag-add" type="submit">Add</button>
+      </form>
+      <p id="tag-error" role="alert"></p>
+    </dialog>
     <dialog id="notifications-dialog" aria-labelledby="notifications-title">
       <div class="dialog-header">
         <div class="notifications-heading">
@@ -278,124 +296,136 @@
         <span id="codex-update-text"></span>
         <button id="codex-update-button" type="button" hidden>Update Codex</button>
       </div>
-      <div class="page-tabs" role="tablist" aria-label="Dashboard views">
-        <button
-          id="attention-tab"
-          type="button"
-          role="tab"
-          aria-selected="true"
-          aria-controls="attention-panel"
-          aria-describedby="attention-tab-needs"
-        >
-          Needs you
-          <span id="attention-tab-needs" hidden></span
-          ><span id="attention-tab-count" class="count attention-count" hidden aria-hidden="true"
-            >0</span
+      <div class="view-navigation">
+        <div class="page-tabs" role="tablist" aria-label="Dashboard views">
+          <button
+            id="attention-tab"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="attention-panel"
+            aria-describedby="attention-tab-needs"
           >
-        </button>
-        <button
-          id="watcher-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="watcher-panel"
-          aria-describedby="watcher-tab-needs"
-          tabindex="-1"
-        >
-          Watcher
-          <span id="watcher-tab-needs" hidden></span
-          ><span id="watcher-tab-count" class="count attention-count" hidden aria-hidden="true"
-            >0</span
+            Needs you
+            <span id="attention-tab-needs" hidden></span
+            ><span id="attention-tab-count" class="count attention-count" hidden aria-hidden="true"
+              >0</span
+            >
+          </button>
+          <button
+            id="watcher-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="watcher-panel"
+            aria-describedby="watcher-tab-needs"
+            tabindex="-1"
           >
-        </button>
-        <button
-          id="prs-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="prs-panel"
-          aria-describedby="prs-tab-needs"
-          tabindex="-1"
-        >
-          Pull requests
-          <span id="prs-tab-needs" hidden></span
-          ><span id="prs-tab-count" class="count attention-count" hidden aria-hidden="true">0</span>
-        </button>
-        <button
-          id="issues-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="issues-panel"
-          aria-describedby="issues-tab-needs"
-          tabindex="-1"
-        >
-          Issues
-          <span id="issues-tab-needs" hidden></span
-          ><span id="issues-tab-count" class="count attention-count" hidden aria-hidden="true"
-            >0</span
+            Watcher
+            <span id="watcher-tab-needs" hidden></span
+            ><span id="watcher-tab-count" class="count attention-count" hidden aria-hidden="true"
+              >0</span
+            >
+          </button>
+          <button
+            id="prs-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="prs-panel"
+            aria-describedby="prs-tab-needs"
+            tabindex="-1"
           >
-        </button>
-        <button
-          id="scheduled-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="scheduled-panel"
-          tabindex="-1"
-          hidden
-        >
-          Scheduled <span id="scheduled-tab-count" class="count" hidden>0</span>
-        </button>
-        <button
-          id="cron-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="cron-panel"
-          tabindex="-1"
-          hidden
-        >
-          Cron jobs <span id="cron-tab-count" class="count attention-count" hidden>0</span>
-        </button>
-        <button
-          id="workspaces-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="workspaces-panel"
-          aria-describedby="workspaces-tab-needs"
-          tabindex="-1"
-          hidden
-        >
-          Workspaces
-          <span id="workspaces-tab-needs" hidden></span
-          ><span id="workspaces-tab-count" class="count attention-count" hidden aria-hidden="true"
-            >0</span
+            Pull requests
+            <span id="prs-tab-needs" hidden></span
+            ><span id="prs-tab-count" class="count attention-count" hidden aria-hidden="true"
+              >0</span
+            >
+          </button>
+          <button
+            id="issues-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="issues-panel"
+            aria-describedby="issues-tab-needs"
+            tabindex="-1"
           >
-        </button>
-        <button
-          id="upstream-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="upstream-panel"
-          tabindex="-1"
-          hidden
-        >
-          Upstream tests
-        </button>
-        <button
-          id="sentry-tab"
-          type="button"
-          role="tab"
-          aria-selected="false"
-          aria-controls="sentry-panel"
-          tabindex="-1"
-          hidden
-        >
-          Sentry
-        </button>
+            Issues
+            <span id="issues-tab-needs" hidden></span
+            ><span id="issues-tab-count" class="count attention-count" hidden aria-hidden="true"
+              >0</span
+            >
+          </button>
+          <button
+            id="scheduled-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="scheduled-panel"
+            tabindex="-1"
+            hidden
+          >
+            Scheduled <span id="scheduled-tab-count" class="count" hidden>0</span>
+          </button>
+          <button
+            id="cron-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="cron-panel"
+            tabindex="-1"
+            hidden
+          >
+            Cron jobs <span id="cron-tab-count" class="count attention-count" hidden>0</span>
+          </button>
+          <button
+            id="workspaces-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="workspaces-panel"
+            aria-describedby="workspaces-tab-needs"
+            tabindex="-1"
+            hidden
+          >
+            Workspaces
+            <span id="workspaces-tab-needs" hidden></span
+            ><span id="workspaces-tab-count" class="count attention-count" hidden aria-hidden="true"
+              >0</span
+            >
+          </button>
+          <button
+            id="upstream-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="upstream-panel"
+            tabindex="-1"
+            hidden
+          >
+            Upstream tests
+          </button>
+          <button
+            id="sentry-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="sentry-panel"
+            tabindex="-1"
+            hidden
+          >
+            Sentry
+          </button>
+        </div>
+        <div class="tag-focus-bar">
+          <label for="tag-focus">Focus tag</label>
+          <select id="tag-focus" aria-label="Focus tag">
+            <option value="">All tags</option>
+          </select>
+          <button id="tag-clear" type="button" hidden>Clear tag focus</button>
+          <span id="tag-status" role="status"></span>
+        </div>
       </div>
       <section
         id="attention-panel"

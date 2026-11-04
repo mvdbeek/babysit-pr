@@ -846,6 +846,48 @@ out), and in report mode the number of would-be refusals.
 Setup, the Keycloak client settings, the policy table and every command are in
 [the sign-in reference](references/auth.md).
 
+## Focus tags
+
+Use a local tag to follow related work across repositories in the **Workspaces**,
+**Issues**, and **PRs** tabs. Choose **Focus tag** above the tabs to filter all three
+views; **Clear tag focus** returns to all work. Existing repository and search
+filters still apply. Focus survives reloads and tab changes, and the `?tag=` URL
+can be bookmarked or shared with someone using the same dashboard.
+
+Each row has a **Tags** button for adding and removing tags. Clicking a tag on a
+row focuses it. Tags are shared by `wt` and the dashboard in
+`$BABYSIT_HOME/tags.sqlite` (default `~/.local/state/babysit-pr/tags.sqlite`).
+They are local to that dashboard; GitHub labels are unchanged. Use the same
+`BABYSIT_HOME` as the dashboard's `--home` when running `wt`.
+
+```bash
+# Tag a new or existing workspace; repeat --tag for multiple tags.
+wt --tag release --tag backend -r galaxy dev release-fix
+wti --tag release https://github.com/galaxyproject/galaxy/issues/123
+wtpr --tag release https://github.com/galaxyproject/galaxy/pull/456
+
+# Tag existing work without opening a workspace or starting an agent.
+wt tag add release                         # current workspace directory
+wt tag add release ~/src/worktrees/other/fix
+wt tag add release https://github.com/owner/other/issues/12
+wt tag add release https://github.com/owner/third/pull/34
+wt tag list release
+wt tag remove release https://github.com/owner/third/pull/34
+```
+
+Names are case-sensitive, accept spaces, and contain 1–64 characters. Quote
+names containing spaces. Tags assigned to a workspace also appear on its linked
+issues and PRs, and tags assigned directly to those items appear on the workspace.
+The dashboard uses the workspace inventory's known links; `wti --tag` and
+`wtpr --tag` record their link immediately. The editor distinguishes direct tags
+from inherited ones, which must be removed where assigned. Tags do not spread
+transitively from an issue through one workspace to another PR.
+
+`wt --with` applies its tags to each local companion checkout too. For a launch
+on a worker, tags are stored by the controller with the machine's workspace key,
+so identical paths on different machines remain separate. Advanced CLI callers
+can name those keys as `workspace:m:<machine>:<path>`.
+
 ## Worktree helper
 
 `scripts/wt.py` is a portable, stdlib-only Python implementation of the `wt`, `wti`

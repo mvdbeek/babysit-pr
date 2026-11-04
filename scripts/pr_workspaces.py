@@ -36,6 +36,7 @@ import placement
 import remote_probe
 import safe_git
 import skill_sync
+import work_tags
 import worker_api
 import worker_updates
 import workspace_agents
@@ -1086,6 +1087,18 @@ class Workspaces:
 
     def save_operation(self, op, **changes):
         op.update(changes, updated_at=time.time())
+        path = op.get("path") or (op.get("result") or {}).get("path")
+        if path and op.get("tags") and op.get("tagged_path") != path:
+            key = f"m:{op['machine']}:{path}" if op.get("machine") else os.path.realpath(path)
+            tags = work_tags.Tags(self.home)
+            tags.change({"target": f"workspace:{key}", "add": op["tags"]})
+            subject = op.get("subject") or {}
+            if subject.get("kind") in {"issue", "pr"} and subject.get("number"):
+                tags.link(
+                    f"workspace:{key}",
+                    work_tags.item_target(subject["kind"], subject["repo"], subject["number"]),
+                )
+            op["tagged_path"] = path
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO operations VALUES (?,?)", (op["pr"], json.dumps(op)))
             db.execute(
@@ -1681,6 +1694,7 @@ class Workspaces:
             "docker",
             "exit_when_done",
             "also",
+            "tags",
             "also_bases",
             "machine",
             # `wt --permission-mode auto`, from a `wt` that hands its launch here.
@@ -1694,7 +1708,7 @@ class Workspaces:
             or any(
                 not isinstance(v, str)
                 for k, v in request.items()
-                if k not in {*flags, "also", "also_bases"}
+                if k not in {*flags, "also", "also_bases", "tags"}
             )
             or any(not isinstance(request.get(flag, False), bool) for flag in flags)
             or not isinstance(also, list)
@@ -1703,6 +1717,7 @@ class Workspaces:
             or any(not isinstance(base, str) for base in bases.values())
         ):
             raise ValueError("Invalid new task parameters")
+        tags = work_tags.tag_names(request.get("tags", []))
         repo = request.get("repo", "")
         if not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
             raise ValueError("Choose a repository")
@@ -1817,6 +1832,7 @@ class Workspaces:
             "permission_mode": request.get("permission_mode") or None,
             "exit_when_done": request.get("exit_when_done", False),
             "also": also,
+            **({"tags": tags} if tags else {}),
             **({"also_bases": bases} if bases else {}),
             **({"also_repos": also_repos} if also_repos else {}),
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
@@ -1849,7 +1865,7 @@ class Workspaces:
     def subtask(self, launch, parent):
         """A New task an agent asked for from its sandbox (`wt` there), under stricter rules.
 
-        ``launch`` is exactly ``wt.LAUNCH_FIELDS``. ``parent`` is the launch asking, as a
+        ``launch`` has ``wt.LAUNCH_FIELDS`` and optional ``tags``. ``parent`` asks, as a
         worker's broker reports it (``worker_api.launch_args``: that machine, its sandbox's
         directory, Docker grant and agent configuration, the conversation's transcript) or
         as a `wt` inside Safehouse here claims it (``worker_api.local_parent``); it is
@@ -1864,14 +1880,15 @@ class Workspaces:
         of the repository there. Answers the operation as soon as it is recorded.
         """
         flags = {"docker", "exit_when_done"}
-        if not isinstance(launch, dict) or set(launch) != set(wt.LAUNCH_FIELDS):
+        if not isinstance(launch, dict) or set(launch) - {"tags"} != set(wt.LAUNCH_FIELDS):
             raise ValueError("Expected exactly the launch fields")
         if any(type(launch[flag]) is not bool for flag in flags) or any(
             not isinstance(value, str) or (key != "task" and CONTROL.search(value))
             for key, value in launch.items()
-            if key not in flags
+            if key not in flags | {"tags"}
         ):
             raise ValueError("Invalid launch fields")
+        work_tags.tag_names(launch.get("tags", []))
         if launch["machine"] != "auto" and not wt.MACHINE.fullmatch(launch["machine"]):
             raise ValueError("Name a machine, or auto")
         if not SLUG.fullmatch(launch["repo"]):
