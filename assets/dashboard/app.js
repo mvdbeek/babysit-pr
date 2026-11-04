@@ -1350,7 +1350,10 @@ function itemTable(spec) {
     const query = id("search").value.toLowerCase();
     const filters = Object.fromEntries(spec.filters.map((name) => [name, id(name).value]));
     const visible = all.filter(
-      (item) => spec.visible(item, filters) && spec.searchText(item).toLowerCase().includes(query),
+      (item) =>
+        window.dashboardTags.matches(item, spec.prefix) &&
+        spec.visible(item, filters) &&
+        spec.searchText(item).toLowerCase().includes(query),
     );
     ordered(visible, pins);
     table.shown = visible.slice(0, table.limit);
@@ -1601,6 +1604,7 @@ function itemTable(spec) {
     focusNotification(renderedRows.get(item.id).row);
     return true;
   }
+  window.addEventListener("tags-changed", render);
   return Object.assign(table, { items, render, refresh, reveal });
 }
 
@@ -1693,6 +1697,7 @@ const prTable = itemTable({
     titleLink.className = "pr-title";
     title.append(titleLink, el("span", `#${pr.number}`, "pr-meta"));
     title.append(statusLine({ ...pr, kind: "pr" }));
+    title.append(window.dashboardTags.controls(pr, "pr"));
     const author = authorCell(pr.author);
     const readiness = el("td", undefined, "pr-readiness");
     for (const [label, color, feedback] of prReviewBadges(pr))
@@ -1882,6 +1887,7 @@ const issueTable = itemTable({
     titleLink.className = "pr-title";
     title.append(titleLink, el("span", `#${issue.number}`, "pr-meta"));
     title.append(statusLine({ ...issue, kind: "issue" }));
+    title.append(window.dashboardTags.controls(issue, "issue"));
     if (issue.labels?.length) {
       const labels = el("div", undefined, "pr-badges pr-labels");
       for (const label of issue.labels) labels.append(labelBadge(label));

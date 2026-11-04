@@ -61,6 +61,7 @@
     return `Not available for workspaces on ${entry.machine_label} yet`;
   }
   function matches(row) {
+    if (!window.dashboardTags.matches(row, "workspace")) return false;
     const term = byId("ws-search").value.trim().toLowerCase();
     const repo = byId("ws-repo").value;
     const status = byId("ws-status").value;
@@ -156,6 +157,7 @@
     if (entry.machine && entry.workspace_ids.length)
       plain.title = `Collie unavailable for ${entry.machine_label}`;
     name.append(entry.workspace_url ? anchor(entry.name, entry.workspace_url) : plain);
+    name.append(window.dashboardTags.controls(entry, "workspace"));
     if (entry.machine) {
       const chip = badge(entry.machine_label, entry.machine_stale ? "amber" : "");
       chip.classList.add("ws-machine");
@@ -339,7 +341,13 @@
     }
     byId("ws-count").textContent = String(shown.length);
     // Rows show the entry, its selection and its open-workspace progress; times are absolute.
-    const rowState = JSON.stringify([shown, [...selected], [...opening], [...openResults]]);
+    const rowState = JSON.stringify([
+      shown,
+      [...selected],
+      [...opening],
+      [...openResults],
+      window.dashboardTags.revision,
+    ]);
     if (rowState !== renderedRows) {
       renderedRows = rowState;
       rebuild(byId("ws-list"), shown.map(row));
@@ -623,6 +631,7 @@
       openDialog(targets.slice(0, BATCH), Math.max(0, targets.length - BATCH));
     },
   };
+  window.addEventListener("tags-changed", render);
   searchRequestedItem();
   void refresh();
 })();

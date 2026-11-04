@@ -31,6 +31,7 @@ import llm_usage
 import machines
 import service_control
 import voice_assistant
+import work_tags
 import worker_api
 import workspace_agents
 import workspace_move
@@ -144,6 +145,7 @@ ACTIONS = frozenset(
         "notification-silence",
         "notification-focus",
         "attention-triage",
+        "tags",
         "extension-pair",
         "effort-default",
         "settings",
@@ -526,6 +528,7 @@ class DashboardServer(ThreadingHTTPServer):
         auth: dashboard_auth.Auth | None = None,
     ) -> None:
         self.home = home
+        self.tags = work_tags.Tags(home)
         # None while auth is off: every request is answered as before Phase 1.
         self.auth = auth
         # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.
@@ -552,6 +555,19 @@ class DashboardServer(ThreadingHTTPServer):
             home, lambda: self.workspaces, lambda: self.workspace_overview
         )
         super().__init__(("127.0.0.1", port), Handler)
+
+    def tag_snapshot(self):
+        rows = []
+        warning = None
+        if self.workspace_overview:
+            try:
+                rows = self.workspace_overview.snapshot(start=False).get("workspaces", [])
+            except Exception:
+                warning = "Workspace tag links unavailable; showing saved tags"
+        value = self.tags.snapshot(rows)
+        if warning:
+            value["warning"] = warning
+        return value
 
     def attention_feed(self):
         """Every source through its own snapshot; a failing one is named, the rest answer.
@@ -989,6 +1005,7 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-answer",
                         "workspace-prompt-forget",
                         "settings",
+                        "tags",
                         "sentry-action",
                         "cron-action",
                         "voice-turn",
@@ -1027,6 +1044,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.server.push:
                     raise ValueError("Notification preferences are unavailable")
                 self.send_json(200, self.server.push.focus(request))
+                return
+            if action == "tags":
+                self.server.tags.change(request)
+                self.send_json(200, self.server.tag_snapshot())
                 return
             if action == "attention-triage":
                 # Validated against the shared feed; the answer carries a fresh one.
@@ -1662,6 +1683,8 @@ class Handler(BaseHTTPRequestHandler):
             elif route.path == "/api/attention":
                 fresh = parse_qs(route.query).get("refresh") == ["1"]
                 self.send_json(200, self.server.attention.get(fresh=fresh))
+            elif route.path == "/api/tags":
+                self.send_json(200, self.server.tag_snapshot())
             elif route.path == "/api/prs":
                 self.send_json(
                     200,
@@ -1796,6 +1819,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/icon-512.png": ("icon-512.png", "image/png"),
                     "/upstream-tests.js": ("upstream-tests.js", "text/javascript"),
                     "/upstream-tests.css": ("upstream-tests.css", "text/css"),
+                    "/tags.js": ("tags.js", "text/javascript"),
                     "/workspaces.js": ("workspaces.js", "text/javascript"),
                     "/workspaces.css": ("workspaces.css", "text/css"),
                     "/viewer.js": ("viewer.js", "text/javascript"),

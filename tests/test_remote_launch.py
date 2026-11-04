@@ -22,6 +22,7 @@ import machines
 import pr_workspaces as pw
 import pytest
 import remote_probe
+import work_tags
 import workspace_exit
 from test_new_tasks import other_clone
 from test_new_tasks import request as new_request
@@ -926,3 +927,16 @@ def test_an_exit_watch_a_worker_hands_back_is_checked(remote):
     with pytest.raises(ValueError, match="did not hand back"):
         manager.record_remote_watch(worker, op, "/h/w", "pr-repo-feature", "not json")
     assert not watches(manager.home)
+
+
+def test_tags_on_a_worker_are_recorded_on_the_controller_once(remote):
+    manager, _, _, worker = remote
+    value = manager.new_task(new_request(manager, name="tagged", machine="mini", tags=["release"]))
+    op = finish(manager, value["operation"]["pr"])
+    assert op["status"] == "complete", op
+    key = f"workspace:m:mini:{op['result']['path']}"
+    tags = work_tags.Tags(manager.home)
+    assert tags.snapshot()["assignments"] == {key: ["release"]}
+    tags.change({"target": key, "remove": ["release"]})
+    manager.save_operation(op, message="Still ready")
+    assert tags.snapshot()["assignments"] == {}

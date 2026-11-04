@@ -18,13 +18,16 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import NamedTuple, Protocol, TextIO
 
 import claude_accounts
 import safe_git
 import sandbox
+import work_tags
 
 COMMANDS = ("wt", "wti", "wtpr")
 ALIASES = {"wri": "wti", "wtissue": "wti"}
@@ -94,6 +97,7 @@ VALUE_OPTIONS = {
     "--worktree-root": "worktree_root",
     "--agent-arg": "agent_args",
     "--with": "also",
+    "--tag": "tags",
     "--machine": "machine",
 }
 WT_OPTIONS = frozenset(
@@ -111,6 +115,7 @@ WT_OPTIONS = frozenset(
         "-F",
         "--prompt-file",
         "--with",
+        "--tag",
         "--exit-when-done",
         "--machine",
     }
@@ -138,8 +143,14 @@ WT_HELP = """\
 usage:
   wt [opts] <branch|pr-number> [dirname]
   wt [opts] issue <issue-number|issue-url> [branch-name]
+  wt tag add|remove <tag> [workspace-path|github-url ...]
+  wt tag list [tag]
 
 Open or create a Git worktree, then attach a multiplexer session.
+Tags span repositories and are shared with the dashboard in $BABYSIT_HOME.
+Tag add/remove defaults to the current directory. Tag list shows assignments
+and linked items, optionally limited to one tag. GitHub labels are unchanged.
+
 Numeric arguments are treated as PR numbers. A branch that is already checked
 out -- in the main clone or in a worktree under another name -- is opened where
 it is instead of being checked out a second time. Without an origin remote,
@@ -161,6 +172,7 @@ options:
   --with <repo>[:<base>]  also check the branch out in ~/src/<repo> (or a clone path),
                 new from <base> or that clone's default branch, and let the
                 sandboxed agent write there (repeatable)
+  --tag <name>  add a shared local focus tag (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of ~/src/galaxy
@@ -227,6 +239,7 @@ options:
   --with <repo>[:<base>]  also check the branch out in ~/src/<repo> (or a clone path),
                 new from <base> or that clone's default branch, and let the
                 sandboxed agent write there (repeatable)
+  --tag <name>  add a shared local focus tag (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
@@ -267,6 +280,7 @@ options:
   --with <repo>[:<base>]  also check the branch out in ~/src/<repo> (or a clone path),
                 new from <base> or that clone's default branch, and let the
                 sandboxed agent write there (repeatable)
+  --tag <name>  add a shared local focus tag (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
   -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy
@@ -345,6 +359,8 @@ class Options:
         "also",
         "also_bases",
         "also_checkouts",
+        "tags",
+        "tag_item",
         "exit_when_done",
         "exit_watch_json",
         "gpg",
@@ -371,6 +387,8 @@ class Options:
         self.agent_args: list[str] = []
         # `--with` clones, then the checkouts open_session makes in them for the agent.
         self.also: list[str] = []
+        self.tags: list[str] = []
+        self.tag_item = ""
         # A new branch's base in a `--with` clone (`--with <clone>:<base>`), by clone.
         self.also_bases: dict[str, str] = {}
         self.also_checkouts: list[AlsoCheckout] = []
@@ -453,6 +471,11 @@ def parse_args(
             elif field == "repo":
                 options.repo = value
                 options.repo_override = True
+            elif field == "tags":
+                try:
+                    options.tags.append(work_tags.tag_name(value))
+                except ValueError as exc:
+                    raise WtError(f"{command}: {exc}") from exc
             elif field == "also":
                 options.also.append(value)
             elif field == "github_repo":
@@ -469,6 +492,8 @@ def parse_args(
                 setattr(options, field, value)
             args.pop(0)
         args.pop(0)
+    if len(options.tags) > 50:
+        raise WtError(f"{command}: supply at most 50 tags")
     options.positional = args
     return options
 
@@ -984,13 +1009,14 @@ class SubprocessRunner:
 
 
 def launch_request(command: str, options: Options, repo: str, machine: str) -> dict[str, object]:
-    """The New task a launch on a worker asks the controller for: exactly LAUNCH_FIELDS.
+    """A worker launch: the required LAUNCH_FIELDS and an optional list of tags.
 
     Every field is checked here as the controller checks it, so any transport (the local
     dashboard's API, or a sandbox's broker) carries one shape: ``repo`` (``owner/name``),
     ``base`` and ``name`` (the new branch: ``options.positional``), ``agent``, ``model``,
     ``effort``, ``claude_account``, ``task`` (the brief), ``docker``, ``exit_when_done``,
-    ``permission_mode`` (empty or ``auto``) and ``machine`` (a registry id or ``auto``).
+    ``permission_mode`` (empty or ``auto``), ``machine`` (a registry id or ``auto``),
+    and ``tags`` when supplied.
     A field a worker launch cannot take raises NotForWorker; agent options that are
     wrong anywhere raise WtError.
     """
@@ -1035,6 +1061,7 @@ def launch_request(command: str, options: Options, repo: str, machine: str) -> d
         "exit_when_done": options.exit_when_done,
         "permission_mode": options.permission_mode,
         "machine": machine,
+        **({"tags": options.tags} if options.tags else {}),
     }
 
 
@@ -1590,6 +1617,19 @@ class Tool:
         has an agent in it, so reattaching warns and ignores the prompt.
         """
         self.add_also(options, name, repo_path)
+        if options.tags:
+            try:
+                tags = work_tags.Tags(Path(self.babysit_home))
+                target = work_tags.cli_target(directory)
+                if options.tag_item:
+                    tags.link(target, options.tag_item)
+                tags.change({"target": target, "add": options.tags})
+                for checkout in options.also_checkouts:
+                    tags.change(
+                        {"target": work_tags.cli_target(checkout.path), "add": options.tags}
+                    )
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                raise WtError(f"wt: cannot save tags: {exc}") from exc
         mux = self.multiplexer()
         if mux in ("herdr", "tmux", "cmux") and not self.runner.which(mux):
             self.warn(f"wt: {mux} is not on PATH; opening nothing")
@@ -1912,6 +1952,8 @@ class Tool:
         number, title = info.get("number"), info.get("title")
         if not isinstance(number, int) or not isinstance(title, str):
             raise WtError("wti: unexpected gh reply")
+        if options.tags:
+            options.tag_item = work_tags.item_target("issue", slug, number)
         branch = requested or issue_branch(str(number), title)
         directory = os.path.join(root, branch)
         if os.path.lexists(directory):
@@ -1965,6 +2007,8 @@ class Tool:
         # this in a terminal (see trusts_origin).
         host = slug
         slug = slug or self.repo_slug(repo_path, "wtpr")
+        if options.tags:
+            options.tag_item = work_tags.item_target("pr", slug, int(pr))
         info = self.gh_json(
             "wtpr",
             slug,
@@ -2340,7 +2384,35 @@ class Tool:
         marker = os.path.join(self.home, ".config", "babysit-pr", "worker.json")
         return bool(self.env.get("BABYSIT_WORKER")) or os.path.exists(marker)
 
+    def run_tag(self, args: Sequence[str]) -> None:
+        """Edit existing work without opening a checkout or starting an agent."""
+        usage = "wt: usage: wt tag add|remove <tag> [target ...], or wt tag list [tag]"
+        try:
+            tags = work_tags.Tags(Path(self.babysit_home))
+            if args and args[0] == "list" and len(args) <= 2:
+                snapshot = tags.snapshot()
+                name = work_tags.tag_name(args[1]) if len(args) == 2 else None
+                targets = set(snapshot["assignments"])
+                for workspace, items in snapshot["links"].items():
+                    targets.update([workspace, *items])
+                for target in sorted(targets):
+                    names = work_tags.effective(snapshot, target)
+                    if names and (name is None or name in names):
+                        print(f"{target}\t{', '.join(names)}", file=self.stdout)
+                return
+            if len(args) < 2 or args[0] not in ("add", "remove"):
+                raise WtError(usage)
+            name = work_tags.tag_name(args[1])
+            chosen_targets = [work_tags.cli_target(value) for value in (args[2:] or [os.getcwd()])]
+            for target in chosen_targets:
+                tags.change({"target": target, args[0]: [name]})
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            raise WtError(f"wt: {exc}") from exc
+
     def run(self, command: str, argv: Sequence[str]) -> None:
+        if command == "wt" and argv and argv[0] == "tag":
+            self.run_tag(argv[1:])
+            return
         options = parse_args(command, argv)
         if options.exit_watch_json and not options.exit_when_done:
             raise UsageError(command, f"{command}: --exit-watch-json needs --exit-when-done")
