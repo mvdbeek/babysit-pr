@@ -999,6 +999,7 @@ class Move:
                     resume_command=resume_here(src),
                 )
             self.exited = True
+            resumed = None
             try:
                 self.say("Checking the checkout here again")
                 state = snapshot(src["root"])
@@ -1043,8 +1044,15 @@ class Move:
                     )
             except Exception as exc:
                 self.restore_watch("Move stopped after the agent left;")
+                said = str(exc)
+                if resumed is not None:
+                    # Typed there: it may still start, and two agents must not share it.
+                    said += (
+                        f". Its resume was typed in {resumed.get('pane')} on "
+                        f"{self.machine.label}; check there before resuming it here"
+                    )
                 raise Failed(
-                    f"{exc}",
+                    said,
                     stage="after_exit",
                     source_kept=True,
                     worker_path=self.worker["path"] if self.worker else None,
@@ -1245,19 +1253,6 @@ def post(base, action, body):
         raise ValueError(detail or f"HTTP {exc.code}") from None
     except (OSError, ValueError) as exc:
         raise ValueError(f"Cannot reach the dashboard at {base}: {exc}") from None
-
-
-def add_arguments(sub):
-    parser = sub.add_parser(
-        "workspace-move",
-        help="Move a workspace's agent to a worker, with its branch, changes and session",
-    )
-    parser.add_argument("workspace", help="herdr workspace ID on this machine (w1)")
-    parser.add_argument("--pane", help="The agent's pane, when the workspace has several")
-    parser.add_argument("--machine", default="auto", help="Registered worker id, or auto")
-    parser.add_argument("--yes", action="store_true", help="Stop a working agent's turn to move it")
-    parser.add_argument("--plan", action="store_true", help="Only show what a move would do")
-    parser.add_argument("--dashboard", help="Dashboard URL (default $BABYSIT_DASHBOARD_URL)")
 
 
 def cli(args, stream=None):

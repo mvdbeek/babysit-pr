@@ -6,6 +6,7 @@ with a clone of the same repository and its own herdr state in the fake herdr's 
 Real Git runs on both; herdr, ssh, ps, Claude and Codex are fakes.
 """
 
+import io
 import json
 import os
 import re
@@ -562,9 +563,10 @@ def test_a_failure_after_the_exit_keeps_the_source_checkout(rig, monkeypatch):
 
 def test_an_unconfirmed_resume_keeps_the_source_checkout(rig, monkeypatch):
     monkeypatch.setattr(workspace_move.Move, "confirmed", lambda self, *args: None)
-    with pytest.raises(workspace_move.Failed) as failed:
+    with pytest.raises(workspace_move.Failed, match="check there before resuming") as failed:
         run_move(rig)
     assert failed.value.details["stage"] == "after_exit"
+    assert "typed in w1:p1 on Mac mini" in str(failed.value)
     assert rig.checkout.exists() and rig.target.exists()
 
 
@@ -790,3 +792,58 @@ def test_the_receive_answer_is_validated():
     for change in ({"path": "/w/\nx"}, {"head": "HEAD"}, {"extra": 1}):
         with pytest.raises(ValueError):
             remote_probe.validate_move_receive({**good, **change})
+
+
+def test_the_command_line_plans_then_follows_the_move_through_the_dashboard(monkeypatch):
+    plan = {
+        "agent": "claude",
+        "pane": "w1:p2",
+        "session": SID,
+        "status": "working",
+        "branch": "feature",
+        "changed": 1,
+        "untracked": 0,
+        "unpushed": 2,
+        "children": [{"pid": 5000, "command": "pytest -x"}],
+        "error": None,
+        "machine": "box",
+        "label": "Linux box",
+        "reason": "auto: least busy, 3/4 free",
+        "confirm": True,
+    }
+    sent = []
+    follows = [
+        {"id": "m1", "status": "running", "message": "Copying"},
+        {"id": "m1", "status": "moved", "message": "Moved to Linux box", "result": {}},
+    ]
+
+    def post(base, action, body):
+        assert (base, action) == ("http://127.0.0.1:9", "workspace-move")
+        sent.append(body)
+        if body.get("plan"):
+            return {"plan": plan}
+        if "id" in body:
+            return {"move": follows.pop(0)}
+        return {"move": {"id": "m1", "status": "running", "message": "Stopping"}}
+
+    monkeypatch.setattr(workspace_move, "post", post)
+    monkeypatch.setattr(workspace_move.time, "sleep", lambda seconds: None)
+    args = SimpleNamespace(
+        workspace="w1", pane=None, machine="auto", yes=False, plan=False, dashboard=None
+    )
+    monkeypatch.setenv("BABYSIT_DASHBOARD_URL", "http://127.0.0.1:9/")
+    said = io.StringIO()
+    with pytest.raises(ValueError, match="pass --yes"):
+        workspace_move.cli(args, stream=said)
+    assert len(sent) == 1 and "stops: pytest -x" in said.getvalue()
+    args.yes = True
+    done = workspace_move.cli(args, stream=said)
+    assert done["move"]["status"] == "moved" and "Copying" in said.getvalue()
+    assert sent[2] == {
+        "workspace": "w1",
+        "pane": "w1:p2",
+        "session": SID,
+        "machine": "box",
+        "confirm_working": True,
+    }
+    assert sent[3:] == [{"id": "m1"}, {"id": "m1"}]
