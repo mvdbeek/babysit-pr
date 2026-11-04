@@ -26,6 +26,8 @@ PLAN = {
     "children_count": 1,
     "watch": None,
     "docker": False,
+    "ignored_kept": ["debug.log"],
+    "ignored_kept_count": 1,
     "model": "opus",
     "effort": None,
     "confirm": True,
@@ -100,7 +102,11 @@ def test_moving_a_working_agent_asks_first_and_follows_the_move(
     expect(card).to_contain_text("Branch feature goes there with 3 commits no remote has")
     expect(card).to_contain_text("its turn is stopped first")
     expect(card).to_contain_text("Exiting it here stops 1 process it started:")
-    expect(card.locator(".ws-move-children li")).to_have_text(["/bin/zsh -c pytest -x"])
+    expect(card).to_contain_text("Files Git ignores are not copied.")
+    expect(card).to_contain_text("1 ignored path would not be copied, so the worktree stays")
+    expect(card.locator(".ws-move-children li")).to_have_text(
+        ["debug.log", "/bin/zsh -c pytest -x"]
+    )
     target = card.get_by_label("Machine to move to")
     expect(target.locator("option").first).to_have_text("Auto (→ Linux box)")
     expect(target.locator("option[value=full]")).to_have_js_property("disabled", True)
@@ -154,7 +160,15 @@ def test_a_move_that_cannot_go_says_why_and_a_failed_one_how_to_resume(
             "error": "babysit watch 0123456789abcdef follows this workspace, and watches on "
             "Mac mini need a Linux worker; stop the watch first",
         },
-        {**PLAN, "status": "idle", "confirm": False, "children": [], "children_count": 0},
+        {
+            **PLAN,
+            "status": "idle",
+            "confirm": False,
+            "children": [],
+            "children_count": 0,
+            "ignored_kept": [],
+            "ignored_kept_count": 0,
+        },
     ]
     failed = {
         "id": "m2",

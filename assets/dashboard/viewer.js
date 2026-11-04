@@ -1830,12 +1830,28 @@
           "p",
           `Branch ${plan.branch} goes there with ${plural(plan.unpushed, "commit", "commits")} ` +
             `no remote has, ${plural(plan.changed, "changed file", "changed files")} and ` +
-            `${plural(plan.untracked, "untracked file", "untracked files")} (files Git ignores ` +
-            "stay here), and its conversation resumes in a new workspace there. Once it runs " +
-            "there, this workspace, its worktree and branch are removed here.",
+            `${plural(plan.untracked, "untracked file", "untracked files")}, and its ` +
+            "conversation resumes in a new workspace there. Files Git ignores are not copied. " +
+            "Once it runs there, this workspace closes here, and its worktree and branch are " +
+            "removed with rebuildable ignored files (virtualenvs, node_modules, caches).",
           "pr-meta",
         ),
       );
+      if (plan.ignored_kept_count) {
+        card.append(
+          node(
+            "p",
+            `${plural(plan.ignored_kept_count, "ignored path", "ignored paths")} would not be ` +
+              "copied, so the worktree stays here for them:",
+            "ws-move-warning",
+          ),
+        );
+        const kept = node("ul", undefined, "ws-move-children");
+        kept.append(...plan.ignored_kept.map((name) => node("li", name)));
+        if (plan.ignored_kept_count > plan.ignored_kept.length)
+          kept.append(node("li", `and ${plan.ignored_kept_count - plan.ignored_kept.length} more`));
+        card.append(kept);
+      }
       const select = node("select");
       select.setAttribute("aria-label", "Machine to move to");
       const auto = node(
@@ -1924,7 +1940,8 @@
       );
     let text = op.error || "The move failed";
     if (!/[.!?]$/.test(text)) text += ".";
-    if (result.stage === "before_exit") text += " The agent is still running here.";
+    if (result.stage === "before_exit" && !result.interrupted)
+      text += " The agent is still running here.";
     if (result.stage === "exit")
       text += " Check its pane first: the agent may still be running here.";
     if (result.resume_command)

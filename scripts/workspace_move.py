@@ -82,6 +82,28 @@ IDENTITY = {
     "GIT_COMMITTER_EMAIL": "babysit-pr@localhost",
 }
 CODEX_DAY = re.compile(r".*/sessions/([0-9]{4}/[0-9]{2}/[0-9]{2})$")
+# Ignored paths a move leaves behind and its cleanup may remove: anything Git ignores
+# outside these keeps the checkout here, since it was not copied.
+REBUILDABLE = {
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cache",
+    ".eggs",
+    ".parcel-cache",
+    ".next",
+    ".turbo",
+    "build",
+    "dist",
+    "target",
+}
+LFS = re.compile(rb"\bfilter\s*=\s*lfs\b")
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 KEPT_MOVES = 20
 
@@ -111,12 +133,10 @@ def git(path, *args, env=None, timeout=300):
     return done.stdout.strip()
 
 
-def tree_of(path):
-    """The tree ``git add -A`` would stage: the index and every file Git does not ignore.
-
-    Read through a copy of the index, which stays as it was; the worker reads its new
-    checkout's the same way (``remote_probe._host_tree``).
-    """
+@contextlib.contextmanager
+def index_copy(path):
+    """The environment pointing Git at a copy of the checkout's index: what is read or
+    staged through it never takes the live index's lock under a working agent."""
     index = git(path, "rev-parse", "--path-format=absolute", "--git-path", "index")
     descriptor, temporary = tempfile.mkstemp(prefix=".babysit-move-", dir=os.path.dirname(index))
     os.close(descriptor)
@@ -125,12 +145,21 @@ def tree_of(path):
             Path(temporary).write_bytes(Path(index).read_bytes())
         else:
             os.unlink(temporary)
-        env = {"GIT_INDEX_FILE": temporary}
-        git(path, "add", "-A", env=env)
-        return git(path, "write-tree", env=env)
+        yield {"GIT_INDEX_FILE": temporary}
     finally:
         with contextlib.suppress(OSError):
             os.unlink(temporary)
+
+
+def tree_of(path):
+    """The tree ``git add -A`` would stage: the index and every file Git does not ignore.
+
+    Read through a copy of the index, which stays as it was; the worker reads its new
+    checkout's the same way (``remote_probe._host_tree``).
+    """
+    with index_copy(path) as env:
+        git(path, "add", "-A", env=env)
+        return git(path, "write-tree", env=env)
 
 
 def snapshot(path):
@@ -142,7 +171,8 @@ def snapshot(path):
             "Its checkout has no branch checked out; check one out first", "detached"
         ) from None
     try:
-        index_tree = git(path, "write-tree")
+        with index_copy(path) as env:
+            index_tree = git(path, "write-tree", env=env)
     except ValueError:
         raise Refused(
             "Its checkout has unresolved merge conflicts; resolve them first", "conflicts"
@@ -167,6 +197,17 @@ def changes(path):
     untracked = sum(1 for e in entries if e.startswith("??"))
     unpushed = int(git(path, "rev-list", "--count", "HEAD", "--not", "--remotes") or 0)
     return {"changed": len(entries) - untracked, "untracked": untracked, "unpushed": unpushed}
+
+
+def rebuildable(name):
+    return any(part in REBUILDABLE or part.endswith(".egg-info") for part in name.split("/"))
+
+
+def ignored_kept(path):
+    """What Git ignores in the checkout that is not rebuildable: a move does not copy it,
+    so it keeps the checkout here. Folders are named once, with a trailing slash."""
+    listing = git(path, "ls-files", "-z", "-o", "-i", "--exclude-standard", "--directory")
+    return [name for name in listing.split("\0") if name and not rebuildable(name.rstrip("/"))]
 
 
 def bundle(path, state, move_id):
@@ -367,6 +408,17 @@ def source(home, request):
             "the workspace closes once this one has moved",
             "others",
         )
+    try:
+        busy = busy_panes(workspace, pane)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"herdr could not list the workspace's panes: {exc}") from exc
+    if busy:
+        raise Refused(
+            "The workspace closes once the agent has moved, and its other panes are running "
+            f"{', '.join(busy)}; finish or close them first",
+            "panes",
+            panes=busy,
+        )
     if not isinstance(session, str) or not remote_probe.UUID.fullmatch(session.lower()):
         raise Refused("herdr names no session for this agent; it cannot be resumed", "session")
     status = target.get("status")
@@ -385,6 +437,15 @@ def source(home, request):
     proc = found[0]
     if proc["pid"] == procs["shell_pid"]:
         raise Refused("The agent is the pane's root process; quitting it would close it", "root")
+    # What the exit would refuse, refused before any key (a working agent's Esc) too.
+    if (pane, proc["pid"]) in agent_messages._exiting:
+        raise Refused("An exit was already attempted for this agent; check it in Collie", "exit")
+    if not agent_messages.interactive_shell(procs["shell_pid"]):
+        raise Refused(
+            "The pane's root process is not an interactive shell, so the pane could close "
+            "with the agent",
+            "root",
+        )
     if info.get("scroll", {}).get("offset_from_bottom", 0) != 0:
         raise Refused("The terminal is scrolled; scroll it back down first", "scrolled")
     if agent_messages.has_draft(screen, kind):
@@ -409,11 +470,15 @@ def source(home, request):
     if any(e.startswith("160000 ") for e in git(root, "ls-files", "--stage", "-z").split("\0")):
         raise Refused("Its checkout contains submodules, which a move cannot carry", "submodules")
     state = snapshot(root)
-    # An untracked clone inside the checkout would travel as a commit the worker lacks.
-    if " commit " in git(root, "ls-tree", "-r", state["work_tree"]).replace("\t", " "):
+    check_tree(root, state["work_tree"])
+    try:
+        remote_probe._branch(state["branch"], "moved")
+    except ValueError:
         raise Refused(
-            "Its checkout holds another Git repository, which a move cannot carry", "nested"
-        )
+            f"Branch {state['branch']} cannot be checked out on a worker", "branch"
+        ) from None
+    if not remote_probe.MOVE_PART.fullmatch(Path(root).name):
+        raise Refused(f"A worker cannot name a checkout {Path(root).name!r}", "name")
     if kind == "codex" and not CODEX_DAY.fullmatch(Path(chosen["_file"]).parent.as_posix()):
         raise Refused("Its Codex rollout is not in a sessions/YYYY/MM/DD folder", "rollout")
     config = repo_config(root)
@@ -423,7 +488,14 @@ def source(home, request):
         raise Refused("Its clone has no GitHub upstream or origin remote", "remote")
     upstream = None
     remote, merge = (config.get(f"branch.{state['branch']}.{k}") for k in ("remote", "merge"))
-    if remote in remotes and merge and merge.startswith("refs/heads/"):
+    if (
+        remote in remotes
+        and remote_probe.MOVE_PART.fullmatch(remote)
+        and merge
+        and merge.startswith("refs/heads/")
+        and remote_probe.BRANCH.fullmatch(merge.removeprefix("refs/heads/"))
+        and ".." not in merge
+    ):
         upstream = [remote, merge.removeprefix("refs/heads/"), remotes[remote]]
     account = chosen.get("claude_account") if kind == "claude" else None
     if kind == "claude" and account is None:
@@ -459,8 +531,77 @@ def source(home, request):
         "watch": watch,
         "docker": docker,
         "children": children(proc["pid"]),
+        "ignored_kept": ignored_kept(root),
+        "suffix": project_suffix(kind, chosen, [root, spelled]),
         **settings(proc["argv"], kind, chosen.get("_file") if kind == "codex" else None),
     }
+
+
+def busy_panes(workspace, pane):
+    """The workspace's other panes running something beyond their shell, by pane and
+    program: closing the workspace would end it."""
+    live = workspace_viewer.live_workspace(workspace)
+    panes = herdr_handoff.result("pane", "list", "--workspace", live)["panes"] if live else []
+    busy = []
+    for other in panes:
+        name = other.get("pane_id") if isinstance(other, dict) else None
+        if not name or name == pane:
+            continue
+        procs = herdr_handoff.result("pane", "process-info", "--pane", name)["process_info"]
+        running = [
+            herdr_handoff.program(p)
+            for p in procs.get("foreground_processes") or []
+            if p.get("pid") != procs.get("shell_pid")
+        ]
+        if running:
+            busy.append(f"{', '.join(running)} in {name}")
+    return busy
+
+
+def check_tree(root, tree):
+    """Refuse a working tree a worker cannot reproduce from Git alone."""
+    attributes = []
+    for entry in git(root, "ls-tree", "-r", "-z", tree).split("\0"):
+        meta, _, name = entry.partition("\t")
+        fields = meta.split()
+        if len(fields) != 3:
+            continue
+        if fields[1] == "commit":
+            # An untracked clone inside the checkout would travel as a commit it lacks.
+            raise Refused(
+                f"Its checkout holds another Git repository ({name}), which a move cannot carry",
+                "nested",
+            )
+        if fields[1] == "blob" and Path(name).name == ".gitattributes":
+            attributes.append(fields[2])
+    for blob in attributes:
+        if LFS.search(git_bytes(root, "cat-file", "blob", blob)):
+            raise Refused(
+                "Its checkout uses Git LFS, whose files a worker would get as pointers", "lfs"
+            )
+
+
+def git_bytes(path, *args):
+    argv, environment = safe_git.prepare(str(path), *args)
+    done = owned_process.run(argv, env=environment, timeout=120)
+    if done.returncode:
+        raise ValueError(done.stderr.decode(errors="replace").strip()[-2000:] or "Git failed")
+    return done.stdout
+
+
+def project_suffix(kind, chosen, roots):
+    """What Claude's project folder adds to the checkout's for a session started below it
+    (``-frontend``); empty otherwise."""
+    if kind != "claude":
+        return ""
+    folder = Path(chosen["_file"]).parent.name
+    for root in roots:
+        name = re.sub(r"[^A-Za-z0-9]", "-", root)
+        if folder == name or folder.startswith(name + "-"):
+            suffix = folder[len(name) :]
+            if remote_probe.MOVE_SUFFIX.fullmatch(suffix):
+                return suffix
+    raise Refused("Its transcript is not in the checkout's Claude project folder", "transcript")
 
 
 def placement_request(src, override):
@@ -536,6 +677,9 @@ def public(src):
         if src["watch"] is None
         else {"id": src["watch"].get("id"), "status": src["watch"].get("status")},
         "docker": src["docker"],
+        # Not copied, and not rebuildable: they keep the checkout here after the move.
+        "ignored_kept": src["ignored_kept"][:MAX_SHOWN],
+        "ignored_kept_count": len(src["ignored_kept"]),
         "model": src["model"] or None,
         "effort": src["effort"] or None,
         "confirm": src["status"] == "working",
@@ -568,7 +712,8 @@ def plan(home, request, workspaces):
     if chosen is not None:
         try:
             check_watch(src, chosen["machine"])
-        except Refused as exc:
+            check_worker(home, chosen["machine"], src)
+        except (Refused, ValueError) as exc:
             chosen, error = None, str(exc)
     return {
         **public(src),
@@ -578,6 +723,31 @@ def plan(home, request, workspaces):
         "reason": chosen["reason"] if chosen else None,
         "error": error,
     }
+
+
+def worker_paths(machine, src):
+    name = src["slug"].split("/")[1]
+    return {
+        "clone": f"{machine.src.rstrip('/')}/{name}",
+        "repo": src["slug"],
+        "root": f"{machine.src.rstrip('/')}/worktrees/{name}",
+        "name": Path(src["root"]).name,
+        "branch": src["state"]["branch"],
+        "agent": src["agent"],
+        "account": src["account"],
+        "sandbox": placement.SANDBOX[machine.os],
+    }
+
+
+def check_worker(home, machine, src):
+    """Whether the worker can make the checkout (its clone, a free branch and path, the
+    Claude account): asked before any key, so a refusal there changes nothing here."""
+    try:
+        return remote_probe.call(home, machine, "move_check", 60, **worker_paths(machine, src))
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"{machine.label} did not answer within 60 seconds") from exc
+    except OSError as exc:
+        raise ValueError(f"{machine.label} could not be reached: {exc}") from exc
 
 
 def message(src, machine, path, stopped, watch):
@@ -643,7 +813,8 @@ def rewrite(data, old, new):
                     holder["cwd"], changed = moved, True
         if changed:
             ending = b"\n" if line.endswith(b"\n") else b""
-            line = json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode() + ending
+            # Escaped: a lone surrogate in what the agent read must not stop the copy.
+            line = json.dumps(item, separators=(",", ":")).encode() + ending
         out.append(line)
     return b"".join(out)
 
@@ -702,8 +873,11 @@ def transcripts(src, path):
 class Move:
     """One move as it runs; ``progress`` hears each step."""
 
-    def __init__(self, home, request, workspaces, overview, progress):
+    def __init__(self, home, request, workspaces, overview, progress, record=None):
         self.home = Path(home)
+        # Facts a restarted dashboard needs about this move: its stage, the watch it
+        # holds, and how to resume the session here (``Moves.recover``).
+        self.record = record or (lambda **facts: None)
         self.request = request
         self.workspaces = workspaces
         self.overview = overview
@@ -745,15 +919,10 @@ class Move:
         data, fetch = bundle(src["root"], state, self.id)
         self.say(f"Copying {state['branch']} to {machine.label} ({max(1, len(data) >> 10)} KB)")
         staged = self.stage(f"{self.id}-{uuid.uuid4().hex[:8]}.bundle", data)
-        name = src["slug"].split("/")[1]
         made = self.probe(
             "move_receive",
             RECEIVE_TIMEOUT,
-            clone=f"{machine.src.rstrip('/')}/{name}",
-            repo=src["slug"],
-            root=f"{machine.src.rstrip('/')}/worktrees/{name}",
-            name=Path(src["root"]).name,
-            branch=state["branch"],
+            **{**worker_paths(machine, src), "branch": state["branch"]},
             bundle=staged,
             move=self.id,
             head=state["head"],
@@ -761,9 +930,6 @@ class Move:
             work_tree=state["work_tree"],
             upstream=src["upstream"],
             fetch=fetch,
-            agent=src["agent"],
-            account=src["account"],
-            sandbox=placement.SANDBOX[machine.os],
         )
         self.worker = made
         if not same_state(state, made):
@@ -925,9 +1091,25 @@ class Move:
                 "from the Workspaces tab or with `git worktree remove`"
             )
         request = {"targets": [{"key": src["root"], "approve": ["dirty", "unpushed"]}]}
+
+        def guard(row):
+            """Asked under the clone's lock, before the workspace closes and again before
+            the worktree goes: only what the worker has is ever removed here."""
+            if row["path"] != src["root"]:
+                raise ValueError("That is not the moved checkout; it was kept")
+            if not same_state(src["state"], snapshot(src["root"])):
+                raise ValueError("The checkout here changed after it was copied, so it was kept")
+            kept = ignored_kept(src["root"])
+            if kept:
+                shown = ", ".join(kept[:5]) + (
+                    f" and {len(kept) - 5} more" if len(kept) > 5 else ""
+                )
+                return f"The worktree here was kept for files Git ignores, not copied: {shown}"
+            return None
+
         deadline = time.monotonic() + CLEANUP_WAIT
         while True:
-            started = overview.cleanup(request)
+            started = overview.cleanup(request, guard=guard)
             if started["accepted"]:
                 break
             if time.monotonic() >= deadline:
@@ -943,6 +1125,8 @@ class Move:
             time.sleep(CLEANUP_POLL)
         result = (job.get("results") or [{}])[0] if job.get("id") == job_id else {}
         said = result.get("message") or "Cleanup unconfirmed"
+        if result.get("status") == "kept":
+            return False, said
         # "Already removed" also answers a checkout the inventory could not find.
         if result.get("status") != "done" or os.path.lexists(src["root"]):
             return False, f"The checkout here was kept: {said}"
@@ -951,7 +1135,21 @@ class Move:
     def run(self):
         """Move the agent; the result, or Failed saying what was kept where."""
         request = self.request
-        src = source(self.home, request)
+        first = source(self.home, request)
+        if (request.get("pane"), request.get("session")) != (first["pane"], first["session"]):
+            raise Refused("That agent is no longer running in this workspace; refresh", "changed")
+        # Nothing else is typed into its pane, resumed in its checkout or session, or
+        # restarted while it moves: such actions are refused at once (``reserved``).
+        keys = [
+            ("checkout", first["root"]),
+            ("session", first["session"]),
+            ("pane", first["pane"]),
+        ]
+        with agent_messages.reserved(*keys):
+            return self.moving(request)
+
+    def moving(self, request):
+        src = source(self.home, request)  # Read again, now that nothing else acts on it.
         if (request.get("pane"), request.get("session")) != (src["pane"], src["session"]):
             raise Refused("That agent is no longer running in this workspace; refresh", "changed")
         if src["status"] == "working" and request.get("confirm_working") is not True:
@@ -965,133 +1163,144 @@ class Move:
             raise Refused(error or "No machine can take this agent", "target")
         self.machine = chosen["machine"]
         check_watch(src, self.machine)
+        # Before any key: what the worker would refuse is refused while nothing changed.
+        try:
+            check_worker(self.home, self.machine, src)
+        except ValueError as exc:
+            raise Refused(str(exc), "worker") from exc
         # Its transcripts only travel once the agent left: one too large is refused first.
         if session_size(src) > remote_probe.MAX_MOVE_SESSION:
             raise Refused("Its conversation is too large to move", "too_large")
         label = LABEL[src["agent"]]
-        # No resume, message or restart of this session or in this checkout meanwhile.
-        with agent_messages.locked(("checkout", src["root"]), ("session", src["session"])):
-            stopped = src["children"] or []
-            try:
-                if src["status"] == "working":
-                    self.say(f"Stopping {label}'s turn")
-                    stop = agent_messages.interrupt(
-                        {
-                            "workspace": src["workspace"],
-                            "pane": src["pane"],
-                            "session": src["session"],
-                        }
-                    )
-                    if not stop["stopped"]:
-                        raise ValueError(stop["warning"] or "The agent kept working")
-                    after = source(self.home, request)
-                    if after["status"] == "working":
-                        raise ValueError("The agent is working again; it stays here")
-                    # Recorded before Esc, and what is still running after it.
-                    pids = {c["pid"] for c in stopped}
-                    stopped += [c for c in after["children"] or [] if c["pid"] not in pids]
-                    src = {**after, "children": stopped}
-                    check_watch(src, self.machine)
-                self.say(f"Packing {src['state']['branch']} for {self.machine.label}")
-                made = self.send_code(src, src["state"])
-                if src["watch"] is not None:
-                    self.say(f"Holding babysit watch {src['watch']['id']} for the move")
-                    self.hold_watch(src)
-                self.say(f"Exiting {label} here")
-                try:
-                    quit_ = agent_messages.exit_agent(
-                        {
-                            "workspace": src["workspace"],
-                            "pane": src["pane"],
-                            "session": src["session"],
-                        },
-                        self.home,
-                    )
-                except Exception as exc:
-                    if self.still_here(src):
-                        raise
-                    # Raised once the agent had gone: as an unconfirmed exit, never "running".
-                    quit_ = {"quit": False, "warning": str(exc)}
-            except Exception as exc:
-                kept = self.remove_worker_checkout()
-                self.restore_watch("Move stopped before the agent left;")
-                raise Failed(
-                    f"{exc}" + (f". {kept}" if kept else ""),
-                    stage="before_exit",
-                    source_kept=True,
-                    agent_running=True,
-                ) from exc
-            if not quit_["quit"]:
-                self.restore_watch("Move stopped while the agent exited;")
-                raise Failed(
-                    f"The agent's exit could not be confirmed: {quit_['warning']}",
-                    stage="exit",
-                    source_kept=True,
-                    worker_path=made["path"],
-                    resume_command=resume_here(src),
+        stopped = src["children"] or []
+        try:
+            if src["status"] == "working":
+                self.say(f"Stopping {label}'s turn")
+                stop = agent_messages.interrupt(
+                    {
+                        "workspace": src["workspace"],
+                        "pane": src["pane"],
+                        "session": src["session"],
+                    }
                 )
-            self.exited = True
-            resumed = None
+                if not stop["stopped"]:
+                    raise ValueError(stop["warning"] or "The agent kept working")
+                after = source(self.home, request)
+                if after["status"] == "working":
+                    raise ValueError("The agent is working again; it stays here")
+                # Recorded before Esc, and what is still running after it.
+                pids = {c["pid"] for c in stopped}
+                stopped += [c for c in after["children"] or [] if c["pid"] not in pids]
+                src = {**after, "children": stopped}
+                check_watch(src, self.machine)
+            self.say(f"Packing {src['state']['branch']} for {self.machine.label}")
+            made = self.send_code(src, src["state"])
+            if src["watch"] is not None:
+                self.say(f"Holding babysit watch {src['watch']['id']} for the move")
+                self.hold_watch(src)
+                self.record(watch=src["watch"]["id"])
+            self.say(f"Exiting {label} here")
+            self.record(stage="exit", resume_command=resume_here(src))
             try:
-                self.say("Checking the checkout here again")
-                state = snapshot(src["root"])
-                if not same_state(src["state"], state):
-                    self.say("The checkout changed while the agent exited; sending it again")
-                    made = self.send_code(src, state)
-                src["state"] = state
-                path = made["path"]
-                self.say(f"Copying the conversation to {self.machine.label}")
-                archive, day = transcripts(src, path)
-                staged = self.stage(f"{self.id}-session.tar.gz", archive)
-                self.probe(
-                    "move_session",
-                    SESSION_TIMEOUT,
-                    archive=staged,
-                    agent=src["agent"],
-                    account=src["account"],
-                    sandbox=placement.SANDBOX[self.machine.os],
-                    path=path,
-                    day=day,
-                )
-                self.say(f"Resuming {label} on {self.machine.label}")
-                watch = self.watch[0] if self.watch else None
-                resumed = agent_messages.resume(
-                    None,
-                    src["session"],
-                    message(src, self.machine, path, stopped, watch),
-                    self.home,
-                    root=path,
-                    machine=self.machine,
-                    agent_options={
-                        "model": src["model"],
-                        "effort": src["effort"],
-                        "docker": src["docker"],
+                # A turn it started since is stopped only if the reader confirmed that.
+                quit_ = agent_messages.exit_agent(
+                    {
+                        "workspace": src["workspace"],
+                        "pane": src["pane"],
+                        "session": src["session"],
                     },
+                    self.home,
+                    stop=request.get("confirm_working") is True,
                 )
-                running = self.confirmed(src["session"], src["agent"], resumed.get("pane"))
-                if running is None:
-                    raise ValueError(
-                        resumed.get("warning")
-                        or f"{self.machine.label}'s herdr does not show the resumed session"
-                    )
             except Exception as exc:
-                said = str(exc)
-                if resumed is None:
-                    self.restore_watch("Move stopped after the agent left;")
-                else:
-                    # Typed there: it may still start, and two agents must not share it,
-                    # so the watch stays stopped too.
-                    said += (
-                        f". Its resume was typed in {resumed.get('pane')} on "
-                        f"{self.machine.label}; check there before resuming it here"
-                    )
-                raise Failed(
-                    said,
-                    stage="after_exit",
-                    source_kept=True,
-                    worker_path=self.worker["path"] if self.worker else None,
-                    resume_command=resume_here(src),
-                ) from exc
+                if self.still_here(src):
+                    raise
+                # Raised once the agent had gone: as an unconfirmed exit, never "running".
+                quit_ = {"quit": False, "warning": str(exc)}
+        except Exception as exc:
+            self.record(stage="before_exit")
+            kept = self.remove_worker_checkout()
+            self.restore_watch("Move stopped before the agent left;")
+            raise Failed(
+                f"{exc}" + (f". {kept}" if kept else ""),
+                stage="before_exit",
+                source_kept=True,
+                agent_running=True,
+            ) from exc
+        if not quit_["quit"]:
+            self.restore_watch("Move stopped while the agent exited;")
+            raise Failed(
+                f"The agent's exit could not be confirmed: {quit_['warning']}",
+                stage="exit",
+                source_kept=True,
+                worker_path=made["path"],
+                resume_command=resume_here(src),
+            )
+        self.exited = True
+        self.record(stage="after_exit")
+        resumed = None
+        try:
+            self.say("Checking the checkout here again")
+            state = snapshot(src["root"])
+            if not same_state(src["state"], state):
+                self.say("The checkout changed while the agent exited; sending it again")
+                made = self.send_code(src, state)
+            src["state"] = state
+            path = made["path"]
+            self.say(f"Copying the conversation to {self.machine.label}")
+            archive, day = transcripts(src, path)
+            staged = self.stage(f"{self.id}-session.tar.gz", archive)
+            self.probe(
+                "move_session",
+                SESSION_TIMEOUT,
+                archive=staged,
+                agent=src["agent"],
+                account=src["account"],
+                sandbox=placement.SANDBOX[self.machine.os],
+                path=path,
+                day=day,
+                suffix=src["suffix"],
+            )
+            self.say(f"Resuming {label} on {self.machine.label}")
+            watch = self.watch[0] if self.watch else None
+            resumed = agent_messages.resume(
+                None,
+                src["session"],
+                message(src, self.machine, path, stopped, watch),
+                self.home,
+                root=path,
+                machine=self.machine,
+                agent_options={
+                    "model": src["model"],
+                    "effort": src["effort"],
+                    "docker": src["docker"],
+                },
+            )
+            running = self.confirmed(src["session"], src["agent"], resumed.get("pane"))
+            if running is None:
+                raise ValueError(
+                    resumed.get("warning")
+                    or f"{self.machine.label}'s herdr does not show the resumed session"
+                )
+        except Exception as exc:
+            said = str(exc)
+            if resumed is None:
+                self.restore_watch("Move stopped after the agent left;")
+            else:
+                # Typed there: it may still start, and two agents must not share it,
+                # so the watch stays stopped too.
+                said += (
+                    f". Its resume was typed in {resumed.get('pane')} on "
+                    f"{self.machine.label}; check there before resuming it here"
+                )
+            raise Failed(
+                said,
+                stage="after_exit",
+                source_kept=True,
+                worker_path=self.worker["path"] if self.worker else None,
+                resume_command=resume_here(src),
+            ) from exc
+        self.record(stage="resumed")
         warnings = []
         if resumed.get("warning"):
             warnings.append(resumed["warning"])
@@ -1111,14 +1320,10 @@ class Move:
                 )
         self.say("Removing the workspace here")
         try:
-            unchanged = same_state(src["state"], snapshot(src["root"]))
-        except ValueError:
-            unchanged = False
-        if unchanged:
             removed, said = self.clean_source(src)
-        else:
-            # Written since it was copied: nothing here is removed that the worker lacks.
-            removed, said = False, "The checkout here changed after it was copied, so it was kept"
+        except Exception as exc:
+            # Moved all the same: what stays here is said, never undone.
+            removed, said = False, f"The checkout here was kept: its cleanup failed ({exc})"
         if not removed:
             warnings.append(said)
         space = pane.split(":")[0]
@@ -1155,6 +1360,76 @@ class Moves:
         self.lock = threading.Lock()
         self.ops: dict[str, dict] = {}
         self.starting: set[tuple[str, str]] = set()
+        self.recover()
+
+    def recover(self):
+        """Read the moves saved before this dashboard started. One that was still running
+        stopped with the dashboard: it is marked interrupted with where it got to, and a
+        watch it held is given back to the status it had."""
+        folder = self.home / "moves"
+        try:
+            files = sorted(folder.glob("*.json"), key=lambda f: f.stat().st_mtime)
+        except OSError:
+            return
+        for file in files[-KEPT_MOVES:]:
+            try:
+                op = json.loads(file.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(op, dict) or not isinstance(op.get("id"), str):
+                continue
+            if op.get("status") == "running":
+                stage = op.get("stage")
+                left = stage in {"after_exit", "resumed"}
+                said = f"The dashboard restarted during this move, at: {op.get('message')}. " + (
+                    "The agent had left this machine; check the worker before resuming it here"
+                    if left
+                    else "Check whether the agent still runs here"
+                )
+                watch = op.get("watch")
+                if watch:
+                    said += self.give_back(watch)
+                op.update(
+                    status="interrupted",
+                    message=said,
+                    error=said,
+                    finished_at=time.time(),
+                    result={
+                        "stage": stage or "before_exit",
+                        "source_kept": True,
+                        "interrupted": True,
+                        "resume_command": op.get("resume_command") if stage else None,
+                    },
+                )
+                self.save(op)
+            self.ops[op["id"]] = op
+
+    def give_back(self, job_id):
+        """A watch an interrupted move held, given its status back; what became of it."""
+        import pr_supervisor
+
+        try:
+            db = pr_supervisor.open_db(self.home)
+            try:
+                with db:
+                    db.execute("BEGIN IMMEDIATE")
+                    job = pr_supervisor.get_job(db, job_id)
+                    if job["status"] != "stopped" or not str(job.get("summary")).startswith(
+                        "Moving with its workspace"
+                    ):
+                        return ""
+                    job.update(
+                        status="awaiting_release",
+                        epoch=job["epoch"] + 1,
+                        summary="The dashboard restarted during a move of this workspace; "
+                        "check where its agent runs",
+                    )
+                    pr_supervisor.save_job(db, job)
+            finally:
+                db.close()
+        except Exception as exc:
+            return f". babysit watch {job_id} stays stopped ({exc})"
+        return f". babysit watch {job_id} is awaiting release again"
 
     def action(self, request):
         if not isinstance(request, dict):
@@ -1226,6 +1501,7 @@ class Moves:
             workspaces,
             self.overview(),
             lambda text: self.update(op, message=text, step=text),
+            lambda **facts: self.update(op, **facts),
         )
         op["id"] = move.id
         with self.lock:

@@ -105,7 +105,17 @@ class Placing:
         return {}
 
 
-def make_rig(tmp_path, fake_tools, short_tmp, monkeypatch, kind="claude", dirty=True, worker=MINI):
+def make_rig(
+    tmp_path,
+    fake_tools,
+    short_tmp,
+    monkeypatch,
+    kind="claude",
+    dirty=True,
+    worker=MINI,
+    precious=False,
+    subdir=None,
+):
     tmp = tmp_path.resolve()
     monkeypatch.setenv("HOME", str(tmp))
     for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "BABYSIT_DASHBOARD_URL"):
@@ -124,7 +134,10 @@ def make_rig(tmp_path, fake_tools, short_tmp, monkeypatch, kind="claude", dirty=
         launcher.write_text(BWRAP)
         launcher.chmod(0o755)
     # Commits only this machine has: the branch is ahead of every remote branch.
-    (checkout / ".gitignore").write_text("*.log\n")
+    (checkout / ".gitignore").write_text("*.log\n.venv/\n")
+    if subdir:
+        (checkout / subdir).mkdir()
+        (checkout / subdir / "app.js").write_text("app\n")
     (checkout / "lib.py").write_text("one\n")
     (checkout / "gone.txt").write_text("going\n")
     (checkout / "tool.sh").write_text("#!/bin/sh\n")
@@ -141,9 +154,16 @@ def make_rig(tmp_path, fake_tools, short_tmp, monkeypatch, kind="claude", dirty=
         (checkout / "gone.txt").unlink()
         (checkout / "notes").mkdir()
         (checkout / "notes" / "todo.md").write_text("untracked\n")
-        (checkout / "debug.log").write_text("ignored\n")
+        # A name the nested-repository check once took for a gitlink.
+        (checkout / "notes" / "a commit b.md").write_text("untracked\n")
+    # Ignored and rebuildable: neither copied nor a reason to keep the checkout.
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (checkout / ".venv" / "bin" / "python").write_text("#!/bin/sh\n")
+    if precious:
+        (checkout / "debug.log").write_text("ignored, and not rebuildable\n")
+    started = checkout / subdir if subdir else checkout
     if kind == "claude":
-        folder = tmp / ".claude" / "projects" / slug(checkout)
+        folder = tmp / ".claude" / "projects" / slug(started)
         (folder / SID / "subagents").mkdir(parents=True)
         transcript = folder / f"{SID}.jsonl"
         transcript.write_text(
@@ -151,7 +171,7 @@ def make_rig(tmp_path, fake_tools, short_tmp, monkeypatch, kind="claude", dirty=
                 {
                     "type": "user",
                     "sessionId": SID,
-                    "cwd": str(checkout),
+                    "cwd": str(started),
                     "message": {"role": "user", "content": "Fix the bug"},
                 },
                 {
@@ -308,9 +328,9 @@ def watch_exits(rig, monkeypatch):
     seen = []
     real = agent_messages.exit_agent
 
-    def exit_agent(request, home=None):
+    def exit_agent(request, home=None, **options):
         seen.append(rig.target.exists())
-        return real(request, home)
+        return real(request, home, **options)
 
     monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
     return seen
@@ -333,7 +353,7 @@ def test_an_idle_claude_moves_with_its_branch_changes_and_conversation(rig, monk
     assert git("rev-parse", "HEAD", cwd=target) == head
     assert git("symbolic-ref", "--short", "HEAD", cwd=target) == "feature"
     # Unpushed commits, staged, unstaged and untracked changes; ignored files stay here.
-    expected = {k: v for k, v in before.items() if k != "debug.log"}
+    expected = {k: v for k, v in before.items() if not k.startswith(".venv/")}
     assert files(target) == expected
     assert files(target)["tool.sh"][1] & 0o100
     assert git("diff", "--cached", "--name-status", cwd=target) == staged
@@ -516,21 +536,23 @@ def test_a_changed_agent_is_refused(rig):
 # Failures --------------------------------------------------------------------------------
 
 
-def test_a_failure_before_the_exit_leaves_the_source_running(rig):
+def test_what_the_worker_would_refuse_is_refused_before_any_key(rig):
     # The worker already has a branch of that name: a second, diverging one is refused.
     git("branch", "feature", cwd=rig.host / "src" / "repo")
+    set_agent(rig, agent_status="working")
     before = files(rig.checkout)
-    with pytest.raises(workspace_move.Failed) as failed:
-        run_move(rig)
-    assert "Branch feature already exists" in str(failed.value)
-    assert failed.value.details["stage"] == "before_exit"
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert "Branch feature already exists" in found["error"] and found["machine"] is None
+    refused = refusal(rig, confirm_working=True)
+    assert refused.details["code"] == "worker" and "Branch feature" in str(refused)
     nothing_happened(rig)
+    assert "esc" not in json.dumps(read(rig.state)["calls"])
     assert files(rig.checkout) == before
-    assert not list((rig.host / ".local/state/babysit-pr/moves").iterdir())
+    assert not (rig.host / ".local/state/babysit-pr/moves").exists()
 
 
 def test_a_refused_exit_takes_the_workers_checkout_back(rig, monkeypatch):
-    def exit_agent(request, home=None):
+    def exit_agent(request, home=None, **options):
         raise ValueError("Not quit: the composer holds a draft; clear it in Collie first")
 
     monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
@@ -637,9 +659,9 @@ def test_a_watch_is_held_through_the_move_then_registered_on_the_worker(clean_bo
     held = []
     real = agent_messages.exit_agent
 
-    def exit_agent(request, home=None):
+    def exit_agent(request, home=None, **options):
         held.append(watch(rig)["status"])
-        return real(request, home)
+        return real(request, home, **options)
 
     registered = []
 
@@ -868,8 +890,8 @@ def test_a_checkout_written_after_its_copy_is_kept(rig, monkeypatch):
 def test_an_exit_that_raises_once_the_agent_left_keeps_both_checkouts(rig, monkeypatch):
     real = agent_messages.exit_agent
 
-    def exit_agent(request, home=None):
-        real(request, home)
+    def exit_agent(request, home=None, **options):
+        real(request, home, **options)
         raise RuntimeError("herdr could not close the pane")
 
     monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
@@ -912,3 +934,221 @@ def test_the_session_probe_takes_a_longer_copy_of_the_same_conversation(tmp_path
     assert Path(first).read_bytes() == b'{"a":1}\n{"b":2}\n'
     with pytest.raises(ValueError, match="already exists here"):
         place(b'{"other":1}\n')
+
+
+# Review findings ---------------------------------------------------------------------------
+
+
+def test_ignored_files_that_are_not_rebuildable_keep_the_worktree(
+    tmp_path, fake_tools, short_tmp, monkeypatch
+):
+    rig = make_rig(tmp_path, fake_tools, short_tmp, monkeypatch, precious=True)
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    # Named up front: .venv is rebuildable, debug.log is not.
+    assert found["ignored_kept"] == ["debug.log"] and found["ignored_kept_count"] == 1
+    result = run_move(rig)
+    assert not result["source"]["removed"]
+    assert "files Git ignores, not copied: debug.log" in result["warnings"][0]
+    # The workspace closed; the worktree, its ignored file and its branch stay.
+    assert ["workspace", "close", "w1"] in read(rig.state)["calls"]
+    assert (rig.checkout / "debug.log").read_text() == "ignored, and not rebuildable\n"
+    assert "feature" in git("branch", "--format=%(refname:short)", cwd=rig.clone).split()
+    assert not (rig.target / "debug.log").exists()
+
+
+def test_the_checkout_is_checked_again_after_its_workspace_closed(rig, monkeypatch):
+    real = rig.overview.close_workspaces
+
+    def close_workspaces(*args, **kwargs):
+        real(*args, **kwargs)
+        # A shell of the closing workspace wrote one last file.
+        (rig.checkout / "last.txt").write_text("written as the panes closed\n")
+
+    monkeypatch.setattr(rig.overview, "close_workspaces", close_workspaces)
+    result = run_move(rig)
+    assert not result["source"]["removed"] and (rig.checkout / "last.txt").exists()
+    assert "changed after it was copied" in result["warnings"][0]
+
+
+def test_a_failing_cleanup_after_the_move_is_a_warning(rig, monkeypatch):
+    def clean_source(self, src):
+        raise RuntimeError("cleanup thread died")
+
+    monkeypatch.setattr(workspace_move.Move, "clean_source", clean_source)
+    result = run_move(rig)
+    assert result["machine"] == "mini" and rig.checkout.exists()
+    assert "its cleanup failed (cleanup thread died)" in result["warnings"][0]
+
+
+def test_another_pane_running_a_program_is_refused(rig):
+    data = read(rig.state)
+    data["process_info"]["w1:p1"] = {
+        "shell_pid": 90,
+        "foreground_processes": [{"pid": 91, "argv0": "/usr/bin/vim", "argv": ["vim"]}],
+    }
+    rig.state.write_text(json.dumps(data))
+    refused = refusal(rig)
+    assert refused.details["code"] == "panes" and refused.details["panes"] == ["vim in w1:p1"]
+    nothing_happened(rig)
+
+
+def test_a_pane_root_that_is_no_shell_is_refused_before_esc(rig):
+    data = read(rig.state)
+    data["agents"][0]["agent_status"] = "working"
+    data["commands"] = {"100": "bash -c claude"}
+    rig.state.write_text(json.dumps(data))
+    assert "not an interactive shell" in str(refusal(rig, confirm_working=True))
+    nothing_happened(rig)
+    assert "esc" not in json.dumps(read(rig.state)["calls"])
+
+
+def test_an_agent_busy_again_is_never_stopped_unconfirmed(rig, monkeypatch):
+    real = workspace_move.Move.send_code
+
+    def send_code(self, src, state):
+        made = real(self, src, state)
+        set_agent(rig, agent_status="working")  # A message woke it meanwhile.
+        return made
+
+    monkeypatch.setattr(workspace_move.Move, "send_code", send_code)
+    with pytest.raises(workspace_move.Failed, match="may not be stopped") as failed:
+        run_move(rig)
+    assert failed.value.details["stage"] == "before_exit"
+    assert local_agents(rig) and not rig.target.exists()
+    assert "esc" not in json.dumps(read(rig.state)["calls"])
+
+
+def test_actions_on_an_agent_under_a_move_are_refused_at_once():
+    import threading
+
+    keys = [("checkout", "/w/x"), ("session", SID), ("pane", "w1:p2")]
+    holding, done = threading.Event(), threading.Event()
+
+    def move():
+        with agent_messages.reserved(*keys):
+            # Its own actions on them go ahead.
+            with agent_messages.locked(("pane", "w1:p2")):
+                holding.set()
+                done.wait(10)
+
+    thread = threading.Thread(target=move)
+    thread.start()
+    try:
+        assert holding.wait(10)
+        target = {"pane": "w1:p2", "status": "idle", "agent": "claude"}
+        with pytest.raises(ValueError, match="move of this agent"):
+            agent_messages.prompt(target, "hello")
+        with pytest.raises(ValueError, match="move of this agent"):
+            with agent_messages.locked(("checkout", "/w/x"), ("session", SID)):
+                pass
+        with pytest.raises(ValueError, match="move of this agent"):
+            with agent_messages.reserved(*keys):
+                pass
+        with agent_messages.locked(("pane", "w9:p1")):
+            pass  # Another agent's actions are unaffected.
+    finally:
+        done.set()
+        thread.join(10)
+    with agent_messages.locked(*keys):
+        pass  # Released with the move.
+
+
+def test_a_lone_surrogate_in_a_transcript_survives_its_copy():
+    line = b'{"type":"user","cwd":"/a/b","message":{"content":"x\\ud83d y"}}\n'
+    moved = workspace_move.rewrite(line, ["/a/b"], "/c/d")
+    item = json.loads(moved)
+    assert item["cwd"] == "/c/d" and item["message"]["content"] == "x\ud83d y"
+    assert moved.endswith(b"\n") and moved.isascii()
+
+
+def test_a_session_started_below_the_checkout_keeps_its_project_folder(
+    tmp_path, fake_tools, short_tmp, monkeypatch
+):
+    rig = make_rig(tmp_path, fake_tools, short_tmp, monkeypatch, subdir="frontend")
+    result = run_move(rig)
+    folder = rig.host / ".claude" / "projects" / (slug(rig.target) + "-frontend")
+    moved = lines(folder / f"{SID}.jsonl")
+    assert moved[0]["cwd"] == str(rig.target / "frontend")
+    # Resumed where it was started, below the new checkout.
+    [run] = worker_store(rig)["runs"]
+    assert run[1].startswith(f"cd {rig.target / 'frontend'} && ")
+    assert worker_store(rig)["agents"][0]["agent_session"] == {"value": SID}
+    assert result["source"]["removed"]
+
+
+def test_a_restarted_dashboard_marks_a_running_move_interrupted(rig):
+    add_watch(rig)
+    db = pr_supervisor.open_db(rig.home)
+    try:
+        with db:
+            job = pr_supervisor.get_job(db, "0123456789abcdef")
+            job.update(status="stopped", summary="Moving with its workspace to Mac mini")
+            pr_supervisor.save_job(db, job)
+    finally:
+        db.close()
+    folder = rig.home / "moves"
+    folder.mkdir()
+    (folder / "a1.json").write_text(
+        json.dumps(
+            {
+                "id": "a1",
+                "status": "running",
+                "pane": "w1:p2",
+                "session": SID,
+                "message": "Copying the conversation to Mac mini",
+                "steps": [],
+                "started_at": 1,
+                "stage": "after_exit",
+                "watch": "0123456789abcdef",
+                "resume_command": f"cd {rig.checkout} && claude --resume {SID}",
+            }
+        )
+    )
+    moves = workspace_move.Moves(rig.home, lambda: rig.placing, lambda: rig.overview)
+    op = moves.action({"id": "a1"})["move"]
+    assert op["status"] == "interrupted"
+    assert "at: Copying the conversation to Mac mini" in op["message"]
+    assert op["result"]["resume_command"].endswith(f"claude --resume {SID}")
+    assert watch(rig)["status"] == "awaiting_release"
+    assert json.loads((folder / "a1.json").read_text())["status"] == "interrupted"
+
+
+def test_git_lfs_is_refused(rig):
+    (rig.checkout / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+    git("add", ".gitattributes", cwd=rig.checkout)
+    git("commit", "-q", "-m", "lfs", cwd=rig.checkout)
+    assert refusal(rig).details["code"] == "lfs"
+    nothing_happened(rig)
+
+
+def test_a_plan_never_takes_the_live_index_lock(rig):
+    index = Path(
+        git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=rig.checkout)
+    )
+    lock = index.with_name("index.lock")
+    lock.write_text("")  # The agent is staging something right now.
+    before = index.stat().st_mtime_ns
+    try:
+        found = workspace_move.plan(rig.home, request(), rig.placing)
+    finally:
+        lock.unlink()
+    assert found["machine"] == "mini" and index.stat().st_mtime_ns == before
+
+
+def test_the_session_probe_takes_only_a_project_folder_suffix(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    folder = tmp_path / ".local/state/babysit-pr/moves"
+    folder.mkdir(parents=True)
+    archive = folder / "s.tar"
+    for suffix in ("/../x", "-a/b", "x"):
+        archive.write_bytes(b"")  # Taken and removed by each refusal.
+        with pytest.raises(ValueError, match="project folder suffix"):
+            remote_probe._host_move_session(
+                str(archive.resolve()),
+                "claude",
+                "default",
+                "safehouse",
+                str(tmp_path),
+                None,
+                suffix,
+            )
