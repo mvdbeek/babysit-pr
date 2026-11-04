@@ -1400,6 +1400,9 @@ def main():
     )
     token.add_argument("machine", help="Registered machine id")
     token.add_argument("--revoke", action="store_true", help="Stop the machine's token working")
+    import workspace_move
+
+    workspace_move.add_arguments(sub)
     start = sub.add_parser("start", help="Restart the shared watcher after logout/reboot")
     start.add_argument("--max-workers", type=int, default=2)
     server = sub.add_parser("serve", help="Run shared watcher in foreground")
@@ -1449,6 +1452,14 @@ def main():
                 emit({"error": str(exc)})
                 return 1
             return 0
+    if args.command == "workspace-move":
+        # Through the dashboard, whose locks and cleanup its own actions share.
+        try:
+            emit(workspace_move.cli(args))
+        except (OSError, ValueError) as exc:
+            emit({"error": str(exc)})
+            return 1
+        return 0
     if args.command == "worker-token":
         import worker_api
 
