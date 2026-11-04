@@ -354,7 +354,7 @@ def test_a_task_whose_attached_file_cannot_be_copied_is_not_started(remote):
     (manager.attachments / shot).unlink()
     op = finish(manager, manager.new_task(request)["operation"]["pr"])
     assert op["status"] == "failed" and "attached file is missing" in op["message"], op
-    assert not store(state)["machines"]["Mac mini"].get("agents")
+    assert not store(state).get("machines", {}).get("Mac mini", {}).get("agents")
     assert not (worker / ".local/state/babysit-pr/workspace-prompts").exists()
     assert not any("wt.py" in c for c in remote_commands(state))
 

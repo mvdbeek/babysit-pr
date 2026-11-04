@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1159,7 +1160,7 @@ def test_the_session_probe_takes_only_a_project_folder_suffix(tmp_path, monkeypa
             )
 
 
-def test_saved_moves_this_dashboard_did_not_write_are_skipped(rig, capsys):
+def test_saved_moves_this_dashboard_did_not_write_are_skipped(rig, capsys, monkeypatch):
     folder = rig.home / "moves"
     folder.mkdir()
     good = {"id": MOVED, "status": "moved", "started_at": 1.0, "pane": "w1:p9", "session": SID}
@@ -1178,12 +1179,24 @@ def test_saved_moves_this_dashboard_did_not_write_are_skipped(rig, capsys):
     assert capsys.readouterr().err.count("Skipped unreadable saved move") == 4
     assert not (rig.home.parent / "escape.json").exists()
     # Starting and pruning still work beside what was read.
+    finished = threading.Event()
+    run = moves.run
+
+    def complete(*args):
+        try:
+            run(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(moves, "run", complete)
     started = moves.action(request())["move"]
     assert started["status"] == "running" and started["id"] in moves.ops
     deadline = time.time() + 60
     while moves.action({"id": started["id"]})["move"]["status"] == "running":
         assert time.time() < deadline
         time.sleep(0.1)
+    # Terminal status precedes the worker's final save; wait before removing its state.
+    assert finished.wait(60)
     with pytest.raises(ValueError, match="only under its own ID"):
         moves.save({"id": "../../escape"})
     assert not (rig.home.parent / "escape.json").exists()
