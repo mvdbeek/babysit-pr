@@ -1901,6 +1901,15 @@
         card.append(
           node("p", "Its processes could not be listed; any it started stop with it.", "pr-meta"),
         );
+      if (plan.mcp_count)
+        card.append(
+          node(
+            "p",
+            `Its MCP servers (${plural(plan.mcp_count, "process", "processes")}) end with it ` +
+              "and start again with it there.",
+            "pr-meta",
+          ),
+        );
       if (plan.watch && !plan.error)
         card.append(node("p", `babysit watch ${plan.watch.id} follows it there.`, "pr-meta"));
       if (plan.error) card.append(node("p", plan.error, "ws-move-error"));

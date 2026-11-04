@@ -2446,10 +2446,64 @@ def _move_place(clone, repo, root, name, branch, agent, account, sandbox, move=N
     return clone, common, path, config, ours
 
 
-def _host_move_check(clone, repo, root, name, branch, agent, account, sandbox):
-    """Whether a move could make its checkout here (``_move_place``), changing nothing."""
-    clone, _, path, _, _ = _move_place(clone, repo, root, name, branch, agent, account, sandbox)
-    return {"clone": clone, "path": path}
+def _upstream_arg(upstream):
+    """A moved branch's upstream as the controller sends it: ``[remote, branch, repo]``,
+    with the commit its remote-tracking ref names there (or None) as a fourth item."""
+    if upstream is None:
+        return None
+    if not (isinstance(upstream, list) and len(upstream) in (3, 4)):
+        raise ValueError("Expected the upstream as [remote, branch, repo, tip]")
+    _branch(upstream[1], "upstream")
+    _repo(upstream[2])
+    if not isinstance(upstream[0], str) or not MOVE_PART.fullmatch(upstream[0]):
+        raise ValueError("Expected the upstream's remote name")
+    tip = upstream[3] if len(upstream) == 4 else None
+    if tip is not None:
+        _object(tip, "upstream tip")
+    return upstream[0], upstream[1], upstream[2], tip
+
+
+def _move_upstream(clone, common, upstream):
+    """The remote a moved branch tracks here, and whether this move adds it, or (None,
+    why not). A repository no remote here names gets one named as wtpr names a pull
+    request's fork remote (``wtpr-<owner>-<repo>``), by its GitHub URL alone."""
+    remote, _, slug, _ = upstream
+    remotes = remote_slugs(repo_config(host_git, clone))
+    if remotes.get(remote) == slug.lower():
+        return remote, False
+    found = next((r for r in sorted(remotes) if remotes[r] == slug.lower()), None)
+    if found is not None:
+        return found, False
+    owner, name = slug.split("/")
+    added = f"wtpr-{owner}-{name}"
+    if not MOVE_PART.fullmatch(added):
+        return None, f"no remote here names {slug}, and {added} is no remote name"
+    try:
+        host_git(clone, "config", "--get", f"remote.{added}.url")
+    except ValueError:
+        pass  # Free.
+    else:
+        return None, f"no remote here names {slug}, and remote {added} names another"
+    if os.path.islink(os.path.join(common, "config")):
+        return None, f"no remote here names {slug}, and {common}/config is a symbolic link"
+    return added, True
+
+
+def _host_move_check(clone, repo, root, name, branch, agent, account, sandbox, upstream=None):
+    """Whether a move could make its checkout here (``_move_place``), and which remote its
+    branch would track (``_move_upstream``), changing nothing."""
+    clone, common, path, _, _ = _move_place(
+        clone, repo, root, name, branch, agent, account, sandbox
+    )
+    tracks, note = None, None
+    upstream = _upstream_arg(upstream)
+    if upstream is not None:
+        remote, add = _move_upstream(clone, common, upstream)
+        if remote is None:
+            note = add
+        else:
+            tracks = [remote, upstream[1]]
+    return {"clone": clone, "path": path, "upstream": tracks, "upstream_note": note}
 
 
 def _host_move_receive(
@@ -2473,13 +2527,16 @@ def _host_move_receive(
 
     The bundle holds one ref, ``refs/babysit-move/<move>``: a commit of the source's
     whole working tree (``work_tree``) whose parent commits its index (``index_tree``),
-    whose parent is the branch's ``head``. Its prerequisites are commits on the source's
-    remote branches; ``fetch`` (``[repo, branch]`` pairs) names those to fetch from
-    GitHub when this clone lacks them. ``branch`` is checked out at ``head`` in a new
+    whose parent is the branch's ``head``. Its prerequisites are commits on the
+    repository's default branch; ``fetch`` (``[repo, branch]`` pairs) names that branch,
+    fetched from GitHub when this clone lacks them, and a refusal names what is missing
+    and what each fetch said. ``branch`` is checked out at ``head`` in a new
     worktree ``root/name`` of ``clone`` (which must be a clone of ``repo``), whose files
     are then the working tree's and whose index the index's: staged, unstaged and
     untracked changes as they were. ``upstream`` (``[remote, branch, repo]`` or None) is
-    the branch's upstream there, set when a remote here names the same repository.
+    the branch's upstream there (``_track``): through a remote here naming the same
+    repository, or a fork's remote this move adds, answered as ``[remote, branch]``;
+    left unset, with why, when neither can be.
 
     A branch or directory already there is refused, unless it is this move's own
     (its admin dir records ``move``), which is then brought to the new state. Claude is
@@ -2492,13 +2549,7 @@ def _host_move_receive(
             raise ValueError("Expected a move ID")
         for value, what in ((head, "head"), (index_tree, "index"), (work_tree, "working tree")):
             _object(value, what)
-        if upstream is not None:
-            if not (isinstance(upstream, list) and len(upstream) == 3):
-                raise ValueError("Expected the upstream as [remote, branch, repo]")
-            _branch(upstream[1], "upstream")
-            _repo(upstream[2])
-            if not isinstance(upstream[0], str) or not MOVE_PART.fullmatch(upstream[0]):
-                raise ValueError("Expected the upstream's remote name")
+        upstream = _upstream_arg(upstream)
         if not isinstance(fetch, list) or len(fetch) > MAX_ALSO:
             raise ValueError(f"Expected at most {MAX_ALSO} branches to fetch")
         for pair in fetch:
@@ -2506,18 +2557,22 @@ def _host_move_receive(
                 raise ValueError("Expected [repo, branch] pairs to fetch")
             _repo(pair[0])
             _branch(pair[1], "fetched")
-        clone, _, path, config, ours = _move_place(
+        clone, common, path, config, ours = _move_place(
             clone, repo, root, name, branch, agent, account, sandbox, move
         )
         root = os.path.dirname(path)
         remotes = remote_slugs(repo_config(host_git, clone))
 
         def verified():
-            done = _host_run(host_argv(clone, ["bundle", "verify", "-q", bundle]), 300)
-            return done.returncode == 0, (done.stderr or done.stdout).strip()[-2000:]
+            # Not -q: quiet, Git leaves out which prerequisite commits are missing.
+            done = _host_run(host_argv(clone, ["bundle", "verify", bundle]), 300)
+            said = " ".join((done.stderr or "").split())[-2000:]
+            return done.returncode == 0, said or f"git bundle verify exited {done.returncode}"
 
         ok, said = verified()
+        notes = []
         if not ok and fetch:
+            # Its base is a remote default branch this clone may be behind on.
             for slug, base in fetch:
                 remote = next(
                     (
@@ -2527,11 +2582,22 @@ def _host_move_receive(
                     ),
                     None,
                 )
-                if remote is not None:
+                if remote is None:
+                    notes.append(f"no remote here names {slug}, so {base} was not fetched")
+                    continue
+                try:
                     _host_fetch(clone, slug, base, remote)
+                except ValueError as exc:
+                    detail = " ".join(str(exc).split())[-1000:]
+                    notes.append(f"fetching {base} of {slug} into {remote} failed: {detail}")
+                else:
+                    notes.append(f"fetched {base} of {slug} into {remote}")
             ok, said = verified()
         if not ok:
-            raise ValueError(f"{clone} lacks commits the moved branch needs: {said}")
+            raise ValueError(
+                f"{clone} lacks commits the moved branch needs ({said})"
+                + (f"; {'; '.join(notes)}" if notes else "")
+            )
         listed = host_git(clone, "bundle", "unbundle", bundle, timeout=600).splitlines()
         ref = f"refs/babysit-move/{move}"
         tips = [line.split(" ", 1)[0] for line in listed if line.endswith(f" {ref}")]
@@ -2558,16 +2624,17 @@ def _host_move_receive(
                     handle.write(move + "\n")
             host_git(path, "read-tree", "-u", "--reset", work_tree, timeout=600)
             host_git(path, "read-tree", index_tree)
+            tracked = note = None
             if upstream is not None:
-                remote, merge, slug = upstream
-                if remotes.get(remote) != slug.lower():
-                    remote = next((r for r in sorted(remotes) if remotes[r] == slug.lower()), None)
-                if remote is not None:
-                    host_git(clone, "config", f"branch.{branch}.remote", remote)
-                    host_git(clone, "config", f"branch.{branch}.merge", f"refs/heads/{merge}")
+                tracked, note = _track(clone, common, branch, upstream)
             if config is not None:
                 _host_trust(config, path)
-            return {**_move_state(path), "clone": clone}
+            return {
+                **_move_state(path),
+                "clone": clone,
+                "upstream": tracked,
+                "upstream_note": note,
+            }
         except BaseException:
             if not ours:
                 # Half made by this move: nothing of it stays to refuse the next one.
@@ -2581,6 +2648,40 @@ def _host_move_receive(
     finally:
         if isinstance(bundle, str):
             _discard(bundle)
+
+
+def _track(clone, common, branch, upstream):
+    """Set the moved branch's upstream here as it was on the controller; ([remote,
+    branch], None), or (None, why not), leaving nothing half set.
+
+    A fork's remote this move adds gets its remote-tracking ref at the commit the
+    controller's names, which the bundle brought, so nothing is fetched for it."""
+    _, merge, slug, tip = upstream
+    remote, add = _move_upstream(clone, common, upstream)
+    if remote is None:
+        return None, add
+    try:
+        if add:
+            host_git(clone, "remote", "add", remote, f"https://github.com/{slug}.git")
+            if tip is not None:
+                try:
+                    host_git(clone, "cat-file", "-e", f"{tip}^{{commit}}")
+                except ValueError:
+                    pass  # Not brought along: the ref is left for a fetch to make.
+                else:
+                    host_git(clone, "update-ref", f"refs/remotes/{remote}/{merge}", tip)
+        host_git(clone, "config", f"branch.{branch}.remote", remote)
+        host_git(clone, "config", f"branch.{branch}.merge", f"refs/heads/{merge}")
+    except ValueError as exc:
+        for undo in (
+            ["config", "--unset", f"branch.{branch}.remote"],
+            ["config", "--unset", f"branch.{branch}.merge"],
+            *([["remote", "remove", remote]] if add else []),
+        ):
+            with contextlib.suppress(ValueError):
+                host_git(clone, *undo)
+        return None, f"its upstream {slug} could not be set: {' '.join(str(exc).split())[-300:]}"
+    return [remote, merge], None
 
 
 def _host_move_session(archive, agent, account, sandbox, path, day, suffix=""):
@@ -3944,20 +4045,47 @@ def validate_move_receive(value):
     """A moved checkout's state there, which the controller compares with its own."""
     _expect(
         isinstance(value, dict)
-        and set(value) == {"path", "branch", "head", "index_tree", "work_tree", "clone"},
+        and set(value)
+        == {
+            "path",
+            "branch",
+            "head",
+            "index_tree",
+            "work_tree",
+            "clone",
+            "upstream",
+            "upstream_note",
+        },
         "fields",
     )
     _expect(_shown_path(value["path"]), "path")
     _expect(_shown_path(value["clone"]), "clone")
+    _expect(_tracked(value["upstream"]) and _note(value["upstream_note"]), "upstream")
     _expect(_text(value["branch"]) and bool(value["branch"]), "branch")
     for key in ("head", "index_tree", "work_tree"):
         _expect(isinstance(value[key], str) and OBJECT.fullmatch(value[key]), key)
     return value
 
 
+def _tracked(value):
+    return value is None or (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(_text(part) and part and not CONTROL.search(part) for part in value)
+    )
+
+
+def _note(value):
+    return value is None or (_text(value) and not CONTROL.search(value))
+
+
 def validate_move_check(value):
-    _expect(isinstance(value, dict) and set(value) == {"clone", "path"}, "fields")
+    _expect(
+        isinstance(value, dict) and set(value) == {"clone", "path", "upstream", "upstream_note"},
+        "fields",
+    )
     _expect(_shown_path(value["clone"]) and _shown_path(value["path"]), "paths")
+    _expect(_tracked(value["upstream"]) and _note(value["upstream_note"]), "upstream")
     return value
 
 
