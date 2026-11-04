@@ -847,3 +847,68 @@ def test_the_command_line_plans_then_follows_the_move_through_the_dashboard(monk
         "confirm_working": True,
     }
     assert sent[3:] == [{"id": "m1"}, {"id": "m1"}]
+
+
+def test_a_checkout_written_after_its_copy_is_kept(rig, monkeypatch):
+    real = workspace_move.Move.confirmed
+
+    def confirmed(self, *args):
+        # Something left in the pane writes there while the worker's agent starts.
+        (rig.checkout / "late.txt").write_text("written after the copy\n")
+        return real(self, *args)
+
+    monkeypatch.setattr(workspace_move.Move, "confirmed", confirmed)
+    result = run_move(rig)
+    assert not result["source"]["removed"] and rig.checkout.exists()
+    assert "changed after it was copied" in result["warnings"][0]
+    assert (rig.checkout / "late.txt").exists()
+    assert ["workspace", "close", "w1"] not in read(rig.state)["calls"]
+
+
+def test_an_exit_that_raises_once_the_agent_left_keeps_both_checkouts(rig, monkeypatch):
+    real = agent_messages.exit_agent
+
+    def exit_agent(request, home=None):
+        real(request, home)
+        raise RuntimeError("herdr could not close the pane")
+
+    monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
+    with pytest.raises(workspace_move.Failed, match="could not be confirmed") as failed:
+        run_move(rig)
+    details = failed.value.details
+    assert details["stage"] == "exit" and details["worker_path"] == str(rig.target)
+    assert details["resume_command"].endswith(f"claude --resume {SID}")
+    assert rig.checkout.exists() and rig.target.exists()
+
+
+def test_a_nested_repository_is_refused(rig):
+    subprocess.check_call(["git", "init", "-q", str(rig.checkout / "vendored")])
+    (rig.checkout / "vendored" / "f").write_text("x\n")
+    git("add", "f", cwd=rig.checkout / "vendored")
+    git("commit", "-q", "-m", "inner", cwd=rig.checkout / "vendored")
+    assert refusal(rig).details["code"] == "nested"
+    nothing_happened(rig)
+
+
+def test_the_session_probe_takes_a_longer_copy_of_the_same_conversation(tmp_path, monkeypatch):
+    import tarfile
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    folder = tmp_path / ".local/state/babysit-pr/moves"
+    folder.mkdir(parents=True)
+
+    def place(data):
+        archive = folder / "s.tar"
+        with tarfile.open(archive, "w") as bundle:
+            info = tarfile.TarInfo(f"{SID}.jsonl")
+            info.size = len(data)
+            bundle.addfile(info, io.BytesIO(data))
+        return remote_probe._host_move_session(
+            str(archive.resolve()), "claude", "default", "safehouse", str(tmp_path), None
+        )["transcript"]
+
+    first = place(b'{"a":1}\n')
+    assert place(b'{"a":1}\n{"b":2}\n') == first
+    assert Path(first).read_bytes() == b'{"a":1}\n{"b":2}\n'
+    with pytest.raises(ValueError, match="already exists here"):
+        place(b'{"other":1}\n')

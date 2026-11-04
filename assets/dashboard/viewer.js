@@ -1925,6 +1925,8 @@
     let text = op.error || "The move failed";
     if (!/[.!?]$/.test(text)) text += ".";
     if (result.stage === "before_exit") text += " The agent is still running here.";
+    if (result.stage === "exit")
+      text += " Check its pane first: the agent may still be running here.";
     if (result.resume_command)
       text += ` The checkout here was kept; resume it here with: ${result.resume_command}`;
     return text;

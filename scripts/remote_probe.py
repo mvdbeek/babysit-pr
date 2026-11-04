@@ -2571,7 +2571,8 @@ def _host_move_session(archive, agent, account, sandbox, path, day):
     ``<id>.jsonl`` and ``<id>/`` (subagents, tool results), which go in the project
     folder Claude names after ``path`` in the account's home; Codex's one rollout, which
     goes in ``sessions/<day>`` of its home. A file already there is left only when it
-    holds the same bytes. Answers the transcript's path; the archive is always removed.
+    holds the same bytes, or the start of them (an earlier copy of the conversation).
+    Answers the transcript's path; the archive is always removed.
     """
     try:
         _arg_paths([path])
@@ -2610,24 +2611,31 @@ def _host_move_session(archive, agent, account, sandbox, path, day):
                 raise ValueError("The archive holds no transcript")
             for member in members:
                 target = folder.joinpath(*member.name.split("/"))
-                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                if not Path(os.path.realpath(target.parent)).is_relative_to(
-                    os.path.realpath(store)
-                ):
-                    raise ValueError(f"{target.parent} leads out of {store}")
+                # Each folder on the way is made here, never reached through a link.
+                place = Path(os.path.realpath(store))
+                for part in target.parent.relative_to(store).parts:
+                    place = place / part
+                    if os.path.islink(place):
+                        raise ValueError(f"{place} is a symbolic link")
+                    if not place.is_dir():
+                        place.mkdir(mode=0o700)
                 stream = bundle.extractfile(member)
                 assert stream is not None
                 data = stream.read()
                 if os.path.lexists(target):
+                    if os.path.islink(target) or not os.path.isfile(target):
+                        raise ValueError(f"{target} already exists here")
                     with open(target, "rb") as existing:
-                        if os.path.islink(target) or existing.read() != data:
-                            raise ValueError(f"{target} already exists here")
-                    continue
-                descriptor = os.open(
-                    target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-                )
+                        held = existing.read()
+                    if held == data:
+                        continue
+                    if not data.startswith(held):
+                        raise ValueError(f"{target} already exists here")
+                    # An earlier copy of this conversation, which it has gone on from.
+                descriptor, temporary = tempfile.mkstemp(prefix=".babysit-", dir=place)
                 with os.fdopen(descriptor, "wb") as out:
                     out.write(data)
+                os.replace(temporary, place / target.name)
         return {"transcript": str(folder / main)}
     finally:
         if isinstance(archive, str):

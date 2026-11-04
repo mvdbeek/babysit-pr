@@ -409,6 +409,13 @@ def source(home, request):
     if any(e.startswith("160000 ") for e in git(root, "ls-files", "--stage", "-z").split("\0")):
         raise Refused("Its checkout contains submodules, which a move cannot carry", "submodules")
     state = snapshot(root)
+    # An untracked clone inside the checkout would travel as a commit the worker lacks.
+    if " commit " in git(root, "ls-tree", "-r", state["work_tree"]).replace("\t", " "):
+        raise Refused(
+            "Its checkout holds another Git repository, which a move cannot carry", "nested"
+        )
+    if kind == "codex" and not CODEX_DAY.fullmatch(Path(chosen["_file"]).parent.as_posix()):
+        raise Refused("Its Codex rollout is not in a sessions/YYYY/MM/DD folder", "rollout")
     config = repo_config(root)
     remotes = remote_slugs(config)
     slug = remotes.get("upstream") or remotes.get("origin")
@@ -791,22 +798,28 @@ class Move:
 
     def restore_watch(self, note):
         """Give the watch back its status, while it is still the one this move stopped."""
-        import pr_supervisor
-
         if self.watch is None:
             return
         job_id, status, summary = self.watch
+        try:
+            self.give_back(job_id, status, f"{note} {summary}")
+        except Exception as exc:  # The move's own failure is what gets reported.
+            self.say(f"babysit watch {job_id} could not be given back: {exc}")
+        self.watch = None
+
+    def give_back(self, job_id, status, summary):
+        import pr_supervisor
+
         db = pr_supervisor.open_db(self.home)
         try:
             with db:
                 db.execute("BEGIN IMMEDIATE")
                 job = pr_supervisor.get_job(db, job_id)
                 if job["status"] == "stopped" and str(job.get("summary")).startswith("Moving"):
-                    job.update(status=status, epoch=job["epoch"] + 1, summary=f"{note} {summary}")
+                    job.update(status=status, epoch=job["epoch"] + 1, summary=summary)
                     pr_supervisor.save_job(db, job)
         finally:
             db.close()
-        self.watch = None
 
     def follow_watch(self, src, path, pane):
         """Register the stopped watch again on the worker, for the resumed agent there."""
@@ -872,6 +885,14 @@ class Move:
             return f"The new checkout {self.worker['path']} on {self.machine.label} stays: {exc}"
         self.worker = None
         return None
+
+    def still_here(self, src):
+        """Whether the agent still runs its session in its pane here, as far as herdr says."""
+        try:
+            listed = agent_messages.agents(src["workspace"])
+        except Exception:
+            return False  # Unknown: it may have gone, so nothing assumes it runs.
+        return any(a["pane"] == src["pane"] and a.get("session") == src["session"] for a in listed)
 
     def confirmed(self, session, kind, pane):
         """The worker's herdr agent on ``session``, in ``pane`` if one is named, once it
@@ -970,19 +991,30 @@ class Move:
                     pids = {c["pid"] for c in stopped}
                     stopped += [c for c in after["children"] or [] if c["pid"] not in pids]
                     src = {**after, "children": stopped}
+                    check_watch(src, self.machine)
                 self.say(f"Packing {src['state']['branch']} for {self.machine.label}")
                 made = self.send_code(src, src["state"])
                 if src["watch"] is not None:
                     self.say(f"Holding babysit watch {src['watch']['id']} for the move")
                     self.hold_watch(src)
                 self.say(f"Exiting {label} here")
-                quit_ = agent_messages.exit_agent(
-                    {"workspace": src["workspace"], "pane": src["pane"], "session": src["session"]},
-                    self.home,
-                )
+                try:
+                    quit_ = agent_messages.exit_agent(
+                        {
+                            "workspace": src["workspace"],
+                            "pane": src["pane"],
+                            "session": src["session"],
+                        },
+                        self.home,
+                    )
+                except Exception as exc:
+                    if self.still_here(src):
+                        raise
+                    # Raised once the agent had gone: as an unconfirmed exit, never "running".
+                    quit_ = {"quit": False, "warning": str(exc)}
             except Exception as exc:
-                self.restore_watch("Move stopped before the agent left;")
                 kept = self.remove_worker_checkout()
+                self.restore_watch("Move stopped before the agent left;")
                 raise Failed(
                     f"{exc}" + (f". {kept}" if kept else ""),
                     stage="before_exit",
@@ -1043,10 +1075,12 @@ class Move:
                         or f"{self.machine.label}'s herdr does not show the resumed session"
                     )
             except Exception as exc:
-                self.restore_watch("Move stopped after the agent left;")
                 said = str(exc)
-                if resumed is not None:
-                    # Typed there: it may still start, and two agents must not share it.
+                if resumed is None:
+                    self.restore_watch("Move stopped after the agent left;")
+                else:
+                    # Typed there: it may still start, and two agents must not share it,
+                    # so the watch stays stopped too.
                     said += (
                         f". Its resume was typed in {resumed.get('pane')} on "
                         f"{self.machine.label}; check there before resuming it here"
@@ -1068,14 +1102,23 @@ class Move:
             job_id = self.watch[0]
             try:
                 followed = self.follow_watch(src, path, pane)["id"]
-            except (OSError, ValueError, RuntimeError) as exc:
+            except Exception as exc:
+                # The agent runs there already: nothing here undoes the move for this.
                 self.watch = None
                 warnings.append(
                     f"babysit watch {job_id} stays stopped: it could not be registered on "
                     f"{self.machine.label} ({exc}); register it there again"
                 )
         self.say("Removing the workspace here")
-        removed, said = self.clean_source(src)
+        try:
+            unchanged = same_state(src["state"], snapshot(src["root"]))
+        except ValueError:
+            unchanged = False
+        if unchanged:
+            removed, said = self.clean_source(src)
+        else:
+            # Written since it was copied: nothing here is removed that the worker lacks.
+            removed, said = False, "The checkout here changed after it was copied, so it was kept"
         if not removed:
             warnings.append(said)
         space = pane.split(":")[0]
@@ -1111,6 +1154,7 @@ class Moves:
         self.overview = overview
         self.lock = threading.Lock()
         self.ops: dict[str, dict] = {}
+        self.starting: set[tuple[str, str]] = set()
 
     def action(self, request):
         if not isinstance(request, dict):
@@ -1139,13 +1183,21 @@ class Moves:
             return json.loads(json.dumps(op))
 
     def start(self, request, workspaces):
+        key = (request["pane"], request["session"])
         with self.lock:
-            if any(
-                op["status"] == "running"
-                and (op["pane"], op["session"]) == (request["pane"], request["session"])
+            if key in self.starting or any(
+                op["status"] == "running" and (op["pane"], op["session"]) == key
                 for op in self.ops.values()
             ):
                 raise ValueError("This agent is already being moved")
+            self.starting.add(key)
+        try:
+            return self.begin(request, workspaces)
+        finally:
+            with self.lock:
+                self.starting.discard(key)
+
+    def begin(self, request, workspaces):
         # Refusals come back at once; the move itself runs on.
         src = source(self.home, request)
         if src["status"] == "working" and request.get("confirm_working") is not True:
