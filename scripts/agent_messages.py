@@ -93,6 +93,9 @@ PS = "/bin/ps"
 LOCK_ORDER = ("checkout", "session", "pane")
 _locks_guard = threading.Lock()
 _locks: dict[tuple[str, str], list] = {}
+# Keys a running workspace move reserved, by the thread running it (``reserved``).
+_reserved: dict[tuple[str, str], int] = {}
+MOVING = "A move of this agent to another machine is in progress; try again once it finishes"
 _recent: dict[str, tuple[str, float]] = {}
 # Once any Codex answer keystroke was attempted, retries must finish in the terminal.
 # Async questions can retain only an acknowledgment in the transcript after answering.
@@ -111,6 +114,11 @@ def locked(*keys):
     """
     ordered = sorted(set(keys), key=lambda key: (LOCK_ORDER.index(key[0]), key[1]))
     with _locks_guard:
+        # A move holds its keys for minutes: any other action on them is refused at once
+        # rather than left waiting.
+        me = threading.get_ident()
+        if any(_reserved.get(key, me) != me for key in ordered):
+            raise ValueError(MOVING)
         entries = [_locks.setdefault(key, [threading.RLock(), 0]) for key in ordered]
         for entry in entries:
             entry[1] += 1
@@ -125,6 +133,26 @@ def locked(*keys):
                 entry[1] -= 1
                 if not entry[1]:
                     del _locks[key]
+
+
+@contextlib.contextmanager
+def reserved(*keys):
+    """Hold ``locked(*keys)`` for a workspace move, refusing every other thread's action
+    on them meanwhile instead of making it wait (``locked``)."""
+    me = threading.get_ident()
+    with _locks_guard:
+        if any(_reserved.get(key, me) != me for key in keys):
+            raise ValueError(MOVING)
+        taken = [key for key in keys if key not in _reserved]
+        for key in taken:
+            _reserved[key] = me
+    try:
+        with locked(*keys):
+            yield
+    finally:
+        with _locks_guard:
+            for key in taken:
+                _reserved.pop(key, None)
 
 
 def clean(text):
@@ -627,7 +655,7 @@ def interrupt(request, machine=None):
     return {"stopped": True, "pane": pane, "warning": None}
 
 
-def exit_agent(request, home=None):
+def exit_agent(request, home=None, *, stop=True):
     """Quit the agent of a pane as its own exit does, keeping its session.
 
     The pane's shell stays, unless babysit split the pane off for the agent
@@ -642,7 +670,8 @@ def exit_agent(request, home=None):
     and Codex Ctrl-D (``send_exit``), and the process must leave. An exit is attempted
     once per process, and never while another process exits the same pane
     (``herdr_handoff.pane_lock`` under ``home``): a second could reach the shell once
-    the first took. Agents on workers are not quit from here.
+    the first took. Agents on workers are not quit from here. With ``stop`` False a busy
+    agent is refused instead of stopped, before any key.
     """
     if set(request) != {"workspace", "pane", "session"} or not (
         all(isinstance(request[k], str) and request[k] for k in ("workspace", "pane"))
@@ -734,6 +763,11 @@ def exit_agent(request, home=None):
                 target["status"] == "blocked"
                 and not (target["agent"] == "claude" and idle_screen(pane, screen))
             ):
+                if not stop:
+                    # A caller that was not allowed to stop a turn: nothing was sent.
+                    raise ValueError(
+                        "Not quit: the agent is busy again and its turn may not be stopped"
+                    )
                 sent = True
                 try:
                     herdr_handoff.herdr("agent", "send-keys", pane, "esc")
