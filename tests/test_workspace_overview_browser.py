@@ -154,7 +154,7 @@ def site(tmp_path, monkeypatch):
     monkeypatch.setattr(type(plugin), "collect", lambda self, **kwargs: copy.deepcopy(self.value))
     removed: list = []
 
-    def remove(self, job, index, target):
+    def remove(self, job, index, target, guard=None):
         removed.append(target)
         self.record(job, index, status="done", message="Cleaned up", steps=["Closed workspace w1"])
 

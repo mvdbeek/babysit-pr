@@ -792,10 +792,10 @@ def test_an_unexpected_failure_stops_only_its_own_target(site, monkeypatch):
     first, second = str(worktrees / "merged-work"), str(worktrees / "issue-12-crash")
     original = wso.WorkspaceOverview.remove
 
-    def remove(self, job, index, target):
+    def remove(self, job, index, target, guard=None):
         if target["key"] == first:
             raise RuntimeError("herdr returned nonsense")
-        return original(self, job, index, target)
+        return original(self, job, index, target, guard)
 
     monkeypatch.setattr(wso.WorkspaceOverview, "remove", remove)
     results = finish(plugin, plugin.cleanup({"targets": [{"key": first}, {"key": second}]}))
