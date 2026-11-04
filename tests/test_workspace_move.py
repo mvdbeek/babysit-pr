@@ -906,6 +906,10 @@ def test_an_exit_that_raises_once_the_agent_left_keeps_both_checkouts(rig, monke
 
 def test_a_nested_repository_is_refused(rig):
     subprocess.check_call(["git", "init", "-q", str(rig.checkout / "vendored")])
+    # A fresh repository has no identity of its own, and CI has no global one.
+    git("config", "user.name", "Fixture", cwd=rig.checkout / "vendored")
+    git("config", "user.email", "fixture@example.test", cwd=rig.checkout / "vendored")
+    git("config", "commit.gpgsign", "false", cwd=rig.checkout / "vendored")
     (rig.checkout / "vendored" / "f").write_text("x\n")
     git("add", "f", cwd=rig.checkout / "vendored")
     git("commit", "-q", "-m", "inner", cwd=rig.checkout / "vendored")
