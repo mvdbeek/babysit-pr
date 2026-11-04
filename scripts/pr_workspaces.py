@@ -136,7 +136,7 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 REMOTE_PROMPTS = "~/.local/state/babysit-pr/workspace-prompts"
 PROMPT_KEEP = 86400
 # How long a worker may take to check its clone and name a launch's checkout.
-PREPARE_TIMEOUT = 60
+PREPARE_TIMEOUT = 600  # A worker may need to clone the repository before preparing its checkout.
 # Seconds between looks at a worker agent's exit watch: each costs the worker ssh calls.
 REMOTE_WATCH = 60
 # What a worker's wt hands back about the exit watch of the agent it typed.
@@ -3148,7 +3148,7 @@ class Workspaces:
                     helper, subject, prefix = "wt", None, pr["branch"]
                 else:
                     helper, subject, prefix = "wtpr", "Pull request", f"pr-{owner}-{pr['number']}"
-                self.save_operation(op, message=f"Checking {op['clone']} on {machine.label}")
+                self.save_operation(op, message=f"Preparing {op['clone']} on {machine.label}")
                 found = cron_agents.probe(
                     self.home,
                     machine,
