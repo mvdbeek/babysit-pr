@@ -218,6 +218,34 @@ def test_each_worker_is_scanned_with_one_ssh_call_and_listed(fleet):
     assert sorted(fleet["ssh"]) == ["box", "box", "mini", "mini"]
 
 
+def test_clones_git_calls_bare_are_named_instead_of_silently_dropped(fleet):
+    """``core.bare = true`` on a clone hides it and all its worktrees from the scan."""
+    register(fleet["home"], MINI)
+    local = fleet["local"].parent.parent / "repo"
+    mini = fleet["hosts"] / "mini.test" / "src" / "repo"
+    for clone in (local, mini):
+        git("config", "core.bare", "true", cwd=clone)
+    value = wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect()
+    rows = by_key(value)
+    assert str(fleet["local"] / "local-work") not in rows
+    assert f"m:mini:{fleet['mini'] / 'merged-work'}" not in rows
+    assert remote_probe.bare_warning(local) in value["warnings"]
+    assert remote_probe.bare_warning(mini, "Mac mini") in value["warnings"]
+    assert f"`git -C {local} config core.bare false`" in remote_probe.bare_warning(local)
+    for clone in (local, mini):
+        git("config", "core.bare", "false", cwd=clone)
+    value = wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect()
+    assert not any("bare" in warning for warning in value["warnings"])
+    assert str(fleet["local"] / "local-work") in by_key(value)
+
+
+def test_a_real_bare_repository_is_not_flagged(tmp_path):
+    real = tmp_path / "real.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(real)], check=True)
+    assert not remote_probe.bare_checkout(remote_probe.host_git, real)
+    assert not remote_probe.bare_checkout(remote_probe.host_git, tmp_path / "missing")
+
+
 def test_worker_transcripts_date_its_rows(fleet):
     register(fleet["home"], MINI)
     day = fleet["hosts"] / "mini.test" / ".codex" / "sessions" / "2026" / "10" / "05"
@@ -431,7 +459,14 @@ def test_probe_entry_checks_protocol_op_and_arguments(capsys, tmp_path):
     answer = run_main(capsys, remote_probe.PROTOCOL, encoded(good))
     assert answer == {
         "protocol": remote_probe.PROTOCOL,
-        "result": {"roots": [], "clones": [], "states": {}, "updates": {}, "paths": {}},
+        "result": {
+            "roots": [],
+            "clones": [],
+            "states": {},
+            "updates": {},
+            "paths": {},
+            "bare": [],
+        },
     }
 
 
@@ -443,10 +478,12 @@ def test_probe_entry_checks_protocol_op_and_arguments(capsys, tmp_path):
         lambda v: v["paths"].update({"/x": {"path": "x", "exists": True}}),
         lambda v: v["states"].update({"/unlisted": {"changes": 0, "unpushed": 0, "error": None}}),
         lambda v: v.update(extra=1),
+        lambda v: v.pop("bare"),
+        lambda v: v["bare"].append("relative"),
     ],
 )
 def test_malformed_probe_answers_are_rejected(change):
-    value = {"roots": [], "clones": [], "states": {}, "updates": {}, "paths": {}}
+    value = {"roots": [], "clones": [], "states": {}, "updates": {}, "paths": {}, "bare": []}
     change(value)
     with pytest.raises(ValueError, match="Malformed probe answer"):
         remote_probe.validate_inventory(value)
@@ -690,6 +727,7 @@ def test_implausible_worker_states_are_rejected(state):
         "states": {"/c": state},
         "updates": {},
         "paths": {},
+        "bare": [],
     }
     with pytest.raises(ValueError, match="Malformed probe answer"):
         remote_probe.validate_inventory(value)
@@ -707,6 +745,7 @@ def test_an_item_listed_by_two_clones_is_rejected():
         "states": {},
         "updates": {},
         "paths": {},
+        "bare": [],
     }
     with pytest.raises(ValueError, match="item listed twice"):
         remote_probe.validate_inventory(value)
@@ -715,7 +754,9 @@ def test_an_item_listed_by_two_clones_is_rejected():
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
 def test_non_finite_numbers_in_an_answer_are_refused(tmp_path, monkeypatch, constant):
     register(tmp_path, MINI)
-    result = '{"roots": [], "clones": [], "states": {}, "updates": {"/x": %}, "paths": {}}'
+    result = (
+        '{"roots": [], "clones": [], "states": {}, "updates": {"/x": %}, "paths": {}, "bare": []}'
+    )
     answer = f'{{"protocol": "{remote_probe.PROTOCOL}", "result": {result}}}'
     stdout = answer.replace("%", constant).encode()
     monkeypatch.setattr(

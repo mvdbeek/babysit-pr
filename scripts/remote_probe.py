@@ -212,6 +212,33 @@ def clone_worktrees(git, root, wanted=None, config=None):
     return (main, items) if main else None
 
 
+def bare_checkout(git, root):
+    """Whether ``root`` has a ``.git`` directory that Git nonetheless calls bare.
+
+    ``core.bare = true`` on an ordinary clone makes ``clone_worktrees`` skip it, so the
+    clone and every worktree of it vanish from the inventory without an error.
+    A real bare repository has no ``.git`` directory and is not flagged. The setting is
+    read from config: ``rev-parse --is-bare-repository`` answers false under the
+    ``--work-tree`` this machine's hardened Git passes.
+    """
+    if not (Path(root) / ".git").is_dir():
+        return False
+    try:
+        return git(root, "config", "--bool", "--get", "core.bare") == "true"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def bare_warning(path, label=None):
+    """The scan warning for a clone ``bare_checkout`` flagged."""
+    where = f"{label}: " if label else ""
+    return (
+        f"{where}{path} skipped: Git treats it as a bare repository (core.bare = true), "
+        f"so none of its worktrees are listed. If it has a working tree, run "
+        f"`git -C {path} config core.bare false`"
+    )
+
+
 def scanned_roots(src, roots, repo_roots):
     """Clone roots a scan may touch: herdr's own, the configured ones, and those in ``src``."""
     found = {Path(root).resolve() for root in repo_roots}
@@ -400,13 +427,15 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
 
     def survey(root):
         config = repo_config(git, root)
-        return config, clone_worktrees(git, root, None, config)
+        return root, config, clone_worktrees(git, root, None, config)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     try:
-        clones, checkouts = [], {}
-        for config, result in pool.map(survey, found):
+        clones, checkouts, bare = [], {}, []
+        for root, config, result in pool.map(survey, found):
             if not result:
+                if bare_checkout(git, root):
+                    bare.append(str(root))
                 continue
             main, items = result
             clones.append({"main": main, "items": items, "config": config})
@@ -435,6 +464,7 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
         "states": states,
         "updates": updates,
         "paths": paths,
+        "bare": bare,
     }
 
 
@@ -3103,8 +3133,9 @@ def _constant(name):
 def validate_inventory(value):
     """Check a worker's inventory answer field by field before the controller reads it."""
     _expect(isinstance(value, dict), "not an object")
-    _expect(set(value) == {"roots", "clones", "states", "updates", "paths"}, "fields")
+    _expect(set(value) == {"roots", "clones", "states", "updates", "paths", "bare"}, "fields")
     _expect(isinstance(value["roots"], list) and all(map(_absolute, value["roots"])), "roots")
+    _expect(isinstance(value["bare"], list) and all(map(_absolute, value["bare"])), "bare")
     _expect(isinstance(value["clones"], list), "clones")
     for clone in value["clones"]:
         _expect(isinstance(clone, dict) and set(clone) == {"main", "items", "config"}, "clone")
@@ -3470,7 +3501,7 @@ def validate_resolve(value):
     _expect(value["root"] is None or _absolute(value["root"]), "root")
     rest = {k: v for k, v in value.items() if k != "root"}
     _expect(isinstance(rest.get("clones"), list) and len(rest["clones"]) <= 1, "clones")
-    validate_inventory({**rest, "updates": {}})
+    validate_inventory({**rest, "updates": {}, "bare": []})
     return {k: v for k, v in value.items() if k != "updates"}
 
 
