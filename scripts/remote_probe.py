@@ -1072,12 +1072,12 @@ def host_environment():
     return env
 
 
-def _host_run(argv, timeout):
+def _host_run(argv, timeout, env=None):
     with _spawning:
         timeout = _within_deadline(timeout)
         proc = subprocess.Popen(
             argv,
-            env=host_environment(),
+            env={**host_environment(), **(env or {})},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1148,9 +1148,9 @@ def host_argv(path, args, options=(), cache=_guards):
     return [*HOST_GIT, *options, *host_guard(path, cache=cache), "-C", str(path), *args]
 
 
-def host_git(path, *args, timeout=60, strip=True):
+def host_git(path, *args, timeout=60, strip=True, env=None):
     """Git in one checkout on the machine this probe runs on, hardened and non-interactive."""
-    result = _host_run(host_argv(path, args), timeout)
+    result = _host_run(host_argv(path, args), timeout, env)
     if result.returncode:
         raise ValueError((result.stderr or result.stdout or "Git failed")[-4000:].strip())
     return result.stdout.strip() if strip else result.stdout
@@ -2339,6 +2339,331 @@ def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
     }
 
 
+# A workspace moved here from another machine (workspace_move) ------------------------
+
+# Where the controller stages a move's bundle and transcripts here; each op takes its
+# file and removes it, and older ones go with the next file staged.
+MOVE_STATE = "~/.local/state/babysit-pr/moves"
+MAX_MOVE_BUNDLE = 512 * 1024 * 1024
+MAX_MOVE_SESSION = 256 * 1024 * 1024
+MOVE_ID = re.compile(r"[0-9a-f]{32}")
+OBJECT = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+# A file of a moved conversation: a name in the store, as Claude and Codex name theirs.
+MOVE_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
+MOVE_DEPTH = 6
+CODEX_DAY = re.compile(r"[0-9]{4}/[0-9]{2}/[0-9]{2}")
+# What Claude's project folder adds for a session started below the checkout: "-sub".
+MOVE_SUFFIX = re.compile(r"(-[A-Za-z0-9-]{1,200})?")
+MOVE_MARKER = "babysit-move"
+
+
+def _object(value, what):
+    if not isinstance(value, str) or not OBJECT.fullmatch(value):
+        raise ValueError(f"Expected the {what} object name")
+    return value
+
+
+def _staged_move(path):
+    """A file the controller staged for a move here: in MOVE_STATE, regular, this user's."""
+    _arg_paths([path])
+    folder = os.path.realpath(os.path.expanduser(MOVE_STATE))
+    if os.path.dirname(path) != folder:
+        raise ValueError(f"Moves are taken only from {folder}")
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError(f"{path} is not a file this user staged")
+    return path
+
+
+def _discard(path):
+    if os.path.dirname(path) == os.path.realpath(os.path.expanduser(MOVE_STATE)):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def _host_tree(path):
+    """The tree ``git add -A`` would stage in ``path``: its index with every untracked
+    file Git does not ignore. Read through a copy of its index, which stays as it is."""
+    index = host_git(path, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    descriptor, temporary = tempfile.mkstemp(prefix=".babysit-move-", dir=os.path.dirname(index))
+    os.close(descriptor)
+    try:
+        if os.path.isfile(index):
+            shutil.copyfile(index, temporary)
+        else:
+            os.unlink(temporary)
+        env = {"GIT_INDEX_FILE": temporary}
+        host_git(path, "add", "-A", timeout=300, env=env)
+        return host_git(path, "write-tree", env=env)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+
+
+def _move_state(path):
+    """What a move compares on both machines: the checkout, its branch and head, its
+    index's tree and the tree of all it holds (``_host_tree``)."""
+    return {
+        "path": os.path.realpath(path),
+        "branch": host_git(path, "symbolic-ref", "--quiet", "--short", "HEAD"),
+        "head": host_git(path, "rev-parse", "--verify", "HEAD"),
+        "index_tree": host_git(path, "write-tree"),
+        "work_tree": _host_tree(path),
+    }
+
+
+def _move_marker(path):
+    """The move that made the checkout ``path``, as recorded in its admin dir; None if
+    it was not a move's."""
+    admin = host_git(path, "rev-parse", "--absolute-git-dir")
+    try:
+        with open(os.path.join(admin, MOVE_MARKER)) as handle:
+            return handle.read(64).strip()
+    except OSError:
+        return None
+
+
+def _move_place(clone, repo, root, name, branch, agent, account, sandbox, move=None):
+    """Where a moved checkout goes here, checked: ``clone`` a clone of ``repo``, the
+    account known, and ``root/name`` and ``branch`` free, unless the checkout is the
+    move ``move``'s own. (clone, common, path, Claude's config, whether it is ours)."""
+    _arg_paths([clone, root], home=True)
+    _repo(repo)
+    _branch(branch, "moved")
+    if not isinstance(name, str) or not MOVE_PART.fullmatch(name):
+        raise ValueError("Expected a checkout name")
+    _, _, config = _host_claude(agent, account, sandbox)
+    clone, _, common = _host_clone(clone, repo)
+    root = os.path.realpath(os.path.expanduser(root))
+    if root == common or root.startswith(common + os.sep):
+        raise ValueError(f"{root} lies inside {clone}'s .git")
+    path = os.path.join(root, name)
+    ours = move is not None and os.path.lexists(path) and _move_marker(path) == move
+    if os.path.lexists(path) and not ours:
+        raise ValueError(f"{path} already exists here")
+    if not ours and _host_branch_exists(clone, branch):
+        raise ValueError(f"Branch {branch} already exists in {clone} here")
+    return clone, common, path, config, ours
+
+
+def _host_move_check(clone, repo, root, name, branch, agent, account, sandbox):
+    """Whether a move could make its checkout here (``_move_place``), changing nothing."""
+    clone, _, path, _, _ = _move_place(clone, repo, root, name, branch, agent, account, sandbox)
+    return {"clone": clone, "path": path}
+
+
+def _host_move_receive(
+    clone,
+    repo,
+    root,
+    name,
+    branch,
+    bundle,
+    move,
+    head,
+    index_tree,
+    work_tree,
+    upstream,
+    fetch,
+    agent,
+    account,
+    sandbox,
+):
+    """Make the checkout of a workspace moved here from the staged ``bundle``.
+
+    The bundle holds one ref, ``refs/babysit-move/<move>``: a commit of the source's
+    whole working tree (``work_tree``) whose parent commits its index (``index_tree``),
+    whose parent is the branch's ``head``. Its prerequisites are commits on the source's
+    remote branches; ``fetch`` (``[repo, branch]`` pairs) names those to fetch from
+    GitHub when this clone lacks them. ``branch`` is checked out at ``head`` in a new
+    worktree ``root/name`` of ``clone`` (which must be a clone of ``repo``), whose files
+    are then the working tree's and whose index the index's: staged, unstaged and
+    untracked changes as they were. ``upstream`` (``[remote, branch, repo]`` or None) is
+    the branch's upstream there, set when a remote here names the same repository.
+
+    A branch or directory already there is refused, unless it is this move's own
+    (its admin dir records ``move``), which is then brought to the new state. Claude is
+    trusted for the checkout. Answers as ``_move_state``, with the clone's real path; a
+    checkout this op made and could not finish is taken back, and the bundle removed.
+    """
+    try:
+        _staged_move(bundle)
+        if not isinstance(move, str) or not MOVE_ID.fullmatch(move):
+            raise ValueError("Expected a move ID")
+        for value, what in ((head, "head"), (index_tree, "index"), (work_tree, "working tree")):
+            _object(value, what)
+        if upstream is not None:
+            if not (isinstance(upstream, list) and len(upstream) == 3):
+                raise ValueError("Expected the upstream as [remote, branch, repo]")
+            _branch(upstream[1], "upstream")
+            _repo(upstream[2])
+            if not isinstance(upstream[0], str) or not MOVE_PART.fullmatch(upstream[0]):
+                raise ValueError("Expected the upstream's remote name")
+        if not isinstance(fetch, list) or len(fetch) > MAX_ALSO:
+            raise ValueError(f"Expected at most {MAX_ALSO} branches to fetch")
+        for pair in fetch:
+            if not (isinstance(pair, list) and len(pair) == 2):
+                raise ValueError("Expected [repo, branch] pairs to fetch")
+            _repo(pair[0])
+            _branch(pair[1], "fetched")
+        clone, _, path, config, ours = _move_place(
+            clone, repo, root, name, branch, agent, account, sandbox, move
+        )
+        root = os.path.dirname(path)
+        remotes = remote_slugs(repo_config(host_git, clone))
+
+        def verified():
+            done = _host_run(host_argv(clone, ["bundle", "verify", "-q", bundle]), 300)
+            return done.returncode == 0, (done.stderr or done.stdout).strip()[-2000:]
+
+        ok, said = verified()
+        if not ok and fetch:
+            for slug, base in fetch:
+                remote = next(
+                    (
+                        r
+                        for r in ("upstream", "origin", *sorted(remotes))
+                        if remotes.get(r) == slug.lower()
+                    ),
+                    None,
+                )
+                if remote is not None:
+                    _host_fetch(clone, slug, base, remote)
+            ok, said = verified()
+        if not ok:
+            raise ValueError(f"{clone} lacks commits the moved branch needs: {said}")
+        listed = host_git(clone, "bundle", "unbundle", bundle, timeout=600).splitlines()
+        ref = f"refs/babysit-move/{move}"
+        tips = [line.split(" ", 1)[0] for line in listed if line.endswith(f" {ref}")]
+        if len(tips) != 1:
+            raise ValueError("The bundle does not hold this move's snapshot")
+        tip = _object(tips[0], "snapshot")
+        if (
+            host_git(clone, "rev-parse", "--verify", f"{tip}^{{tree}}") != work_tree
+            or host_git(clone, "rev-parse", "--verify", f"{tip}~1^{{tree}}") != index_tree
+            or host_git(clone, "rev-parse", "--verify", f"{tip}~2") != head
+        ):
+            raise ValueError("The bundle's snapshot does not match the moved checkout")
+        if ours:
+            # A move tried again after the source changed: this checkout is its own.
+            host_git(path, "reset", "-q", "--hard", head, timeout=600)
+            host_git(path, "clean", "-fdq", timeout=600)
+        else:
+            os.makedirs(root, mode=0o700, exist_ok=True)
+            host_git(clone, "worktree", "add", "-q", "--no-checkout", "-b", branch, path, head)
+        try:
+            if not ours:
+                admin = host_git(path, "rev-parse", "--absolute-git-dir")
+                with open(os.path.join(admin, MOVE_MARKER), "w") as handle:
+                    handle.write(move + "\n")
+            host_git(path, "read-tree", "-u", "--reset", work_tree, timeout=600)
+            host_git(path, "read-tree", index_tree)
+            if upstream is not None:
+                remote, merge, slug = upstream
+                if remotes.get(remote) != slug.lower():
+                    remote = next((r for r in sorted(remotes) if remotes[r] == slug.lower()), None)
+                if remote is not None:
+                    host_git(clone, "config", f"branch.{branch}.remote", remote)
+                    host_git(clone, "config", f"branch.{branch}.merge", f"refs/heads/{merge}")
+            if config is not None:
+                _host_trust(config, path)
+            return {**_move_state(path), "clone": clone}
+        except BaseException:
+            if not ours:
+                # Half made by this move: nothing of it stays to refuse the next one.
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(path)
+                with contextlib.suppress(ValueError):
+                    host_git(clone, "worktree", "prune")
+                with contextlib.suppress(ValueError):
+                    host_git(clone, "branch", "-D", "--", branch)
+            raise
+    finally:
+        if isinstance(bundle, str):
+            _discard(bundle)
+
+
+def _host_move_session(archive, agent, account, sandbox, path, day, suffix=""):
+    """Place the staged transcripts of a conversation moved to the checkout ``path`` here.
+
+    ``archive`` is a tar of one session's files, as its agent stores them: Claude's
+    ``<id>.jsonl`` and ``<id>/`` (subagents, tool results), which go in the project
+    folder Claude names after ``path`` (and ``suffix``, for a session started in a
+    folder below it) in the account's home; Codex's one rollout, which
+    goes in ``sessions/<day>`` of its home. A file already there is left only when it
+    holds the same bytes, or the start of them (an earlier copy of the conversation).
+    Answers the transcript's path; the archive is always removed.
+    """
+    try:
+        _arg_paths([path])
+        _staged_move(archive)
+        if not isinstance(suffix, str) or not MOVE_SUFFIX.fullmatch(suffix):
+            raise ValueError("Expected a project folder suffix")
+        claude_home, _, _ = _host_claude(agent, account, sandbox)
+        if agent == "claude":
+            store = Path(claude_home) / "projects"
+            folder = store / (re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(path)) + suffix)
+        else:
+            if not isinstance(day, str) or not CODEX_DAY.fullmatch(day):
+                raise ValueError("Expected the rollout's day as YYYY/MM/DD")
+            store = host_codex_sessions()
+            folder = store / day
+        store.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if host_session_root(store) is None:
+            raise ValueError(f"{store} is not a session store in this home")
+        with tarfile.open(archive, "r:*") as bundle:
+            members = bundle.getmembers()
+            if not members or sum(m.size for m in members) > MAX_MOVE_SESSION:
+                raise ValueError("Expected a session's transcripts")
+            main = None
+            for member in members:
+                parts = member.name.split("/")
+                if (
+                    not member.isfile()
+                    or len(parts) > MOVE_DEPTH
+                    or not all(MOVE_PART.fullmatch(part) for part in parts)
+                    or (agent == "codex" and len(parts) != 1)
+                ):
+                    raise ValueError(f"Not a transcript file: {member.name!r}")
+                if len(parts) == 1 and parts[0].endswith(".jsonl"):
+                    if main is not None:
+                        raise ValueError("Expected one session's transcript")
+                    main = parts[0]
+            if main is None:
+                raise ValueError("The archive holds no transcript")
+            for member in members:
+                target = folder.joinpath(*member.name.split("/"))
+                # Each folder on the way is made here, never reached through a link.
+                place = Path(os.path.realpath(store))
+                for part in target.parent.relative_to(store).parts:
+                    place = place / part
+                    if os.path.islink(place):
+                        raise ValueError(f"{place} is a symbolic link")
+                    if not place.is_dir():
+                        place.mkdir(mode=0o700)
+                stream = bundle.extractfile(member)
+                assert stream is not None
+                data = stream.read()
+                if os.path.lexists(target):
+                    if os.path.islink(target) or not os.path.isfile(target):
+                        raise ValueError(f"{target} already exists here")
+                    with open(target, "rb") as existing:
+                        held = existing.read()
+                    if held == data:
+                        continue
+                    if not data.startswith(held):
+                        raise ValueError(f"{target} already exists here")
+                    # An earlier copy of this conversation, which it has gone on from.
+                descriptor, temporary = tempfile.mkstemp(prefix=".babysit-", dir=place)
+                with os.fdopen(descriptor, "wb") as out:
+                    out.write(data)
+                os.replace(temporary, place / target.name)
+        return {"transcript": str(folder / main)}
+    finally:
+        if isinstance(archive, str):
+            _discard(archive)
+
+
 # Personal skills kept in sync with the controller's (skill_sync) ---------------------
 
 # A skill's folder name, as machines.SKILL, and the two folders never synced (in any
@@ -3005,6 +3330,9 @@ OPS: dict[str, Callable[..., Any]] = {
     "session_info": _host_session_info,
     "skills_status": _host_skills_status,
     "skills_install": _host_skills_install,
+    "move_check": _host_move_check,
+    "move_receive": _host_move_receive,
+    "move_session": _host_move_session,
 }
 
 
@@ -3612,6 +3940,35 @@ def validate_session_info(value):
     return value
 
 
+def validate_move_receive(value):
+    """A moved checkout's state there, which the controller compares with its own."""
+    _expect(
+        isinstance(value, dict)
+        and set(value) == {"path", "branch", "head", "index_tree", "work_tree", "clone"},
+        "fields",
+    )
+    _expect(_shown_path(value["path"]), "path")
+    _expect(_shown_path(value["clone"]), "clone")
+    _expect(_text(value["branch"]) and bool(value["branch"]), "branch")
+    for key in ("head", "index_tree", "work_tree"):
+        _expect(isinstance(value[key], str) and OBJECT.fullmatch(value[key]), key)
+    return value
+
+
+def validate_move_check(value):
+    _expect(isinstance(value, dict) and set(value) == {"clone", "path"}, "fields")
+    _expect(_shown_path(value["clone"]) and _shown_path(value["path"]), "paths")
+    return value
+
+
+def validate_move_session(value):
+    _expect(isinstance(value, dict) and set(value) == {"transcript"}, "fields")
+    _expect(
+        _shown_path(value["transcript"]) and value["transcript"].endswith(".jsonl"), "transcript"
+    )
+    return value
+
+
 VALIDATORS = {
     "inventory": validate_inventory,
     "resolve": validate_resolve,
@@ -3635,6 +3992,9 @@ VALIDATORS = {
     "session_info": validate_session_info,
     "skills_status": validate_skills,
     "skills_install": validate_skills,
+    "move_check": validate_move_check,
+    "move_receive": validate_move_receive,
+    "move_session": validate_move_session,
 }
 
 

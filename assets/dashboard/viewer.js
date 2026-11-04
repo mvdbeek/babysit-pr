@@ -1054,6 +1054,8 @@
   let hostLabel = null;
   // The quit asked about ({id, pane, session}), until it is answered or the agent goes.
   let quitQuestion = null;
+  // The move asked about ({id, pane, session, machine, plan, error, loading}), likewise.
+  let moveQuestion = null;
   let changingDocker = false;
   let sending = false; // A send in flight keeps the button disabled through refreshes.
   // Cancelling the babysit watch that owns the picked session: the question asked
@@ -1118,6 +1120,7 @@
     agentsRead = messageable(entry) ? "loading" : "unavailable";
     hostLabel = null;
     quitQuestion = null;
+    moveQuestion = null;
     if (!messageable(entry)) {
       // A checkout without a herdr workspace or a row has no agent to talk to.
       draft = null;
@@ -1579,6 +1582,8 @@
       done: (name, pane) => `Quit ${name} in ${pane}; its session can be resumed.`,
       unknown: "The quit could not be confirmed; refresh or check Collie.",
     },
+    // Followed by its own polls (startMove), not liveAction.
+    move: { busy: "Moving…" },
   };
   // The action ({pane, action}) on its way, per viewed entry: stepping to another one
   // leaves its buttons and polls alone.
@@ -1639,9 +1644,39 @@
         session: agent.session ?? null,
         focus: true,
       };
+      moveQuestion = null;
       byId("ws-live-status").textContent = "";
       renderLive();
     };
+    // Only where workers are registered, and for an agent whose session can resume there.
+    if (hostLabel && agent.session && ["claude", "codex"].includes(agent.agent)) {
+      const move = button(
+        "move",
+        "Move…",
+        "ws-move",
+        `Move ${name} to another machine`,
+        "Continue this session on a worker machine, with its branch and uncommitted changes; this workspace is then removed here",
+      );
+      if (worker) {
+        move.disabled = true;
+        move.title = `Agents on ${worker} cannot be moved from this dashboard yet`;
+      }
+      move.onclick = () => {
+        quitQuestion = null;
+        moveQuestion = {
+          id: viewer.id,
+          pane: agent.pane,
+          session: agent.session,
+          machine: "auto",
+          plan: null,
+          error: null,
+          loading: false,
+          focus: true,
+        };
+        byId("ws-live-status").textContent = "";
+        void loadMovePlan();
+      };
+    }
     const holder = node("span", undefined, "ws-live-actions");
     holder.append(...buttons);
     return holder;
@@ -1741,6 +1776,217 @@
     }
     return card;
   }
+  // Moving an agent to a worker ------------------------------------------------------
+  // Asked inline like a quit: the server's plan says what goes where and what stops, and
+  // a working agent's move says it stops its turn first. The move runs on the server;
+  // this page follows it by ID and says how it ended.
+  async function movePost(body) {
+    try {
+      const response = await fetch("/api/workspace-move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-move" },
+        body: JSON.stringify(body),
+      });
+      const value = await response.json();
+      return response.ok ? value : { error: value.error || `HTTP ${response.status}` };
+    } catch {
+      return { error: "The connection dropped.", dropped: true };
+    }
+  }
+  async function loadMovePlan() {
+    const question = moveQuestion;
+    if (!question || !viewer) return;
+    question.loading = true;
+    question.error = null;
+    renderLive();
+    const value = await movePost({
+      workspace: viewer.entry.workspace,
+      pane: question.pane,
+      session: question.session,
+      machine: question.machine,
+      plan: true,
+    });
+    if (moveQuestion !== question) return;
+    question.loading = false;
+    question.plan = value.plan || null;
+    question.error = value.error || null;
+    renderLive();
+  }
+  function plural(count, one, many) {
+    return `${count} ${count === 1 ? one : many}`;
+  }
+  function moveCard(agent) {
+    const question = moveQuestion;
+    const plan = question.plan;
+    const card = node("div", undefined, "ws-question ws-move-confirm");
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label", "Confirm moving the agent");
+    card.append(node("strong", `Move ${agentTitle(agent)} in ${agent.pane} to another machine?`));
+    if (question.loading) card.append(node("p", "Checking the agent and where it can go…"));
+    if (question.error) card.append(node("p", question.error, "ws-move-error"));
+    if (plan) {
+      card.append(
+        node(
+          "p",
+          `Branch ${plan.branch} goes there with ${plural(plan.unpushed, "commit", "commits")} ` +
+            `no remote has, ${plural(plan.changed, "changed file", "changed files")} and ` +
+            `${plural(plan.untracked, "untracked file", "untracked files")}, and its ` +
+            "conversation resumes in a new workspace there. Files Git ignores are not copied. " +
+            "Once it runs there, this workspace closes here, and its worktree and branch are " +
+            "removed with rebuildable ignored files (virtualenvs, node_modules, caches).",
+          "pr-meta",
+        ),
+      );
+      if (plan.ignored_kept_count) {
+        card.append(
+          node(
+            "p",
+            `${plural(plan.ignored_kept_count, "ignored path", "ignored paths")} would not be ` +
+              "copied, so the worktree stays here for them:",
+            "ws-move-warning",
+          ),
+        );
+        const kept = node("ul", undefined, "ws-move-children");
+        kept.append(...plan.ignored_kept.map((name) => node("li", name)));
+        if (plan.ignored_kept_count > plan.ignored_kept.length)
+          kept.append(node("li", `and ${plan.ignored_kept_count - plan.ignored_kept.length} more`));
+        card.append(kept);
+      }
+      const select = node("select");
+      select.setAttribute("aria-label", "Machine to move to");
+      const auto = node(
+        "option",
+        question.machine === "auto" && plan.label ? `Auto (→ ${plan.label})` : "Auto",
+      );
+      auto.value = "auto";
+      select.append(auto);
+      for (const option of plan.options) {
+        const choice = node("option", `${option.label} · ${option.note}`);
+        choice.value = option.id;
+        choice.disabled = option.disabled;
+        select.append(choice);
+      }
+      select.value = question.machine;
+      select.onchange = () => {
+        question.machine = select.value;
+        question.plan = null;
+        void loadMovePlan();
+      };
+      const field = node("label", "To ", "ws-move-target");
+      field.append(select);
+      card.append(field);
+      if (plan.reason && !plan.error) card.append(node("p", plan.reason, "pr-meta"));
+      if (plan.status === "working")
+        card.append(
+          node(
+            "p",
+            "It is working now: its turn is stopped first, as Esc does.",
+            "ws-move-warning",
+          ),
+        );
+      if (plan.children_count) {
+        card.append(
+          node(
+            "p",
+            `Exiting it here stops ${plural(plan.children_count, "process", "processes")} it started:`,
+            plan.status === "working" ? "ws-move-warning" : "pr-meta",
+          ),
+        );
+        const list = node("ul", undefined, "ws-move-children");
+        list.append(...plan.children.map((child) => node("li", child.command)));
+        if (plan.children_count > plan.children.length)
+          list.append(node("li", `and ${plan.children_count - plan.children.length} more`));
+        card.append(list);
+      } else if (plan.children_count === null)
+        card.append(
+          node("p", "Its processes could not be listed; any it started stop with it.", "pr-meta"),
+        );
+      if (plan.watch && !plan.error)
+        card.append(node("p", `babysit watch ${plan.watch.id} follows it there.`, "pr-meta"));
+      if (plan.error) card.append(node("p", plan.error, "ws-move-error"));
+    }
+    const actions = node("div", undefined, "ws-choices");
+    const working = plan?.status === "working";
+    const yes = node(
+      "button",
+      plan?.label ? `${working ? "Stop its turn and move" : "Move"} to ${plan.label}` : "Move",
+      "ws-move",
+    );
+    yes.type = "button";
+    yes.disabled = !plan?.machine || Boolean(plan.error) || question.loading;
+    yes.onclick = () => void startMove(agent);
+    const no = node("button", "Keep it here");
+    no.type = "button";
+    no.onclick = () => {
+      moveQuestion = null;
+      renderLive();
+    };
+    actions.append(yes, no);
+    card.append(actions);
+    // Focused once the plan is shown, on the reader's click; Enter keeps the agent here.
+    if (question.focus && !question.loading) {
+      question.focus = false;
+      queueMicrotask(() => no.isConnected && no.focus());
+    }
+    return card;
+  }
+  // How a move ended, in words; a moved agent's Collie there is linked.
+  function moveOutcome(op) {
+    const result = op.result || {};
+    if (op.status === "moved")
+      return (
+        `Moved to ${result.machine_label}: ${result.path}` +
+        (result.warnings?.length ? `. ${result.warnings.join(" ")}` : "")
+      );
+    let text = op.error || "The move failed";
+    if (!/[.!?]$/.test(text)) text += ".";
+    if (result.stage === "before_exit" && !result.interrupted)
+      text += " The agent is still running here.";
+    if (result.stage === "exit")
+      text += " Check its pane first: the agent may still be running here.";
+    if (result.resume_command)
+      text += ` The checkout here was kept; resume it here with: ${result.resume_command}`;
+    return text;
+  }
+  async function startMove(agent) {
+    const question = moveQuestion;
+    if (!viewer || !question?.plan || stopping()) return;
+    const { entry, id } = viewer;
+    const status = byId("ws-live-status");
+    const say = (text, link) => {
+      if (viewer?.id !== id) return;
+      tell(status, text);
+      if (link) status.append(" ", external("Open it in Collie", link));
+    };
+    moveQuestion = null;
+    stops.set(id, { pane: agent.pane, action: "move" });
+    renderLive();
+    let value = await movePost({
+      workspace: entry.workspace,
+      pane: question.pane,
+      session: question.session,
+      machine: question.plan.machine,
+      confirm_working: question.plan.status === "working",
+    });
+    let op = value.move;
+    let dropped = 0;
+    while (op && op.status === "running") {
+      say(op.message);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      value = await movePost({ id: op.id });
+      if (value.dropped && dropped++ < 30) continue;
+      if (value.error) break;
+      op = value.move;
+    }
+    stops.delete(id);
+    if (!op || value.error)
+      say(value.error || "The move's progress was lost; refresh to see where the agent is.");
+    else if (op.status === "running")
+      say("The move is still running; refresh to see where the agent is.");
+    else say(moveOutcome(op), op.status === "moved" ? op.result?.url : null);
+    renderLive();
+    if (viewer?.id === id) await fetchAgents(entry);
+  }
   function renderLive() {
     const holder = byId("ws-live");
     const data = viewer?.mode === "transcript" ? viewer.data : null;
@@ -1767,11 +2013,25 @@
         : undefined;
     // The agent left or changed sessions: there is nothing to confirm any more.
     if (quitQuestion && !asked) quitQuestion = null;
+    const moving =
+      moveQuestion?.id === viewer.id
+        ? agents.find(
+            (agent) => agent.pane === moveQuestion.pane && agent.session === moveQuestion.session,
+          )
+        : undefined;
+    if (moveQuestion && !moving) moveQuestion = null;
     // Polls redraw only on a change, so a focused button stays focused.
     const key = JSON.stringify([
       shown,
       stopping(),
       quitQuestion && [quitQuestion.id, quitQuestion.pane, quitQuestion.session],
+      moveQuestion && [
+        moveQuestion.pane,
+        moveQuestion.machine,
+        moveQuestion.loading,
+        moveQuestion.error,
+        moveQuestion.plan,
+      ],
       agentsRead,
       hostLabel,
       workerLabel(viewer.entry),
@@ -1790,7 +2050,9 @@
     byId("ws-live-agents").replaceChildren(
       ...agents.filter((agent) => agent !== mine).map((agent) => agentRow(agent, data)),
     );
-    byId("ws-live-confirm").replaceChildren(...(asked && !stopping() ? [quitCard(asked)] : []));
+    byId("ws-live-confirm").replaceChildren(
+      ...(stopping() ? [] : asked ? [quitCard(asked)] : moving ? [moveCard(moving)] : []),
+    );
   }
   async function liveAction(agent, action) {
     if (!viewer || stopping()) return;

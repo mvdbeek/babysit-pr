@@ -93,7 +93,7 @@ ENVIRONMENT = {"GIT_PROXY_COMMAND": ""}
 LAZY_FETCH_SWITCH = (2, 44)
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 # Subcommands that read working tree files through filters, or run a transport.
-CONTENT = {"diff", "fetch", "ls-remote", "reset", "status", "switch"}
+CONTENT = {"add", "diff", "fetch", "ls-remote", "reset", "status", "switch"}
 # Their checkout or clean check would run in a worktree whose config was not listed.
 WORKTREE = {"worktree add": "--no-checkout", "worktree remove": "--force"}
 # A fetch names https://github.com, so these are reached only through URL rewrites in the

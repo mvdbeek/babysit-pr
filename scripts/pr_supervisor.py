@@ -1400,6 +1400,16 @@ def main():
     )
     token.add_argument("machine", help="Registered machine id")
     token.add_argument("--revoke", action="store_true", help="Stop the machine's token working")
+    move = sub.add_parser(
+        "workspace-move",
+        help="Move a workspace's agent to a worker, with its branch, changes and session",
+    )
+    move.add_argument("workspace", help="herdr workspace ID on this machine (w1)")
+    move.add_argument("--pane", help="The agent's pane, when the workspace has several")
+    move.add_argument("--machine", default="auto", help="Registered worker id, or auto")
+    move.add_argument("--yes", action="store_true", help="Stop a working agent's turn to move it")
+    move.add_argument("--plan", action="store_true", help="Only show what a move would do")
+    move.add_argument("--dashboard", help="Dashboard URL (default $BABYSIT_DASHBOARD_URL)")
     start = sub.add_parser("start", help="Restart the shared watcher after logout/reboot")
     start.add_argument("--max-workers", type=int, default=2)
     server = sub.add_parser("serve", help="Run shared watcher in foreground")
@@ -1449,6 +1459,16 @@ def main():
                 emit({"error": str(exc)})
                 return 1
             return 0
+    if args.command == "workspace-move":
+        import workspace_move
+
+        # Through the dashboard, whose locks and cleanup its own actions share.
+        try:
+            emit(workspace_move.cli(args))
+        except (OSError, ValueError) as exc:
+            emit({"error": str(exc)})
+            return 1
+        return 0
     if args.command == "worker-token":
         import worker_api
 

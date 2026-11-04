@@ -33,6 +33,7 @@ import service_control
 import voice_assistant
 import worker_api
 import workspace_agents
+import workspace_move
 import workspace_viewer
 from dashboard_push import check_result
 from issue_overview import Overview as IssueOverview
@@ -131,6 +132,7 @@ ACTIONS = frozenset(
         "workspace-docker",
         "workspace-interrupt",
         "workspace-quit",
+        "workspace-move",
         "workspace-prompt-forget",
         "attachment-upload",
         "sentry-action",
@@ -546,6 +548,9 @@ class DashboardServer(ThreadingHTTPServer):
         self.push = push
         self.allowed_hosts = set(allowed_hosts)
         self.extension = browser_extension.Extension(home)
+        self.moves = workspace_move.Moves(
+            home, lambda: self.workspaces, lambda: self.workspace_overview
+        )
         super().__init__(("127.0.0.1", port), Handler)
 
     def attention_feed(self):
@@ -1128,6 +1133,15 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.exit_agent(request, self.server.home))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
+                return
+            if action == "workspace-move":
+                # Started here and followed by its ID; the move itself runs on.
+                try:
+                    self.send_json(200, self.server.moves.action(request))
+                except workspace_move.Refused as exc:
+                    self.send_json(400, {"error": str(exc), **exc.details})
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Nothing was moved: {exc}"})
                 return
             if action == "workspace-answer":
                 try:

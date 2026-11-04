@@ -93,6 +93,9 @@ PS = "/bin/ps"
 LOCK_ORDER = ("checkout", "session", "pane")
 _locks_guard = threading.Lock()
 _locks: dict[tuple[str, str], list] = {}
+# Keys a running workspace move reserved, by the thread running it (``reserved``).
+_reserved: dict[tuple[str, str], int] = {}
+MOVING = "A move of this agent to another machine is in progress; try again once it finishes"
 _recent: dict[str, tuple[str, float]] = {}
 # Once any Codex answer keystroke was attempted, retries must finish in the terminal.
 # Async questions can retain only an acknowledgment in the transcript after answering.
@@ -111,6 +114,11 @@ def locked(*keys):
     """
     ordered = sorted(set(keys), key=lambda key: (LOCK_ORDER.index(key[0]), key[1]))
     with _locks_guard:
+        # A move holds its keys for minutes: any other action on them is refused at once
+        # rather than left waiting.
+        me = threading.get_ident()
+        if any(_reserved.get(key, me) != me for key in ordered):
+            raise ValueError(MOVING)
         entries = [_locks.setdefault(key, [threading.RLock(), 0]) for key in ordered]
         for entry in entries:
             entry[1] += 1
@@ -125,6 +133,26 @@ def locked(*keys):
                 entry[1] -= 1
                 if not entry[1]:
                     del _locks[key]
+
+
+@contextlib.contextmanager
+def reserved(*keys):
+    """Hold ``locked(*keys)`` for a workspace move, refusing every other thread's action
+    on them meanwhile instead of making it wait (``locked``)."""
+    me = threading.get_ident()
+    with _locks_guard:
+        if any(_reserved.get(key, me) != me for key in keys):
+            raise ValueError(MOVING)
+        taken = [key for key in keys if key not in _reserved]
+        for key in taken:
+            _reserved[key] = me
+    try:
+        with locked(*keys):
+            yield
+    finally:
+        with _locks_guard:
+            for key in taken:
+                _reserved.pop(key, None)
 
 
 def clean(text):
@@ -627,7 +655,7 @@ def interrupt(request, machine=None):
     return {"stopped": True, "pane": pane, "warning": None}
 
 
-def exit_agent(request, home=None):
+def exit_agent(request, home=None, *, stop=True):
     """Quit the agent of a pane as its own exit does, keeping its session.
 
     The pane's shell stays, unless babysit split the pane off for the agent
@@ -642,7 +670,8 @@ def exit_agent(request, home=None):
     and Codex Ctrl-D (``send_exit``), and the process must leave. An exit is attempted
     once per process, and never while another process exits the same pane
     (``herdr_handoff.pane_lock`` under ``home``): a second could reach the shell once
-    the first took. Agents on workers are not quit from here.
+    the first took. Agents on workers are not quit from here. With ``stop`` False a busy
+    agent is refused instead of stopped, before any key.
     """
     if set(request) != {"workspace", "pane", "session"} or not (
         all(isinstance(request[k], str) and request[k] for k in ("workspace", "pane"))
@@ -722,17 +751,7 @@ def exit_agent(request, home=None):
             if info.get("scroll", {}).get("offset_from_bottom", 0) != 0:
                 raise ValueError("Not quit: the terminal is scrolled; nothing was sent")
             screen = herdr_handoff.read_screen(pane)
-            if target["agent"] == "claude":
-                draft = bool(herdr_handoff.claude_composer(screen))
-            else:
-                # Codex's composer is its last "›" line, unless it shows the faint placeholder.
-                typed = [
-                    line.lstrip()[1:].strip()
-                    for line in herdr_handoff.SGR.sub("", screen).splitlines()
-                    if line.lstrip().startswith("›")
-                ]
-                draft = bool(typed and typed[-1]) and not herdr_handoff.empty_codex_composer(screen)
-            if draft:
+            if has_draft(screen, target["agent"]):
                 raise ValueError("Not quit: the composer holds a draft; clear it in Collie first")
         except RuntimeError as exc:
             # herdr_handoff reports a failed herdr call so; nothing was sent yet.
@@ -744,6 +763,11 @@ def exit_agent(request, home=None):
                 target["status"] == "blocked"
                 and not (target["agent"] == "claude" and idle_screen(pane, screen))
             ):
+                if not stop:
+                    # A caller that was not allowed to stop a turn: nothing was sent.
+                    raise ValueError(
+                        "Not quit: the agent is busy again and its turn may not be stopped"
+                    )
                 sent = True
                 try:
                     herdr_handoff.herdr("agent", "send-keys", pane, "esc")
@@ -820,6 +844,19 @@ def exit_agent(request, home=None):
                 "check the pane in Collie.",
             }
     return {"quit": True, "pane": pane, "warning": None}
+
+
+def has_draft(screen, agent):
+    """Whether the agent's composer on ``screen`` holds typed text, which an exit loses."""
+    if agent == "claude":
+        return bool(herdr_handoff.claude_composer(screen))
+    # Codex's composer is its last "›" line, unless it shows the faint placeholder.
+    typed = [
+        line.lstrip()[1:].strip()
+        for line in herdr_handoff.SGR.sub("", screen).splitlines()
+        if line.lstrip().startswith("›")
+    ]
+    return bool(typed and typed[-1]) and not herdr_handoff.empty_codex_composer(screen)
 
 
 def interactive_shell(pid):
@@ -1600,13 +1637,24 @@ def prune(prompts):
             _recent.pop(key, None)
 
 
-def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, machine=None):
+def resume(
+    workspace_id,
+    session_id,
+    text,
+    home,
+    root=None,
+    stop_watch=None,
+    machine=None,
+    agent_options=None,
+):
     """Resume a recorded session in the workspace with the message, if any, as its prompt.
 
     Given a checkout root instead, the session resumes in the workspace open there, or
     in one opened on it again. Given the ID of the babysit watch that owns the session,
     the reader confirmed cancelling it first. A ``machine`` names the worker it all is
     on: its herdr, its session listing and its own paths, which its probe reports.
+    ``agent_options`` (``model``, ``effort``, ``docker``) keep a worker's resume on the
+    settings the session ran with elsewhere (``workspace_move``).
     """
     if not isinstance(session_id, str) or not workspace_viewer.SESSION.match(session_id):
         raise ValueError("Choose a recorded session to resume")
@@ -1714,6 +1762,7 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
                     machine=machine,
                     found=found,
                     mark=True,
+                    agent_options=agent_options,
                 ),
                 skills_warning,
             )
@@ -1729,6 +1778,7 @@ def resume(workspace_id, session_id, text, home, root=None, stop_watch=None, mac
                 worktree=root,
                 machine=machine,
                 found=found,
+                agent_options=agent_options,
             ),
             skills_warning,
         )
@@ -1828,22 +1878,29 @@ def reopen(root, machine=None, found=None):
     return live, pane if pane is None else pane_id(pane, machine)
 
 
-def remote_command(machine, chosen, found, text, staged):
+def remote_command(machine, chosen, found, text, staged, agent_options=None):
     """The resume line typed on a worker: its own sandbox, with the paths its probe found.
 
     The Claude configuration is the worker's account home, typed as the worker spells
-    it; nothing about this machine's accounts applies there.
+    it; nothing about this machine's accounts applies there. ``agent_options`` may name
+    the ``model``, ``effort`` and ``docker`` access to resume with.
     """
     account = chosen.get("claude_account")
+    options = agent_options or {}
     job = {
         "agent": chosen["agent"],
         "prompt": text,
-        "model": "",
-        "docker": False,
+        "model": options.get("model") or "",
+        "docker": bool(options.get("docker")),
         "claude_account": "" if account in (None, "default") else account,
     }
     return cron_agents.remote_command(
-        job, machine, found, staged, "", extra=[*RESUME[chosen["agent"]], chosen["id"]]
+        job,
+        machine,
+        found,
+        staged,
+        options.get("effort") or "",
+        extra=[*RESUME[chosen["agent"]], chosen["id"]],
     )
 
 
@@ -1861,6 +1918,7 @@ def launch(
     machine=None,
     found=None,
     mark=False,
+    agent_options=None,
 ):
     """Resume once into a fresh or verified empty shell pane, optionally with a prompt.
 
@@ -1885,7 +1943,7 @@ def launch(
                 (text + "\n").encode(),
                 keep=PROMPT_KEEP,
             )
-        command = remote_command(machine, chosen, found, text, remote)
+        command = remote_command(machine, chosen, found, text, remote, agent_options)
     else:
         prompts = Path(home or os.environ.get("TMPDIR") or "/tmp") / "message-prompts"
         prompts.mkdir(mode=0o700, parents=True, exist_ok=True)

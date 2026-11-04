@@ -1415,8 +1415,14 @@ class WorkspaceOverview:
 
     # Cleanup -------------------------------------------------------------------
 
-    def cleanup(self, request):
-        """Validate and start one batch; a running batch is reported, never queued."""
+    def cleanup(self, request, guard=None):
+        """Validate and start one batch; a running batch is reported, never queued.
+
+        ``guard`` (in-process callers only, for this machine's rows) is asked about each
+        row under its clone's lock, before its workspaces close and again before its
+        worktree goes: None lets it go on; text keeps the worktree, saying why; a
+        ValueError skips the row, or after the close keeps the worktree.
+        """
         if set(request) - {"id", "action", "targets"}:
             raise ValueError("Invalid cleanup parameters")
         targets = request.get("targets")
@@ -1455,19 +1461,19 @@ class WorkspaceOverview:
                 ],
             }
             self.job = job
-            threading.Thread(target=self._cleanup, args=(job, wanted), daemon=True).start()
+            threading.Thread(target=self._cleanup, args=(job, wanted, guard), daemon=True).start()
             return {"cleanup": copy.deepcopy(job), "accepted": True}
 
     def record(self, job, index, **changes):
         with self.lock:
             job["results"][index].update(changes)
 
-    def _cleanup(self, job, targets):
+    def _cleanup(self, job, targets, guard=None):
         try:
             for index, target in enumerate(targets):
                 self.record(job, index, status="running", message="Revalidating resources")
                 try:
-                    self.remove(job, index, target)
+                    self.remove(job, index, target, guard)
                 except Exception as exc:
                     # Any failure belongs to its own target; the batch continues.
                     self.record(job, index, status="failed", message=str(exc)[-400:] or repr(exc))
@@ -1611,7 +1617,7 @@ class WorkspaceOverview:
             machine,
         )
 
-    def remove(self, job, index, target):
+    def remove(self, job, index, target, guard=None):
         """Act only on blockers the user actually approved, re-read a moment ago.
 
         The row is read again once its clone's lock is held: a launch that held it may
@@ -1640,7 +1646,22 @@ class WorkspaceOverview:
             row = fresh
             if not self.approved(job, index, row, approved, steps):
                 return
+            kept = None
+            if guard is not None:
+                try:
+                    kept = guard(row)
+                except ValueError as exc:
+                    self.record(job, index, status="skipped", message=str(exc), steps=steps)
+                    return
             self.close_workspaces(job, index, row, steps, machine)
+            if guard is not None and kept is None:
+                try:
+                    kept = guard(row)  # What its closing panes left behind counts too.
+                except ValueError as exc:
+                    kept = str(exc)
+            if kept is not None:
+                self.record(job, index, status="kept", message=kept, steps=steps)
+                return
             if machine is not None:
                 kept = self.remove_remote(job, index, row, steps, approved, machine)
             else:
