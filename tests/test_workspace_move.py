@@ -30,6 +30,7 @@ from test_workspace_overview import FakeGitHub
 __all__ = ["short_tmp"]  # A fixture, used by name.
 
 SID = "8f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10"
+MOVED = "ab" * 16  # A saved move's ID.
 RULE = "─" * 40
 CLAUDE_READY = "\n".join(["⏺ Done.", "", RULE, "❯ ", RULE, "  ? for shortcuts"])
 CLAUDE_EXIT_TYPED = CLAUDE_READY.replace("❯ ", "❯ /exit")
@@ -1088,10 +1089,10 @@ def test_a_restarted_dashboard_marks_a_running_move_interrupted(rig):
         db.close()
     folder = rig.home / "moves"
     folder.mkdir()
-    (folder / "a1.json").write_text(
+    (folder / f"{MOVED}.json").write_text(
         json.dumps(
             {
-                "id": "a1",
+                "id": MOVED,
                 "status": "running",
                 "pane": "w1:p2",
                 "session": SID,
@@ -1105,12 +1106,12 @@ def test_a_restarted_dashboard_marks_a_running_move_interrupted(rig):
         )
     )
     moves = workspace_move.Moves(rig.home, lambda: rig.placing, lambda: rig.overview)
-    op = moves.action({"id": "a1"})["move"]
+    op = moves.action({"id": MOVED})["move"]
     assert op["status"] == "interrupted"
     assert "at: Copying the conversation to Mac mini" in op["message"]
     assert op["result"]["resume_command"].endswith(f"claude --resume {SID}")
     assert watch(rig)["status"] == "awaiting_release"
-    assert json.loads((folder / "a1.json").read_text())["status"] == "interrupted"
+    assert json.loads((folder / f"{MOVED}.json").read_text())["status"] == "interrupted"
 
 
 def test_git_lfs_is_refused(rig):
@@ -1152,3 +1153,55 @@ def test_the_session_probe_takes_only_a_project_folder_suffix(tmp_path, monkeypa
                 None,
                 suffix,
             )
+
+
+def test_saved_moves_this_dashboard_did_not_write_are_skipped(rig, capsys):
+    folder = rig.home / "moves"
+    folder.mkdir()
+    good = {"id": MOVED, "status": "moved", "started_at": 1.0, "pane": "w1:p9", "session": SID}
+    (folder / f"{MOVED}.json").write_text(json.dumps(good))
+    other = "cd" * 16
+    bad = {
+        "missing.json": {"id": "ef" * 16},  # No status or start.
+        "typed.json": {"id": "01" * 16, "status": 3, "started_at": "now"},
+        "escape.json": {"id": "../../escape", "status": "running", "started_at": 1},
+        f"{other}.json": {"id": "23" * 16, "status": "moved", "started_at": 1},  # Not its name.
+    }
+    for name, op in bad.items():
+        (folder / name).write_text(json.dumps(op))
+    moves = workspace_move.Moves(rig.home, lambda: rig.placing, lambda: rig.overview)
+    assert set(moves.ops) == {MOVED}
+    assert capsys.readouterr().err.count("Skipped unreadable saved move") == 4
+    assert not (rig.home.parent / "escape.json").exists()
+    # Starting and pruning still work beside what was read.
+    started = moves.action(request())["move"]
+    assert started["status"] == "running" and started["id"] in moves.ops
+    deadline = time.time() + 60
+    while moves.action({"id": started["id"]})["move"]["status"] == "running":
+        assert time.time() < deadline
+        time.sleep(0.1)
+    with pytest.raises(ValueError, match="only under its own ID"):
+        moves.save({"id": "../../escape"})
+    assert not (rig.home.parent / "escape.json").exists()
+
+
+def test_a_pane_busy_since_the_move_began_keeps_the_workspace(rig, monkeypatch):
+    real = workspace_move.Move.confirmed
+
+    def confirmed(self, *args):
+        found = real(self, *args)
+        # The reader opened an editor beside the agent while it moved.
+        data = read(rig.state)
+        data["process_info"]["w1:p1"] = {
+            "shell_pid": 90,
+            "foreground_processes": [{"pid": 91, "argv0": "/usr/bin/vim", "argv": ["vim"]}],
+        }
+        rig.state.write_text(json.dumps(data))
+        return found
+
+    monkeypatch.setattr(workspace_move.Move, "confirmed", confirmed)
+    result = run_move(rig)
+    assert result["machine"] == "mini" and not result["source"]["removed"]
+    assert "vim in w1:p1 started there during the move" in result["warnings"][0]
+    assert ["workspace", "close", "w1"] not in read(rig.state)["calls"]
+    assert rig.checkout.exists()

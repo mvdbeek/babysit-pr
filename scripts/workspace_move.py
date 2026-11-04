@@ -1091,12 +1091,27 @@ class Move:
                 "from the Workspaces tab or with `git worktree remove`"
             )
         request = {"targets": [{"key": src["root"], "approve": ["dirty", "unpushed"]}]}
+        asked: list[bool] = []
 
         def guard(row):
             """Asked under the clone's lock, before the workspace closes and again before
-            the worktree goes: only what the worker has is ever removed here."""
+            the worktree goes: only what the worker has is ever removed here, and nothing
+            started in its other panes since the move began is closed with it."""
             if row["path"] != src["root"]:
                 raise ValueError("That is not the moved checkout; it was kept")
+            if not asked:
+                asked.append(True)
+                try:
+                    busy = busy_panes(src["workspace"], src["pane"])
+                except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                    raise ValueError(
+                        f"Its panes could not be read ({exc}), so it was kept"
+                    ) from exc
+                if busy:
+                    raise ValueError(
+                        f"Its workspace was kept open, with its worktree: {', '.join(busy)} "
+                        "started there during the move"
+                    )
             if not same_state(src["state"], snapshot(src["root"])):
                 raise ValueError("The checkout here changed after it was copied, so it was kept")
             kept = ignored_kept(src["root"])
@@ -1376,7 +1391,17 @@ class Moves:
                 op = json.loads(file.read_text())
             except (OSError, ValueError):
                 continue
-            if not isinstance(op, dict) or not isinstance(op.get("id"), str):
+            if not (
+                isinstance(op, dict)
+                and isinstance(op.get("id"), str)
+                and remote_probe.MOVE_ID.fullmatch(op["id"])
+                and file.name == f"{op['id']}.json"
+                and isinstance(op.get("status"), str)
+                and isinstance(op.get("started_at"), (int, float))
+                and not isinstance(op.get("started_at"), bool)
+            ):
+                # Not one this dashboard wrote: the state home is writable by more than it.
+                print(f"Skipped unreadable saved move {file}", file=sys.stderr)
                 continue
             if op.get("status") == "running":
                 stage = op.get("stage")
@@ -1521,6 +1546,8 @@ class Moves:
         self.save(op)
 
     def save(self, op):
+        if not remote_probe.MOVE_ID.fullmatch(str(op.get("id"))):
+            raise ValueError("A move is saved only under its own ID")
         folder = self.home / "moves"
         with contextlib.suppress(OSError):
             folder.mkdir(mode=0o700, parents=True, exist_ok=True)
