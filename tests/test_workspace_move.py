@@ -738,8 +738,8 @@ def test_children_are_the_agents_process_tree():
     listing = "\n".join(" ".join(map(str, row)) for row in CHILDREN) + "\n  bad line\n"
     found = workspace_move.descendants(listing, 4242)
     assert found == [
-        {"pid": 5000, "command": "/bin/zsh -c pytest -x"},
-        {"pid": 5001, "command": "python -m pytest -x"},
+        {"pid": 5000, "ppid": 4242, "command": "/bin/zsh -c pytest -x"},
+        {"pid": 5001, "ppid": 5000, "command": "python -m pytest -x"},
     ]
     assert workspace_move.descendants(listing, 6000) == []
 
@@ -810,6 +810,7 @@ def test_the_receive_answer_is_validated():
         "index_tree": "b" * 40,
         "work_tree": "c" * 40,
         "clone": "/w/repo",
+        "upstream": None,
     }
     assert remote_probe.validate_move_receive(good) == good
     for change in ({"path": "/w/\nx"}, {"head": "HEAD"}, {"extra": 1}):
@@ -1209,3 +1210,264 @@ def test_a_pane_busy_since_the_move_began_keeps_the_workspace(rig, monkeypatch):
     assert "vim in w1:p1 started there during the move" in result["warnings"][0]
     assert ["workspace", "close", "w1"] not in read(rig.state)["calls"]
     assert rig.checkout.exists()
+
+
+# A review of a pull request from an outside fork ---------------------------------------
+
+
+def track_fork(rig):
+    """The branch tracks a fork's branch that only this clone has a remote for, as wtpr
+    sets a review up: its commits are on that remote-tracking ref, nowhere the worker
+    knows."""
+    git("remote", "add", "wtpr-dannon", "https://github.com/dannon/repo.git", cwd=rig.clone)
+    git("update-ref", "refs/remotes/wtpr-dannon/fix", "HEAD", cwd=rig.checkout)
+    git("config", "branch.feature.remote", "wtpr-dannon", cwd=rig.checkout)
+    git("config", "branch.feature.merge", "refs/heads/fix", cwd=rig.checkout)
+
+
+def test_a_review_of_a_fork_pr_moves_with_the_forks_commits(rig):
+    track_fork(rig)
+    head = git("rev-parse", "HEAD", cwd=rig.checkout)
+    there = rig.host / "src" / "repo"
+    assert subprocess.run(["git", "-C", str(there), "cat-file", "-e", head]).returncode
+    result = run_move(rig)
+    # The fork's commit travelled in the bundle; head and trees were verified there.
+    assert git("rev-parse", "HEAD", cwd=rig.target) == head
+    assert git("log", "-1", "--format=%s", cwd=rig.target) == "Unpushed work"
+    # The worker has no remote for the fork: its branch is left without an upstream.
+    with pytest.raises(subprocess.CalledProcessError):
+        git("config", "branch.feature.remote", cwd=rig.target)
+    assert any("which no remote names on Mac mini" in w for w in result["warnings"])
+    assert result["source"]["removed"]
+
+
+def test_the_bundle_leaves_out_only_the_upstream_default_branch(tmp_path):
+    clone = make_clone(tmp_path.resolve() / "repo", []).parent.parent / "repo"
+    for n in range(3):
+        # History the worker has: large, and on upstream's default branch only.
+        (clone / f"big{n}.bin").write_bytes(os.urandom(200_000))
+        git("add", "-A", cwd=clone)
+        git("commit", "-q", "-m", f"big {n}", cwd=clone)
+    git("update-ref", "refs/remotes/upstream/dev", "HEAD", cwd=clone)
+    git("symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/dev", cwd=clone)
+    # The branch is on origin too, but the worker may not have that.
+    git("checkout", "-q", "-b", "small", cwd=clone)
+    (clone / "small.txt").write_text("small\n")
+    git("add", "small.txt", cwd=clone)
+    git("commit", "-q", "-m", "small", cwd=clone)
+    git("update-ref", "refs/remotes/origin/small", "HEAD", cwd=clone)
+    assert workspace_move.base_branch(str(clone)) == (
+        "refs/remotes/upstream/dev",
+        "base/repo",
+        "dev",
+    )
+    state = workspace_move.snapshot(str(clone))
+    data, fetch = workspace_move.bundle(str(clone), state, "ab" * 16)
+    assert fetch == [["base/repo", "dev"]]
+    assert len(data) < 20_000  # Not the 600 kB of history before it.
+    header = data.split(b"\n\n", 1)[0].decode().splitlines()
+    # Built on upstream's default branch alone; the branch's own commit travels, though
+    # origin has it.
+    dev = git("rev-parse", "refs/remotes/upstream/dev", cwd=clone)
+    assert [line.split()[0] for line in header if line.startswith("-")] == [f"-{dev}"]
+    assert header[-1].endswith(" refs/babysit-move/" + "ab" * 16)
+    assert git("show-ref", cwd=clone).count("refs/babysit-move") == 0
+
+
+def test_a_clone_lacking_the_base_says_what_is_missing_and_what_the_fetch_said(rig, monkeypatch):
+    # The worker's clone is not this one's: it lacks the commit the branch builds on.
+    there = rig.host / "src" / "repo"
+    subprocess.check_call(["rm", "-rf", str(there)])
+    there.mkdir()
+    git("init", "-q", "-b", "main", cwd=there)
+    git(
+        "-c",
+        "user.name=W",
+        "-c",
+        "user.email=w@example.test",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "another history",
+        cwd=there,
+    )
+    git("remote", "add", "origin", "https://github.com/fork/repo.git", cwd=there)
+    git("remote", "add", "upstream", "https://github.com/base/repo.git", cwd=there)
+    state = workspace_move.snapshot(str(rig.checkout))
+    data, fetch = workspace_move.bundle(str(rig.checkout), state, "cd" * 16)
+    assert fetch == [["fork/repo", "main"]]  # origin's default: there is no upstream ref.
+    monkeypatch.setenv("HOME", str(rig.host))
+    staged = rig.host / ".local/state/babysit-pr/moves"
+    staged.mkdir(parents=True)
+    fetched = []
+
+    def fetch_(clone, repo, base, remote, timeout=120):
+        fetched.append((repo, base, remote))
+        raise ValueError(
+            "fatal: unable to access 'https://github.com/fork/repo.git/': Could not resolve host"
+        )
+
+    monkeypatch.setattr(remote_probe, "_host_fetch", fetch_)
+
+    def receive(fetch):
+        bundle = staged / "m.bundle"
+        bundle.write_bytes(data)
+        return remote_probe._host_move_receive(
+            str(there),
+            "base/repo",
+            str(rig.host / "src" / "worktrees" / "repo"),
+            "feature",
+            "feature",
+            str(bundle.resolve()),
+            "cd" * 16,
+            state["head"],
+            state["index_tree"],
+            state["work_tree"],
+            None,
+            fetch,
+            "claude",
+            "default",
+            "safehouse",
+        )
+
+    with pytest.raises(ValueError) as refused:
+        receive(fetch)
+    said = str(refused.value)
+    assert "lacks these prerequisite commits" in said
+    assert "fetching main of fork/repo into origin failed" in said
+    assert "Could not resolve host" in said
+    assert fetched == [("fork/repo", "main", "origin")]
+    with pytest.raises(ValueError, match="no remote here names other/repo"):
+        receive([["other/repo", "main"]])
+    assert not (rig.host / "src" / "worktrees" / "repo" / "feature").exists()
+
+
+def test_mcp_servers_restart_with_the_agent_and_are_not_listed_as_stopped():
+    listing = "\n".join(
+        [
+            "100 1 claude",
+            "200 100 npm exec @sentry/mcp-server@latest",
+            "201 200 node /home/u/.npm/_npx/x/node_modules/.bin/sentry-mcp",
+            "300 100 node /home/u/.claude/plugins/oh-my-claudecode/bridge/mcp-server.cjs",
+            "400 100 /bin/zsh -c make test",
+            "401 400 pytest -q",
+        ]
+    )
+    stopped, restarting = workspace_move.mcp_servers(workspace_move.descendants(listing, 100))
+    assert [p["command"] for p in stopped] == ["/bin/zsh -c make test", "pytest -q"]
+    assert [p["pid"] for p in restarting] == [200, 300, 201]
+    assert workspace_move.split(None) == (None, None)
+
+
+def test_a_plan_shows_the_workers_own_check(rig):
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert found["worker"] == {
+        "clone": str(rig.host / "src" / "repo"),
+        "path": str(rig.target),
+    }
+    assert found["mcp_count"] == 0
+
+
+def run_command_line(tmp_path, answers):
+    """pr_supervisor.py workspace-move against a dashboard that answers ``answers``:
+    callables by kind of request (plan, start, follow), each giving (status, body)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            kind = "plan" if body.get("plan") else "follow" if "id" in body else "start"
+            status, answer = answers[kind]
+            data = json.dumps(answer).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = Path(workspace_move.__file__).with_name("pr_supervisor.py")
+        return subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--home",
+                str(tmp_path / "state"),
+                "workspace-move",
+                "w1",
+                "--dashboard",
+                f"http://127.0.0.1:{server.server_port}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "BABYSIT_PR_REPAIR": ""},
+        )
+    finally:
+        server.shutdown()
+
+
+CLI_PLAN = {
+    "agent": "claude",
+    "pane": "w1:p2",
+    "session": SID,
+    "status": "idle",
+    "branch": "review-pr-1",
+    "changed": 0,
+    "untracked": 0,
+    "unpushed": 1,
+    "children": [],
+    "mcp_count": 2,
+    "worker": {"clone": "/home/b/src/repo", "path": "/home/b/src/worktrees/repo/x"},
+    "error": None,
+    "machine": "box",
+    "label": "Linux box",
+    "reason": "chosen",
+    "confirm": False,
+}
+
+
+def test_the_command_line_exits_non_zero_on_a_failed_or_refused_move(tmp_path):
+    running = {"move": {"id": "m", "status": "running", "message": "Copying"}}
+    failed = {
+        "move": {
+            "id": "m",
+            "status": "failed",
+            "message": "x",
+            "error": "Linux box probe failed: ValueError: lacks commits",
+            "result": {"stage": "before_exit"},
+        }
+    }
+    done = run_command_line(
+        tmp_path,
+        {"plan": (200, {"plan": CLI_PLAN}), "start": (200, running), "follow": (200, failed)},
+    )
+    assert done.returncode == 1, done
+    assert json.loads(done.stdout) == {"error": "Linux box probe failed: ValueError: lacks commits"}
+    assert "restarts with the agent: 2 MCP server" in done.stderr
+    assert "Checked on Linux box: clone /home/b/src/repo" in done.stderr
+    refused = run_command_line(
+        tmp_path,
+        {
+            "plan": (200, {"plan": CLI_PLAN}),
+            "start": (400, {"error": "The composer holds a draft", "code": "draft"}),
+            "follow": (500, {}),
+        },
+    )
+    assert refused.returncode == 1 and "composer holds a draft" in refused.stdout
+    planned = run_command_line(
+        tmp_path,
+        {
+            "plan": (200, {"plan": {**CLI_PLAN, "machine": None, "error": "Branch exists"}}),
+            "start": (500, {}),
+            "follow": (500, {}),
+        },
+    )
+    assert planned.returncode == 1 and "Branch exists" in planned.stdout
