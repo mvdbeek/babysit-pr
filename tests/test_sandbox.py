@@ -550,6 +550,8 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
     last_writable = max(i for i, word in enumerate(argv) if word == "--bind")
     assert last_writable < min(i for i, word in enumerate(argv) if word.startswith("--ro-"))
     assert (str(home / ".config/gh"), str(home / ".config/gh")) in pairs(argv, "--ro-bind-try")
+    rc = str(home / ".sentryclirc")
+    assert (rc, rc) in pairs(argv, "--ro-bind-try")
     assert ("/usr", "/usr") in pairs(argv, "--ro-bind-try")
     assert not any(target == "/etc" for _, target in pairs(argv, "--ro-bind-try"))
     assert dict(pairs(argv, "--setenv")) == {
@@ -1010,6 +1012,7 @@ def test_wrapper_protects_session_and_git_startup_files(checkout, path):
         ".tmux.conf",
         ".config/tmux",
         ".docker",  # credential helpers and CLI plugins
+        ".sentryclirc",  # sentry-cli auth token, bound read-only
         ".local/share/uv",  # toolchains that also run outside
         ".local/share/claude",
         ".nvm",
