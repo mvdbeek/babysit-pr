@@ -103,7 +103,7 @@ resolve() {
 # --codex-home, below), and shell, session, service and git startup files, all of
 # which run or authorize code outside.
 protected=()
-for path in .ssh .gnupg .config/gh .config/babysit-pr .local/state/babysit-pr .local/bin \
+for path in .ssh .gnupg .config/gh .sentryclirc .config/babysit-pr .local/state/babysit-pr .local/bin \
   .local/share/babysit-pr \
   .local/share/uv .local/share/claude .nvm .npm-global .docker .config/herdr .claude .codex \
   .cache/babysit-sandbox .bashrc .bashrc.d .bash_aliases .bash_profile .bash_login \
@@ -434,9 +434,10 @@ for path in alternatives ca-certificates crypto-policies gai.conf gitconfig grou
   argv+=(--ro-bind-try "/etc/$path" "/etc/$path")
 done
 
-# Toolchains and credentials, read-only. gh holds the only GitHub credential.
+# Toolchains and credentials, read-only. gh holds the only GitHub credential;
+# ~/.sentryclirc holds sentry-cli's auth token.
 for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .gitconfig \
-  .config/git .config/gh; do
+  .config/git .config/gh .sentryclirc; do
   argv+=(--ro-bind-try "$home/$path" "$home/$path")
 done
 # Files attached in the dashboard, which copies them here for a worker's agents to read
