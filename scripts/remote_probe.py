@@ -496,6 +496,9 @@ MAX_UNTRACKED = 200
 MAX_COMMITS = 200
 SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 MAX_SESSIONS = 50
+# Clones directly under a worker's src a placement state lists, and worktrees of each.
+MAX_CLONES = 200
+MAX_WORKTREES = 500
 DIGEST = re.compile(r"[0-9a-f]{64}")
 # Bytes of a process's command line read to compare it: more than any argument limit.
 MAX_CMDLINE = 16 * 1024 * 1024
@@ -1787,6 +1790,52 @@ def _host_clone(clone, repo, create=False):
     if os.path.islink(common) or not os.path.isdir(common):
         raise ValueError(f"{clone} has no .git directory of its own")
     return clone, tracking, os.path.realpath(common)
+
+
+def _host_placement_state(src):
+    """Each clone directly under ``src`` by its name there, with its GitHub remotes and
+    worktrees, in one round trip: what Auto needs to keep launches beside a clone.
+
+    A launch here uses ``<src>/<repo name>``, a directory with a ``.git`` of its own
+    (``_host_clone``), so only those are listed; the controller matches the names.
+    """
+    if src != "~":
+        _arg_paths([src], home=True)
+    root = os.path.expanduser(src)
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        entries = []
+    names = [
+        name
+        for name in entries
+        if os.path.isdir(os.path.join(root, name, ".git"))
+        and not os.path.islink(os.path.join(root, name, ".git"))
+    ][:MAX_CLONES]
+
+    def survey(name):
+        path = Path(root, name).resolve()
+        config = repo_config(host_git, path)
+        # Listed as a launch would accept it, whatever its own checkout is on; a detached
+        # or mid-rebase main checkout only hides the worktrees.
+        found = clone_worktrees(host_git, path, config=config)
+        items = found[1] if found else []
+        return {
+            "name": name,
+            "remotes": sorted(set(remote_slugs(config).values())),
+            "worktrees": [
+                {key: item[key] for key in ("path", "branch", "sha", "upstream")}
+                for item in items[:MAX_WORKTREES]
+            ],
+        }
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    try:
+        clones = [clone for clone in pool.map(survey, names) if clone]
+    finally:
+        # An expired deadline must not wait for a step that is stuck.
+        pool.shutdown(wait=False, cancel_futures=True)
+    return {"clones": clones}
 
 
 def _host_version(babysit_root):
@@ -3463,6 +3512,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "alive": _host_alive,
     "cron_checkout": _host_cron_checkout,
     "version": _host_version,
+    "placement_state": _host_placement_state,
     "wt_prepare": _host_wt_prepare,
     "wt_checkout": _host_wt_checkout,
     "worktree": _host_worktree,
@@ -3863,6 +3913,49 @@ def validate_cron_checkout(value):
     return value
 
 
+def validate_placement_state(value):
+    """A worker's clones by name with their remotes and worktrees, bounded."""
+    _expect(isinstance(value, dict) and set(value) == {"clones"}, "fields")
+    clones = value["clones"]
+    _expect(isinstance(clones, list) and len(clones) <= MAX_CLONES, "clones")
+    for clone in clones:
+        _expect(isinstance(clone, dict) and set(clone) == {"name", "remotes", "worktrees"}, "clone")
+        name = clone["name"]
+        _expect(_text(name) and name not in {"", ".", ".."} and not set(name) & {"/", "\0"}, "name")
+        remotes = clone["remotes"]
+        _expect(
+            isinstance(remotes, list)
+            and all(isinstance(slug, str) and SLUG.fullmatch(slug) for slug in remotes),
+            "remotes",
+        )
+        worktrees = clone["worktrees"]
+        _expect(isinstance(worktrees, list) and len(worktrees) <= MAX_WORKTREES, "worktrees")
+        for item in worktrees:
+            _expect(
+                isinstance(item, dict) and set(item) == {"path", "branch", "sha", "upstream"},
+                "worktree",
+            )
+            _expect(_absolute(item["path"]) and _text(item["branch"]), "worktree path")
+            _expect(
+                isinstance(item["sha"], str)
+                and re.fullmatch("([0-9a-f]{40}([0-9a-f]{24})?)?", item["sha"]),
+                "sha",
+            )
+            upstream = item["upstream"]
+            _expect(
+                upstream is None
+                or (
+                    isinstance(upstream, list)
+                    and len(upstream) == 2
+                    and all(part is None or _text(part) for part in upstream)
+                ),
+                "upstream",
+            )
+    names = [clone["name"] for clone in clones]
+    _expect(len(set(names)) == len(names), "clone listed twice")
+    return value
+
+
 def validate_version(value):
     _expect(isinstance(value, dict) and set(value) == {"head"}, "fields")
     _expect(
@@ -4152,6 +4245,7 @@ VALIDATORS = {
     "alive": validate_alive,
     "cron_checkout": validate_cron_checkout,
     "version": validate_version,
+    "placement_state": validate_placement_state,
     "wt_prepare": validate_wt_prepare,
     "wt_checkout": validate_wt_checkout,
     "worktree": validate_worktree,

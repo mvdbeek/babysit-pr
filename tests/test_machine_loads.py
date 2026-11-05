@@ -35,12 +35,28 @@ def register(home, *entries):
 
 
 def settle(loads):
-    for _ in range(200):
+    for _ in range(400):
         with loads.lock:
-            if not loads.refreshing:
+            if not loads.refreshing and not loads.syncing:
                 return
         time.sleep(0.05)
     pytest.fail("machine loads never settled")
+
+
+def clone(name="repo", remotes=("base/repo",), worktrees=()):
+    return {"name": name, "remotes": list(remotes), "worktrees": list(worktrees)}
+
+
+def known(loads, machine_id, *clones):
+    """Clones just listed for ``machine_id``, as its placement state."""
+    now = time.time()
+    with loads.lock:
+        loads.states[machine_id] = {
+            "clones": list(clones),
+            "error": None,
+            "synced_at": now,
+            "attempted_at": now,
+        }
 
 
 def test_loads_come_from_each_machines_herdr_and_isolate_failures(
@@ -402,18 +418,27 @@ def test_auto_places_on_a_worker_registered_for_it_only_what_can_start_there(syn
     register(manager.home, {**MINI, "auto": True})
     manager.loads.snapshot()
     settle(manager.loads)
+    known(manager.loads, "mini", clone("other", ("other/other",)))
     manager.scan()  # The inventory the dashboard keeps fresh says which clones are here.
     busy_here(manager, 3)
-    # A new task starts from this machine's clone, so it stays here while there is room;
-    # the preview says so, as the launch will do.
+    # A new task starts from this machine's clone, so it stays here while the worker has
+    # none; the preview says so, as the launch will do.
     preview = manager.preview({"repo": "base/repo"})
     assert (preview["machine"], preview["reason"]) == ("local", "auto: clone present, 17/20 free")
     assert manager.local_history("pr", "base/repo") == {"local": 1}
     assert manager.local_history("pr", "other/repo") == {"local": 0}
     assert manager.preview({"repo": "other/repo", "kind": "pr"})["machine"] == "mini"
-    dashboard_settings.save(manager.home, {"local_max_agents": 3})
+    # The worker's clone draws its repository there.
+    preview = manager.preview({"repo": "other/other", "kind": "pr"})
+    assert (preview["machine"], preview["reason"]) == ("mini", "auto: clone present, 4/4 free")
+    # Cloned on both machines, the less busy one takes it; at equal load, this one.
+    known(manager.loads, "mini", clone())
     preview = manager.preview({"repo": "base/repo"})
-    assert (preview["machine"], preview["reason"]) == ("mini", "auto: least busy, 4/4 free")
+    assert (preview["machine"], preview["reason"]) == ("mini", "auto: clone present, 4/4 free")
+    busy_here(manager, 0)
+    assert manager.preview({"repo": "base/repo"})["machine"] == "local"
+    busy_here(manager, 3)
+    dashboard_settings.save(manager.home, {"local_max_agents": 3})
     assert manager.place({"machine": "auto"}, {"kind": "pr", "repo": "base/repo"}) == "mini"
     # Filing an issue keeps a new task here, and so does Auto with other clones.
     assert manager.preview({"repo": "base/repo", "kind": "issue"})["machine"] == "local"
@@ -424,6 +449,12 @@ def test_auto_places_on_a_worker_registered_for_it_only_what_can_start_there(syn
     # Cron jobs are new tasks: Auto may place them there, resolved once at save.
     request = {"machine": "auto", "agent": "codex", "unsandboxed": False}
     assert cron_agents.place(request, manager, "base/repo").id == "mini"
+    # A job needs its clone there already, which a launch would otherwise make.
+    known(manager.loads, "mini", clone("other", ("other/other",)))
+    assert cron_agents.place(request, manager, "base/repo") is None
+    assert cron_agents.place({**request, "machine": "mini"}, manager, "base/repo").id == "mini"
+    assert manager.place({"machine": "auto"}, {"kind": "scratch", "repo": "base/repo"}) == "mini"
+    known(manager.loads, "mini", clone())
     # A job outside its sandbox stays here, even with this machine full.
     assert cron_agents.place({**request, "unsandboxed": True}, manager, "base/repo") is None
     preview = manager.preview({"repo": "base/repo", "kind": "cron", "unsandboxed": "1"})
@@ -468,6 +499,7 @@ def test_docker_launches_go_to_the_worker_the_registry_prefers(synced):  # noqa:
     )
     manager.loads.snapshot()
     settle(manager.loads)
+    known(manager.loads, "mini")
     manager.scan()
     busy_here(manager, 3)
     # The clone here keeps a new task here, unless it uses Docker.
@@ -480,9 +512,70 @@ def test_docker_launches_go_to_the_worker_the_registry_prefers(synced):  # noqa:
     fields = {"kind": "scratch", "repo": "base/repo", "docker": True}
     assert manager.place({"machine": "auto"}, fields, {"local": 1}) == "mini"
     request = {"machine": "auto", "agent": "codex", "unsandboxed": False, "docker": True}
+    known(manager.loads, "mini", clone())  # A cron job needs its clone there.
     assert cron_agents.place(request, manager, "base/repo").id == "mini"
     # An issue cannot start there, so Auto starts it here and says why.
     preview = manager.preview({"repo": "base/repo", "docker": "1", "kind": "issue"})
     assert preview["machine"] == "local"
     assert preview["reason"].endswith("; Mac mini: only takes pull request work and new tasks")
     settle(manager.loads)
+
+
+@pytest.mark.placement_sync
+def test_a_workers_clones_are_kept_on_a_slow_ttl_until_they_go_stale(tmp_path, monkeypatch):
+    register(tmp_path, MINI, {**MINI, "id": "off", "label": "Off", "ssh": "off", "enabled": False})
+    monkeypatch.setattr(pw, "herdr", lambda *args, machine=None, timeout=30: {"workspaces": []})
+    answer = {"clones": [clone()]}
+    asked = []
+
+    def probe(home, machine, op, timeout, **args):
+        asked.append((machine.id, op, args))
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(cron_agents, "probe", probe)
+    loads = pw.MachineLoads(tmp_path, lambda: INVENTORY)
+    first = loads.snapshot()[1]["mini"]
+    assert (first["clones"], first["state_synced_at"]) == (None, None)
+    settle(loads)
+    # Asked of the worker's registered src; a disabled one is not asked.
+    assert asked == [("mini", "placement_state", {"src": "~/src"})]
+    mini = loads.snapshot()[1]["mini"]
+    assert (mini["clones"], mini["state_error"]) == ([clone()], None)
+    at = mini["state_synced_at"]
+    # Load refreshes come and go; the clones are asked again only after their own TTL.
+    loads.snapshot(now=time.time() + pw.placement.LOAD_TTL + 1)
+    settle(loads)
+    assert len(asked) == 1
+    answer = ValueError("Mac mini did not answer within 60 seconds")
+    loads.snapshot(now=time.time() + pw.placement.STATE_TTL + 1)
+    settle(loads)
+    assert len(asked) == 2
+    # A failed refresh keeps the last clones, and says why.
+    mini = loads.snapshot()[1]["mini"]
+    assert (mini["clones"], mini["state_synced_at"]) == ([clone()], at)
+    assert mini["state_error"] == "Mac mini did not answer within 60 seconds"
+    # Too old, they are unknown again: a cron job is left to explicit choice there.
+    later = at + pw.placement.STATE_STALE + 1
+    config, stale = loads.snapshot(now=later)
+    settle(loads)
+    assert stale["mini"]["clones"] is None
+    req = {"kind": "cron", "repo": "base/repo", "sandboxed": True}
+    found = pw.placement.exclusions(req, config["machines"], stale, {}, later)
+    assert found["mini"] == pw.placement.Exclusion("checking…", True)
+
+
+def test_this_machine_says_it_is_still_counting_before_its_first_scan(local):  # noqa: F811
+    manager, *_ = local
+    register(manager.home, MINI)
+    manager.loads.snapshot()
+    settle(manager.loads)
+    manager.loads.local = lambda: {"workspaces": [], "error": None, "synced_at": None}
+    preview = manager.preview({"repo": "base/repo"})
+    assert (preview["machine"], preview["reason"]) == (
+        "local",
+        "auto: clone present, still counting agents",
+    )
+    here = manager.machine_list()[0]
+    assert (here["pending"], here["reason"]) == (True, None)

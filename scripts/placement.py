@@ -9,8 +9,10 @@ id (2: a prior workspace for the same target, 1: a clone of its repository is th
 and ``reservations`` the launches placed on each machine that herdr does not list yet.
 A launch that uses Docker goes to the registry's ``docker`` ``prefer`` machine ahead of
 a clone here, when Auto may place launches there and it can take this one.
+A worker's load carries its ``clones`` from its placement state, None while unknown.
 """
 
+import re
 import time
 from typing import NamedTuple
 
@@ -18,6 +20,9 @@ LOCAL = "local"
 # Seconds a machine's cached load stays fresh, and how long it may stay unreachable
 # before placement stops offering it.
 LOAD_TTL = 15
+# Seconds a worker's placement state stays fresh, and after which it counts as unknown.
+STATE_TTL = 300
+STATE_STALE = 600
 # Agents this machine takes before Auto prefers a worker, unless the settings say otherwise.
 LOCAL_SLOTS = 20
 # What a launch starts work on, and what of it a worker can start; anything else stays
@@ -97,6 +102,9 @@ def exclusions(req, machines, loads, reservations, now):
         stale = now - load.get("attempted_at", now) > 2 * LOAD_TTL
         lacking = [label for label in requirements(req, machine) if label not in machine.labels]
         used = busy(machine_id, loads, reservations)
+        job_clone = (
+            cloned(load, req["repo"]) if req.get("kind") == "cron" and req.get("repo") else True
+        )
         if not machine.enabled:
             excluded[machine_id] = Exclusion("disabled", False)
         elif since is not None and not stale and now - since > LOAD_TTL:
@@ -107,8 +115,12 @@ def exclusions(req, machines, loads, reservations, now):
             excluded[machine_id] = Exclusion("only takes pull request work and new tasks", False)
         elif machine_id != LOCAL and req.get("kind") == "cron" and not req.get("sandboxed", True):
             excluded[machine_id] = Exclusion("runs jobs only in their sandbox", False)
-        elif machine_id != LOCAL and (stale or load.get("pending")):
-            # No load has come back yet, so its agents are unknown.
+        elif machine_id != LOCAL and job_clone is False:
+            # Launches clone a missing repository; a cron job needs its clone already.
+            # Listed up to minutes ago, so a person may still choose it by name.
+            excluded[machine_id] = Exclusion(f"no clone of {req['repo']}", True)
+        elif machine_id != LOCAL and (stale or load.get("pending") or job_clone is None):
+            # No load (or, for a cron job, clone listing) has come back yet.
             excluded[machine_id] = Exclusion("checking…", True)
         elif machine_id != LOCAL and used >= machine.max_agents:
             excluded[machine_id] = Exclusion(f"full ({used}/{machine.max_agents})", True)
@@ -122,12 +134,63 @@ def exclusions(req, machines, loads, reservations, now):
     return excluded
 
 
+def cloned(load, repo):
+    """Whether a worker has ``repo``'s clone where its launches use it, ``<src>/<name>``;
+    None while its clones are unknown."""
+    clones = load.get("clones")
+    if clones is None or not repo:
+        return None
+    name = repo.split("/")[-1]
+    return any(c["name"] == name and repo.lower() in c["remotes"] for c in clones)
+
+
+def matched(pr, loads):
+    """Workers with a checkout of ``pr``'s head branch at its head commit, in the clone a
+    launch there uses, as ``verified_head`` would find it there, from the last placement
+    state."""
+    head_repo = (pr.get("head_repo") or "").lower()
+    branch = pr.get("head_branch")
+    sha = (pr.get("head_sha") or "").lower()
+    if not head_repo or not branch or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return []
+    name, repo = pr["repo"].split("/")[-1], pr["repo"].lower()
+    found = []
+    for machine_id, load in sorted(loads.items()):
+        if machine_id == LOCAL:
+            continue
+        clones = [c for c in load.get("clones") or () if c["name"] == name and repo in c["remotes"]]
+        if any(
+            (
+                item["upstream"] == [head_repo, branch]
+                or (item["branch"] == branch and head_repo in clone["remotes"])
+            )
+            and item["sha"] == sha
+            for clone in clones
+            for item in clone["worktrees"]
+        ):
+            found.append(machine_id)
+    return found
+
+
+def history(repo, loads, here, matches=()):
+    """Stickiness by machine: ``here`` for this one, and for each worker 2 when it is in
+    ``matches``, 1 when it has the clone a launch there uses, else 0."""
+    scores = {LOCAL: here}
+    for machine_id, load in loads.items():
+        if machine_id != LOCAL:
+            scores[machine_id] = 2 if machine_id in matches else 1 if cloned(load, repo) else 0
+    return scores
+
+
 def label(machine_id, machines):
     machine = machines.get(machine_id)
     return machine.label if machine else "This machine"
 
 
 def free(machine_id, machines, loads, reservations):
+    # Until a first scan answers, its agents are unknown: "20/20 free" would mislead.
+    if (loads.get(machine_id) or {}).get("pending"):
+        return "still counting agents"
     total = slots(machine_id, machines, loads)
     return f"{max(0, total - busy(machine_id, loads, reservations))}/{total} free"
 

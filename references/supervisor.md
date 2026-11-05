@@ -991,12 +991,24 @@ worker registered with `"auto": true`; any worker can still be chosen by name. E
 way the worker is checked against the launch (disabled, unreachable, missing `labels`
 such as `docker`, `safehouse`/`bwrap` for the sandbox, `claude-account:<name>`, or a
 repo's `requires`; a launch kind workers cannot start yet, listed below) and recorded on
-the operation or scheduled task. A worker whose load has not come back yet, or whose
-refresh has not finished for 30 s, shows "checking…" and is left out of Auto. Auto ranks
-the machines that can take a launch by stickiness first: a prior workspace for the same
-target, then a clone of its repository. New tasks and cron jobs always count this
-machine's clone, and pull request and issue work count it when this machine has one, so
-those launches stay here until it is full. A launch that uses Docker is the exception:
+the operation or scheduled task. A `placement_state` probe lists the clones directly under
+each worker's `src` with their remotes and worktrees. It runs in the background when a
+placement or the machines' loads are asked for and the last list is over 5 minutes old;
+a failed refresh keeps the last list, and one older than 10 minutes counts as unknown, so
+after a quiet spell the first launch places as if no worker had a clone. A worker whose load has not come back yet, or whose refresh has not finished
+for 30 s, shows "checking…" and is left out of Auto. Auto ranks the machines that can
+take a launch by stickiness first: a prior workspace for the same target, then a clone of
+its repository, on every machine. New tasks and cron jobs always count this machine's
+clone, and pull request and issue work count it when this machine has one. A worker
+counts the clone its launches use (`<src>/<repo name>`, with the repository among its
+remotes), so a repository cloned only here stays here until it is full, one cloned only
+on a worker goes there, and one cloned on both goes to the repo's `prefer`, else to the
+machine with the lower share of its capacity in use (this one on a tie). Sub-tasks and
+moves do not count workers' clones. For Handle
+on a pull request, a worker with a checkout at the pull request's head commit, tracking
+its head branch (or on that branch with the head repository among the clone's remotes),
+counts as a prior workspace there; Handle still starts a fresh checkout beside it, and
+any machine can still be chosen by name. A launch that uses Docker is the exception:
 with `"docker": {"prefer": "<id>"}` it goes to that worker ahead of a clone here ("auto:
 Docker prefers <label>"), so Docker runs on the worker rather than on this machine. Only
 a prior workspace, a pin (Handle on a verified checkout) or a machine chosen by name
@@ -1005,15 +1017,21 @@ false` promises that it runs only what is sent to it by name; one that cannot ta
 launch (not used by Auto, full, unreachable, checking, a kind it cannot start) leaves
 it to the usual ranking, and the reason says why ("…; <label>: full (6/6)"). Placement
 does not require a clone on the worker: task and pull request launches clone a missing
-repository when they start (cron jobs still require an existing clone).
+repository when they start. Cron jobs still require an existing clone, so Auto
+leaves a worker without it out for a cron job ("no clone of owner/name"; chosen by name
+it is only noted, since the list may be minutes old, and the run checks the clone), and
+one whose clones are not listed yet shows "checking…".
 Then come the repo's `prefer`, then load:
 agents plus launches placed but not yet listed, over the machine's capacity. This
 machine's capacity is **Agents on this machine** in Settings (default 20, shown once
 workers are registered): at that many agents Auto prefers a worker, and comes back here
-when no worker can take the launch. Chosen by name, a full machine is only noted. A cron
+when no worker can take the launch. Until this machine's first workspace scan after a
+restart, its free slots read "still counting agents". Chosen by name, a
+full machine is only noted. A cron
 job outside its sandbox never runs on a worker. The preview uses the same stickiness, the
-dialog's issue, other-repository and sandbox choices, but cannot see a Handle's verified
-checkout, which pins the launch to its machine.
+dialog's issue, other-repository and sandbox choices, and workers' clones, but cannot see
+a Handle's verified checkout, which pins the launch to this machine or, on a worker, ranks
+that worker first.
 
 A launch placed on a worker (Handle or Create on a pull request, a new task, from the
 dialog or from `wt --machine` on this machine, batch review, a scheduled launch) starts

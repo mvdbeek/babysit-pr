@@ -20,7 +20,10 @@ package = false
 testpaths = ["scripts", "tests"]
 pythonpath = ["scripts"]
 addopts = "-ra --strict-markers --strict-config"
-markers = ["browser: real Chromium tests against an isolated local dashboard"]
+markers = [
+  "browser: real Chromium tests against an isolated local dashboard",
+  "placement_sync: let MachineLoads probe workers' clones (fake ssh or a stubbed probe)",
+]
 # A stuck test fails with every thread's stack instead of hanging CI. The thread method
 # works under xdist (the worker is replaced and its test named) and leaves SIGALRM to the
 # probe, which sets its own deadline with it.
