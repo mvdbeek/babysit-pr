@@ -521,6 +521,8 @@ def close_launched(watch, record, machine=None):
 AGENT_STATES = {"working", "blocked", "idle", "done"}
 # How long a worker's herdr may take to list its workspaces.
 LOAD_TIMEOUT = 5
+# How long a worker may take to list its clones and their worktrees.
+STATE_TIMEOUT = 60
 
 
 def parent_account(parent):
@@ -593,7 +595,9 @@ class MachineLoads:
 
     A request reads the cache; an entry older than ``placement.LOAD_TTL`` is refreshed by
     its own daemon thread, so one hung machine delays nobody else. This machine's counts
-    come from the workspace inventory ``local`` returns.
+    come from the workspace inventory ``local`` returns. Each worker's clones and their
+    worktrees (the ``placement_state`` probe) are kept the same way on the slower
+    ``placement.STATE_TTL``, and read as unknown once older than ``placement.STATE_STALE``.
     """
 
     def __init__(self, home, local):
@@ -602,6 +606,8 @@ class MachineLoads:
         self.lock = threading.Lock()
         self.entries: dict[str, dict] = {}
         self.refreshing: set[str] = set()
+        self.states: dict[str, dict] = {}
+        self.syncing: set[str] = set()
         # Checkouts herdr lists with a working or blocked agent, by machine, as its last
         # refresh saw them (sub-tasks count them).
         self.agent_paths: dict[str, set[str]] = {}
@@ -623,19 +629,56 @@ class MachineLoads:
                 if machine.enabled and stale and machine_id not in self.refreshing:
                     self.refreshing.add(machine_id)
                     threading.Thread(target=self.refresh, args=(machine,), daemon=True).start()
+                state = self.states.get(machine_id) or {}
+                due = not state or now - state["attempted_at"] >= placement.STATE_TTL
+                if machine.enabled and due and machine_id not in self.syncing:
+                    self.syncing.add(machine_id)
+                    threading.Thread(target=self.sync, args=(machine,), daemon=True).start()
+                synced = state.get("synced_at")
+                known = synced is not None and now - synced <= placement.STATE_STALE
                 load = {**empty, **(entry or {})}
                 # Until a first refresh answers, its agents are unknown, not zero.
-                loads[machine_id] = {**load, "pending": load["synced_at"] is None}
+                loads[machine_id] = {
+                    **load,
+                    "pending": load["synced_at"] is None,
+                    "clones": state["clones"] if known else None,
+                    "state_synced_at": synced,
+                    "state_error": state.get("error"),
+                }
         inventory = self.local()
         loads[placement.LOCAL] = {
             **empty,
             **load_counts(inventory["workspaces"]),
             "error": inventory["error"],
             "synced_at": inventory["synced_at"],
-            "pending": False,
+            # Before the first workspace scan its agents are unknown, not zero.
+            "pending": inventory["synced_at"] is None,
             "max_agents": dashboard_settings.settings(self.home)["local_max_agents"],
         }
         return config, loads
+
+    def sync(self, machine):
+        """Refresh ``machine``'s clones; a failure keeps the last ones, with why."""
+        import cron_agents
+
+        attempted = time.time()
+        previous = self.states.get(machine.id, {})
+        state = None
+        error = "Placement state refresh failed"  # Kept if something unforeseen escapes.
+        try:
+            found = cron_agents.probe(
+                self.home, machine, "placement_state", STATE_TIMEOUT, src=machine.src
+            )
+            state = {**found, "error": None, "synced_at": time.time()}
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            error = str(exc)[-300:] or type(exc).__name__
+        finally:
+            if state is None:
+                state = {**previous, "error": error}
+            # Always released, or this machine would never be asked again.
+            with self.lock:
+                self.states[machine.id] = {**state, "attempted_at": attempted}
+                self.syncing.discard(machine.id)
 
     def refresh(self, machine):
         attempted = time.time()
@@ -1256,7 +1299,8 @@ class Workspaces:
             )
         return [
             {
-                **loads[m["id"]],
+                # A worker's clones and worktrees are for placement, not the page.
+                **{k: v for k, v in loads[m["id"]].items() if k != "clones"},
                 **m,
                 "available": m["id"] not in found or found[m["id"]].soft,
                 "reason": found[m["id"]].why if m["id"] in found else None,
@@ -1277,12 +1321,14 @@ class Workspaces:
         ]
         return {machine_id: placed.count(machine_id) for machine_id in set(placed)}
 
-    def place(self, request, fields, history=None):
+    def place(self, request, fields, history=None, target=None):
         """The registry id a launch runs on, None for this machine.
 
         A request without ``machine`` runs here, as before workers existed. ``fields`` are
         the launch's ``placement.request`` fields; an explicit machine that cannot take
-        the launch is refused with the reason.
+        the launch is refused with the reason. ``history`` gives this machine's
+        stickiness (none by default); workers get theirs from their clones, and a pull request ``target`` counts a worker's verified checkout of it
+        as a prior workspace.
         """
         if "machine" not in request:
             return None
@@ -1290,9 +1336,11 @@ class Workspaces:
         req = placement.request(
             {**fields, "override": request["machine"]}, config["repos"], config.get("docker")
         )
-        return placement.choose(
-            req, config["machines"], loads, history or {}, self.reservations()
-        ).machine
+        repo = fields.get("repo") or ""
+        matches = placement.matched(target, loads) if target else []
+        here = (history or {}).get(placement.LOCAL, 0)
+        scores = placement.history(repo, loads, here, matches)
+        return placement.choose(req, config["machines"], loads, scores, self.reservations()).machine
 
     def preview(self, query):
         """Where Auto would place a launch, and which machines a person may choose."""
@@ -1334,7 +1382,9 @@ class Workspaces:
                 req,
                 config["machines"],
                 loads,
-                self.local_history(kind, fields["repo"]),
+                placement.history(
+                    fields["repo"], loads, self.local_history(kind, fields["repo"])[placement.LOCAL]
+                ),
                 reservations,
             )
         except ValueError as exc:
@@ -1352,7 +1402,8 @@ class Workspaces:
 
         New tasks and cron jobs always start from a local clone here; pull request and
         issue work count one when this machine has a clone of the repository. A verified
-        checkout pins Handle instead, which a preview cannot see.
+        checkout pins Handle instead, which a preview cannot see, as it cannot see a
+        worker's verified checkout counting as a prior workspace there.
         """
         if kind in {"scratch", "cron"}:
             return {placement.LOCAL: 1}
@@ -1525,7 +1576,8 @@ class Workspaces:
                 request.get("effort", ""),
                 self.home,
             )
-            # A verified checkout pins Handle to its machine; every checkout is here so far.
+            # A verified checkout here pins Handle to this machine; one on a worker ranks
+            # that worker first under Auto.
             machine = self.place(
                 request,
                 {
@@ -1537,6 +1589,7 @@ class Workspaces:
                     "pin": placement.LOCAL if info["matches"] else None,
                 },
                 {placement.LOCAL: 2 if info["matches"] else 1 if info["clones"] else 0},
+                pr if action == "handle" and pr.get("kind") == "pr" else None,
             )
             remote = machines.resolve(self.home, machine) if machine else None
             validate_account(request.get("agent", "codex"), request.get("claude_account"), remote)

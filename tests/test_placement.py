@@ -337,3 +337,106 @@ def test_docker_falls_back_here_when_its_worker_cannot_take_the_launch(change, l
     # Chosen by name, a worker Auto does not use still takes it.
     if change == {"auto": False}:
         assert choose({**req, "override": "chonk"}, fleet).machine == "chonk"
+
+
+PR = {
+    "repo": "base/repo",
+    "head_repo": "fork/repo",
+    "head_branch": "feature",
+    "head_sha": "b" * 40,
+}
+
+
+def clone(name="repo", remotes=("base/repo",), worktrees=()):
+    return {"name": name, "remotes": list(remotes), "worktrees": list(worktrees)}
+
+
+def worktree(branch="feature", sha="b" * 40, upstream=("fork/repo", "feature")):
+    path = f"/home/w/src/worktrees/repo/{branch}"
+    upstream = list(upstream) if upstream else None
+    return {"path": path, "branch": branch, "sha": sha, "upstream": upstream}
+
+
+def test_a_cron_job_needs_its_clone_where_the_worker_launches_it():
+    loads = {
+        # base/repo's clone is there, but not where a launch looks for it.
+        "mini": load(clones=[clone("other", ("base/repo",)), clone("tool", ("base/tool",))]),
+        "box": load(clones=[clone("repo", ("fork/repo", "base/repo"))]),
+        "local": load(agents=8),
+    }
+    # The owner may differ in case; the name is the directory a launch uses.
+    req = {"kind": "cron", "repo": "Base/repo"}
+    missing = pl.Exclusion("no clone of Base/repo", True)
+    assert pl.exclusions(req, FLEET, loads, {}, NOW) == {"mini": missing}
+    assert choose(req, loads=loads).machine == "box"
+    # The listing may be minutes old: by name it is only noted, and the run checks.
+    chosen = choose({**req, "override": "mini"}, loads=loads)
+    assert chosen.machine == "mini" and chosen.reason == "chosen; no clone of Base/repo"
+    # Other launches clone a missing repository when they start.
+    for kind in ("pr", "scratch"):
+        assert pl.exclusions({**req, "kind": kind}, FLEET, loads, {}, NOW) == {}
+    # Clones not listed yet leave a cron job to explicit choice, and nothing else.
+    loads = {"mini": load(clones=None), "box": load(clones=[clone()])}
+    checking = pl.Exclusion("checking…", True)
+    assert pl.exclusions(req, FLEET, loads, {}, NOW) == {"mini": checking}
+    assert pl.exclusions({**req, "kind": "scratch"}, FLEET, loads, {}, NOW) == {}
+    assert pl.exclusions({"kind": "cron"}, FLEET, loads, {}, NOW) == {}
+
+
+def test_history_counts_a_workers_clone_and_load_breaks_the_tie():
+    loads = {
+        "local": load(agents=4),
+        "mini": load(clones=[clone()]),
+        "box": load(clones=[clone("tool", ("base/tool",))]),
+    }
+    history = pl.history("base/repo", loads, 1)
+    assert history == {"local": 1, "mini": 1, "box": 0}
+    assert pl.history("base/repo", loads, 0, ["mini"]) == {"local": 0, "mini": 2, "box": 0}
+    assert pl.history("base/repo", {"mini": load(clones=None)}, 1) == {"local": 1, "mini": 0}
+    # Cloned on both, the less busy machine takes it: 0/4 beats 4/20.
+    req = {"kind": "scratch", "repo": "base/repo", "sandboxed": False}
+    chosen = choose(req, loads=loads, history=history)
+    assert chosen.machine == "mini" and chosen.reason == "auto: clone present, 4/4 free"
+    # At equal load this machine comes first.
+    loads["mini"] = load(agents=1, clones=[clone()])
+    loads["local"] = load(agents=5)
+    assert choose(req, loads=loads, history=pl.history("base/repo", loads, 1)).machine is None
+
+
+def test_a_workers_checkout_of_the_pull_requests_head_counts_as_a_prior_workspace():
+    verified = clone(remotes=("base/repo", "fork/repo"), worktrees=[worktree()])
+    loads = {
+        "mini": load(clones=[verified]),
+        "box": load(clones=[clone(worktrees=[worktree(sha="c" * 40)])]),
+    }
+    assert pl.matched(PR, loads) == ["mini"]
+    # Same branch with the head repository among the clone's remotes, as verified_head.
+    plain = clone(remotes=("base/repo", "fork/repo"), worktrees=[worktree(upstream=None)])
+    assert pl.matched(PR, {"box": load(clones=[plain])}) == ["box"]
+    for unverified in (
+        {"box": load(clones=[clone(worktrees=[worktree(upstream=None)])])},
+        {"box": load(clones=[clone(worktrees=[worktree(branch="other", upstream=None)])])},
+        # In a clone a launch there would not use.
+        {"box": load(clones=[clone("fork", ("base/repo", "fork/repo"), [worktree()])])},
+        {"box": load(clones=None)},
+        {"local": load(clones=[verified])},
+    ):
+        assert pl.matched(PR, unverified) == []
+    assert pl.matched({**PR, "head_sha": ""}, loads) == []
+    # It ranks first under Auto, ahead of a clone here, but pins nothing.
+    req = {"kind": "pr", "repo": "base/repo", "sandboxed": False}
+    history = pl.history("base/repo", loads, 1, pl.matched(PR, loads))
+    chosen = choose(req, loads={**loads, "local": load()}, history=history)
+    assert chosen.machine == "mini" and chosen.reason == "auto: prior workspace, 4/4 free"
+    assert choose({**req, "override": "local"}, loads=loads, history=history).machine is None
+
+
+def test_this_machine_still_counting_its_agents_says_so():
+    loads = {"local": load(max_agents=20, pending=True)}
+    assert pl.free("local", {}, loads, {}) == "still counting agents"
+    chosen = choose({"sandboxed": False}, fleet={}, loads=loads)
+    assert chosen.reason == "auto: least busy, still counting agents"
+    # Launches placed here meanwhile still fill it.
+    assert pl.exclusions({}, {}, loads, {"local": 20}, NOW) == {
+        "local": pl.Exclusion("full (20/20)", True)
+    }

@@ -24,6 +24,7 @@ import pytest
 import remote_probe
 import work_tags
 import workspace_exit
+from test_machine_loads import settle
 from test_new_tasks import other_clone
 from test_new_tasks import request as new_request
 from test_pr_workspaces import finish, helper_calls, local  # noqa: F401 (fixture)
@@ -777,6 +778,144 @@ def test_the_babysit_pr_a_worker_runs_is_its_deployed_commit(host):  # noqa: F81
     assert remote_probe.validate_version(remote_probe._host_version(str(clone))) == {"head": head}
     with pytest.raises(ValueError, match="Malformed probe answer"):
         remote_probe.validate_version({"head": "main"})
+
+
+def test_a_workers_placement_state_lists_the_clones_in_its_src(host, monkeypatch):  # noqa: F811
+    home, clone, _ = host
+    head = git("rev-parse", "HEAD", cwd=clone)
+    path = home / "src/worktrees/repo/x"
+    git("worktree", "add", "-q", "-b", "x", str(path), cwd=clone)
+    git("config", "branch.x.remote", "origin", cwd=clone)
+    git("config", "branch.x.merge", "refs/heads/feature", cwd=clone)
+    # Neither a plain directory nor one whose .git is a link is a clone a launch uses.
+    (home / "src" / "notes").mkdir()
+    (home / "src" / "linked").mkdir()
+    (home / "src" / "linked" / ".git").symlink_to(clone / ".git")
+    git("clone", "-q", str(clone), str(home / "src" / "zeta"), cwd=home)
+    git("remote", "set-url", "origin", "https://github.com/base/zeta.git", cwd=home / "src/zeta")
+
+    def state(src="~/src"):
+        return remote_probe.validate_placement_state(remote_probe._host_placement_state(src))
+
+    repo = {
+        "name": "repo",
+        "remotes": ["base/repo"],
+        "worktrees": [
+            {"path": str(clone.resolve()), "branch": "main", "sha": head, "upstream": None},
+            {
+                "path": str(path.resolve()),
+                "branch": "x",
+                "sha": head,
+                "upstream": ["base/repo", "feature"],
+            },
+        ],
+    }
+    # A detached clone is still one a launch uses; only its own checkout is hidden.
+    git("checkout", "-q", "--detach", cwd=home / "src/zeta")
+    found = state()
+    assert [c["name"] for c in found["clones"]] == ["repo", "zeta"]
+    assert found["clones"][1]["worktrees"] == []
+    assert found["clones"][0] == repo
+    assert found["clones"][1]["remotes"] == ["base/zeta"]
+    # Bounded, by name.
+    monkeypatch.setattr(remote_probe, "MAX_CLONES", 1)
+    assert state()["clones"] == [repo]
+    monkeypatch.setattr(remote_probe, "MAX_WORKTREES", 1)
+    assert state()["clones"][0]["worktrees"] == repo["worktrees"][:1]
+    assert state(src=str(home / "missing"))["clones"] == []
+    with pytest.raises(ValueError, match="absolute paths"):
+        state(src="src")
+
+
+def test_a_malformed_placement_state_is_refused(monkeypatch):
+    item = {"path": "/h/src/repo", "branch": "main", "sha": "a" * 40, "upstream": None}
+    clone = {"name": "repo", "remotes": ["base/repo"], "worktrees": [item]}
+    good = {"clones": [clone]}
+    assert remote_probe.validate_placement_state(good) == good
+    bad_items = [
+        {**item, "path": "src/repo"},
+        {**item, "sha": "main"},
+        {**item, "branch": None},
+        {**item, "upstream": ["base/repo"]},
+        {**item, "extra": 1},
+    ]
+    bad_clones = [
+        *({**clone, "worktrees": [bad]} for bad in bad_items),
+        {**clone, "name": ".."},
+        {**clone, "name": "a/b"},
+        {**clone, "remotes": ["not a slug"]},
+        {**clone, "remotes": "base/repo"},
+        {**clone, "extra": 1},
+    ]
+    for bad in (
+        *({"clones": [c]} for c in bad_clones),
+        {"clones": [clone, clone]},
+        {**good, "extra": 1},
+        [],
+    ):
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_placement_state(bad)
+    monkeypatch.setattr(remote_probe, "MAX_CLONES", 0)
+    with pytest.raises(ValueError, match="Malformed probe answer: clones"):
+        remote_probe.validate_placement_state(good)
+    monkeypatch.setattr(remote_probe, "MAX_CLONES", 1)
+    monkeypatch.setattr(remote_probe, "MAX_WORKTREES", 0)
+    with pytest.raises(ValueError, match="Malformed probe answer: worktrees"):
+        remote_probe.validate_placement_state(good)
+
+
+def synced_state(manager):
+    """The worker's clones, listed now rather than after their TTL."""
+    settle(manager.loads)
+    manager.loads.states.clear()
+    manager.loads.snapshot()
+    settle(manager.loads)
+
+
+@pytest.mark.placement_sync
+def test_a_workers_clones_come_over_ssh_and_stay_off_the_page(remote):
+    manager, pr, state, worker = remote
+    synced_state(manager)
+    _, loads = manager.loads.snapshot()
+    assert loads["mini"]["state_error"] is None
+    assert [(c["name"], c["remotes"]) for c in loads["mini"]["clones"]] == [("repo", ["base/repo"])]
+    assert "clones" not in manager.machine_list()[1]
+    # A cron job goes only where its clone is; other launches clone what is missing.
+    preview = manager.preview({"repo": "other/repo", "kind": "cron"})
+    assert preview["machine"] == "local"
+    assert preview["options"] == [
+        {"id": "mini", "label": "Mac mini", "note": "no clone of other/repo", "disabled": False}
+    ]
+    preview = manager.preview({"repo": "other/repo", "kind": "pr"})
+    assert preview["options"] == [
+        {"id": "mini", "label": "Mac mini", "note": "4/4 free", "disabled": False}
+    ]
+
+
+@pytest.mark.placement_sync
+def test_auto_handles_a_pull_request_beside_a_workers_checkout_of_it(remote):
+    manager, pr, state, worker = remote
+    request = {"id": pr["id"], "action": "handle", "task": "Review it", "machine": "mini"}
+    synced_state(manager)  # Probed before the launch, not racing its fakes.
+    manager.action(request)
+    first = finish(manager, pr["id"])
+    assert first["status"] == "complete", first
+    fields = {"kind": "pr", "repo": "base/repo"}
+    here = {"local": 1}
+    # Not registered for Auto, the worker is never chosen for it.
+    synced_state(manager)
+    assert manager.place({"machine": "auto"}, fields, here, pr) is None
+    register(manager.home, auto=True)
+    synced_state(manager)
+    # Its checkout of the head ranks it ahead of the clone here, without pinning it there.
+    manager.action({**request, "machine": "auto"})
+    op = finish(manager, pr["id"])
+    assert (op["status"], op["machine"]) == ("complete", "mini"), op
+    # Like Handle here, it starts a fresh checkout beside the verified one.
+    assert Path(op["path"]).name == "pr-base-7-2"
+    assert manager.place({"machine": "local"}, fields, here, pr) is None
+    # A head pushed since, which its checkouts do not have, no longer draws it there.
+    assert manager.place({"machine": "auto"}, fields, here, {**pr, "head_sha": "f" * 40}) is None
 
 
 @pytest.mark.parametrize("bad", ["\x15", "\x1b[201~", "\n", "\x9b"])

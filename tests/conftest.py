@@ -297,3 +297,22 @@ def fresh_viewer_caches(monkeypatch):
     monkeypatch.setattr(agent_docker, "has_access", lambda pid: True)
     monkeypatch.setattr(agent_messages, "_recent", {})
     monkeypatch.setattr(agent_messages, "_exiting", set())
+
+
+@pytest.fixture(autouse=True)
+def no_placement_probe(request, monkeypatch):
+    """Worker clones stay unknown unless a test opts in with ``placement_sync``.
+
+    Every snapshot of ``MachineLoads`` would otherwise probe each registered worker in the
+    background: over the real ssh when a test has no fakes on PATH, and racing the fakes'
+    shared log when it does.
+    """
+    if request.node.get_closest_marker("placement_sync"):
+        return
+    import pr_workspaces
+
+    def sync(self, machine):
+        with self.lock:
+            self.syncing.discard(machine.id)
+
+    monkeypatch.setattr(pr_workspaces.MachineLoads, "sync", sync)
