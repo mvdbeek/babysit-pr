@@ -185,6 +185,27 @@ def test_a_subtask_runs_the_parents_agent_as_its_claude_account(local):  # noqa:
     assert [request["claude_account"] for request, _ in asked] == ["oss", "oss", ""]
 
 
+def test_cross_agent_review_refusal_explains_the_trusted_launch_route(local):  # noqa: F811
+    manager, *_ = local
+    asked = captured(manager)
+    for agent, account in (("codex", ""), ("claude", "reviewer")):
+        other = "claude" if agent == "codex" else "codex"
+        with pytest.raises(ValueError) as error:
+            manager.subtask(
+                launch(agent=other, task="The user explicitly requested a cross-agent review"),
+                parent(
+                    agent=agent,
+                    config_dir=f"/home/u/.{agent}" + (f"/accounts/{account}" if account else ""),
+                ),
+            )
+        message = str(error.value)
+        assert "same agent and account" in message
+        assert "host terminal" in message and f"wt --{other}" in message
+        assert "isolation" in message and "re-login" in message
+    assert asked == []
+    assert not [op for op in manager.state()["operations"].values() if op.get("parent")]
+
+
 def test_a_workers_subtask_never_lands_on_the_controller(local):  # noqa: F811
     manager, *_ = local
     asked = captured(manager)

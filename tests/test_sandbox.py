@@ -555,7 +555,7 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
     assert ("/usr", "/usr") in pairs(argv, "--ro-bind-try")
     assert not any(target == "/etc" for _, target in pairs(argv, "--ro-bind-try"))
     assert dict(pairs(argv, "--setenv")) == {
-        "PATH": env["PATH"],
+        "PATH": f"/tmp/babysit-bin:{env['PATH']}",
         "HOME": str(home),
         "TERM": "dumb",
         "LANG": "C",
@@ -566,6 +566,7 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
         "PIP_CACHE_DIR": f"{cache}/pip",
         "npm_config_cache": f"{cache}/npm",
         "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/ms-playwright",
+        "BABYSIT_ARTIFACT_DIR": f"{cache}/artifacts",
         "CLAUDE_CONFIG_DIR": str(account),
     }
     assert not any("docker" in word for word in argv)
@@ -1227,7 +1228,10 @@ def test_wrapper_gives_gpg_the_agent_socket_and_public_keyring_only(checkout, gn
     assert copies == {f"{gnupghome}/{name}": "0600" for name in names}
     # Private to the user, or gpg would look for the socket in the home instead.
     dirs = [(words[2], words[0]) for words in made if words[1] == "--dir"]
-    assert dirs == [(str(p), "0700") for p in (gnupghome, path.parent.parent, path.parent)]
+    assert dirs == [
+        (f"{sandbox_cache(home, granted='gpg')}/artifacts", "0700"),
+        *[(str(p), "0700") for p in (gnupghome, path.parent.parent, path.parent)],
+    ]
     # Even a passed-through GNUPGHOME cannot point gpg elsewhere.
     assert dict(pairs(argv, "--setenv"))["GNUPGHOME"] == gnupghome
     # Signing is a grant: its cache is apart from that of launches without it.
@@ -1348,6 +1352,186 @@ def _bwrap_works():
 
 
 linux_bwrap = pytest.mark.skipif(not _bwrap_works(), reason="needs Linux with working bwrap")
+
+
+@pytest.fixture
+def cross_agent(checkout):
+    """An authenticated host and fake CLIs; no real agent or credential is used."""
+    worktree, _, home = checkout
+    codex = home / ".codex"
+    codex.mkdir()
+    (codex / "auth.json").write_text("fixture codex account")
+    default = home / ".claude"
+    named = default / "accounts/reviewer"
+    named.mkdir(parents=True)
+    for account, label in ((default, "default"), (named, "reviewer")):
+        (account / ".credentials.json").write_text(label)
+    binaries = worktree / "bin"
+    binaries.mkdir()
+    claude = binaries / "claude"
+    claude.write_text(
+        "#!/bin/sh\nconfig=${CLAUDE_CONFIG_DIR:-$HOME/.claude}\n"
+        'if [ -f "$config/.credentials.json" ]; then\n'
+        '  printf "Authenticated fixture account: "; cat "$config/.credentials.json"\n'
+        'else\n  echo "Not logged in · Please run /login" >&2; exit 1\nfi\n'
+    )
+    claude.chmod(0o755)
+    codex_cli = binaries / "codex"
+    codex_cli.write_text('#!/bin/sh\nprintf "codex fixture: %s\\n" "$CODEX_HOME"\n')
+    codex_cli.chmod(0o755)
+    env = environment(home, bwrap=None)
+    env["PATH"] = f"{binaries}:{env['PATH']}"
+
+    def run(config_option, *command, **passed):
+        return subprocess.run(
+            [
+                "bash",
+                WRAPPER,
+                f"--add-dirs={worktree}",
+                config_option,
+                *passed.pop("options", []),
+                "--",
+                *command,
+            ],
+            cwd=worktree,
+            env={**env, **passed},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+
+    return run, env, claude, codex, default, named
+
+
+def test_cross_agent_diagnostic_with_sanitized_home(cross_agent, checkout, tmp_path):
+    _, env, claude, codex, _, _ = cross_agent
+    worktree, _, home = checkout
+    host = subprocess.run(
+        [str(claude), "auth", "status", "--text"], env=env, capture_output=True, text=True
+    )
+    assert host.returncode == 0 and "account: default" in host.stdout
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    clean = {"PATH": env["PATH"], "HOME": str(empty_home), "CODEX_HOME": str(codex)}
+    isolated = subprocess.run(
+        [str(claude), "auth", "status", "--text"], env=clean, capture_output=True, text=True
+    )
+    assert isolated.returncode == 1 and "Please run /login" in isolated.stderr
+    argv = printed(worktree, environment(home), f"--codex-home={codex}", "sh")
+    # Project only the diagnostic's read-only bind into the fixture. Real mount
+    # enforcement is covered by the Linux tests below and the grant argv tests.
+    [(source, target)] = [
+        (s, t) for s, t in pairs(argv, "--ro-bind") if t == "/tmp/babysit-bin/claude"
+    ]
+    diagnostic_bin = tmp_path / "diagnostic-bin"
+    diagnostic_bin.mkdir()
+    (diagnostic_bin / "claude").symlink_to(source)
+    clean["PATH"] = f"{diagnostic_bin}:{clean['PATH']}"
+    for command in ("claude auth status --text", "claude -p 'Review the patch'"):
+        result = subprocess.run(["sh", "-c", command], env=clean, capture_output=True, text=True)
+        assert result.returncode == 2
+        assert "Codex sandbox" in result.stderr and "Claude account" in result.stderr
+        assert "host terminal" in result.stderr and "wt --claude" in result.stderr
+        assert "same agent and account" in result.stderr
+        assert "Please run /login" not in result.stderr
+        assert not result.stdout
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+@pytest.mark.parametrize("absolute", [False, True])
+def test_other_agent_diagnostic_and_artifacts_do_not_add_grants(checkout, agent, absolute):
+    worktree, common, home = checkout
+    config = home / f".{agent}"
+    config.mkdir()
+    option = "claude-config-dir" if agent == "claude" else "codex-home"
+    variable = "CLAUDE_CONFIG_DIR" if agent == "claude" else "CODEX_HOME"
+    other = "codex" if agent == "claude" else "claude"
+    env = environment(home, BABYSIT_ARTIFACT_DIR="/host")
+    argv = printed(
+        worktree,
+        env,
+        f"--{option}={config}",
+        f"--add-dirs={worktree}:{common}",
+        "--env-pass=PATH,BABYSIT_ARTIFACT_DIR",
+        f"/usr/bin/{other}" if absolute else other,
+    )
+    cache = sandbox_cache(home, variable, config.resolve())
+    assert dict(pairs(argv, "--setenv"))["BABYSIT_ARTIFACT_DIR"] == f"{cache}/artifacts"
+    assert dict(pairs(argv, "--setenv"))["PATH"] == f"/tmp/babysit-bin:{env['PATH']}"
+    assert ("--dir", f"{cache}/artifacts") in list(zip(argv, argv[1:], strict=False))
+    assert {s for s, _ in pairs(argv, "--bind")} == {
+        cache,
+        str(config),
+        str(worktree),
+        str(common),
+    }
+    assert argv[-1] == f"/tmp/babysit-bin/{other}"
+    assert not any(t == f"/tmp/babysit-bin/{agent}" for _, t in pairs(argv, "--ro-bind"))
+
+
+@linux_bwrap
+def test_host_claude_login_is_not_a_codex_sandbox_login(cross_agent):
+    run, env, claude, codex, _, _ = cross_agent
+    host = subprocess.run(
+        [str(claude), "auth", "status", "--text"], env=env, capture_output=True, text=True
+    )
+    assert host.returncode == 0 and "account: default" in host.stdout
+    # An explicit binary path bypasses the PATH diagnostic, but never the isolation.
+    isolated = run(f"--codex-home={codex}", "sh", "-c", f'"{claude}" auth status --text')
+    assert isolated.returncode == 1 and "Not logged in" in isolated.stderr
+    assert "default" not in isolated.stdout
+
+
+@linux_bwrap
+@pytest.mark.parametrize("command", ["claude auth status --text", "claude -p 'Review the patch'"])
+def test_cross_agent_review_explains_isolation_instead_of_requesting_login(cross_agent, command):
+    run, _, _, codex, _, _ = cross_agent
+    result = run(f"--codex-home={codex}", "sh", "-c", command)
+    assert result.returncode == 2
+    assert "Codex sandbox" in result.stderr and "Claude account" in result.stderr
+    assert "host terminal" in result.stderr and "wt --claude" in result.stderr
+    assert "same agent and account" in result.stderr
+    assert "Please run /login" not in result.stderr
+    assert not result.stdout
+
+
+@linux_bwrap
+@pytest.mark.parametrize("account", ["default", "reviewer"])
+def test_separate_claude_review_launch_uses_only_the_selected_account(cross_agent, account):
+    run, _, _, codex, default, named = cross_agent
+    selected = default if account == "default" else named
+    other = named if account == "default" else default
+    result = run(
+        f"--claude-config-dir={selected}",
+        "sh",
+        "-c",
+        f'test ! -e "{other}/.credentials.json" && test ! -e "{codex}/auth.json" && '
+        "claude auth status --text",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"Authenticated fixture account: {account}"
+
+
+@linux_bwrap
+def test_artifacts_persist_in_the_configuration_cache_not_the_temporary_home(cross_agent, checkout):
+    run, _, _, codex, _, _ = cross_agent
+    _, _, home = checkout
+    result = run(
+        f"--codex-home={codex}",
+        "sh",
+        "-c",
+        'mkdir -p "$HOME/src/agent-artefacts/outbox" && '
+        'echo ephemeral > "$HOME/src/agent-artefacts/outbox/review.txt" && '
+        'echo persistent > "$BABYSIT_ARTIFACT_DIR/review.txt"',
+        BABYSIT_ARTIFACT_DIR="/wrong",
+        options=["--env-pass=BABYSIT_ARTIFACT_DIR"],
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (home / "src/agent-artefacts/outbox/review.txt").exists()
+    artifacts = Path(sandbox_cache(home, "CODEX_HOME", codex.resolve())) / "artifacts"
+    assert (artifacts / "review.txt").read_text() == "persistent\n"
+    again = run(f"--codex-home={codex}", "sh", "-c", 'cat "$BABYSIT_ARTIFACT_DIR/review.txt"')
+    assert again.returncode == 0 and again.stdout == "persistent\n"
 
 
 @linux_bwrap

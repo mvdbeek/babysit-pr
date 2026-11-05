@@ -1060,6 +1060,15 @@ not to start it again. The
 dashboard shows "Started by …" (the asking agent, its directory, machine and session)
 in the operation and on the sub-task's Workspaces row.
 
+An explicitly requested cross-agent review needs a separate user launch: from a host
+terminal on the intended worker, use `wt --claude --claude-account default -r REPO
+--machine local -F BRIEF BASE REVIEW_BRANCH` (or select a named account). `REPO` names
+a local clone. Brokered sub-tasks keep the asking agent and account; host re-login
+does not expose Claude's account to a Codex sandbox. See
+[the sandbox guidance](references/supervisor.md#sub-tasks-from-a-sandbox). On Linux,
+save reports in `$BABYSIT_ARTIFACT_DIR` for persistence on the worker host;
+`~/src/agent-artefacts/outbox` is temporary unless explicitly granted.
+
 Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
 the planning code without processes and the whole tool against temporary
 repositories with fake `gh`, `herdr`, `tmux`, `cmux` and agent executables.

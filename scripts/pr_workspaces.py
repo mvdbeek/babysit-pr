@@ -1894,7 +1894,18 @@ class Workspaces:
         if not SLUG.fullmatch(launch["repo"]):
             raise ValueError("Choose a repository")
         if launch["agent"] != parent["agent"]:
-            raise ValueError(f"A sub-task runs {parent['agent']}, as the launch asking does")
+            agent = launch["agent"]
+            option = (
+                "--claude --claude-account <account|default>" if agent == "claude" else "--codex"
+            )
+            raise ValueError(
+                f"A sub-task runs {parent['agent']}, as the launch asking does. "
+                "Brokered sub-tasks keep the same agent and account. "
+                "For an explicitly requested cross-agent review, start a separate sandbox "
+                f"from the host terminal on the intended worker with wt {option} -r REPO "
+                "--machine local -F BRIEF BASE REVIEW_BRANCH (REPO names a local clone). "
+                "Host re-login will not change this configuration isolation; nothing was started"
+            )
         request = dict(launch)
         if launch["agent"] == "claude":
             account = parent_account(parent)

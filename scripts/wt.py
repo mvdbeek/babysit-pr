@@ -190,7 +190,12 @@ Safehouse on macOS without a grant for ~/src/<repo>) wt makes no worktree: it ha
 new <branch> from <base> with a prompt to the controller's dashboard, which places it
 (auto unless --machine names a machine) and starts it sandboxed. There -r also takes
 owner/name, which a sandbox that cannot read the clone needs; --docker needs a launch
-that has Docker itself.
+that has Docker itself. Brokered sub-tasks keep the same agent and account. For an
+explicitly requested cross-agent review, start a separate sandbox from the host
+terminal with --claude --claude-account <account|default> or --codex. Host re-login
+does not change the worker sandbox's isolated HOME or expose another agent's account.
+On Linux, save reports under $BABYSIT_ARTIFACT_DIR (the persistent sandbox cache's
+artifacts directory), or an explicitly granted worktree; other HOME paths are temporary.
 
 dashboard options (a new branch from the remote default branch unless <base> is given):
   wt --name <branch> [--repo-path <clone>] [--worktree-root <dir>] [--label <label>]
