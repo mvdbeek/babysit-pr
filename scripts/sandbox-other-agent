@@ -1,0 +1,16 @@
+#!/bin/sh
+# A diagnostic on babysit-bwrap's PATH, bound read-only under the other CLI's name.
+# This is guidance, not an authorization check: explicit executable paths still run
+# with the same isolated HOME. The broker/controller enforce sub-task authorization.
+case ${0##*/} in
+  claude) selected=Codex; requested=Claude; option='--claude --claude-account <account|default>' ;;
+  codex) selected=Claude; requested=Codex; option=--codex ;;
+  *) printf '%s\n' 'Invoke this diagnostic as claude or codex.' >&2; exit 2 ;;
+esac
+printf '%s\n' \
+  "babysit-bwrap: this $selected sandbox has no $requested account mounted." \
+  'Its HOME and agent configuration are isolated; re-login on the host will not change this namespace.' \
+  'Brokered wt sub-tasks keep the same agent and account.' \
+  "For an explicitly requested cross-agent review, start a separate sandbox from the host terminal on the intended worker with wt $option -r REPO --machine local -F BRIEF BASE REVIEW_BRANCH." \
+  'REPO names a local clone. Select the intended account there. Share the exact commit/diff through the repository or an explicitly granted path; private account caches are separate.' >&2
+exit 2

@@ -421,6 +421,31 @@ agents keep job control only where the kernel already blocks injection.
 launches on Linux invoke the wrapper directly; there are no shell functions there
 to rely on.
 
+Only the selected agent's account is mounted. A Codex sandbox has no host Claude
+login, even when `HOME`, the username and `/usr/bin/claude` match the host. Signing in
+again on the host cannot change an existing mount namespace. The other CLI's command
+name on the sandbox's `PATH` gives an isolation diagnostic instead of misleading
+login advice. An explicit path nested inside a shell can bypass that diagnostic,
+but still sees the same isolated HOME. This helper is guidance; authorization stays
+with the launcher and broker. A host update requires a fresh sandbox launch to get
+the helper and environment below.
+
+Save reports in `$BABYSIT_ARTIFACT_DIR`, created under the persistent sandbox cache
+as `artifacts/`, or in an explicitly granted worktree. For example:
+
+```sh
+printf '%s\n' 'Review findings for COMMIT' > "$BABYSIT_ARTIFACT_DIR/review.txt"
+printf '%s\n' "$BABYSIT_ARTIFACT_DIR/review.txt"
+```
+
+The printed absolute path also names the file on the worker host. Other home paths,
+including `~/src/agent-artefacts/outbox`, are temporary unless explicitly granted.
+The artifact directory inherits the cache's agent configuration and grant separation:
+another account or a launch with different grants cannot use it as a shared inbox.
+Keep secrets out of reports and transcripts; hand another reviewer the repository's
+exact commit/diff or an explicitly granted artifact path rather than copying account
+stores or widening access to a private cache.
+
 Provisioning a Linux worker (bubblewrap under AppArmor, rootless Docker, accounts)
 is in [the worker setup checklist](worker-setup.md).
 
@@ -841,6 +866,30 @@ New task only when:
   first listed); a worker uses its own clone, creating it when missing as for New task.
 
 A sub-task always runs sandboxed: New task has no other launch, here or on a worker.
+Cross-agent review requests do not override the same-agent/account rule, even when
+the brief explicitly asks for one. The refusal explains this isolation and starts
+nothing. For an authorized Claude review from Codex, the user starts a separate
+sandboxed launch from a host terminal on the intended worker (outside the asking
+sandbox), selecting the intended account explicitly, for example:
+
+```sh
+wt --claude --claude-account default -r REPO --machine local \
+  -F /absolute/path/to/review-brief.md BASE REVIEW_BRANCH
+```
+
+`REPO` names the local clone under `~/src`, not an `owner/name` slug. To launch from
+the controller's host terminal instead, use its local clone name and
+`--machine MACHINE` to select the worker. A worker's host terminal refuses that
+remote placement option, so use `--machine local` there.
+
+Use a named account instead of `default` when appropriate. The brief should identify
+the repository, exact SHA, review scope and output path, including any restrictions
+on edits or posting reviews. A Codex review uses `--codex` instead of the Claude
+options. This is a user launch through the trusted launcher, not an agent bypass of
+the broker. Confirm the resulting agent, account, machine, branch and worktree and
+that the agent received the brief; an idle workspace alone is not a completed review.
+No controller credentials or other account stores are exposed to the asking sandbox.
+
 A worker's request is answered once the operation is recorded and the worker's request
 limits are released, after waiting up to 240 s for the launch; it gets the operation
 without its log. From then on nothing is a refusal: an operation that cannot be read is

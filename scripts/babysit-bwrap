@@ -222,6 +222,17 @@ granted=${granted#,}
 # Everything below must keep a launch without these grants from leaving code for a
 # launch with them, of any agent of the same configuration, to run.
 command=("$@")
+other_agent=
+if [[ -n $config_var ]]; then
+  other_agent=codex
+  [[ $config_var == CLAUDE_CONFIG_DIR ]] || other_agent=claude
+  # Also diagnose an absolute CLI path when it is the command being launched.
+  # Nested explicit paths still see the isolated HOME; the PATH helper below is
+  # guidance, never a substitute for the broker/controller's authorization.
+  if [[ ${command[0]##*/} == "$other_agent" ]]; then
+    command=("/tmp/babysit-bin/$other_agent" "${command[@]:1}")
+  fi
+fi
 if [[ -n $granted && $config_var == CLAUDE_CONFIG_DIR ]]; then
   # Claude rewrites .claude.json all the time, so it stays writable, and the MCP servers
   # any agent of the account adds there start with Claude: a granted Claude starts none.
@@ -240,6 +251,9 @@ cache=$home/.cache/babysit-sandbox/${key:0:16}
 # Writable: the sandbox cache, the agent configuration and the explicit grants. They
 # come before every read-only bind, so none of them can shadow one.
 argv+=(--bind "$cache" "$cache")
+# Create the persistent outbox inside the namespace, after binding the cache. Do
+# not follow an agent-writable cache entry from the host to create directories.
+argv+=(--perms 0700 --dir "$cache/artifacts")
 [[ -z $config_var ]] || grant "$config_dir"
 granted_dirs=()
 for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
@@ -458,6 +472,11 @@ if [[ -f $home/.config/babysit-pr/worker.json && ${self%/*} == */scripts ]]; the
   argv+=(--ro-bind "$deployed" "$deployed")
 fi
 
+if [[ -n $other_agent ]]; then
+  argv+=(--dir /tmp/babysit-bin
+    --ro-bind "${self%/*}/sandbox-other-agent" "/tmp/babysit-bin/$other_agent")
+fi
+
 for name in PATH HOME TERM LANG USER ${env_pass[@]+"${env_pass[@]}"}; do
   [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid variable name $name"
   if [[ -n ${!name+set} ]]; then
@@ -467,7 +486,9 @@ done
 # Last, so no --env-pass name can point an agent at host caches or another configuration.
 argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
   --setenv PIP_CACHE_DIR "$cache/pip" --setenv npm_config_cache "$cache/npm"
-  --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright")
+  --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright"
+  --setenv BABYSIT_ARTIFACT_DIR "$cache/artifacts")
+[[ -z $other_agent ]] || argv+=(--setenv PATH "/tmp/babysit-bin:${PATH:-/usr/bin:/bin}")
 [[ -z $config_var ]] || argv+=(--setenv "$config_var" "$config_dir")
 ((!gpg)) || argv+=(--setenv GNUPGHOME "$gnupghome")
 # Inside, $HOME is empty: a worker's agent learns it is on one from this, set last so
