@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import dashboard
+import exit_watch
 import issue_overview
 import machines
 import pr_workspaces as pw
@@ -628,7 +629,50 @@ def test_viewer_recovers_a_closed_workspace_after_restart(local, route):
             thread.join(5)
 
 
-@pytest.mark.parametrize("change", ["branch", "common", "missing", "ambiguous", "unknown"])
+def test_viewed_workspace_still_takes_messages_once_closed_after_restart(local):
+    """A workspace no operation opened: once viewed, a restart does not lose its checkout,
+    so a message resumes one of its sessions instead of being refused."""
+    manager, _, _, state, _ = local
+    path = make_checkout(local)
+    space(state, path, manager.src / "repo", wid="review-space")
+    sid = "01a1064c-4c81-7232-ad79-a967ee51fac2"
+    session = (
+        Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "11" / "05" / f"rollout-{sid}.jsonl"
+    )
+    session.parent.mkdir(parents=True)
+    session.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(path)}}) + "\n"
+    )
+
+    def agents(workspaces):
+        with dashboard.DashboardServer(manager.home, 0, workspaces=workspaces) as httpd:
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=10)
+                conn.request("GET", "/api/workspace-agents?workspace=review-space")
+                response = conn.getresponse()
+                value = json.loads(response.read())
+                conn.close()
+            finally:
+                httpd.shutdown()
+                thread.join(5)
+        assert response.status == 200, value
+        return value
+
+    assert agents(manager)["path"] == str(path.resolve())
+    data = json.loads(state.read_text())
+    data["workspaces"] = []
+    state.write_text(json.dumps(data))
+    workspace_viewer._checkouts.clear()
+    restarted = pw.Workspaces(manager.home, manager.overview, lambda: [], manager.src)
+    value = agents(restarted)
+    assert value["path"] == str(path.resolve())
+    assert value["agents"] == [] and value["workspace"] is None
+    assert [session["id"] for session in value["sessions"]] == [sid]
+
+
+@pytest.mark.parametrize("change", ["branch", "common", "missing", "unknown"])
 def test_recorded_workspace_recovery_rejects_unverified_checkouts(local, change):
     manager, pr, git, _, _ = local
     path = make_checkout(local)
@@ -640,18 +684,51 @@ def test_recorded_workspace_recovery_rejects_unverified_checkouts(local, change)
         git("switch", "-c", "other-branch", cwd=path)
     elif change == "missing":
         shutil.rmtree(path)
-    elif change == "ambiguous":
-        manager.save_operation(
-            {
-                "id": "other-operation",
-                "pr": pr["id"],
-                "result": {**result, "path": str(manager.src / "repo")},
-            }
-        )
     workspace_id = "unknown-space" if change == "unknown" else "closed-space"
     assert manager.recorded_checkout(workspace_id) is None
     with pytest.raises(ValueError, match="not open"):
         workspace_viewer.workspace_checkout(workspace_id, manager.recorded_checkout)
+
+
+@pytest.mark.parametrize("newest", ["operation", "exit watch", "viewed"])
+def test_a_reused_workspace_id_recovers_its_newest_checkout(local, newest):
+    """A restarted herdr hands its IDs out again: an older record names another checkout."""
+    manager, pr, git, _, _ = local
+    old = make_checkout(local)
+    git("branch", "second")
+    path = make_checkout(local, "second", "second")
+    manager.save_operation(
+        {
+            "id": "old-operation",
+            "pr": pr["id"],
+            "result": {**pw.checkout(old), "workspace_id": "w3"},
+        }
+    )
+    if newest == "operation":
+        manager.save_operation(
+            {
+                "id": "new-operation",
+                "pr": pr["id"],
+                "result": {**pw.checkout(path), "workspace_id": "w3"},
+            }
+        )
+    elif newest == "exit watch":
+        # `wt --exit-when-done` records the checkout and workspace, with no repository.
+        exit_watch.register(
+            manager.home,
+            {"id": "watch", "path": str(path), "workspace_id": "w3", "created_at": time.time() + 1},
+        )
+    else:
+        manager.note_viewed("w3", str(path.resolve()))
+    restarted = pw.Workspaces(manager.home, manager.overview, lambda: [], manager.src)
+    assert restarted.recorded_checkout("w3") == str(path.resolve())
+    assert workspace_viewer.workspace_checkout("w3", restarted.recorded_checkout) == str(
+        path.resolve()
+    )
+    # The newest names a checkout no longer on its branch: never an older one instead.
+    git("switch", "-q", "-c", "elsewhere", cwd=path)
+    if newest != "exit watch":
+        assert restarted.recorded_checkout("w3") is None
 
 
 def test_recover_reservation_before_association_was_saved(local):

@@ -748,6 +748,8 @@ class Workspaces:
         self.refreshing = False
         self.pruned_at = 0.0
         self.history_pruned_at = 0.0
+        # The checkouts noted for viewed workspaces, so polls do not write them again.
+        self.viewed: dict[str, str] = {}
         # The snapshot requests waiting for the next computation, and the turn to compute.
         self.flight: concurrent.futures.Future | None = None
         self.flight_lock = threading.Lock()
@@ -768,6 +770,11 @@ class Workspaces:
             db.execute("CREATE TABLE IF NOT EXISTS operations (pr TEXT PRIMARY KEY, data TEXT)")
             db.execute(
                 "CREATE TABLE IF NOT EXISTS operation_history (id TEXT PRIMARY KEY, data TEXT)"
+            )
+            # The checkout each herdr workspace the viewer read was open on, so a viewer
+            # still names it once the workspace closes, across dashboard restarts.
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS viewed_workspaces (id TEXT PRIMARY KEY, data TEXT)"
             )
             # The check, the table and its seed commit together, so a failed seed retries.
             db.execute("BEGIN IMMEDIATE")
@@ -2744,31 +2751,78 @@ class Workspaces:
             row = db.execute("SELECT data FROM operation_history WHERE id=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
-    def recorded_checkout(self, workspace_id):
-        """Recover a closed workspace's checkout from a verified operation result.
+    def note_viewed(self, workspace_id, root, machine=None):
+        """Remember the checkout a viewed workspace was open on, as recovery checks it.
 
-        A saved result can outlive herdr's ID and the viewer's in-memory cache. Require
-        its repository and branch to still match before exposing the recorded checkout.
+        A worker's is keyed by its qualified ID, with its path as that worker spells it.
         """
+        key = machines.qualify(machine.id, workspace_id) if machine else workspace_id
+        if self.viewed.get(key) == root:
+            return
+        if machine is None:
+            item = checkout(root)
+            if not item:
+                return
+            record = {name: item[name] for name in ("path", "common", "branch")}
+        else:
+            record = {"path": root}
         with self.db() as db:
-            records = db.execute(
+            db.execute(
+                "INSERT OR REPLACE INTO viewed_workspaces VALUES (?,?)",
+                (key, json.dumps({**record, "seen_at": time.time()})),
+            )
+        self.viewed[key] = root
+
+    def recorded_checkout(self, workspace_id, machine=None):
+        """Recover a closed workspace's checkout from its newest record: where the viewer
+        read it, an operation's result, or an exit watch.
+
+        Each can outlive herdr's ID and the viewer's in-memory cache. A restarted herdr
+        hands its IDs out again, so an older record may name another checkout: only the
+        newest counts. Here it must still be the top of a checkout, on the recorded
+        repository and branch where those were recorded. A worker's records name it by
+        its qualified ID, and the worker's probe checks the path when it reads it.
+        """
+        key = machines.qualify(machine.id, workspace_id) if machine else workspace_id
+        with self.db() as db:
+            viewed = db.execute(
+                "SELECT data FROM viewed_workspaces WHERE id = ?", (key,)
+            ).fetchall()
+            operations = db.execute(
                 "SELECT data FROM operation_history "
                 "WHERE json_extract(data, '$.result.workspace_id') = ?",
-                (workspace_id,),
+                (key,),
             ).fetchall()
-        results = [json.loads(row[0])["result"] for row in records]
-        identities = {
-            (result.get("path"), result.get("common"), result.get("branch")) for result in results
-        }
-        if len(identities) != 1:
+            watches = db.execute(
+                "SELECT data FROM exit_watches WHERE json_extract(data, '$.workspace_id') = ?",
+                (key,),
+            ).fetchall()
+        # (when, path, (repository, branch) or None where only the path was recorded)
+        records = []
+        for (data,) in viewed:
+            record = json.loads(data)
+            identity = None if machine else (record.get("common"), record.get("branch"))
+            records.append((record.get("seen_at") or 0, record.get("path"), identity))
+        for (data,) in operations:
+            op = json.loads(data)
+            result = op["result"]
+            identity = None if machine else (result.get("common"), result.get("branch"))
+            when = op.get("updated_at") or op.get("created_at") or 0
+            records.append((when, result.get("path"), identity))
+        for (data,) in watches:
+            watch = json.loads(data)
+            records.append((watch.get("created_at") or 0, watch.get("path"), None))
+        if not records:
             return None
-        path, common, branch = identities.pop()
-        if not path or not common or not branch:
+        _, path, identity = max(records, key=lambda record: record[0])
+        if not isinstance(path, str) or not path:
             return None
+        if machine is not None:
+            return path
         item = checkout(path)
-        if item and item["common"] == common and item["branch"] == branch:
-            return item["path"]
-        return None
+        if not item or identity is not None and (item["common"], item["branch"]) != identity:
+            return None
+        return item["path"]
 
     def prune_history(self, now=None):
         """Forget month-old finished operations, exit watches and month-missing checkouts;
@@ -2814,6 +2868,12 @@ class Workspaces:
                                       ORDER BY json_extract(data,'$.created_at') DESC LIMIT ?))""",
                 (cutoff, LAUNCH_HISTORY),
             )
+            # Still viewed, they are noted again, with the time.
+            db.execute(
+                "DELETE FROM viewed_workspaces WHERE json_extract(data,'$.seen_at') < ?",
+                (cutoff,),
+            )
+            self.viewed.clear()
             for key, path, data in db.execute("SELECT pr,path,data FROM associations").fetchall():
                 record = json.loads(data)
                 if os.path.lexists(path):

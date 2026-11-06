@@ -22,11 +22,13 @@ from urllib.parse import quote
 
 import dashboard
 import machines
+import pr_workspaces as pw
 import pytest
 import remote_probe
 import workspace_overview as wso
 import workspace_viewer as wv
 from playwright.sync_api import expect
+from test_pr_workspaces_snapshot import Listed
 from test_remote_inventory import MINI, git, make_clone, read, register
 from test_workspace_overview import FakeGitHub, request
 from test_workspace_overview_browser import row
@@ -431,6 +433,34 @@ def test_views_resolve_worker_rows_and_ids_on_the_server(worker, dashboard_site,
     assert status == 400 and "Mac mini probe failed (unreachable)" in value["error"]
     status, value = request(port, f"/api/workspace-diff?key={quote(str(worker.local), safe='')}")
     assert status == 200 and value["untracked"] == ["local.txt"]
+
+
+def test_a_closed_worker_workspace_still_takes_messages_after_a_restart(worker, short_tmp):
+    """Viewed once, a worker's workspace closed and forgotten by a restart still names its
+    checkout, so a message resumes one of its sessions there."""
+
+    def agents():
+        workspaces = pw.Workspaces(worker.home, Listed("prs", []), lambda: [], short_tmp / "src")
+        with dashboard.DashboardServer(worker.home, 0, workspaces=workspaces) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                return request(server.server_port, "/api/workspace-agents?workspace=mini%2Fw1")
+            finally:
+                server.shutdown()
+                thread.join(3)
+
+    status, value = agents()
+    assert status == 200 and value["path"] == str(worker.checkout), value
+    store = read(worker.state)
+    store["machines"]["Mac mini"]["workspaces"] = []
+    worker.state.write_text(json.dumps(store))
+    wv._checkouts.clear()
+    status, value = agents()
+    assert status == 200, value
+    assert value["path"] == str(worker.checkout)
+    assert value["agents"] == [] and value["workspace"] is None
+    assert CLAUDE_SID in [session["id"] for session in value["sessions"]]
 
 
 @pytest.mark.browser

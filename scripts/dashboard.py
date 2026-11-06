@@ -590,9 +590,24 @@ class DashboardServer(ThreadingHTTPServer):
         )
 
     def workspace_checkout(self, workspace_id):
-        return workspace_viewer.workspace_checkout(
-            workspace_id, self.workspaces.recorded_checkout if self.workspaces else None
+        if not self.workspaces:
+            return workspace_viewer.workspace_checkout(workspace_id)
+        root = workspace_viewer.workspace_checkout(workspace_id, self.workspaces.recorded_checkout)
+        # Kept past a restart: a message to it once closed resumes a session there.
+        self.workspaces.note_viewed(workspace_id, root)
+        return root
+
+    def remote_checkout(self, machine, workspace_id):
+        """``workspace_checkout`` for a worker's workspace, as that worker spells it."""
+        if not self.workspaces:
+            return workspace_viewer.remote_checkout(machine, workspace_id)
+        root = workspace_viewer.remote_checkout(
+            machine,
+            workspace_id,
+            lambda wid: self.workspaces.recorded_checkout(wid, machine),
         )
+        self.workspaces.note_viewed(workspace_id, root, machine)
+        return root
 
     def handle_error(self, request, client_address):
         # A phone that sleeps or loses the tailnet mid-request is routine, not a fault.
@@ -1580,6 +1595,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     if machine is None:
                         self.server.workspace_checkout(workspace_id)
+                    else:
+                        self.server.remote_checkout(machine, workspace_id)
                 if workspace_id is None:
                     # Nobody to message, but a recorded session can be resumed.
                     value = {
@@ -1643,7 +1660,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Read-only views own their failure boundary, like the inventory.
                 try:
                     if machine is not None and path is None:
-                        path = workspace_viewer.remote_checkout(machine, workspace_id)
+                        path = self.server.remote_checkout(machine, workspace_id)
                     elif path is None:
                         path = self.server.workspace_checkout(workspace_id)
                     if route.path == "/api/workspace-diff":
