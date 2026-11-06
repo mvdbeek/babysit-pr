@@ -148,6 +148,8 @@
     if (!handling) return null;
     if (["queued", "running"].includes(handling.status))
       return { label: "Starting agent…", tone: "amber", detail: handling.message };
+    if (handling.status === "waiting")
+      return { label: "Waiting for room", tone: "amber", detail: handling.message };
     if (handling.path)
       return {
         label: handling.workspace_url ? "Being handled" : "Checkout exists",
@@ -292,7 +294,7 @@
         );
       cell.append(state);
     }
-    const starting = ["queued", "running"].includes(entry.handling?.status);
+    const starting = ["queued", "running", "waiting"].includes(entry.handling?.status);
     const handleButton = button(work && !starting ? "Handle again" : "Handle", () => handle(entry));
     handleButton.dataset.focus = "handle";
     handleButton.disabled = starting;

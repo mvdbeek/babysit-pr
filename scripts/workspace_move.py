@@ -719,17 +719,18 @@ def placement_request(src, override):
     }
 
 
-def target(home, workspaces, src, wanted):
+def target(home, workspaces, src, wanted, fresh=False):
     """Where the agent would go: (options, machine or None, why not), as New task places.
 
     Never this machine; a machine that cannot take it or is full is refused, as are
     labels it lacks (its sandbox, the Claude account, Docker, the repository's needs).
+    ``fresh``, for the move itself, first waits for the machines' loads to answer.
     """
     if wanted not in (None, "auto") and (
         not isinstance(wanted, str) or not machines.ID.fullmatch(wanted)
     ):
         raise ValueError("Choose a machine or Auto")
-    config, loads = workspaces.loads.snapshot()
+    config, loads = workspaces.loads.current() if fresh else workspaces.loads.snapshot()
     reservations = workspaces.reservations()
     req = placement.request(
         placement_request(src, wanted or "auto"), config["repos"], config.get("docker")
@@ -1311,7 +1312,9 @@ class Move:
                 "confirm_working",
                 plan=public(src),
             )
-        _, chosen, error = target(self.home, self.workspaces, src, request.get("machine"))
+        _, chosen, error = target(
+            self.home, self.workspaces, src, request.get("machine"), fresh=True
+        )
         if chosen is None:
             raise Refused(error or "No machine can take this agent", "target")
         self.machine = chosen["machine"]

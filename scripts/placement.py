@@ -43,6 +43,19 @@ class Exclusion(NamedTuple):
     why: str
     # Full or not yet checked: an explicit choice may still take it; Auto never does.
     soft: bool
+    # Full or not yet checked: a launch that waits for room may take it later.
+    room: bool = False
+
+
+class NoRoom(ValueError):
+    """No machine a launch may use has room for it now; it can wait for some.
+
+    ``machine`` is the registry id it waits for, None for this machine or under Auto.
+    """
+
+    def __init__(self, message, machine=None):
+        super().__init__(message)
+        self.machine = machine
 
 
 def request(fields, repos, docker=None):
@@ -121,16 +134,16 @@ def exclusions(req, machines, loads, reservations, now):
             excluded[machine_id] = Exclusion(f"no clone of {req['repo']}", True)
         elif machine_id != LOCAL and (stale or load.get("pending") or job_clone is None):
             # No load (or, for a cron job, clone listing) has come back yet.
-            excluded[machine_id] = Exclusion("checking…", True)
+            excluded[machine_id] = Exclusion("checking…", True, True)
         elif machine_id != LOCAL and used >= machine.max_agents:
-            excluded[machine_id] = Exclusion(f"full ({used}/{machine.max_agents})", True)
+            excluded[machine_id] = Exclusion(f"full ({used}/{machine.max_agents})", True, True)
         elif machine_id != LOCAL and req.get("also"):
             # The other clones are picked from this machine's; a worker has them only
             # where someone cloned them, so only a person sends the task there.
             excluded[machine_id] = Exclusion("takes other repositories only when chosen", True)
     used, total = busy(LOCAL, loads, reservations), slots(LOCAL, machines, loads)
     if LOCAL not in excluded and used >= total:
-        excluded[LOCAL] = Exclusion(f"full ({used}/{total})", True)
+        excluded[LOCAL] = Exclusion(f"full ({used}/{total})", True, True)
     return excluded
 
 
@@ -195,7 +208,7 @@ def free(machine_id, machines, loads, reservations):
     return f"{max(0, total - busy(machine_id, loads, reservations))}/{total} free"
 
 
-def choose(req, machines, loads, history, reservations, *, now=None, local=True):
+def choose(req, machines, loads, history, reservations, *, now=None, local=True, wait=False):
     """The machine ``req`` runs on, or ValueError naming why each machine could not take it.
 
     An explicit choice (``override``) wins, then a pin, and the two must agree; Auto
@@ -204,7 +217,9 @@ def choose(req, machines, loads, history, reservations, *, now=None, local=True)
     candidates always resolve the same way.
     Auto only considers workers registered with ``auto``, and this machine when it is
     full only if nothing else can take the launch. Without ``local`` this machine is
-    never chosen, by name or by Auto.
+    never chosen, by name or by Auto. With ``wait`` no machine without room (full, or
+    not checked yet) is chosen, by name or by Auto: NoRoom says why, so the launch can
+    wait for one.
     """
     now = time.time() if now is None else now
     found = exclusions(req, machines, loads, reservations, now)
@@ -217,6 +232,11 @@ def choose(req, machines, loads, history, reservations, *, now=None, local=True)
     def named(machine_id, reason):
         known(machine_id)
         exclusion = found.get(machine_id)
+        if exclusion and exclusion.room and wait:
+            raise NoRoom(
+                f"{label(machine_id, machines)}: {exclusion.why}",
+                None if machine_id == LOCAL else machine_id,
+            )
         if exclusion and not exclusion.soft:
             raise ValueError(f"{label(machine_id, machines)}: {exclusion.why}")
         if exclusion:
@@ -239,6 +259,11 @@ def choose(req, machines, loads, history, reservations, *, now=None, local=True)
     offered = {*([LOCAL] if local else []), *(m for m, machine in machines.items() if machine.auto)}
     candidates = [machine_id for machine_id in offered if machine_id not in found]
     here = found.get(LOCAL)
+    reasons = "; ".join(
+        f"{label(m, machines)}: {why}" for m, why in sorted(excluded.items()) if local or m != LOCAL
+    )
+    if not candidates and wait and any(found[m].room for m in offered):
+        raise NoRoom(reasons)
     if not candidates and local and here and here.soft:
         # Full, not unable: as before workers existed, it still takes the launch.
         return Placement(
@@ -248,11 +273,6 @@ def choose(req, machines, loads, history, reservations, *, now=None, local=True)
             excluded,
         )
     if not candidates:
-        reasons = "; ".join(
-            f"{label(m, machines)}: {why}"
-            for m, why in sorted(excluded.items())
-            if local or m != LOCAL
-        )
         raise ValueError(f"No machine can take this launch ({reasons})")
 
     def rank(machine_id):

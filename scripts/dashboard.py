@@ -125,6 +125,7 @@ ACTIONS = frozenset(
         "workspace-new",
         "workspace-subtask",
         "schedule-cancel",
+        "waiting-cancel",
         "workspace-cleanup",
         "workspace-open",
         "workspace-message",
@@ -1263,6 +1264,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Workspace actions are not enabled")
                 self.send_json(
                     200, {"task": self.server.workspaces.cancel_scheduled(request["id"])}
+                )
+                return
+            if action == "waiting-cancel":
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(
+                    200, {"operation": self.server.workspaces.cancel_waiting(request["id"])}
                 )
                 return
             if action == "feedback":

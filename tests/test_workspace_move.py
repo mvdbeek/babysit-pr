@@ -92,7 +92,7 @@ class Placing:
     def __init__(self, home, **loads):
         self.home = home
         self.extra = loads
-        self.loads = SimpleNamespace(snapshot=self.snapshot)
+        self.loads = SimpleNamespace(snapshot=self.snapshot, current=self.snapshot)
 
     def snapshot(self):
         config = machines.load_config(self.home)

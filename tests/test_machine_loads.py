@@ -563,7 +563,7 @@ def test_a_workers_clones_are_kept_on_a_slow_ttl_until_they_go_stale(tmp_path, m
     assert stale["mini"]["clones"] is None
     req = {"kind": "cron", "repo": "base/repo", "sandboxed": True}
     found = pw.placement.exclusions(req, config["machines"], stale, {}, later)
-    assert found["mini"] == pw.placement.Exclusion("checking…", True)
+    assert found["mini"] == pw.placement.Exclusion("checking…", True, True)
 
 
 def test_this_machine_says_it_is_still_counting_before_its_first_scan(local):  # noqa: F811

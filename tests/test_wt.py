@@ -2367,6 +2367,18 @@ def test_refused_failed_and_unreachable_launches_name_the_reason(tmp_path, dashb
         away.launch_elsewhere("wt", parsed, "auto")
 
 
+def test_a_launch_waiting_for_room_is_reported_and_left_to_the_controller(tmp_path, dashboard):
+    dashboard.launch(status="waiting", message="Waiting for room: Chonk: full (6/6)", now=True)
+    t = controller(tmp_path, dashboard)
+    parsed = options(prompt="go", positional=["main", "feat"])
+    assert t.launch_elsewhere("wt", parsed, "chonk") is True
+    # Nothing follows it: it may start hours later.
+    assert dashboard.paths() == [("POST", "/api/workspace-new")]
+    said = t.stderr.getvalue().splitlines()
+    assert said[0] == "wt: Waiting for room: Chonk: full (6/6)"
+    assert "starts it once there is room" in said[1] and said[1].endswith("start it again")
+
+
 def test_wt_docker_starts_on_the_docker_worker_end_to_end(repo, tmp_path, monkeypatch, dashboard):
     home, git, state = repo
     registry(home / ".local/state/babysit-pr")

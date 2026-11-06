@@ -2237,7 +2237,8 @@ class Tool:
     def follow_launch(
         self, command: str, transport: DashboardTransport | BrokerTransport, op: dict[str, object]
     ) -> None:
-        """Wait for the controller's launch to finish, reporting its progress on stderr."""
+        """Wait for the controller's launch to finish, or to wait for room on its machine,
+        reporting its progress on stderr."""
         import time
 
         deadline = time.monotonic() + LAUNCH_WAIT
@@ -2254,6 +2255,14 @@ class Tool:
                     url = f" ({result['url']})" if result.get("url") else ""
                     machine = result.get("machine_label") or "the controller"
                     self.warn(f"{command}: {where} on {machine}{url}")
+                return
+            if status == "waiting":
+                # Started by the controller once there is room, hours later perhaps.
+                self.warn(
+                    f"{command}: the controller starts it once there is room, or gives up "
+                    "after a few hours; its dashboard lists it under Scheduled. Do not "
+                    "start it again"
+                )
                 return
             poll = transport.status
             # From a worker's sandbox there is no dashboard to look at: never retry.

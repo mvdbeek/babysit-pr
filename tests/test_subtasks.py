@@ -149,9 +149,10 @@ def captured(manager):
     """What ``subtask`` hands New task, which then starts nothing."""
     asked = []
 
-    def new_task(request, parent=None):
+    def new_task(request, parent=None, room=None, **_):
         asked.append((request, parent))
-        return {"operation": {"pr": "new:x", "status": "queued", "parent": parent}}
+        status = "queued" if room is None else "waiting"
+        return {"operation": {"pr": "new:x", "status": status, "parent": parent, "room": room}}
 
     manager.new_task = new_task
     return asked
@@ -284,14 +285,17 @@ def test_a_parent_launch_and_its_machine_start_only_so_many_an_hour(local, monke
         manager.subtask(launch(), parent(cwd="/third"))
 
 
-def test_a_subtask_never_takes_a_full_machine_or_too_many_subtask_slots(local):  # noqa: F811
+def test_a_subtask_waits_for_a_full_machine_or_too_many_subtask_slots(local):  # noqa: F811
     manager, *_ = local
-    # Full: Auto would still start a person's task here; a sub-task waits.
+    # Full: Auto would still start a person's task here; a sub-task waits for room.
     pw.dashboard_settings.save(manager.home, {"local_max_agents": 1})
     manager.inventory = {**manager.inventory, "workspaces": [{"agent_status": "working"}]}
-    with pytest.raises(ValueError, match=r"^This machine: full \(1/1\); a sub-task waits"):
-        manager.subtask(launch(), parent())
+    op = manager.subtask(launch(), parent())["operation"]
+    assert op["status"] == "waiting", op
+    assert op["message"] == "Waiting for room: This machine: full (1/1)"
+    assert op["machine"] is None and op["parent"]["depth"] == 1
     pw.dashboard_settings.save(manager.home, {"local_max_agents": 20})
+    manager.cancel_waiting(op["pr"])
     # Working sub-task agents here: launches under way, and checkouts with a working
     # agent; one idle agent left open does not count.
     live = manager.src / "worktrees/repo/live"
@@ -315,8 +319,9 @@ def test_a_subtask_never_takes_a_full_machine_or_too_many_subtask_slots(local): 
     manager.subtask(launch(), parent())  # Three: there is room for one more.
     assert len(asked) == 1
     record(manager, "/p/running", status="running")
-    with pytest.raises(ValueError, match="This machine already runs 4 working sub-task agents"):
-        manager.subtask(launch(), parent())
+    waited = manager.subtask(launch(), parent())["operation"]
+    assert waited["status"] == "waiting"
+    assert str(waited["room"]) == "This machine already runs 4 working sub-task agents"
 
 
 def test_a_subtask_goes_to_the_worker_named_and_records_its_parent_there(remote):  # noqa: F811

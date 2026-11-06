@@ -90,6 +90,10 @@ SCHEDULE_MISSED_AFTER = 86400
 SCHEDULE_PENDING_LIMIT = 100
 SCHEDULE_HISTORY = 50
 SCHEDULE_POLL_SECONDS = 30
+# Launches waiting for room on their machine: how long before they fail, and how often
+# they are placed again (a machine's load is cached that long).
+ROOM_WAIT = 6 * 3600
+ROOM_POLL = 15
 # `wt --exit-when-done` returns once the agent command is typed; the agent shows up later.
 LAUNCH_START_SECONDS = 120
 LAUNCH_HISTORY = 100
@@ -547,6 +551,15 @@ def lineage_root(parent):
     return parent.get("root") or f"{parent.get('machine') or placement.LOCAL}:{parent.get('cwd')}"
 
 
+def waiting(room):
+    """An operation's fields while it waits for room, ``room`` saying why there is none."""
+    return {
+        "status": "waiting",
+        "message": f"Waiting for room: {room}",
+        "wait_until": time.time() + ROOM_WAIT,
+    }
+
+
 def started_by(parent):
     """The line the dashboard shows for a sub-task: the launch that asked for it."""
     where = f" on {parent.get('machine_label') or parent['machine']}" if parent["machine"] else ""
@@ -604,6 +617,8 @@ class MachineLoads:
         self.home = Path(home)
         self.local = local
         self.lock = threading.Lock()
+        # Notified as each refresh ends, for ``current``.
+        self.refreshed = threading.Condition(self.lock)
         self.entries: dict[str, dict] = {}
         self.refreshing: set[str] = set()
         self.states: dict[str, dict] = {}
@@ -656,6 +671,15 @@ class MachineLoads:
             "max_agents": dashboard_settings.settings(self.home)["local_max_agents"],
         }
         return config, loads
+
+    def current(self, wait=LOAD_TIMEOUT + 2):
+        """``snapshot`` once the refreshes it starts, or finds under way, have answered,
+        waiting at most ``wait`` seconds: a launch placed from loads nobody asked for
+        lately would otherwise find every worker still being checked."""
+        self.snapshot()
+        with self.refreshed:
+            self.refreshed.wait_for(lambda: not self.refreshing, timeout=wait)
+        return self.snapshot()
 
     def sync(self, machine):
         """Refresh ``machine``'s clones; a failure keeps the last ones, with why."""
@@ -719,6 +743,7 @@ class MachineLoads:
             with self.lock:
                 self.entries[machine.id] = {**entry, "attempted_at": attempted}
                 self.refreshing.discard(machine.id)
+                self.refreshed.notify_all()
 
 
 class Workspaces:
@@ -780,6 +805,8 @@ class Workspaces:
             if fresh:
                 self.import_prompts(db)
             db.execute("CREATE TABLE IF NOT EXISTS scheduled (id TEXT PRIMARY KEY, data TEXT)")
+            # How each waiting operation, by its key, is started again once there is room.
+            db.execute("CREATE TABLE IF NOT EXISTS waiting (pr TEXT PRIMARY KEY, data TEXT)")
             # A launch the previous process claimed but never recorded may have started.
             for key, data in db.execute(
                 "SELECT id,data FROM scheduled WHERE json_extract(data,'$.status')='starting'"
@@ -1321,18 +1348,19 @@ class Workspaces:
         ]
         return {machine_id: placed.count(machine_id) for machine_id in set(placed)}
 
-    def place(self, request, fields, history=None, target=None):
+    def place(self, request, fields, history=None, target=None, wait=False):
         """The registry id a launch runs on, None for this machine.
 
         A request without ``machine`` runs here, as before workers existed. ``fields`` are
         the launch's ``placement.request`` fields; an explicit machine that cannot take
         the launch is refused with the reason. ``history`` gives this machine's
         stickiness (none by default); workers get theirs from their clones, and a pull request ``target`` counts a worker's verified checkout of it
-        as a prior workspace.
+        as a prior workspace. With ``wait`` a machine named that has no room now raises
+        ``placement.NoRoom``, so the launch can wait for it; Auto still places as before.
         """
         if "machine" not in request:
             return None
-        config, loads = self.loads.snapshot()
+        config, loads = self.loads.current()
         req = placement.request(
             {**fields, "override": request["machine"]}, config["repos"], config.get("docker")
         )
@@ -1340,7 +1368,14 @@ class Workspaces:
         matches = placement.matched(target, loads) if target else []
         here = (history or {}).get(placement.LOCAL, 0)
         scores = placement.history(repo, loads, here, matches)
-        return placement.choose(req, config["machines"], loads, scores, self.reservations()).machine
+        return placement.choose(
+            req,
+            config["machines"],
+            loads,
+            scores,
+            self.reservations(),
+            wait=wait and request["machine"] != "auto",
+        ).machine
 
     def preview(self, query):
         """Where Auto would place a launch, and which machines a person may choose."""
@@ -1413,12 +1448,14 @@ class Workspaces:
     def agent_started(self, target, agent):
         return not agent or agent_in(target["workspace_id"], target["path"], agent)
 
-    def action(self, request, inventory=None, scheduled=False):
+    def action(self, request, inventory=None, scheduled=False, resume=None):
         """Validate and perform one workspace action.
 
         ``inventory`` lets a batch validate many items against a single fresh scan.
         ``scheduled`` marks a launch the scheduler started: its brief asks the agent to
-        confirm completion, so the agent can be exited once it is done.
+        confirm completion, so the agent can be exited once it is done. A launch on a
+        machine named that has no room is recorded as waiting for it (``run_waiting``
+        starts it again as ``resume``, that waiting operation).
         """
         allowed = {
             "id",
@@ -1484,6 +1521,7 @@ class Workspaces:
         action = request["action"]
         chosen = False  # Whether the launch uses an existing local clone.
         machine = None  # Where a launch runs; reopening stays with its checkout, here.
+        room = None  # Why the machine named has no room for it now.
         if action not in {"create", "clone-and-create", "handle"} and request.get(
             "machine", placement.LOCAL
         ) not in {"auto", placement.LOCAL}:
@@ -1494,10 +1532,14 @@ class Workspaces:
             raise ValueError("Use Handle to start work on a Sentry issue")
         # A launch running now does not block one scheduled for later; the scheduler
         # waits for it to finish before starting the scheduled task.
-        if action in {"create", "clone-and-create", "reopen", "handle"} and not scheduling:
+        if (
+            action in {"create", "clone-and-create", "reopen", "handle"}
+            and not scheduling
+            and resume is None
+        ):
             existing = self.operation(pr["id"])
             if existing and (
-                existing["status"] in {"queued", "running"}
+                existing["status"] in {"queued", "running", "waiting"}
                 or (
                     action != "reopen"
                     and not (action == "handle" and existing["status"] == "complete")
@@ -1578,19 +1620,26 @@ class Workspaces:
             )
             # A verified checkout here pins Handle to this machine; one on a worker ranks
             # that worker first under Auto.
-            machine = self.place(
-                request,
-                {
-                    "kind": pr.get("kind"),
-                    "repo": pr.get("repo"),
-                    "agent": request.get("agent", "codex"),
-                    "claude_account": request.get("claude_account"),
-                    "docker": request.get("docker", False),
-                    "pin": placement.LOCAL if info["matches"] else None,
-                },
-                {placement.LOCAL: 2 if info["matches"] else 1 if info["clones"] else 0},
-                pr if action == "handle" and pr.get("kind") == "pr" else None,
-            )
+            try:
+                machine = self.place(
+                    request,
+                    {
+                        "kind": pr.get("kind"),
+                        "repo": pr.get("repo"),
+                        "agent": request.get("agent", "codex"),
+                        "claude_account": request.get("claude_account"),
+                        "docker": request.get("docker", False),
+                        "pin": placement.LOCAL if info["matches"] else None,
+                    },
+                    {placement.LOCAL: 2 if info["matches"] else 1 if info["clones"] else 0},
+                    pr if action == "handle" and pr.get("kind") == "pr" else None,
+                    wait=not scheduling,
+                )
+            except placement.NoRoom as exc:
+                if resume is not None:
+                    return {"operation": self.keep_waiting(resume, exc)}
+                # Checked below as if placed there; it starts once the machine has room.
+                machine, room = exc.machine, exc
             remote = machines.resolve(self.home, machine) if machine else None
             validate_account(request.get("agent", "codex"), request.get("claude_account"), remote)
             if remote is not None and (refusal := worker_refusal(pr, remote)):
@@ -1649,22 +1698,58 @@ class Workspaces:
         }
         if scheduled and action != "reopen":
             op["exit_marker"] = workspace_exit.new_marker()
+        if resume is not None:
+            # The same operation, now starting: a scheduled task follows it by its id.
+            op.update(
+                {k: resume[k] for k in ("id", "created_at", "exit_marker") if k in resume},
+                exit_when_done=resume["exit_when_done"],
+            )
+        elif room is not None:
+            op.update(waiting(room))
         # Reserve the PR in SQLite before starting a thread (also across server instances).
         with self.lock, self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM operations WHERE pr=?", (pr["id"],)).fetchone()
             if row:
                 previous = json.loads(row[0])
-                if previous["status"] in {"queued", "running"} or (
+                if resume is not None:
+                    # Cancelled, or started elsewhere, since it was read.
+                    if previous["id"] != resume["id"] or previous["status"] != "waiting":
+                        return {"operation": previous}
+                elif previous["status"] in {"queued", "running", "waiting"} or (
                     action != "reopen"
                     and not (action == "handle" and previous["status"] == "complete")
                     and (previous["status"] != "failed" or not request.get("retry"))
                 ):
                     return {"operation": previous}
+            elif resume is not None:
+                return {"operation": None}
             db.execute("INSERT OR REPLACE INTO operations VALUES (?,?)", (pr["id"], json.dumps(op)))
             # The dashboard flags unedited prefills; the pattern also catches older tabs.
-            if action != "reopen" and not request.get("prefilled"):
+            if action != "reopen" and not request.get("prefilled") and resume is None:
                 self.remember_prompt(db, request["task"], op["created_at"])
+            if room is not None:
+                subject = {
+                    key: pr.get(key)
+                    for key in ("kind", "repo", "number", "title", "url", "short_id")
+                    if pr.get(key) is not None
+                }
+                saved = {
+                    "entry": "action",
+                    "request": request,
+                    "scheduled": scheduled,
+                    "subject": subject,
+                }
+                db.execute(
+                    "INSERT OR REPLACE INTO waiting VALUES (?,?)", (pr["id"], json.dumps(saved))
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO operation_history VALUES (?,?)",
+                    (op["id"], json.dumps(op)),
+                )
+                self.wake.set()
+                return {"operation": copy.deepcopy(op), "started": True}
+            db.execute("DELETE FROM waiting WHERE pr=?", (pr["id"],))
             worker = threading.Thread(
                 target=self.perform, args=(pr, op, request.get("task", "")), daemon=True
             )
@@ -1720,7 +1805,7 @@ class Workspaces:
                 found.append({"repo": slug, "clone": str(root), "remote": name, "active": active})
         return {"repos": found, "idle": idle}
 
-    def new_task(self, request, parent=None):
+    def new_task(self, request, parent=None, room=None, waits=None, resume=None):
         """Start an agent on a task with no PR or issue behind it, in a new workspace.
 
         With ``issue_title`` the task is first filed as a GitHub issue in ``repo`` and
@@ -1730,6 +1815,10 @@ class Workspaces:
         each and the agent's sandbox may write there (`wt --with`); on a worker, in its
         own clone of each one's repository, under its src. ``parent``, the launch
         a sub-task was asked for from (see ``subtask``), is recorded on the operation.
+
+        A machine named that has no room (or ``room``, why the one ``subtask`` named has
+        none) records the task as waiting for it; ``waits`` is how ``run_waiting`` starts
+        it again (this call by default), as ``resume``, that waiting operation.
         """
         allowed = {
             "repo",
@@ -1776,18 +1865,28 @@ class Workspaces:
             raise ValueError("Choose a repository")
         clone = request.get("clone", "")
         listed = self.local_repositories(everything=True)["repos"]
-        machine = self.place(
-            request,
-            {
-                "kind": "issue" if request.get("issue_title", "").strip() else "scratch",
-                "repo": repo,
-                "agent": request.get("agent", "codex"),
-                "claude_account": request.get("claude_account"),
-                "docker": request.get("docker", False),
-                "also": [r["repo"] for r in listed if r["clone"] in also],
-            },
-            {placement.LOCAL: 1},
-        )
+        if room is None:
+            try:
+                machine = self.place(
+                    request,
+                    {
+                        "kind": "issue" if request.get("issue_title", "").strip() else "scratch",
+                        "repo": repo,
+                        "agent": request.get("agent", "codex"),
+                        "claude_account": request.get("claude_account"),
+                        "docker": request.get("docker", False),
+                        "also": [r["repo"] for r in listed if r["clone"] in also],
+                    },
+                    {placement.LOCAL: 1},
+                    wait=True,
+                )
+            except placement.NoRoom as exc:
+                if resume is not None:
+                    return {"operation": self.keep_waiting(resume, exc)}
+                # Checked below as if placed there; it starts once the machine has room.
+                machine, room = exc.machine, exc
+        else:
+            machine = None if request["machine"] == placement.LOCAL else request["machine"]
         remote = machines.resolve(self.home, machine) if machine else None
         if remote is not None:
             if request.get("issue_title", "").strip():
@@ -1867,10 +1966,10 @@ class Workspaces:
             if base and (base.startswith("-") or "@" in base or not valid(base)):
                 raise ValueError("The base branch is not a valid branch name")
             target = {"kind": "scratch", "repo": repo, "branch": name, "base": base or None}
-        key = f"{NEW_PREFIX}{uuid.uuid4()}"
+        key = resume["pr"] if resume else f"{NEW_PREFIX}{uuid.uuid4()}"
         target["id"] = key
         op = {
-            "id": str(uuid.uuid4()),
+            "id": resume["id"] if resume else str(uuid.uuid4()),
             "pr": key,
             "action": "new",
             "status": "queued",
@@ -1892,12 +1991,31 @@ class Workspaces:
             **({"parent": parent, "started_by": started_by(parent)} if parent else {}),
             "message": "Queued",
             "log": "",
-            "created_at": time.time(),
+            "created_at": resume["created_at"] if resume else time.time(),
+            **(waiting(room) if room is not None else {}),
         }
         with self.lock:
             with self.db() as db:
-                db.execute("INSERT INTO operations VALUES (?,?)", (key, json.dumps(op)))
-                self.remember_prompt(db, task, op["created_at"])
+                db.execute("BEGIN IMMEDIATE")
+                if resume is not None:
+                    row = db.execute("SELECT data FROM operations WHERE pr=?", (key,)).fetchone()
+                    current = json.loads(row[0]) if row else None
+                    # Cancelled since it was read: it never starts.
+                    if not current or current["id"] != op["id"] or current["status"] != "waiting":
+                        return {"operation": current}
+                db.execute("INSERT OR REPLACE INTO operations VALUES (?,?)", (key, json.dumps(op)))
+                if resume is None:
+                    self.remember_prompt(db, task, op["created_at"])
+                if room is not None:
+                    saved = waits or {"entry": "new", "request": request, "parent": parent}
+                    db.execute("INSERT INTO waiting VALUES (?,?)", (key, json.dumps(saved)))
+                    db.execute(
+                        "INSERT OR REPLACE INTO operation_history VALUES (?,?)",
+                        (op["id"], json.dumps(op)),
+                    )
+                    self.wake.set()
+                    return {"operation": copy.deepcopy(op)}
+                db.execute("DELETE FROM waiting WHERE pr=?", (key,))
                 worker = threading.Thread(
                     target=self.perform_new,
                     args=(target, op, task, request.get("task_files", "")),
@@ -1928,9 +2046,10 @@ class Workspaces:
         below the launch that started the lineage, SUBTASK_RATE an hour per lineage and
         SUBTASK_MACHINE_RATE per machine asking; placed as Auto places it (sticking to the
         parent's machine), or on the machine named, but never on one Auto would not use now
-        (full, unchecked, lacking what it needs) or that already runs SUBTASK_AGENTS working
-        sub-task agents, never on this machine for a worker's parent, and only in a clone
-        of the repository there. Answers the operation as soon as it is recorded.
+        (lacking what it needs), never on this machine for a worker's parent, and only in a
+        clone of the repository there. One that has no room now (full, unchecked, or already
+        running SUBTASK_AGENTS working sub-task agents) is recorded as waiting for room.
+        Answers the operation as soon as it is recorded.
         """
         flags = {"docker", "exit_when_done"}
         if not isinstance(launch, dict) or set(launch) - {"tags"} != set(wt.LAUNCH_FIELDS):
@@ -2012,18 +2131,28 @@ class Workspaces:
                 raise worker_api.RateLimited(
                     f"Launches there started {SUBTASK_MACHINE_RATE} sub-tasks in the last hour; wait"
                 )
-            config, loads = self.loads.snapshot()
-            fields = {
-                "kind": "scratch",
-                "repo": launch["repo"],
-                "agent": launch["agent"],
-                "claude_account": request["claude_account"] or None,
-                "docker": launch["docker"],
-                "also": [],
-                "override": launch["machine"],
-            }
-            req = placement.request(fields, config["repos"], config.get("docker"))
-            reservations = self.reservations()
+            return self.start_subtask(request, {**parent, "root": root, "depth": depth}, ops)
+
+    def start_subtask(self, request, parent, ops, resume=None):
+        """Place a checked sub-task and start it, or record it as waiting for room (or, as
+        ``resume``, keep it waiting). Called under ``subtask_lock``."""
+        worker = parent["machine"] is not None
+        origin = parent["machine"] or placement.LOCAL
+        named = request["machine"]
+        config, loads = self.loads.current()
+        fields = {
+            "kind": "scratch",
+            "repo": request["repo"],
+            "agent": request["agent"],
+            "claude_account": request["claude_account"] or None,
+            "docker": request["docker"],
+            "also": [],
+            "override": named,
+        }
+        req = placement.request(fields, config["repos"], config.get("docker"))
+        reservations = self.reservations()
+        waits = {"entry": "subtask", "request": request, "parent": parent}
+        try:
             try:
                 chosen = placement.choose(
                     req,
@@ -2031,25 +2160,40 @@ class Workspaces:
                     loads,
                     {origin: 1},
                     reservations,
-                    now=now,
                     local=not worker,
+                    wait=True,
                 )
+            except placement.NoRoom:
+                raise
             except ValueError as exc:
-                if worker and launch["machine"] == "auto":
+                if worker and named == "auto":
                     raise ValueError(f"No worker can take this sub-task now: {exc}") from None
                 raise
             target = chosen.machine or placement.LOCAL
             name = placement.label(target, config["machines"])
-            excluded = placement.exclusions(req, config["machines"], loads, reservations, now)
+            excluded = placement.exclusions(
+                req, config["machines"], loads, reservations, time.time()
+            )
             if target in excluded:
-                raise ValueError(f"{name}: {excluded[target].why}; a sub-task waits for room")
+                raise ValueError(f"{name}: {excluded[target].why}")
             if self.subtask_agents(target, ops) >= SUBTASK_AGENTS:
-                raise ValueError(f"{name} already runs {SUBTASK_AGENTS} working sub-task agents")
-            request["machine"] = target
+                raise placement.NoRoom(
+                    f"{name} already runs {SUBTASK_AGENTS} working sub-task agents",
+                    chosen.machine,
+                )
+        except placement.NoRoom as exc:
+            if resume is not None:
+                return {"operation": self.keep_waiting(resume, exc)}
+            # Checked as if placed on the machine named, else where Auto sticks to.
+            target = named if named != "auto" else origin
+            launch = {**request, "machine": target}
             if target == placement.LOCAL:
-                request.update(self.subtask_clone(launch["repo"]))
-            recorded = {**parent, "root": root, "depth": depth}
-            return self.new_task(request, parent=recorded)
+                launch.update(self.subtask_clone(request["repo"]))
+            return self.new_task(launch, parent=parent, room=exc, waits=waits)
+        launch = {**request, "machine": target}
+        if target == placement.LOCAL:
+            launch.update(self.subtask_clone(request["repo"]))
+        return self.new_task(launch, parent=parent, waits=waits, resume=resume)
 
     def await_operation(self, op, wait):
         """The operation once it finished, or as last read after ``wait`` seconds.
@@ -2417,6 +2561,7 @@ class Workspaces:
             "time": time.time(),
             "tasks": pending + done,
             "launched": self.launched_exits(),
+            "waiting": self.waiting_launches(),
         }
 
     def cancel_scheduled(self, key):
@@ -2600,7 +2745,7 @@ class Workspaces:
         now = time.time() if now is None else now
         if now - row["exit"].get("checked_at", 0) < REMOTE_WATCH:
             return
-        if op is not None and op.get("status") in {"queued", "running"}:
+        if op is not None and op.get("status") in {"queued", "running", "waiting"}:
             return
         machine_id = row["machine"] if op is None else op["machine"]
         machine = machines.load(self.home).get(machine_id)
@@ -2832,6 +2977,140 @@ class Workspaces:
                     (json.dumps(record), key, path),
                 )
 
+    # -- launches waiting for room --
+
+    def settle_waiting(self, key, op_id, **changes):
+        """Change a waiting operation, unless it stopped waiting since it was read
+        (cancelled, started or failed); answers it as it is now, and whether it changed."""
+        with self.lock, self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM operations WHERE pr=?", (key,)).fetchone()
+            op = json.loads(row[0]) if row else None
+            if not op or op["id"] != op_id or op["status"] != "waiting":
+                return op, False
+            op.update(changes, updated_at=time.time())
+            db.execute("UPDATE operations SET data=? WHERE pr=?", (json.dumps(op), key))
+            db.execute(
+                "INSERT OR REPLACE INTO operation_history VALUES (?,?)", (op["id"], json.dumps(op))
+            )
+            if op["status"] != "waiting":
+                db.execute("DELETE FROM waiting WHERE pr=?", (key,))
+        return op, True
+
+    def keep_waiting(self, op, room):
+        """A waiting operation still without room, saying why now."""
+        return self.settle_waiting(op["pr"], op["id"], message=f"Waiting for room: {room}")[0]
+
+    def cancel_waiting(self, key):
+        op = self.operation(key)
+        if op and op["status"] == "waiting":
+            op, changed = self.settle_waiting(
+                key, op["id"], status="failed", message="Cancelled while waiting for room"
+            )
+            if changed:
+                return op
+        raise ValueError("This launch is no longer waiting for room; refresh the dashboard")
+
+    def waiting_launches(self):
+        """Operations waiting for room, longest waiting first, as the dashboard lists them."""
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT o.data, w.data FROM waiting w JOIN operations o ON o.pr = w.pr"
+                " WHERE json_extract(o.data,'$.status')='waiting'"
+            ).fetchall()
+        found = []
+        for data, saved in rows:
+            op, saved = json.loads(data), json.loads(saved)
+            shown = ("pr", "id", "machine", "agent", "message", "created_at", "wait_until")
+            found.append(
+                {
+                    **{key: op.get(key) for key in shown},
+                    # A Handle names its item in what starts it; a new task in its operation.
+                    "subject": saved.get("subject") or op.get("subject") or {},
+                    "action": saved["request"].get("action", "new"),
+                    **({"started_by": op["started_by"]} if op.get("started_by") else {}),
+                }
+            )
+        return sorted(found, key=lambda op: op["created_at"])
+
+    def run_waiting(self, now=None):
+        """Start each waiting launch that now has room, longest waiting first; one that
+        waited ROOM_WAIT, or can no longer start, fails with the reason."""
+        now = time.time() if now is None else now
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT w.pr, w.data, o.data FROM waiting w LEFT JOIN operations o ON o.pr = w.pr"
+            ).fetchall()
+        found = []
+        for key, saved, data in rows:
+            op = json.loads(data) if data else None
+            if op is None or op["status"] != "waiting":
+                with self.db() as db:  # It started, failed or was cancelled meanwhile.
+                    db.execute("DELETE FROM waiting WHERE pr=? AND data=?", (key, saved))
+                continue
+            found.append((op, json.loads(saved)))
+        if found:
+            # Room on each worker as its load says, before any launch checks its item.
+            config, loads = self.loads.current()
+            rooms = placement.exclusions(
+                {"kind": "scratch", "sandboxed": False},
+                config["machines"],
+                loads,
+                self.reservations(),
+                time.time(),
+            )
+        for op, saved in sorted(found, key=lambda item: item[0]["created_at"]):
+            if now >= op.get("wait_until", op["created_at"] + ROOM_WAIT):
+                room = op["message"].removeprefix("Waiting for room: ")
+                self.settle_waiting(
+                    op["pr"],
+                    op["id"],
+                    status="failed",
+                    message=f"Not started: no room within {ROOM_WAIT // 3600} hours ({room})",
+                )
+                continue
+            if saved["entry"] == "action" and not self.listed(saved):
+                continue  # Its item may only be missing from a list not loaded yet.
+            named = saved["request"].get("machine")
+            if named in config["machines"] and (exclusion := rooms.get(named)) and exclusion.room:
+                self.keep_waiting(op, f"{config['machines'][named].label}: {exclusion.why}")
+                continue
+            try:
+                if saved["entry"] == "action":
+                    self.action(saved["request"], scheduled=saved["scheduled"], resume=op)
+                elif saved["entry"] == "subtask":
+                    with self.subtask_lock:
+                        ops = [
+                            other
+                            for k, other in self.state()["operations"].items()
+                            if k.startswith(NEW_PREFIX) and isinstance(other.get("parent"), dict)
+                        ]
+                        self.start_subtask(saved["request"], saved["parent"], ops, resume=op)
+                else:
+                    self.new_task(saved["request"], parent=saved["parent"], resume=op)
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                sqlite3.Error,
+                subprocess.SubprocessError,
+            ) as exc:
+                self.settle_waiting(
+                    op["pr"], op["id"], status="failed", message=f"Not started: {exc}"
+                )
+            except Exception as exc:
+                # The launch may have begun; never start it again, as after a restart.
+                self.settle_waiting(
+                    op["pr"],
+                    op["id"],
+                    status="uncertain",
+                    message=f"Starting failed unexpectedly ({exc}). Check for its workspace before starting it again.",
+                )
+
+    def has_waiting(self):
+        with self.db() as db:
+            return db.execute("SELECT 1 FROM waiting LIMIT 1").fetchone() is not None
+
     def next_due(self):
         with self.db() as db:
             (due,) = db.execute(
@@ -2859,6 +3138,10 @@ class Workspaces:
             except Exception:
                 pass  # The scheduler must outlive any single failure; the next pass retries.
             try:
+                self.run_waiting()
+            except Exception:
+                pass
+            try:
                 self.exit_finished()
             except Exception:
                 pass
@@ -2877,6 +3160,11 @@ class Workspaces:
             now = time.time()
             # A due task waiting on another launch for its item is rechecked every 5 seconds.
             delay = SCHEDULE_POLL_SECONDS if due is None else 5 if due <= now else due - now
+            try:
+                if self.has_waiting():
+                    delay = min(delay, ROOM_POLL)
+            except Exception:
+                pass
             self.wake.wait(min(SCHEDULE_POLL_SECONDS, delay))
 
     def run_logged(self, op, *args, pass_fds=(), timeout=600, env=None):
