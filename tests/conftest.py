@@ -129,6 +129,9 @@ AGENT = """import json,os,sys
 from pathlib import Path
 if sys.argv[1:] == ['--version']:
     print(os.environ.get('FAKE_AGENT_VERSION', 'fixture-cli 0.0.1')); sys.exit()
+if sys.argv[1:] in (['auth', 'status'], ['login', 'status']):
+    ok = os.environ.get('FAKE_AGENT_AUTH', '1') == '1'
+    print(json.dumps({'loggedIn': ok})); sys.exit(0 if ok else 1)
 p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
 agent={'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]}
 if os.environ.get('FAKE_PANE'): agent.update(pane_id=os.environ['FAKE_PANE'],agent_status='working')

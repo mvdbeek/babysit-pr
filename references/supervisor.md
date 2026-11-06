@@ -867,29 +867,54 @@ New task only when:
   first listed); a worker uses its own clone, creating it when missing as for New task.
 
 A sub-task always runs sandboxed: New task has no other launch, here or on a worker.
-Cross-agent review requests do not override the same-agent/account rule, even when
-the brief explicitly asks for one. The refusal explains this isolation and starts
-nothing. For an authorized Claude review from Codex, the user starts a separate
-sandboxed launch from a host terminal on the intended worker (outside the asking
-sandbox), selecting the intended account explicitly, for example:
+Ordinary sub-tasks retain the same-agent/account rule. A worker's broker supports a
+narrow exception through `--review`, for either Codex to Claude or Claude to Codex:
 
 ```sh
-wt --claude --claude-account default -r REPO --machine local \
-  -F /absolute/path/to/review-brief.md BASE REVIEW_BRANCH
+wt --review --claude --claude-account default -r OWNER/REPO \
+  -F /path/to/review-brief.md FULL_COMMIT_SHA REVIEW_BRANCH
 ```
 
-`REPO` names the local clone under `~/src`, not an `owner/name` slug. To launch from
-the controller's host terminal instead, use its local clone name and
-`--machine MACHINE` to select the worker. A worker's host terminal refuses that
-remote placement option, so use `--machine local` there.
+Install the same updated babysit-pr version on the controller and worker, and start
+a fresh worker sandbox: an already running broker retains its old request protocol.
+This does not require copying a launch command into a host terminal. The agent
+submits the request and the user approves it in the dashboard.
 
-Use a named account instead of `default` when appropriate. The brief should identify
-the repository, exact SHA, review scope and output path, including any restrictions
-on edits or posting reviews. A Codex review uses `--codex` instead of the Claude
-options. This is a user launch through the trusted launcher, not an agent bypass of
-the broker. Confirm the resulting agent, account, machine, branch and worktree and
-that the agent received the brief; an idle workspace alone is not a completed review.
-No controller credentials or other account stores are exposed to the asking sandbox.
+Use `--codex` for a Codex reviewer. Claude defaults explicitly to `default`, never
+the controller's active account; named accounts are resolved on the selected worker.
+Codex uses that worker's configured `CODEX_HOME`, else `~/.codex`; arbitrary account
+paths cannot be supplied. Auto pins the parent worker, and an explicit `--machine`
+can choose another eligible Linux worker. Reviewers require Linux babysit-bwrap
+so only their selected provider/account configuration is mounted. The full 40-character
+commit must already exist in its clone, including local unpushed commits on the parent worker. The new review
+checkout starts at that exact commit without fetching a moving branch tip.
+
+This records a request with status `approval`, not a launch or an authorization claim.
+The **Scheduled** tab displays the complete brief and launch fields, plus the broker's
+parent lineage. A signed-in user must approve that stored request. The approval
+endpoint accepts only its ID, requires an authenticated session or admin key with
+access to that endpoint even in report mode, and rejects worker/launch keys.
+With dashboard auth off, approval is unavailable until sign-in is configured.
+Unapproved requests expire after the normal waiting interval or can be cancelled.
+A brief claiming user permission has no authority; repeating it does not bypass approval.
+
+Approval is consumed once, recorded with the request and approving identity, and
+enters the existing constrained sub-task launcher. Docker still requires the parent's
+grant; placement, rate, depth and capacity constraints still apply. An approved launch
+may wait for room and resumes with the same stored request. It creates a separate
+sandbox mounting only its selected provider configuration, never private account
+caches from the asking sandbox. A provider auth-status check on the selected worker
+refuses missing executables or unauthenticated accounts before launch; it does not
+provision a login or copy credentials. A provisioned account can still fail later if
+its credentials expire or the provider is unreachable.
+
+The brief should identify the exact commit, review scope and output path and any
+restrictions on edits or posting. Save results under the reviewer's
+`BABYSIT_ARTIFACT_DIR` or a granted worktree; private sandbox caches are separate.
+Verify the resulting provider/account and receipt of the brief. A ready workspace is
+not a completed review. Direct execution of another provider binary can be possible,
+but does not gain its authentication in the current isolated HOME. Logging in on the
+host cannot alter the mounts of an existing sandbox.
 
 A launch waiting for room is an operation with status `waiting` and `wait_until`;
 the `waiting` table keeps what starts it again: the Handle or New task request (and a

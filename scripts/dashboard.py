@@ -124,6 +124,7 @@ ACTIONS = frozenset(
         "workspace-batch",
         "workspace-new",
         "workspace-subtask",
+        "review-approve",
         "schedule-cancel",
         "waiting-cancel",
         "workspace-cleanup",
@@ -1035,6 +1036,35 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.read_body(length, 5))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
+            if action == "review-approve":
+                # This exception to provider isolation always needs real authentication,
+                # including in report mode. Worker/launch keys cannot authorize it.
+                auth = self.server.auth
+                decision = (
+                    auth.decide(self.command, self.path, self.headers, self.secure_host())
+                    if auth
+                    else None
+                )
+                if (
+                    not decision
+                    or not decision.allowed
+                    or decision.credential not in {"session", "admin"}
+                ):
+                    self.send_json(
+                        403,
+                        {
+                            "error": "Sign in to the dashboard to approve a cross-agent review; approval requires a session or admin key even when auth is off/report-only"
+                        },
+                    )
+                    return
+                if set(request) != {"id"} or not isinstance(request["id"], str):
+                    raise ValueError("Supply only the stored review request ID")
+                if not self.server.workspaces:
+                    raise ValueError("Workspace actions are not enabled")
+                self.send_json(
+                    200, self.server.workspaces.approve_review(request["id"], decision.subject)
+                )
+                return
             attached = bool(request.get("attachments"))
             # Attached files become paths in the text the agent receives.
             attachments.attach(self.server.attachments, action, request)

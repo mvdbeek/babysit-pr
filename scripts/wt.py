@@ -117,6 +117,7 @@ WT_OPTIONS = frozenset(
         "--with",
         "--tag",
         "--exit-when-done",
+        "--review",
         "--machine",
     }
 )
@@ -178,6 +179,8 @@ options:
   -r repo       use ~/src/<repo> instead of ~/src/galaxy
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
+  --review      request a cross-agent review on a Linux worker; requires a full
+                local commit SHA as base and authenticated dashboard approval
   --exit-when-done  have the dashboard exit the agent once it says the task is done
   --machine <id>|auto|local  start the agent on a worker of the dashboard's machine
                 registry (auto: where the dashboard's Auto places it) instead of
@@ -190,10 +193,13 @@ Safehouse on macOS without a grant for ~/src/<repo>) wt makes no worktree: it ha
 new <branch> from <base> with a prompt to the controller's dashboard, which places it
 (auto unless --machine names a machine) and starts it sandboxed. There -r also takes
 owner/name, which a sandbox that cannot read the clone needs; --docker needs a launch
-that has Docker itself. Brokered sub-tasks keep the same agent and account. For an
-explicitly requested cross-agent review, start a separate sandbox from the host
-terminal with --claude --claude-account <account|default> or --codex. Host re-login
-does not change the worker sandbox's isolated HOME or expose another agent's account.
+that has Docker itself. Ordinary sub-tasks keep the same agent and account. From a
+worker broker, --review requests a separate sandbox for the other provider. Use a
+full commit SHA as base, select --claude --claude-account <account|default> or --codex,
+and supply the review scope/output in the brief. The dashboard Scheduled tab shows
+the exact request for authenticated approval; the request alone starts nothing.
+Auto pins the parent worker; --machine may select another eligible Linux worker that
+already has the commit. Host re-login does not change this sandbox's isolated HOME.
 On Linux, save reports under $BABYSIT_ARTIFACT_DIR (the persistent sandbox cache's
 artifacts directory), or an explicitly granted worktree; other HOME paths are temporary.
 
@@ -346,6 +352,7 @@ class Options:
 
     __slots__ = (
         "agent",
+        "review",
         "docker",
         "repo",
         "repo_override",
@@ -375,6 +382,7 @@ class Options:
 
     def __init__(self) -> None:
         self.agent = "claude"
+        self.review = False
         self.docker = False
         self.repo = DEFAULT_REPO
         self.repo_override = False
@@ -462,6 +470,8 @@ def parse_args(
             options.focus = False
         elif flag == "--exit-when-done":
             options.exit_when_done = True
+        elif flag == "--review":
+            options.review = True
         elif flag == "--exit-watch-json":
             options.exit_watch_json = True
         elif flag == "--gpg":
@@ -1021,7 +1031,7 @@ def launch_request(command: str, options: Options, repo: str, machine: str) -> d
     ``base`` and ``name`` (the new branch: ``options.positional``), ``agent``, ``model``,
     ``effort``, ``claude_account``, ``task`` (the brief), ``docker``, ``exit_when_done``,
     ``permission_mode`` (empty or ``auto``), ``machine`` (a registry id or ``auto``),
-    and ``tags`` when supplied.
+    and ``tags``/``review`` when supplied. A review flag only requests approval.
     A field a worker launch cannot take raises NotForWorker; agent options that are
     wrong anywhere raise WtError.
     """
@@ -1067,6 +1077,7 @@ def launch_request(command: str, options: Options, repo: str, machine: str) -> d
         "permission_mode": options.permission_mode,
         "machine": machine,
         **({"tags": options.tags} if options.tags else {}),
+        **({"review": True} if options.review else {}),
     }
 
 
@@ -1351,7 +1362,13 @@ class Tool:
         remotes = self.remote_slugs(repo_path)
         start_point = base
         source = fetch_source(remotes, slug, trust)
-        if source:
+        if re.fullmatch(r"[0-9a-f]{40}", base):
+            # An approved review pins a local commit, including unpushed work. Never
+            # replace it with the current tip of a remote branch.
+            result = self.git_query(repo_path, "cat-file", "-t", base, credentials=False)
+            if result.returncode or result.stdout.strip() != "commit":
+                raise WtError(f"wt: review base {base} is not a commit in this worker's clone")
+        elif source:
             target, token, remote = source
             try:
                 self.git_action(
@@ -2248,6 +2265,12 @@ class Tool:
                 said = op.get("message")
                 self.warn(f"{command}: {said}")
             status = op.get("status")
+            if status == "approval":
+                self.warn(
+                    f"{command}: review request {op.get('pr')} awaits approval in the "
+                    "dashboard's Scheduled tab; no reviewer started. Do not repeat the request"
+                )
+                return
             if status == "complete":
                 result = op.get("result")
                 if isinstance(result, dict):
@@ -2432,6 +2455,8 @@ class Tool:
             raise UsageError(command, f"{command}: --exit-watch-json needs --exit-when-done")
         # The dashboard's own runs always make their worktree where they run.
         kind = "" if dashboard_run(options) else self.sandboxed(options)
+        if options.review and kind != "bwrap":
+            raise WtError(f"{command}: --review requires a worker's babysit-bwrap broker")
         if kind:
             self.launch_from_sandbox(command, options, kind)
             return

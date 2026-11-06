@@ -201,8 +201,8 @@ def test_cross_agent_review_refusal_explains_the_trusted_launch_route(local):  #
             )
         message = str(error.value)
         assert "same agent and account" in message
-        assert "host terminal" in message and f"wt --{other}" in message
-        assert "isolation" in message and "re-login" in message
+        assert "wt --review" in message and "authenticated approval" in message
+        assert "isolated configuration" in message and "re-login" in message
     assert asked == []
     assert not [op for op in manager.state()["operations"].values() if op.get("parent")]
 

@@ -84,7 +84,7 @@ def requirements(req, machine):
         needed.append("docker")
     if req.get("sandboxed", True):
         needed.append(SANDBOX[machine.os])
-    if req.get("agent") == "claude" and req.get("claude_account"):
+    if req.get("agent") == "claude" and req.get("claude_account") not in (None, "", "default"):
         needed.append(f"claude-account:{req['claude_account']}")
     return list(dict.fromkeys([*needed, *req.get("requires", [])]))
 
