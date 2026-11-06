@@ -578,6 +578,22 @@ def get_file(home, m: Machine, directory, name, *, limit, timeout=30) -> bytes:
     return result.stdout
 
 
+# Removes one staged file, never through a link to its folder.
+DROP_FILE = 'cd -P -- "$1" || exit 1\nrm -f -- "$2"'
+
+
+def drop_file(home, m: Machine, directory, name, *, timeout=30) -> None:
+    """Remove the file ``directory/name`` an op staged on ``m``, if it is still there."""
+    if not isinstance(name, str) or not FILE_NAME.fullmatch(name):
+        raise ValueError(f"Invalid staged file name {name!r}")
+    if not isinstance(directory, RemotePath):
+        directory = remote_path(directory)
+    result = run(home, m, ["sh", "-c", DROP_FILE, "sh", directory, name], timeout=timeout)
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip()[-300:]
+        raise ValueError(f"Could not remove {name} on {m.label}: {detail or 'no output'}")
+
+
 def qualify(machine_id: str | None, wid: str) -> str:
     """API/DOM workspace id: ``w111`` locally, ``mini/w111`` on a worker."""
     if not WORKSPACE.fullmatch(wid):

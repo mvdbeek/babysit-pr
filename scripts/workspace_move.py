@@ -39,6 +39,7 @@ removes the worker's workspace through the Workspaces tab's cleanup of its row.
 """
 
 import contextlib
+import gzip
 import hashlib
 import io
 import json
@@ -126,6 +127,15 @@ def git(path, *args, env=None, timeout=300):
     if done.returncode:
         raise ValueError((done.stderr or done.stdout or "Git failed").strip()[-2000:])
     return done.stdout.strip()
+
+
+def git_bytes(path, blob):
+    """A blob's bytes, read by hardened Git in the checkout."""
+    argv, environment = safe_git.prepare(str(path), "cat-file", "blob", blob)
+    done = owned_process.run(argv, env=environment, timeout=120)
+    if done.returncode:
+        raise ValueError(done.stderr.decode(errors="replace").strip()[-2000:] or "Git failed")
+    return done.stdout
 
 
 def label(machine):
@@ -384,7 +394,7 @@ def checkout_facts(home, machine, root, chosen, session, kind):
     return {
         "path": root,
         "main": False,
-        **remote_probe.move_facts(git, root, repo_config(root)),
+        **remote_probe.move_facts(git, root, repo_config(root), git_bytes),
         "session_size": sum(file.stat().st_size for _, file in files),
     }
 
@@ -754,12 +764,12 @@ def public(src):
 
 
 def check_watch(src, machine):
-    """A watch follows the agent only where a worker watch can be registered; this
-    machine registers any."""
+    """A watch follows the agent only where a watch can be registered for it: on a Linux
+    worker, or on this machine, and in a clean worktree either way."""
     watch = src["watch"]
-    if watch is None or machine is None:
+    if watch is None:
         return
-    if machine.os != "linux":
+    if machine is not None and machine.os != "linux":
         raise Refused(
             f"babysit watch {watch.get('id')} follows this workspace, and watches on "
             f"{machine.label} need a Linux worker; stop the watch first",
@@ -767,8 +777,9 @@ def check_watch(src, machine):
         )
     if src["changes"]["changed"] or src["changes"]["untracked"]:
         raise Refused(
-            f"babysit watch {watch.get('id')} follows this workspace, and a watch on a worker "
-            "needs a clean worktree; commit the changes or stop the watch first",
+            f"babysit watch {watch.get('id')} follows this workspace, and a watch on "
+            f"{label(machine)} needs a clean worktree; commit the changes or stop the watch "
+            "first",
             "watch",
         )
 
@@ -885,10 +896,17 @@ def resume_here(src):
     machine = src["machine"]
     if machine is None:
         config = src["chosen"].get("claude_config_env") if src["agent"] == "claude" else None
+    elif src["agent"] != "claude":
+        config = None
+    elif src["account"] not in (None, "default"):
+        config = src["chosen"].get("_home")
     else:
-        named = src["agent"] == "claude" and src["account"] not in (None, "default")
-        config = src["chosen"].get("_home") if named else None
-    prefix = f"CLAUDE_CONFIG_DIR={shlex.quote(config)} " if config else ""
+        # babysit-bwrap's default login: its CLAUDE_CONFIG_DIR, and the config in it.
+        config = "$HOME/.claude" if machine.os == "linux" else None
+    if config == "$HOME/.claude":
+        prefix = 'CLAUDE_CONFIG_DIR="$HOME/.claude" '
+    else:
+        prefix = f"CLAUDE_CONFIG_DIR={shlex.quote(config)} " if config else ""
     command = f"cd {shlex.quote(src['cwd'])} && {prefix}{shlex.join(words)}"
     return command if machine is None else shlex.join(["ssh", "-t", machine.ssh, command])
 
@@ -930,24 +948,62 @@ def session_files(src):
     return remote_probe.move_session_files(src["chosen"]["_file"], src["session"], src["agent"])
 
 
+# What a worker's session tar may hold beyond its files' bytes (headers, padding), and
+# how many files: its gzip stream is never inflated past these.
+PACK_MARGIN = 1 << 20
+MAX_PACKED = 10000
+MAX_PACKED_NAME = remote_probe.MOVE_DEPTH * 201
+
+
+class Bounded(io.RawIOBase):
+    """A stream that refuses to give more than ``limit`` bytes of ``stream``."""
+
+    def __init__(self, stream, limit):
+        self.stream, self.left = stream, limit
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        data = self.stream.read(min(len(buffer), self.left + 1))
+        if len(data) > self.left:
+            raise ValueError("The worker packed more than a conversation a move takes")
+        self.left -= len(data)
+        buffer[: len(data)] = data
+        return len(data)
+
+
 def unpacked(data):
     """The (name, bytes) files of a session tar a worker staged (``move_pack``), each a
-    regular file under a name ``move_session`` takes, in all at most a move's size."""
-    files, total = [], 0
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        for member in archive:
-            parts = member.name.split("/")
-            total += member.size
-            if (
-                not member.isfile()
-                or len(parts) > remote_probe.MOVE_DEPTH
-                or not all(remote_probe.MOVE_PART.fullmatch(part) for part in parts)
-                or total > remote_probe.MAX_MOVE_SESSION
-            ):
-                raise ValueError(f"The worker packed an unexpected file: {member.name!r}")
-            stream = archive.extractfile(member)
-            assert stream is not None
-            files.append((member.name, stream.read()))
+    regular file under a name ``move_session`` takes, in all at most a move's size.
+
+    Read as a stream, inflated at most to that size (and a margin for its headers), at
+    most MAX_PACKED members, with no extended or long-name headers: a small archive that
+    expands to far more never fills this dashboard's memory."""
+    inflated = gzip.GzipFile(fileobj=io.BytesIO(data))
+    stream = io.BufferedReader(Bounded(inflated, remote_probe.MAX_MOVE_SESSION + PACK_MARGIN))
+    files: list[tuple[str, bytes]] = []
+    total = 0
+    try:
+        with tarfile.open(fileobj=stream, mode="r|") as archive:
+            for member in archive:
+                parts = member.name.split("/")
+                total += member.size
+                if (
+                    len(files) >= MAX_PACKED
+                    or member.pax_headers
+                    or len(member.name) > MAX_PACKED_NAME
+                    or not member.isfile()
+                    or len(parts) > remote_probe.MOVE_DEPTH
+                    or not all(remote_probe.MOVE_PART.fullmatch(part) for part in parts)
+                    or total > remote_probe.MAX_MOVE_SESSION
+                ):
+                    raise ValueError(f"The worker packed an unexpected file: {member.name[:200]!r}")
+                extracted = archive.extractfile(member)
+                assert extracted is not None
+                files.append((member.name, extracted.read()))
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise ValueError(f"The worker's packed conversation is unreadable: {exc}") from exc
     return files
 
 
@@ -975,6 +1031,15 @@ def transcripts(src, path, files=None):
             info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
             archive.addfile(info, io.BytesIO(data))
     return buffer.getvalue(), day
+
+
+def leftover(path, branch, where):
+    """What a move that stopped part way leaves on its target, said once its checkout
+    there was made: a next move is refused while they stay."""
+    return (
+        f"The new checkout {path} (branch {branch}) stays on {where}; remove it before "
+        "moving the agent again"
+    )
 
 
 class Move:
@@ -1007,10 +1072,13 @@ class Move:
         return probe_on(self.home, self.machine, op, timeout, **args)
 
     def stage(self, name, data):
+        """Stage ``data`` for the target's probe: in a worker's MOVE_STATE, or in this
+        dashboard's own home (``remote_probe.local_staging``)."""
+        folder = STAGED if self.machine is not None else remote_probe.local_staging(self.home)
         return machines.put_file(
             self.home,
             self.machine,
-            machines.remote_path(STAGED),
+            machines.remote_path(folder),
             name,
             data,
             keep=STAGE_KEEP,
@@ -1020,14 +1088,22 @@ class Move:
     def fetch(self, src, staged, limit):
         """A file the source worker staged (``move_bundle``, ``move_pack``), read back
         within ``limit`` bytes and checked against what it said it staged."""
-        data = machines.get_file(
-            self.home,
-            src["machine"],
-            machines.remote_path(STAGED),
-            staged["name"],
-            limit=limit,
-            timeout=RECEIVE_TIMEOUT,
-        )
+        try:
+            data = machines.get_file(
+                self.home,
+                src["machine"],
+                machines.remote_path(STAGED),
+                staged["name"],
+                limit=limit,
+                timeout=RECEIVE_TIMEOUT,
+            )
+        except (ValueError, OSError, subprocess.SubprocessError):
+            # Not left for a day there: up to a move's size of it.
+            with contextlib.suppress(ValueError, OSError, subprocess.SubprocessError):
+                machines.drop_file(
+                    self.home, src["machine"], machines.remote_path(STAGED), staged["name"]
+                )
+            raise
         if len(data) != staged["size"] or hashlib.sha256(data).hexdigest() != staged["sha256"]:
             raise ValueError(f"{staged['name']} arrived from {label(src['machine'])} changed")
         return data
@@ -1071,6 +1147,8 @@ class Move:
             fetch=fetch,
         )
         self.worker = made
+        # Kept for a restarted dashboard, which says what this move left there.
+        self.record(target_path=made["path"], target_label=label(machine), branch=state["branch"])
         if not same_state(state, made):
             raise ValueError(
                 f"The checkout made on {label(machine)} does not match "
@@ -1197,6 +1275,7 @@ class Move:
         except ValueError as exc:
             return f"The new checkout {self.worker['path']} on {label(self.machine)} stays: {exc}"
         self.worker = None
+        self.record(target_path=None)
         return None
 
     def still_here(self, src):
@@ -1426,7 +1505,8 @@ class Move:
         if not quit_["quit"]:
             self.restore_watch("Move stopped while the agent exited;")
             raise Failed(
-                f"The agent's exit could not be confirmed: {quit_['warning']}",
+                f"The agent's exit could not be confirmed: {quit_['warning']}. "
+                + leftover(made["path"], src["state"]["branch"], there),
                 stage="exit",
                 source_kept=True,
                 worker_path=made["path"],
@@ -1509,6 +1589,8 @@ class Move:
                     f". Its resume was typed in {resumed.get('pane')} on {there}; check "
                     f"there before resuming it on {here}"
                 )
+            if self.worker is not None:
+                said += ". " + leftover(self.worker["path"], src["state"]["branch"], there)
             raise Failed(
                 said,
                 stage="after_exit",
@@ -1628,6 +1710,10 @@ class Moves:
                     if left
                     else f"Check whether the agent still runs on {where}"
                 )
+                if op.get("target_path"):
+                    said += ". " + leftover(
+                        op["target_path"], op.get("branch"), op.get("target_label") or "its target"
+                    )
                 watch = op.get("watch")
                 if watch:
                     said += self.give_back(watch)

@@ -1129,6 +1129,14 @@ def test_git_lfs_is_refused(rig):
     nothing_happened(rig)
 
 
+def test_a_gitattributes_that_is_not_utf8_is_no_lfs(rig):
+    (rig.checkout / ".gitattributes").write_bytes(b"# caf\xe9\n*.txt text\n")
+    git("add", ".gitattributes", cwd=rig.checkout)
+    git("commit", "-q", "-m", "attributes", cwd=rig.checkout)
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert found["error"] is None and found["machine"] == "mini"
+
+
 def test_a_plan_never_takes_the_live_index_lock(rig):
     index = Path(
         git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=rig.checkout)

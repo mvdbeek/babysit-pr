@@ -7,9 +7,13 @@ same repository made before the branch moved on there. Real Git runs on both; he
 ssh, ps, Claude and Codex are fakes.
 """
 
+import gzip
+import hashlib
+import io
 import json
 import subprocess
 import sys
+import tarfile
 import time
 from types import SimpleNamespace
 
@@ -42,7 +46,9 @@ from test_workspace_overview import FakeGitHub
 
 __all__ = ["short_tmp"]  # A fixture, used by name.
 
-WATCH = "0123456789abcdef"
+PR = "https://github.com/base/repo/pull/7"
+# A watch's ID, as registering it names it: from its pull request.
+WATCH = hashlib.sha256(PR.encode()).hexdigest()[:16]
 MOVING = agent_messages.MOVING
 
 
@@ -169,6 +175,12 @@ def make_home_rig(tmp_path, fake_tools, short_tmp, monkeypatch, kind="claude", d
     ps = fake_tools.parent / "bin" / "ps"
     ps.write_text(f"#!{sys.executable} -S\n" + PS)
     ps.chmod(0o700)
+    # The worker's probe lists its processes with the system's ps: here, the fake.
+    shipped = remote_probe.probe_source()
+    assert shipped.count(b'PS = "/bin/ps"') == 1
+    patched = shipped.replace(b'PS = "/bin/ps"', f"PS = {str(ps)!r}".encode())
+    monkeypatch.setattr(remote_probe, "probe_source", lambda: patched)
+    monkeypatch.setattr(remote_probe, "PS", str(ps))
     monkeypatch.setattr(workspace_move, "CONFIRM_WAIT", 2)
     monkeypatch.setattr(workspace_move, "CLEANUP_POLL", 0.05)
     home = short_tmp / "state"
@@ -249,10 +261,11 @@ def nothing_happened(rig):
 
 
 def staged(rig):
-    """What either machine still holds of the move's staged files."""
+    """What either machine still holds of the move's staged files: this one stages under
+    the dashboard's home, never in its HOME's state folder."""
+    assert not (rig.tmp / ".local/state/babysit-pr/move-staging").exists()
     found = []
-    for home in (rig.tmp, rig.host):
-        folder = home / ".local/state/babysit-pr/move-staging"
+    for folder in (rig.home / "move-staging", rig.host / ".local/state/babysit-pr/move-staging"):
         found += list(folder.iterdir()) if folder.exists() else []
     return found
 
@@ -554,9 +567,13 @@ def test_a_failure_after_the_exit_keeps_the_workers_checkout(rig, monkeypatch):
         run_move(rig)
     details = failed.value.details
     assert details["stage"] == "after_exit" and details["source_kept"]
+    # babysit-bwrap's default login is in its CLAUDE_CONFIG_DIR.
     assert details["resume_command"] == (
-        f"ssh -t box.test 'cd {rig.checkout} && claude --resume {SID}'"
+        f'ssh -t box.test \'cd {rig.checkout} && CLAUDE_CONFIG_DIR="$HOME/.claude" '
+        f"claude --resume {SID}'"
     )
+    # What stays here is named, for a next move to be possible.
+    assert f"The new checkout {rig.target} (branch feature) stays on" in str(failed.value)
     assert details["worker_path"] == str(rig.target)
     # The worker's agent exited; nothing of its checkout or branch went.
     assert not worker_agents(rig)
@@ -579,6 +596,71 @@ def test_a_checkout_there_written_after_its_copy_is_kept(rig, monkeypatch):
     assert "Linux box" in result["warnings"][0]
 
 
+def test_ignored_files_there_that_are_not_rebuildable_keep_the_workers_worktree(rig):
+    (rig.checkout / "debug.log").write_text("ignored, and not rebuildable\n")
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert found["ignored_kept"] == ["debug.log"] and found["ignored_kept_count"] == 1
+    result = run_move(rig)
+    assert files(rig.target)  # Moved all the same.
+    assert not result["source"]["removed"] and rig.checkout.exists()
+    assert result["warnings"] == [
+        "The worktree on Linux box was kept for files Git ignores, not copied: debug.log"
+    ]
+    # Its workspace closed; the worktree stays for what was not copied.
+    assert ["workspace", "close", "w1"] in worker_store(rig)["calls"]
+    assert (rig.checkout / "debug.log").exists()
+
+
+def test_a_change_there_while_the_agent_exits_is_sent_again(rig, monkeypatch):
+    real = agent_messages.exit_agent
+
+    def exit_agent(request, home=None, **options):
+        done = real(request, home, **options)
+        (rig.checkout / "late.txt").write_text("written as it exited\n")
+        return done
+
+    monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
+    result = run_move(rig)
+    assert "The checkout changed while the agent exited; sending it again" in rig.progress
+    # This move's own checkout here was brought up to date, not refused as already there.
+    assert (rig.target / "late.txt").read_text() == "written as it exited\n"
+    assert result["source"]["removed"] and staged(rig) == []
+
+
+def test_a_failed_fetch_of_the_conversation_keeps_the_workers_checkout(rig, monkeypatch):
+    real = machines.get_file
+
+    def get_file(home, m, directory, name, **options):
+        if name.endswith(".tar.gz"):
+            raise ValueError("ssh: connection to box.test lost")
+        return real(home, m, directory, name, **options)
+
+    monkeypatch.setattr(machines, "get_file", get_file)
+    before = files(rig.checkout)
+    with pytest.raises(workspace_move.Failed, match="connection to box.test lost") as failed:
+        run_move(rig)
+    details = failed.value.details
+    assert details["stage"] == "after_exit" and details["resume_command"].startswith("ssh -t")
+    assert not worker_agents(rig) and files(rig.checkout) == before
+    # The pack it could not fetch is not left on the worker for a day.
+    assert staged(rig) == []
+
+
+def test_files_only_this_machine_ignores_still_move(rig, monkeypatch):
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    (rig.tmp / ".config" / "git").mkdir(parents=True)
+    (rig.tmp / ".config" / "git" / "ignore").write_text("notes/\n")
+    result = run_move(rig)
+    assert (rig.target / "notes" / "todo.md").read_text() == "untracked\n"
+    assert result["source"]["removed"]
+
+
+def test_a_gitattributes_that_is_not_utf8_there_is_no_lfs(rig):
+    (rig.checkout / ".gitattributes").write_bytes(b"# caf\xe9\n*.txt text\n")
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert found["error"] is None and found["machine"] == "local"
+
+
 # Watches ---------------------------------------------------------------------------------
 
 
@@ -590,7 +672,7 @@ def add_watch(rig, status="awaiting_release"):
                 db,
                 {
                     "id": WATCH,
-                    "url": "https://github.com/base/repo/pull/7",
+                    "url": PR,
                     "repo": "base/repo",
                     "ci_repo": "base/repo",
                     "branch": None,
@@ -620,11 +702,39 @@ def watch(rig):
         db.close()
 
 
-def test_a_workers_watch_is_held_through_the_move_then_registered_here(rig, monkeypatch):
+@pytest.fixture
+def clean_rig(tmp_path, fake_tools, short_tmp, monkeypatch):
+    return make_home_rig(tmp_path, fake_tools, short_tmp, monkeypatch, dirty=False)
+
+
+def test_a_watch_follows_here_only_from_a_clean_worktree(rig):
     add_watch(rig)
     found = workspace_move.plan(rig.home, request(), rig.placing)
-    # A dirty worktree is no reason to refuse: watches here take any.
-    assert found["watch"] == {"id": WATCH, "status": "awaiting_release"} and not found["error"]
+    assert found["watch"] == {"id": WATCH, "status": "awaiting_release"}
+    assert "needs a clean worktree" in found["error"] and found["machine"] is None
+    assert refusal(rig).details["code"] == "watch"
+    nothing_happened(rig)
+
+
+def test_a_workers_watch_is_held_through_the_move_then_registered_here(clean_rig, monkeypatch):
+    rig = clean_rig
+    add_watch(rig)
+    head = git("rev-parse", "HEAD", cwd=rig.checkout)
+    # The pull request as GitHub has it: the moved branch at its head.
+    monkeypatch.setenv(
+        "FAKE_GH_PR",
+        json.dumps(
+            {
+                "url": PR,
+                "number": 7,
+                "state": "OPEN",
+                "headRefName": "feature",
+                "headRefOid": head,
+                "headRepository": {"name": "repo"},
+                "headRepositoryOwner": {"login": "fork"},
+            }
+        ),
+    )
     held = []
     real = agent_messages.exit_agent
 
@@ -632,30 +742,20 @@ def test_a_workers_watch_is_held_through_the_move_then_registered_here(rig, monk
         held.append(watch(rig)["status"])
         return real(request, home, **options)
 
-    registered = []
-
-    def register_(db, args):
-        registered.append(args)
-        return {"id": WATCH}
-
     monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
-    monkeypatch.setattr(pr_supervisor, "register", register_)
     result = run_move(rig)
     assert held == ["stopped"]
-    [args] = registered
-    assert (args.machine, args.cwd, args.session, args.pane) == (
-        None,
-        str(rig.target),
-        SID,
-        result["pane"],
-    )
-    assert args.pr == "https://github.com/base/repo/pull/7"
-    assert result["watch"] == WATCH
+    # Registered here for real: this machine's checkout, session and pane.
+    job = watch(rig)
+    assert result["watch"] == WATCH and result["warnings"] == []
+    assert (job["machine"], job["cwd"], job["session_id"]) == (None, str(rig.target), SID)
+    assert job["status"] == "awaiting_release" and job["pane"]["pane_id"] == result["pane"]
     [agent] = [a for a in read(rig.state)["agents"] if a.get("agent_session") == {"value": SID}]
     assert f"babysit watch {WATCH} now follows" in agent["task"]
 
 
-def test_a_failed_move_here_gives_the_workers_watch_back(rig, monkeypatch):
+def test_a_failed_move_here_gives_the_workers_watch_back(clean_rig, monkeypatch):
+    rig = clean_rig
     add_watch(rig)
 
     def resume(*args, **kwargs):
@@ -697,6 +797,9 @@ def test_a_restarted_dashboard_says_where_to_resume_an_interrupted_move_here(rig
                 "stage": "after_exit",
                 "watch": WATCH,
                 "resume_command": command,
+                "target_path": str(rig.target),
+                "target_label": "this Mac",
+                "branch": "feature",
             }
         )
     )
@@ -706,6 +809,7 @@ def test_a_restarted_dashboard_says_where_to_resume_an_interrupted_move_here(rig
     assert "The agent had left Linux box" in op["message"]
     assert op["result"]["resume_command"] == command
     assert op["result"]["source_label"] == "Linux box"
+    assert f"The new checkout {rig.target} (branch feature) stays on this Mac" in op["message"]
     assert watch(rig)["status"] == "awaiting_release"
 
 
@@ -915,3 +1019,110 @@ def test_the_dashboard_passes_a_workers_workspace_to_the_move(rig):
         thread.join(5)
         server.server_close()
     assert seen == [{"workspace": "box/w1", "pane": "w1:p2", "session": SID}]
+
+
+def tarball(*members):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for info, data in members:
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def member(name, size=0, **pax):
+    info = tarfile.TarInfo(name)
+    info.size = size
+    info.pax_headers = pax
+    return info
+
+
+def test_a_pack_is_never_inflated_past_a_conversations_size(monkeypatch):
+    monkeypatch.setattr(remote_probe, "MAX_MOVE_SESSION", 4096)
+    monkeypatch.setattr(workspace_move, "PACK_MARGIN", 4096)
+    # A few kB that inflate to a MB.
+    bomb = tarball((member(f"{SID}.jsonl", 1 << 20), b"\0" * (1 << 20)))
+    assert len(bomb) < 4096
+    with pytest.raises(ValueError, match="more than a conversation"):
+        workspace_move.unpacked(bomb)
+    # Not inflated whole either when it is no tar at all.
+    with pytest.raises(ValueError, match="more than a conversation|unreadable"):
+        workspace_move.unpacked(gzip.compress(b"\0" * (1 << 20)))
+
+
+def test_a_pack_with_too_many_members_or_extended_headers_is_refused(monkeypatch):
+    monkeypatch.setattr(workspace_move, "MAX_PACKED", 5)
+    many = tarball(*[(member(f"{SID}/f{n}.jsonl"), b"") for n in range(6)])
+    with pytest.raises(ValueError, match="unexpected file"):
+        workspace_move.unpacked(many)
+    extended = tarball((member(f"{SID}.jsonl", comment="x" * 100), b""))
+    with pytest.raises(ValueError, match="unexpected file"):
+        workspace_move.unpacked(extended)
+    assert workspace_move.unpacked(tarball((member(f"{SID}.jsonl", 2), b"{}"))) == [
+        (f"{SID}.jsonl", b"{}")
+    ]
+
+
+def test_a_staged_file_swapped_after_its_check_is_never_read(tmp_path, monkeypatch):
+    folder = tmp_path / "staging"
+    folder.mkdir(mode=0o700)
+    monkeypatch.setenv(remote_probe.MOVE_STAGING, str(folder))
+    staged_file = folder / "x.tar.gz"
+    staged_file.write_bytes(b"staged")
+    with remote_probe._staged_move(str(staged_file.resolve())) as opened:
+        staged_file.unlink()
+        staged_file.write_bytes(b"swapped in")
+        assert opened.read() == b"staged"
+    (folder / "link.tar.gz").symlink_to(staged_file)
+    with pytest.raises(ValueError, match="not a file this user staged"):
+        remote_probe._staged_move(str((folder / "link.tar.gz").absolute()))
+    with pytest.raises(ValueError, match="Moves are taken only from"):
+        remote_probe._staged_move(str(tmp_path / "x.tar.gz"))
+
+
+def test_this_machines_probe_stages_in_the_home_and_fetches_with_its_token(tmp_path, monkeypatch):
+    seen = {}
+
+    def run(home, machine, argv, **options):
+        seen.update(machine=machine, env=options["env"])
+        answer = {"protocol": remote_probe.PROTOCOL, "result": {"path": "/x"}}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(answer).encode(), b"")
+
+    monkeypatch.setattr(machines, "run", run)
+    monkeypatch.setenv("GH_TOKEN", "gho_" + "a" * 36)
+    remote_probe.call(tmp_path, None, "realpath", 10, path="/x")
+    assert seen["machine"] is None
+    assert seen["env"][remote_probe.MOVE_STAGING] == str(tmp_path.resolve() / "move-staging")
+    # The dashboard's token, for the fetch alone: no other child gets GH_TOKEN.
+    assert seen["env"]["BABYSIT_FETCH_TOKEN"] == "gho_" + "a" * 36
+    assert "GH_TOKEN" not in seen["env"]
+    calls = []
+
+    def host_run(argv, timeout, env=None, **options):
+        calls.append(env)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(remote_probe, "_host_run", host_run)
+    monkeypatch.setattr(remote_probe, "_host_fetch_refusals", lambda clone, timeout: None)
+    monkeypatch.setattr(remote_probe, "host_guard", lambda path, **options: [])
+    monkeypatch.setenv("BABYSIT_FETCH_TOKEN", "gho_" + "b" * 36)
+    remote_probe._host_fetch("/c", "base/repo", "main", "upstream")
+    assert calls == [{"GH_TOKEN": "gho_" + "b" * 36}]
+    assert "BABYSIT_FETCH_TOKEN" not in remote_probe.host_environment()
+
+
+def test_a_worker_drops_only_what_moves_staged_in_its_old_folder(rig, monkeypatch):
+    monkeypatch.setenv("HOME", str(rig.host))
+    old = rig.host / ".local/state/babysit-pr/moves"
+    old.mkdir(parents=True)
+    bundle_name, record = f"{'ab' * 16}-0123abcd.bundle", f"{'ab' * 16}.json"
+    for name in (bundle_name, f"{'cd' * 16}-session.tar.gz", record, "notes.txt"):
+        (old / name).write_text("x")
+    state = remote_probe.move_snapshot(remote_probe.host_git, str(rig.checkout))
+    args = {k: state[k] for k in ("head", "index_tree", "work_tree")}
+    remote_probe._host_move_bundle(str(rig.checkout), "ef" * 16, base=None, **args)
+    assert sorted(f.name for f in old.iterdir()) == [record, "notes.txt"]
+    # This machine's probe never touches it: there it is the dashboard's record of moves.
+    (old / bundle_name).write_text("x")
+    monkeypatch.setenv(remote_probe.MOVE_STAGING, str(rig.host / "staging"))
+    remote_probe._host_move_bundle(str(rig.checkout), "ef" * 16, base=None, **args)
+    assert (old / bundle_name).exists()
