@@ -1439,8 +1439,9 @@ def test_cross_agent_diagnostic_with_sanitized_home(cross_agent, checkout, tmp_p
         result = subprocess.run(["sh", "-c", command], env=clean, capture_output=True, text=True)
         assert result.returncode == 2
         assert "Codex sandbox" in result.stderr and "Claude account" in result.stderr
-        assert "host terminal" in result.stderr and "wt --claude" in result.stderr
-        assert "same agent and account" in result.stderr
+        assert "wt --review --claude" in result.stderr and "Scheduled" in result.stderr
+        assert "Direct executable paths may run" in result.stderr
+        assert "no reviewer starts before approval" in result.stderr
         assert "Please run /login" not in result.stderr
         assert not result.stdout
 
@@ -1497,8 +1498,9 @@ def test_cross_agent_review_explains_isolation_instead_of_requesting_login(cross
     result = run(f"--codex-home={codex}", "sh", "-c", command)
     assert result.returncode == 2
     assert "Codex sandbox" in result.stderr and "Claude account" in result.stderr
-    assert "host terminal" in result.stderr and "wt --claude" in result.stderr
-    assert "same agent and account" in result.stderr
+    assert "wt --review --claude" in result.stderr and "Scheduled" in result.stderr
+    assert "Direct executable paths may run" in result.stderr
+    assert "no reviewer starts before approval" in result.stderr
     assert "Please run /login" not in result.stderr
     assert not result.stdout
 
@@ -1670,7 +1672,11 @@ def test_linux_account_login_and_status_run_claude_auth_in_the_account_alone(
     (fakes / "bwrap").write_text(
         '#!/bin/sh\n[ "$1" = --help ] && exit 0\n'
         'while [ "$1" != -- ]; do\n'
-        '  [ "$1" = --setenv ] && export "$2=$3"\n'
+        # This fake does not mount /tmp. Avoid a diagnostic on the enclosing
+        # sandbox's PATH shadowing this test's selected provider executable.
+        '  if [ "$1" = --setenv ]; then\n'
+        '    if [ "$2" = PATH ]; then export PATH="${3#/tmp/babysit-bin:}"; else export "$2=$3"; fi\n'
+        "  fi\n"
         '  shift\ndone\nshift\nexec "$@"\n'
     )
     (fakes / "claude").write_text(

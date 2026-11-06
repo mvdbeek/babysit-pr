@@ -1076,11 +1076,17 @@ not to start it again. The
 dashboard shows "Started by …" (the asking agent, its directory, machine and session)
 in the operation and on the sub-task's Workspaces row.
 
-An explicitly requested cross-agent review needs a separate user launch: from a host
-terminal on the intended worker, use `wt --claude --claude-account default -r REPO
---machine local -F BRIEF BASE REVIEW_BRANCH` (or select a named account). `REPO` names
-a local clone. Brokered sub-tasks keep the asking agent and account; host re-login
-does not expose Claude's account to a Codex sandbox. See
+An explicitly requested cross-agent review can be requested from a worker sandbox:
+`wt --review --claude --claude-account default -r OWNER/REPO -F BRIEF FULL_COMMIT_SHA
+REVIEW_BRANCH` (or select a named account; use `--codex` for the reverse). The request
+starts nothing until a signed-in user approves its exact provider, account, machine,
+repository, commit, grants and brief in **Scheduled**. Approval requires dashboard
+sign-in or an admin key scoped to the endpoint even in report mode; it is unavailable
+with auth off. Auto pins the parent worker; another eligible Linux worker can be
+explicitly selected. The selected worker must already have the commit and an authenticated
+provider account. The controller launches a separate sandbox with only that
+provider/account; the asking worker gains no credentials. Ordinary subtasks keep
+their existing restrictions. Host re-login does not alter an existing sandbox. See
 [the sandbox guidance](references/supervisor.md#sub-tasks-from-a-sandbox). On Linux,
 save reports in `$BABYSIT_ARTIFACT_DIR` for persistence on the worker host;
 `~/src/agent-artefacts/outbox` is temporary unless explicitly granted.

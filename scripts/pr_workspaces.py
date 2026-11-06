@@ -2043,7 +2043,7 @@ class Workspaces:
     def subtask(self, launch, parent):
         """A New task an agent asked for from its sandbox (`wt` there), under stricter rules.
 
-        ``launch`` has ``wt.LAUNCH_FIELDS`` and optional ``tags``. ``parent`` asks, as a
+        ``launch`` has ``wt.LAUNCH_FIELDS`` and optional ``tags``/``review``. ``parent`` asks, as a
         worker's broker reports it (``worker_api.launch_args``: that machine, its sandbox's
         directory, Docker grant and agent configuration, the conversation's transcript) or
         as a `wt` inside Safehouse here claims it (``worker_api.local_parent``); it is
@@ -2056,11 +2056,19 @@ class Workspaces:
         (lacking what it needs), never on this machine for a worker's parent, and only in a
         clone of the repository there. One that has no room now (full, unchecked, or already
         running SUBTASK_AGENTS working sub-task agents) is recorded as waiting for room.
+        ``review`` requests a cross-agent exception from a worker broker, recorded
+        without launching until ``approve_review`` receives authenticated approval.
         Answers the operation as soon as it is recorded.
         """
         flags = {"docker", "exit_when_done"}
-        if not isinstance(launch, dict) or set(launch) - {"tags"} != set(wt.LAUNCH_FIELDS):
+        if not isinstance(launch, dict) or set(launch) - {"tags", "review"} != set(
+            wt.LAUNCH_FIELDS
+        ):
             raise ValueError("Expected exactly the launch fields")
+        review = launch.get("review", False)
+        if type(review) is not bool:
+            raise ValueError("Invalid review flag")
+        launch = {k: v for k, v in launch.items() if k != "review"}
         if any(type(launch[flag]) is not bool for flag in flags) or any(
             not isinstance(value, str) or (key != "task" and CONTROL.search(value))
             for key, value in launch.items()
@@ -2072,21 +2080,46 @@ class Workspaces:
             raise ValueError("Name a machine, or auto")
         if not SLUG.fullmatch(launch["repo"]):
             raise ValueError("Choose a repository")
-        if launch["agent"] != parent["agent"]:
-            agent = launch["agent"]
-            option = (
-                "--claude --claude-account <account|default>" if agent == "claude" else "--codex"
-            )
+        cross = launch["agent"] != parent["agent"]
+        if cross and not review:
             raise ValueError(
                 f"A sub-task runs {parent['agent']}, as the launch asking does. "
-                "Brokered sub-tasks keep the same agent and account. "
-                "For an explicitly requested cross-agent review, start a separate sandbox "
-                f"from the host terminal on the intended worker with wt {option} -r REPO "
-                "--machine local -F BRIEF BASE REVIEW_BRANCH (REPO names a local clone). "
-                "Host re-login will not change this configuration isolation; nothing was started"
+                "Ordinary sub-tasks keep the same agent and account. For a cross-agent review "
+                "from a worker, use wt --review with the requested provider, selected account, "
+                "repository, full commit SHA as base and review brief. The dashboard's "
+                "Scheduled tab requires authenticated approval before a separate sandbox starts. "
+                "Host re-login does not change this sandbox's isolated configuration"
             )
         request = dict(launch)
-        if launch["agent"] == "claude":
+        if review:
+            if not cross or launch["agent"] not in {"claude", "codex"}:
+                raise ValueError("--review requests a different provider")
+            if parent["sandbox"] != "bwrap" or parent["machine"] is None:
+                raise ValueError("Cross-agent review approval requires a worker's broker")
+            if not re.fullmatch(r"[0-9a-f]{40}", launch["base"]):
+                raise ValueError("A review requires the full commit SHA as its base")
+            if not wt.LAUNCH_BRANCH.fullmatch(launch["name"]) or ".." in launch["name"]:
+                raise ValueError("Name the new review branch")
+            if not launch["task"].strip() or len(launch["task"]) > 32000 or "\0" in launch["task"]:
+                raise ValueError("Supply a review brief of 1–32,000 characters")
+            if launch["agent"] == "claude":
+                # Never inherit the controller's active Claude account.
+                request["claude_account"] = launch["claude_account"] or "default"
+            elif launch["claude_account"]:
+                raise ValueError("A Claude account can only be selected for Claude")
+            if request["claude_account"] and not claude_accounts.NAME.fullmatch(
+                request["claude_account"]
+            ):
+                raise ValueError("Invalid Claude account name")
+            workspace_agents.validate(launch["agent"], launch["model"], launch["effort"], self.home)
+            if launch["permission_mode"] not in {"", "auto"} or (
+                launch["permission_mode"] and launch["agent"] != "claude"
+            ):
+                raise ValueError("Only Claude takes a permission mode, and only auto")
+            # Approval binds a concrete machine, even when the caller chose Auto.
+            if request["machine"] == "auto":
+                request["machine"] = parent["machine"]
+        elif launch["agent"] == "claude":
             account = parent_account(parent)
             if (launch["claude_account"] or account) != account:
                 raise ValueError(
@@ -2138,7 +2171,72 @@ class Workspaces:
                 raise worker_api.RateLimited(
                     f"Launches there started {SUBTASK_MACHINE_RATE} sub-tasks in the last hour; wait"
                 )
-            return self.start_subtask(request, {**parent, "root": root, "depth": depth}, ops)
+            lineage = {**parent, "root": root, "depth": depth}
+            if review:
+                key = f"{NEW_PREFIX}{uuid.uuid4()}"
+                op = {
+                    "id": str(uuid.uuid4()),
+                    "pr": key,
+                    "status": "approval",
+                    "action": "new",
+                    "machine": request["machine"],
+                    "agent": request["agent"],
+                    "path": None,
+                    "parent": lineage,
+                    "started_by": started_by(lineage),
+                    "created_at": now,
+                    "wait_until": now + ROOM_WAIT,
+                    "message": "Review awaiting authenticated approval in Scheduled; no reviewer started",
+                    "subject": {
+                        "repo": request["repo"],
+                        "branch": request["name"],
+                        "base": request["base"],
+                    },
+                    "review_request": request,
+                }
+                with self.db() as db:
+                    db.execute("INSERT INTO operations VALUES (?,?)", (key, json.dumps(op)))
+                return {"operation": op}
+            return self.start_subtask(request, lineage, ops)
+
+    def approve_review(self, key, subject):
+        """Consume one stored request after the dashboard authenticates a human/admin.
+
+        No worker endpoint calls this. Approval accepts only the request ID, never
+        replacement launch fields. Persist authorization before entering the existing
+        sub-task placement/launch path so a restart cannot lose or duplicate it.
+        """
+        with self.subtask_lock:
+            with self.db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM operations WHERE pr=?", (key,)).fetchone()
+                op = json.loads(row[0]) if row else None
+                if not op or op["status"] != "approval" or time.time() >= op["wait_until"]:
+                    raise ValueError(
+                        "This review is no longer awaiting approval; refresh the dashboard"
+                    )
+                request = op["review_request"]
+                parent = {
+                    **op["parent"],
+                    "review_approval": {"by": subject, "at": time.time(), "request": request},
+                }
+                op.update(
+                    status="waiting", parent=parent, message="Approved review waiting for placement"
+                )
+                db.execute("UPDATE operations SET data=? WHERE pr=?", (json.dumps(op), key))
+                db.execute(
+                    "INSERT INTO waiting VALUES (?,?)",
+                    (key, json.dumps({"entry": "subtask", "request": request, "parent": parent})),
+                )
+            # The scheduler holds this same lock; only one caller can launch it.
+            ops = list(self.state()["operations"].values())
+            try:
+                return self.start_subtask(request, parent, ops, resume=op)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                failed, _ = self.settle_waiting(
+                    key, op["id"], status="failed", message=f"Review not started: {exc}"
+                )
+                return {"operation": failed}
 
     def start_subtask(self, request, parent, ops, resume=None):
         """Place a checked sub-task and start it, or record it as waiting for room (or, as
@@ -2147,6 +2245,11 @@ class Workspaces:
         origin = parent["machine"] or placement.LOCAL
         named = request["machine"]
         config, loads = self.loads.current()
+        if parent.get("review_approval") and named in config["machines"]:
+            if config["machines"][named].os != "linux":
+                raise ValueError(
+                    "Cross-agent reviewers require a Linux worker with babysit-bwrap account isolation"
+                )
         fields = {
             "kind": "scratch",
             "repo": request["repo"],
@@ -3062,6 +3165,13 @@ class Workspaces:
         return self.settle_waiting(op["pr"], op["id"], message=f"Waiting for room: {room}")[0]
 
     def cancel_waiting(self, key):
+        with self.subtask_lock, self.db() as db:
+            row = db.execute("SELECT data FROM operations WHERE pr=?", (key,)).fetchone()
+            pending = json.loads(row[0]) if row else None
+            if pending and pending["status"] == "approval":
+                pending.update(status="failed", message="Review request cancelled before approval")
+                db.execute("UPDATE operations SET data=? WHERE pr=?", (json.dumps(pending), key))
+                return pending
         op = self.operation(key)
         if op and op["status"] == "waiting":
             op, changed = self.settle_waiting(
@@ -3079,6 +3189,13 @@ class Workspaces:
                 " WHERE json_extract(o.data,'$.status')='waiting'"
             ).fetchall()
         found = []
+        with self.db() as db:
+            for (data,) in db.execute(
+                "SELECT data FROM operations WHERE json_extract(data,'$.status')='approval'"
+            ):
+                op = json.loads(data)
+                if time.time() < op["wait_until"]:
+                    found.append(op)
         for data, saved in rows:
             op, saved = json.loads(data), json.loads(saved)
             shown = ("pr", "id", "machine", "agent", "message", "created_at", "wait_until")
@@ -3097,6 +3214,14 @@ class Workspaces:
         """Start each waiting launch that now has room, longest waiting first; one that
         waited ROOM_WAIT, or can no longer start, fails with the reason."""
         now = time.time() if now is None else now
+        with self.subtask_lock, self.db() as db:
+            for key, data in db.execute(
+                "SELECT pr,data FROM operations WHERE json_extract(data,'$.status')='approval'"
+            ).fetchall():
+                op = json.loads(data)
+                if now >= op["wait_until"]:
+                    op.update(status="failed", message="Review request expired before approval")
+                    db.execute("UPDATE operations SET data=? WHERE pr=?", (json.dumps(op), key))
         with self.db() as db:
             rows = db.execute(
                 "SELECT w.pr, w.data, o.data FROM waiting w LEFT JOIN operations o ON o.pr = w.pr"
@@ -3541,6 +3666,10 @@ class Workspaces:
         try:
             machine = machines.resolve(self.home, op["machine"], placing=True)
             assert machine is not None
+            if op.get("parent", {}).get("review_approval") and machine.os != "linux":
+                raise ValueError(
+                    "Cross-agent reviewers require a Linux worker with babysit-bwrap account isolation"
+                )
             # The worker's clone by its real path there, as its cleanup locks it; never a
             # same-named one here.
             real = cron_agents.probe(self.home, machine, "realpath", 30, path=op["clone"])["path"]
@@ -3591,6 +3720,7 @@ class Workspaces:
                     account=op.get("claude_account"),
                     sandbox=cron_agents.BACKENDS[machine.os],
                     also=[[c, op["also_repos"][c]] for c in op.get("also", [])],
+                    **({"review": True} if op.get("parent", {}).get("review_approval") else {}),
                 )
                 name = found["name"]
                 # Each other clone's base, by the real path the probe found it at there.

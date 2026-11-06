@@ -10,7 +10,7 @@ esac
 printf '%s\n' \
   "babysit-bwrap: this $selected sandbox has no $requested account mounted." \
   'Its HOME and agent configuration are isolated; re-login on the host will not change this namespace.' \
-  'Brokered wt sub-tasks keep the same agent and account.' \
-  "For an explicitly requested cross-agent review, start a separate sandbox from the host terminal on the intended worker with wt $option -r REPO --machine local -F BRIEF BASE REVIEW_BRANCH." \
-  'REPO names a local clone. Select the intended account there. Share the exact commit/diff through the repository or an explicitly granted path; private account caches are separate.' >&2
+  'Direct executable paths may run, but do not gain the other provider account. wt is the supported controller approval route.' \
+  "For an explicitly requested cross-agent review, request wt --review $option -r OWNER/REPO -F BRIEF FULL_COMMIT_SHA REVIEW_BRANCH. Approve the exact request in the dashboard Scheduled tab with a signed-in session; no reviewer starts before approval." \
+  'Select the intended account on the reviewer worker. The executable and authenticated account must be available there. Share the exact commit/diff through the repository or an explicitly granted path; private account caches are separate.' >&2
 exit 2

@@ -3219,6 +3219,69 @@ def test_scheduled_tab_lists_and_cancels_launches_waiting_for_room(page, dashboa
 
 
 @pytest.mark.parametrize("width", [1280, 390])
+def test_review_approval_shows_exact_scope_and_requires_an_explicit_click(
+    page, dashboard_site, width
+):
+    url, _ = dashboard_site
+    now = time.time()
+    waiting = [
+        {
+            "pr": "new:review",
+            "id": "review-op",
+            "status": "approval",
+            "agent": "claude",
+            "machine": "chonk",
+            "created_at": now,
+            "wait_until": now + 3600,
+            "message": "Review awaiting authenticated approval; no reviewer started",
+            "subject": {"repo": "base/repo", "branch": "review", "base": "a" * 40},
+            "parent": {"agent": "codex", "session": "parent-session", "docker": False},
+            "review_request": {
+                "repo": "base/repo",
+                "agent": "claude",
+                "claude_account": "oss",
+                "base": "a" * 40,
+                "docker": False,
+                "task": '<img src=x onerror="window.injected=true"> Review only; no posting',
+            },
+        }
+    ]
+    approvals = []
+    page.route(
+        "**/api/scheduled-tasks",
+        lambda route: route.fulfill(json={"enabled": True, "tasks": [], "waiting": waiting}),
+    )
+
+    def approve(route):
+        approvals.append(
+            (route.request.headers.get("x-babysit-action"), route.request.post_data_json)
+        )
+        if len(approvals) == 1:
+            route.fulfill(status=403, json={"error": "Sign in to approve"})
+        else:
+            waiting.clear()
+            route.fulfill(json={"operation": {"status": "queued"}})
+
+    page.route("**/api/review-approve", approve)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#scheduled")
+    card = page.locator("#waiting-list li")
+    expect(card).to_contain_text("Review approval required")
+    expect(card.locator("pre")).to_contain_text('"claude_account": "oss"')
+    expect(card.locator("pre")).to_contain_text("a" * 40)
+    expect(card.locator("pre")).to_contain_text("parent-session")
+    expect(card.locator("pre")).to_contain_text("Review only; no posting")
+    assert not approvals and not page.evaluate("window.injected")
+    assert card.locator("img").count() == 0
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    card.get_by_role("button", name="Approve this review").click()
+    expect(card.get_by_role("button", name="Sign in to approve")).to_be_enabled()
+    card.get_by_role("button", name="Sign in to approve").click()
+    expect(card).to_have_count(0)
+    assert approvals == [("review-approve", {"id": "new:review"})] * 2
+
+
+@pytest.mark.parametrize("width", [1280, 390])
 def test_scheduled_tab_lists_wt_exit_watches(page, dashboard_site, width):
     url, _ = dashboard_site
     now = time.time()

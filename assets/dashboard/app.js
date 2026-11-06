@@ -4027,7 +4027,11 @@ function waitingCard(op) {
   const head = el("div", undefined, "scheduled-when");
   head.append(
     el("strong", scheduleTime(op.created_at)),
-    el("span", "Waiting for room", "badge blue"),
+    el(
+      "span",
+      op.status === "approval" ? "Review approval required" : "Waiting for room",
+      "badge blue",
+    ),
   );
   const subject = op.subject || {};
   let heading;
@@ -4064,6 +4068,38 @@ function waitingCard(op) {
     ),
     el("p", `${op.message}. Gives up at ${scheduleTime(op.wait_until)}.`, "scheduled-message"),
   );
+  if (op.status === "approval") {
+    const details = el("details", undefined, "scheduled-text");
+    details.append(
+      el("summary", "Review provider, account, commit, grants and complete brief"),
+      el("pre", JSON.stringify({ launch: op.review_request, parent: op.parent }, null, 2)),
+    );
+    details.open = true;
+    const approve = el("button", "Approve this review");
+    approve.type = "button";
+    approve.onclick = async () => {
+      approve.disabled = true;
+      try {
+        const response = await fetch("/api/review-approve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Babysit-Action": "review-approve" },
+          body: JSON.stringify({ id: op.pr }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not approve review");
+        if (["failed", "uncertain"].includes(result.operation?.status)) {
+          $("scheduled-error").textContent =
+            `Review ${result.operation.status}: ${result.operation.message}`;
+        }
+        scheduledData.waiting = scheduledData.waiting.filter((other) => other.pr !== op.pr);
+        renderScheduled();
+      } catch (error) {
+        approve.disabled = false;
+        approve.textContent = error.message;
+      }
+    };
+    card.append(details, approve);
+  }
   const cancel = el("button", scheduledCancelling.has(op.pr) ? "Cancelling…" : "Cancel");
   cancel.type = "button";
   cancel.disabled = scheduledCancelling.has(op.pr);

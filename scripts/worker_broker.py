@@ -19,12 +19,13 @@ names the launch's own conversation only, with the transcript found for it, and 
 controller acts only on a watch of that machine, worktree and session whose transcript
 is exactly that one.
 
-A launch (``action: launch``) asks for a sub-task: ``wt.LAUNCH_FIELDS`` and optional ``tags`` under
+A launch (``action: launch``) asks for a sub-task: ``wt.LAUNCH_FIELDS`` and optional ``tags``/``review`` under
 ``launch``, and the conversations it may run in under ``sessions``. The broker keeps its
 launch's agent's session, checked as a handoff's, and tells the controller, as the
 sub-task's parent, what the sandbox cannot forge: the launch's working directory
 (``--cwd``, babysit-bwrap's), its agent and CONFIG_DIR, that transcript, and whether the
-launch was granted Docker (``docker`` in ``--granted``). The controller decides the rest; a launch without
+launch was granted Docker (``docker`` in ``--granted``). The review flag requests approval,
+never authorizes a provider/account change. The controller decides the rest; a launch without
 ``--cwd`` starts nothing.
 
 "Its own sessions" means every session in that configuration directory, which other
@@ -114,7 +115,7 @@ def check(request, agent, config_dir, worktrees, launch=None):
             set(request) != {"launch", "sessions"}
             or not isinstance(sessions, dict)
             or not isinstance(fields, dict)
-            or set(fields) - {"tags"} != set(wt.LAUNCH_FIELDS)
+            or set(fields) - {"tags", "review"} != set(wt.LAUNCH_FIELDS)
         ):
             raise ValueError("Expected exactly the launch fields")
         if not launch or not launch.get("cwd"):

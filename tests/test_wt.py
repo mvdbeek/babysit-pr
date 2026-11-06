@@ -2721,3 +2721,46 @@ def test_a_gone_broker_starts_nothing(tmp_path, socket_dir):
     t = tool(env={"HOME": str(tmp_path), "BABYSIT_REGISTER_SOCKET": str(socket_dir / "gone")})
     with pytest.raises(wt.WtError, match="broker is gone; nothing was started"):
         t.run("wt", ["-r", "a/b", "-p", "go", "main", "x"])
+
+
+def test_review_cli_requests_other_provider_and_reports_approval_without_retry(
+    tmp_path, socket_dir
+):
+    path = socket_dir / "register.sock"
+    received = []
+    broker_answering(
+        path,
+        {
+            "operation": {
+                "pr": "new:review",
+                "status": "approval",
+                "message": "Awaiting authenticated approval",
+            }
+        },
+        received,
+    )
+    t = tool(
+        env={"HOME": str(tmp_path), "BABYSIT_REGISTER_SOCKET": str(path), "CODEX_THREAD_ID": SID}
+    )
+    t.run(
+        "wt",
+        [
+            "--review",
+            "--claude",
+            "--claude-account",
+            "oss",
+            "-r",
+            "a/b",
+            "-p",
+            "Review commit only",
+            "a" * 40,
+            "review",
+        ],
+    )
+    [request] = received
+    assert request["launch"]["review"] is True
+    assert request["launch"]["agent"] == "claude" and request["launch"]["claude_account"] == "oss"
+    assert request["launch"]["base"] == "a" * 40
+    assert request["sessions"] == {"codex": SID, "claude": None}
+    assert "Scheduled tab" in t.stderr.getvalue() and "no reviewer started" in t.stderr.getvalue()
+    assert "once there is room" not in t.stderr.getvalue()

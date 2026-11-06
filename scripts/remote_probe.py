@@ -2026,7 +2026,7 @@ def _host_session_info(agent, session, cwd, rollout, account, expected_home=None
     raise ValueError("Expected claude or codex")
 
 
-def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox, also=()):
+def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox, also=(), review=False):
     """Where a dashboard launch's ``wt`` makes its checkout here, before it runs.
 
     ``clone`` must be a clone of ``repo``, as for a cron job, and so must each clone in
@@ -2048,7 +2048,68 @@ def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox, also=()
             raise ValueError("Expected [clone, repo] pairs")
         _arg_paths([pair[0]], home=True)
         _repo(pair[1])
-    _, _, config = _host_claude(agent, account, sandbox)
+    if type(review) is not bool:
+        raise ValueError("Expected a review flag")
+    selected, claude_env, config = _host_claude(agent, account, sandbox)
+    if review:
+        # Ask the selected provider, never inspect or copy credential contents. The
+        # executable may exist while the selected account is unauthenticated.
+        executable = shutil.which(agent)
+        if not executable:
+            raise ValueError(f"Review provider executable {agent} is unavailable on this worker")
+        env = dict(os.environ)
+        provider_home = (
+            selected
+            if agent == "claude"
+            else os.path.realpath(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+        )
+        if not os.path.isdir(provider_home):
+            raise ValueError(
+                f"Review provider {agent} has no configured account directory on this worker"
+            )
+        if agent == "claude":
+            for name in (
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "ANTHROPIC_PROFILE",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+            ):
+                env.pop(name, None)
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            if claude_env is not None:
+                env["CLAUDE_CONFIG_DIR"] = claude_env
+            args = [executable, "auth", "status"]
+        else:
+            env["CODEX_HOME"] = provider_home
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("CODEX_API_KEY", None)
+            args = [executable, "login", "status"]
+        try:
+            result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=30)
+            authenticated = result.returncode == 0
+            if agent == "claude":
+                logged_in = json.loads(result.stdout)["loggedIn"]
+                if type(logged_in) is not bool:
+                    raise ValueError("Unexpected authentication status")
+                authenticated = authenticated and logged_in
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            # Do not describe a timeout, broken CLI or unexpected output as a login
+            # failure, and never echo auth-status output into an operation's log.
+            raise ValueError(
+                f"Review executable {agent} is available but its selected account's authentication could not be verified on this worker; no reviewer started"
+            ) from None
+        if not authenticated:
+            label = (
+                f"Claude account {account or 'default'}"
+                if agent == "claude"
+                else "Codex account in the worker's configured CODEX_HOME"
+            )
+            raise ValueError(
+                f"Review executable is available but {label} is not authenticated on this worker; provision that selected account on the host before requesting a new review. Existing sandboxes keep their isolated configuration"
+            )
     clone, _, common = _host_clone(clone, repo, create=True)
     root = os.path.realpath(os.path.expanduser(root))
     if root == common or root.startswith(common + os.sep):
