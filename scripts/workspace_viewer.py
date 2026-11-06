@@ -303,11 +303,12 @@ def checkout_workspace(root, machine=None):
     return found
 
 
-def remote_checkout(machine, workspace_id):
+def remote_checkout(machine, workspace_id, recorded_checkout=None):
     """The checkout a worker's herdr workspace was opened on, as that worker spells it.
 
-    Remembered like this machine's, so a closed workspace keeps its views. Nothing here
-    looks at the path: the worker's probe resolves it and checks it is a checkout's top.
+    Remembered like this machine's, so a closed workspace keeps its views, and recovered
+    like it from ``recorded_checkout`` once forgotten. Nothing here looks at the path:
+    the worker's probe resolves it and checks it is a checkout's top.
     """
     if not isinstance(workspace_id, str) or not WORKSPACE_ID.match(workspace_id):
         raise ValueError("Supply a herdr workspace")
@@ -320,15 +321,18 @@ def remote_checkout(machine, workspace_id):
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ValueError(f"{machine.label} did not list its workspaces: {exc}") from exc
     space = next((w for w in spaces if w["workspace_id"] == workspace_id), None)
+    recovered = False
     if space is not None:
         root = checkout_of(space, machine)
         if root is None:
             raise ValueError("That herdr workspace has no checkout to show")
     elif cached:
         root = cached[1]  # Closed since it was last seen.
+    elif recorded_checkout and (root := recorded_checkout(workspace_id)):
+        recovered = True
     else:
         raise ValueError("That herdr workspace is not open; refresh")
-    remember(workspace_id, root, spaces, machine=machine)
+    remember(workspace_id, root, spaces, recovered=recovered, machine=machine)
     return root
 
 
