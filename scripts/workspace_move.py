@@ -1573,6 +1573,8 @@ class Move:
                     "docker": src["docker"],
                 },
             )
+            # Typed there: a restarted dashboard must not advise removing its checkout.
+            self.record(resumed=True)
             running = self.confirmed(src["session"], src["agent"], resumed.get("pane"))
             if running is None:
                 raise ValueError(
@@ -1589,7 +1591,7 @@ class Move:
                     f". Its resume was typed in {resumed.get('pane')} on {there}; check "
                     f"there before resuming it on {here}"
                 )
-            if self.worker is not None:
+            if self.worker is not None and resumed is None:
                 said += ". " + leftover(self.worker["path"], src["state"]["branch"], there)
             raise Failed(
                 said,
@@ -1710,10 +1712,15 @@ class Moves:
                     if left
                     else f"Check whether the agent still runs on {where}"
                 )
-                if op.get("target_path"):
-                    said += ". " + leftover(
-                        op["target_path"], op.get("branch"), op.get("target_label") or "its target"
+                target = op.get("target_label") or "its target"
+                if op.get("target_path") and (op.get("resumed") or stage == "resumed"):
+                    # Its resume was typed there: the agent may run in that checkout now.
+                    said += (
+                        f". The agent may be running in {op['target_path']} on {target}; check "
+                        "there before doing anything with it"
                     )
+                elif op.get("target_path"):
+                    said += ". " + leftover(op["target_path"], op.get("branch"), target)
                 watch = op.get("watch")
                 if watch:
                     said += self.give_back(watch)

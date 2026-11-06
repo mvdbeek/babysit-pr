@@ -591,6 +591,8 @@ def test_an_unconfirmed_resume_keeps_the_source_checkout(rig, monkeypatch):
         run_move(rig)
     assert failed.value.details["stage"] == "after_exit"
     assert "typed in w1:p1 on Mac mini" in str(failed.value)
+    # The agent may run in the new checkout: nothing advises removing it.
+    assert "remove it" not in str(failed.value)
     assert rig.checkout.exists() and rig.target.exists()
 
 

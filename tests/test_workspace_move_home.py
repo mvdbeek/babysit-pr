@@ -596,6 +596,49 @@ def test_a_checkout_there_written_after_its_copy_is_kept(rig, monkeypatch):
     assert "Linux box" in result["warnings"][0]
 
 
+def test_an_unconfirmed_resume_here_never_advises_removing_its_checkout(rig, monkeypatch):
+    monkeypatch.setattr(workspace_move.Move, "confirmed", lambda self, *args: None)
+    saved = {}
+    move = workspace_move.Move(
+        rig.home, request(), rig.placing, rig.overview, rig.progress.append, saved.update
+    )
+    with pytest.raises(workspace_move.Failed, match="check there before resuming") as failed:
+        move.run()
+    assert failed.value.details["stage"] == "after_exit"
+    assert "remove it" not in str(failed.value) and rig.target.exists()
+    assert saved["resumed"] is True and saved["target_path"] == str(rig.target)
+
+
+def test_a_restart_after_the_resume_says_the_agent_may_run_in_the_new_checkout(rig):
+    folder = rig.home / "moves"
+    folder.mkdir()
+    for move_id, stage, resumed in (("ab" * 16, "resumed", False), ("cd" * 16, "after_exit", True)):
+        (folder / f"{move_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": move_id,
+                    "status": "running",
+                    "pane": "w1:p2",
+                    "session": SID,
+                    "message": "Resuming Claude on this Mac",
+                    "steps": [],
+                    "started_at": 1,
+                    "source_label": "Linux box",
+                    "stage": stage,
+                    "resumed": resumed,
+                    "target_path": str(rig.target),
+                    "target_label": "this Mac",
+                    "branch": "feature",
+                }
+            )
+        )
+    moves = workspace_move.Moves(rig.home, lambda: rig.placing, lambda: rig.overview)
+    for move_id in ("ab" * 16, "cd" * 16):
+        said = moves.action({"id": move_id})["move"]["message"]
+        assert f"The agent may be running in {rig.target} on this Mac" in said
+        assert "remove it" not in said
+
+
 def test_ignored_files_there_that_are_not_rebuildable_keep_the_workers_worktree(rig):
     (rig.checkout / "debug.log").write_text("ignored, and not rebuildable\n")
     found = workspace_move.plan(rig.home, request(), rig.placing)
