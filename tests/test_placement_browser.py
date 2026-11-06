@@ -265,12 +265,14 @@ def test_badges_appear_once_the_status_names_workers(page, site, dashboard_site)
     register_workers(dashboard_site[1])
     snapshot["machines"] = [LOCAL, MINI]
     calls["machines_down"] = True
-    page.goto(url + "/#workspaces")
+    # Badges are asked for only once the status names workers, so wait for that first
+    # answer itself: machinesBusy is also false before it was ever asked.
+    with page.expect_response("**/api/machines") as answer:
+        page.goto(url + "/#workspaces")
+    assert answer.value.status == 500
     # A failed answer is asked again by the next poll, never left for good.
     page.wait_for_function("() => !machinesBusy")
     expect(page.locator("#ws-machines")).to_be_hidden()
-    asked = calls["machines"]
-    assert asked >= 1
     calls["machines_down"] = False
     expect(page.locator("#ws-machines .badge")).to_have_text(
         ["This machine · 2 agents", "Mac mini · 4/4 busy"], timeout=20000

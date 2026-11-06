@@ -13,6 +13,7 @@ import os
 import pty
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -610,6 +611,10 @@ def test_wrapper_tells_a_workers_agent_it_is_on_a_worker(checkout):
     socket = [v for k, v in pairs(argv, "--setenv") if k == "BABYSIT_REGISTER_SOCKET"][-1]
     assert socket.endswith("/register.sock") and "babysit-register." in socket
     assert (socket, socket) in pairs(argv, "--bind")
+    # Claude records its session by its PID in the sandbox, the same in every one: each
+    # launch's records go to a directory of its own, beside the broker's socket.
+    records = (str(Path(socket).parent / "sessions"), str(account.resolve() / "sessions"))
+    assert pairs(argv, "--bind")[-1] == records
 
 
 @fd_bash
@@ -649,6 +654,9 @@ def test_a_workers_broker_is_told_the_launchs_directory_and_grants(checkout, tmp
     ]
     assert argv[4].endswith("/register.sock")
     assert argv[5:] == ["claude", str(account.resolve()), str(worktree)]
+    # The broker reads the sandbox's session records beside its socket.
+    records = Path(argv[4]).parent / "sessions"
+    assert records.is_dir() and stat.S_IMODE(records.stat().st_mode) == 0o700
 
 
 def test_wrapper_ignores_the_working_directory_and_its_git_files(checkout):

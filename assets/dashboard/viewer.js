@@ -1707,13 +1707,29 @@
       row.append(node("span", "No session is recorded in this checkout", "pr-meta"));
       return row;
     }
-    row.dataset.live = known ? "false" : "unknown";
+    // An agent of this session's kind whose session herdr does not know may well run this
+    // one: it is not called stopped. It is listed below, as the workspace's other agents are.
+    const kind = viewer.data?.session?.agent;
+    const unnamed = known && agents.some((agent) => !agent.session && agent.agent === kind);
+    row.dataset.live = known && !unnamed ? "false" : "unknown";
     row.append(
-      badge({ loaded: "Not running", loading: "Checking…" }[agentsRead] || "Status unknown"),
+      badge(
+        unnamed
+          ? "Status unknown"
+          : { loaded: "Not running", loading: "Checking…" }[agentsRead] || "Status unknown",
+      ),
     );
     if (where) row.append(node("span", known && shown ? `on ${where} · ` : `on ${where}`));
     if (known && shown)
-      row.append(node("span", "no agent has this session open right now", "pr-meta"));
+      row.append(
+        node(
+          "span",
+          unnamed
+            ? "an agent runs here, but which session it has open is not known"
+            : "no agent has this session open right now",
+          "pr-meta",
+        ),
+      );
     return row;
   }
   function agentRow(agent, data) {

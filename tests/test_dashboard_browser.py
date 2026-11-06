@@ -4126,6 +4126,40 @@ def test_the_agent_status_sits_beside_the_tabs_while_the_header_has_room(
     expect(others).to_be_hidden()
 
 
+def test_an_agent_whose_session_herdr_does_not_know_is_not_called_stopped(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    # A worker's sandboxed agent before its session is reported: herdr lists it without one.
+    # A Codex without one cannot be running this Claude transcript.
+    codex, claude = viewer_routes["agents"]
+    viewer_routes["agents"] = [codex]
+    page.clock.install()
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-live")
+    strip = live.locator(".ws-live-state")
+    expect(strip).to_have_text("Not runningno agent has this session open right now")
+    viewer_routes["agents"] = [claude]
+    page.clock.run_for(11000)
+    expect(strip).to_have_attribute("data-live", "unknown")
+    expect(strip).to_have_text(
+        "Status unknownan agent runs here, but which session it has open is not known"
+    )
+    # It is listed, with what it is doing.
+    others = page.locator("#ws-viewer").get_by_role("group", name="Other running agents")
+    expect(others).to_contain_text("WorkingClaudein w1:p2")
+    # Once herdr knows its session, the strip says it runs this transcript.
+    viewer_routes["agents"][0]["session"] = "s1"
+    page.clock.run_for(11000)
+    expect(strip).to_have_attribute("data-live", "true")
+    expect(strip).to_contain_text("LiveWorkingClaude in w1:p2")
+    # Running another session, it is not this transcript's.
+    viewer_routes["agents"][0]["session"] = "s2"
+    page.clock.run_for(11000)
+    expect(strip).to_have_text("Not runningno agent has this session open right now")
+
+
 TRANSCRIPT_MARKDOWN = """Both PRs are forwarded; **one** test is <img src=x onerror="window.injected=true"> open.
 
 **New PRs, pushed to upstream:**
