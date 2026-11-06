@@ -366,15 +366,22 @@ if [[ -f $home/.config/babysit-pr/worker.json && -n $config_var ]]; then
   else
     command -v python3 >/dev/null || die "python3 is not installed"
     broker=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/babysit-register.XXXXXX") || die "cannot create a registration broker directory"
+    if [[ $agent == claude ]]; then
+      mkdir -m 0700 "$broker/sessions" || die "cannot create a session record directory"
+    fi
     exec {ready}< <(exec python3 -I "${self%/*}/worker_broker.py" --cwd="$cwd" --granted="$granted" \
       "$broker/register.sock" "$agent" "$config_dir" ${granted_dirs[@]+"${granted_dirs[@]}"} </dev/null)
     if ! read -r -u "$ready" line || [[ $line != ready ]]; then
-      rmdir "$broker" 2>/dev/null || true
+      rmdir "$broker/sessions" "$broker" 2>/dev/null || true
       die "the registration broker did not start"
     fi
     exec {ready}<&-
   fi
   argv+=(--perms 0700 --dir "$broker" --bind "$broker/register.sock" "$broker/register.sock")
+  # Claude records its running session as sessions/<pid>.json by the PID it has here,
+  # which is the same in every sandbox: each launch gets a directory of its own, which
+  # the broker reads to tell herdr the session, and removes when the sandbox exits.
+  [[ $agent != claude ]] || argv+=(--bind "$broker/sessions" "$config_dir/sessions")
 fi
 
 if ((docker)); then

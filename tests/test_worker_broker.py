@@ -19,6 +19,7 @@ import pr_supervisor as supervisor
 import pytest
 import remote_probe
 import worker_api
+import worker_broker
 from test_remote_cron import git, rollout, short_tmp  # noqa: F401 (fixture)
 from test_remote_registration import (  # noqa: F401 (fixtures)
     URL,
@@ -143,6 +144,9 @@ def test_the_broker_exits_with_its_parent_and_removes_its_socket(tmp_path):
     with tempfile.TemporaryDirectory(dir="/tmp") as runtime:
         listen = Path(runtime) / "broker" / "register.sock"
         listen.parent.mkdir(mode=0o700)
+        # The sandbox's session records, which babysit-bwrap puts beside the socket.
+        (listen.parent / "sessions" / "nested").mkdir(parents=True)
+        (listen.parent / "sessions" / "2.json").write_text("{}")
         script = 'exec 3< <(exec "$0" -I "$1" "$2" codex /nowhere </dev/null); read -r line <&3; echo "$line"'
         argv = ["bash", "-c", script, sys.executable, str(BROKER), str(listen)]
         assert subprocess.run(argv, capture_output=True, text=True).stdout == "ready\n"
@@ -238,3 +242,157 @@ def test_the_controller_checks_the_transcript_lies_in_the_launchs_store_as_it_re
             )
     finally:
         os.environ["HOME"] = home
+
+
+def fake_process(proc, pid, children=(), nspid=None, start="100", comm="claude"):
+    """A process in a fake /proc: its children, its PIDs per namespace and start time."""
+    folder = proc / str(pid)
+    (folder / "task" / str(pid)).mkdir(parents=True)
+    (folder / "task" / str(pid) / "children").write_text(" ".join(map(str, children)))
+    (folder / "status").write_text(
+        f"Name:\t{comm}\nNSpid:\t{pid}" + (f"\t{nspid}" if nspid else "") + "\n"
+    )
+    # starttime is field 22; the command name may hold spaces and parentheses.
+    (folder / "stat").write_text(
+        f"{pid} ({comm}) x) S 1 " + " ".join(["0"] * 17) + f" {start} 0 0\n"
+    )
+
+
+def session_record(store, nspid, session, start="100"):
+    store.mkdir(parents=True, exist_ok=True)
+    (store / f"{nspid}.json").write_text(
+        json.dumps({"pid": nspid, "sessionId": session, "procStart": start, "kind": "interactive"})
+    )
+
+
+@pytest.fixture
+def sandbox(tmp_path):
+    """A sandbox as bwrap runs it: bwrap (10), then its broker (11) and its init (12) in
+    a namespace of its own, which runs Claude (13), PID 2 there, whose shell (14) runs
+    another Claude (15). Claude's store is <tmp>/.claude, its records this launch's own."""
+    proc = tmp_path / "proc"
+    fake_process(proc, 10, [11, 12], comm="bwrap")
+    fake_process(proc, 11, comm="python3")
+    fake_process(proc, 12, [13], nspid=1, comm="bwrap")
+    fake_process(proc, 13, [14], nspid=2, start="777")
+    fake_process(proc, 14, [15], nspid=3, comm="bash")
+    fake_process(proc, 15, nspid=4, start="900")
+    return {
+        "proc": proc,
+        "config": tmp_path / ".claude",
+        "store": tmp_path / "launch-sessions",
+        "tree": tmp_path / "tree",
+    }
+
+
+def test_the_broker_finds_the_session_its_sandboxs_claude_records_by_its_own_pid(sandbox, tmp_path):
+    proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
+
+    def found():
+        return worker_broker.running_session(10, config, store, proc)
+
+    session = str(uuid.uuid4())
+    # Recorded, but not written to yet: nothing to show, so nothing is reported.
+    session_record(store, 2, session, start="777")
+    assert found() is None
+    path = claude_transcript(tmp_path, tree, session).resolve()
+    assert found() == (session, str(path))
+    # A record left by an earlier Claude of the same namespace PID is not this one's,
+    # nor is the session of a Claude the launch's own one runs.
+    nested = str(uuid.uuid4())
+    claude_transcript(tmp_path, tree, nested)
+    session_record(store, 4, nested, start="900")
+    session_record(store, 2, session, start="776")
+    assert found() is None
+    # Nor is a session whose transcript lies in another account's store.
+    other = str(uuid.uuid4())
+    claude_transcript(tmp_path, tree, other, "b")
+    session_record(store, 2, other, start="777")
+    assert found() is None
+    session_record(store, 2, "not a uuid", start="777")
+    assert found() is None
+    # A process outside the namespace (the broker, PID 11 on the host) never matches.
+    session_record(store, 11, session, start="100")
+    assert found() is None
+    # Only the record itself is read: not a link to one, nor a pipe that never ends.
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text(json.dumps({"sessionId": session, "procStart": "777"}))
+    (store / "2.json").unlink()
+    (store / "2.json").symlink_to(elsewhere)
+    assert found() is None
+    (store / "2.json").unlink()
+    os.mkfifo(store / "2.json")
+    assert found() is None
+    (store / "2.json").unlink()
+    (store / "2.json").write_text("[" * 60000)
+    assert found() is None
+
+
+def fake_herdr(tmp_path, monkeypatch, body):
+    calls = tmp_path / "herdr-calls"
+    herdr = tmp_path / "herdr"
+    herdr.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\n{body}\n')
+    herdr.chmod(0o755)
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setenv("HERDR_PANE_ID", "wQ:p1")
+    monkeypatch.setenv("HERDR_BIN_PATH", str(herdr))
+    monkeypatch.setattr(worker_broker, "SESSION_POLL", 0)
+    return calls
+
+
+def test_the_broker_tells_herdr_the_session_and_again_when_it_changes(
+    sandbox, tmp_path, monkeypatch
+):
+    proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    paths = {sid: claude_transcript(tmp_path, tree, sid).resolve() for sid in (first, second)}
+    session_record(store, 2, first, start="777")
+    calls = fake_herdr(tmp_path, monkeypatch, "true")
+    rounds = iter(range(6))
+
+    def running():
+        index = next(rounds, None)
+        if index == 3:  # A /clear starts another session in the same process.
+            session_record(store, 2, second, start="777")
+        return index is not None
+
+    worker_broker.report_sessions(10, config, store, proc, running)
+    reports = calls.read_text().splitlines()
+    # Once per session, not once per look.
+    assert len(reports) == 2
+    for report, sid in zip(reports, (first, second), strict=True):
+        args = report.split()
+        assert args[:4] == [
+            "pane",
+            "report-agent-session",
+            "--source=herdr:claude",
+            "--agent=claude",
+        ]
+        assert args[4].startswith("--seq=")
+        assert args[5:] == [
+            f"--agent-session-id={sid}",
+            f"--agent-session-path={paths[sid]}",
+            "wQ:p1",
+        ]
+    first_seq, second_seq = (int(r.split()[4].removeprefix("--seq=")) for r in reports)
+    assert second_seq > first_seq
+
+
+def test_the_broker_reports_again_when_herdr_refused_and_not_outside_herdr(
+    sandbox, tmp_path, monkeypatch
+):
+    proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
+    session = str(uuid.uuid4())
+    claude_transcript(tmp_path, tree, session)
+    session_record(store, 2, session, start="777")
+    # herdr is not answering at first: the report is tried again.
+    calls = fake_herdr(
+        tmp_path, monkeypatch, f'[ "$(wc -l < "{tmp_path / "herdr-calls"}")" -gt 1 ]'
+    )
+    monkeypatch.delenv("HERDR_ENV")
+    worker_broker.report_sessions(10, config, store, proc, lambda: True)  # Returns at once.
+    assert not calls.exists()
+    monkeypatch.setenv("HERDR_ENV", "1")
+    rounds = iter(range(4))
+    worker_broker.report_sessions(10, config, store, proc, lambda: next(rounds, None) is not None)
+    assert len(calls.read_text().splitlines()) == 2

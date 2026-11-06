@@ -37,6 +37,16 @@ One request is forwarded at a time, at most one of each action per MIN_INTERVAL
 seconds, so one sandbox cannot use up its worker's requests at the controller. A
 launch's answer waits for the task to start, a few minutes at most.
 
+For a Claude launch it also tells the pane's herdr which session the sandbox runs, as
+herdr's own Claude hook would: inside the sandbox that hook cannot reach herdr, and in
+its own PID namespace Claude records its session under the PID it sees there
+(``sessions/2.json``, in every sandbox alike), which herdr, looking up the host's PID,
+never finds. babysit-bwrap binds ``sessions`` beside LISTEN over CONFIG_DIR's, so each
+launch's records are its own, and this process reads them there. Without it,
+herdr lists the agent with no session, and the dashboard cannot tell that the agent runs
+the transcript it shows. Only a session whose transcript lies in CONFIG_DIR's store is
+reported, the same check a registration passes.
+
 Prints ``ready`` once LISTEN accepts connections, then runs until its parent exits
 (babysit-bwrap execs bwrap, so that is the sandbox), and removes LISTEN and its
 directory.
@@ -45,8 +55,11 @@ directory.
 import contextlib
 import json
 import os
+import shutil
 import signal
 import socket
+import stat as stat_module
+import subprocess
 import sys
 import threading
 import time
@@ -65,6 +78,11 @@ CONNECTIONS = 4
 _forwarding = threading.Lock()
 _last = {"register": 0.0, "handoff": 0.0, "launch": 0.0}
 _slots = threading.BoundedSemaphore(CONNECTIONS)
+SESSION_POLL = 2  # Seconds between looks at the session the sandbox's Claude runs.
+SESSION_DEPTH = 4  # bwrap, its init in the namespace, then Claude: two levels down.
+MAX_RECORD = 65536
+HERDR_TIMEOUT = 10
+MAX_BACKOFF = 60  # Seconds between reports herdr keeps refusing.
 
 
 def transcript(agent, config_dir, session):
@@ -201,6 +219,132 @@ def serve(client, agent, config_dir, worktrees, launch=None):
         _slots.release()
 
 
+def _children(proc, pid):
+    found = []
+    for listed in (proc / str(pid) / "task").glob("*/children"):
+        with contextlib.suppress(OSError, ValueError):
+            found += [int(child) for child in listed.read_text().split()]
+    return found
+
+
+def _namespaced(proc, pid):
+    """A process in a PID namespace of its own: (its PID there, its start time, its
+    name), or None."""
+    try:
+        status = (proc / str(pid) / "status").read_text()
+        stat = (proc / str(pid) / "stat").read_text()
+    except OSError:
+        return None
+    lines = [line.split() for line in status.splitlines()]
+    nspid: list[str] = next((line[1:] for line in lines if line[:1] == ["NSpid:"]), [])
+    name = next((line[1] for line in lines if line[:1] == ["Name:"] and len(line) > 1), "")
+    # The command name may hold spaces or parentheses; the fields follow its last ")".
+    fields = stat[stat.rfind(")") + 2 :].split()
+    if len(nspid) < 2 or len(fields) < 20:
+        return None
+    return nspid[-1], fields[19], name  # starttime is field 22 of stat
+
+
+def _record(store, pid):
+    """Claude's record of the process with this PID, or None. The sandbox writes the
+    store: only a regular file is read, never through a link or from a pipe."""
+    try:
+        fd = os.open(store / f"{pid}.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        try:
+            record = json.loads(handle.read(MAX_RECORD))
+        except (OSError, ValueError, RecursionError):
+            return None
+    return record if isinstance(record, dict) else None
+
+
+def running_session(parent, config_dir, store, proc=Path("/proc")):
+    """The Claude session the sandbox under ``parent`` runs, as (ID, transcript), or None.
+
+    Claude records it in ``store`` (``sessions`` of its configuration directory in the
+    sandbox, this launch's own), as ``<pid>.json`` by the PID it has in the sandbox's
+    namespace, with its start time. Only the outermost Claude is the launch's own, not
+    one it runs; a session with no transcript in this launch's store is not reported.
+    """
+    level = _children(proc, parent)
+    for _ in range(SESSION_DEPTH):
+        below = []
+        for pid in level:
+            ids = _namespaced(proc, pid)
+            if ids is None:
+                below += _children(proc, pid)
+                continue
+            nspid, start, name = ids
+            record = _record(store, nspid)
+            if record is not None and str(record.get("procStart")) == start:
+                try:
+                    session = str(uuid.UUID(record.get("sessionId")))
+                    return session, transcript("claude", config_dir, session)
+                except (TypeError, ValueError, AttributeError):
+                    return None
+            if name != "claude":  # Not yet recorded: what it runs is not the launch's.
+                below += _children(proc, pid)
+        level = below
+    return None
+
+
+def tell_herdr(pane, session, path):
+    """Report the session to herdr as its Claude hook does; whether herdr took it."""
+    # herdr takes a session report only from the source that holds the pane, and its
+    # Claude detection holds it as herdr:claude. Only the session is reported, as that
+    # hook does, so herdr still reads the agent's state from its screen.
+    command = [
+        os.environ.get("HERDR_BIN_PATH") or "herdr",
+        "pane",
+        "report-agent-session",
+        "--source=herdr:claude",
+        "--agent=claude",
+        f"--seq={time.time_ns()}",
+        f"--agent-session-id={session}",
+        f"--agent-session-path={path}",
+        pane,
+    ]
+    try:
+        done = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=HERDR_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def report_sessions(parent, config_dir, store, proc=Path("/proc"), running=None):
+    """Tell herdr the sandbox's Claude session, and again whenever it changes (a /clear,
+    a /resume), while ``running()``: by default, until the sandbox exits. Outside a herdr
+    pane there is no one to tell; a refusal is tried again less and less often."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if os.environ.get("HERDR_ENV") != "1" or not pane:
+        return
+    running = running or (lambda: os.getppid() == parent)
+    told = None
+    refusals = 0
+    while running():
+        try:
+            found = running_session(parent, config_dir, store, proc)
+            if found and found != told:
+                if tell_herdr(pane, *found):
+                    told, refusals = found, 0
+                else:
+                    refusals += 1
+        except Exception:  # noqa: BLE001 - what the sandbox writes must not end the reports.
+            pass
+        time.sleep(min(SESSION_POLL * 2 ** min(refusals, 5), MAX_BACKOFF))
+
+
 def main(argv):
     argv = list(argv)
     launch = {"cwd": None, "docker": False}
@@ -216,6 +360,8 @@ def main(argv):
     if agent not in {"claude", "codex"}:
         raise SystemExit(f"worker_broker: unknown agent {agent}")
     granted = {os.path.realpath(path) for path in worktrees}
+    # Beside LISTEN, babysit-bwrap's per-launch directory over CONFIG_DIR/sessions.
+    store = Path(os.path.dirname(listen)) / "sessions"
     # Out of the terminal's session: its signals and the terminal itself are not ours.
     with contextlib.suppress(OSError):
         os.setsid()
@@ -230,6 +376,10 @@ def main(argv):
         server.settimeout(1)
         print("ready", flush=True)
         os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+        if agent == "claude":
+            threading.Thread(
+                target=report_sessions, args=(parent, config_dir, store), daemon=True
+            ).start()
         while os.getppid() == parent:
             try:
                 client, _ = server.accept()
@@ -248,6 +398,9 @@ def main(argv):
         server.close()
         with contextlib.suppress(OSError):
             os.unlink(listen)
+        # The sandbox's session records: the directory is this launch's, and gone with it.
+        shutil.rmtree(store, ignore_errors=True)
+        with contextlib.suppress(OSError):
             os.rmdir(os.path.dirname(listen))
 
 
