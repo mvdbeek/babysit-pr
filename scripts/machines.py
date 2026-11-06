@@ -519,12 +519,15 @@ PUT_FILE = (
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-def put_file(home, m: Machine, directory, name, data: bytes, *, keep=None, timeout=30) -> str:
+def put_file(
+    home, m: Machine | None, directory, name, data: bytes, *, keep=None, timeout=30
+) -> str:
     """Write ``data`` to ``directory/name`` on ``m``: a new file only its owner reads.
 
     ``directory`` is a ``RemotePath`` (it may start with ``~``) and is made if missing.
     Returns the file's absolute path there; never overwrites one. ``keep`` (seconds)
-    first removes regular files in the folder older than that.
+    first removes regular files in the folder older than that. ``m`` None writes it on
+    this machine the same way.
     """
     if not isinstance(name, str) or not FILE_NAME.fullmatch(name):
         raise ValueError(f"Invalid staged file name {name!r}")
@@ -537,8 +540,42 @@ def put_file(home, m: Machine, directory, name, data: bytes, *, keep=None, timeo
     path = result.stdout.decode(errors="replace")
     if result.returncode or not path.startswith("/") or CONTROL.search(path):
         detail = result.stderr.decode(errors="replace").strip()[-300:]
-        raise ValueError(f"Could not stage {name} on {m.label}: {detail or 'no path returned'}")
+        where = m.label if m else "this machine"
+        raise ValueError(f"Could not stage {name} on {where}: {detail or 'no path returned'}")
     return path
+
+
+# Prints a staged file and removes it: only a regular file, never through a link, in a
+# folder reached as ``put_file`` makes one.
+GET_FILE = (
+    'cd -P -- "$1" || exit 1\n'
+    'if [ -L "$2" ] || [ ! -f "$2" ]; then echo "$2 is not a staged file" >&2; exit 1; fi\n'
+    'cat -- "$2" && rm -f -- "$2"'
+)
+
+
+def get_file(home, m: Machine, directory, name, *, limit, timeout=30) -> bytes:
+    """Read the file ``directory/name`` an op staged on ``m``, at most ``limit`` bytes,
+    and remove it there. ``directory`` is a ``RemotePath`` as for ``put_file``; a larger
+    file is refused, and left for the next file staged there to remove."""
+    if not isinstance(name, str) or not FILE_NAME.fullmatch(name):
+        raise ValueError(f"Invalid staged file name {name!r}")
+    if not isinstance(directory, RemotePath):
+        directory = remote_path(directory)
+    try:
+        result = run(
+            home,
+            m,
+            ["sh", "-c", GET_FILE, "sh", directory, name],
+            timeout=timeout,
+            max_output=limit,
+        )
+    except owned_process.OutputLimitExceeded as exc:
+        raise ValueError(f"{name} on {m.label} is larger than {limit} bytes") from exc
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip()[-300:]
+        raise ValueError(f"Could not fetch {name} from {m.label}: {detail or 'no output'}")
+    return result.stdout
 
 
 def qualify(machine_id: str | None, wid: str) -> str:

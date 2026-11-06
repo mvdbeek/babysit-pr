@@ -1,4 +1,5 @@
-"""Moving the transcript's agent to a worker from the viewer, in real Chromium."""
+"""Moving the transcript's agent to a worker, or a worker's back here, from the viewer, in
+real Chromium."""
 
 import copy
 
@@ -7,6 +8,8 @@ from playwright.sync_api import expect
 from test_dashboard_browser import dashboard_site as dashboard_site
 from test_dashboard_browser import viewer_routes as viewer_routes
 from test_dashboard_browser import workspace_routes as workspace_routes
+from test_workspace_overview_browser import row, transcript
+from test_workspace_overview_browser import site as site
 
 pytestmark = pytest.mark.browser
 
@@ -201,3 +204,97 @@ def test_a_move_that_cannot_go_says_why_and_a_failed_one_how_to_resume(
         "Linux box's herdr did not answer. The checkout here was kept; resume it here with: "
         "cd /fixture/checkout && claude --resume s1"
     )
+
+
+def test_a_workers_agent_moves_back_here_and_a_failure_says_where_to_resume(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row(
+            "remote-work",
+            key="m:mini:/src/worktrees/repo/remote-work",
+            workspace_ids=["mini/w3"],
+            machine="mini",
+            machine_label="Mac mini",
+            machine_stale=False,
+        )
+    ]
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    agent = {"pane": "w3:p2", "agent": "claude", "status": "idle", "session": "s1"}
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "agents": [agent],
+                "sessions": [],
+                "path": "/src/worktrees/repo/remote-work",
+                "workspace": "mini/w3",
+                "url": None,
+                # A worker's agents are named with its machine.
+                "machine_label": "Mac mini",
+            }
+        ),
+    )
+    plan = {
+        **PLAN,
+        "workspace": "mini/w3",
+        "pane": "w3:p2",
+        "status": "idle",
+        "confirm": False,
+        "children": [],
+        "children_count": 0,
+        "ignored_kept": [],
+        "ignored_kept_count": 0,
+        "source": "mini",
+        "source_label": "Mac mini",
+        "options": [{"id": "local", "label": "this Mac", "note": "19/20 free", "disabled": False}],
+        "machine": "local",
+        "label": "this Mac",
+        "reason": "this Mac, 19/20 free",
+    }
+    posts = []
+    failed = {
+        "id": "m3",
+        "status": "failed",
+        "error": "herdr here did not answer",
+        "result": {
+            "stage": "after_exit",
+            "source_kept": True,
+            "source_label": "Mac mini",
+            "resume_command": "ssh -t mini.test 'cd /src/worktrees/repo/remote-work && "
+            "claude --resume s1'",
+        },
+    }
+
+    def move(route):
+        body = route.request.post_data_json
+        posts.append(body)
+        route.fulfill(json={"plan": plan} if body.get("plan") else {"move": failed})
+
+    page.route("**/api/workspace-move", move)
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("remote-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
+    live.get_by_role("button", name="Move Claude in w3:p2 to this machine").click()
+    card = live.get_by_role("group", name="Confirm moving the agent")
+    expect(card).to_contain_text("Move Claude in w3:p2 to this machine?")
+    expect(card).to_contain_text("this workspace closes on Mac mini")
+    expect(card.get_by_label("Machine to move to").locator("option").first).to_have_text(
+        "Auto (→ this Mac)"
+    )
+    expect(card.get_by_role("button", name="Keep it on Mac mini")).to_be_focused()
+    assert posts == [
+        {"workspace": "mini/w3", "pane": "w3:p2", "session": "s1", "machine": "auto", "plan": True}
+    ]
+    card.get_by_role("button", name="Move to this Mac").click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "herdr here did not answer. The checkout on Mac mini was kept; resume it there with: "
+        "ssh -t mini.test 'cd /src/worktrees/repo/remote-work && claude --resume s1'"
+    )
+    assert posts[1] == {
+        "workspace": "mini/w3",
+        "pane": "w3:p2",
+        "session": "s1",
+        "machine": "local",
+        "confirm_working": False,
+    }

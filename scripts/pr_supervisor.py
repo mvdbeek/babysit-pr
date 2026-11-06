@@ -1402,11 +1402,19 @@ def main():
     token.add_argument("--revoke", action="store_true", help="Stop the machine's token working")
     move = sub.add_parser(
         "workspace-move",
-        help="Move a workspace's agent to a worker, with its branch, changes and session",
+        help="Move a workspace's agent to a worker, or a worker's back here, with its "
+        "branch, changes and session",
     )
-    move.add_argument("workspace", help="herdr workspace ID on this machine (w1)")
+    move.add_argument(
+        "workspace",
+        help="herdr workspace ID: w1 on this machine, or <machine>/w1 on a worker",
+    )
     move.add_argument("--pane", help="The agent's pane, when the workspace has several")
-    move.add_argument("--machine", default="auto", help="Registered worker id, or auto")
+    move.add_argument(
+        "--machine",
+        default="auto",
+        help="Registered worker id, or auto; a worker's agent moves only here (local)",
+    )
     move.add_argument("--yes", action="store_true", help="Stop a working agent's turn to move it")
     move.add_argument("--plan", action="store_true", help="Only show what a move would do")
     move.add_argument("--dashboard", help="Dashboard URL (default $BABYSIT_DASHBOARD_URL)")

@@ -2487,11 +2487,14 @@ def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
     }
 
 
-# A workspace moved here from another machine (workspace_move) ------------------------
+# A workspace moved to or from another machine (workspace_move) ----------------------
 
-# Where the controller stages a move's bundle and transcripts here; each op takes its
-# file and removes it, and older ones go with the next file staged.
-MOVE_STATE = "~/.local/state/babysit-pr/moves"
+# Where a move stages its bundle and transcripts on either machine: the controller puts
+# them here for a worker's op to take, and a worker's ops leave theirs for the controller
+# to fetch (``machines.get_file``). Each is removed once read; older ones go with the next
+# file staged.
+MOVE_STATE = "~/.local/state/babysit-pr/move-staging"
+MOVE_KEEP = 86400
 MAX_MOVE_BUNDLE = 512 * 1024 * 1024
 MAX_MOVE_SESSION = 256 * 1024 * 1024
 MOVE_ID = re.compile(r"[0-9a-f]{32}")
@@ -2503,6 +2506,41 @@ CODEX_DAY = re.compile(r"[0-9]{4}/[0-9]{2}/[0-9]{2}")
 # What Claude's project folder adds for a session started below the checkout: "-sub".
 MOVE_SUFFIX = re.compile(r"(-[A-Za-z0-9-]{1,200})?")
 MOVE_MARKER = "babysit-move"
+# A file a move staged, as ``machines.FILE_NAME`` names one: no path, option or dotfile.
+STAGED_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Ignored paths a move leaves behind and its cleanup may remove: anything Git ignores
+# outside these keeps the source checkout, since it was not copied.
+MOVE_REBUILDABLE = {
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cache",
+    ".eggs",
+    ".parcel-cache",
+    ".next",
+    ".turbo",
+    "build",
+    "dist",
+    "target",
+}
+MAX_MOVE_IGNORED = 200  # Ignored paths an answer names; the count says how many more.
+MOVE_LFS = re.compile(r"\bfilter\s*=\s*lfs\b")
+MOVE_DEFAULT_BRANCHES = ("main", "master", "dev", "develop", "trunk")
+# Snapshot commits are the move's own, never signed and never anyone's work.
+MOVE_IDENTITY = {
+    "GIT_AUTHOR_NAME": "babysit-pr",
+    "GIT_AUTHOR_EMAIL": "babysit-pr@localhost",
+    "GIT_COMMITTER_NAME": "babysit-pr",
+    "GIT_COMMITTER_EMAIL": "babysit-pr@localhost",
+}
+MAX_PROCESSES = 500  # Of an agent's process tree a listing names.
+MAX_COMMAND = 200  # Characters of each process's command line.
 
 
 def _object(value, what):
@@ -2529,10 +2567,16 @@ def _discard(path):
             os.unlink(path)
 
 
-def _host_tree(path):
-    """The tree ``git add -A`` would stage in ``path``: its index with every untracked
-    file Git does not ignore. Read through a copy of its index, which stays as it is."""
-    index = host_git(path, "rev-parse", "--path-format=absolute", "--git-path", "index")
+# What a move reads of a checkout, on whichever machine it is: each takes that machine's
+# hardened ``git`` (this module's ``host_git`` on a worker, workspace_move's here), which
+# answers stripped text and raises ValueError, with ``env`` and ``timeout`` options.
+
+
+@contextlib.contextmanager
+def move_index_copy(git, path):
+    """The environment pointing Git at a copy of the checkout's index: what is read or
+    staged through it never takes the live index's lock under a working agent."""
+    index = git(path, "rev-parse", "--path-format=absolute", "--git-path", "index")
     descriptor, temporary = tempfile.mkstemp(prefix=".babysit-move-", dir=os.path.dirname(index))
     os.close(descriptor)
     try:
@@ -2540,17 +2584,297 @@ def _host_tree(path):
             shutil.copyfile(index, temporary)
         else:
             os.unlink(temporary)
-        env = {"GIT_INDEX_FILE": temporary}
-        host_git(path, "add", "-A", timeout=300, env=env)
-        return host_git(path, "write-tree", env=env)
+        yield {"GIT_INDEX_FILE": temporary}
     finally:
         with contextlib.suppress(OSError):
             os.unlink(temporary)
 
 
+def move_tree(git, path):
+    """The tree ``git add -A`` would stage in ``path``: its index with every untracked
+    file Git does not ignore. Read through a copy of its index, which stays as it is."""
+    with move_index_copy(git, path) as env:
+        git(path, "add", "-A", timeout=300, env=env)
+        return git(path, "write-tree", env=env)
+
+
+def move_snapshot(git, path):
+    """The state a move carries and compares: branch (None when detached), head, index
+    tree (None with unresolved conflicts) and working tree (``move_tree``)."""
+    try:
+        branch = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    except ValueError:
+        branch = None
+    state = {
+        "path": os.path.realpath(path),
+        "branch": branch,
+        "head": git(path, "rev-parse", "--verify", "HEAD"),
+        "index_tree": None,
+        "work_tree": None,
+    }
+    if branch is None:
+        return state
+    try:
+        with move_index_copy(git, path) as env:
+            state["index_tree"] = git(path, "write-tree", env=env)
+    except ValueError:
+        return state
+    state["work_tree"] = move_tree(git, path)
+    return state
+
+
+def move_rebuildable(name):
+    return any(part in MOVE_REBUILDABLE or part.endswith(".egg-info") for part in name.split("/"))
+
+
+def move_ignored(git, path):
+    """What Git ignores in the checkout that is not rebuildable: a move does not copy it,
+    so it keeps the source checkout. Folders are named once, with a trailing slash."""
+    listing = git(path, "ls-files", "-z", "-o", "-i", "--exclude-standard", "--directory")
+    return [name for name in listing.split("\0") if name and not move_rebuildable(name.rstrip("/"))]
+
+
+def move_changes(git, path):
+    """Counts of uncommitted changes, untracked files and commits no remote branch has."""
+    listing = git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    entries = [e for e in listing.split("\0") if len(e) > 3 and e[2] == " "]
+    untracked = sum(1 for e in entries if e.startswith("??"))
+    unpushed = int(git(path, "rev-list", "--count", "HEAD", "--not", "--remotes") or 0)
+    return {"changed": len(entries) - untracked, "untracked": untracked, "unpushed": unpushed}
+
+
+def move_base(git, path, remotes):
+    """The remote default branch the target's clone has, or can fetch from GitHub: the
+    ``upstream`` remote's, else ``origin``'s, as [ref, repo, branch]; None without one.
+
+    Only its history is left out of a move's bundle. A branch's own remote-tracking
+    commits, and a fork's that only the source clone has a remote for (a review
+    checkout's), may be on no remote the target knows, so they travel in the bundle."""
+    for remote in ("upstream", "origin"):
+        if remote not in remotes:
+            continue
+        try:
+            head = git(path, "symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD")
+        except ValueError:
+            head = ""
+        named = head[len(f"refs/remotes/{remote}/") :] if head else None
+        for name in dict.fromkeys([named, *MOVE_DEFAULT_BRANCHES]):
+            if not name or not BRANCH.fullmatch(name):
+                continue
+            ref = f"refs/remotes/{remote}/{name}"
+            try:
+                git(path, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+            except ValueError:
+                continue
+            return [ref, remotes[remote], name]
+    return None
+
+
+def move_history(git, path):
+    """Bytes of the clone's objects, packed and loose: what a bundle of its whole history
+    comes to at most."""
+    counts = dict(
+        line.split(": ", 1)
+        for line in git(path, "count-objects", "-v").splitlines()
+        if ": " in line
+    )
+    return sum(int(counts.get(key, 0) or 0) for key in ("size", "size-pack")) * 1024
+
+
+def move_tree_refusal(git, path, tree):
+    """What in a working tree no target can reproduce from Git alone: ``("nested",
+    name)`` for another repository inside it, ``("lfs", None)`` for Git LFS; else None."""
+    attributes = []
+    for entry in git(path, "ls-tree", "-r", "-z", tree).split("\0"):
+        meta, _, name = entry.partition("\t")
+        fields = meta.split()
+        if len(fields) != 3:
+            continue
+        if fields[1] == "commit":
+            # An untracked clone inside the checkout would travel as a commit it lacks.
+            return "nested", name
+        if fields[1] == "blob" and Path(name).name == ".gitattributes":
+            attributes.append(fields[2])
+    for blob in attributes:
+        try:
+            text = git(path, "cat-file", "blob", blob)
+        except (ValueError, UnicodeDecodeError):
+            return "lfs", None  # Unreadable, it might name LFS: refused, not guessed.
+        if MOVE_LFS.search(text):
+            return "lfs", None
+    return None
+
+
+def move_upstream(git, path, config, remotes, branch):
+    """The branch's upstream as a target can set it: [remote, branch, repo, tip], tip
+    being the commit this clone's remote-tracking ref names (or None); None without one."""
+    remote = config.get(f"branch.{branch}.remote")
+    merge = config.get(f"branch.{branch}.merge")
+    if not (
+        remote in remotes
+        and MOVE_PART.fullmatch(remote)
+        and merge
+        and merge.startswith("refs/heads/")
+        and BRANCH.fullmatch(merge[len("refs/heads/") :])
+        and ".." not in merge
+    ):
+        return None
+    merged = merge[len("refs/heads/") :]
+    try:
+        # Where this clone's remote-tracking ref has it, for a remote the target adds.
+        tip = git(path, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{merged}")
+    except ValueError:
+        tip = None
+    return [remote, merged, remotes[remote], tip or None]
+
+
+# ``move_facts`` before any is read.
+MOVE_NO_FACTS: dict[str, Any] = {
+    "submodules": False,
+    "branch": None,
+    "head": None,
+    "index_tree": None,
+    "work_tree": None,
+    "nested": None,
+    "lfs": False,
+    "base": None,
+    "history": None,
+    "slug": None,
+    "upstream": None,
+    "changes": None,
+    "ignored": [],
+    "ignored_count": 0,
+}
+
+
+def move_facts(git, path, config):
+    """What a move checks of the checkout ``path`` (its top) before anything is sent, read
+    in the order its refusals go: submodules, a detached head, conflicts, a tree a target
+    cannot reproduce, the base its bundle leaves out, the repository and upstream, then
+    what it would carry and leave behind. Facts past the first refusal stay None."""
+    remotes = remote_slugs(config)
+    facts = dict(MOVE_NO_FACTS, ignored=[])
+    staged = git(path, "ls-files", "--stage", "-z", timeout=300)
+    if any(e.startswith("160000 ") for e in staged.split("\0")):
+        facts["submodules"] = True
+        return facts
+    state = move_snapshot(git, path)
+    facts.update({k: state[k] for k in ("branch", "head", "index_tree", "work_tree")})
+    if state["work_tree"] is None:
+        return facts
+    refused = move_tree_refusal(git, path, state["work_tree"])
+    if refused is not None:
+        code, name = refused
+        facts["nested"], facts["lfs"] = (name if code == "nested" else None), code == "lfs"
+        return facts
+    facts["base"] = move_base(git, path, remotes)
+    if facts["base"] is None:
+        facts["history"] = move_history(git, path)
+    slug = remotes.get("upstream") or remotes.get("origin")
+    facts["slug"] = slug if slug and SLUG.fullmatch(slug) else None
+    facts["upstream"] = move_upstream(git, path, config, remotes, state["branch"])
+    facts["changes"] = move_changes(git, path)
+    ignored = move_ignored(git, path)
+    facts["ignored"], facts["ignored_count"] = ignored[:MAX_MOVE_IGNORED], len(ignored)
+    return facts
+
+
+def move_write_bundle(git, path, state, move, base, file):
+    """Write ``file``, the bundle of ``state``: one ref, ``refs/babysit-move/<move>``, a
+    commit of the working tree on a commit of the index on the branch's head, without
+    the history of ``base`` (a remote default branch's ref, or None for all of it). The
+    ref is gone again once the bundle is written."""
+    index = git(
+        path,
+        "commit-tree",
+        "--no-gpg-sign",
+        state["index_tree"],
+        "-p",
+        state["head"],
+        "-m",
+        "babysit-pr move: index",
+        env=MOVE_IDENTITY,
+    )
+    work = git(
+        path,
+        "commit-tree",
+        "--no-gpg-sign",
+        state["work_tree"],
+        "-p",
+        index,
+        "-m",
+        "babysit-pr move: working tree",
+        env=MOVE_IDENTITY,
+    )
+    ref = f"refs/babysit-move/{move}"
+    git(path, "update-ref", ref, work)
+    try:
+        git(
+            path,
+            "bundle",
+            "create",
+            "-q",
+            str(file),
+            ref,
+            *(["--not", base] if base else []),
+            timeout=1200,
+        )
+    finally:
+        with contextlib.suppress(ValueError):
+            git(path, "update-ref", "-d", ref)
+
+
+def move_session_files(main, session, agent):
+    """A session's files to move, by their name in the store: Claude's transcript and
+    its folder (subagents, tool results), or Codex's rollout. Names the target would
+    refuse are left out."""
+    main = Path(main)
+    found = [(main.name, main)]
+    extra = main.parent / session
+    if agent == "claude" and extra.is_dir() and not extra.is_symlink():
+        for file in sorted(extra.rglob("*")):
+            name = f"{session}/{file.relative_to(extra).as_posix()}"
+            parts = name.split("/")
+            if (
+                not file.is_symlink()
+                and file.is_file()
+                and len(parts) <= MOVE_DEPTH
+                and all(MOVE_PART.fullmatch(part) for part in parts)
+            ):
+                found.append((name, file))
+    return found
+
+
+def move_descendants(listing, pid):
+    """The processes under ``pid`` in a ``ps -o pid=,ppid=,args=`` listing, nearest first."""
+    under: dict[int, list[int]] = {}
+    commands: dict[int, str] = {}
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        child, parent = int(parts[0]), int(parts[1])
+        commands[child] = CONTROL.sub("", parts[2] if len(parts) > 2 else "")[:MAX_COMMAND]
+        under.setdefault(parent, []).append(child)
+    found: list[dict] = []
+    queue, seen = [(child, pid) for child in under.get(pid, [])], {pid}
+    while queue and len(found) < MAX_PROCESSES:
+        child, parent = queue.pop(0)
+        if child in seen:
+            continue
+        seen.add(child)
+        found.append({"pid": child, "ppid": parent, "command": commands[child]})
+        queue.extend((grandchild, child) for grandchild in under.get(child, []))
+    return found
+
+
+def _host_tree(path):
+    return move_tree(host_git, path)
+
+
 def _move_state(path):
     """What a move compares on both machines: the checkout, its branch and head, its
-    index's tree and the tree of all it holds (``_host_tree``)."""
+    index's tree and the tree of all it holds (``move_tree``)."""
     return {
         "path": os.path.realpath(path),
         "branch": host_git(path, "symbolic-ref", "--quiet", "--short", "HEAD"),
@@ -2911,6 +3235,179 @@ def _host_move_session(archive, agent, account, sandbox, path, day, suffix=""):
     finally:
         if isinstance(archive, str):
             _discard(archive)
+
+
+# A workspace moved from here to the controller: what its ops read and stage here.
+
+
+def _move_staging():
+    """This machine's folder of staged move files, made private if missing: refused
+    unless it is a folder only this user can write. Files older than MOVE_KEEP go."""
+    named = os.path.expanduser(MOVE_STATE)
+    os.makedirs(named, mode=0o700, exist_ok=True)
+    info = os.lstat(named)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise ValueError(f"{named} is not a folder only this user can write")
+    folder = os.path.realpath(named)
+    now = time.time()
+    for entry in os.scandir(folder):
+        with contextlib.suppress(OSError):
+            if (
+                entry.is_file(follow_symlinks=False)
+                and now - entry.stat(follow_symlinks=False).st_mtime > MOVE_KEEP
+            ):
+                os.unlink(entry.path)
+    return folder
+
+
+def _stage_here(name, write, limit, too_large):
+    """A file ``write(path)`` makes in the staging folder for the controller to fetch:
+    its name, size and SHA-256. One over ``limit`` bytes is removed and refused."""
+    path = os.path.join(_move_staging(), name)
+    try:
+        write(path)
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        size = os.path.getsize(path)
+        if size > limit:
+            raise ValueError(too_large(size))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    return {"name": name, "size": size, "sha256": digest.hexdigest()}
+
+
+def _session_arg(session, agent):
+    if not isinstance(session, str) or not UUID.fullmatch(session):
+        raise ValueError("Expected a session ID")
+    if agent not in {"claude", "codex"}:
+        raise ValueError("Expected claude or codex")
+
+
+def _move_transcript(transcript, session, agent):
+    """One of this machine's session transcripts, by its real path, and the files a move
+    of its session takes (``move_session_files``)."""
+    _session_arg(session, agent)
+    with _host_transcript(transcript):
+        pass  # Refused unless it is a transcript in this machine's stores.
+    main = Path(os.path.realpath(transcript))
+    return move_session_files(main, session, agent)
+
+
+def _host_move_source(path, transcript=None, session=None, agent=None):
+    """What a move of the checkout ``path`` to the controller checks first
+    (``move_facts``), with its real path, whether it is a clone's own checkout, and the
+    bytes of the session ``transcript`` names (``move_session_files``), if named.
+
+    A linked worktree's common dir must verify (``_host_common_dir``)."""
+    real = _host_checkout(path)
+    dot = os.path.join(real, ".git")
+    main = os.path.isdir(dot) and not os.path.islink(dot)
+    if main:
+        facts = dict(MOVE_NO_FACTS)
+    else:
+        _host_common_dir(real)
+        facts = move_facts(host_git, real, repo_config(host_git, real))
+    size = None
+    if transcript is not None:
+        size = sum(file.stat().st_size for _, file in _move_transcript(transcript, session, agent))
+    return {"path": real, "main": main, **facts, "session_size": size}
+
+
+def _pid_arg(value):
+    if value is not None and not (type(value) is int and 1 < value < 2**31):
+        raise ValueError("Expected a process ID")
+    return value
+
+
+def _host_processes(pid=None, shell=None):
+    """The processes under ``pid`` (``move_descendants``) and the command line of process
+    ``shell``, from one ``ps`` listing; None for what this machine cannot list."""
+    _pid_arg(pid)
+    _pid_arg(shell)
+    if pid is None and shell is None:
+        raise ValueError("Expected a process ID")
+    try:
+        done = _host_run(["ps", "-A", "-o", "pid=,ppid=,args="], 10)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        done = None
+    if done is None or done.returncode:
+        return {"shell": None, "children": None}
+    command = None
+    for line in done.stdout.splitlines():
+        parts = line.split(None, 2)
+        if shell is not None and len(parts) >= 2 and parts[0] == str(shell):
+            command = CONTROL.sub("", parts[2] if len(parts) > 2 else "")[:MAX_COMMAND]
+    return {
+        "shell": command,
+        "children": None if pid is None else move_descendants(done.stdout, pid),
+    }
+
+
+def _base_arg(base):
+    """The ref of a remote default branch a bundle leaves out, as ``move_base`` names it."""
+    if base is None:
+        return None
+    prefix = next(
+        (p for p in ("refs/remotes/upstream/", "refs/remotes/origin/") if str(base).startswith(p)),
+        None,
+    )
+    if not isinstance(base, str) or prefix is None:
+        raise ValueError("Expected an upstream or origin branch")
+    _branch(base[len(prefix) :], "base")
+    return base
+
+
+def _host_move_bundle(path, move, head, index_tree, work_tree, base):
+    """Stage the bundle of a checkout moving to the controller (``move_write_bundle``):
+    its head, index tree and working tree as ``move_source`` read them, leaving out the
+    history of ``base``. Answers the staged file's name, size and SHA-256."""
+    real = _host_checkout(path)
+    if not isinstance(move, str) or not MOVE_ID.fullmatch(move):
+        raise ValueError("Expected a move ID")
+    state = {
+        "head": _object(head, "head"),
+        "index_tree": _object(index_tree, "index"),
+        "work_tree": _object(work_tree, "working tree"),
+    }
+    base = _base_arg(base)
+    return _stage_here(
+        f"{move}-{os.urandom(4).hex()}.bundle",
+        lambda file: move_write_bundle(host_git, real, state, move, base, file),
+        MAX_MOVE_BUNDLE,
+        lambda size: f"Its branch and changes come to {size >> 20} MB, more than a move takes",
+    )
+
+
+def _host_move_pack(transcript, session, agent):
+    """Stage a tar of the session's files (``move_session_files``) for the controller,
+    as they are: the controller moves their recorded working directories. Answers the
+    staged file's name, size and SHA-256."""
+    files = _move_transcript(transcript, session, agent)
+    if sum(file.stat().st_size for _, file in files) > MAX_MOVE_SESSION:
+        raise ValueError("Its conversation is too large to move")
+
+    def write(path):
+        with tarfile.open(path, "w:gz") as archive:
+            for name, file in files:
+                data = file.read_bytes()
+                info = tarfile.TarInfo(name)
+                info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
+                archive.addfile(info, io.BytesIO(data))
+
+    return _stage_here(
+        f"{session}-{os.urandom(4).hex()}.tar.gz",
+        write,
+        MAX_MOVE_SESSION,
+        lambda size: "Its conversation is too large to move",
+    )
 
 
 # Personal skills kept in sync with the controller's (skill_sync) ---------------------
@@ -3583,6 +4080,10 @@ OPS: dict[str, Callable[..., Any]] = {
     "move_check": _host_move_check,
     "move_receive": _host_move_receive,
     "move_session": _host_move_session,
+    "move_source": _host_move_source,
+    "processes": _host_processes,
+    "move_bundle": _host_move_bundle,
+    "move_pack": _host_move_pack,
 }
 
 
@@ -4289,6 +4790,107 @@ def validate_move_session(value):
     return value
 
 
+def _plain(value):
+    return _text(value) and bool(value) and not CONTROL.search(value)
+
+
+def validate_move_source(value):
+    """A worker checkout's move facts, read as the controller reads its own."""
+    _expect(
+        isinstance(value, dict) and set(value) == {"path", "main", "session_size", *MOVE_NO_FACTS},
+        "fields",
+    )
+    _expect(_shown_path(value["path"]), "path")
+    for key in ("main", "submodules", "lfs"):
+        _expect(isinstance(value[key], bool), key)
+    _expect(value["branch"] is None or _plain(value["branch"]), "branch")
+    for key in ("head", "index_tree", "work_tree"):
+        _expect(
+            value[key] is None or (isinstance(value[key], str) and OBJECT.fullmatch(value[key])),
+            key,
+        )
+    _expect(value["nested"] is None or _plain(value["nested"]), "nested")
+    base = value["base"]
+    _expect(
+        base is None
+        or (
+            isinstance(base, list)
+            and len(base) == 3
+            and all(isinstance(part, str) for part in base)
+            and SLUG.fullmatch(base[1])
+            and BRANCH.fullmatch(base[2])
+            and base[0] in (f"refs/remotes/upstream/{base[2]}", f"refs/remotes/origin/{base[2]}")
+        ),
+        "base",
+    )
+    for key in ("history", "session_size"):
+        _expect(_count(value[key], 2**62), key)
+    _expect(
+        value["slug"] is None or (isinstance(value["slug"], str) and SLUG.fullmatch(value["slug"])),
+        "slug",
+    )
+    try:
+        _upstream_arg(value["upstream"])
+    except ValueError:
+        _expect(False, "upstream")
+    changes = value["changes"]
+    _expect(
+        changes is None
+        or (
+            isinstance(changes, dict)
+            and set(changes) == {"changed", "untracked", "unpushed"}
+            and all(_count(changes[k], 2**31) and changes[k] is not None for k in changes)
+        ),
+        "changes",
+    )
+    _expect(
+        isinstance(value["ignored"], list)
+        and len(value["ignored"]) <= MAX_MOVE_IGNORED
+        and all(_plain(name) for name in value["ignored"])
+        and type(value["ignored_count"]) is int
+        and value["ignored_count"] >= len(value["ignored"]),
+        "ignored",
+    )
+    return value
+
+
+def validate_processes(value):
+    _expect(isinstance(value, dict) and set(value) == {"shell", "children"}, "fields")
+    _expect(
+        value["shell"] is None or (_text(value["shell"]) and not CONTROL.search(value["shell"])),
+        "shell",
+    )
+    children = value["children"]
+    _expect(
+        children is None
+        or (
+            isinstance(children, list)
+            and len(children) <= MAX_PROCESSES
+            and all(
+                isinstance(c, dict)
+                and set(c) == {"pid", "ppid", "command"}
+                and type(c["pid"]) is int
+                and type(c["ppid"]) is int
+                and isinstance(c["command"], str)
+                and len(c["command"]) <= MAX_COMMAND
+                and not CONTROL.search(c["command"])
+                for c in children
+            )
+        ),
+        "children",
+    )
+    return value
+
+
+def validate_staged(value):
+    """A file a worker staged for the controller to fetch."""
+    _expect(isinstance(value, dict) and set(value) == {"name", "size", "sha256"}, "fields")
+    _expect(isinstance(value["name"], str) and STAGED_NAME.fullmatch(value["name"]), "name")
+    _expect(_count(value["size"], MAX_MOVE_BUNDLE) and value["size"] is not None, "size")
+    _expect(isinstance(value["sha256"], str) and DIGEST.fullmatch(value["sha256"]), "sha256")
+    return value
+
+
 VALIDATORS = {
     "inventory": validate_inventory,
     "resolve": validate_resolve,
@@ -4316,11 +4918,24 @@ VALIDATORS = {
     "move_check": validate_move_check,
     "move_receive": validate_move_receive,
     "move_session": validate_move_session,
+    "move_source": validate_move_source,
+    "processes": validate_processes,
+    "move_bundle": validate_staged,
+    "move_pack": validate_staged,
 }
 
 
 class Unreachable(ValueError):
     """The worker did not answer: ssh failed, or the probe ran out of time there."""
+
+
+class _Here:
+    """This machine, as ``call`` names it in what it reports."""
+
+    label = "this machine"
+
+
+_HERE = _Here()
 
 
 class Failed(ValueError):
@@ -4338,19 +4953,26 @@ def call(home, machine, op, timeout, **args):
     fails or the answer is oversized or malformed; ``subprocess.TimeoutExpired`` when
     the worker takes longer than ``timeout``, which is also the probe's own deadline
     there. Its stdout is read only up to MAX_STDOUT before the ssh client is stopped.
+
+    ``machine`` None runs it on this machine the same way, in a process of its own (a
+    workspace moved here from a worker is received by the ops that receive one there).
     """
     import machines  # The controller's transport; workers never import it.
     import owned_process
 
     request = {"op": op, "args": args, "deadline": max(1, min(timeout, MAX_DEADLINE))}
     payload = base64.b64encode(json.dumps(request).encode()).decode()
-    python = machine.python
+    if machine is None:
+        machine = _HERE
+        python = sys.executable
+    else:
+        python = machine.python
     if python.startswith(("/", "~")):
         python = machines.remote_path(python)
     try:
         result = machines.run(
             home,
-            machine,
+            None if machine is _HERE else machine,
             # -S: no site hooks (.pth files, sitecustomize) run before the probe.
             [python, "-I", "-S", "-", PROTOCOL, payload],
             timeout=timeout,
