@@ -388,7 +388,7 @@ def test_an_idle_claude_moves_with_its_branch_changes_and_conversation(rig, monk
     assert ["workspace", "close", "w1"] in read(rig.state)["calls"]
     assert result["source"]["removed"] and result["warnings"] == []
     # Staged files are taken there and never left behind.
-    assert not list((rig.host / ".local/state/babysit-pr/moves").iterdir())
+    assert not list((rig.host / ".local/state/babysit-pr/move-staging").iterdir())
     assert rig.progress[0].startswith("Packing feature")
 
 
@@ -550,7 +550,7 @@ def test_what_the_worker_would_refuse_is_refused_before_any_key(rig):
     nothing_happened(rig)
     assert "esc" not in json.dumps(read(rig.state)["calls"])
     assert files(rig.checkout) == before
-    assert not (rig.host / ".local/state/babysit-pr/moves").exists()
+    assert not (rig.host / ".local/state/babysit-pr/move-staging").exists()
 
 
 def test_a_refused_exit_takes_the_workers_checkout_back(rig, monkeypatch):
@@ -591,6 +591,8 @@ def test_an_unconfirmed_resume_keeps_the_source_checkout(rig, monkeypatch):
         run_move(rig)
     assert failed.value.details["stage"] == "after_exit"
     assert "typed in w1:p1 on Mac mini" in str(failed.value)
+    # The agent may run in the new checkout: nothing advises removing it.
+    assert "remove it" not in str(failed.value)
     assert rig.checkout.exists() and rig.target.exists()
 
 
@@ -787,7 +789,7 @@ def test_the_session_probe_refuses_paths_out_of_the_store(tmp_path, monkeypatch)
     import tarfile
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    folder = tmp_path / ".local/state/babysit-pr/moves"
+    folder = tmp_path / ".local/state/babysit-pr/move-staging"
     folder.mkdir(parents=True)
     for name in ("../escape.jsonl", f"{SID}/../../x.jsonl", ".hidden.jsonl"):
         archive = folder / "s.tar"
@@ -924,7 +926,7 @@ def test_the_session_probe_takes_a_longer_copy_of_the_same_conversation(tmp_path
     import tarfile
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    folder = tmp_path / ".local/state/babysit-pr/moves"
+    folder = tmp_path / ".local/state/babysit-pr/move-staging"
     folder.mkdir(parents=True)
 
     def place(data):
@@ -1129,6 +1131,14 @@ def test_git_lfs_is_refused(rig):
     nothing_happened(rig)
 
 
+def test_a_gitattributes_that_is_not_utf8_is_no_lfs(rig):
+    (rig.checkout / ".gitattributes").write_bytes(b"# caf\xe9\n*.txt text\n")
+    git("add", ".gitattributes", cwd=rig.checkout)
+    git("commit", "-q", "-m", "attributes", cwd=rig.checkout)
+    found = workspace_move.plan(rig.home, request(), rig.placing)
+    assert found["error"] is None and found["machine"] == "mini"
+
+
 def test_a_plan_never_takes_the_live_index_lock(rig):
     index = Path(
         git("rev-parse", "--path-format=absolute", "--git-path", "index", cwd=rig.checkout)
@@ -1145,7 +1155,7 @@ def test_a_plan_never_takes_the_live_index_lock(rig):
 
 def test_the_session_probe_takes_only_a_project_folder_suffix(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
-    folder = tmp_path / ".local/state/babysit-pr/moves"
+    folder = tmp_path / ".local/state/babysit-pr/move-staging"
     folder.mkdir(parents=True)
     archive = folder / "s.tar"
     for suffix in ("/../x", "-a/b", "x"):
@@ -1353,7 +1363,7 @@ def test_a_clone_lacking_the_base_says_what_is_missing_and_what_the_fetch_said(r
     data, fetch = workspace_move.bundle(str(rig.checkout), state, "cd" * 16)
     assert fetch == [["fork/repo", "main"]]  # origin's default: there is no upstream ref.
     monkeypatch.setenv("HOME", str(rig.host))
-    staged = rig.host / ".local/state/babysit-pr/moves"
+    staged = rig.host / ".local/state/babysit-pr/move-staging"
     staged.mkdir(parents=True)
     fetched = []
 
@@ -1546,7 +1556,7 @@ def test_a_large_clone_without_a_known_default_branch_is_refused_before_any_key(
     assert workspace_move.base_branch(str(rig.checkout)) is None
     # Small enough, it travels whole.
     assert workspace_move.plan(rig.home, request(), rig.placing)["error"] is None
-    monkeypatch.setattr(workspace_move, "history_size", lambda path: 1 << 40)
+    monkeypatch.setattr(workspace_move.remote_probe, "move_history", lambda git, path: 1 << 40)
     set_agent(rig, agent_status="working")
     assert refusal(rig, confirm_working=True).details["code"] == "base"
     nothing_happened(rig)

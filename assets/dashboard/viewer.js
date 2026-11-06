@@ -1648,19 +1648,18 @@
       byId("ws-live-status").textContent = "";
       renderLive();
     };
-    // Only where workers are registered, and for an agent whose session can resume there.
+    // Only where workers are registered, and for an agent whose session can resume there:
+    // one here goes to a worker, a worker's comes back to this machine.
     if (hostLabel && agent.session && ["claude", "codex"].includes(agent.agent)) {
       const move = button(
         "move",
         "Move…",
         "ws-move",
-        `Move ${name} to another machine`,
-        "Continue this session on a worker machine, with its branch and uncommitted changes; this workspace is then removed here",
+        `Move ${name} to ${worker ? "this machine" : "another machine"}`,
+        worker
+          ? `Continue this session on this machine, with its branch and uncommitted changes; this workspace is then removed from ${worker}`
+          : "Continue this session on a worker machine, with its branch and uncommitted changes; this workspace is then removed here",
       );
-      if (worker) {
-        move.disabled = true;
-        move.title = `Agents on ${worker} cannot be moved from this dashboard yet`;
-      }
       move.onclick = () => {
         quitQuestion = null;
         moveQuestion = {
@@ -1792,7 +1791,7 @@
     }
     return card;
   }
-  // Moving an agent to a worker ------------------------------------------------------
+  // Moving an agent to a worker, or a worker's back here ------------------------------
   // Asked inline like a quit: the server's plan says what goes where and what stops, and
   // a working agent's move says it stops its turn first. The move runs on the server;
   // this page follows it by ID and says how it ended.
@@ -1834,10 +1833,18 @@
   function moveCard(agent) {
     const question = moveQuestion;
     const plan = question.plan;
+    // A worker's agent comes back to this machine; its workspace closes on the worker.
+    const worker = workerLabel(viewer.entry);
+    const here = worker ? `on ${worker}` : "here";
     const card = node("div", undefined, "ws-question ws-move-confirm");
     card.setAttribute("role", "group");
     card.setAttribute("aria-label", "Confirm moving the agent");
-    card.append(node("strong", `Move ${agentTitle(agent)} in ${agent.pane} to another machine?`));
+    card.append(
+      node(
+        "strong",
+        `Move ${agentTitle(agent)} in ${agent.pane} to ${worker ? "this machine" : "another machine"}?`,
+      ),
+    );
     if (question.loading) card.append(node("p", "Checking the agent and where it can go…"));
     if (question.error) card.append(node("p", question.error, "ws-move-error"));
     if (plan) {
@@ -1848,7 +1855,7 @@
             `no remote has, ${plural(plan.changed, "changed file", "changed files")} and ` +
             `${plural(plan.untracked, "untracked file", "untracked files")}, and its ` +
             "conversation resumes in a new workspace there. Files Git ignores are not copied. " +
-            "Once it runs there, this workspace closes here, and its worktree and branch are " +
+            `Once it runs there, this workspace closes ${here}, and its worktree and branch are ` +
             "removed with rebuildable ignored files (virtualenvs, node_modules, caches).",
           "pr-meta",
         ),
@@ -1858,7 +1865,7 @@
           node(
             "p",
             `${plural(plan.ignored_kept_count, "ignored path", "ignored paths")} would not be ` +
-              "copied, so the worktree stays here for them:",
+              `copied, so the worktree stays ${here} for them:`,
             "ws-move-warning",
           ),
         );
@@ -1904,7 +1911,7 @@
         card.append(
           node(
             "p",
-            `Exiting it here stops ${plural(plan.children_count, "process", "processes")} it started:`,
+            `Exiting it ${here} stops ${plural(plan.children_count, "process", "processes")} it started:`,
             plan.status === "working" ? "ws-move-warning" : "pr-meta",
           ),
         );
@@ -1940,7 +1947,7 @@
     yes.type = "button";
     yes.disabled = !plan?.machine || Boolean(plan.error) || question.loading;
     yes.onclick = () => void startMove(agent);
-    const no = node("button", "Keep it here");
+    const no = node("button", worker ? `Keep it on ${worker}` : "Keep it here");
     no.type = "button";
     no.onclick = () => {
       moveQuestion = null;
@@ -1955,22 +1962,24 @@
     }
     return card;
   }
-  // How a move ended, in words; a moved agent's Collie there is linked.
-  function moveOutcome(op) {
+  // How a move ended, in words; a moved agent's Collie there is linked. ``worker`` is
+  // where a worker's agent ran, which the checkout kept stays on.
+  function moveOutcome(op, worker) {
     const result = op.result || {};
     if (op.status === "moved")
       return (
         `Moved to ${result.machine_label}: ${result.path}` +
         (result.warnings?.length ? `. ${result.warnings.join(" ")}` : "")
       );
+    const here = worker ? `on ${worker}` : "here";
     let text = op.error || "The move failed";
     if (!/[.!?]$/.test(text)) text += ".";
     if (result.stage === "before_exit" && !result.interrupted)
-      text += " The agent is still running here.";
+      text += ` The agent is still running ${here}.`;
     if (result.stage === "exit")
-      text += " Check its pane first: the agent may still be running here.";
+      text += ` Check its pane first: the agent may still be running ${here}.`;
     if (result.resume_command)
-      text += ` The checkout here was kept; resume it here with: ${result.resume_command}`;
+      text += ` The checkout ${here} was kept; resume it ${worker ? "there" : "here"} with: ${result.resume_command}`;
     return text;
   }
   async function startMove(agent) {
@@ -2008,7 +2017,7 @@
       say(value.error || "The move's progress was lost; refresh to see where the agent is.");
     else if (op.status === "running")
       say("The move is still running; refresh to see where the agent is.");
-    else say(moveOutcome(op), op.status === "moved" ? op.result?.url : null);
+    else say(moveOutcome(op, workerLabel(entry)), op.status === "moved" ? op.result?.url : null);
     renderLive();
     if (viewer?.id === id) await fetchAgents(entry);
   }

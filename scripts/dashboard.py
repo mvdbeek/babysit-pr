@@ -1077,7 +1077,9 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "workspace-docker" and isinstance(request.get("workspace"), str):
                 if viewed_workspace(self.server.home, request["workspace"])[0] is not None:
                     raise ValueError("Docker access can be changed only for agents on this Mac")
-            if action.startswith("workspace-"):
+            # A move names a worker's workspace itself (``workspace_move.source``): its
+            # agent comes back to this machine.
+            if action.startswith("workspace-") and action != "workspace-move":
                 for name in ("workspace", "workspace_id"):
                     if name in request and machine is None:
                         request[name] = local_workspace(self.server.home, request[name])
