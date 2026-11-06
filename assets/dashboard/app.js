@@ -3786,6 +3786,9 @@ function updateWorkspaceOperation() {
   // The result below links Collie once the workspace is ready.
   $("workspace-progress").textContent =
     `${op.status}: ${op.message}` +
+    (op.status === "waiting"
+      ? ` · Starts once there is room, or gives up at ${scheduleTime(op.wait_until)}; the Scheduled tab can cancel it`
+      : "") +
     (op.machine ? ` · On ${machineName(op.machine)}` : "") +
     (op.started_by ? ` · ${op.started_by}` : "") +
     (op.skills_warning ? ` · ${op.skills_warning}` : "");
@@ -3807,7 +3810,7 @@ function updateWorkspaceOperation() {
       submit.dataset.inflight === "true" ||
       submit.dataset.scheduled === "true" ||
       // A launch in progress does not block scheduling another for later.
-      (!(submit.dataset.later === "true" && ["queued", "running"].includes(op.status)) &&
+      (!(submit.dataset.later === "true" && ["queued", "running", "waiting"].includes(op.status)) &&
         // A failed new task whose issue was filed must not file it again.
         (op.status !== "failed" || Boolean(op.subject?.url)) &&
         !(submit.dataset.handling === "true" && op.status === "complete"));
@@ -4016,6 +4019,58 @@ function scheduledCard(task) {
   }
   return card;
 }
+// A launch the machine it was placed on had no room for: it starts once there is.
+function waitingCard(op) {
+  const card = el("li", undefined, "scheduled-task");
+  card.dataset.status = "waiting";
+  card.dataset.id = op.pr;
+  const head = el("div", undefined, "scheduled-when");
+  head.append(
+    el("strong", scheduleTime(op.created_at)),
+    el("span", "Waiting for room", "badge blue"),
+  );
+  const subject = op.subject || {};
+  let heading;
+  if (subject.number || subject.short_id) heading = scheduledSubject(op);
+  else {
+    heading = el("div", undefined, "scheduled-subject");
+    heading.append(
+      subject.url ? link(subject.repo, subject.url) : el("span", subject.repo || ""),
+      el("span", subject.title || subject.branch || "", "scheduled-title"),
+    );
+  }
+  const action =
+    op.action === "handle"
+      ? "Handle"
+      : op.action === "clone-and-create"
+        ? "Clone and create workspace"
+        : op.action === "create"
+          ? "Create workspace"
+          : "New task";
+  card.append(
+    head,
+    heading,
+    el(
+      "small",
+      [
+        action,
+        op.agent === "claude" ? "Claude" : "Codex",
+        op.machine && `On ${machineName(op.machine)}`,
+        op.started_by,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      "scheduled-settings",
+    ),
+    el("p", `${op.message}. Gives up at ${scheduleTime(op.wait_until)}.`, "scheduled-message"),
+  );
+  const cancel = el("button", scheduledCancelling.has(op.pr) ? "Cancelling…" : "Cancel");
+  cancel.type = "button";
+  cancel.disabled = scheduledCancelling.has(op.pr);
+  cancel.onclick = () => cancelWaiting(op);
+  card.append(cancel);
+  return card;
+}
 const launchedNames = {
   watching: ["Watching", "blue"],
   exiting: ["Exiting", "blue"],
@@ -4046,15 +4101,16 @@ function renderScheduled() {
   const tasks = scheduledData?.tasks ?? [];
   const pending = tasks.filter((task) => task.status === "scheduled");
   const history = tasks.filter((task) => task.status !== "scheduled");
+  const waiting = scheduledData?.waiting ?? [];
   $("scheduled-tab").hidden = !scheduledData?.enabled;
-  $("scheduled-tab-count").hidden = !pending.length;
-  $("scheduled-tab-count").textContent = pending.length;
-  $("scheduled-count").textContent = pending.length;
+  $("scheduled-tab-count").hidden = !(pending.length + waiting.length);
+  $("scheduled-tab-count").textContent = pending.length + waiting.length;
+  $("scheduled-count").textContent = pending.length + waiting.length;
   $("scheduled-status").textContent = !scheduledData
     ? "Loading scheduled tasks…"
     : "Tasks start at their time while the dashboard is running. A task due while it was stopped starts when it returns, up to a day late.";
   const launched = scheduledData?.launched ?? [];
-  const key = JSON.stringify([tasks, launched, [...scheduledCancelling]]);
+  const key = JSON.stringify([tasks, launched, waiting, [...scheduledCancelling]]);
   if (key !== scheduledKey) {
     scheduledKey = key;
     // Give focus back to the same control of the same task.
@@ -4064,6 +4120,7 @@ function renderScheduled() {
     const position = card ? controls(card).indexOf(active) : -1;
     $("scheduled-pending").replaceChildren(...pending.map(scheduledCard));
     $("scheduled-history").replaceChildren(...history.map(scheduledCard));
+    $("waiting-list").replaceChildren(...waiting.map(waitingCard));
     $("launched-list").replaceChildren(...launched.map(launchedCard));
     const rebuilt =
       card &&
@@ -4074,8 +4131,9 @@ function renderScheduled() {
   }
   for (const node of $("scheduled-pending").querySelectorAll("[data-until]"))
     setText(node, until(Number(node.dataset.until)));
-  $("scheduled-empty").hidden = !scheduledData || pending.length > 0;
+  $("scheduled-empty").hidden = !scheduledData || pending.length + waiting.length > 0;
   $("scheduled-history-heading").hidden = !history.length;
+  $("waiting-heading").hidden = !waiting.length;
   $("launched-heading").hidden = !launched.length;
 }
 async function refreshScheduled() {
@@ -4113,6 +4171,29 @@ async function cancelScheduled(task) {
     $("scheduled-error").textContent = `Could not cancel: ${error.message}`;
   } finally {
     scheduledCancelling.delete(task.id);
+    renderScheduled();
+    void refreshScheduled();
+    void refreshWorkspaces();
+  }
+}
+async function cancelWaiting(op) {
+  if (scheduledCancelling.has(op.pr)) return;
+  scheduledCancelling.add(op.pr);
+  $("scheduled-error").textContent = "";
+  renderScheduled();
+  try {
+    const response = await fetch("/api/waiting-cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Babysit-Action": "waiting-cancel" },
+      body: JSON.stringify({ id: op.pr }),
+    });
+    const value = await response.json();
+    if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+    scheduledData.waiting = scheduledData.waiting.filter((other) => other.pr !== op.pr);
+  } catch (error) {
+    $("scheduled-error").textContent = `Could not cancel: ${error.message}`;
+  } finally {
+    scheduledCancelling.delete(op.pr);
     renderScheduled();
     void refreshScheduled();
     void refreshWorkspaces();

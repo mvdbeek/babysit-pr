@@ -68,7 +68,7 @@ def test_hard_filter_reasons():
     }
     req = {"agent": "codex", "docker": True, "also": ["base/other"]}
     found = pl.exclusions(req, fleet, loads, {"full": 1}, NOW)
-    assert {k: tuple(v) for k, v in found.items()} == {
+    assert {k: tuple(v)[:2] for k, v in found.items()} == {
         "mini": ("takes other repositories only when chosen", True),
         "box": ("lacks docker", False),
         "off": ("disabled", False),
@@ -76,7 +76,7 @@ def test_hard_filter_reasons():
         "gone": ("unreachable 3m", False),
     }
     found = pl.exclusions({"agent": "codex"}, fleet, loads, {"full": 1}, NOW)
-    assert found["full"] == pl.Exclusion("full (2/2)", True)
+    assert found["full"] == pl.Exclusion("full (2/2)", True, True)
     assert "mini" not in found and "box" not in found
     # Unreachable for less than one load TTL is still offered.
     recent = {"gone": load(unreachable_since=NOW - 5)}
@@ -123,7 +123,7 @@ def test_other_repositories_keep_auto_here_but_a_worker_may_be_chosen():
     assert chosen.reason == "chosen; takes other repositories only when chosen"
     # Full or unreachable still says so first.
     full = pl.exclusions(req, FLEET, {"box": load(agents=8)}, {}, NOW)
-    assert full["box"] == pl.Exclusion("full (8/8)", True)
+    assert full["box"] == pl.Exclusion("full (8/8)", True, True)
     # A local entry describing this machine is never refused for them.
     fleet = {**FLEET, "local": machine("local", "This Mac", labels=())}
     assert "local" not in pl.exclusions(req, fleet, {}, {}, NOW)
@@ -136,7 +136,7 @@ def test_a_load_not_refreshed_for_two_ttls_is_checked_again():
     for agents in (0, 4):
         loads = {"mini": load(agents=agents, attempted_at=stale), "local": load(agents=8)}
         assert pl.exclusions(req, FLEET, loads, {}, NOW) == {
-            "mini": pl.Exclusion("checking…", True)
+            "mini": pl.Exclusion("checking…", True, True)
         }
         assert choose(req, loads=loads).machine == "box"
     # Nor is old unreachability: chosen by name, it is no longer refused outright.
@@ -169,7 +169,7 @@ def test_auto_only_considers_workers_registered_for_it():
 def test_this_machine_is_full_at_its_capacity_and_still_takes_what_nobody_else_can():
     loads = {"local": load(agents=10, max_agents=10), "mini": load(), "box": load()}
     found = pl.exclusions({"sandboxed": False}, FLEET, loads, {}, NOW)
-    assert found == {"local": pl.Exclusion("full (10/10)", True)}
+    assert found == {"local": pl.Exclusion("full (10/10)", True, True)}
     assert choose({"sandboxed": False}, loads=loads).machine == "box"
     # Chosen by name it is only noted.
     chosen = choose({"override": "local"}, loads=loads)
@@ -247,7 +247,7 @@ def test_override_bypasses_capacity_not_capability():
 def test_a_worker_not_yet_checked_is_left_to_explicit_choice():
     loads = {"mini": load(pending=True), "local": load(agents=8)}
     found = pl.exclusions({"sandboxed": False}, FLEET, loads, {}, NOW)
-    assert found == {"mini": pl.Exclusion("checking…", True)}
+    assert found == {"mini": pl.Exclusion("checking…", True, True)}
     chosen = choose({"sandboxed": False}, loads=loads)
     assert chosen.machine == "box"
     chosen = choose({"override": "mini"}, loads=loads)
@@ -377,7 +377,7 @@ def test_a_cron_job_needs_its_clone_where_the_worker_launches_it():
         assert pl.exclusions({**req, "kind": kind}, FLEET, loads, {}, NOW) == {}
     # Clones not listed yet leave a cron job to explicit choice, and nothing else.
     loads = {"mini": load(clones=None), "box": load(clones=[clone()])}
-    checking = pl.Exclusion("checking…", True)
+    checking = pl.Exclusion("checking…", True, True)
     assert pl.exclusions(req, FLEET, loads, {}, NOW) == {"mini": checking}
     assert pl.exclusions({**req, "kind": "scratch"}, FLEET, loads, {}, NOW) == {}
     assert pl.exclusions({"kind": "cron"}, FLEET, loads, {}, NOW) == {}
@@ -438,5 +438,5 @@ def test_this_machine_still_counting_its_agents_says_so():
     assert chosen.reason == "auto: least busy, still counting agents"
     # Launches placed here meanwhile still fill it.
     assert pl.exclusions({}, {}, loads, {"local": 20}, NOW) == {
-        "local": pl.Exclusion("full (20/20)", True)
+        "local": pl.Exclusion("full (20/20)", True, True)
     }

@@ -475,6 +475,20 @@ the agent when it is done** was ticked (see below). Sessions
 started with `wt --exit-when-done` (see [Worktree helper](#worktree-helper)) are
 followed the same way and listed under **Quit when done** on the Scheduled tab.
 
+### Launches waiting for room
+
+A launch sent to a machine chosen by name (in a dialog's Machine select, or with
+`wt --machine` on this machine) that is full, or whose load is not known yet, waits for
+room there instead of overfilling it. So does a sub-task an agent asks for from its
+sandbox, under Auto too (see [Worktree helper](#worktree-helper)). The launch is checked as
+if it started now and recorded as **waiting**, which holds its item as a launch under
+way would. The dashboard then places it again every 15 seconds, longest waiting first,
+and starts it as the same operation once the machine has room. The **Scheduled** tab
+lists waiting launches under **Waiting for room**, each with the reason and **Cancel**.
+One that has waited 6 hours, or that can no longer start (its clone or item is gone),
+fails with the reason. Waiting launches survive a dashboard restart. Auto still places a
+person's launch as before, on this machine when nothing else can take it.
+
 ### Handling several issues
 
 Tick the checkbox beside each issue on the Issues tab, or **Select all shown** for
@@ -1049,8 +1063,10 @@ Safehouse as it always has. The controller places it, Auto unless
 `--machine` names a machine (`local` is refused), and starts it as **New task** does,
 always sandboxed, under the sub-task rules of the supervisor reference: the asking
 launch's agent and Claude account, Docker only when that launch has it, at most two
-levels deep and a few an hour per lineage, never on a full machine or one already
-running 4 working sub-task agents, a worker's never on this machine. A worker clones
+levels deep and a few an hour per lineage, a worker's never on this machine. One whose
+machine is full, not checked yet, or already running 4 working sub-task agents waits
+for room (see [Launches waiting for room](#launches-waiting-for-room)), and `wt` says so
+and returns rather than waiting with it. A worker clones
 the repository there if it is missing, as it does for other new tasks. Only
 `wt <base> <branch>` with a prompt is handed over; anything else is refused rather than
 run here. `-r` there also takes `owner/name`, which a sandbox that cannot read the

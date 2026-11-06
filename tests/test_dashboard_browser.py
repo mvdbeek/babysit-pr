@@ -3144,6 +3144,81 @@ def test_scheduled_tab_lists_and_cancels_tasks(page, dashboard_site, width):
 
 
 @pytest.mark.parametrize("width", [1280, 390])
+def test_scheduled_tab_lists_and_cancels_launches_waiting_for_room(page, dashboard_site, width):
+    url, _ = dashboard_site
+    now = time.time()
+    waiting = [
+        {
+            "pr": "new:one",
+            "id": "op-one",
+            "action": "new",
+            "agent": "codex",
+            "machine": "chonk",
+            "message": "Waiting for room: Chonk: full (6/6)",
+            "created_at": now - 600,
+            "wait_until": now - 600 + 6 * 3600,
+            "subject": {
+                "kind": "scratch",
+                "repo": "test/alpha",
+                "branch": '<img src=x onerror="window.injected=true">fix',
+            },
+            "started_by": "Started by codex in /w/cron on Chonk, session 0b6f3c1e",
+        },
+        {
+            "pr": "PR_eight",
+            "id": "op-two",
+            "action": "handle",
+            "agent": "claude",
+            "machine": None,
+            "message": "Waiting for room: This machine: full (20/20)",
+            "created_at": now - 60,
+            "wait_until": now - 60 + 6 * 3600,
+            "subject": {
+                "kind": "pr",
+                "repo": "test/alpha",
+                "number": 8,
+                "url": "https://github.com/test/alpha/pull/8",
+            },
+        },
+    ]
+    cancels = []
+    page.route(
+        "**/api/scheduled-tasks",
+        lambda route: route.fulfill(
+            json={"enabled": True, "time": now, "tasks": [], "waiting": waiting}
+        ),
+    )
+
+    def cancel(route):
+        cancels.append(
+            (route.request.headers.get("x-babysit-action"), route.request.post_data_json)
+        )
+        waiting.pop(0)
+        route.fulfill(json={"operation": {"status": "failed"}})
+
+    page.route("**/api/waiting-cancel", cancel)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url)
+    page.get_by_role("tab", name="Scheduled 2").click()
+    cards = page.locator("#waiting-list li")
+    expect(cards).to_have_count(2)
+    expect(page.locator("#waiting-heading")).to_be_visible()
+    expect(page.locator("#scheduled-empty")).to_be_hidden()
+    expect(cards.first).to_contain_text("Waiting for room: Chonk: full (6/6). Gives up at")
+    expect(cards.first).to_contain_text("New task · Codex · On ")
+    expect(cards.first).to_contain_text("Started by codex in /w/cron on Chonk")
+    expect(cards.last.get_by_role("link", name="test/alpha #8")).to_be_visible()
+    expect(cards.last).to_contain_text("Handle · Claude")
+    assert page.locator("#scheduled-panel img").count() == 0
+    assert not page.evaluate("window.injected")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    cards.first.get_by_role("button", name="Cancel").click()
+    expect(cards).to_have_count(1)
+    expect(page.get_by_role("tab", name="Scheduled 1")).to_be_visible()
+    assert cancels == [("waiting-cancel", {"id": "new:one"})]
+
+
+@pytest.mark.parametrize("width", [1280, 390])
 def test_scheduled_tab_lists_wt_exit_watches(page, dashboard_site, width):
     url, _ = dashboard_site
     now = time.time()

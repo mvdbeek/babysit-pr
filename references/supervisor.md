@@ -854,14 +854,15 @@ New task only when:
   than 6 sub-tasks in the last hour, and launches on the parent's machine fewer than 24
   (answered 429 from a worker);
 - placement (Auto, sticking to the parent's machine, or the machine named) lands on a
-  machine Auto would use now: never a full one, one whose load is not known yet, or this
-  machine past its capacity, which a person's launch still gets. A worker's parent never
-  gets this machine, whose own agents' sandboxes reach the dashboard and herdr: named,
-  it is refused, and Auto that finds no worker answers "No worker can take this sub-task
-  now";
-- that machine runs fewer than 4 working sub-task agents: launches under way, and
-  earlier sub-tasks whose checkout herdr lists with a working or blocked agent (an idle
-  one left open does not count; sub-task operations are kept a week);
+  machine Auto would use now. A worker's parent never gets this machine, whose own
+  agents' sandboxes reach the dashboard and herdr: named, it is refused, and Auto that
+  finds no worker that could take it answers "No worker can take this sub-task now";
+- that machine has room: it is not full, its load is known, it is not this machine past
+  its capacity (which a person's launch still gets), and it runs fewer than 4 working
+  sub-task agents: launches under way, and earlier sub-tasks whose checkout herdr lists
+  with a working or blocked agent (an idle one left open does not count; sub-task
+  operations are kept a week). Otherwise the sub-task is recorded as waiting for room
+  (below), checked as if placed on the machine named, else the parent's;
 - the repository has a clone on this machine (`<src>/<name>` if it is one, else the
   first listed); a worker uses its own clone, creating it when missing as for New task.
 
@@ -890,9 +891,21 @@ the broker. Confirm the resulting agent, account, machine, branch and worktree a
 that the agent received the brief; an idle workspace alone is not a completed review.
 No controller credentials or other account stores are exposed to the asking sandbox.
 
+A launch waiting for room is an operation with status `waiting` and `wait_until`;
+the `waiting` table keeps what starts it again: the Handle or New task request (and a
+sub-task's parent and lineage, which already counted towards its rates). The scheduler
+loop places waiting launches again every 15 s, longest waiting first, through the same
+checks; with room it starts the same operation (its id and creation time kept, so a
+scheduled task's exit watch follows it), and without it updates the reason. Starting,
+cancelling (`POST /api/waiting-cancel` with the operation's key) and failing compare and
+swap on the waiting operation, so a cancelled launch never starts. One that waited 6
+hours, or whose request no longer passes, fails with the reason; a Handle waits until
+its item's list has loaded since the dashboard started. `/api/scheduled-tasks` lists
+them under `waiting`. `wt` reports a waiting launch and returns without following it.
+
 A worker's request is answered once the operation is recorded and the worker's request
-limits are released, after waiting up to 240 s for the launch; it gets the operation
-without its log. From then on nothing is a refusal: an operation that cannot be read is
+limits are released, after waiting up to 240 s for the launch (not for room); it gets
+the operation without its log. From then on nothing is a refusal: an operation that cannot be read is
 answered as uncertain, and a 5xx from the controller or a proxy, or a timeout, reaches
 `wt` as "may have started; do not start it again", as does "still launching". From
 Safehouse `wt` follows the operation through `/api/workspaces`.
@@ -1026,8 +1039,13 @@ agents plus launches placed but not yet listed, over the machine's capacity. Thi
 machine's capacity is **Agents on this machine** in Settings (default 20, shown once
 workers are registered): at that many agents Auto prefers a worker, and comes back here
 when no worker can take the launch. Until this machine's first workspace scan after a
-restart, its free slots read "still counting agents". Chosen by name, a
-full machine is only noted. A cron
+restart, its free slots read "still counting agents". Chosen by name, a full machine,
+or one not checked yet, has a launch from a dialog or `wt --machine` wait for room
+there (below); a scheduled launch's choice is only noted when it is scheduled, and
+it waits when it starts. A cron job's run is only noted. Placing a launch, as
+opposed to previewing it, first waits up to 7 s for the load refreshes it starts:
+a worker's load is refreshed only when something asks for it, so without the wait a
+launch after a quiet spell would find every worker still "checking…". A cron
 job outside its sandbox never runs on a worker. The preview uses the same stickiness, the
 dialog's issue, other-repository and sandbox choices, and workers' clones, but cannot see
 a Handle's verified checkout, which pins the launch to this machine or, on a worker, ranks
