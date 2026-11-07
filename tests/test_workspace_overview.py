@@ -2287,14 +2287,15 @@ def test_the_dashboard_relays_quits_and_names_this_machine_beside_workers(quitti
                 port, "/api/workspace-quit", stop_request(session="s9"), action="workspace-quit"
             )
             assert status == 400 and "no longer running" in value["error"]
-            # A worker's agents are not quit from here yet.
+            # A worker's agent is looked up in that worker's herdr, never this machine's
+            # pane of the same name: the mini has no such workspace open.
             status, value = request(
                 port,
                 "/api/workspace-quit",
                 stop_request(workspace="mini/w1"),
                 action="workspace-quit",
             )
-            assert status == 400 and "cannot be opened" in value["error"]
+            assert status == 400 and "workspace is not open" in value["error"], value
             status, _ = request(port, "/api/workspace-quit", stop_request(), action="cancel")
             assert status == 404
             assert keys(quitting) == []

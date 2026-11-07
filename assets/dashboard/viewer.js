@@ -1669,12 +1669,8 @@
       `Quit ${name}`,
       "End the agent's process; its session can be resumed. A pane babysit opened for it closes; any other keeps its shell",
     );
+    // A worker's agent is quit through that worker's herdr, as a stop is.
     const worker = workerLabel(viewer.entry);
-    if (worker) {
-      // The server refuses it too: exit watches and quits stay on this machine's agents.
-      quit.disabled = true;
-      quit.title = `Agents on ${worker} cannot be quit from this dashboard yet`;
-    }
     quit.onclick = () => {
       // Focused once, on this click; a redraw while it is open leaves focus alone.
       quitQuestion = {

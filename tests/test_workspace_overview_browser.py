@@ -313,7 +313,7 @@ def test_worker_rows_show_their_machine_and_are_not_opened_from_here(page, site,
     assert not errors
 
 
-def test_a_worker_transcript_shows_its_agent_there_and_cannot_quit_it_yet(page, site):
+def test_a_worker_transcript_shows_its_agent_there_and_quits_it_there(page, site):
     url, plugin, _ = site
     plugin.value["workspaces"] = [
         row(
@@ -357,13 +357,26 @@ def test_a_worker_transcript_shows_its_agent_there_and_cannot_quit_it_yet(page, 
     expect(strip).to_have_attribute("data-live", "true")
     expect(strip).to_contain_text("on Mac mini")
     expect(strip.get_by_role("button", name="Stop the turn of Claude in w3:p2")).to_be_enabled()
-    quit_button = strip.get_by_role("button", name="Quit Claude in w3:p2")
-    expect(quit_button).to_be_disabled()
-    expect(quit_button).to_have_attribute(
-        "title", "Agents on Mac mini cannot be quit from this dashboard yet"
-    )
     expect(page.locator("#ws-docker")).to_be_hidden()
     live.screenshot(path="reports/viewer-strip-worker.png")
+    # Quit there too, named by the worker's qualified workspace.
+    quits = []
+
+    def quit_(route):
+        quits.append(route.request.post_data_json)
+        route.fulfill(json={"quit": True, "pane": "w3:p2", "warning": None})
+
+    page.route("**/api/workspace-quit", quit_)
+    quit_button = strip.get_by_role("button", name="Quit Claude in w3:p2")
+    expect(quit_button).to_be_enabled()
+    quit_button.click()
+    live.get_by_role("group", name="Confirm quitting the agent").get_by_role(
+        "button", name="Yes, quit"
+    ).click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "Quit Claude in w3:p2; its session can be resumed."
+    )
+    assert quits == [{"workspace": "mini/w3", "pane": "w3:p2", "session": "s1"}]
 
 
 def test_selection_confirmation_override_and_cleanup_progress(page, site):

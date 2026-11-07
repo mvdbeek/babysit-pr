@@ -14,16 +14,19 @@ import json
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from types import SimpleNamespace
 
 import agent_messages
+import dashboard
 import machines
 import pr_supervisor
 import pytest
 import remote_probe
 import workspace_move
 import workspace_overview as wso
+from test_dashboard_http import get
 from test_remote_inventory import git, make_clone, read, register, short_tmp
 from test_workspace_move import (
     BOX,
@@ -1032,13 +1035,15 @@ def test_the_command_line_names_a_workers_workspace(monkeypatch):
     assert any("Resume it on Linux box: ssh -t box.test" in line for line in out)
 
 
-def test_the_dashboard_passes_a_workers_workspace_to_the_move(rig):
-    """Other agent actions refuse a qualified workspace they cannot act on; a move takes it."""
-    import threading
+def test_the_dashboard_passes_a_workers_workspace_to_a_move_and_a_quit(rig, monkeypatch):
+    """A move takes the qualified workspace itself; a quit acts on the worker it names."""
+    quits = []
 
-    import dashboard
-    from test_dashboard_http import get
+    def exit_agent(request, home=None, *, machine=None):
+        quits.append((request, home, machine.id))
+        return {"quit": True, "pane": request["pane"], "warning": None}
 
+    monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
     server = dashboard.DashboardServer(rig.home, 0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1053,15 +1058,14 @@ def test_the_dashboard_passes_a_workers_workspace_to_the_move(rig):
                 method="POST",
                 body=json.dumps({"workspace": "box/w1", "pane": "w1:p2", "session": SID}),
             )
-            if action == "workspace-move":
-                assert status == 200, body
-            else:
-                assert status == 400 and "cannot be opened" in json.loads(body)["error"]
+            assert status == 200, body
     finally:
         server.shutdown()
         thread.join(5)
         server.server_close()
     assert seen == [{"workspace": "box/w1", "pane": "w1:p2", "session": SID}]
+    request = {"workspace": "w1", "pane": "w1:p2", "session": SID}
+    assert quits == [(request, rig.home, "box")]
 
 
 def tarball(*members):
