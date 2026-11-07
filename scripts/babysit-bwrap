@@ -439,6 +439,15 @@ if [[ -n $config_var ]]; then
       argv+=(--ro-bind "$path" "$path")
     fi
   done
+  # On a worker, the deployed babysit-pr (bound read-only below) is this configuration's
+  # babysit-pr skill. The skill sync never copies that one (RESERVED_SKILLS), so a link
+  # to the deployed copy is made here, or repointed if it leads elsewhere. A folder of that
+  # name is left alone. Agents cannot change the link: the skills folder is read-only inside.
+  link=$config_dir/skills/babysit-pr
+  if ((!print)) && [[ -f $home/.config/babysit-pr/worker.json && ${self%/*} == */scripts ]] &&
+    [[ (-L $link && $(readlink -- "$link") != "$deployed") || (! -e $link && ! -L $link) ]]; then
+    ln -sfn -- "$deployed" "$link" 2>/dev/null || true
+  fi
 fi
 
 # Read-only system. Merged-/usr links stay links.
