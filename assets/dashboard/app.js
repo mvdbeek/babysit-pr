@@ -1965,6 +1965,7 @@ async function refresh(force = false) {
 }
 const pages = [
   "attention",
+  "agents",
   "watcher",
   "prs",
   "issues",
@@ -1987,6 +1988,7 @@ function showPage(name) {
   if (name === "prs" || name === "issues") refreshOverviews();
   if (name === "scheduled") void refreshScheduled();
   if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));
+  if (name === "agents") window.dispatchEvent(new Event("agents-visible"));
   if (name === "upstream") window.dispatchEvent(new Event("upstream-visible"));
   if (name === "sentry") window.dispatchEvent(new Event("sentry-visible"));
   if (name === "cron") window.dispatchEvent(new Event("cron-visible"));
@@ -2196,7 +2198,13 @@ function renderMachines() {
       const badge = el("span", machineText(entry), `badge ${tone}`.trim());
       const title = [entry.error, skillsText(entry.skills)].filter(Boolean).join("\n");
       if (title) badge.title = title;
-      return badge;
+      // Each machine's agents are one click away on the Agents tab.
+      const link = el("a", undefined, "ws-machine-link");
+      link.href = "#agents";
+      link.setAttribute("aria-label", `${machineText(entry)}: show its agents`);
+      link.onclick = () => window.agentsTab?.showMachine(entry.local ? "local" : entry.id);
+      link.append(badge);
+      return link;
     }),
   );
 }

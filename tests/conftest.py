@@ -85,6 +85,10 @@ elif a[:2] == ['agent','send-keys']:
   # Only the pane's shell is left in its foreground.
   procs=data.get('process_info',{}).get(a[2])
   if procs: procs['foreground_processes']=[{'pid':procs['shell_pid']}]
+elif a[:2] == ['pane','send-keys']:
+ data.setdefault('pane_keys',[]).append(a[2:])
+elif a[:2] == ['pane','read']:
+ save(); print(data.get('screens',{}).get(a[2],[''])[-1]); sys.exit(0)
 elif a[:2] == ['agent','read']:
  # A scripted dialog: each key or text sent to the pane advances to its next screen.
  sent=[c for c in data['calls'] if c[:2] in (['agent','send-keys'],['pane','send-text']) and c[2]==a[2]]

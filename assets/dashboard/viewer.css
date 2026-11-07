@@ -901,3 +901,75 @@ body.ws-tray-shown main {
     min-width: 44px;
   }
 }
+/* Terminal: one pane's screen in terminal colours, whatever the page theme. */
+.ws-terminal {
+  --term-bg: #1e1e1e;
+  --term-fg: #e5e5e5;
+  min-height: 12em;
+  max-height: 60vh;
+  max-height: 60dvh;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--term-bg);
+  color: var(--term-fg);
+  font:
+    12px/1.35 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  white-space: pre;
+}
+.ws-terminal:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.ws-terminal.capturing {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+.ws-terminal-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+.ws-terminal-capture {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+.ws-terminal-pad {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0;
+}
+.ws-terminal-pad button {
+  min-width: 2.6em;
+}
+.ws-terminal-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+.ws-terminal-form input[type="text"] {
+  flex: 1 1 14em;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+#ws-terminal-note:empty {
+  display: none;
+}
+#ws-terminal-note {
+  color: var(--red);
+}
+/* Typing into the pane replaces the composer while the terminal shows. */
+#ws-viewer[data-mode="terminal"] #ws-message,
+#ws-viewer[data-mode="terminal"] #ws-agent-interaction {
+  display: none;
+}
