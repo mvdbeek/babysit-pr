@@ -289,7 +289,7 @@ def test_the_broker_finds_the_session_its_sandboxs_claude_records_by_its_own_pid
     proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
 
     def found():
-        return worker_broker.running_session(10, config, store, proc)
+        return worker_broker.running_claude_session(10, config, store, proc)
 
     session = str(uuid.uuid4())
     # Recorded, but not written to yet: nothing to show, so nothing is reported.
@@ -356,7 +356,7 @@ def test_the_broker_tells_herdr_the_session_and_again_when_it_changes(
             session_record(store, 2, second, start="777")
         return index is not None
 
-    worker_broker.report_sessions(10, config, store, proc, running)
+    worker_broker.report_sessions("claude", 10, config, store, proc, running)
     reports = calls.read_text().splitlines()
     # Once per session, not once per look.
     assert len(reports) == 2
@@ -390,9 +390,144 @@ def test_the_broker_reports_again_when_herdr_refused_and_not_outside_herdr(
         tmp_path, monkeypatch, f'[ "$(wc -l < "{tmp_path / "herdr-calls"}")" -gt 1 ]'
     )
     monkeypatch.delenv("HERDR_ENV")
-    worker_broker.report_sessions(10, config, store, proc, lambda: True)  # Returns at once.
+    worker_broker.report_sessions(
+        "claude", 10, config, store, proc, lambda: True
+    )  # Returns at once.
     assert not calls.exists()
     monkeypatch.setenv("HERDR_ENV", "1")
     rounds = iter(range(4))
-    worker_broker.report_sessions(10, config, store, proc, lambda: next(rounds, None) is not None)
+    worker_broker.report_sessions(
+        "claude", 10, config, store, proc, lambda: next(rounds, None) is not None
+    )
     assert len(calls.read_text().splitlines()) == 2
+
+
+def codex_rollout(config, sid, source="cli"):
+    folder = config / "sessions" / "2026" / "11" / "07"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"rollout-2026-11-07T09-00-00-{sid}.jsonl"
+    meta = {"type": "session_meta", "payload": {"id": sid, "cwd": "/tree", "source": source}}
+    path.write_text(json.dumps(meta) + "\n")
+    return path.resolve()
+
+
+def hold(proc, pid, fd, path, flags="02102002"):
+    """``pid`` has ``path`` open as ``fd``: by default O_RDWR | O_APPEND, as Codex does."""
+    (proc / str(pid) / "fd").mkdir(exist_ok=True)
+    (proc / str(pid) / "fdinfo").mkdir(exist_ok=True)
+    (proc / str(pid) / "fd" / str(fd)).symlink_to(path)
+    (proc / str(pid) / "fdinfo" / str(fd)).write_text(f"pos:\t0\nflags:\t{flags}\nmnt_id:\t1\n")
+
+
+def let_go(proc, pid, fd):
+    (proc / str(pid) / "fd" / str(fd)).unlink()
+
+
+@pytest.fixture
+def codex_sandbox(tmp_path):
+    """A Codex sandbox as bwrap runs it: bwrap (10), its broker (11) and its init (12),
+    then npm's codex (13, node), the native Codex (14), a shell it runs (15) and a Codex
+    that shell runs (16). Codex's home is <tmp>/.codex."""
+    proc = tmp_path / "proc"
+    fake_process(proc, 10, [11, 12], comm="bwrap")
+    fake_process(proc, 11, comm="python3")
+    fake_process(proc, 12, [13], nspid=1, comm="bwrap")
+    fake_process(proc, 13, [14], nspid=2, comm="node")
+    fake_process(proc, 14, [15], nspid=3, comm="codex")
+    fake_process(proc, 15, [16], nspid=4, comm="bash")
+    fake_process(proc, 16, nspid=5, comm="codex")
+    return {"proc": proc, "config": tmp_path / ".codex"}
+
+
+def test_the_broker_finds_the_rollout_its_sandboxs_codex_writes(codex_sandbox, tmp_path):
+    proc, config = codex_sandbox["proc"], codex_sandbox["config"]
+
+    def found():
+        return worker_broker.running_codex_session(10, config, proc)
+
+    own, nested, other = (str(uuid.uuid4()) for _ in range(3))
+    path = codex_rollout(config, own)
+    # Nothing written yet: the session of a Codex it runs is not the launch's.
+    hold(proc, 16, 3, codex_rollout(config, nested))
+    assert found() is None
+    # Read, as /resume's picker reads one, is not run.
+    hold(proc, 14, 20, path, flags="02100000")
+    assert found() is None
+    hold(proc, 14, 21, path)
+    assert found() == (own, str(path))
+    # A subagent's rollout, which the same process writes, is not the conversation.
+    hold(proc, 14, 22, codex_rollout(config, str(uuid.uuid4()), {"subagent": "review"}))
+    # Nor is one in another Codex home, or the store's file under a name the sandbox
+    # gave another one.
+    hold(proc, 14, 23, codex_rollout(tmp_path / "elsewhere", other))
+    planted = tmp_path / "planted" / path.name
+    planted.parent.mkdir()
+    planted.write_text(path.read_text())
+    hold(proc, 14, 24, planted)
+    assert found() == (own, str(path))
+    # Two conversations at once: neither is reported.
+    hold(proc, 14, 25, codex_rollout(config, other))
+    assert found() is None
+    let_go(proc, 14, 25)
+    # A rollout whose first line is not its own session's is not read as one.
+    path.write_text(json.dumps({"type": "session_meta", "payload": {"id": other}}) + "\n")
+    assert found() is None
+    path.write_text("[" * 60000)
+    assert found() is None
+
+
+def test_the_broker_reads_what_a_real_codex_process_holds_open(tmp_path):
+    if not Path("/proc/self/fdinfo").is_dir():
+        pytest.skip("needs Linux /proc")
+    config = tmp_path / ".codex"
+    own, read = str(uuid.uuid4()), str(uuid.uuid4())
+    path, other = codex_rollout(config, own), codex_rollout(config, read)
+    holder = (
+        "import ctypes, sys, time\n"
+        "ctypes.CDLL(None).prctl(15, b'codex', 0, 0, 0)\n"  # PR_SET_NAME, as the native one
+        "held = open(sys.argv[1], 'a+'), open(sys.argv[2])\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    # Its parent stands in for bwrap.
+    parent = subprocess.Popen(
+        [sys.executable, "-c", "import subprocess, sys; subprocess.run(sys.argv[1:])"]
+        + [sys.executable, "-c", holder, str(path), str(other)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert parent.stdout.readline() == "ready\n"
+        assert worker_broker.running_codex_session(parent.pid, config) == (own, str(path))
+    finally:
+        parent.kill()
+        for child in worker_broker._children(Path("/proc"), parent.pid):
+            os.kill(child, 9)
+        parent.wait()
+
+
+def test_the_broker_tells_herdr_the_codex_session(codex_sandbox, tmp_path, monkeypatch):
+    proc, config = codex_sandbox["proc"], codex_sandbox["config"]
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    paths = {sid: codex_rollout(config, sid) for sid in (first, second)}
+    hold(proc, 14, 30, paths[first])
+    calls = fake_herdr(tmp_path, monkeypatch, "true")
+    rounds = iter(range(6))
+
+    def running():
+        index = next(rounds, None)
+        if index == 3:  # A /new moves Codex to another rollout.
+            let_go(proc, 14, 30)
+            hold(proc, 14, 31, paths[second])
+        return index is not None
+
+    worker_broker.report_sessions("codex", 10, config, tmp_path / "unused", proc, running)
+    reports = [report.split() for report in calls.read_text().splitlines()]
+    assert len(reports) == 2
+    for args, sid in zip(reports, (first, second), strict=True):
+        assert args[:4] == ["pane", "report-agent-session", "--source=herdr:codex", "--agent=codex"]
+        assert args[5:] == [
+            f"--agent-session-id={sid}",
+            f"--agent-session-path={paths[sid]}",
+            "wQ:p1",
+        ]
