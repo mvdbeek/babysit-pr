@@ -919,6 +919,25 @@ user_checks() {
   fi
   gpg_checks
   claude_account_checks
+  instruction_checks
+}
+
+# babysit-bwrap turns a missing CLAUDE.md or AGENTS.md into an empty placeholder, so a
+# worker that was never given the user's instructions runs its agents without them.
+instruction_checks() {
+  local file files=()
+  [[ -d $HOME/.claude ]] && files+=("$HOME/.claude/CLAUDE.md")
+  for file in "$HOME"/.claude/accounts/*/; do
+    [[ -d $file ]] && files+=("${file}CLAUDE.md")
+  done
+  [[ -d $HOME/.codex ]] && files+=("$HOME/.codex/AGENTS.md")
+  for file in ${files[@]+"${files[@]}"}; do
+    if [[ -f $file && ! -L $file ]] && grep -q '[^[:space:]]' "$file" 2>/dev/null; then
+      ok "$file has instructions"
+    else
+      warn "$file is missing or empty, so its agents run without your instructions; copy them from the controller (references/worker-setup.md)"
+    fi
+  done
 }
 
 # A fresh login stops an unattended launch at Claude's first-run screens (theme, the

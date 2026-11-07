@@ -553,6 +553,8 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
     assert (str(home / ".config/gh"), str(home / ".config/gh")) in pairs(argv, "--ro-bind-try")
     rc = str(home / ".sentryclirc")
     assert (rc, rc) in pairs(argv, "--ro-bind-try")
+    matrix = str(home / ".config/matrix-commander")
+    assert (matrix, matrix) in pairs(argv, "--ro-bind-try")
     assert ("/usr", "/usr") in pairs(argv, "--ro-bind-try")
     assert not any(target == "/etc" for _, target in pairs(argv, "--ro-bind-try"))
     assert dict(pairs(argv, "--setenv")) == {
@@ -1022,6 +1024,7 @@ def test_wrapper_protects_session_and_git_startup_files(checkout, path):
         ".config/tmux",
         ".docker",  # credential helpers and CLI plugins
         ".sentryclirc",  # sentry-cli auth token, bound read-only
+        ".config/matrix-commander",  # Matrix token, bound read-only
         ".local/share/uv",  # toolchains that also run outside
         ".local/share/claude",
         ".nvm",

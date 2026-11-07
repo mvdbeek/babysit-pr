@@ -384,7 +384,7 @@ other registered worktrees is refused (use a linked worktree): its agent could
 swap that directory for a link just before another worktree's sandbox binds it.
 Every writable path must be absolute and is resolved first; `/`, `$HOME` and its
 ancestors, and anything equal to, inside or holding `~/.ssh`, `~/.gnupg`,
-`~/.config/gh`, `~/.sentryclirc`, `~/.config/babysit-pr`, `~/.local/state/babysit-pr`,
+`~/.config/gh`, `~/.sentryclirc`, `~/.config/matrix-commander`, `~/.config/babysit-pr`, `~/.local/state/babysit-pr`,
 `~/.local/bin`, the toolchains that also run outside (`~/.local/share/uv`,
 `~/.local/share/claude`, `~/.nvm`, `~/.npm-global`), `~/.docker` (credential
 helpers and CLI plugins), `~/.config/herdr` (its socket drives panes outside the
@@ -410,7 +410,7 @@ are resolved whether or not they exist, through linked parents and dangling
 dotfile links. Where bwrap has `--bind-fd` (bubblewrap 0.10.0 and later, detected
 from `bwrap --help`), each writable directory is opened once after it is checked,
 its descriptor must still resolve to the checked path, and bwrap binds that
-descriptor, so a path swapped after the check cannot redirect the bind. Read-only binds (system, toolchains, `~/.config/gh`, `~/.sentryclirc`) follow the
+descriptor, so a path swapped after the check cannot redirect the bind. Read-only binds (system, toolchains, `~/.config/gh`, `~/.sentryclirc`, `~/.config/matrix-commander`) follow the
 writable ones, so none can be shadowed. It unshares PID, IPC and UTS
 namespaces, dies with its parent, and clears the environment except `PATH`,
 `HOME`, `TERM`, `LANG`, `USER`, the variables above and the `--env-pass` names.
