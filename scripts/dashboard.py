@@ -111,6 +111,7 @@ def local_workspace(home, value):
 WORKER_ACTIONS = {
     "workspace-message",
     "workspace-interrupt",
+    "workspace-quit",
     "workspace-answer",
     "workspace-choose",
     "workspace-keys",
@@ -1215,7 +1216,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if action == "workspace-quit":
                 try:
-                    self.send_json(200, agent_messages.exit_agent(request, self.server.home))
+                    self.send_json(
+                        200, agent_messages.exit_agent(request, self.server.home, machine=machine)
+                    )
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
                 return
