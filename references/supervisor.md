@@ -41,7 +41,10 @@ Otherwise, exit the original CLI with Ctrl-D and run the returned `release_argv`
 command. A headless caller may release after its original agent process exits.
 Release transfers session/worktree ownership to the service. Service locks protect
 its workers; they cannot lock a manually launched TUI. Never manually release a
-live conversation. Each repair holds a flock (`scripts/session_locks.py`), one lease
+live conversation. `release` refuses from inside the watched conversation (its
+`CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID` or `CLAUDE_SESSION_ID`), and for a Claude
+watch from a Claude Code session that names no conversation; another agent's session
+may release a watch whose conversation has exited. Each repair holds a flock (`scripts/session_locks.py`), one lease
 per machine and session owned by the controller, which every supervisor home there
 contends for: a local session's lock lives in `CLAUDE_CONFIG_DIR`/`CODEX_HOME` under
 `babysit-pr-locks/`, a worker machine's in
