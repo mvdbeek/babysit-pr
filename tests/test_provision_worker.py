@@ -472,3 +472,39 @@ def test_user_check_reports_claude_accounts_that_would_not_start_unattended(tmp_
     )
     assert "Claude account signedout is not signed in; run claude-account login signedout" in output
     assert done.returncode == 1
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root --check inspects the host instead")
+def test_user_check_warns_about_agents_without_instructions(tmp_path):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    for tool in ("bwrap", "docker", "gpg", "systemctl", "git"):
+        (fakes / tool).write_text("#!/bin/sh\necho rootless\nexit 0\n")
+    (fakes / "id").write_text('#!/bin/sh\ncase "$1" in -u) echo 1000 ;; *) echo babysit ;; esac\n')
+    for fake in fakes.iterdir():
+        fake.chmod(0o755)
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    (claude / "accounts/given").mkdir(parents=True)
+    (claude / "accounts/given/CLAUDE.md").write_text("## Python Imports\n- module level\n")
+    (claude / "accounts/placeholder").mkdir()
+    (claude / "accounts/placeholder/CLAUDE.md").write_text(" \n")
+    (claude / "accounts/linked").mkdir()
+    (claude / "accounts/linked/CLAUDE.md").symlink_to(claude / "accounts/given/CLAUDE.md")
+    (home / ".codex").mkdir()
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--check"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    output = done.stdout + done.stderr
+    assert f"ok: {claude}/accounts/given/CLAUDE.md has instructions" in output
+    for missing in (
+        claude / "CLAUDE.md",
+        claude / "accounts/placeholder/CLAUDE.md",
+        claude / "accounts/linked/CLAUDE.md",
+        home / ".codex/AGENTS.md",
+    ):
+        assert f"WARNING: {missing} is missing or empty" in output

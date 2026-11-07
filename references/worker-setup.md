@@ -226,6 +226,23 @@ the sandboxed Claude can't save the answers into its read-only `settings.json`. 
 settings already have). `--check` reports an account that is missing either, or that
 is not signed in.
 
+**Instructions.** Nothing copies your global agent instructions to the worker.
+babysit-bwrap creates a missing `CLAUDE.md` or `AGENTS.md` as an empty placeholder,
+so without them, worker agents run without your rules. Copy the controller's
+`~/.claude/CLAUDE.md` into the worker's `~/.claude/CLAUDE.md` and into each
+`~/.claude/accounts/<name>/CLAUDE.md`, and copy `~/.codex/AGENTS.md` into
+`~/.codex/AGENTS.md`. Use real files, not links, because babysit-bwrap refuses links
+there. In the copy, inline any `@` import, drop or adapt instructions that name
+helpers or paths the worker lacks, and point sandboxed agents at
+`$BABYSIT_ARTIFACT_DIR` for files meant for you. Helpers in `~/.local/bin` are on
+the sandbox's PATH (read-only). A Matrix token in `~/.config/matrix-commander` is
+bound read-only into every sandbox, like `~/.config/gh`, so any worker agent can read
+it. Claude's auto-memory stays on the
+host and account that wrote it, and Codex never reads it. Put any rule that must
+hold on every machine in these files, not in a memory. `--check` warns about a
+missing or empty file. After changing the instructions on the controller, copy them
+again.
+
 The worker's `gh` login is used only by agents and git on the worker; the controller
 keeps polling GitHub with its own. Prefer a fine-grained token or a separate GitHub
 account limited to the repositories babysit works on.
