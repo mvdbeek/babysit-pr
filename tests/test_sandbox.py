@@ -802,6 +802,62 @@ def test_wrapper_creates_empty_placeholders_before_a_launch(checkout, tmp_path):
     assert (config / "CLAUDE.md").read_text() == ""
     assert (config / "plugins").is_dir() and not any((config / "plugins").iterdir())
     assert (config / "skills" / "kept").read_text() == "x"
+    # Off a worker, no babysit-pr skill is linked in.
+    assert not (config / "skills" / "babysit-pr").is_symlink()
+
+
+@fd_bash
+def test_wrapper_links_the_deployed_babysit_pr_skill_on_a_worker(checkout, tmp_path):
+    worktree, _, home = checkout
+    (home / ".config" / "babysit-pr").mkdir(parents=True)
+    (home / ".config" / "babysit-pr" / "worker.json").write_text("{}")
+    # A bwrap that exits at once, so the wrapper really launches, and a stand-in for the
+    # registration broker every worker launch starts, which only says it is ready.
+    fake = tmp_path / "launching-bwrap"
+    fake.mkdir()
+    (fake / "bwrap").write_text("#!/bin/sh\nexit 0\n")
+    (fake / "python3").write_text("#!/bin/sh\necho ready\n")
+    (fake / "bwrap").chmod(0o755)
+    (fake / "python3").chmod(0o755)
+    env = environment(home, XDG_RUNTIME_DIR=str(tmp_path))
+    env["PATH"] = f"{fake}:{os.environ['PATH']}"
+    deployed = str(Path(WRAPPER).resolve().parent.parent)
+
+    def launch(option, config):
+        result = subprocess.run(
+            ["bash", WRAPPER, f"{option}={config}", "--", "agent"],
+            cwd=worktree,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        return config / "skills" / "babysit-pr"
+
+    # Claude's configuration, a Claude account's and Codex's each get the deployed skill.
+    for option, name in (
+        ("--claude-config-dir", ".claude"),
+        ("--claude-config-dir", "accounts/oss"),
+        ("--codex-home", ".codex"),
+    ):
+        config = home / name
+        config.mkdir(parents=True)
+        link = launch(option, config)
+        assert os.readlink(link) == deployed
+        assert (link / "SKILL.md").is_file()
+    # A link left from another deployed path is repointed.
+    config = home / ".claude"
+    link = config / "skills" / "babysit-pr"
+    link.unlink()
+    link.symlink_to(tmp_path)
+    assert os.readlink(launch("--claude-config-dir", config)) == deployed
+    # A folder of that name is the user's own and is left alone.
+    link.unlink()
+    link.mkdir()
+    (link / "SKILL.md").write_text("mine")
+    launch("--claude-config-dir", config)
+    assert not link.is_symlink() and (link / "SKILL.md").read_text() == "mine"
 
 
 def test_wrapper_keeps_shell_snapshots_and_the_configuration_to_each_sandbox(checkout, tmp_path):

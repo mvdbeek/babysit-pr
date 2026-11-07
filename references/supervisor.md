@@ -734,7 +734,10 @@ so the account is where the transcript lies. One request is forwarded at a time,
 most one every 20 s per launch, with at most 4 connections open and 30 s to send a
 request.
 The wrapper also shows the deployed babysit-pr read-only inside on a worker, so the
-skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. `handoff` on
+skill and `pr_supervisor.py` are at `<babysit_root>` for sandboxed agents. The skill sync
+never copies babysit-pr itself, so before each launch the wrapper links `<babysit_root>` as
+`skills/babysit-pr` in the launch's Claude or Codex configuration, which makes
+`/babysit-pr` and `$babysit-pr` resolve there. `handoff` on
 a worker goes the same way (`action: handoff` in a broker request; registrations carry
 no `action`, as brokers started before handoff expect; at most one of each action every
 20 s per launch): it sends the watch ID, pane and timeout with both conversations it
