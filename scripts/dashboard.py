@@ -22,6 +22,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import agent_messages
+import agent_roster
+import agent_terminal
 import attachments
 import attention
 import browser_extension
@@ -111,6 +113,8 @@ WORKER_ACTIONS = {
     "workspace-interrupt",
     "workspace-answer",
     "workspace-choose",
+    "workspace-keys",
+    "workspace-shell",
 }
 
 
@@ -137,6 +141,8 @@ ACTIONS = frozenset(
         "workspace-quit",
         "workspace-move",
         "workspace-prompt-forget",
+        "workspace-keys",
+        "workspace-shell",
         "attachment-upload",
         "sentry-action",
         "cron-action",
@@ -162,6 +168,7 @@ ACTIONS = frozenset(
 # requests cannot grow it.
 API_ROUTES = frozenset(
     {
+        "/api/agents",
         "/api/attention",
         "/api/auth-report",
         "/api/codex-update",
@@ -192,6 +199,7 @@ API_ROUTES = frozenset(
         "/api/workspace-overview",
         "/api/workspace-prompts",
         "/api/workspace-repos",
+        "/api/workspace-terminal",
         "/api/workspace-transcript",
         "/api/workspaces",
     }
@@ -555,6 +563,12 @@ class DashboardServer(ThreadingHTTPServer):
         self.extension = browser_extension.Extension(home)
         self.moves = workspace_move.Moves(
             home, lambda: self.workspaces, lambda: self.workspace_overview
+        )
+        self.roster = agent_roster.Roster(
+            home,
+            jobs=lambda: read_jobs(home),
+            cron=lambda: self.cron.snapshot() if self.cron else None,
+            overview=workspace_overview,
         )
         super().__init__(("127.0.0.1", port), Handler)
 
@@ -1021,6 +1035,8 @@ class Handler(BaseHTTPRequestHandler):
                         "workspace-message",
                         "workspace-answer",
                         "workspace-prompt-forget",
+                        "workspace-keys",
+                        "workspace-shell",
                         "settings",
                         "tags",
                         "sentry-action",
@@ -1223,6 +1239,18 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, agent_messages.choose(request, machine))
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the dialog in Collie: {exc}"})
+                return
+            if action == "workspace-keys":
+                try:
+                    self.send_json(200, agent_terminal.send(request, machine))
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the terminal in Collie: {exc}"})
+                return
+            if action == "workspace-shell":
+                try:
+                    self.send_json(200, agent_terminal.shell(request, machine))
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the workspace in Collie: {exc}"})
                 return
             if action == "service-restart":
                 self.service_restart(request)
@@ -1806,6 +1834,26 @@ class Handler(BaseHTTPRequestHandler):
                     if self.server.workspaces
                     else {"prs": {}, "issues": {}, "error": "Workspace actions are not enabled"},
                 )
+            elif route.path == "/api/agents":
+                self.send_json(200, self.server.roster.snapshot())
+            elif route.path == "/api/workspace-terminal":
+                query = parse_qs(route.query)
+                if not {"workspace"} <= set(query) <= {"workspace", "pane"} or any(
+                    len(values) != 1 for values in query.values()
+                ):
+                    raise ValueError("Supply a workspace, and optionally a pane")
+                machine, workspace_id = viewed_workspace(self.server.home, query["workspace"][0])
+                if machine is None:
+                    self.server.workspace_checkout(workspace_id)
+                else:
+                    self.server.remote_checkout(machine, workspace_id)
+                try:
+                    value = agent_terminal.screen(
+                        workspace_id, query.get("pane", [None])[0], machine
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise ValueError(f"The terminal could not be read: {exc}") from exc
+                self.send_json(200, value)
             elif route.path == "/api/machines":
                 if not self.server.workspaces:
                     raise ValueError("Workspace actions are not enabled")
@@ -1879,7 +1927,10 @@ class Handler(BaseHTTPRequestHandler):
                     "/tags.js": ("tags.js", "text/javascript"),
                     "/workspaces.js": ("workspaces.js", "text/javascript"),
                     "/workspaces.css": ("workspaces.css", "text/css"),
+                    "/agents.js": ("agents.js", "text/javascript"),
+                    "/agents.css": ("agents.css", "text/css"),
                     "/viewer.js": ("viewer.js", "text/javascript"),
+                    "/terminal.js": ("terminal.js", "text/javascript"),
                     "/attachments.js": ("attachments.js", "text/javascript"),
                     "/viewer.css": ("viewer.css", "text/css"),
                     "/sentry.js": ("sentry.js", "text/javascript"),

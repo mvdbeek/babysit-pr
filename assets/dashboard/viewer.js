@@ -5,6 +5,8 @@
   // The dialog shows one workspace at a time, re-fetched on demand. Every change starts
   // a request; only the newest one may render.
   let viewer = null;
+  // Shown inside a page (the Agents tab) rather than as a modal dialog.
+  let docked = false;
   let viewerRequest = 0;
   let viewerInflight = 0;
   // Run once no load is in flight any more (a reload that one could have overtaken).
@@ -15,6 +17,15 @@
   // The open workspace in Collie, once its agents are read; text that sends the
   // reader to Collie links there.
   let collieUrl = null;
+  // The Terminal tab (terminal.js), shown in this viewer.
+  const terminal = window.workspaceTerminal({
+    current: () => (viewer?.mode === "terminal" ? viewer : null),
+    showPane: (pane) => change((state) => (state.pane = pane)),
+    busy: () => viewerInflight > 0,
+    choice,
+    getJSON,
+    paneLabel,
+  });
 
   function node(tag, text, className) {
     const element = document.createElement(tag);
@@ -286,9 +297,14 @@
     for (const [id, mode] of [
       ["ws-view-diff", "diff"],
       ["ws-view-transcript", "transcript"],
+      ["ws-view-terminal", "terminal"],
     ]) {
       byId(id).setAttribute("aria-selected", String(viewer?.mode === mode));
     }
+    // A pane can only be shown in a herdr workspace.
+    byId("ws-view-terminal").hidden = !viewer?.entry.workspace;
+    byId("ws-viewer").dataset.mode = viewer?.mode || "";
+    terminal.reset();
   }
   // A view names a Workspaces-tab row, a herdr workspace (anything Collie can open), or
   // a watch, whose registered checkout is read without one.
@@ -327,7 +343,17 @@
   // base and session to start with, as a restored viewer does. Settles once loaded.
   function openViewer(entry, mode, siblings = null, state = null) {
     const last = viewer?.siblings === siblings ? viewer.position : -1;
-    viewer = { entry, mode, scope: "branch", base: null, session: null, ...state };
+    if (mode === "terminal" && !entry.workspace) mode = "transcript";
+    // An entry for one agent (the Agents tab's) starts on its session and pane.
+    viewer = {
+      entry,
+      mode,
+      scope: "branch",
+      base: null,
+      session: entry.session ?? null,
+      pane: entry.pane ?? null,
+      ...state,
+    };
     viewer.data = null;
     viewer.nodes = [];
     viewer.siblings = siblings;
@@ -339,8 +365,12 @@
     resetViewer("Loading…");
     openComposer(entry);
     const dialog = byId("ws-viewer");
-    if (!dialog.open) dialog.showModal();
+    if (!dialog.open) {
+      if (docked) dialog.show();
+      else dialog.showModal();
+    }
     renderNav();
+    window.dispatchEvent(new CustomEvent("workspace-viewer-open", { detail: { id: viewer.id } }));
     return loadViewer();
   }
   // Taken when the entry opens: a reopened agent may give it another workspace since.
@@ -405,7 +435,16 @@
     const token = ++viewerRequest;
     viewerInflight += 1;
     try {
-      if (current.mode === "diff") {
+      if (current.mode === "terminal") {
+        const data = await getJSON("/api/workspace-terminal", {
+          workspace: current.entry.workspace,
+          pane: current.pane,
+        });
+        if (token !== viewerRequest || viewer !== current) return;
+        current.data = data;
+        current.pane = data.pane;
+        terminal.render(data);
+      } else if (current.mode === "diff") {
         const data = await getJSON("/api/workspace-diff", {
           ...where(current.entry),
           scope: current.scope,
@@ -2533,11 +2572,19 @@
   });
   byId("ws-view-diff").onclick = () => setMode("diff");
   byId("ws-view-transcript").onclick = () => setMode("transcript");
+  byId("ws-view-terminal").onclick = () => setMode("terminal");
   byId("ws-viewer-close").onclick = () => byId("ws-viewer").close();
   byId("ws-viewer-prev").onclick = () => step("previous");
   byId("ws-viewer-next").onclick = () => step("next");
   // Full screen is a per-browser preference, kept across viewers and reloads.
   const FULL_KEY = "ws-viewer-full";
+  // A terminal pane's label in its Pane choice: the agent in it and what it is doing.
+  function paneLabel(pane) {
+    const what = pane.agent
+      ? `${agentTitle(pane)} · ${ACTIVITY[pane.status]?.[0] || pane.status || "unknown"}`
+      : pane.label || "shell";
+    return `${pane.pane} · ${what}`;
+  }
   function setFull(full) {
     byId("ws-viewer").classList.toggle("ws-viewer-full", full);
     byId("ws-viewer-full").setAttribute("aria-pressed", String(full));
@@ -2572,7 +2619,7 @@
       typeof item?.id === "string" &&
       typeof entry === "object" &&
       entry !== null &&
-      ["id", "workspace", "key", "watch", "name", "machineLabel"].every((name) =>
+      ["id", "workspace", "key", "watch", "name", "machineLabel", "session", "pane"].every((name) =>
         optional(entry[name]),
       ) &&
       Boolean(entry.workspace || entry.key || entry.watch) &&
@@ -2612,6 +2659,7 @@
   // Where the reader is. In a transcript: the end while they follow it, or else the first
   // entry in view and its offset, which newer entries arriving meanwhile do not move.
   function readingPosition() {
+    if (viewer.mode === "terminal") return { top: 0 };
     const scroller = byId("ws-viewer");
     if (!viewer.data) return null;
     if (viewer.mode !== "transcript" || !viewer.nodes.length) return { top: scroller.scrollTop };
@@ -2648,7 +2696,9 @@
     // The checkout its agents were read from: a restore checks its workspace ID still
     // names it, as a restarted herdr reuses IDs.
     const path = draft?.path || null;
-    const { mode, scope, base, session } = viewer;
+    const { scope, base, session } = viewer;
+    // The tray restores diffs and transcripts; a terminal comes back as its transcript.
+    const mode = viewer.mode === "terminal" ? "transcript" : viewer.mode;
     const item = { id, entry, path, mode, scope, base, session, position: readingPosition() };
     tray = [item, ...tray.filter((other) => other.id !== id)].slice(0, TRAY_LIMIT);
     if (viewer.siblings) traySiblings.set(id, viewer.siblings);
@@ -2706,7 +2756,7 @@
     }
   }
   async function restore(id, button) {
-    if (byId("ws-viewer").open) return;
+    if (byId("ws-viewer").open && !docked) return;
     const at = chipIndex(button);
     let item = tray.find((other) => other.id === id);
     const name = item.entry.name || "Workspace";
@@ -2722,7 +2772,7 @@
     button.disabled = false;
     // Another tab may have restored, dismissed or replaced it meanwhile.
     item = tray.find((other) => other.id === id);
-    if (!item || byId("ws-viewer").open) return;
+    if (!item || (byId("ws-viewer").open && !docked)) return;
     if (failure) {
       if (GONE.test(failure)) {
         unpark(id);
@@ -2831,7 +2881,11 @@
   // so do its running agents.
   let pollingAgents = false;
   setInterval(() => {
-    if (viewer?.mode === "transcript" && messageable(viewer.entry) && !document.hidden) {
+    if (
+      ["transcript", "terminal"].includes(viewer?.mode) &&
+      messageable(viewer.entry) &&
+      !document.hidden
+    ) {
       if (!pollingAgents && !stopping()) {
         pollingAgents = true;
         void fetchAgents(viewer.entry).finally(() => (pollingAgents = false));
@@ -2878,5 +2932,24 @@
     if (!viewer || !byId("ws-viewer").open) return null;
     return { ...where(viewer.entry), name: viewer.entry.name || null, mode: viewer.mode };
   }
-  window.workspaceViewer = { open: openViewer, buttons, listChanged, current };
+  // Docked, the viewer is a pane of the page (the Agents tab's), shown without a modal
+  // backdrop; undocked, it goes back where it was and opens as a dialog again.
+  const dialogHome = { parent: byId("ws-viewer").parentNode, next: byId("ws-viewer").nextSibling };
+  function dock(container) {
+    const dialog = byId("ws-viewer");
+    if (docked && dialog.parentNode === container) return;
+    if (dialog.open) dialog.close();
+    docked = true;
+    dialog.classList.add("ws-viewer-docked");
+    container.append(dialog);
+  }
+  function undock() {
+    if (!docked) return;
+    const dialog = byId("ws-viewer");
+    if (dialog.open) dialog.close();
+    docked = false;
+    dialog.classList.remove("ws-viewer-docked");
+    dialogHome.parent.insertBefore(dialog, dialogHome.next);
+  }
+  window.workspaceViewer = { open: openViewer, buttons, listChanged, current, dock, undock };
 })();

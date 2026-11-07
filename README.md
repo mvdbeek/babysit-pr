@@ -252,6 +252,35 @@ assignee, comment and date columns away and moves the CI and review state onto t
 line, leaving the repository, the title with its status line, and the actions. One
 choice covers both overviews and is kept in this browser.
 
+## Running agents
+
+The **Agents** tab lists every agent herdr runs, on this machine and on each enabled
+worker, wherever it was started: your own launches and `wt` sessions, babysit watch
+repairs, and cron runs. Agents waiting for your answer come first (longest waiting
+first), then working ones, then idle and finished ones. Each row says what the agent
+is doing and for how long, which machine and checkout it runs in, its terminal title,
+the pull request or issue the Workspaces tab linked to that checkout, and **Watch** or
+**Cron** when babysit started it. You can filter by machine, state and who started the
+agent, and search by repository, branch or title. The tab's badge counts the running
+agents and turns red while any of them waits for you. Each machine badge on the
+Workspaces tab opens that machine's agents here.
+
+Choosing an agent opens the workspace viewer on its session. On a wide screen the viewer
+docks beside the list, so you can move between agents without closing it; on a phone it
+opens full screen. Its transcript, live status, **Stop turn**, **Quit agent** and
+answers to the agent's questions and dialogs work there as they do elsewhere. Its
+**Terminal** tab shows the pane's own screen (see
+[the workspace reference](references/workspaces.md)).
+
+The list comes from `GET /api/agents`: `herdr agent list` and `herdr workspace list` on
+each machine, cached in the dashboard and refreshed in the background, every 3 seconds
+for this machine and every 10 for a worker. Nothing is read while nobody looks: the tab
+asks every 3 seconds while it is shown, and every 30 seconds otherwise, for its badge. A
+worker that does not answer keeps the agents last seen there, and the status line says
+why. How long an agent has been in its state is what this dashboard has seen since it
+started. Origins come from the watcher's queue (a watch not yet ended that owns the
+session) and from cron's running runs (the pane they launched).
+
 ## Your pull requests
 
 Use **Pull requests** to switch to the
