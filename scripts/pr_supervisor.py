@@ -1563,16 +1563,19 @@ def main():
                         raise ValueError(
                             "Automatic handoff pending; pause it before a manual release"
                         )
-                    if os.environ.get("CODEX_THREAD_ID") == job["session_id"]:
+                    # The watcher resumes the session; from inside it, two would write it.
+                    session = job["session_id"].lower()
+                    if (os.environ.get("CODEX_THREAD_ID") or "").lower() == session:
                         raise ValueError(
                             "Exit this interactive Codex session before releasing its watch"
                         )
+                    claude = [
+                        (os.environ.get(key) or "").lower()
+                        for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
+                    ]
+                    # A Claude Code session that cannot name itself might be the watched one.
                     if job.get("agent") == "claude" and (
-                        os.environ.get("CLAUDECODE")
-                        or any(
-                            os.environ.get(key) == job["session_id"]
-                            for key in ("CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
-                        )
+                        session in claude or (os.environ.get("CLAUDECODE") and not any(claude))
                     ):
                         raise ValueError(
                             "Exit this interactive Claude session before releasing its watch"

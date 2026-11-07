@@ -622,26 +622,60 @@ def test_a_worker_never_registers_watches_of_its_own(tmp_path, command, marked):
     assert not state.exists()
 
 
-def test_live_session_cannot_release_itself(harness):
+OTHER_SESSION = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.mark.parametrize(
+    "agent,caller,refused",
+    [
+        ("codex", {"CODEX_THREAD_ID": "{sid}"}, True),
+        ("codex", {"CODEX_THREAD_ID": "{SID}"}, True),
+        ("claude", {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "{sid}"}, True),
+        ("claude", {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "{SID}"}, True),
+        ("claude", {"CLAUDE_SESSION_ID": "{sid}"}, True),
+        # A Claude session that cannot say which it is might be the watched one.
+        ("claude", {"CLAUDECODE": "1"}, True),
+        # Another Claude session releases a watch whose conversation has exited.
+        ("claude", {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": OTHER_SESSION}, False),
+        ("codex", {"CLAUDECODE": "1"}, False),
+    ],
+)
+def test_only_the_watched_session_cannot_release_itself(harness, agent, caller, refused):
     h = harness
-    env = os.environ.copy()
-    env["CODEX_THREAD_ID"] = h["job"]["session_id"]
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(supervisor.SCRIPT),
-            "--home",
-            str(h["home"]),
-            "release",
-            h["job"]["id"],
-        ],
-        env=env,
-        text=True,
-        capture_output=True,
-    )
-    assert result.returncode == 1
-    assert "Exit this interactive" in result.stdout
-    assert supervisor.get_job(h["db"], h["job"]["id"])["status"] == "awaiting_release"
+    sid = h["job"]["session_id"]
+    with h["db"]:
+        job = supervisor.get_job(h["db"], h["job"]["id"])
+        job["agent"] = agent
+        supervisor.save_job(h["db"], job)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"CLAUDECODE", "CODEX_THREAD_ID"} and not k.startswith("CLAUDE_")
+    }
+    env.update({k: v.format(sid=sid, SID=sid.upper()) for k, v in caller.items()})
+    # Held here, the supervisor lock keeps an allowed release from starting a daemon.
+    with supervisor.locked(h["home"] / "supervisor.lock"):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(supervisor.SCRIPT),
+                "--home",
+                str(h["home"]),
+                "release",
+                h["job"]["id"],
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+    status = supervisor.get_job(h["db"], h["job"]["id"])["status"]
+    if refused:
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "Exit this interactive" in json.loads(result.stdout)["error"]
+        assert status == "awaiting_release"
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert status == "watching"
     assert not (h["home"] / "daemon.json").exists()
 
 
