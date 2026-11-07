@@ -103,7 +103,7 @@ resolve() {
 # --codex-home, below), and shell, session, service and git startup files, all of
 # which run or authorize code outside.
 protected=()
-for path in .ssh .gnupg .config/gh .sentryclirc .config/babysit-pr .local/state/babysit-pr .local/bin \
+for path in .ssh .gnupg .config/gh .sentryclirc .config/matrix-commander .config/babysit-pr .local/state/babysit-pr .local/bin \
   .local/share/babysit-pr \
   .local/share/uv .local/share/claude .nvm .npm-global .docker .config/herdr .claude .codex \
   .cache/babysit-sandbox .bashrc .bashrc.d .bash_aliases .bash_profile .bash_login \
@@ -456,9 +456,10 @@ for path in alternatives ca-certificates crypto-policies gai.conf gitconfig grou
 done
 
 # Toolchains and credentials, read-only. gh holds the only GitHub credential;
-# ~/.sentryclirc holds sentry-cli's auth token.
+# ~/.sentryclirc holds sentry-cli's auth token; ~/.config/matrix-commander holds the
+# Matrix token matrix-send posts with (its store goes in the sandbox cache).
 for path in .local/bin .local/share/uv .local/share/claude .nvm .npm-global .gitconfig \
-  .config/git .config/gh .sentryclirc; do
+  .config/git .config/gh .config/matrix-commander .sentryclirc; do
   argv+=(--ro-bind-try "$home/$path" "$home/$path")
 done
 # Files attached in the dashboard, which copies them here for a worker's agents to read
