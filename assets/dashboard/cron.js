@@ -574,7 +574,9 @@
           hints: () => ({
             ...(document.getElementById("cron-unsandboxed")?.checked ? { unsandboxed: "1" } : {}),
             // Other clones are this machine's, so Auto keeps the job here.
-            ...(document.querySelector("#cron-other-clones input:checked") ? { also: "1" } : {}),
+            ...(document.querySelector("#cron-other-clones input:checked:enabled")
+              ? { also: "1" }
+              : {}),
           }),
           remote: (label) =>
             `The job runs on ${label}, in its own clone of the repository, always in its sandbox.`,

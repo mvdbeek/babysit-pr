@@ -1,11 +1,14 @@
 """Agent cron jobs against temporary clones, fake herdr and fake agents."""
 
 import json
+import re
 import time
+from pathlib import Path
 
 import cron_agents
 import cron_jobs
 import pytest
+import sandbox
 import workspace_exit
 import wt
 from cron_jobs import CronJobs
@@ -236,9 +239,30 @@ def test_a_job_whose_other_clone_has_gone_does_not_start(setup):
     (other / ".git").rename(other / "moved")
     jobs.run_now(saved["id"])
     run = settle(jobs, saved["id"])
-    assert run["status"] == "error" and "no longer a clone" in run["message"], run
+    assert run["status"] == "error" and "not a clone with its own .git" in run["message"], run
     assert herdr_state(state).get("runs", []) == []
     assert herdr_state(state)["workspaces"] == []
+
+
+def test_a_clone_whose_git_directory_is_a_link_is_refused_when_saving(setup):
+    jobs, manager, git, _ = setup
+    other = other_clone(manager, git)
+    (other / ".git").rename(other / "real-git")
+    (other / ".git").symlink_to(other / "real-git")
+    with pytest.raises(ValueError, match="not a clone with its own .git"):
+        jobs.save(request(manager, other_clones=[str(other)]))
+
+
+def test_bwrap_gets_the_other_clones_in_their_own_staged_file(setup, monkeypatch):
+    jobs, manager, git, state = setup
+    other = other_clone(manager, git)
+    saved = jobs.save(request(manager, other_clones=[str(other)]))
+    monkeypatch.setattr(sandbox, "DEFAULT", "bwrap")
+    jobs.run_now(saved["id"])
+    settle(jobs, saved["id"])
+    [(_, command)] = herdr_state(state)["runs"]
+    [listed] = re.findall(r'"--add-dirs=\$\(cat ([^)]+)\)"', command)
+    assert Path(listed.strip("'")).read_text() == f"{other}/.git"
 
 
 @pytest.mark.parametrize(

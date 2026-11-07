@@ -134,32 +134,36 @@ def other_clones(request, clone, listed):
             raise ValueError("The job's own clone is not another clone")
         if path not in listed:
             raise ValueError(f"{path} is not a local clone")
-        if ":" in path:
-            # Safehouse splits its directory lists on colons.
-            raise ValueError(f"{path} contains ':', which Safehouse cannot grant")
+        # The run checks it again: saving and running refuse the same clones.
+        own_git_dir(path)
     if others and request.get("unsandboxed") is True:
         raise ValueError("Outside Safehouse the job can already write every clone; choose one")
     return others
 
 
+def own_git_dir(clone):
+    """A clone's own ``.git`` directory, from the layout rather than from anything git's
+    configuration (which agents write) says.
+
+    Clones are saved by their real path, so one reached through a link since then, or
+    whose ``.git`` is a link or a file, is refused rather than grant another directory.
+    """
+    git_dir = Path(clone) / ".git"
+    if Path(clone).resolve() != Path(clone) or git_dir.is_symlink() or not git_dir.is_dir():
+        raise ValueError(f"{clone} is not a clone with its own .git directory")
+    if ":" in str(git_dir):
+        # Safehouse splits its directory lists on colons.
+        raise ValueError(f"{git_dir} contains ':', which Safehouse cannot grant")
+    return str(git_dir)
+
+
 def other_git_dirs(job):
     """The git directories of the job's other clones, as they are now.
 
-    Each is a main clone's own ``.git`` directory, found from the layout rather than from
-    anything git's configuration (which agents write) says. A clone that has gone, or
-    whose ``.git`` is no longer a directory, fails the run rather than start the agent
-    without the grant its prompt relies on.
+    A clone that has gone, or changed, fails the run rather than start the agent without
+    the grant its prompt relies on.
     """
-    dirs = []
-    for clone in job.get("other_clones") or ():
-        git_dir = Path(clone) / ".git"
-        if git_dir.is_symlink() or not git_dir.is_dir():
-            raise ValueError(f"{clone} is no longer a clone with its own .git directory")
-        resolved = str(git_dir.resolve())
-        if ":" in resolved:
-            raise ValueError(f"{resolved} contains ':', which Safehouse cannot grant")
-        dirs.append(resolved)
-    return dirs
+    return [own_git_dir(clone) for clone in job.get("other_clones") or ()]
 
 
 def validate_settings(request, home, machine=None):
@@ -498,7 +502,8 @@ def started(job, run_id, home, src, machine):
         staged = stage(home, run_id, brief)
 
         def staging(text):
-            # The prompt was staged above, as the brief; the grant list gets its own file.
+            # agent_command stages exactly job["prompt"], which was staged above as the
+            # brief; anything else (the grant list) gets its own file.
             return str(staged) if text == job["prompt"] else str(stage(home, run_id, text))
 
         command = wt.agent_command(

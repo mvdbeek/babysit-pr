@@ -1217,12 +1217,16 @@ grants it the git directory (`<clone>/.git`) of every chosen clone, up to 8, by
 extending `SAFEHOUSE_ADD_DIRS` through a staged file as `wt --with` does. That is
 enough to fetch and add worktrees there, because the worktrees themselves go under
 `~/src/worktrees`, which `safe.env` already makes writable; the clones' working trees
-stay read-only. The grant includes each clone's `hooks/` and `config`, which run
-outside the sandbox the next time you use git there. A chosen clone whose `.git` is no
-longer a directory fails the run before anything is opened. The list is refused for jobs
+stay read-only. `wt -r <owner>/<name>` looks for the clone at `~/src/<name>`, so choose
+clones whose folder is named after their repository. The grant includes each clone's
+`hooks/` and `config`, which run outside the sandbox the next time you use git there;
+an agent could also point a clone's remotes elsewhere, which changes the repository
+the dashboard lists it under. A chosen clone whose `.git` is not a real directory is
+refused when saving, and fails a run before anything is opened. The list is refused for jobs
 outside Safehouse, which can already write every clone, and for jobs on workers; it
-keeps Auto placement on this machine. Each run records the clones it was granted. A
-session you resume or answer from the dashboard is started without these grants.
+keeps Auto placement on this machine. Each run records the clones it was set to
+grant. A session you resume or answer from the dashboard, or an agent restarted for
+Docker, is started without these grants.
 
 Commands run as you, through your login shell (`$SHELL -lc`, so your usual `PATH`
 applies even under launchd), with stdin closed and `BABYSIT_CRON_JOB` and
