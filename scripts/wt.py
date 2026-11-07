@@ -791,9 +791,7 @@ def agent_command(
             backend=backend,
         )
     if (also or grant_dirs) and len(command.encode()) > TYPED_LIMIT:
-        raise ValueError(
-            "The agent command is too long to type; use fewer --with clones or granted directories"
-        )
+        raise ValueError("The agent command is too long to type; use fewer --with clones")
     sandbox.typed(command)  # The staged paths and account prefix as well.
     if directory and agent == "claude":
         claude_accounts.trust(claude_config_dir or claude_accounts.current_home(), directory)
