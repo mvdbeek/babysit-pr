@@ -163,6 +163,13 @@ ssh babysit@<box> "bash -s -- --user-step --sha $(git rev-parse HEAD)" \
   < scripts/provision_worker.sh
 ```
 
+After the first deploy, `make deploy` in the controller's live checkout does the
+routine update in one step. It pulls `main`, has the dashboard restart the watcher
+and then itself, and asks the new dashboard to rerun this step on every enabled
+worker at the same commit (`scripts/deploy.py`). It refuses while a cron job is
+running, because the restart would interrupt it; `make deploy DEPLOY_ARGS=--force`
+overrides that.
+
 If the babysit-pr repository is private, run `gh auth login` and `gh auth setup-git`
 as `babysit` first (or pass `--repo` with a URL the box can read).
 
