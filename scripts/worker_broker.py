@@ -38,15 +38,16 @@ One request is forwarded at a time, at most one of each action per MIN_INTERVAL
 seconds, so one sandbox cannot use up its worker's requests at the controller. A
 launch's answer waits for the task to start, a few minutes at most.
 
-For a Claude launch it also tells the pane's herdr which session the sandbox runs, as
-herdr's own Claude hook would: inside the sandbox that hook cannot reach herdr, and in
-its own PID namespace Claude records its session under the PID it sees there
+It also tells the pane's herdr which session the sandbox runs, as herdr's own hooks
+would: inside the sandbox they cannot reach herdr. Without it, herdr lists the agent
+with no session, and the dashboard cannot tell that the agent runs the transcript it
+shows. In its own PID namespace Claude records its session under the PID it sees there
 (``sessions/2.json``, in every sandbox alike), which herdr, looking up the host's PID,
 never finds. babysit-bwrap binds ``sessions`` beside LISTEN over CONFIG_DIR's, so each
-launch's records are its own, and this process reads them there. Without it,
-herdr lists the agent with no session, and the dashboard cannot tell that the agent runs
-the transcript it shows. Only a session whose transcript lies in CONFIG_DIR's store is
-reported, the same check a registration passes.
+launch's records are its own, and this process reads them there. Codex records none:
+its session is the rollout its process holds open for writing, read from ``/proc``.
+Only a session whose transcript lies in CONFIG_DIR's store is reported, the same check
+a registration passes.
 
 Prints ``ready`` once LISTEN accepts connections, then runs until its parent exits
 (babysit-bwrap execs bwrap, so that is the sandbox), and removes LISTEN and its
@@ -56,6 +57,7 @@ directory.
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -79,9 +81,11 @@ CONNECTIONS = 4
 _forwarding = threading.Lock()
 _last = {"register": 0.0, "handoff": 0.0, "launch": 0.0}
 _slots = threading.BoundedSemaphore(CONNECTIONS)
-SESSION_POLL = 2  # Seconds between looks at the session the sandbox's Claude runs.
-SESSION_DEPTH = 4  # bwrap, its init in the namespace, then Claude: two levels down.
+SESSION_POLL = 2  # Seconds between looks at the session the sandbox's agent runs.
+SESSION_DEPTH = 4  # bwrap, its init in the namespace, then the agent: two levels down.
 MAX_RECORD = 65536
+MAX_META = 1 << 20  # Codex's session_meta line carries its instructions.
+ROLLOUT = re.compile(r"rollout-.+-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl")
 HERDR_TIMEOUT = 10
 MAX_BACKOFF = 60  # Seconds between reports herdr keeps refusing.
 
@@ -263,7 +267,7 @@ def _record(store, pid):
     return record if isinstance(record, dict) else None
 
 
-def running_session(parent, config_dir, store, proc=Path("/proc")):
+def running_claude_session(parent, config_dir, store, proc=Path("/proc")):
     """The Claude session the sandbox under ``parent`` runs, as (ID, transcript), or None.
 
     Claude records it in ``store`` (``sessions`` of its configuration directory in the
@@ -293,17 +297,106 @@ def running_session(parent, config_dir, store, proc=Path("/proc")):
     return None
 
 
-def tell_herdr(pane, session, path):
-    """Report the session to herdr as its Claude hook does; whether herdr took it."""
+def _name(proc, pid):
+    try:
+        status = (proc / str(pid) / "status").read_text()
+    except OSError:
+        return ""
+    lines = [line.split() for line in status.splitlines()]
+    return next((line[1] for line in lines if line[:1] == ["Name:"] and len(line) > 1), "")
+
+
+def _writing(proc, pid, fd):
+    """Whether ``pid`` has its descriptor ``fd`` open for writing."""
+    try:
+        info = (proc / str(pid) / "fdinfo" / fd).read_text()
+        flags = next(line.split()[1] for line in info.splitlines() if line.startswith("flags:"))
+        return int(flags, 8) & os.O_ACCMODE != os.O_RDONLY
+    except (OSError, StopIteration, IndexError, ValueError):
+        return False
+
+
+def _rollout_meta(path, held):
+    """The ``session_meta`` a rollout opens with, read only when ``path`` is the regular
+    file ``held`` is, never through a link or from a pipe; else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        status = os.fstat(fd)
+        if not stat_module.S_ISREG(status.st_mode) or not os.path.samestat(status, held):
+            return None
+        try:
+            item = json.loads(handle.readline(MAX_META))
+        except (OSError, ValueError, RecursionError):
+            return None
+    if not isinstance(item, dict) or item.get("type") != "session_meta":
+        return None
+    return item["payload"] if isinstance(item.get("payload"), dict) else None
+
+
+def _held_rollouts(proc, pid, config_dir):
+    """The conversations ``pid`` writes the rollouts of in this launch's store, as
+    {(ID, transcript)}: not a subagent's, nor one Codex runs for itself."""
+    try:
+        fds = list((proc / str(pid) / "fd").iterdir())
+    except OSError:
+        return set()
+    found = set()
+    for fd in fds:
+        try:
+            match = ROLLOUT.fullmatch(os.path.basename(os.readlink(fd)))
+            if match is None or not _writing(proc, pid, fd.name):
+                continue
+            session = match[1]
+            path = transcript("codex", config_dir, session)
+            # The file it has open, whatever name the sandbox gives it now.
+            meta = _rollout_meta(path, os.stat(fd))
+        except (OSError, ValueError):
+            continue
+        if meta is None or meta.get("id") != session:
+            continue
+        source = meta.get("source")
+        if not (isinstance(source, dict) and source.keys() & {"subagent", "internal"}):
+            found.add((session, path))
+    return found
+
+
+def running_codex_session(parent, config_dir, proc=Path("/proc")):
+    """The Codex session the sandbox under ``parent`` runs, as (ID, transcript), or None.
+
+    Codex keeps the rollout of the conversation it runs open for appending, in the
+    ``sessions`` of its home, from its first write until it moves to another. Only the
+    outermost Codex is the launch's own, not one it runs; a rollout outside this
+    launch's store is not reported, nor are two at once.
+    """
+    level = _children(proc, parent)
+    for _ in range(SESSION_DEPTH):
+        below = []
+        for pid in level:
+            held = _held_rollouts(proc, pid, config_dir)
+            if held:
+                return held.pop() if len(held) == 1 else None
+            # npm's codex runs the native one, which is named codex. One with nothing
+            # written yet: what it runs is not the launch's.
+            if _name(proc, pid) != "codex":
+                below += _children(proc, pid)
+        level = below
+    return None
+
+
+def tell_herdr(agent, pane, session, path):
+    """Report the session to herdr as its hook for ``agent`` does; whether herdr took it."""
     # herdr takes a session report only from the source that holds the pane, and its
-    # Claude detection holds it as herdr:claude. Only the session is reported, as that
-    # hook does, so herdr still reads the agent's state from its screen.
+    # detection holds it as herdr:<agent>. Only the session is reported, as the hooks
+    # do, so herdr still reads the agent's state from its screen.
     command = [
         os.environ.get("HERDR_BIN_PATH") or "herdr",
         "pane",
         "report-agent-session",
-        "--source=herdr:claude",
-        "--agent=claude",
+        f"--source=herdr:{agent}",
+        f"--agent={agent}",
         f"--seq={time.time_ns()}",
         f"--agent-session-id={session}",
         f"--agent-session-path={path}",
@@ -323,10 +416,10 @@ def tell_herdr(pane, session, path):
     return done.returncode == 0
 
 
-def report_sessions(parent, config_dir, store, proc=Path("/proc"), running=None):
-    """Tell herdr the sandbox's Claude session, and again whenever it changes (a /clear,
-    a /resume), while ``running()``: by default, until the sandbox exits. Outside a herdr
-    pane there is no one to tell; a refusal is tried again less and less often."""
+def report_sessions(agent, parent, config_dir, store, proc=Path("/proc"), running=None):
+    """Tell herdr the sandbox's session, and again whenever it changes (a /clear, a
+    /resume, a /new), while ``running()``: by default, until the sandbox exits. Outside a
+    herdr pane there is no one to tell; a refusal is tried again less and less often."""
     pane = os.environ.get("HERDR_PANE_ID")
     if os.environ.get("HERDR_ENV") != "1" or not pane:
         return
@@ -335,9 +428,13 @@ def report_sessions(parent, config_dir, store, proc=Path("/proc"), running=None)
     refusals = 0
     while running():
         try:
-            found = running_session(parent, config_dir, store, proc)
+            found = (
+                running_claude_session(parent, config_dir, store, proc)
+                if agent == "claude"
+                else running_codex_session(parent, config_dir, proc)
+            )
             if found and found != told:
-                if tell_herdr(pane, *found):
+                if tell_herdr(agent, pane, *found):
                     told, refusals = found, 0
                 else:
                     refusals += 1
@@ -377,10 +474,9 @@ def main(argv):
         server.settimeout(1)
         print("ready", flush=True)
         os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
-        if agent == "claude":
-            threading.Thread(
-                target=report_sessions, args=(parent, config_dir, store), daemon=True
-            ).start()
+        threading.Thread(
+            target=report_sessions, args=(agent, parent, config_dir, store), daemon=True
+        ).start()
         while os.getppid() == parent:
             try:
                 client, _ = server.accept()
