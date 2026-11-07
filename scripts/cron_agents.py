@@ -10,7 +10,10 @@ accounts) apply. A job marked ``unsandboxed`` types ``command claude``/``command
 instead, which skips the Safehouse wrapper so the agent can write anywhere, for example
 to other clones when it makes worktrees with ``wt``. Agents those launch are typed into
 panes the multiplexer's server starts, with fresh shells and the usual wrappers, so they
-are still in Safehouse; nothing marks the environment as unsandboxed. The brief asks the
+are still in Safehouse; nothing marks the environment as unsandboxed. A job inside
+Safehouse can instead name ``other_clones``: each one's git directory is granted to its
+agent, so ``wt`` and ``wtpr`` can fetch and add worktrees there (the worktrees themselves
+land under ``~/src/worktrees``, which the sandbox already writes). The brief asks the
 agent to end with a marker line once the task is finished, as scheduled launches do;
 ``workspace_exit`` then follows the session and exits the agent once it confirms and
 stays idle. The run keeps the agent's final response and closes its pane. An agent that
@@ -58,6 +61,9 @@ BACKENDS = {"darwin": "safehouse", "linux": "bwrap"}
 FENCE = re.compile(r"`{3,}\w*")
 # The label of a pane split off for an agent, which its shell may be closed by later.
 RUN_PANE_LABEL = "babysit agent"
+# Other clones a job's sandbox may write the git directories of. The grants are staged in
+# a file, so this bounds the list rather than the typed line.
+OTHER_CLONES_LIMIT = 8
 
 
 class Busy(Exception):
@@ -74,11 +80,12 @@ def validate(request, workspaces, home):
     machine = place(request, workspaces, repo)
     if machine is not None:
         return validate_remote(request, machine, repo, home)
+    listed = workspaces.local_repositories(everything=True)["repos"]
     if not isinstance(clone, str) or not any(
-        r["repo"] == repo and r["clone"] == clone
-        for r in workspaces.local_repositories(everything=True)["repos"]
+        r["repo"] == repo and r["clone"] == clone for r in listed
     ):
         raise ValueError(f"Choose a local clone of {repo}")
+    others = other_clones(request, clone, {r["clone"] for r in listed})
     branch = request.get("branch")
     if (
         not isinstance(branch, str)
@@ -110,7 +117,53 @@ def validate(request, workspaces, home):
         "branch": branch,
         "base": base,
         **validate_settings(request, home),
+        "other_clones": others,
     }
+
+
+def other_clones(request, clone, listed):
+    """The local clones, besides the job's own, whose git directories its sandbox writes."""
+    others = request.get("other_clones") or []
+    if not isinstance(others, list) or not all(isinstance(path, str) for path in others):
+        raise ValueError("Expected other_clones to be a list of local clones")
+    others = list(dict.fromkeys(others))
+    if len(others) > OTHER_CLONES_LIMIT:
+        raise ValueError(f"Choose at most {OTHER_CLONES_LIMIT} other clones")
+    for path in others:
+        if path == clone:
+            raise ValueError("The job's own clone is not another clone")
+        if path not in listed:
+            raise ValueError(f"{path} is not a local clone")
+        # The run checks it again: saving and running refuse the same clones.
+        own_git_dir(path)
+    if others and request.get("unsandboxed") is True:
+        raise ValueError("Outside Safehouse the job can already write every clone; choose one")
+    return others
+
+
+def own_git_dir(clone):
+    """A clone's own ``.git`` directory, from the layout rather than from anything git's
+    configuration (which agents write) says.
+
+    Clones are saved by their real path, so one reached through a link since then, or
+    whose ``.git`` is a link or a file, is refused rather than grant another directory.
+    """
+    git_dir = Path(clone) / ".git"
+    if Path(clone).resolve() != Path(clone) or git_dir.is_symlink() or not git_dir.is_dir():
+        raise ValueError(f"{clone} is not a clone with its own .git directory")
+    if ":" in str(git_dir):
+        # Safehouse splits its directory lists on colons.
+        raise ValueError(f"{git_dir} contains ':', which Safehouse cannot grant")
+    return str(git_dir)
+
+
+def other_git_dirs(job):
+    """The git directories of the job's other clones, as they are now.
+
+    A clone that has gone, or changed, fails the run rather than start the agent without
+    the grant its prompt relies on.
+    """
+    return [own_git_dir(clone) for clone in job.get("other_clones") or ()]
 
 
 def validate_settings(request, home, machine=None):
@@ -174,6 +227,8 @@ def place(request, workspaces, repo):
         "claude_account": request.get("claude_account") or None,
         "docker": request.get("docker") is True,
         "sandboxed": not unsandboxed,
+        # Clones beside it are this machine's, so Auto keeps the job here.
+        "also": request.get("other_clones") or [],
     }
     # Here a job works in a local clone, as a new task does.
     machine_id = workspaces.place({"machine": choice}, fields, {placement.LOCAL: 1})
@@ -189,6 +244,8 @@ def validate_remote(request, machine, repo, home):
     """
     if request.get("unsandboxed", False) is not False:
         raise ValueError(f"Jobs on worker machines always run in their sandbox ({machine.label})")
+    if request.get("other_clones"):
+        raise ValueError(f"Jobs on worker machines cannot write other clones ({machine.label})")
     branch = request.get("branch")
     if not isinstance(branch, str) or not BRANCH_NAME.fullmatch(branch) or ".." in branch:
         raise ValueError("Name the job's branch: letters, digits, '.', '_' and '-'")
@@ -205,6 +262,7 @@ def validate_remote(request, machine, repo, home):
         "branch": branch,
         "base": base,
         **validate_settings(request, home, machine),
+        "other_clones": [],
     }
 
 
@@ -385,6 +443,8 @@ def start(job, run_id, home, src):
 def started(job, run_id, home, src, machine):
     found = None
     if machine is None:
+        # Before anything is made or opened for a run that cannot have its grants.
+        grants = other_git_dirs(job)
         path = checkout(job, src)
         clone = job["clone"]
     else:
@@ -440,18 +500,25 @@ def started(job, run_id, home, src, machine):
     if machine is None:
         config = claude_accounts.validate(job["agent"], job["claude_account"] or None)
         staged = stage(home, run_id, brief)
+
+        def staging(text):
+            # agent_command stages exactly job["prompt"], which was staged above as the
+            # brief; anything else (the grant list) gets its own file.
+            return str(staged) if text == job["prompt"] else str(stage(home, run_id, text))
+
         command = wt.agent_command(
             job["agent"],
             job["prompt"],
             job["model"],
             effort,
-            stage=lambda _: str(staged),
+            stage=staging,
             docker=job["docker"],
             claude_config_dir=str(config) if config else None,
             claude_subscription=bool(job["claude_account"]),
             # Jobs saved before the option existed lack it.
             unsandboxed=job.get("unsandboxed", False),
             directory=str(path),
+            grant_dirs=grants,
         )
     else:
         staged = machines.put_file(

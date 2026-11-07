@@ -692,6 +692,7 @@ def agent_command(
     launcher: str | None = None,
     confined: Sequence[str] | None = None,
     permission_mode: str | None = None,
+    grant_dirs: Sequence[str] = (),
 ) -> str:
     """The shell line that starts the agent, optionally with an initial prompt.
 
@@ -727,6 +728,8 @@ def agent_command(
     file like the prompt. Each checkout is also an ``--add-dir`` for the agent itself,
     which a Docker restart reads back to keep the grants. ``stage`` is called once for
     the grants and once for the prompt, so it must return a new path each time.
+    ``grant_dirs`` are further writable directories, granted the same way but without
+    an ``--add-dir`` (a cron job's other clones' git directories).
 
     ``directory`` is the checkout the line will be typed in. Claude is told to trust it,
     in the configuration that Claude reads, so its folder trust dialog cannot hold up a
@@ -754,6 +757,11 @@ def agent_command(
     if any(":" in path for path in grants):
         # Safehouse splits its directory lists on colons.
         raise ValueError("A --with checkout path contains ':'")
+    if any(":" in path for path in grant_dirs):
+        raise ValueError("A granted directory contains ':'")
+    if grant_dirs and unsandboxed:
+        raise ValueError("Directory grants only apply inside the sandbox")
+    grants += grant_dirs
     added = [word for checkout in also for word in ("--add-dir", checkout.path)]
     extra = [*added, *extra]
     command = sandbox.typed_line(
@@ -782,7 +790,7 @@ def agent_command(
             config_env=claude_config_env,
             backend=backend,
         )
-    if also and len(command.encode()) > TYPED_LIMIT:
+    if (also or grant_dirs) and len(command.encode()) > TYPED_LIMIT:
         raise ValueError("The agent command is too long to type; use fewer --with clones")
     sandbox.typed(command)  # The staged paths and account prefix as well.
     if directory and agent == "claude":

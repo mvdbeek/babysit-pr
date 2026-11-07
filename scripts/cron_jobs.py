@@ -55,6 +55,7 @@ AGENT_KEYS = {
     "claude_account",
     "docker",
     "unsandboxed",
+    "other_clones",
     "prompt",
 }
 # A run in one of these is flagged until the user dismisses it; the latest raises an alert.
@@ -654,6 +655,7 @@ class CronJobs:
             agent=job["agent"],
             claude_account=job["claude_account"],
             unsandboxed=job.get("unsandboxed", False),
+            other_clones=job.get("other_clones", []),
             prompt=job["prompt"],
             timeout=job["timeout"],
         )

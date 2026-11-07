@@ -1,14 +1,18 @@
 """Agent cron jobs against temporary clones, fake herdr and fake agents."""
 
 import json
+import re
 import time
+from pathlib import Path
 
 import cron_agents
 import cron_jobs
 import pytest
+import sandbox
 import workspace_exit
 import wt
 from cron_jobs import CronJobs
+from test_new_tasks import other_clone
 from test_pr_workspaces import local  # noqa: F401 (fixture)
 
 
@@ -206,6 +210,93 @@ def test_a_job_saved_before_the_option_existed_stays_in_safehouse(setup):
     [(_, command)] = herdr_state(state)["runs"]
     assert command.startswith("claude ")
     assert "command" not in command and "dangerously" not in command
+
+
+def test_a_job_may_write_other_clones_git_directories_inside_safehouse(setup, monkeypatch):
+    jobs, manager, git, state = setup
+    other = other_clone(manager, git)
+    monkeypatch.setenv("SAFEHOUSE_ADD_DIRS", "/granted")
+    saved = jobs.save(request(manager, agent="claude", other_clones=[str(other), str(other)]))
+    assert saved["other_clones"] == [str(other)]
+    jobs.run_now(saved["id"])
+    run = settle(jobs, saved["id"])
+    assert run["status"] == "running", run
+    assert run["other_clones"] == [str(other)]
+    [(_, command)] = herdr_state(state)["runs"]
+    # Still through the shell's wrapper, with the grant list staged in its own file.
+    assert command.startswith("SAFEHOUSE_ADD_DIRS=${SAFEHOUSE_ADD_DIRS:+$SAFEHOUSE_ADD_DIRS:}")
+    assert "command claude" not in command and "--add-dir" not in command
+    [agent] = herdr_state(state)["agents"]
+    # Only the other clone's git directory: never its working tree.
+    assert agent["safehouse_add_dirs"] == f"/granted:{other}/.git"
+    assert agent["task"].startswith("Triage new issues\n")
+
+
+def test_a_job_whose_other_clone_has_gone_does_not_start(setup):
+    jobs, manager, git, state = setup
+    other = other_clone(manager, git)
+    saved = jobs.save(request(manager, other_clones=[str(other)]))
+    (other / ".git").rename(other / "moved")
+    jobs.run_now(saved["id"])
+    run = settle(jobs, saved["id"])
+    assert run["status"] == "error" and "not a clone with its own .git" in run["message"], run
+    assert herdr_state(state).get("runs", []) == []
+    assert herdr_state(state)["workspaces"] == []
+
+
+def test_a_clone_whose_git_directory_is_a_link_is_refused_when_saving(setup):
+    jobs, manager, git, _ = setup
+    other = other_clone(manager, git)
+    (other / ".git").rename(other / "real-git")
+    (other / ".git").symlink_to(other / "real-git")
+    with pytest.raises(ValueError, match="not a clone with its own .git"):
+        jobs.save(request(manager, other_clones=[str(other)]))
+
+
+def test_bwrap_gets_the_other_clones_in_their_own_staged_file(setup, monkeypatch):
+    jobs, manager, git, state = setup
+    other = other_clone(manager, git)
+    saved = jobs.save(request(manager, other_clones=[str(other)]))
+    monkeypatch.setattr(sandbox, "DEFAULT", "bwrap")
+    jobs.run_now(saved["id"])
+    settle(jobs, saved["id"])
+    [(_, command)] = herdr_state(state)["runs"]
+    [listed] = re.findall(r'"--add-dirs=\$\(cat ([^)]+)\)"', command)
+    assert Path(listed.strip("'")).read_text() == f"{other}/.git"
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"other_clones": "x"}, "list of local clones"),
+        ({"other_clones": [1]}, "list of local clones"),
+        ({"other_clones": ["/elsewhere"]}, "not a local clone"),
+        ({"other_clones": ["OWN"]}, "own clone"),
+        ({"other_clones": ["OTHER"], "unsandboxed": True}, "already write every clone"),
+    ],
+)
+def test_invalid_other_clones_are_refused(setup, changes, message):
+    jobs, manager, git, _ = setup
+    other = str(other_clone(manager, git))
+    own = request(manager)["clone"]
+    changes["other_clones"] = (
+        [
+            {"OWN": own, "OTHER": other}.get(c, c) if isinstance(c, str) else c
+            for c in changes["other_clones"]
+        ]
+        if isinstance(changes["other_clones"], list)
+        else changes["other_clones"]
+    )
+    with pytest.raises(ValueError, match=message):
+        jobs.save(request(manager, **changes))
+
+
+def test_too_many_other_clones_are_refused(setup, monkeypatch):
+    jobs, manager, git, _ = setup
+    monkeypatch.setattr(cron_agents, "OTHER_CLONES_LIMIT", 1)
+    others = [str(other_clone(manager, git, name)) for name in ("one", "two")]
+    with pytest.raises(ValueError, match="at most 1 other clones"):
+        jobs.save(request(manager, other_clones=others))
 
 
 def test_a_claude_job_trusts_its_checkout_in_its_account_before_starting(setup, monkeypatch):
