@@ -114,6 +114,8 @@
       job.claude_account && `Claude account: ${job.claude_account}`,
       job.docker && "Docker",
       job.unsandboxed && "Outside Safehouse",
+      job.other_clones?.length &&
+        `Writes ${job.other_clones.length} other clone${job.other_clones.length === 1 ? "" : "s"}`,
       job.machine && `On ${job.machine_label || job.machine}`,
     ]
       .filter(Boolean)
@@ -569,8 +571,11 @@
         tools.fields({
           kind: "cron",
           // Read by id: the checkbox is made after these fields.
-          hints: () =>
-            document.getElementById("cron-unsandboxed")?.checked ? { unsandboxed: "1" } : {},
+          hints: () => ({
+            ...(document.getElementById("cron-unsandboxed")?.checked ? { unsandboxed: "1" } : {}),
+            // Other clones are this machine's, so Auto keeps the job here.
+            ...(document.querySelector("#cron-other-clones input:checked") ? { also: "1" } : {}),
+          }),
           remote: (label) =>
             `The job runs on ${label}, in its own clone of the repository, always in its sandbox.`,
         }),
@@ -656,6 +661,62 @@
     unsandboxed.addEventListener("change", syncSandbox);
     unsandboxed.addEventListener("change", () => fields.refreshPlacement());
     machine.addEventListener("change", syncSandbox);
+    // Clones whose git directories the job's sandbox may write, so that wt and wtpr can
+    // add worktrees there; Safehouse otherwise grants only the job's own repository.
+    const others = new Set(job?.other_clones ?? []);
+    const othersBox = node("details", undefined, "new-task-also");
+    othersBox.id = "cron-other-clones";
+    const othersSummary = node("summary");
+    const othersList = node("div", undefined, "new-task-also-list");
+    const OTHERS_LIMIT = 8;
+    const othersText = () =>
+      `Other clones it may add worktrees to${others.size ? ` (${others.size})` : " (optional)"}`;
+    const limitOthers = () => {
+      for (const box of othersList.querySelectorAll("input[type=checkbox]"))
+        box.disabled =
+          unsandboxed.checked || onWorker() || (!box.checked && others.size >= OTHERS_LIMIT);
+      othersSummary.textContent = othersText();
+    };
+    const fillOthers = () => {
+      const own = repos[Number(repo.value)]?.clone;
+      others.delete(own);
+      const clones = new Map();
+      for (const choice of repos)
+        if (choice.clone !== own && !choice.missing && !clones.has(choice.clone))
+          clones.set(choice.clone, choice.repo);
+      // A saved clone that is no longer listed stays, so saving shows why it is refused.
+      for (const clone of others) if (!clones.has(clone)) clones.set(clone, "not found");
+      othersList.replaceChildren(
+        ...[...clones].map(([clone, slug]) => {
+          const box = node("input");
+          box.type = "checkbox";
+          box.value = clone;
+          box.checked = others.has(clone);
+          box.onchange = () => {
+            if (box.checked) others.add(clone);
+            else others.delete(clone);
+            limitOthers();
+            fields.refreshPlacement();
+          };
+          const label = node("label", undefined, "workspace-later");
+          label.append(box, ` ${slug} · ${clone}`);
+          return label;
+        }),
+      );
+      if (!clones.size) othersList.append(node("small", "No other local clones are listed."));
+      limitOthers();
+    };
+    othersBox.append(
+      othersSummary,
+      node(
+        "small",
+        `The job’s agent stays in Safehouse but may write each chosen clone’s git directory (up to ${OTHERS_LIMIT}), so wt and wtpr can fetch and add worktrees there. That includes its hooks and config, which run outside the sandbox when you next use git there.`,
+      ),
+      othersList,
+    );
+    repo.addEventListener("change", fillOthers);
+    unsandboxed.addEventListener("change", limitOthers);
+    machine.addEventListener("change", limitOthers);
     // A saved setting the current choices lack (an uncached model, a removed account)
     // stays selected, so editing something else does not quietly drop it.
     const keep = (select, value) => {
@@ -683,6 +744,7 @@
       keep(machine, job.machine || "local");
     }
     syncSandbox();
+    fillOthers();
     const prompt = node("textarea");
     prompt.id = "cron-prompt";
     prompt.rows = 6;
@@ -713,6 +775,7 @@
       dockerLabel,
       unsandboxedLabel,
       unsandboxedNote,
+      othersBox,
       machineField,
     );
     field("Prompt", prompt);
@@ -725,7 +788,7 @@
     container.replaceChildren(...parts);
     // The first preview ran before the checkbox was in the page; a saved job outside its
     // sandbox is previewed again with it.
-    if (unsandboxed.checked) fields.refreshPlacement();
+    if (unsandboxed.checked || others.size) fields.refreshPlacement();
     for (const select of [repo, model, effort]) tools.searchable(select);
     agentForm = {
       repos,
@@ -738,6 +801,8 @@
       account,
       docker,
       unsandboxed,
+      others,
+      onWorker,
       prompt,
       machineChoice,
     };
@@ -793,6 +858,8 @@
       claude_account: form.agent.value === "claude" ? form.account.value : "",
       docker: form.docker.checked,
       unsandboxed: form.unsandboxed.checked,
+      // Outside Safehouse, or on a worker, the list has no meaning and is refused.
+      other_clones: form.unsandboxed.checked || form.onWorker() ? [] : [...form.others],
       prompt: form.prompt.value,
       ...form.machineChoice(),
     };

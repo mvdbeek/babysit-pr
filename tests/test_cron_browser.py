@@ -2,6 +2,7 @@
 
 import json
 import shlex
+import subprocess
 import threading
 import time
 
@@ -14,6 +15,7 @@ import workspace_exit
 from cron_jobs import CronJobs
 from playwright.sync_api import expect
 from test_dashboard_browser import choose_option
+from test_new_tasks import other_clone
 from test_pr_workspaces import local  # noqa: F401 (fixture)
 
 pytestmark = pytest.mark.browser
@@ -364,6 +366,55 @@ def test_an_agent_job_can_run_outside_safehouse(page, agent_site, errors, tmp_pa
     expect(outside).to_be_checked()
     expect(docker).to_be_disabled()
     assert page.evaluate("document.documentElement.scrollWidth") <= 390
+
+
+def test_an_agent_job_can_write_other_clones_inside_safehouse(page, agent_site, errors, tmp_path):
+    url, jobs, manager, _ = agent_site
+    other = str(other_clone(manager, manager_git(manager)))
+    page.set_viewport_size({"width": 390, "height": 1000})
+    page.goto(url + "/#cron")
+    page.get_by_role("button", name="New job").click()
+    dialog = page.locator("#cron-dialog")
+    dialog.get_by_label("Name").fill("Review elsewhere")
+    clone = str((manager.src / "repo").resolve())
+    # The newest clone is listed first; the job works in the fixture's own, the second.
+    expect(dialog.locator("#cron-repo option").nth(1)).to_have_text(f"base/repo · {clone}")
+    choose_option(dialog.get_by_role("combobox", name="Repository and local clone"), "1")
+    dialog.get_by_label("Branch", exact=True).fill("nightly")
+    dialog.get_by_label("Agent", exact=True).select_option("claude")
+    others = dialog.locator("#cron-other-clones")
+    others.locator("summary").click()
+    # Only the other clone is offered, never the job's own.
+    box = others.get_by_label(f"base/other · {other}")
+    expect(others.locator("input[type=checkbox]")).to_have_count(1)
+    box.check()
+    expect(others.locator("summary")).to_have_text("Other clones it may add worktrees to (1)")
+    # Outside Safehouse the job writes every clone anyway: the list is locked.
+    outside = dialog.get_by_label("Run outside Safehouse (can write anywhere)")
+    outside.check()
+    expect(box).to_be_disabled()
+    outside.uncheck()
+    expect(box).to_be_enabled()
+    dialog.get_by_label("Prompt").fill("Review PRs in both repositories")
+    page.screenshot(path=str(tmp_path / "other-clones-dialog.png"))
+    dialog.get_by_role("button", name="Save job").click()
+    expect(dialog).to_be_hidden()
+    [saved] = jobs.snapshot()["jobs"]
+    assert (saved["other_clones"], saved["unsandboxed"]) == ([other], False)
+    page.locator(".cron-job").first.click()
+    detail = page.locator("#cron-detail")
+    expect(detail).to_contain_text("Claude · Writes 1 other clone")
+    detail.get_by_role("button", name="Edit").click()
+    dialog.locator("#cron-other-clones summary").click()
+    expect(box).to_be_checked()
+    assert page.evaluate("document.documentElement.scrollWidth") <= 390
+
+
+def manager_git(manager):
+    def git(*args, cwd):
+        return subprocess.check_output(["git", "-C", str(cwd), *args], text=True).strip()
+
+    return git
 
 
 def test_a_job_saved_on_a_hidden_default_login_opens_on_the_same_login(

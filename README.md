@@ -1210,6 +1210,20 @@ Jobs saved before this option existed keep running in Safehouse. A session from 
 job that you resume or answer from the dashboard is started through the wrappers again,
 so it continues inside Safehouse. Each run records whether it ran outside Safehouse.
 
+**Other clones it may add worktrees to** is the narrower choice for a job that only
+needs `wt` or `wtpr` to make checkouts in other repositories, such as a review job
+that starts reviewers in several clones. The agent stays in Safehouse, and each run
+grants it the git directory (`<clone>/.git`) of every chosen clone, up to 8, by
+extending `SAFEHOUSE_ADD_DIRS` through a staged file as `wt --with` does. That is
+enough to fetch and add worktrees there, because the worktrees themselves go under
+`~/src/worktrees`, which `safe.env` already makes writable; the clones' working trees
+stay read-only. The grant includes each clone's `hooks/` and `config`, which run
+outside the sandbox the next time you use git there. A chosen clone whose `.git` is no
+longer a directory fails the run before anything is opened. The list is refused for jobs
+outside Safehouse, which can already write every clone, and for jobs on workers; it
+keeps Auto placement on this machine. Each run records the clones it was granted. A
+session you resume or answer from the dashboard is started without these grants.
+
 Commands run as you, through your login shell (`$SHELL -lc`, so your usual `PATH`
 applies even under launchd), with stdin closed and `BABYSIT_CRON_JOB` and
 `BABYSIT_CRON_RUN` set. Stdout and stderr are kept together per run, up to 512 KiB;
