@@ -268,6 +268,18 @@ for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   fi
   grant "$real"
 done
+# Agents are told to leave what they make for the user in ~/src/agent-artefacts/outbox,
+# and the worker's artefact-url links to it. In the empty home that would die with the
+# sandbox and never reach the share, so it leads to the persistent artifacts instead,
+# which the controller pulls. A grant of that directory wins: it is the real one.
+outbox=$home/src/agent-artefacts/outbox
+outbox_granted=0
+for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
+  [[ $real != "$outbox" && $outbox != "$real"/* && $real != "$outbox"/* ]] || outbox_granted=1
+done
+if ((!outbox_granted)); then
+  argv+=(--symlink "$cache/artifacts" "$outbox")
+fi
 # Codex's trust dialog persists its answer in config.toml, which is deliberately
 # read-only below. The caller already selected and granted this checkout: trust only
 # that exact working directory for this invocation. Codex checks its cwd before the
