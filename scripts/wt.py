@@ -201,7 +201,8 @@ the exact request for authenticated approval; the request alone starts nothing.
 Auto pins the parent worker; --machine may select another eligible Linux worker that
 already has the commit. Host re-login does not change this sandbox's isolated HOME.
 On Linux, save reports under $BABYSIT_ARTIFACT_DIR (the persistent sandbox cache's
-artifacts directory), or an explicitly granted worktree; other HOME paths are temporary.
+artifacts directory; ~/src/agent-artefacts/outbox links to it), or an explicitly
+granted worktree; other HOME paths are temporary.
 
 dashboard options (a new branch from the remote default branch unless <base> is given):
   wt --name <branch> [--repo-path <clone>] [--worktree-root <dir>] [--label <label>]

@@ -1118,7 +1118,7 @@ provider/account; the asking worker gains no credentials. Ordinary subtasks keep
 their existing restrictions. Host re-login does not alter an existing sandbox. See
 [the sandbox guidance](references/supervisor.md#sub-tasks-from-a-sandbox). On Linux,
 save reports in `$BABYSIT_ARTIFACT_DIR` for persistence on the worker host;
-`~/src/agent-artefacts/outbox` is temporary unless explicitly granted.
+`~/src/agent-artefacts/outbox` is a link to it.
 
 Warnings and errors are prefixed `wt:`, `wti:` or `wtpr:`. `tests/test_wt.py` covers
 the planning code without processes and the whole tool against temporary

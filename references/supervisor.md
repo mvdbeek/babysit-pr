@@ -441,8 +441,9 @@ printf '%s\n' 'Review findings for COMMIT' > "$BABYSIT_ARTIFACT_DIR/review.txt"
 printf '%s\n' "$BABYSIT_ARTIFACT_DIR/review.txt"
 ```
 
-The printed absolute path also names the file on the worker host. Other home paths,
-including `~/src/agent-artefacts/outbox`, are temporary unless explicitly granted.
+The printed absolute path also names the file on the worker host. In the sandbox,
+`~/src/agent-artefacts/outbox` is a link to `$BABYSIT_ARTIFACT_DIR`, unless that
+directory is explicitly granted. Other home paths are temporary.
 The artifact directory inherits the cache's agent configuration and grant separation:
 another account or a launch with different grants cannot use it as a shared inbox.
 Keep secrets out of reports and transcripts; hand another reviewer the repository's

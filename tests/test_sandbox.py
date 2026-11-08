@@ -1589,18 +1589,44 @@ def test_artifacts_persist_in_the_configuration_cache_not_the_temporary_home(cro
         f"--codex-home={codex}",
         "sh",
         "-c",
-        'mkdir -p "$HOME/src/agent-artefacts/outbox" && '
-        'echo ephemeral > "$HOME/src/agent-artefacts/outbox/review.txt" && '
+        'mkdir -p "$HOME/src/agent-artefacts/outbox/task" && '
+        'echo outbox > "$HOME/src/agent-artefacts/outbox/task/review.txt" && '
+        'echo ephemeral > "$HOME/ephemeral.txt" && '
         'echo persistent > "$BABYSIT_ARTIFACT_DIR/review.txt"',
         BABYSIT_ARTIFACT_DIR="/wrong",
         options=["--env-pass=BABYSIT_ARTIFACT_DIR"],
     )
     assert result.returncode == 0, result.stderr
-    assert not (home / "src/agent-artefacts/outbox/review.txt").exists()
+    assert not (home / "src/agent-artefacts/outbox/task/review.txt").exists()
+    assert not (home / "ephemeral.txt").exists()
     artifacts = Path(sandbox_cache(home, "CODEX_HOME", codex.resolve())) / "artifacts"
     assert (artifacts / "review.txt").read_text() == "persistent\n"
+    assert (artifacts / "task/review.txt").read_text() == "outbox\n"
     again = run(f"--codex-home={codex}", "sh", "-c", 'cat "$BABYSIT_ARTIFACT_DIR/review.txt"')
     assert again.returncode == 0 and again.stdout == "persistent\n"
+
+
+@pytest.mark.parametrize(
+    "granted",
+    ["src/agent-artefacts/outbox", "src/agent-artefacts", "src/agent-artefacts/outbox/task"],
+)
+def test_a_granted_outbox_is_not_replaced_by_the_artifacts_link(checkout, granted):
+    worktree, common, home = checkout
+    outbox = home / "src/agent-artefacts/outbox"
+    (home / granted).mkdir(parents=True)
+    argv = printed(
+        worktree, environment(home), f"--add-dirs={worktree}:{common}:{home / granted}", "true"
+    )
+    assert str(outbox) not in [target for _, target in pairs(argv, "--symlink")]
+
+
+def test_the_outbox_leads_to_the_persistent_artifacts(checkout):
+    worktree, common, home = checkout
+    argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "true")
+    outbox = str(home / "src/agent-artefacts/outbox")
+    assert (f"{sandbox_cache(home)}/artifacts", outbox) in pairs(argv, "--symlink")
+    # Made in the empty home, so it must come after the tmpfs that creates it.
+    assert argv.index(str(home)) < argv.index(outbox)
 
 
 @linux_bwrap
