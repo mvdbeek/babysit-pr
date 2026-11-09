@@ -1644,7 +1644,10 @@ def _host_common_dir(checkout):
         registered = os.path.realpath(os.path.join(admin, read(os.path.join(admin, "gitdir"))))
         named = os.path.realpath(os.path.join(admin, read(os.path.join(admin, "commondir"))))
     except OSError as exc:
-        raise refuse(f"{admin} is incomplete ({exc.strerror})") from exc
+        raise refuse(
+            f"{admin} is incomplete ({exc.strerror}); a `git worktree prune` that could not "
+            "see this checkout may have removed its registration"
+        ) from exc
     if registered != os.path.realpath(dot):
         raise refuse(f"{admin} does not register this checkout")
     if named != common or os.path.lexists(os.path.join(common, "commondir")):

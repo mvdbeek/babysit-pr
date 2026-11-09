@@ -480,6 +480,14 @@ Known gaps of the Linux sandbox:
   writable for `git branch`, `git push -u` and `git worktree add`, and alone can
   run anything, while read-only hooks would break `pre-commit install`. Give
   workspaces that need Docker a clone of their own.
+- Sibling checkouts of a clone are hidden from a bwrap sandbox, whose `git worktree
+prune` (also run by `git gc`) would drop every registration it finds no `.git`
+  for. babysit-bwrap therefore puts an empty directory at each registered sibling's
+  `.git` when it launches. A checkout created after the launch has none, so an agent
+  pruning in a long-lived sandbox can still unregister it; so does a registration
+  recorded through a symbolic link, which Git only leaves after a tree is moved.
+  Safehouse needs no such step: its grants keep `~/src` readable, so the siblings
+  stay visible there.
 - With a bwrap older than 0.10.0 writable directories are bound by path, so a
   process that can write a bound directory's parent could swap it for a link
   between the check and the bind. Refusing shared main checkouts closes the

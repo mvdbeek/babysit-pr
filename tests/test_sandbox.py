@@ -1421,6 +1421,139 @@ def _bwrap_works():
 linux_bwrap = pytest.mark.skipif(not _bwrap_works(), reason="needs Linux with working bwrap")
 
 
+def add_worktree(common, path):
+    """A further linked worktree of the clone at ``common``, resolved as git records it."""
+    subprocess.run(
+        ["git", "-C", str(common.parent), "worktree", "add", "-q", str(path)], check=True
+    )
+    return path.resolve()
+
+
+def checkout_placeholders(argv):
+    pairs = itertools.pairwise(argv)
+    return [dest for flag, dest in pairs if flag == "--dir" and dest.endswith("/.git")]
+
+
+def test_git_worktree_prune_keeps_a_sibling_the_sandbox_cannot_see(checkout, tmp_path):
+    """Real git against the launch's view; a fake bwrap cannot show the mounts themselves."""
+    worktree, common, home = checkout
+    sibling = add_worktree(common, tmp_path / "sibling")
+    deleted = add_worktree(common, tmp_path / "deleted")
+    shutil.rmtree(deleted)
+    argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "x")
+    # The host as the sandbox shows it: no sibling checkout, only what the launch creates.
+    shutil.move(sibling, tmp_path / "out-of-view")
+    for dest in checkout_placeholders(argv):
+        if not os.path.lexists(dest):  # the agent's own checkout, bound over its placeholder
+            Path(dest).mkdir(parents=True)
+    subprocess.run(["git", "-C", str(worktree), "worktree", "prune"], check=True)
+    assert (common / "worktrees/sibling/gitdir").is_file()
+    assert not (common / "worktrees/deleted").exists()  # a dead entry can still be pruned
+
+
+def test_checkout_placeholders_come_before_every_bind(checkout, tmp_path):
+    worktree, common, home = checkout
+    sibling = add_worktree(common, tmp_path / "sibling")
+    argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "x")
+    assert str(sibling / ".git") in checkout_placeholders(argv)
+    # Any later bind then covers a placeholder, whatever a gitdir entry names.
+    before = argv[: argv.index(str(sibling / ".git"))]
+    assert not [word for word in before if "bind" in word or word == "--symlink"]
+
+
+def test_only_a_live_checkout_gets_a_placeholder(checkout, tmp_path):
+    """A ``gitdir`` entry is agent-writable: it picks an empty directory, and only that."""
+    worktree, common, home = checkout
+    (home / ".gitconfig").write_text("[user]\n")
+    aimed = {
+        "file": home / ".gitconfig",  # would turn a later file bind into a failed launch
+        "missing": tmp_path / "no-such-checkout/.git",
+        "directory": common,
+    }
+    link = tmp_path / "linked-gitfile"
+    link.mkdir()
+    (link / ".git").symlink_to(home / ".gitconfig")
+    aimed["link"] = link / ".git"
+    for name, target in aimed.items():
+        entry = common / "worktrees" / name
+        entry.mkdir()
+        (entry / "gitdir").write_text(f"{target}\n")
+    # A live `.git`, but named through a link where a real entry has a file.
+    unregistered = tmp_path / "unregistered"
+    unregistered.mkdir()
+    (unregistered / ".git").write_text("gitdir: elsewhere\n")
+    (tmp_path / "gitdir-target").write_text(f"{unregistered / '.git'}\n")
+    entry = common / "worktrees/linked-entry"
+    entry.mkdir()
+    (entry / "gitdir").symlink_to(tmp_path / "gitdir-target")
+    argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "x")
+    assert checkout_placeholders(argv) == [str(worktree / ".git")]
+
+
+def test_a_placeholder_never_blocks_the_outbox_link(checkout, tmp_path):
+    worktree, common, home = checkout
+    task = home / "src/agent-artefacts/outbox/task"
+    task.mkdir(parents=True)
+    (task / ".git").write_text("gitdir: elsewhere\n")
+    entry = common / "worktrees/in-outbox"
+    entry.mkdir()
+    (entry / "gitdir").write_text(f"{task.resolve() / '.git'}\n")
+    argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "x")
+    assert str(task.resolve() / ".git") not in checkout_placeholders(argv)
+
+
+def test_planted_entries_cannot_push_a_launch_past_the_argument_limit(checkout, tmp_path):
+    worktree, common, home = checkout
+    deep = tmp_path / "/".join(["d" * 180] * 4)  # macOS allows 1024 bytes in a path
+    deep.mkdir(parents=True)
+    (deep / ".git").write_text("gitdir: elsewhere\n")
+    for number in range(700):
+        entry = common / "worktrees" / f"planted-{number}"
+        entry.mkdir()
+        (entry / "gitdir").write_text(f"{deep.resolve() / '.git'}\n")
+    result = run_wrapper(worktree, environment(home), f"--add-dirs={worktree}:{common}", "x")
+    assert result.returncode == 0, result.stderr.decode()
+    assert b"too many registered worktrees" in result.stderr
+    argv = result.stdout.decode().split("\0")[:-1]
+    assert sum(map(len, checkout_placeholders(argv))) <= 500000
+
+
+def test_a_relative_gitdir_entry_gets_its_placeholder(checkout, tmp_path):
+    worktree, common, home = checkout
+    sibling = add_worktree(common, tmp_path / "sibling")
+    gitdir = common / "worktrees/sibling/gitdir"
+    gitdir.write_text(os.path.relpath(sibling / ".git", gitdir.parent) + "\n")
+    argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "x")
+    assert str(sibling / ".git") in checkout_placeholders(argv)
+
+
+@linux_bwrap
+def test_git_maintenance_in_the_real_sandbox_keeps_siblings(checkout, tmp_path):
+    worktree, common, home = checkout
+    sibling = add_worktree(common, tmp_path / "sibling")
+    (sibling / "private-note").write_text("not for other sandboxes")
+    # `git gc` prunes with this expiry, which only spares an index newer than it.
+    aged = time.time() - 200 * 86400
+    os.utime(common / "worktrees/sibling/index", (aged, aged))
+    script = (
+        f'test "$(ls -A {sibling})" = .git && '
+        "git worktree prune && git worktree prune --expire 3.months.ago && "
+        'git worktree add -q "$HOME/made-inside" && git -C "$HOME/made-inside" rev-parse HEAD'
+    )
+    result = subprocess.run(
+        ["bash", WRAPPER, f"--add-dirs={worktree}:{common}", "--", "sh", "-c", script],
+        cwd=worktree,
+        env=environment(home, bwrap=None),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (common / "worktrees/sibling/gitdir").is_file()
+    assert (common / "worktrees/made-inside/gitdir").is_file()
+    subprocess.run(["git", "-C", str(sibling), "status", "--short"], check=True)
+
+
 @pytest.fixture
 def cross_agent(checkout):
     """An authenticated host and fake CLIs; no real agent or credential is used."""

@@ -8,7 +8,8 @@
 # caller passes the worktree and its git common directory there), the one agent
 # configuration directory (which must exist; what it runs code from stays read-only) and
 # a cache root that only sandboxed agents of that configuration and grants use. Nothing
-# is discovered from the working directory or its git files, which the agent can rewrite.
+# is discovered from the working directory or its git files, which the agent can rewrite;
+# the one use of a grant's git files places empty directories in the sandbox's own tmpfs.
 # Every writable path must be absolute and is resolved first; home, its ancestors and
 # protected paths are refused. The environment is cleared except for a small baseline,
 # the agent configuration variable, the cache variables and the --env-pass names that
@@ -248,6 +249,49 @@ command -v sha256sum >/dev/null || sha=(shasum -a 256) # macOS dry runs
 key=$(printf '%s\0%s\0%s' "$config_var" "$config_dir" "$granted" | "${sha[@]}")
 cache=$home/.cache/babysit-sandbox/${key:0:16}
 
+granted_dirs=()
+for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
+  [[ -n $path ]] || continue
+  real=$(writable "$path")
+  [[ -n $real ]] || continue
+  granted_dirs+=("$real")
+done
+# `git worktree prune`, which `git gc` also runs, drops a worktree's registration from the
+# common directory when the `.git` that registration names is missing, and from here
+# every sibling checkout looks missing. An empty directory there keeps git from dropping
+# it, and shows nothing of the sibling. These come before every bind, so that whatever
+# an agent writes in a `gitdir` file only places an empty directory in this sandbox's
+# own tmpfs: a later bind covers it, and it can never cover one. Only a checkout's real
+# `.git` file counts, so a dead entry stays prunable and a later file bind never meets a
+# directory; the outbox link below is the one later step that a placeholder would fail.
+# The total is limited so that planted entries cannot push every launch past the
+# argument limit. A checkout made after this launch has no placeholder, and remains exposed.
+outbox=$home/src/agent-artefacts/outbox
+outbox_granted=0
+for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
+  [[ $real != "$outbox" && $outbox != "$real"/* && $real != "$outbox"/* ]] || outbox_granted=1
+done
+placeholder_bytes=0
+for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
+  for entry in "$real"/worktrees/*/gitdir; do
+    [[ -f $entry && ! -L $entry ]] || continue
+    path=
+    IFS= read -r -n 4096 path <"$entry" || [[ -n $path ]] || continue
+    [[ $path == /* ]] || path=${entry%/*}/$path
+    [[ -f $path && ! -L $path ]] || continue
+    path=$(realpath -- "$path") || continue
+    # After resolving, in case `.git` was swapped for a link since the check above.
+    [[ ${path##*/} == .git ]] || continue
+    ((outbox_granted)) || [[ $path != "$outbox"/* ]] || continue
+    placeholder_bytes=$((placeholder_bytes + ${#path} + 7))
+    if ((placeholder_bytes > 500000)); then
+      printf 'babysit-bwrap: too many registered worktrees in %s; the rest can be pruned from this sandbox\n' "$real" >&2
+      break 2
+    fi
+    argv+=(--dir "$path")
+  done
+done
+
 # Writable: the sandbox cache, the agent configuration and the explicit grants. They
 # come before every read-only bind, so none of them can shadow one.
 argv+=(--bind "$cache" "$cache")
@@ -255,16 +299,11 @@ argv+=(--bind "$cache" "$cache")
 # not follow an agent-writable cache entry from the host to create directories.
 argv+=(--perms 0700 --dir "$cache/artifacts")
 [[ -z $config_var ]] || grant "$config_dir"
-granted_dirs=()
-for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
-  [[ -n $path ]] || continue
-  real=$(writable "$path")
-  [[ -n $real ]] || continue
-  granted_dirs+=("$real")
+for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
   # A grant holding the configuration could move it, read-only entries and all.
   if [[ -n $config_var ]] &&
     [[ $real == "$config_dir" || $config_dir == "$real"/* || $real == "$config_dir"/* ]]; then
-    die "refusing $path, which overlaps the agent configuration $config_dir"
+    die "refusing $real, which overlaps the agent configuration $config_dir"
   fi
   grant "$real"
 done
@@ -272,11 +311,6 @@ done
 # and the worker's artefact-url links to it. In the empty home that would die with the
 # sandbox and never reach the share, so it leads to the persistent artifacts instead,
 # which the controller pulls. A grant of that directory wins: it is the real one.
-outbox=$home/src/agent-artefacts/outbox
-outbox_granted=0
-for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
-  [[ $real != "$outbox" && $outbox != "$real"/* && $real != "$outbox"/* ]] || outbox_granted=1
-done
 if ((!outbox_granted)); then
   argv+=(--symlink "$cache/artifacts" "$outbox")
 fi
