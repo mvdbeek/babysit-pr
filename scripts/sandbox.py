@@ -9,7 +9,7 @@ starts, so supporting another harness only takes its launch argv. Backends:
   ``safe``/``claude()``/``codex()`` shell functions, which read ``SAFE_ENABLE``,
   ``SAFEHOUSE_ADD_DIRS`` and ``SAFEHOUSE_ENV_PASS``; babysit only sets those.
 - ``bwrap`` (Linux): ``babysit-bwrap``, a bubblewrap wrapper taking Safehouse's flags.
-  It discovers nothing itself: babysit passes the worktree, its git directory and the
+  It discovers no grants itself: babysit passes the worktree, its git directory and the
   agent's configuration directory explicitly.
 - ``none``: no sandbox, only for launches that explicitly opt out.
 
