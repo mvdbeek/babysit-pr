@@ -907,9 +907,15 @@ def background_end(text):
     return None
 
 
+# Claude writes turn_duration after most turns but skips it after some (seen in sessions
+# that ran agent teams, or until a session was resumed); stop_hook_summary, written once
+# the Stop hooks ran, closes every turn of a session that has any.
+TURN_ENDS = frozenset({"turn_duration", "stop_hook_summary"})
+
+
 def claude_turn(lines, session_id):
-    """A turn is the last typed prompt; it is complete once its turn_duration record lands
-    and no background task it started is still running.
+    """A turn is the last typed prompt; it is complete once a record that ends it lands
+    (TURN_ENDS) and no background task it started is still running.
 
     The completed text is the assistant text after the turn's final tool result or task
     notification, i.e. the response the user sees, which must carry the handoff marker.
@@ -952,7 +958,7 @@ def claude_turn(lines, session_id):
                 for b in blocks
                 if b.get("type") == "tool_use" and b.get("name") == "TaskStop"
             )
-        elif kind == "system" and item.get("subtype") == "turn_duration" and turn and not running:
+        elif kind == "system" and item.get("subtype") in TURN_ENDS and turn and not running:
             complete = "\n".join(texts)
     if not seen or not turn:
         raise RuntimeError("Cannot identify the current turn in the registered transcript")
