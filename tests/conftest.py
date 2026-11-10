@@ -291,12 +291,18 @@ def fake_tools(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def fresh_viewer_caches(monkeypatch):
-    """Viewer caches are per process; each test starts with none."""
+def fresh_viewer_caches(monkeypatch, tmp_path_factory):
+    """Viewer caches are per process; each test starts with none, and with its own
+    transcript store, opened on first use."""
     import workspace_viewer
 
-    for name in ("_checkouts", "_details", "_parsers", "_sessions"):
+    for name in ("_checkouts", "_details", "_reading", "_sessions"):
         monkeypatch.setattr(workspace_viewer, name, {})
+    store = tmp_path_factory.mktemp("transcripts") / "transcripts.sqlite"
+    monkeypatch.setattr(workspace_viewer, "_store_path", store)
+    monkeypatch.setattr(workspace_viewer, "_store", None)
+    # Probes run on this machine cache their bytecode here, never in the real home.
+    monkeypatch.setenv("BABYSIT_PROBE_CACHE", str(tmp_path_factory.mktemp("probe-cache")))
     import agent_docker
     import agent_messages
 

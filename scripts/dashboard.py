@@ -200,6 +200,7 @@ API_ROUTES = frozenset(
         "/api/workspace-overview",
         "/api/workspace-prompts",
         "/api/workspace-repos",
+        "/api/workspace-search",
         "/api/workspace-terminal",
         "/api/workspace-transcript",
         "/api/workspaces",
@@ -540,6 +541,7 @@ class DashboardServer(ThreadingHTTPServer):
     ) -> None:
         self.home = home
         self.tags = work_tags.Tags(home)
+        workspace_viewer.use_store(home)
         # None while auth is off: every request is answered as before Phase 1.
         self.auth = auth
         # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.
@@ -1699,7 +1701,11 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 value["machine_label"] = machine.label if machine else local_label(self.server.home)
                 self.send_json(200, value)
-            elif route.path in {"/api/workspace-diff", "/api/workspace-transcript"}:
+            elif route.path in {
+                "/api/workspace-diff",
+                "/api/workspace-transcript",
+                "/api/workspace-search",
+            }:
                 query = parse_qs(route.query)
                 if any(len(values) != 1 for values in query.values()):
                     raise ValueError("Supply each parameter once")
@@ -1745,11 +1751,21 @@ class Handler(BaseHTTPRequestHandler):
                                 self.server.home, machine, path, scope, base
                             )
                         )
+                    elif route.path == "/api/workspace-search":
+                        if set(single) != {"q"}:
+                            raise ValueError("Supply what to search for, once")
+                        value = (
+                            workspace_viewer.search(path, single["q"])
+                            if machine is None
+                            else workspace_viewer.remote_search(
+                                self.server.home, machine, path, single["q"]
+                            )
+                        )
                     else:
-                        if set(single) - {"session", "before", "after"}:
+                        if set(single) - {"session", "before", "after", "around", "later"}:
                             raise ValueError("Unknown transcript parameter")
                         positions = {}
-                        for name in ("before", "after"):
+                        for name in ("before", "after", "around", "later"):
                             if name in single:
                                 if not single[name].isdigit():
                                     raise ValueError("Expected a numeric page position")

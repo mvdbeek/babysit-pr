@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import threading
 import time
 
 import pytest
@@ -183,7 +184,6 @@ def stores(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setattr(wv, "_details", {})
-    monkeypatch.setattr(wv, "_parsers", {})
     checkout = tmp_path / "wt" / "repo.x_1"
     checkout.mkdir(parents=True)
     folder = (
@@ -513,9 +513,49 @@ def test_a_growing_transcript_is_read_only_from_where_it_stopped(stores, monkeyp
         json.dumps({"type": "user", "cwd": str(checkout), "message": {"content": "New"}}) + "\n"
     )
     assert [e["text"] for e in wv.transcript(checkout, SID)["entries"]] == ["New"]
-    monkeypatch.setattr(wv, "PARSED_FILES", 0)
-    wv.transcript(checkout, CODEX_SID)
-    assert wv._parsers == {}
+
+
+def test_a_reopened_store_reads_on_from_where_it_stopped(stores, monkeypatch):
+    """After a restart only new bytes are parsed, and an open tool call still gets its
+    result, though its entry was saved before."""
+    checkout, folder, _ = stores
+    fed = []
+    real = wv.Transcript.feed
+    monkeypatch.setattr(
+        wv.Transcript, "feed", lambda self, item: fed.append(item) or real(self, item)
+    )
+    path = folder / f"{SID}.jsonl"
+    common = {"sessionId": SID, "cwd": str(checkout)}
+    call = {"type": "tool_use", "id": "late", "name": "Bash", "input": {"command": "make"}}
+    path.write_text(
+        json.dumps({"type": "user", **common, "message": {"content": "Build it"}})
+        + "\n"
+        + json.dumps({"type": "assistant", **common, "message": {"content": [call]}})
+        + "\n"
+    )
+    first = wv.transcript(checkout, SID)
+    assert first["entries"][-1]["output"] is None
+    # A restarted dashboard: no caches, the same store file.
+    monkeypatch.setattr(wv, "_store", None)
+    monkeypatch.setattr(wv, "_details", {})
+    fed.clear()
+    assert wv.transcript(checkout, SID)["entries"] == first["entries"]
+    assert fed == []
+    result = {"type": "tool_result", "tool_use_id": "late", "content": "built"}
+    with path.open("a") as stream:
+        stream.write(
+            json.dumps({"type": "user", **common, "message": {"content": [result]}}) + "\n"
+        )
+    monkeypatch.setattr(wv, "_store", None)
+    value = wv.transcript(checkout, SID, after=0)
+    assert len(fed) == 1 and value["entries"][-1]["output"] == "built"
+    hits = wv.search(checkout, "built")["results"]
+    assert [(hit["session"], hit["index"]) for hit in hits] == [(SID, 1)]
+    # A store kept by another parser version is parsed again.
+    monkeypatch.setattr(wv, "PARSER", wv.PARSER + 1)
+    fed.clear()
+    assert wv.transcript(checkout, SID)["entries"] == value["entries"]
+    assert len(fed) == 3
 
 
 def test_after_beyond_a_page_falls_back_to_the_newest_page(stores, monkeypatch):
@@ -711,35 +751,51 @@ def prompt_line(text):
 
 def test_a_long_transcript_keeps_its_newest_entries_and_whole_transcript_indices(monkeypatch):
     monkeypatch.setattr(wv, "MAX_ENTRIES", 10)
-    parser = wv.Transcript("claude")
     tool = {"type": "tool_use", "id": "old", "name": "Bash", "input": {"command": "ls"}}
-    parser.consume(
-        (json.dumps({"type": "assistant", "message": {"content": [tool]}}) + "\n").encode()
-    )
-    parser.consume(b"".join(prompt_line(f"p{i}") for i in range(24)))
-    # 25 entries: past 10, the oldest go with a tenth (one) more, and their tool calls.
-    assert parser.first == 16 and len(parser.entries) == 9 and "old" not in parser.tools
-    assert parser.entries[0]["text"] == "p15"
+    chunks = [
+        (json.dumps({"type": "assistant", "message": {"content": [tool]}}) + "\n").encode(),
+        b"".join(prompt_line(f"p{i}") for i in range(24)),
+    ]
+    parsers = []
+
+    def read(parser, file, save):
+        parsers.append(parser)
+        while chunks:
+            parser.consume(chunks.pop(0))
+            save()
+        return True
 
     def page(**args):
         return wv.transcript_page(
             [{"id": SID, "agent": "claude", "_file": "f"}],
-            str,
-            lambda parser, file: None,
+            lambda file: ("w", file),
+            read,
             SID,
             args.get("before"),
             args.get("after"),
             None,
+            args.get("around"),
+            args.get("later"),
         )
 
-    monkeypatch.setitem(wv._parsers, "f", parser)
     newest = page()
+    # 25 entries: past 10, the oldest go with a tenth (one) more, and their tool calls.
     assert (newest["start"], newest["first"], newest["total"]) == (16, 16, 25)
+    assert "old" not in parsers[0].tools
     assert [e["text"] for e in newest["entries"]] == [f"p{i}" for i in range(15, 24)]
     assert page(after=23)["entries"][0]["text"] == "p22" and page(after=23)["start"] == 23
     # Nothing before the first kept entry: an older position answers from there.
     assert page(before=5)["entries"] == [] and page(before=5)["start"] == 16
     assert page(after=3)["start"] == 16
+    monkeypatch.setattr(wv, "PAGE", 4)
+    around = page(around=20)
+    assert (around["start"], [e["text"] for e in around["entries"]]) == (
+        18,
+        ["p17", "p18", "p19", "p20"],
+    )
+    later = page(later=22)
+    assert (later["start"], [e["text"] for e in later["entries"]]) == (22, ["p21", "p22", "p23"])
+    assert page(later=3)["start"] == 16
 
 
 def test_lines_that_are_not_objects_or_nest_too_deeply_are_passed_over():
@@ -779,25 +835,50 @@ def test_a_busy_transcript_answers_from_its_last_complete_read(monkeypatch):
     listed = [{"id": SID, "agent": "claude", "_file": "f"}]
     reads = []
 
-    def read(parser, file):
+    def read(parser, file, save):
         reads.append(file)
         parser.consume(prompt_line(f"r{len(reads)}"))
+        return True
 
     def page():
-        return wv.transcript_page(listed, str, read, SID, None, None, None)
+        return wv.transcript_page(listed, lambda file: ("w", file), read, SID, None, None, None)
 
-    parser = wv.Transcript("claude")
-    monkeypatch.setitem(wv._parsers, "f", parser)
-    with parser.lock:
+    busy = wv._reading.setdefault(("w", "f"), threading.Lock())
+    with busy:
         with pytest.raises(ValueError, match="still being read"):
             page()
     assert reads == []
     assert [e["text"] for e in page()["entries"]] == ["r1"]
-    with parser.lock:
+    with busy:
         started = time.monotonic()
-        busy = page()
+        value = page()
     assert time.monotonic() - started < 5
-    assert [e["text"] for e in busy["entries"]] == ["r1"] and len(reads) == 1
+    assert [e["text"] for e in value["entries"]] == ["r1"] and len(reads) == 1
+
+
+def test_a_transcript_saved_by_another_reader_meanwhile_is_not_overwritten(monkeypatch):
+    listed = [{"id": SID, "agent": "claude", "_file": "f"}]
+
+    def read(parser, file, save):
+        parser.consume(prompt_line("mine"))
+        # Another process read the same file and saved first.
+        row = wv.store().row("w", "f")
+        wv.store().save(
+            row["id"],
+            row["generation"],
+            restarted=False,
+            added=[(0, json.dumps({"role": "user", "text": "theirs"}), "theirs")],
+            changed=[],
+            place=(None, 9, False, 1, 0, "{}"),
+            ready=True,
+        )
+        return True
+
+    with pytest.raises(ValueError, match="read elsewhere"):
+        wv.transcript_page(listed, lambda file: ("w", file), read, SID, None, None, None)
+    assert wv.store().page(wv.store().row("w", "f")["id"], 0, 5) == [
+        {"role": "user", "text": "theirs"}
+    ]
 
 
 def test_only_lines_that_can_be_an_object_are_parsed(monkeypatch):
@@ -813,3 +894,47 @@ def test_only_lines_that_can_be_an_object_are_parsed(monkeypatch):
     parser.consume(b"[" * 100000 + b"\n" + b'"text"\n' + b"  " + prompt_line("after"))
     assert [e["text"] for e in parser.entries] == ["after"]
     assert parsed == [b" "]
+
+
+# Searching a checkout's sessions -------------------------------------------------
+
+
+def test_search_finds_entries_in_every_session_of_the_checkout_only(stores, tmp_path):
+    checkout, folder, _ = stores
+    stranger = "5f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10"
+    write_jsonl(
+        folder.parent / "elsewhere-repo" / f"{stranger}.jsonl",
+        {"type": "user", "cwd": str(tmp_path / "other"), "message": {"content": "A button"}},
+    )
+    found = wv.search(checkout, "a.py")
+    assert (found["total"], found["searched"], found["behind"]) == (1, 2, 0)
+    [hit] = found["results"]
+    assert (hit["session"], hit["role"], hit["name"], hit["index"]) == (SID, "tool", "Bash", 2)
+    assert {"text": "a.py", "match": True} in hit["snippet"]
+    [button] = wv.search(checkout, "  BUTTON ")["results"]
+    assert (button["session"], button["kind"], button["agent"]) == (CODEX_SID, "prompt", "codex")
+    assert wv.search(checkout, "  BUTTON ")["query"] == "BUTTON"
+    # Every word must match; a word too short to match alone makes the query one phrase.
+    assert wv.search(checkout, "fix crash")["total"] == 1
+    assert wv.search(checkout, "fix button")["total"] == 0
+    assert [h["session"] for h in wv.search(checkout, "on it")["results"]] == [CODEX_SID]
+    for bad, reason in (("ab", "at least 3"), ("", "Type something"), ("x" * 201, "at most")):
+        with pytest.raises(ValueError, match=reason):
+            wv.search(checkout, bad)
+
+
+def test_search_reads_unopened_sessions_within_its_budget_and_says_what_it_skipped(
+    stores, monkeypatch
+):
+    checkout, _, _ = stores
+    monkeypatch.setattr(wv, "SEARCH_BUDGET", 0)
+    nothing = wv.search(checkout, "Done")
+    assert (nothing["results"], nothing["searched"], nothing["behind"]) == ([], 0, 2)
+    monkeypatch.setattr(wv, "SEARCH_BUDGET", 20)
+    # A session another request is still reading is searched as far as it was saved:
+    # not at all, before its first save.
+    codex = next(s["_file"] for s in wv.sessions(checkout) if s["id"] == CODEX_SID)
+    with wv._reading.setdefault(("", str(codex)), threading.Lock()):
+        value = wv.search(checkout, "Done")
+    assert (value["total"], value["searched"], value["behind"]) == (1, 1, 1)
+    assert wv.search(checkout, "Done")["behind"] == 0

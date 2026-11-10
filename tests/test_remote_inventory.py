@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import attention
@@ -521,7 +522,9 @@ def test_call_bounds_and_checks_the_worker_answer(
         "deadline": 5,
     }
     assert kwargs["max_output"] == remote_probe.MAX_STDOUT
-    assert kwargs["input"] == Path(remote_probe.__file__).read_bytes()
+    # The loader that runs this file, signed for the worker's bytecode cache.
+    packed = base64.b64encode(zlib.compress(Path(remote_probe.__file__).read_bytes(), 9))
+    assert kwargs["input"] == remote_probe.probe_loader(tmp_path) and packed in kwargs["input"]
 
 
 # A worker that is buggy, version-skewed or compromised -------------------------

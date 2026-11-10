@@ -427,7 +427,11 @@
     void loadViewer();
   }
   function setMode(mode) {
-    if (viewer && viewer.mode !== mode) change((state) => (state.mode = mode));
+    if (viewer && viewer.mode !== mode)
+      change((state) => {
+        state.mode = mode;
+        state.query = null;
+      });
   }
   async function loadViewer(options = {}) {
     const current = viewer;
@@ -454,12 +458,24 @@
         current.data = data;
         current.base = data.base;
         renderDiff(data);
+      } else if (current.query) {
+        const data = await getJSON("/api/workspace-search", {
+          ...where(current.entry),
+          q: current.query,
+        });
+        if (token !== viewerRequest || viewer !== current) return;
+        renderSearch(data);
       } else {
+        // A search hit opens its session around the entry found.
+        const jump = current.jump;
+        current.jump = null;
         const data = await getJSON("/api/workspace-transcript", {
           ...where(current.entry),
           session: current.session,
           before: options.before,
           after: options.after,
+          later: options.later,
+          around: jump ?? undefined,
         });
         if (token !== viewerRequest || viewer !== current) return;
         current.session = data.session ? data.session.id : null;
@@ -467,9 +483,12 @@
           mergeTranscript(data);
         } else if (options.before !== undefined && current.data) {
           prependTranscript(data);
+        } else if (options.later !== undefined && current.data) {
+          appendTranscript(data);
         } else {
           current.data = data;
-          renderTranscript(data, true);
+          renderTranscript(data, jump === null || jump === undefined);
+          if (jump !== null && jump !== undefined) showFound(jump);
         }
       }
       byId("ws-viewer-error").textContent = "";
@@ -688,6 +707,95 @@
     };
     return earlier;
   }
+  function laterButton(data) {
+    const shown = data.start + data.entries.length;
+    const later = node("button", `Show later entries (${data.total - shown})`, "ws-later");
+    later.type = "button";
+    later.onclick = () => {
+      later.disabled = true;
+      void loadViewer({ later: viewer.data.start + viewer.data.entries.length });
+    };
+    return later;
+  }
+  // Searching every session recorded in the checkout, from the transcript's controls.
+  function searchForm(query) {
+    const form = node("form", undefined, "ws-search");
+    form.setAttribute("role", "search");
+    const input = document.createElement("input");
+    input.type = "search";
+    input.placeholder = "Search all transcripts";
+    input.setAttribute("aria-label", "Search this checkout's transcripts");
+    input.value = query || "";
+    const go = node("button", "Search");
+    go.type = "submit";
+    form.append(input, go);
+    form.onsubmit = (event) => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (text) change((state) => (state.query = text));
+    };
+    return form;
+  }
+  function plainSnippet(parts) {
+    const text = node("div", undefined, "ws-hit-text");
+    for (const part of parts) text.append(part.match ? node("mark", part.text) : part.text);
+    return text;
+  }
+  function renderSearch(data) {
+    const controls = byId("ws-viewer-controls");
+    const back = node("button", "Back to the transcript");
+    back.type = "button";
+    back.onclick = () => change((state) => (state.query = null));
+    controls.replaceChildren(searchForm(data.query), back);
+    const shown = data.results.length;
+    byId("ws-viewer-meta").textContent =
+      `${plural(data.total, "match", "matches")} for “${data.query}” in ` +
+      `${plural(data.searched, "session", "sessions")}` +
+      (shown < data.total ? `; the newest ${shown} are shown` : "") +
+      "." +
+      (data.behind
+        ? ` ${plural(data.behind, "session was", "sessions were")} not read to the end` +
+          " in time; search again to read on."
+        : "");
+    const content = byId("ws-viewer-content");
+    const list = node("ol", undefined, "ws-hits");
+    for (const hit of data.results) {
+      const button = node("button", undefined, "ws-hit");
+      button.type = "button";
+      const head = node("span", undefined, "ws-hit-head");
+      const who =
+        hit.role === "tool"
+          ? hit.name || "Tool"
+          : hit.role === "assistant"
+            ? hit.agent === "claude"
+              ? "Claude"
+              : "Codex"
+            : USER_KINDS[hit.kind || "prompt"] || "Prompt";
+      const session = sessionLabel({ ...hit, id: hit.session });
+      head.append(node("strong", who), " ", node("span", session, "ws-hit-session"));
+      const when = stamp(hit.time);
+      if (when) head.append(when);
+      button.append(head, plainSnippet(hit.snippet));
+      button.onclick = () =>
+        change((state) => {
+          state.query = null;
+          state.session = hit.session;
+          state.jump = hit.index;
+        });
+      const item = node("li");
+      item.append(button);
+      list.append(item);
+    }
+    content.replaceChildren(shown ? list : node("p", "Nothing found.", "pr-meta"));
+  }
+  // The entry a search hit named, scrolled to and marked.
+  function showFound(index) {
+    const item = viewer.nodes[index - viewer.data.start];
+    if (!item) return;
+    item.classList.add("ws-found");
+    if (item.tagName === "DETAILS") item.open = true;
+    item.scrollIntoView({ block: "center" });
+  }
   function renderTranscript(data, follow) {
     const controls = byId("ws-viewer-controls");
     controls.replaceChildren();
@@ -702,6 +810,7 @@
       );
     }
     controls.append(refreshButton());
+    if (data.sessions.length) controls.append(searchForm(""));
     renderLive();
     const content = byId("ws-viewer-content");
     if (!data.session) {
@@ -719,6 +828,8 @@
     viewer.nodes = data.entries.map((entry) => transcriptEntry(entry, agentName(data)));
     list.append(...viewer.nodes);
     content.append(list);
+    // A page opened at a search hit can read on towards the newest entries.
+    if (data.start + data.entries.length < data.total) content.append(laterButton(data));
     syncInteraction();
     if (follow) byId("ws-viewer").scrollTop = byId("ws-viewer").scrollHeight;
   }
@@ -786,6 +897,22 @@
     if (current.start > (current.first || 0)) content.prepend(earlierButton(current));
     // Keep the entry the reader was looking at in place.
     scroller.scrollTop += scroller.scrollHeight - before;
+  }
+  function appendTranscript(data) {
+    const current = viewer.data;
+    const shown = current.start + current.entries.length;
+    const added = data.entries.slice(Math.max(0, shown - data.start));
+    const items = added.map((entry) => transcriptEntry(entry, agentName(data)));
+    current.entries.push(...added);
+    viewer.nodes.push(...items);
+    current.total = data.total;
+    current.first = data.first;
+    const content = byId("ws-viewer-content");
+    content.querySelector(".ws-later")?.remove();
+    content.querySelector(".ws-transcript").append(...items);
+    if (current.start + current.entries.length < current.total)
+      content.append(laterButton(current));
+    transcriptMeta(current);
   }
   function toolOutput(item, entry) {
     item.querySelector(".ws-tool-output, .ws-tool-error")?.remove();
