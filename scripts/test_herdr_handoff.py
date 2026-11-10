@@ -466,7 +466,8 @@ def test_rollout_requires_exact_turn_and_session(tmp_path):
     assert handoff.latest_turn(path, "session") == ("two", None)
 
 
-def test_claude_transcript_turn_completes_at_turn_duration(tmp_path):
+@pytest.mark.parametrize("end", ["turn_duration", "stop_hook_summary"])
+def test_claude_transcript_turn_completes_at_its_end_record(tmp_path, end):
     path = tmp_path / "transcript.jsonl"
 
     def row(kind, **extra):
@@ -489,7 +490,7 @@ def test_claude_transcript_turn_completes_at_turn_duration(tmp_path):
         row("last-prompt", leafUuid="x"),
     )
     assert handoff.latest_turn(path, "session", "claude") == ("turn-1", None)
-    append(row("system", subtype="turn_duration", durationMs=5))
+    append(row("system", subtype=end))
     assert handoff.latest_turn(path, "session", "claude") == ("turn-1", "done [receipt]")
     with pytest.raises(RuntimeError):
         handoff.latest_turn(path, "other", "claude")
