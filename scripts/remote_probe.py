@@ -12,7 +12,6 @@ Stdlib only, and Python 3.9 compatible: it runs on whatever ``python3`` a worker
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import contextlib
 import errno
 import fcntl
@@ -32,6 +31,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -394,6 +394,42 @@ def local_state(git, path, branch=None):
         return {"changes": None, "unpushed": None, "error": f"Local state unavailable: {detail}"}
 
 
+def parallel_map(fn, items, workers=8):
+    """``fn`` of each item on up to ``workers`` daemon threads, the results in order.
+
+    The first failure, in item order, is raised once the calls already started have
+    returned; none start after a failure. A stuck call never holds up the probe's exit,
+    so an expired deadline leaves it behind. Plain threads rather than a thread pool:
+    importing ``concurrent.futures`` would cost every probe tens of milliseconds.
+    """
+    items = list(items)
+    results: list[Any] = [None] * len(items)
+    errors: dict[int, BaseException] = {}
+    lock = threading.Lock()
+    positions = iter(range(len(items)))
+
+    def work():
+        while True:
+            with lock:
+                index = None if errors else next(positions, None)
+            if index is None:
+                return
+            try:
+                results[index] = fn(items[index])
+            except BaseException as exc:
+                with lock:
+                    errors[index] = exc
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(min(workers, len(items)))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[min(errors)]
+    return results
+
+
 def transcript_updates(paths, src, files, cwd_of):
     """Scan session stores once per inventory, matching the most specific checkout.
 
@@ -436,34 +472,29 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
         config = repo_config(git, root)
         return root, config, clone_worktrees(git, root, None, config)
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-    try:
-        clones, checkouts, bare = [], {}, []
-        for root, config, result in pool.map(survey, found):
-            if not result:
-                if bare_checkout(git, root):
-                    bare.append(str(root))
-                continue
-            main, items = result
-            clones.append({"main": main, "items": items, "config": config})
-            for item in items:
-                checkouts[item["path"]] = item
-        paths = {}
-        for path in opened:
-            real = os.path.realpath(path)
-            paths[path] = {"path": real, "exists": os.path.exists(real)}
-        mains = {clone["main"]["path"] for clone in clones}
-        shown = {value["path"] for value in paths.values()}
-        # A clone's own checkout is only a workspace while herdr holds it open.
-        selected = [path for path in checkouts if path not in mains or path in shown]
-        pending = {
-            path: pool.submit(local_state, git, path, checkouts[path].get("branch"))
-            for path in selected
-        }
-        states = {path: future.result() for path, future in pending.items()}
-    finally:
-        # An expired deadline must not wait for a step that is stuck.
-        pool.shutdown(wait=False, cancel_futures=True)
+    clones, checkouts, bare = [], {}, []
+    for root, config, result in parallel_map(survey, found):
+        if not result:
+            if bare_checkout(git, root):
+                bare.append(str(root))
+            continue
+        main, items = result
+        clones.append({"main": main, "items": items, "config": config})
+        for item in items:
+            checkouts[item["path"]] = item
+    paths = {}
+    for path in opened:
+        real = os.path.realpath(path)
+        paths[path] = {"path": real, "exists": os.path.exists(real)}
+    mains = {clone["main"]["path"] for clone in clones}
+    shown = {value["path"] for value in paths.values()}
+    # A clone's own checkout is only a workspace while herdr holds it open.
+    selected = [path for path in checkouts if path not in mains or path in shown]
+    states = dict(
+        parallel_map(
+            lambda path: (path, local_state(git, path, checkouts[path].get("branch"))), selected
+        )
+    )
     updates = transcript_updates(set(selected), src.resolve(), files, cwd_of)
     return {
         "roots": [str(root) for root in found],
@@ -1857,13 +1888,7 @@ def _host_placement_state(src):
             ],
         }
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-    try:
-        clones = [clone for clone in pool.map(survey, names) if clone]
-    finally:
-        # An expired deadline must not wait for a step that is stuck.
-        pool.shutdown(wait=False, cancel_futures=True)
-    return {"clones": clones}
+    return {"clones": [clone for clone in parallel_map(survey, names) if clone]}
 
 
 def _host_version(babysit_root):
@@ -5039,6 +5064,133 @@ def probe_source():
     return Path(__file__).read_bytes()
 
 
+# What ``call`` sends instead of the source itself: a short loader with the source packed
+# in it, which runs the bytecode a probe of the same source compiled before. Compiling
+# this file costs a worker tens of milliseconds a call, several times that under load.
+# The cache is in the worker's home, which its agents may write, so the loader runs only
+# bytecode signed with the controller's key; the key never rests on the worker.
+PROBE_KEY = "probe-cache.key"
+MAX_PROBE_CODE = 16 * 1024 * 1024
+LOADER = r"""
+import base64, hashlib, hmac, marshal, os, stat, sys, zlib
+
+
+def _babysit_probe_code(key, digest, packed):
+    tag = "%s-%x-%s" % (
+        sys.implementation.cache_tag,
+        sys.hexversion,
+        hashlib.sha256(key).hexdigest()[:12],
+    )
+    name = "%s-%s.pyc" % (digest[:32], tag)
+    label = (name + "\n").encode()
+    folder = os.environ.get("BABYSIT_PROBE_CACHE", "")
+    if not os.path.isabs(folder):
+        cache = os.environ.get("XDG_CACHE_HOME", "")
+        if not os.path.isabs(cache):
+            cache = os.path.join(os.path.expanduser("~"), ".cache")
+        folder = os.path.join(cache, "babysit-probe")
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        directory = None
+    try:
+        if directory is not None and os.fstat(directory).st_uid != os.getuid():
+            os.close(directory)
+            directory = None
+        if directory is not None:
+            try:
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                with os.fdopen(os.open(name, flags, dir_fd=directory), "rb") as stream:
+                    if stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        data = stream.read(__LIMIT__)
+                        body = data[32:]
+                        signed = hmac.new(key, label + body, "sha256").digest()
+                        if hmac.compare_digest(data[:32], signed):
+                            return marshal.loads(body)
+            except (OSError, ValueError, EOFError, TypeError):
+                pass
+        source = zlib.decompress(base64.b64decode(packed))
+        code = compile(source, "remote_probe.py", "exec", dont_inherit=True)
+        if directory is None:
+            return code
+        body = marshal.dumps(code)
+        temporary = "%s.%d.tmp" % (name, os.getpid())
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            with os.fdopen(os.open(temporary, flags, 0o600, dir_fd=directory), "wb") as stream:
+                stream.write(hmac.new(key, label + body, "sha256").digest() + body)
+            os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+            # This controller's earlier probes for this Python, replaced by a deploy.
+            for other in os.listdir(folder):
+                if other != name and other.endswith("-%s.pyc" % tag):
+                    os.unlink(other, dir_fd=directory)
+        except OSError:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except OSError:
+                pass
+        return code
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+exec(_babysit_probe_code(bytes.fromhex(__KEY__), __DIGEST__, __PACKED__), globals())
+"""
+_loaders: dict[tuple[str, bytes], bytes] = {}
+_loaders_lock = threading.Lock()
+
+
+def probe_key(home):
+    """The controller's key that signs its probes' bytecode on workers, made once."""
+    path = Path(os.path.expanduser(str(home))) / PROBE_KEY
+    for _ in range(2):
+        try:
+            key = path.read_bytes()
+        except FileNotFoundError:
+            key = None
+        if key is not None and len(key) == 32:
+            return key
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".probe-key-")
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(os.urandom(32))
+            if key is None:
+                # The first process to make one wins; any other reads that one.
+                with contextlib.suppress(FileExistsError):
+                    os.link(temporary, path)
+            else:
+                os.replace(temporary, path)  # Not a key: replaced.
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+    raise ValueError(f"Could not make the probe key {path}")
+
+
+def probe_loader(home):
+    """The script ``call`` runs: ``LOADER`` with this source and the controller's key."""
+    source = probe_source()
+    digest = hashlib.sha256(source).hexdigest()
+    key = probe_key(home)
+    with _loaders_lock:
+        loader = _loaders.get((digest, key))
+    if loader is None:
+        packed = base64.b64encode(zlib.compress(source, 9)).decode()
+        loader = (
+            LOADER.replace("__LIMIT__", str(MAX_PROBE_CODE))
+            .replace("__KEY__", repr(key.hex()))
+            .replace("__DIGEST__", repr(digest))
+            .replace("__PACKED__", repr(packed))
+            .encode()
+        )
+        with _loaders_lock:
+            _loaders.clear()  # Only the source as deployed now is sent.
+            _loaders[(digest, key)] = loader
+    return loader
+
+
 def local_staging(home):
     """Where this machine's probe takes the files a move staged for it: in the
     dashboard's own home, apart from its records (``<home>/moves``)."""
@@ -5105,7 +5257,7 @@ def call(home, machine, op, timeout, **args):
             # -S: no site hooks (.pth files, sitecustomize) run before the probe.
             [python, "-I", "-S", "-", PROTOCOL, payload],
             timeout=timeout,
-            input=probe_source(),
+            input=probe_loader(home),
             max_output=MAX_STDOUT,
             env=env,
         )

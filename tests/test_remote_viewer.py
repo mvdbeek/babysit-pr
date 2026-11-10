@@ -355,6 +355,29 @@ def test_remote_transcript_follows_appends_truncation_and_replacement(worker, mo
             wv.remote_transcript(worker.home, worker.machine, root, session)
 
 
+def test_remote_search_reads_the_workers_sessions_and_then_only_what_is_new(worker, monkeypatch):
+    root = str(worker.checkout)
+    found = wv.remote_search(worker.home, worker.machine, root, "codex task")
+    assert [(h["session"], h["kind"]) for h in found["results"]] == [(CODEX_SID, "prompt")]
+    assert (found["searched"], found["behind"]) == (2, 0)
+    # Another checkout's session on the same worker is never searched.
+    assert wv.remote_search(worker.home, worker.machine, root, "Not here")["total"] == 0
+    tails = []
+    real = wv.probe
+
+    def counted(home, machine, op, *args, **kwargs):
+        tails.append(op)
+        return real(home, machine, op, *args, **kwargs)
+
+    monkeypatch.setattr(wv, "probe", counted)
+    with worker.claude.open("a") as stream:
+        stream.write(json.dumps(claude_turn("assistant", worker.checkout, "Fixed now")) + "\n")
+    [hit] = wv.remote_search(worker.home, worker.machine, root, "fixed")["results"]
+    assert (hit["session"], hit["index"]) == (CLAUDE_SID, 2)
+    # The listing is still fresh: one read of each transcript's new bytes.
+    assert tails == ["tail", "tail"]
+
+
 def test_remote_tail_refuses_files_outside_the_session_stores(worker):
     outside = worker.host / "outside.jsonl"
     outside.write_text("{}\n")

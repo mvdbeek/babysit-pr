@@ -435,7 +435,7 @@ older snapshots show **PR status pending** until refreshed. Completed PRs show
 Select a watch to **Open workspace** from its details, including branch watches
 and completed PR watches. This uses the watch's recorded checkout, independently
 of the open PR overview. **More actions** offers native focus and command copying;
-**Reopen workspace** restores a closed workspace without starting an agent. Wherever a checkout has a herdr workspace, **Diff** and **Transcript** beside it open a read-only view of its changes against the nearest base branch and of the Claude or Codex sessions recorded in it; see [the workspace reference](references/workspaces.md).
+**Reopen workspace** restores a closed workspace without starting an agent. Wherever a checkout has a herdr workspace, **Diff** and **Transcript** beside it open a read-only view of its changes against the nearest base branch and of the Claude or Codex sessions recorded in it, which can be searched (parsed transcripts are kept in `transcripts.sqlite` under the state home); see [the workspace reference](references/workspaces.md).
 Missing or unrelated checkouts show **Workspace unavailable**.
 
 ## PR workspace actions

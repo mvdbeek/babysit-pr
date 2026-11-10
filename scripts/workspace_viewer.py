@@ -9,14 +9,21 @@ Output is bounded, and nothing is written.
 A checkout on a worker machine is read the same way through ``remote_probe``: the worker
 answers the diff, its session listing and the new bytes of one transcript, and parsing
 stays here.
+
+What a transcript parses to is kept in ``transcript_store`` (the dashboard's
+``transcripts.sqlite``), so a transcript is parsed once, then only as its file grows,
+and its entries can be searched.
 """
 
+import atexit
 import json
 import os
 import re
 import selectors
 import shlex
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -27,6 +34,7 @@ import machines
 import owned_process
 import remote_probe
 import safe_git
+import transcript_store
 from pr_workspaces import herdr
 
 MAX_DIFF = remote_probe.MAX_DIFF
@@ -70,18 +78,30 @@ REMOTE_MAX_LINE = remote_probe.MAX_SCAN_LINE
 # Entries a parsed transcript keeps; past it the oldest go, a tenth at a time, and the
 # page indices stay those of the whole transcript.
 MAX_ENTRIES = 20000
-# An open viewer polls every few seconds: session details are kept per file version, and
-# parsed transcripts keep their read position so a growing file is read from where it
-# stopped. One lock guards both, since requests arrive on separate threads.
+# The newest tool calls a parser keeps for their results (a later result replaces an
+# earlier one), and the newest prompts it remembers to recognise Codex's echoes of them.
+OPEN_TOOLS = 500
+MAX_PROMPTS = 100
+# Bumped whenever parsing changes what an entry holds: saved transcripts are parsed again.
+PARSER = 1
+# A search brings the checkout's sessions up to date first, for at most this long, and
+# answers at most SEARCH_RESULTS entries.
+SEARCH_BUDGET = 20
+SEARCH_RESULTS = 100
+# An open viewer polls every few seconds: session details are kept per file version, in
+# memory and in the store. One lock guards the in-memory caches, since requests arrive on
+# separate threads.
 _lock = threading.Lock()
 _details: dict[str, tuple[tuple, dict | None]] = {}
 DETAIL_FILES = 5000
-# Keyed by file path here, and by (machine id, path) for a worker's.
-_parsers: dict[str | tuple[str, str], "Transcript"] = {}
+# The store, opened on first use: the dashboard's (``use_store``), or a private one.
+_store_path: Path | None = None
+_store: transcript_store.Store | None = None
+# One reader at a time per transcript, keyed (machine id, file); this machine's id is "".
+_reading: dict[tuple[str, str], threading.Lock] = {}
 # Keyed by (machine id, workspace ID); this machine's id is None.
 _checkouts: dict[tuple[str | None, str], tuple[float, str, frozenset[str]]] = {}
 CHECKOUT_TTL = 30
-PARSED_FILES = 4
 # A worker's session listing per (machine id, checkout): a listing costs it a read of
 # every session store, and a transcript only ever reads a file listed here.
 _sessions: dict[tuple[str, str], tuple[float, list[dict]]] = {}
@@ -508,12 +528,17 @@ def details(path, agent):
         cached = _details.get(key)
     if cached and cached[0] == current:
         return cached[1]
-    try:
-        found = claude_details(path) if agent == "claude" else codex_details(path)
-    except BlockingIOError:
-        return None  # Not cached: the first line is still being written.
-    except (OSError, ValueError):
-        found = None
+    saved = store().details(key, current)
+    if saved is not None:
+        found = saved[0]
+    else:
+        try:
+            found = claude_details(path) if agent == "claude" else codex_details(path)
+        except BlockingIOError:
+            return None  # Not cached: the first line is still being written.
+        except (OSError, ValueError):
+            found = None
+        store().put_details(key, current, found)
     with _lock:
         _details.pop(key, None)
         _details[key] = (current, found)
@@ -622,15 +647,17 @@ def remote_sessions(home, machine, path):
 
 
 class Transcript:
-    """A session's conversation, parsed once and then only as its file grows."""
+    """A session's conversation, parsed once and then only as its file grows.
 
-    def __init__(self, agent, max_line=None):
+    Entries go to the store as they are parsed (``take``), and a parser picks up from
+    the place the store kept (``restore``), so only new bytes are ever parsed.
+    """
+
+    def __init__(self, agent, max_line=None, load=None):
         self.agent = agent
         self.max_line = max_line  # None: MAX_LINE.
-        self.lock = threading.Lock()
-        # (first, entries) as of the last complete read, for a request that finds the
-        # parser busy.
-        self.view: tuple[int, list[dict]] | None = None
+        # ``load(index)`` reads a saved entry back, None once it is gone.
+        self.load = load or (lambda index: None)
         self.reset(None)
 
     def reset(self, inode):
@@ -641,12 +668,62 @@ class Transcript:
         self.pending: list[bytes] = []
         self.held = 0
         self.skipping = False
-        # The transcript index of ``entries[0]``: older entries are dropped past MAX_ENTRIES.
+        # Entries before ``saved`` were taken for the store, so ``entries[0]`` has that
+        # index; the store keeps those from ``first``, dropping older past MAX_ENTRIES.
+        self.saved = 0
         self.first = 0
         self.entries: list[dict] = []
-        self.tools: dict[str, dict] = {}
-        # Codex versions that record typed prompts as events also echo them as items.
-        self.prompts: dict[str, set[str]] = {"event": set(), "item": set()}
+        # The newest tool calls, by call ID: (index, entry), the entry None until it is
+        # loaded back from the store. A result for one already taken changes that saved
+        # entry (``changed``).
+        self.tools: dict[str, tuple[int, dict | None]] = {}
+        self.changed: dict[int, dict] = {}
+        # Codex versions that record typed prompts as events also echo them as items;
+        # each is an ordered set of the newest MAX_PROMPTS.
+        self.prompts: dict[str, dict[str, None]] = {"event": {}, "item": {}}
+        # Started again from the file's start: what the store kept for it goes.
+        self.restarted = True
+
+    def restore(self, row):
+        """Pick up from a store ``row``: its place in the file and its tool calls."""
+        state = json.loads(row["state"])
+        self.inode = row["inode"]
+        self.offset = row["offset"]
+        self.skipping = bool(row["skipping"])
+        self.saved = row["saved"]
+        self.first = row["first"]
+        self.tools = {str(key): (index, None) for key, index in state.get("tools", {}).items()}
+        self.prompts = {
+            source: dict.fromkeys(state.get("prompts", {}).get(source, []))
+            for source in ("event", "item")
+        }
+        self.restarted = False
+
+    def take(self):
+        """What was parsed since the last take, for the store, as (restarted, added,
+        changed): new entries as (index, entry) pairs and changed saved entries by index.
+
+        Past MAX_ENTRIES the oldest go, a tenth at a time; indices stay those of the
+        whole transcript.
+        """
+        added = list(enumerate(self.entries, self.saved))
+        changed, restarted = self.changed, self.restarted
+        self.saved += len(self.entries)
+        self.entries, self.changed, self.restarted = [], {}, False
+        if self.saved - self.first > MAX_ENTRIES:
+            self.first = self.saved - MAX_ENTRIES + MAX_ENTRIES // 10
+            self.tools = {k: v for k, v in self.tools.items() if v[0] >= self.first}
+            added = [(i, e) for i, e in added if i >= self.first]
+            changed = {i: e for i, e in changed.items() if i >= self.first}
+        return restarted, added, changed
+
+    def place(self):
+        """Where the parser is, as the store keeps it."""
+        state = {
+            "tools": {key: index for key, (index, _) in self.tools.items()},
+            "prompts": {source: list(seen) for source, seen in self.prompts.items()},
+        }
+        return (self.inode, self.offset, self.skipping, self.saved, self.first, json.dumps(state))
 
     # Reading is split so the bytes can come from anywhere: ``position`` says where to read
     # from for the file as it is now, and ``consume`` parses what was read from there.
@@ -680,7 +757,6 @@ class Transcript:
                 except (ValueError, RecursionError):
                     continue  # Not JSON, or nested too deeply to parse or show.
         self.offset += end + 1
-        self.trim()
         return end + 1
 
     def absorb(self, data):
@@ -708,7 +784,6 @@ class Transcript:
                 self.pending, self.held = [], 0
                 self.skipping = True
                 self.too_long()
-                self.trim()
             return
         self.consume(b"".join([*self.pending, data[: end + 1]]))
         rest = data[end + 1 :]
@@ -727,36 +802,31 @@ class Transcript:
             }
         )
 
-    def trim(self):
-        """Drop the oldest entries past MAX_ENTRIES, and the tool calls they held."""
-        excess = len(self.entries) - MAX_ENTRIES
-        if excess <= 0:
-            return
-        excess += MAX_ENTRIES // 10
-        gone = {id(entry) for entry in self.entries[:excess]}
-        del self.entries[:excess]
-        self.first += excess
-        self.tools = {k: tool for k, tool in self.tools.items() if id(tool) not in gone}
-
-    def update(self, path):
+    def update(self, path, save=None):
+        """Read on to the end of this machine's ``path``, calling ``save`` after each
+        chunk; returns True, as the end was reached."""
         with remote_probe.open_transcript(path) as stream:
             info = os.fstat(stream.fileno())
             stream.seek(self.position(info.st_ino, info.st_size))
             while chunk := stream.read(CHUNK):
                 self.absorb(chunk)
+                if save:
+                    save()
+        return True
 
-    def update_remote(self, tail, file):
+    def update_remote(self, tail, file, save=None, stop=None):
         """Read on through a worker's ``tail(file, inode, offset, limit, timeout)`` probe op.
 
         Each answer ends at a line end, except a full read inside one longer line: those
         pieces are kept, as ``update`` keeps chunks, until the line ends. A poll stops
-        after REMOTE_BUDGET seconds, and the next goes on from there.
+        after REMOTE_BUDGET seconds (or at monotonic ``stop``), and the next goes on from
+        there. ``save`` is called after each answer; returns whether the end was reached.
         """
-        stop = time.monotonic() + REMOTE_BUDGET
+        stop = time.monotonic() + REMOTE_BUDGET if stop is None else stop
         for _ in range(REMOTE_READS):
             left = stop - time.monotonic()
             if left < REMOTE_MIN_READ:
-                return
+                return False
             at = self.offset + self.held
             answer = tail(
                 file=file,
@@ -774,8 +844,11 @@ class Transcript:
             if answer["offset"] + len(data) > answer["size"]:
                 raise ValueError("The worker read past the end of the transcript; refresh")
             self.absorb(data)
+            if save:
+                save()
             if not data or answer["offset"] + len(data) >= answer["size"]:
-                return
+                return True
+        return False
 
     def feed(self, item):
         if self.agent == "claude":
@@ -798,8 +871,27 @@ class Transcript:
         }
         if QUESTION_TOOLS.match(tool["name"]):
             tool["questions"] = question_list(value)
-        self.tools[key or ""] = tool
+        self.tools.pop(key or "", None)
+        self.tools[key or ""] = (self.saved + len(self.entries), tool)
+        while len(self.tools) > OPEN_TOOLS:
+            self.tools.pop(next(iter(self.tools)))
         self.entries.append(tool)
+
+    def answered(self, key):
+        """The tool call ``key`` names, to take its result; None if none is kept."""
+        found = self.tools.get(key or "")
+        if found is None:
+            return None
+        index, tool = found
+        if tool is None:
+            tool = self.load(index)
+            if tool is None:
+                del self.tools[key or ""]
+                return None
+            self.tools[key or ""] = (index, tool)
+        if index < self.saved:
+            self.changed[index] = tool
+        return tool
 
     def claude(self, item):
         if item.get("isSidechain") or item.get("isMeta"):
@@ -811,7 +903,7 @@ class Transcript:
         if kind == "user":
             for block in blocks:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool = self.tools.get(block.get("tool_use_id") or "")
+                    tool = self.answered(block.get("tool_use_id"))
                     if tool is not None:
                         tool["output"] = clip(block_text(block.get("content")), MAX_TOOL)
                         tool["error"] = bool(block.get("is_error"))
@@ -864,7 +956,7 @@ class Transcript:
             value = payload.get("arguments") or payload.get("input") or payload.get("action")
             self.tool(payload.get("call_id"), payload.get("name") or kind, value, when)
         elif kind in {"function_call_output", "custom_tool_call_output"}:
-            tool = self.tools.get(payload.get("call_id") or "")
+            tool = self.answered(payload.get("call_id"))
             if tool is not None:
                 output = payload.get("output")
                 shown = block_text(output) if isinstance(output, list) else output
@@ -879,33 +971,136 @@ class Transcript:
         # Whichever copy arrives first is kept; the echo of an already-shown prompt is not.
         other = self.prompts["item" if source == "event" else "event"]
         if text in other:
-            other.discard(text)
+            del other[text]
             return
-        self.prompts[source].add(text)
+        seen = self.prompts[source]
+        seen.pop(text, None)
+        seen[text] = None
+        while len(seen) > MAX_PROMPTS:
+            seen.pop(next(iter(seen)))
         self.entries.append(
             {"role": "user", "kind": "prompt", "text": clip(text, MAX_TEXT), "time": when}
         )
 
 
-def transcript(path, session=None, before=None, after=None, prefer=None):
+def use_store(home):
+    """Keep parsed transcripts in ``home``'s ``transcripts.sqlite`` from now on."""
+    global _store_path, _store
+    with _lock:
+        _store_path, _store = Path(home) / transcript_store.FILE, None
+
+
+def store():
+    """The transcript store, opened on first use. Without ``use_store`` it is a private
+    temporary one, removed at exit."""
+    global _store
+    with _lock:
+        if _store is None:
+            path = _store_path
+            if path is None:
+                folder = tempfile.mkdtemp(prefix="babysit-transcripts-")
+                atexit.register(shutil.rmtree, folder, True)
+                path = Path(folder) / transcript_store.FILE
+            _store = transcript_store.Store(path)
+        return _store
+
+
+def search_text(entry):
+    """What an entry is found by: its text, or a tool call's name, input and output."""
+    parts = [entry.get(name) for name in ("name", "about", "text", "input", "output")]
+    for question in entry.get("questions") or []:
+        parts += [question["question"], *(option["label"] for option in question["options"])]
+    parts += (entry.get("answers") or {}).values()
+    return "\n".join(part for part in parts if isinstance(part, str))
+
+
+def bring_up_to_date(key, agent, read, wait=1.0):
+    """Parse a transcript on from where the store has it, saving as it goes.
+
+    ``key`` is (machine id, file), "" for this machine. ``read(parser, file, save)``
+    reads on, calling ``save`` as it goes, and says whether it reached the end. Returns
+    the store row; while another request reads the same transcript for longer than
+    ``wait`` seconds, the row as last saved, or None if it was never read to its end.
+    """
+    with _lock:
+        lock = _reading.setdefault(key, threading.Lock())
+        if len(_reading) > 1000:
+            for other in [k for k, held in _reading.items() if k != key and not held.locked()]:
+                del _reading[other]
+    kept = store()
+    if not (lock.acquire(timeout=wait) if wait else lock.acquire(blocking=False)):
+        row = kept.row(*key)
+        return row if row and row["ready"] else None
+    try:
+        machine, file = key
+        row = kept.open(machine, file, agent, PARSER)
+        parser = Transcript(
+            agent,
+            REMOTE_MAX_LINE if machine else None,
+            lambda index: kept.entry(row["id"], index),
+        )
+        parser.restore(row)
+        generation = row["generation"]
+        saved = (parser.place(), row["ready"])
+
+        def save(ready=None):
+            nonlocal generation, saved
+            restarted, added, changed = parser.take()
+            if restarted and ready is None:
+                ready = False  # Read again from the start: not shown until it is whole.
+            now = (parser.place(), saved[1] if ready is None else int(ready))
+            if not (restarted or added or changed) and now == saved:
+                return  # An open viewer's poll that found nothing new writes nothing.
+            saved = now
+            generation = kept.save(
+                row["id"],
+                generation,
+                restarted=restarted,
+                added=[(i, json.dumps(e), search_text(e)) for i, e in added],
+                changed=[(i, json.dumps(e), search_text(e)) for i, e in changed.items()],
+                place=parser.place(),
+                ready=ready,
+            )
+
+        save(ready=True if read(parser, file, save) else None)
+    finally:
+        lock.release()
+    # Indexed once the read is done, so its saves never wait behind the indexing.
+    kept.index_soon(row["id"])
+    if kept.prune_due():
+        threading.Thread(target=kept.prune, name="transcript-prune", daemon=True).start()
+    return kept.row(*key)
+
+
+def local_read(parser, file, save):
+    return parser.update(file, save)
+
+
+def transcript(path, session=None, before=None, after=None, prefer=None, around=None, later=None):
     """One page of a session's conversation.
 
     The newest page by default; ``before`` pages back from an index, and ``after``
-    returns what follows an index, so an open viewer fetches only what is new. Without
-    a ``session``, ``prefer`` is chosen when it is recorded here, else the newest.
+    returns what follows an index, so an open viewer fetches only what is new.
+    ``around`` centres a page on an index (a search hit) and ``later`` pages on from
+    one. Without a ``session``, ``prefer`` is chosen when it is recorded here, else the
+    newest.
     """
     return transcript_page(
         sessions(path),
-        str,
-        lambda parser, file: parser.update(file),
+        lambda file: ("", str(file)),
+        local_read,
         session,
         before,
         after,
         prefer,
+        around,
+        later,
     )
 
 
-def remote_transcript(home, machine, path, session=None, before=None, after=None, prefer=None):
+def remote_transcript(
+    home, machine, path, session=None, before=None, after=None, prefer=None, around=None, later=None
+):
     """``transcript`` of a worker's checkout: its listing and new bytes, parsed here."""
 
     def tail(**args):
@@ -914,17 +1109,19 @@ def remote_transcript(home, machine, path, session=None, before=None, after=None
     return transcript_page(
         remote_sessions(home, machine, path),
         lambda file: (machine.id, file),
-        lambda parser, file: parser.update_remote(tail, file),
+        lambda parser, file, save: parser.update_remote(tail, file, save),
         session,
         before,
         after,
         prefer,
+        around,
+        later,
     )
 
 
-def transcript_page(listed, key_of, read, session, before, after, prefer):
-    """A page of one ``listed`` session, its parser kept under ``key_of(file)`` and
-    brought up to date by ``read(parser, file)``."""
+def transcript_page(listed, key_of, read, session, before, after, prefer, around=None, later=None):
+    """A page of one ``listed`` session, kept in the store under ``key_of(file)`` and
+    brought up to date by ``read(parser, file, save)``."""
     if session is None:
         if not listed:
             return {
@@ -942,40 +1139,106 @@ def transcript_page(listed, key_of, read, session, before, after, prefer):
         chosen = next((s for s in listed if s["id"] == session), None)
         if chosen is None:
             raise ValueError("That session is not recorded for this workspace")
-    key = key_of(chosen["_file"])
-    with _lock:
-        # A worker's transcripts are keyed (machine id, file).
-        parser = _parsers.pop(key, None) or Transcript(
-            chosen["agent"], REMOTE_MAX_LINE if isinstance(key, tuple) else None
-        )
-        _parsers[key] = parser
-        while len(_parsers) > PARSED_FILES:
-            _parsers.pop(next(iter(_parsers)), None)
-    # A first parse of a large file takes a while; it holds only this transcript's lock,
-    # and a request meanwhile is answered from the last complete read.
-    if parser.lock.acquire(timeout=1):
-        try:
-            read(parser, chosen["_file"])
-            parser.view = (parser.first, list(parser.entries))
-        finally:
-            parser.lock.release()
-    elif parser.view is None:
+    # A first parse of a large file takes a while; a request meanwhile is answered from
+    # what was saved by the last complete read.
+    row = bring_up_to_date(key_of(chosen["_file"]), chosen["agent"], read)
+    if row is None:
         raise ValueError("This transcript is still being read; try again shortly")
-    first, entries = parser.view
     # Indices count from the transcript's start, the dropped oldest entries included.
-    total = first + len(entries)
+    first, total = row["first"], row["saved"]
     if after is not None and first <= after <= total and total - after <= PAGE:
         start, end = after, total
+    elif around is not None:
+        start = max(first, min(around, total) - PAGE // 2)
+        end = min(total, start + PAGE)
+    elif later is not None:
+        start = max(first, min(later, total))
+        end = min(total, start + PAGE)
     else:
         end = total if before is None else max(first, min(before, total))
         start = max(first, end - PAGE)
-    page = [dict(e) for e in entries[start - first : end - first]]
     # Underscored fields (the file, and a worker's facts for resuming) stay here.
     return {
         "sessions": [{k: v for k, v in s.items() if not k.startswith("_")} for s in listed],
         "session": {k: v for k, v in chosen.items() if not k.startswith("_")},
-        "entries": page,
+        "entries": store().page(row["id"], start, end),
         "start": start,
         "first": first,
         "total": total,
+    }
+
+
+def search(path, text):
+    """Entries of this checkout's sessions that contain ``text``, newest sessions first."""
+    return search_sessions(sessions(path), lambda file: ("", str(file)), local_read, text)
+
+
+def remote_search(home, machine, path, text):
+    """``search`` of a worker's checkout, reading its transcripts on through the probe."""
+
+    def tail(**args):
+        return probe(home, machine, "tail", **args)
+
+    stop = time.monotonic() + SEARCH_BUDGET
+    return search_sessions(
+        remote_sessions(home, machine, path),
+        lambda file: (machine.id, file),
+        lambda parser, file, save: parser.update_remote(tail, file, save, stop),
+        text,
+        stop,
+    )
+
+
+def search_sessions(listed, key_of, read, text, stop=None):
+    """Search ``listed`` sessions, bringing each up to date first until ``stop``.
+
+    Sessions not read to their end in time (or busy, or unreadable) are searched as far
+    as they were saved and counted in ``behind``; searching again reads on.
+    """
+    expression = transcript_store.match_expression(text)
+    stop = time.monotonic() + SEARCH_BUDGET if stop is None else stop
+    rows: dict[int, dict] = {}
+    behind = 0
+    for session in listed:
+        key = key_of(session["_file"])
+        row = None
+        if time.monotonic() < stop:
+            try:
+                row = bring_up_to_date(key, session["agent"], read, wait=0)
+            except (OSError, ValueError):
+                if key[0]:
+                    stop = 0  # A worker that no longer answers: search what is kept.
+        if row is None:
+            row = store().row(*key)
+        if row is None or not row["ready"]:
+            behind += 1
+        if row is not None:
+            rows[row["id"]] = session
+    matches, counts = store().search(list(rows), expression, SEARCH_RESULTS)
+    found = []
+    for transcript_id, index, entry, snippet in matches:
+        session = rows[transcript_id]
+        found.append(
+            {
+                "session": session["id"],
+                "agent": session["agent"],
+                "title": session["title"],
+                "updated": session["updated"],
+                "index": index,
+                "role": entry.get("role"),
+                "kind": entry.get("kind"),
+                "name": entry.get("name"),
+                "time": entry.get("time"),
+                "snippet": [
+                    {"text": part, "match": matched}
+                    for part, matched in transcript_store.snippet_parts(snippet)
+                ],
+            }
+        )
+    return {
+        "query": " ".join(text.split()),
+        "results": found,
+        "total": sum(counts.values()),
+        "searched": len(rows),
+        "behind": behind,
     }

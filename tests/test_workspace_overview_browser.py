@@ -1,6 +1,7 @@
 """Workspace experiment browser coverage against temporary servers and a stubbed cleanup."""
 
 import copy
+import json
 import re
 import threading
 import time
@@ -812,6 +813,62 @@ def test_a_live_transcript_updates_in_place(page, site):
     expect(details).to_have_attribute("open", "")
     expect(page.locator("#ws-viewer-meta")).to_contain_text("3 entries")
     assert "after=0" in requests[-1]
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_searching_sessions_opens_the_entry_found_and_reads_on_from_there(
+    page, site, tmp_path, monkeypatch, width
+):
+    url, plugin, _ = site
+    checkout = tmp_path / "wt" / "searched"
+    checkout.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    folder = tmp_path / "claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(checkout))
+    folder.mkdir(parents=True)
+
+    def turn(kind, text):
+        content = text if kind == "user" else [{"type": "text", "text": text}]
+        return {"type": kind, "cwd": str(checkout), "message": {"role": kind, "content": content}}
+
+    steps = [f"Step {i}" if i != 10 else "Found a needle in the logs" for i in range(260)]
+    records = [turn("user", "Find the flaky test"), *(turn("assistant", s) for s in steps)]
+    (folder / "8f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    plugin.value["workspaces"] = [row("searched", key=str(checkout), path=str(checkout))]
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("searched", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    meta = page.locator("#ws-viewer-meta")
+    expect(meta).to_contain_text("261 entries")
+    search = dialog.get_by_role("searchbox", name="Search this checkout's transcripts")
+    search.fill("NEEDLE")
+    search.press("Enter")
+    expect(meta).to_have_text("1 match for “NEEDLE” in 1 session.")
+    hit = dialog.locator(".ws-hit")
+    expect(hit.locator("mark")).to_have_text("needle")
+    expect(hit).to_contain_text("Find the flaky test")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    hit.click()
+    found = dialog.locator(".ws-found")
+    expect(found).to_contain_text("Found a needle in the logs")
+    expect(found).to_be_in_viewport()
+    later = dialog.get_by_role("button", name="Show later entries (61)")
+    later.click()
+    expect(later).to_be_hidden()
+    expect(dialog.locator(".ws-msg").last).to_contain_text("Step 259")
+    # The transcript is parsed into the dashboard's store, and searched from it.
+    assert (tmp_path / "transcripts.sqlite").exists()
+    search = dialog.get_by_role("searchbox", name="Search this checkout's transcripts")
+    search.fill("no such words")
+    search.press("Enter")
+    expect(dialog.get_by_text("Nothing found.")).to_be_visible()
+    dialog.get_by_role("button", name="Back to the transcript").click()
+    expect(meta).to_contain_text("261 entries")
+    expect(dialog.locator(".ws-msg").last).to_contain_text("Step 259")
 
 
 def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):

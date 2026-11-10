@@ -509,8 +509,69 @@
   color: var(--del-fg);
   background: var(--del-bg);
 }
-.ws-earlier {
+.ws-earlier,
+.ws-later {
   margin-top: 12px;
+}
+/* Searching a checkout's sessions, and the entries found. */
+.ws-search {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+.ws-search input {
+  width: min(280px, 60vw);
+  min-width: 0;
+}
+.ws-hits {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.ws-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ws-hit:hover {
+  background: var(--hover);
+}
+.ws-hit-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-size: 12px;
+}
+.ws-hit-session {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.ws-hit-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.ws-hit-text mark {
+  color: var(--amber-fg);
+  background: var(--amber-bg);
+  font-weight: 600;
+}
+.ws-found {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 .ws-view-buttons {
   display: inline-flex;
