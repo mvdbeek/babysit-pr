@@ -4316,6 +4316,178 @@ def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
 
 
 @pytest.mark.parametrize("width", [1280, 390])
+def test_consecutive_tool_calls_collapse_and_follow_live_updates(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    entries = [
+        {"role": "user", "text": "Check the changes"},
+        {
+            "role": "tool",
+            "name": "Bash",
+            "about": "Run tests",
+            "input": "tox",
+            "output": "Tests failed",
+            "error": True,
+        },
+        {
+            "role": "tool",
+            "name": "Read",
+            "about": "Inspect the failure",
+            "brief": "tests/" + "long_path/" * 30 + "test_example.py",
+            "input": "Read test_example.py",
+            "output": None,
+        },
+    ]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+    page.clock.install()
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    group = viewer.locator(".ws-tool-group")
+    summary = group.locator(":scope > summary")
+    calls = group.locator(".ws-tool-list > .ws-tool")
+    expect(summary).to_contain_text("2 tool calls")
+    expect(summary.locator("strong")).to_have_text("Read")
+    expect(summary.locator(".badge")).to_have_text("1 error")
+    expect(calls.first).to_be_hidden()
+    expect(calls.last).to_be_hidden()
+    assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+    page.screenshot(path=f"reports/transcript-tools-collapsed-{width}.png", full_page=True)
+    summary.focus()
+    page.keyboard.press("Enter")
+    expect(calls.first).to_be_visible()
+    calls.first.locator("summary").click()
+    expect(calls.first.locator(".ws-tool-error")).to_have_text("Tests failed")
+    calls.last.locator("summary").click()
+    # A new call joins the existing group, and a delayed result fills an open call.
+    entries[2]["output"] = "Assertion source"
+    entries.append({"role": "tool", "name": "Edit", "about": "Fix the assertion", "input": "patch"})
+    page.clock.run_for(11000)
+    expect(summary).to_contain_text("3 tool calls")
+    expect(summary.locator("strong")).to_have_text("Edit")
+    expect(group).to_have_attribute("open", "")
+    expect(calls.nth(1).locator(".ws-tool-output")).to_have_text("Assertion source")
+    expect(calls.first.locator(".ws-tool-error")).to_be_visible()
+    page.screenshot(path=f"reports/transcript-tools-expanded-{width}.png", full_page=True)
+    # Collapsed groups keep following the newest call, including errors that resolve.
+    summary.click()
+    entries[1].update(output="Tests passed", error=False)
+    entries.append({"role": "tool", "name": "Bash", "brief": "git diff", "input": "git diff"})
+    page.clock.run_for(11000)
+    expect(summary).to_contain_text("4 tool calls")
+    expect(summary.locator(".ws-tool-brief")).to_have_text("git diff")
+    expect(summary.locator(".badge")).to_have_count(0)
+    expect(calls.first).to_be_hidden()
+    # Messages and questions break groups and remain visible beside a later call.
+    entries.extend(
+        [
+            {"role": "assistant", "text": "Ready to continue"},
+            {"role": "tool", "name": "Read", "input": "README.md"},
+            question_entry([QUESTION]),
+            {"role": "tool", "name": "Bash", "input": "git status"},
+        ]
+    )
+    page.clock.run_for(11000)
+    expect(viewer.locator(".ws-transcript > .ws-tool-group")).to_have_count(1)
+    expect(viewer.locator(".ws-transcript > .ws-tool:not(.ws-tool-group)")).to_have_count(2)
+    expect(viewer.get_by_text("Ready to continue", exact=True)).to_be_visible()
+    expect(viewer.locator(".ws-transcript > .ws-question")).to_be_visible()
+    assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+
+
+def test_tool_groups_extend_across_pages_and_reveal_search_results(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    entries = [
+        {"role": "user", "text": "Check the changes"},
+        *[
+            {"role": "tool", "name": "Bash", "input": f"command {i}", "output": f"result {i}"}
+            for i in range(4)
+        ],
+        {"role": "assistant", "text": "Finished"},
+    ]
+
+    def transcript(route):
+        if "before=" in route.request.url:
+            start, end = 0, 3
+        elif "later=" in route.request.url:
+            start, end = 4, 6
+        elif "around=" in route.request.url:
+            start, end = 0, 6
+        else:
+            start, end = 3, 4
+        route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries[start:end],
+                "start": start,
+                "total": len(entries),
+            }
+        )
+
+    page.route("**/api/workspace-transcript?*", transcript)
+    page.route(
+        "**/api/workspace-search?*",
+        lambda route: route.fulfill(
+            json={
+                "query": "result 1",
+                "searched": 1,
+                "total": 1,
+                "results": [
+                    {
+                        "session": "s1",
+                        "agent": "claude",
+                        "role": "tool",
+                        "name": "Bash",
+                        "index": 2,
+                        "snippet": [{"text": "result 1", "match": True}],
+                    }
+                ],
+            }
+        ),
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    viewer.locator(".ws-tool > summary").click()
+    expect(viewer.locator(".ws-tool-output")).to_be_visible()
+    viewer.get_by_role("button", name="Show earlier entries (3)").click()
+    group = viewer.locator(".ws-tool-group")
+    expect(group.locator(":scope > summary")).to_contain_text("3 tool calls")
+    expect(group).to_have_attribute("open", "")
+    expect(group.locator(".ws-tool-output").last).to_be_visible()
+    viewer.get_by_role("button", name="Show later entries (2)").click()
+    expect(group.locator(":scope > summary")).to_contain_text("4 tool calls")
+    expect(group.locator(".ws-tool-input")).to_have_text([f"command {i}" for i in range(4)])
+    expect(group.locator(".ws-tool-output").nth(2)).to_be_visible()
+    search = viewer.get_by_role("searchbox", name="Search this checkout's transcripts")
+    search.fill("result 1")
+    search.press("Enter")
+    viewer.locator(".ws-hit").click()
+    found = viewer.locator(".ws-found")
+    expect(found.locator(".ws-tool-output")).to_be_visible()
+    expect(found.locator(".ws-tool-output")).to_have_text("result 1")
+    expect(found).to_be_in_viewport()
+
+
+@pytest.mark.parametrize("width", [1280, 390])
 def test_transcript_entries_show_when_they_were_recorded(
     page, dashboard_site, viewer_routes, width
 ):

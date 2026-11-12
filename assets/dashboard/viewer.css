@@ -392,6 +392,28 @@
 .ws-tool > summary .badge {
   flex: none;
 }
+.ws-tool-count {
+  flex: none;
+  color: var(--muted);
+  font-size: 12px;
+}
+.ws-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 6px 6px;
+}
+@media (max-width: 600px) {
+  .ws-tool-group > summary {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .ws-tool-group > summary .ws-tool-brief {
+    flex-basis: 100%;
+    order: 1;
+    padding-left: 18px;
+  }
+}
 .ws-note {
   padding: 2px 12px;
   font-size: 13px;
