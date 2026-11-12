@@ -18,9 +18,59 @@ from pathlib import Path
 import exit_watch
 import pytest
 import safe_git
+import worker_api
 import wt
 
 TOOL = str(Path(wt.__file__).resolve())
+
+
+@pytest.mark.parametrize("file_prompt", [False, True])
+def test_follow_up_sends_through_the_worker_broker(tmp_path, socket_dir, file_prompt):
+    path = socket_dir / "register.sock"
+    received = []
+    broker_answering(path, {"sent": True, "warning": "Check progress in Collie"}, received)
+    sid = "0b6f3c1e-2d4a-4e5f-9a7b-8c9d0e1f2a3b"
+    t = tool(env={"HOME": str(tmp_path), worker_api.SOCKET_ENV: str(path), "CODEX_THREAD_ID": sid})
+    message = "Also test retries\nwith two workers"
+    args = ["-p", message]
+    if file_prompt:
+        brief = tmp_path / "message.md"
+        brief.write_text(message)
+        args = ["-F", str(brief)]
+    t.run("wt", ["follow-up", f"new:{sid}", *args])
+    assert received == [
+        {
+            "action": "follow-up",
+            "target": f"new:{sid}",
+            "text": message,
+            "sessions": {"codex": sid, "claude": None},
+        }
+    ]
+    assert "message sent" in t.stderr.getvalue() and "Check progress" in t.stderr.getvalue()
+    assert t.runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "answer,message",
+    [
+        ({"error": "Not your child"}, "controller refused"),
+        ({"error": "Timed out", "uncertain": True}, "may have been sent"),
+        ({"unexpected": True}, "check before resending"),
+    ],
+)
+def test_follow_up_refusals_and_uncertain_replies(socket_dir, answer, message):
+    path = socket_dir / "register.sock"
+    broker_answering(path, answer, [])
+    t = tool(env={"HOME": "/h", worker_api.SOCKET_ENV: str(path)})
+    with pytest.raises(wt.WtError, match=message):
+        t.run("wt", ["follow-up", "new:0b6f3c1e-2d4a-4e5f-9a7b-8c9d0e1f2a3b", "-p", "Continue"])
+
+
+def test_follow_up_without_broker_starts_nothing():
+    t = tool()
+    with pytest.raises(wt.WtError, match="original worker conversation's broker"):
+        t.run("wt", ["follow-up", "new:0b6f3c1e-2d4a-4e5f-9a7b-8c9d0e1f2a3b", "-p", "Continue"])
+    assert t.runner.calls == []
 
 
 class FakeRunner:
@@ -2686,6 +2736,7 @@ def test_a_worker_sandbox_hands_a_new_task_to_its_launchs_broker(tmp_path, socke
         "sessions": {"claude": None, "codex": SID},
     }
     assert t.stderr.getvalue().splitlines()[-1] == "wt: x at /w/x on Chonk"
+    assert "wt: task new:1" in t.stderr.getvalue().splitlines()
 
 
 @pytest.mark.parametrize(

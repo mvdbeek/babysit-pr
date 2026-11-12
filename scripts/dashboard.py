@@ -1477,7 +1477,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Send one JSON request body")
             request = json.loads(self.read_body(length, 10))
             answer = worker_api.handle(
-                self.server.home, machine, action, request, launch=self.worker_launch
+                self.server.home,
+                machine,
+                action,
+                request,
+                launch=self.worker_launch,
+                follow_up=self.worker_follow_up,
             )
             if action == "launch":
                 # Recorded: from here nothing is a refusal, which would invite a retry.
@@ -1496,6 +1501,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.server.workspaces:
             raise ValueError("Workspace actions are not enabled")
         return self.server.workspaces.subtask(launch, parent)
+
+    def worker_follow_up(self, target, text, parent):
+        if not self.server.workspaces:
+            raise ValueError("Workspace actions are not enabled")
+        return self.server.workspaces.follow_up(target, text, parent)
 
     def worker_launched(self, op):
         """A worker's sub-task once started or a few minutes on, without its log, which

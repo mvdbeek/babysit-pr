@@ -17,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
+import agent_messages
 import dashboard
 import pr_supervisor as supervisor
 import pr_workspaces as pw
@@ -24,6 +25,7 @@ import pytest
 import worker_api
 import workspace_overview
 import wt
+from test_machine_loads import settle
 from test_pr_workspaces import finish, helper_calls, local  # noqa: F401 (fixture)
 from test_remote_cron import git, rollout, short_tmp  # noqa: F401 (fixture)
 from test_remote_launch import remote  # noqa: F401 (fixture)
@@ -327,8 +329,6 @@ def test_a_subtask_waits_for_a_full_machine_or_too_many_subtask_slots(local):  #
 def test_a_subtask_goes_to_the_worker_named_and_records_its_parent_there(remote):  # noqa: F811
     manager, _, state, _ = remote
     manager.loads.snapshot()
-    from test_machine_loads import settle
-
     settle(manager.loads)
     asked = parent(machine="mini", machine_label="Mac mini", sandbox="bwrap")
     op = manager.subtask(launch(machine="mini"), asked)["operation"]
@@ -371,6 +371,10 @@ class Recorder:
     def await_operation(self, op, wait):
         self.waited.append(wait)
         return op
+
+    def follow_up(self, target, text, parent):
+        self.asked.append((target, text, parent))
+        return {"sent": True, "pane": "w1:p1"}
 
 
 @pytest.fixture
@@ -637,8 +641,9 @@ class Failing(http.server.BaseHTTPRequestHandler):
 
 
 @pytest.mark.parametrize(("status", "uncertain"), [(502, True), (503, True), (400, False)])
+@pytest.mark.parametrize("action", ["launch", "follow-up"])
 def test_a_failing_controller_leaves_a_launch_uncertain_never_refused(
-    tmp_path, monkeypatch, status, uncertain
+    tmp_path, monkeypatch, status, uncertain, action
 ):
     handler = type("Handler", (Failing,), {"status": status})
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -651,8 +656,8 @@ def test_a_failing_controller_leaves_a_launch_uncertain_never_refused(
         monkeypatch.setenv("HOME", str(tmp_path))
         failure = RuntimeError if uncertain else ValueError
         with pytest.raises(failure):
-            worker_api.post("launch", {})
-        # Other actions start nothing, so a failure is only a refusal.
+            worker_api.post(action, {})
+        # Registration starts no task or message, so a failure is only a refusal.
         with pytest.raises(ValueError, match="The controller refused"):
             worker_api.post("register", {})
     finally:
@@ -672,3 +677,111 @@ def test_a_subtasks_record_outlives_the_day_new_tasks_are_listed(local):  # noqa
     manager.new_operations(manager.state())
     left = manager.state()["operations"]
     assert kept["pr"] in left and gone["pr"] not in left and plain["pr"] not in left
+
+
+def test_follow_up_crosses_the_broker_with_only_its_own_parent_identity(box, launching_broker):  # noqa: F811
+    start, workspaces = launching_broker
+    target = f"new:{uuid.uuid4()}"
+    request = {
+        "action": "follow-up",
+        "target": target,
+        "text": "Also test\nthe retry path",
+        "sessions": {"codex": box["sid"], "claude": SID},
+    }
+    for bad, message in (
+        ({**request, "parent": worker_parent()}, "exactly the follow-up fields"),
+        ({**request, "sessions": {"codex": SID}}, "not one of this sandbox's own"),
+        ({**request, "text": "bad\x1btext"}, "control characters"),
+        ({**request, "target": "w1:p1"}, "Invalid sub-task"),
+        ({**request, "text": " "}, "Supply a message"),
+    ):
+        listen = start(f"--cwd={box['tree']}")
+        assert message in ask(listen, bad)["error"]
+    assert workspaces.asked == []
+    # Controller validation failures consume the broker's rate bucket. A fresh broker
+    # represents the same parent, without waiting on the real rate-limit interval.
+    listen = start(f"--cwd={box['tree']}")
+    assert ask(listen, request) == {"sent": True, "pane": "w1:p1"}
+    [(sent, text, asked)] = workspaces.asked
+    assert sent == target and text == request["text"]
+    assert asked["machine"] == "box" and asked["session"] == box["sid"]
+    assert asked["cwd"] == str(box["tree"]) and asked["agent"] == "codex"
+    assert asked["rollout"].startswith(str(box["worker"] / ".codex"))
+    assert "moments ago" in ask(listen, request)["error"]
+
+
+def test_worker_follow_up_requires_authentication_and_strict_fields(box, served_with):  # noqa: F811
+    workspaces = Recorder()
+    server = served_with(workspaces)
+    auth = {"Authorization": f"Bearer {worker_api.issue(box['home'], 'box')}"}
+    body = {"target": f"new:{uuid.uuid4()}", "text": "Continue", "parent": worker_parent()}
+    assert post(server, "/api/worker/follow-up", body)[0] == 403
+    assert (
+        post(server, "/api/worker/follow-up", body, {**auth, "Origin": "http://evil.test"})[0]
+        == 403
+    )
+    assert post(server, "/api/worker/follow-up", {**body, "pane": "w1:p2"}, auth)[0] == 400
+    code, answer = post(server, "/api/worker/follow-up", body, auth)
+    assert code == 200 and answer["sent"] is True
+
+
+def test_follow_up_messages_only_the_recorded_live_child(remote):  # noqa: F811
+    manager, _, state, _ = remote
+    manager.loads.snapshot()
+    settle(manager.loads)
+    asked = parent(machine="mini", machine_label="Mac mini", sandbox="bwrap")
+    op = manager.subtask(launch(machine="mini"), asked)["operation"]
+    op = manager.await_operation(op, 30)
+    assert op["status"] == "complete", op
+    data = json.loads(state.read_text())
+    [agent] = data["machines"]["Mac mini"]["agents"]
+    agent["agent_session"] = {"value": SID}
+    state.write_text(json.dumps(data))
+    for field, value in (
+        ("session", str(uuid.uuid4())),
+        ("machine", "box"),
+        ("cwd", "/other"),
+        ("config_dir", "/other"),
+        ("rollout", "/other"),
+        ("agent", "claude"),
+    ):
+        with pytest.raises(ValueError, match="conversation that started"):
+            manager.follow_up(op["pr"], "No", {**asked, field: value})
+    assert manager.follow_up(op["pr"], "Also cover retries", asked)["sent"] is True
+    assert manager.operation(op["pr"])["result"]["session_id"] == SID
+    data = json.loads(state.read_text())
+    worker = data["machines"]["Mac mini"]
+    assert worker["prompts"] == [[agent["pane_id"], "Also cover retries"]]
+    worker["agents"][0]["agent_session"] = {"value": str(uuid.uuid4())}
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="session changed"):
+        manager.follow_up(op["pr"], "No", asked)
+    worker["agents"] = []
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="no longer running"):
+        manager.follow_up(op["pr"], "No", asked)
+    assert json.loads(state.read_text())["machines"]["Mac mini"]["prompts"] == worker["prompts"]
+    manager.save_operation(op, status="running")
+    with pytest.raises(ValueError, match="not ready"):
+        manager.follow_up(op["pr"], "No", asked)
+    manager.save_operation(op, status="complete", result={})
+    with pytest.raises(ValueError, match="no recorded agent pane"):
+        manager.follow_up(op["pr"], "No", asked)
+
+
+def test_follow_up_rechecks_the_session_before_delivery(remote, monkeypatch):  # noqa: F811
+    manager, _, state, _ = remote
+    op = record(manager, "/parent", machine="mini", target="mini", path="/child")
+    manager.save_operation(
+        op, agent="codex", result={"workspace_id": "mini/w1", "pane_id": "w1:p1", "session_id": SID}
+    )
+    monkeypatch.setattr(agent_messages, "workspace_root", lambda *a: "/child")
+    readings = iter([SID, str(uuid.uuid4())])
+    monkeypatch.setattr(
+        agent_messages,
+        "agents",
+        lambda *a, **k: [{"pane": "w1:p1", "agent": "codex", "session": next(readings)}],
+    )
+    with pytest.raises(ValueError, match="session changed"):
+        manager.follow_up(op["pr"], "No", op["parent"])
+    assert not json.loads(state.read_text()).get("prompts")

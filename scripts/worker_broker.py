@@ -28,6 +28,11 @@ launch was granted Docker (``docker`` in ``--granted``). The review flag request
 never authorizes a provider/account change. The controller decides the rest; a launch without
 ``--cwd`` starts nothing.
 
+A follow-up (``action: follow-up``) carries a child task's ``target`` handle and
+``text`` with the same ``sessions`` as a launch. The broker supplies the same parent
+identity; the controller checks that the recorded child belongs to it before
+messaging its live agent. No pane, worker or session to message comes from the sandbox.
+
 "Its own sessions" means every session in that configuration directory, which other
 launches of the same Claude account or Codex home share and can write: an agent can
 register such a session (one recorded in its own worktree) or plant one there, so a
@@ -79,7 +84,7 @@ READ_TIMEOUT = 30  # For a whole request, however slowly it arrives.
 MIN_INTERVAL = 20
 CONNECTIONS = 4
 _forwarding = threading.Lock()
-_last = {"register": 0.0, "handoff": 0.0, "launch": 0.0}
+_last = dict.fromkeys(worker_api.ACTIONS, 0.0)
 _slots = threading.BoundedSemaphore(CONNECTIONS)
 SESSION_POLL = 2  # Seconds between looks at the session the sandbox's agent runs.
 SESSION_DEPTH = 4  # bwrap, its init in the namespace, then the agent: two levels down.
@@ -112,12 +117,15 @@ def check(request, agent, config_dir, worktrees, launch=None):
     """The action and request to forward, or ValueError: this launch's own session and
     checkout. ``launch`` is this launch's ``cwd`` and ``docker`` grant."""
     action = request.pop("action", "register") if isinstance(request, dict) else None
-    if action == "launch":
+    if action in {"launch", "follow-up"}:
         sessions = request.get("sessions")
         fields = request.get("launch")
-        if (
+        if action == "follow-up":
+            if set(request) != {"target", "text", "sessions"}:
+                raise ValueError("Expected exactly the follow-up fields")
+            fields = {"target": request["target"], "text": request["text"]}
+        elif (
             set(request) != {"launch", "sessions"}
-            or not isinstance(sessions, dict)
             or not isinstance(fields, dict)
             or set(fields) - {"tags", "review"} != set(wt.LAUNCH_FIELDS)
         ):
@@ -125,11 +133,13 @@ def check(request, agent, config_dir, worktrees, launch=None):
         if not launch or not launch.get("cwd"):
             raise ValueError("This sandbox's launch cannot start tasks")
         try:
+            if not isinstance(sessions, dict):
+                raise ValueError("Invalid sessions")
             session = str(uuid.UUID(sessions.get(agent)))
         except (TypeError, ValueError, AttributeError) as exc:
             raise ValueError(f"Start tasks from this sandbox's own {agent} conversation") from exc
         return action, {
-            "launch": fields,
+            **({"launch": fields} if action == "launch" else fields),
             "parent": {
                 "cwd": launch["cwd"],
                 "session": session,
@@ -196,8 +206,11 @@ def answer(client, agent, config_dir, worktrees, launch=None):
             client.settimeout(None)
             result = forward(action, request)
         except RuntimeError as exc:
-            # Sent, but unanswered: a launch may have started.
-            result = {"error": str(exc), **({"uncertain": True} if action == "launch" else {})}
+            # Sent, but unanswered: a launch may have started or a message been delivered.
+            result = {
+                "error": str(exc),
+                **({"uncertain": True} if action in {"launch", "follow-up"} else {}),
+            }
         except (ValueError, OSError) as exc:
             result = {"error": str(exc)}
         with contextlib.suppress(OSError):

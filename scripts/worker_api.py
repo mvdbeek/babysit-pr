@@ -15,6 +15,9 @@ launches (``launch``): a New task, sandboxed, under the controller's sub-task ru
 ``worker.json`` can do that: the worker's user, not its sandboxed agents, whose home
 babysit-bwrap replaces and who reach the controller only through their launch's broker
 (``worker_broker``).
+
+``follow-up`` messages a live child launch, after checking the recorded parent
+against the broker's identity. The target machine and agent come from that record.
 """
 
 import hashlib
@@ -40,7 +43,7 @@ MAX_BODY = 65536
 MAX_ANSWER = 65536
 # Reading the worker's checkout and session, and GitHub, can take a while over ssh.
 FORWARD_TIMEOUT = 300
-ACTIONS = {"register", "handoff", "launch"}
+ACTIONS = {"register", "handoff", "launch", "follow-up"}
 # Set by babysit-bwrap inside a worker's sandbox: its registration broker's socket.
 SOCKET_ENV = "BABYSIT_REGISTER_SOCKET"
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -352,7 +355,21 @@ def local_parent(parent):
     }
 
 
-def handle(home, machine, action, request, launch=None):
+def follow_up_args(machine, request):
+    """A message to a recorded child launch; the broker supplies its parent's identity."""
+    if not isinstance(request, dict) or set(request) != {"target", "text", "parent"}:
+        raise ValueError("Expected exactly the follow-up fields")
+    _, parent = launch_args(machine, {"launch": None, "parent": request["parent"]})
+    target = _text(request["target"], "sub-task", 40)
+    if not target.startswith("new:") or not UUID.fullmatch(target[4:]):
+        raise ValueError("Invalid sub-task")
+    text = _text(request["text"], "message", 32000, prompt=True)
+    if not text.strip():
+        raise ValueError("Supply a message")
+    return target, text, parent
+
+
+def handle(home, machine, action, request, launch=None, follow_up=None):
     """Answer one worker request for ``machine``, the one its token names.
 
     Limits apply per machine and worktree (a launch's: its parent's directory), so one
@@ -362,7 +379,11 @@ def handle(home, machine, action, request, launch=None):
     import pr_supervisor
 
     cwd = request.get("cwd") if isinstance(request, dict) else None
-    if action == "launch" and isinstance(request, dict) and isinstance(request.get("parent"), dict):
+    if (
+        action in {"launch", "follow-up"}
+        and isinstance(request, dict)
+        and isinstance(request.get("parent"), dict)
+    ):
         cwd = request["parent"].get("cwd")
     key = f"{machine.id}\0{cwd if isinstance(cwd, str) and len(cwd) <= 4096 else ''}"
     with _busy_lock:
@@ -378,6 +399,10 @@ def handle(home, machine, action, request, launch=None):
         if not _take(machine.id, machine=True) or not _take(key):
             raise RateLimited(f"Too many requests from {machine.label}; wait a minute")
         try:
+            if action == "follow-up":
+                if follow_up is None:
+                    raise ValueError("This dashboard does not message sub-tasks")
+                return follow_up(*follow_up_args(machine, request))
             if action == "launch":
                 if launch is None:
                     raise ValueError("This dashboard does not start tasks")
@@ -522,8 +547,8 @@ def post(action, payload, timeout=FORWARD_TIMEOUT):
             detail = str(json.loads(exc.read(MAX_ANSWER))["error"])
         except (OSError, ValueError, KeyError, TypeError):
             detail = f"HTTP {exc.code}"
-        if action == "launch" and exc.code >= 500:
-            # A proxy's 502 or the dashboard's 503 may follow a launch it recorded.
+        if action in {"launch", "follow-up"} and exc.code >= 500:
+            # A proxy's 502 or dashboard's 503 may follow a recorded launch or sent message.
             raise RuntimeError(f"The controller failed: {detail[:1000]}") from exc
         raise ValueError(f"The controller refused: {detail[:1000]}") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
