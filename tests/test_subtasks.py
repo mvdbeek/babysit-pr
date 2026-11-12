@@ -679,7 +679,12 @@ def test_a_subtasks_record_outlives_the_day_new_tasks_are_listed(local):  # noqa
     assert kept["pr"] in left and gone["pr"] not in left and plain["pr"] not in left
 
 
-def test_follow_up_crosses_the_broker_with_only_its_own_parent_identity(box, launching_broker):  # noqa: F811
+def test_follow_up_crosses_the_broker_with_only_its_own_parent_identity(
+    box,  # noqa: F811
+    launching_broker,
+    monkeypatch,
+):
+    monkeypatch.setattr(worker_api, "RATE", 100)  # Exercise several controller refusals in a row.
     start, workspaces = launching_broker
     target = f"new:{uuid.uuid4()}"
     request = {
