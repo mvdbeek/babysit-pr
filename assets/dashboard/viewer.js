@@ -793,6 +793,8 @@
     const item = viewer.nodes[index - viewer.data.start];
     if (!item) return;
     item.classList.add("ws-found");
+    const group = item.closest(".ws-tool-group");
+    if (group) group.open = true;
     if (item.tagName === "DETAILS") item.open = true;
     item.scrollIntoView({ block: "center" });
   }
@@ -826,8 +828,8 @@
     if (data.start > (data.first || 0)) content.append(earlierButton(data));
     const list = node("div", undefined, "ws-transcript");
     viewer.nodes = data.entries.map((entry) => transcriptEntry(entry, agentName(data)));
-    list.append(...viewer.nodes);
     content.append(list);
+    groupTools();
     // A page opened at a search hit can read on towards the newest entries.
     if (data.start + data.entries.length < data.total) content.append(laterButton(data));
     syncInteraction();
@@ -847,7 +849,6 @@
   function mergeTranscript(data) {
     const current = viewer.data;
     const follow = nearBottom();
-    const list = byId("ws-viewer-content").querySelector(".ws-transcript");
     data.entries.forEach((entry, offset) => {
       const index = data.start + offset - current.start;
       if (index < current.entries.length) {
@@ -868,8 +869,8 @@
       current.entries.push(entry);
       const item = transcriptEntry(entry, agentName(data));
       viewer.nodes.push(item);
-      list.append(item);
     });
+    groupTools();
     current.total = data.total;
     current.first = data.first;
     current.session = data.session;
@@ -893,7 +894,7 @@
     current.first = data.first;
     const content = byId("ws-viewer-content");
     content.querySelector(".ws-earlier")?.remove();
-    content.querySelector(".ws-transcript").prepend(...items);
+    groupTools();
     if (current.start > (current.first || 0)) content.prepend(earlierButton(current));
     // Keep the entry the reader was looking at in place.
     scroller.scrollTop += scroller.scrollHeight - before;
@@ -909,10 +910,61 @@
     current.first = data.first;
     const content = byId("ws-viewer-content");
     content.querySelector(".ws-later")?.remove();
-    content.querySelector(".ws-transcript").append(...items);
+    groupTools();
     if (current.start + current.entries.length < current.total)
       content.append(laterButton(current));
     transcriptMeta(current);
+  }
+  // Consecutive calls share a disclosure whose summary follows the latest call.
+  // Reuse the group and each call's node as pages and live results arrive, so both
+  // levels of disclosure keep their open state and focused controls stay in place.
+  function groupTools() {
+    const rows = [];
+    const { entries } = viewer.data;
+    const isTool = (entry) => entry?.role === "tool" && !entry.questions;
+    for (let index = 0; index < entries.length;) {
+      let end = index + 1;
+      if (isTool(entries[index])) while (isTool(entries[end])) end += 1;
+      const calls = viewer.nodes.slice(index, end);
+      if (calls.length === 1) rows.push(calls[0]);
+      else {
+        let group = calls.find((call) => call.closest(".ws-tool-group"))?.closest(".ws-tool-group");
+        if (!group) {
+          group = node("details", undefined, "ws-tool ws-tool-group");
+          group.open = calls.some((call) => call.open);
+          group.append(node("summary"), node("div", undefined, "ws-tool-list"));
+        }
+        const summary = group.firstElementChild;
+        const latest = calls[calls.length - 1].querySelector("summary").cloneNode(true);
+        summary.replaceChildren(
+          node("span", `${calls.length} tool calls`, "ws-tool-count"),
+          ...latest.childNodes,
+        );
+        const errors = entries.slice(index, end).filter((entry) => entry.error).length;
+        summary.querySelector(".badge")?.remove();
+        if (errors)
+          summary.insertBefore(
+            badge(`${errors} ${errors === 1 ? "error" : "errors"}`, "red"),
+            summary.querySelector(".ws-time"),
+          );
+        arrange(group.lastElementChild, calls);
+        rows.push(group);
+      }
+      index = end;
+    }
+    arrange(byId("ws-viewer-content").querySelector(".ws-transcript"), rows);
+  }
+  function arrange(parent, items) {
+    let next = parent.firstChild;
+    for (const item of items) {
+      if (item === next) next = next.nextSibling;
+      else parent.insertBefore(item, next);
+    }
+    while (next) {
+      const old = next;
+      next = next.nextSibling;
+      old.remove();
+    }
   }
   function toolOutput(item, entry) {
     item.querySelector(".ws-tool-output, .ws-tool-error")?.remove();
@@ -2789,9 +2841,12 @@
     if (nearBottom()) return { end: true };
     const header = scroller.querySelector(".ws-viewer-header").getBoundingClientRect();
     const top = Math.max(header.bottom, scroller.getBoundingClientRect().top);
-    const index = viewer.nodes.findIndex((item) => item.getBoundingClientRect().bottom > top);
+    const visible = (item) => item.closest(".ws-tool-group:not([open])") || item;
+    const index = viewer.nodes.findIndex(
+      (item) => visible(item).getBoundingClientRect().bottom > top,
+    );
     if (index < 0) return { end: true };
-    const offset = viewer.nodes[index].getBoundingClientRect().top - top;
+    const offset = visible(viewer.nodes[index]).getBoundingClientRect().top - top;
     return { entry: viewer.data.start + index, offset };
   }
   function restorePosition(position) {
@@ -2801,12 +2856,13 @@
       scroller.scrollTop = position.top;
       return;
     }
-    const item = viewer.nodes[position.entry - viewer.data.start];
+    let item = viewer.nodes[position.entry - viewer.data.start];
     if (!item) {
       // An entry before the loaded ones: the top, where earlier entries can be loaded.
       if (position.entry < viewer.data.start) scroller.scrollTop = 0;
       return;
     }
+    item = item.closest(".ws-tool-group:not([open])") || item;
     const header = scroller.querySelector(".ws-viewer-header").getBoundingClientRect();
     const top = Math.max(header.bottom, scroller.getBoundingClientRect().top);
     scroller.scrollTop += item.getBoundingClientRect().top - top - position.offset;
