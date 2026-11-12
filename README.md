@@ -1105,6 +1105,16 @@ not to start it again. The
 dashboard shows "Started by …" (the asking agent, its directory, machine and session)
 in the operation and on the sub-task's Workspaces row.
 
+The launch also prints a `new:<task-uuid>` handle. From the same worker conversation,
+send a follow-up with `wt follow-up new:<task-uuid> -p 'Additional instructions'`
+or `wt follow-up new:<task-uuid> -F message.md`. The broker supplies the parent's
+identity; the controller accepts messages only for that conversation's recorded
+children and delivers through the dashboard's guarded herdr messaging path. The
+child must still have a recognized agent in its recorded pane. Pending launches,
+exited agents, changed sessions and unrelated tasks are refused; this command does
+not resume an exited session. A lost reply may follow delivery, so check the task
+before resending. This operation requires an updated broker and controller.
+
 An explicitly requested cross-agent review can be requested from a worker sandbox:
 `wt --review --claude --claude-account default -r OWNER/REPO -F BRIEF FULL_COMMIT_SHA
 REVIEW_BRANCH` (or select a named account; use `--codex` for the reverse). The request

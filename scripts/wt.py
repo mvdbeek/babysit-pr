@@ -28,6 +28,7 @@ import claude_accounts
 import safe_git
 import sandbox
 import work_tags
+import worker_api
 
 COMMANDS = ("wt", "wti", "wtpr")
 ALIASES = {"wri": "wti", "wtissue": "wti"}
@@ -146,6 +147,7 @@ usage:
   wt [opts] issue <issue-number|issue-url> [branch-name]
   wt tag add|remove <tag> [workspace-path|github-url ...]
   wt tag list [tag]
+  wt follow-up new:<task-uuid> -p <message> | -F <message-file>
 
 Open or create a Git worktree, then attach a multiplexer session.
 Tags span repositories and are shared with the dashboard in $BABYSIT_HOME.
@@ -200,6 +202,9 @@ and supply the review scope/output in the brief. The dashboard Scheduled tab sho
 the exact request for authenticated approval; the request alone starts nothing.
 Auto pins the parent worker; --machine may select another eligible Linux worker that
 already has the commit. Host re-login does not change this sandbox's isolated HOME.
+To message a live sub-task from its original worker conversation, use
+wt follow-up new:<task-uuid> -p 'message' (or -F FILE). The launch prints its task
+handle. The broker checks ownership; exited agents and pending launches are refused.
 On Linux, save reports under $BABYSIT_ARTIFACT_DIR (the persistent sandbox cache's
 artifacts directory; ~/src/agent-artefacts/outbox links to it), or an explicitly
 granted worktree; other HOME paths are temporary.
@@ -1203,8 +1208,6 @@ class BrokerTransport:
         self.sessions = {agent: tool.env.get(name) or None for agent, name in SESSION_ENV}
 
     def start(self, request: Mapping[str, object]) -> dict[str, object]:
-        import worker_api
-
         if not os.path.exists(self.socket):
             raise WtError(f"{self.command}: this sandbox's broker is gone; nothing was started")
         try:
@@ -1226,6 +1229,25 @@ class BrokerTransport:
                 "have started, so do not start it again"
             )
         return op
+
+    def follow_up(self, target: str, text: str) -> dict[str, object]:
+        if not os.path.exists(self.socket):
+            raise WtError("wt: this sandbox's broker is gone; nothing was sent")
+        try:
+            answer = worker_api.forward(
+                "follow-up",
+                {"target": target, "text": text, "sessions": self.sessions},
+                path=self.socket,
+            )
+        except ValueError as exc:
+            raise WtError(f"wt: the controller refused: {exc}") from None
+        except RuntimeError as exc:
+            raise WtError(
+                f"wt: the message may have been sent ({exc}); check before resending"
+            ) from None
+        if answer.get("sent") is not True:
+            raise WtError("wt: the controller answered unexpectedly; check before resending")
+        return answer
 
 
 # --- the tool ------------------------------------------------------------------------
@@ -2423,7 +2445,10 @@ class Tool:
         else:
             transport = DashboardTransport(self, command, parent=self.parent_claims())
         self.warn(f"{command}: inside a sandbox: handing the task to the controller's dashboard")
-        self.follow_launch(command, transport, transport.start(request))
+        op = transport.start(request)
+        if kind == "bwrap" and op.get("pr"):
+            self.warn(f"{command}: task {op['pr']}")
+        self.follow_launch(command, transport, op)
 
     def on_worker(self) -> bool:
         """Whether this is a worker machine: provisioning marks it, and launches say so."""
@@ -2455,7 +2480,27 @@ class Tool:
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise WtError(f"wt: {exc}") from exc
 
+    def run_follow_up(self, args: Sequence[str]) -> None:
+        if len(args) != 3 or args[1] not in {"-p", "--prompt", "-F", "--prompt-file"}:
+            raise WtError("wt: usage: wt follow-up new:<task-uuid> -p MESSAGE | -F FILE")
+        target = args[0]
+        if not target.startswith("new:") or not SESSION.fullmatch(target[4:]):
+            raise WtError("wt: supply the new:<task-uuid> handle printed by the launch")
+        options = parse_args("wt", args[1:])
+        text = options.prompt or ""
+        if not text.strip() or len(text) > 32000 or worker_api.PROMPT_CONTROL.search(text):
+            raise WtError("wt: supply a message of 1–32,000 characters without control characters")
+        if not self.env.get(worker_api.SOCKET_ENV):
+            raise WtError("wt: follow-up needs the original worker conversation's broker")
+        answer = BrokerTransport(self, "wt").follow_up(target, text)
+        self.warn(f"wt: message sent to {target}")
+        if answer.get("warning"):
+            self.warn(f"wt: {answer['warning']}")
+
     def run(self, command: str, argv: Sequence[str]) -> None:
+        if command == "wt" and argv and argv[0] == "follow-up":
+            self.run_follow_up(argv[1:])
+            return
         if command == "wt" and argv and argv[0] == "tag":
             self.run_tag(argv[1:])
             return

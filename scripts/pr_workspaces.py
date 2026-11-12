@@ -2324,6 +2324,42 @@ class Workspaces:
             }
         return op
 
+    def follow_up(self, target, text, parent):
+        """Message a live child of exactly the conversation asking through its broker."""
+        # agent_messages imports pr_workspaces.herdr and run at module level.
+        import agent_messages
+
+        op = self.operation(target)
+        owner = (op or {}).get("parent") or {}
+        identity = ("machine", "cwd", "agent", "session", "config_dir", "rollout")
+        if not owner or any(owner.get(key) != parent.get(key) for key in identity):
+            raise ValueError("Only the conversation that started this sub-task can message it")
+        if op["status"] != "complete":
+            raise ValueError("The sub-task is not ready for messages")
+        result = op.get("result") or {}
+        if not op.get("machine") or not result.get("workspace_id") or not result.get("pane_id"):
+            raise ValueError("The sub-task has no recorded agent pane")
+        machine = machines.resolve(self.home, op["machine"], placing=True)
+        workspace = machines.split(result["workspace_id"])[1]
+        if agent_messages.workspace_root(workspace, machine) != op.get("path"):
+            raise ValueError("The sub-task workspace changed")
+        running = agent_messages.agents(workspace, machine=machine)
+        agent = next((a for a in running if a["pane"] == result["pane_id"]), None)
+        if not agent or agent["agent"] != op["agent"] or not agent.get("session"):
+            raise ValueError("The sub-task's agent is no longer running or its session is unknown")
+        if result.get("session_id") and agent["session"] != result["session_id"]:
+            raise ValueError("The sub-task's agent session changed")
+        if not result.get("session_id"):
+            # Herdr may not have learned the session when the launch completed.
+            with self.lock:
+                self.save_operation(op, result={**result, "session_id": agent["session"]})
+        return agent_messages.send(
+            {"workspace": workspace, "pane": agent["pane"], "text": text},
+            self.home,
+            machine=machine,
+            expected_session=agent["session"],
+        )
+
     def subtask_agents(self, machine_id, ops):
         """Working sub-task agents on a machine: launches under way, and those whose
         checkout herdr lists with a working or blocked agent there (sub-task operations
@@ -3878,6 +3914,7 @@ class Workspaces:
                                 "agent_status": space.get("agent_status", "unknown"),
                                 "url": url,
                                 "pane_id": agent.get("pane_id"),
+                                "session_id": (agent.get("agent_session") or {}).get("value"),
                                 "machine": machine.id,
                                 "machine_label": machine.label,
                             },
