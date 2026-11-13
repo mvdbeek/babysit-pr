@@ -6,6 +6,7 @@ No real agent ever starts; only the Linux-gated tests run bubblewrap, with ``sh`
 """
 
 import contextlib
+import fcntl
 import hashlib
 import itertools
 import json
@@ -465,6 +466,14 @@ fd_bash = pytest.mark.skipif(
 )
 
 
+# A launch past --print-argv locks its $HOME and /tmp with util-linux flock and starts
+# their reaper with setsid, which macOS lacks.
+util_linux = pytest.mark.skipif(
+    not (shutil.which("flock") and shutil.which("setsid")),
+    reason="a launch needs util-linux flock and setsid",
+)
+
+
 def environment(home, bwrap="path", **extra):
     """The wrapper's environment, with a fake bwrap that binds by ``path`` or ``fd``.
 
@@ -506,6 +515,17 @@ def pairs(argv, option):
     return [tuple(argv[i + 1 : i + 3]) for i, word in enumerate(argv) if word == option]
 
 
+def grants(argv):
+    """The writable binds after the launch's own /tmp and $HOME, which always come first."""
+    binds = pairs(argv, "--bind")
+    assert binds[0][1] == "/tmp" and binds[1][0].endswith("/home"), binds[:2]
+    return binds[2:]
+
+
+def tmpfs_targets(argv):
+    return [argv[i + 1] for i, word in enumerate(argv) if word == "--tmpfs"]
+
+
 def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path):
     worktree, common, home = checkout
     extra = tmp_path / "extra"
@@ -536,7 +556,7 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
         "--clearenv",
     ]
     assert argv[-5:] == ["--chdir", str(worktree), "--", "agent", "--flag"]
-    assert ("--tmpfs", str(home)) in [tuple(argv[i : i + 2]) for i in range(len(argv))]
+    assert not {str(home), "/tmp"} & set(tmpfs_targets(argv))
     cache = sandbox_cache(home, "CLAUDE_CONFIG_DIR", account.resolve())
     writable = pairs(argv, "--bind")
     assert {source for source, target in writable if source == target} == {
@@ -666,9 +686,9 @@ def test_wrapper_ignores_the_working_directory_and_its_git_files(checkout):
     # What an agent could leave for the next launch: git pointing outside its checkout.
     subprocess.run(["git", "-C", str(worktree), "config", "core.worktree", str(home)], check=True)
     argv = printed(worktree, environment(home), "--", "agent")
-    assert {source for source, _ in pairs(argv, "--bind")} == {sandbox_cache(home)}
+    assert {source for source, _ in grants(argv)} == {sandbox_cache(home)}
     # And from inside home itself, nothing of home becomes writable either.
-    assert pairs(printed(home, environment(home), "agent"), "--bind") == pairs(argv, "--bind")
+    assert grants(printed(home, environment(home), "agent")) == grants(argv)
 
 
 def test_wrapper_binds_one_agent_configuration_only(checkout):
@@ -680,7 +700,7 @@ def test_wrapper_binds_one_agent_configuration_only(checkout):
     assert not any(word.startswith(str(home / ".claude")) for word in argv)
     message = refused(worktree, environment(home), "--codex-home=/a", "--claude-config-dir=/b", "x")
     assert "only one agent configuration directory" in message
-    # A missing one would leave the agent configured inside the empty home's tmpfs.
+    # A missing one would leave the agent configured inside the empty home.
     message = refused(worktree, environment(home), f"--claude-config-dir={home / 'gone'}", "x")
     assert "configuration directory" in message and "does not exist" in message
 
@@ -692,7 +712,7 @@ def test_wrapper_gives_each_agent_configuration_its_own_cache(checkout):
         (home / option[-1]).mkdir(exist_ok=True)
         config = option.split("=")[0] + f"={home / option[-1]}"
         argv = printed(worktree, environment(home), config, "agent")
-        cache = pairs(argv, "--bind")[0][0]
+        cache = grants(argv)[0][0]
         assert ("XDG_CACHE_HOME", cache) in pairs(argv, "--setenv")
         caches.add(cache)
     assert len(caches) == 3
@@ -775,6 +795,8 @@ def test_wrapper_binds_what_runs_code_in_the_agent_configuration_read_only(
     assert sorted(path.name for path in config.iterdir()) == sorted([*present, "projects"])
 
 
+@fd_bash
+@util_linux
 def test_wrapper_creates_empty_placeholders_before_a_launch(checkout, tmp_path):
     worktree, _, home = checkout
     config = home / "agent"
@@ -807,6 +829,7 @@ def test_wrapper_creates_empty_placeholders_before_a_launch(checkout, tmp_path):
 
 
 @fd_bash
+@util_linux
 def test_wrapper_links_the_deployed_babysit_pr_skill_on_a_worker(checkout, tmp_path):
     worktree, _, home = checkout
     (home / ".config" / "babysit-pr").mkdir(parents=True)
@@ -980,10 +1003,10 @@ def test_wrapper_binds_checked_directories_by_descriptor_when_bwrap_can(checkout
     by_fd = printed(worktree, environment(home, bwrap="fd"), *options)
     granted = [str(home / ".codex"), str(worktree), str(common)]
     cache = sandbox_cache(home, "CODEX_HOME", (home / ".codex").resolve())
-    assert pairs(by_path, "--bind") == [(cache, cache)] + [(path, path) for path in granted]
+    assert grants(by_path) == [(cache, cache)] + [(path, path) for path in granted]
     assert not pairs(by_path, "--bind-fd")
     # The cache root is babysit's own; only checked grants go by descriptor.
-    assert pairs(by_fd, "--bind") == [(cache, cache)]
+    assert grants(by_fd) == [(cache, cache)]
     descriptors = pairs(by_fd, "--bind-fd")
     assert [target for _, target in descriptors] == granted
     assert all(fd.isdigit() and int(fd) > 2 for fd, _ in descriptors)
@@ -1311,6 +1334,7 @@ def test_wrapper_gives_gpg_the_agent_socket_and_public_keyring_only(checkout, gn
 
 
 @fd_bash
+@util_linux
 def test_wrapper_starts_a_gpg_agent_proxy_for_the_launch(checkout, gnupg, tmp_path):
     worktree, _, home = checkout
     env, path = gnupg
@@ -1456,8 +1480,9 @@ def test_checkout_placeholders_come_before_every_bind(checkout, tmp_path):
     sibling = add_worktree(common, tmp_path / "sibling")
     argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "x")
     assert str(sibling / ".git") in checkout_placeholders(argv)
-    # Any later bind then covers a placeholder, whatever a gitdir entry names.
-    before = argv[: argv.index(str(sibling / ".git"))]
+    # Any later bind then covers a placeholder, whatever a gitdir entry names; only the
+    # launch's own /tmp and $HOME come first.
+    before = argv[argv.index(str(home)) + 1 : argv.index(str(sibling / ".git"))]
     assert not [word for word in before if "bind" in word or word == "--symlink"]
 
 
@@ -1660,7 +1685,7 @@ def test_other_agent_diagnostic_and_artifacts_do_not_add_grants(checkout, agent,
     assert dict(pairs(argv, "--setenv"))["BABYSIT_ARTIFACT_DIR"] == f"{cache}/artifacts"
     assert dict(pairs(argv, "--setenv"))["PATH"] == f"/tmp/babysit-bin:{env['PATH']}"
     assert ("--dir", f"{cache}/artifacts") in list(zip(argv, argv[1:], strict=False))
-    assert {s for s, _ in pairs(argv, "--bind")} == {
+    assert {s for s, _ in grants(argv)} == {
         cache,
         str(config),
         str(worktree),
@@ -1758,8 +1783,166 @@ def test_the_outbox_leads_to_the_persistent_artifacts(checkout):
     argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "true")
     outbox = str(home / "src/agent-artefacts/outbox")
     assert (f"{sandbox_cache(home)}/artifacts", outbox) in pairs(argv, "--symlink")
-    # Made in the empty home, so it must come after the tmpfs that creates it.
+    # Made in the empty home, so it must come after the bind that provides it.
     assert argv.index(str(home)) < argv.index(outbox)
+
+
+def sandbox_runs(home):
+    return home / ".cache/babysit-sandbox/runs"
+
+
+def test_home_and_tmp_are_directories_of_the_launchs_own_not_tmpfs(checkout):
+    worktree, common, home = checkout
+    account = home / "acct"
+    account.mkdir()
+    options = (f"--add-dirs={worktree}:{common}", f"--claude-config-dir={account}", "true")
+    argv = printed(worktree, environment(home), *options)
+    # Only the small per-sandbox directories in the configuration are a tmpfs.
+    assert all(target.startswith(f"{account}/") for target in tmpfs_targets(argv))
+    tmp, own_home = pairs(argv, "--bind")[:2]
+    run = Path(tmp[0]).parent
+    assert run.parent == sandbox_runs(home)
+    assert [tmp, own_home] == [(str(run / "tmp"), "/tmp"), (str(run / "home"), str(home))]
+    # The first mounts, so every later entry lands inside them.
+    start = argv.index("--dev")
+    assert argv[start : start + 8] == ["--dev", "/dev", "--bind", *tmp, "--bind", *own_home]
+    # Each launch gets its own; a dry run creates nothing.
+    again = printed(worktree, environment(home), *options)
+    assert pairs(again, "--bind")[0] != tmp
+    assert not sandbox_runs(home).exists()
+
+
+# A bwrap that reports what its launch was given, leaves what an agent might in $HOME
+# and /tmp, and keeps the --sync-fd open in a pid 1 that outlives it until RELEASE exists.
+REPORTING_BWRAP = """\
+import fcntl, json, os, stat, subprocess, sys
+from pathlib import Path
+
+argv = sys.argv
+if argv[1:] == ["--help"]:
+    sys.exit(0)
+home = os.environ["HOME"]
+sources = {t: Path(s) for f, s, t in zip(argv, argv[1:], argv[2:]) if f == "--bind"}
+sync = int(argv[argv.index("--sync-fd") + 1])
+run = sources["/tmp"].parent
+other = os.open(run / "lock", os.O_RDONLY)
+try:
+    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    held = False
+except BlockingIOError:
+    held = True
+views = {t: [os.listdir(sources[t]), stat.S_IMODE(sources[t].stat().st_mode)] for t in ("/tmp", home)}
+for target in ("/tmp", home):
+    # Go's module cache is read-only, so rm alone cannot empty it.
+    package = sources[target] / "go" / "pkg"
+    package.mkdir(parents=True)
+    (package / "data").write_bytes(bytes(1 << 20))
+    package.chmod(0o555)
+    package.parent.chmod(0o555)
+wait = "import os, sys, time\\nfor _ in range(600):\\n    if os.path.exists(sys.argv[1]): break\\n    time.sleep(0.05)"
+subprocess.Popen(
+    [sys.executable, "-c", wait, os.environ["RELEASE"]],
+    pass_fds=(sync,),
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+same = os.path.samestat(os.fstat(sync), os.stat(run / "lock"))
+print(json.dumps({"run": str(run), "held": held, "sync_is_lock": same, "views": views}))
+"""
+
+
+def eventually(check, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not check():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def reporting_launch(worktree, home, tmp_path):
+    fake = tmp_path / "reporting-bwrap"
+    fake.mkdir(exist_ok=True)
+    (fake / "bwrap").write_text(f"#!{sys.executable}\n{REPORTING_BWRAP}")
+    (fake / "bwrap").chmod(0o755)
+    env = environment(home, RELEASE=str(tmp_path / "release"))
+    env["PATH"] = f"{fake}:{os.environ['PATH']}"
+    result = subprocess.run(
+        ["bash", WRAPPER, f"--add-dirs={worktree}", "--", "agent"],
+        cwd=worktree,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@fd_bash
+@util_linux
+def test_each_launch_gets_an_empty_home_on_disk_removed_once_the_sandbox_ends(checkout, tmp_path):
+    worktree, _, home = checkout
+    runs = sandbox_runs(home)
+    first = reporting_launch(worktree, home, tmp_path)
+    run = Path(first["run"])
+    assert run.parent == runs
+    # Empty and private, and locked by the descriptor bwrap's pid 1 keeps.
+    assert first["views"] == {"/tmp": [[], 0o700], str(home): [[], 0o700]}
+    assert first["held"] and first["sync_is_lock"]
+    # bwrap is gone but its pid 1 is not: what the sandbox wrote stays.
+    time.sleep(0.5)
+    assert (run / "home/go/pkg/data").exists() and (run / "tmp/go/pkg/data").exists()
+    # A launch meanwhile gets its own empty home and leaves the live one alone.
+    second = reporting_launch(worktree, home, tmp_path)
+    assert second["run"] != first["run"]
+    assert second["views"] == first["views"]
+    time.sleep(0.5)
+    assert run.exists()
+    (tmp_path / "release").touch()
+    assert eventually(lambda: sorted(path.name for path in runs.iterdir()) == [".lock"])
+
+
+@fd_bash
+@util_linux
+def test_a_launch_removes_homes_whose_sandbox_is_gone(checkout, tmp_path):
+    worktree, _, home = checkout
+    runs = sandbox_runs(home)
+    # One whose reaper died, with a read-only directory inside; one made just before a
+    # crash, without its lock; and one still locked, as a running sandbox's pid 1 does.
+    stale = runs / "stale"
+    package = stale / "home/go/pkg"
+    package.mkdir(parents=True)
+    (package / "data").write_text("x")
+    (stale / "lock").touch()
+    package.chmod(0o555)
+    (runs / "unlocked/home").mkdir(parents=True)
+    live = runs / "live"
+    (live / "home").mkdir(parents=True)
+    (live / "lock").touch()
+    fake = tmp_path / "launching-bwrap"
+    fake.mkdir()
+    (fake / "bwrap").write_text("#!/bin/sh\nexit 0\n")
+    (fake / "bwrap").chmod(0o755)
+    env = environment(home)
+    env["PATH"] = f"{fake}:{os.environ['PATH']}"
+    with open(live / "lock") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = subprocess.run(
+            ["bash", WRAPPER, f"--add-dirs={worktree}", "--", "agent"],
+            cwd=worktree,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        # The stale two and the launch's own (its bwrap has exited) go; the live one stays.
+        assert eventually(lambda: sorted(path.name for path in runs.iterdir()) == [".lock", "live"])
+        assert (live / "home").is_dir()
 
 
 @linux_bwrap
@@ -1784,6 +1967,28 @@ def test_bwrap_contains_writes_and_hides_home(checkout, tmp_path):
     assert result.returncode == 0, result.stderr
     assert (worktree / "inside").exists()
     assert not (outside / "escaped").exists()
+
+
+@linux_bwrap
+def test_bwrap_keeps_home_and_tmp_on_disk_until_the_sandbox_ends(checkout):
+    worktree, _, home = checkout
+    script = 'echo home > "$HOME/left" && echo tmp > /tmp/left && cat /proc/self/mountinfo'
+    result = subprocess.run(
+        ["bash", WRAPPER, f"--add-dirs={worktree}", "--", "sh", "-c", script],
+        cwd=worktree,
+        env=environment(home, bwrap=None),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    # mountinfo: the mount's root within its filesystem, then where it is mounted.
+    roots = {line.split()[4]: line.split()[3] for line in result.stdout.splitlines()}
+    for target, name in ((str(home), "home"), ("/tmp", "tmp")):
+        assert "/.cache/babysit-sandbox/runs/" in roots[target]
+        assert roots[target].endswith(f"/{name}")
+    runs = sandbox_runs(home)
+    assert eventually(lambda: [path.name for path in runs.iterdir()] == [".lock"])
 
 
 @linux_bwrap

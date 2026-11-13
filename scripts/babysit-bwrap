@@ -4,12 +4,13 @@
 #   babysit-bwrap [--add-dirs=A:B] [--claude-config-dir=D | --codex-home=D]
 #                 [--env-pass=X,Y] [--enable=docker,playwright,gpg] [--print-argv] [--] command...
 #
-# Deny by default: a read-only system, an empty $HOME, and writes only to --add-dirs (the
+# Deny by default: a read-only system, an empty $HOME and /tmp (fresh directories on
+# disk for each launch, removed after it), and writes only to --add-dirs (the
 # caller passes the worktree and its git common directory there), the one agent
 # configuration directory (which must exist; what it runs code from stays read-only) and
 # a cache root that only sandboxed agents of that configuration and grants use. Nothing
 # is discovered from the working directory or its git files, which the agent can rewrite;
-# the one use of a grant's git files places empty directories in the sandbox's own tmpfs.
+# the one use of a grant's git files places empty directories in the sandbox's own home.
 # Every writable path must be absolute and is resolved first; home, its ancestors and
 # protected paths are refused. The environment is cleared except for a small baseline,
 # the agent configuration variable, the cache variables and the --env-pass names that
@@ -204,14 +205,20 @@ session=(--new-session)
 if [[ -t 0 ]] && read -r legacy 2>/dev/null <"$tiocsti" && [[ $legacy == 0 ]]; then
   session=()
 fi
+# $HOME and /tmp are directories of this launch's own on disk, made empty just before
+# bwrap starts (below), never a tmpfs, which would keep all an agent writes there in
+# this machine's memory.
+runs=$home/.cache/babysit-sandbox/runs
+run=$(mktemp -d -u "$runs/XXXXXXXXXX")
 argv=(bwrap --die-with-parent ${session[@]+"${session[@]}"} --unshare-pid --unshare-ipc
-  --unshare-uts --clearenv --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$home")
+  --unshare-uts --clearenv --proc /proc --dev /dev --bind "$run/tmp" /tmp
+  --bind "$run/home" "$home")
 
 if [[ -n $config_var ]]; then
   own=.claude
   [[ $config_var == CLAUDE_CONFIG_DIR ]] || own=.codex
   real=$(writable "$config_dir" "$own")
-  # Exporting a missing one would point the agent at the empty home's tmpfs.
+  # Exporting a missing one would point the agent at the empty home.
   [[ -n $real ]] || die "the agent configuration directory $config_dir does not exist"
   config_dir=$real
 fi
@@ -261,7 +268,7 @@ done
 # every sibling checkout looks missing. An empty directory there keeps git from dropping
 # it, and shows nothing of the sibling. These come before every bind, so that whatever
 # an agent writes in a `gitdir` file only places an empty directory in this sandbox's
-# own tmpfs: a later bind covers it, and it can never cover one. Only a checkout's real
+# own home: a later bind covers it, and it can never cover one. Only a checkout's real
 # `.git` file counts, so a dead entry stays prunable and a later file bind never meets a
 # directory; the outbox link below is the one later step that a placeholder would fail.
 # The total is limited so that planted entries cannot push every launch past the
@@ -350,7 +357,7 @@ fi
 
 if ((gpg)); then
   # Signing through this user's gpg-agent, and nothing else of ~/.gnupg (protected, so
-  # never bound): a throwaway home on the sandbox's tmpfs holding copies of the public
+  # never bound): a throwaway home in the sandbox's home holding copies of the public
   # keyring and trust database and a gpg.conf that never starts an agent inside, plus,
   # at the agent's standard socket path, a proxy for this launch that passes on only
   # what signing needs (gpg_agent_proxy.py). Private keys, any passphrase file and the
@@ -559,11 +566,45 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
 [[ ! -e $home/.config/babysit-pr/worker.json ]] || argv+=(--setenv BABYSIT_WORKER 1)
 [[ -z $broker ]] || argv+=(--setenv BABYSIT_REGISTER_SOCKET "$broker/register.sock")
 
+# The launch's $HOME and /tmp, made by mkdir, which refuses an existing name, in a root
+# that no sandbox can see or write: both start empty, and nothing an earlier agent left
+# reaches a later one. The launch's lock goes to bwrap as --sync-fd, which only the
+# sandbox's pid 1 keeps (the agent never has it), so it is held exactly while anything
+# runs in the sandbox, however bwrap ends. A detached reaper waits for it and removes
+# the directory. Any other directory whose lock is free is stale (its reaper died, or
+# the machine restarted) and is removed too; the root's lock keeps that from catching a
+# directory before its launch has locked it. chmod first, since agents leave read-only
+# directories (Go's module cache) that rm cannot empty; neither follows links.
+if ((!print)); then
+  command -v bwrap >/dev/null || die "bubblewrap (bwrap) is not installed"
+  command -v flock >/dev/null && command -v setsid >/dev/null || die "flock and setsid are not installed"
+  mkdir -p "$cache"
+  (umask 077 && mkdir -p -- "$runs") || die "cannot create $runs"
+  exec {runs_lock}<>"$runs/.lock" || die "cannot open $runs/.lock"
+  flock "$runs_lock" || die "cannot lock $runs/.lock"
+  stale=()
+  for entry in "$runs"/*; do
+    [[ -d $entry && ! -L $entry ]] || continue
+    flock -n "$entry/lock" true 2>/dev/null && stale+=("$entry")
+  done
+  mkdir -m 0700 -- "$run" && mkdir -m 0700 -- "$run/home" "$run/tmp" || die "cannot create $run"
+  # Beside, not inside, what the sandbox sees: which launch uses the disk there.
+  printf 'pid %s\ncwd %s\nconfiguration %s\n' "$$" "$cwd" "${config_dir:--}" >"$run/info"
+  : >"$run/lock"
+  exec {lock}<"$run/lock" || die "cannot open $run/lock"
+  flock -n "$lock" || die "cannot lock $run/lock"
+  exec {runs_lock}<&-
+  scrub='chmod -R u+rwX -- "$@" 2>/dev/null; rm -rf -- "$@"'
+  if ((${#stale[@]})); then
+    setsid sh -c "$scrub" sh "${stale[@]}" </dev/null >/dev/null 2>&1 {lock}<&- &
+  fi
+  setsid flock "$run/lock" sh -c "$scrub" sh "$run" </dev/null >/dev/null 2>&1 {lock}<&- &
+  argv+=(--sync-fd "$lock")
+fi
+
 argv+=(--chdir "$cwd" -- "${command[@]}")
 if ((print)); then
   printf '%s\0' "${argv[@]}"
   exit 0
 fi
-command -v bwrap >/dev/null || die "bubblewrap (bwrap) is not installed"
-mkdir -p "$cache"
 exec "${argv[@]}"

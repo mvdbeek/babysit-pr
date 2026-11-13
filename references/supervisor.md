@@ -352,6 +352,31 @@ beyond the sandbox (`--enable=docker`) gets its own, so a launch with Docker nev
 runs downloads that a launch without it could have replaced. Host caches are
 never writable: code planted there would run outside the sandbox.
 
+The empty `$HOME` and `/tmp` are directories on disk, not a tmpfs, so what an agent
+installs or unpacks there (conda, `~/.planemo`, clones, `mkdtemp` workspaces) takes
+disk space rather than the machine's memory. Each launch gets its own pair,
+`~/.cache/babysit-sandbox/runs/<random>/home` and `.../tmp` (mode 0700), created
+with `mkdir` just before bwrap starts. `mkdir` refuses an existing name, and no
+sandbox can see or write `runs/`, which lies under the protected cache root, so both
+always start empty: nothing an earlier agent left (shell startup files,
+`.gitconfig`, `.ssh`, links) reaches a later one, and a resumed session starts with
+an empty home as before. bwrap creates the mount points of the later binds and the
+`--dir`, `--file` and `--symlink` entries as real files in them. The launch
+`flock`s `runs/<random>/lock` and passes that descriptor to bwrap as `--sync-fd`,
+which only the sandbox's pid 1 keeps open (the agent never has it), so the lock is
+held while anything runs in the sandbox, however bwrap ends. A reaper started with
+`setsid`, outside the sandbox and the terminal's signals, waits for the lock and then
+removes the directory (after `chmod -R u+rwX`, since agents leave read-only
+directories such as Go's module cache; neither step follows links). Every launch also
+removes any other directory there whose lock is free, left by a reaper that was killed
+or by a restart; a lock on `runs/.lock` keeps it from catching a directory whose launch
+has not locked it yet. Nothing caps the disk an agent uses there beyond the
+filesystem's free space; `runs/<random>/info`, beside what the sandbox sees, names the
+launch's PID, working directory and configuration, so `du -sh
+~/.cache/babysit-sandbox/runs/*/` shows which session holds what. The tmpfs mounts
+left, none of them capped, are bwrap's `/dev` (with `/dev/shm`) and the per-sandbox
+directories inside the agent configuration below.
+
 What a harness runs from its configuration directory is bound read-only on top of
 it in every launch, granted or not, so no agent leaves code there for the next
 launch of the same account: for Claude `settings.json` (hooks, status line, helper
