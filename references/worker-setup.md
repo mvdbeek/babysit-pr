@@ -175,7 +175,8 @@ as `babysit` first (or pass `--repo` with a URL the box can read).
 
 It deploys babysit-pr to `~/.local/share/babysit-pr/app` and checks out that SHA
 detached (a checkout with local changes is left alone), creates
-`~/.cache/babysit-sandbox` (mode 700), sets npm's prefix to `~/.npm-global` (so
+`~/.cache/babysit-sandbox` (mode 700, which also holds each running sandbox's
+`$HOME` and `/tmp` under `runs/`, on disk), sets npm's prefix to `~/.npm-global` (so
 Codex updates never need root), and prepends `~/.npm-global/bin`, `~/.local/bin`
 and `~/.local/share/babysit-pr/app/scripts` to `PATH` at the top of `~/.bashrc`,
 above Ubuntu's early return, so non-interactive `ssh box <command>` finds the same
@@ -366,8 +367,8 @@ through a proxy in front of that agent, without seeing `~/.gnupg`.
    made inside `babysit-bwrap --enable=gpg` passes `git verify-commit`. It prints no key
    material.
 
-Sandboxed agents sign only with `--enable=gpg`. babysit-bwrap then mounts a throwaway
-`~/.gnupg` on the sandbox's tmpfs holding copies of `pubring.kbx` and `trustdb.gpg`
+Sandboxed agents sign only with `--enable=gpg`. babysit-bwrap then makes a throwaway
+`~/.gnupg` in the sandbox's own empty home holding copies of `pubring.kbx` and `trustdb.gpg`
 and a `gpg.conf` with `no-autostart`, and at the agent's standard socket path (from
 `gpgconf --list-dirs agent-socket`), where gpg inside looks, the socket of
 `scripts/gpg_agent_proxy.py` (python3). babysit-bwrap starts one proxy per launch in
