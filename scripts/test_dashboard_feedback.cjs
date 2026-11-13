@@ -8,6 +8,16 @@ class Node {
     this.value = "";
     this.textContent = "";
     this.attributes = {};
+    this.dataset = {};
+  }
+  get innerText() {
+    return this.textContent;
+  }
+  getAttribute(key) {
+    return this.attributes[key] ?? null;
+  }
+  prepend(...nodes) {
+    this.children.unshift(...nodes);
   }
   append(...nodes) {
     this.children.push(...nodes);
@@ -23,6 +33,7 @@ class Node {
 const nodes = new Map();
 const get = (id) => {
   if (!nodes.has(id)) nodes.set(id, new Node("div"));
+  nodes.get(id).id = id;
   return nodes.get(id);
 };
 get("filter").value = "active";

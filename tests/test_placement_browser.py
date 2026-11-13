@@ -147,6 +147,7 @@ def open_new_task(page, url):
     page.goto(url)
     page.get_by_role("button", name="New task").click()
     dialog = page.locator("#workspace-dialog")
+    dialog.locator(".execution-settings > summary").click()
     expect(dialog.get_by_label("Agent", exact=True)).to_be_visible()
     return dialog
 

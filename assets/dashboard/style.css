@@ -2411,11 +2411,13 @@ html:has(#ws-viewer.ws-viewer-full:modal) {
 @media (pointer: coarse) and (forced-colors: none) {
   /* The row checkbox is a real checkbox with a 44px hit area: a transparent 12px border around a
    20px box drawn by the background, an inset ring and, once checked, a check mark. */
-  .item-select {
+  :is(.item-select, .attention-pick, .ws-select input) {
     appearance: none;
     flex: none;
     width: 44px;
     height: 44px;
+    min-width: 44px;
+    min-height: 44px;
     margin: 0;
     padding: 0;
     border: 12px solid transparent;
@@ -2424,13 +2426,13 @@ html:has(#ws-viewer.ws-viewer-full:modal) {
     background-clip: content-box;
     box-shadow: inset 0 0 0 2px var(--muted);
   }
-  .item-select:checked {
+  :is(.item-select, .attention-pick, .ws-select input):checked {
     background-color: var(--brand);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
     box-shadow: inset 0 0 0 2px var(--brand);
   }
   /* Drawn just outside the visible box, not around the whole hit area. */
-  .item-select:focus-visible {
+  :is(.item-select, .attention-pick, .ws-select input):focus-visible {
     outline-offset: -12px;
   }
 }
@@ -2580,4 +2582,318 @@ html:has(#ws-viewer.ws-viewer-full:modal) {
 }
 #tag-error {
   color: var(--red);
+}
+
+/* Controls shared by creation, settings and task forms. */
+.header-utilities {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mobile-view-picker {
+  display: none;
+}
+.primary-action:not(.badge):hover {
+  background: var(--brand);
+}
+.primary-action {
+  background: var(--brand);
+  color: var(--on-brand);
+  border-color: var(--brand);
+}
+#workspace-dialog textarea,
+#settings-prompt {
+  padding: 10px 12px;
+  border: 1px solid var(--field-line);
+  border-radius: 7px;
+  background: var(--field-bg);
+  color: var(--ink);
+  font: inherit;
+}
+#workspace-dialog select {
+  max-width: none;
+}
+label:has(+ #workspace-claude-account[hidden]) {
+  display: none;
+}
+.execution-settings {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+.execution-settings > summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+.execution-fields {
+  display: grid;
+  gap: 10px;
+  padding-top: 14px;
+}
+#workspace-dialog[open]:has(.new-task-form) {
+  display: flex;
+  flex-direction: column;
+  height: min(860px, 90dvh);
+  overflow: hidden;
+}
+#workspace-dialog:has(.new-task-form) .dialog-header {
+  flex: none;
+}
+#workspace-dialog:has(.new-task-form) #workspace-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+#workspace-dialog form.new-task-form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 0;
+}
+.new-task-body {
+  display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 0 4px 16px;
+  scroll-padding-block: 12px;
+}
+.task-footer {
+  display: flex;
+  flex: none;
+  justify-content: flex-end;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  background: var(--paper);
+}
+#workspace-error:empty,
+#workspace-progress:empty,
+#settings-auto-status:empty {
+  display: none;
+}
+#settings-prompt-status[data-dirty="true"] {
+  color: var(--amber);
+}
+#workspace-task {
+  min-height: 8em;
+}
+.settings-actions {
+  position: sticky;
+  bottom: calc(-1 * var(--dialog-padding));
+  padding-block: 12px;
+  background: var(--paper);
+  z-index: 1;
+}
+.feedback-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 0;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+.feedback-heading h3 {
+  margin-top: 0;
+}
+.feedback-heading p {
+  font-size: 12px;
+  color: var(--muted);
+}
+.watch-management {
+  margin-top: 12px;
+}
+.watch-management > summary {
+  color: var(--muted);
+  cursor: pointer;
+}
+.active-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 16px;
+}
+.filter-chip {
+  background: var(--green-bg);
+  color: var(--green);
+  border-radius: 20px;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+.pr-empty button {
+  margin: 4px;
+}
+@media (pointer: coarse) {
+  button,
+  select,
+  summary,
+  a[role="button"],
+  .agents-waiting,
+  .attention-actions a,
+  .attention-pick,
+  .ws-select input {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  .attention-actions a {
+    display: inline-flex;
+    align-items: center;
+  }
+  label:has(> input:is([type="checkbox"], [type="radio"])) {
+    min-height: 44px;
+    align-content: center;
+  }
+  .select-field .select-toggle,
+  .select-field .select-clear {
+    width: 44px;
+    min-height: 42px;
+  }
+  .select-field input {
+    min-height: 46px;
+    padding-right: 46px;
+  }
+  .select-field .select-clear {
+    right: 45px;
+  }
+  .select-field:has(.select-clear:not([hidden])) input {
+    padding-right: 90px;
+  }
+}
+/* Intermediate cards keep essential metadata together, with full dates behind Details. */
+@media (min-width: 541px) and (max-width: 1260px) {
+  .item-table tr {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .item-table td {
+    padding-block: 4px;
+  }
+  .item-table .pr-description {
+    grid-column: 1 / -1;
+  }
+  .item-table .pr-dates {
+    position: relative;
+    min-height: 44px;
+    padding-right: 85px;
+  }
+  .pr-details-toggle {
+    display: block;
+    position: absolute;
+    right: 0;
+    top: 0;
+    min-height: 44px;
+    color: var(--green);
+    border: 0;
+    background: transparent;
+  }
+  .pr-dates:not(.dates-expanded) .pr-opened,
+  .pr-dates:not(.dates-expanded) .pr-updated > time,
+  .pr-dates:not(.dates-expanded) .pr-activity {
+    display: none;
+  }
+}
+@media (max-width: 540px) {
+  body > header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 8px;
+  }
+  .brand {
+    grid-row: 1;
+    grid-column: 1;
+    min-width: 0;
+  }
+  .header-tools {
+    display: contents;
+  }
+  #agents-waiting {
+    grid-row: 1;
+    grid-column: 2;
+  }
+  #notifications-toggle {
+    grid-row: 1;
+    grid-column: 3;
+    width: 44px;
+    height: 44px;
+  }
+  .header-tools .connection {
+    grid-row: 2;
+    grid-column: 1;
+    flex-wrap: wrap;
+    min-width: 0;
+    gap: 4px;
+  }
+  #health {
+    font-size: 11px;
+  }
+  .header-utilities {
+    grid-row: 2;
+    grid-column: 2 / -1;
+    gap: 4px;
+  }
+  .header-utilities > button {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+  }
+  .view-navigation {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
+  }
+  .view-navigation .page-tabs {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  .mobile-view-picker {
+    display: grid;
+    min-width: 0;
+    gap: 6px;
+  }
+  .mobile-view-picker select {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
+  .mobile-view-picker label,
+  .tag-focus-bar label {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .tag-focus-bar {
+    display: grid;
+    min-width: 0;
+    gap: 6px;
+  }
+  .tag-focus-bar > .searchable-select {
+    width: 100%;
+  }
+  #tag-clear {
+    grid-column: 1;
+  }
+  .pr-filters {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  #workspace-dialog:has(.new-task-form) {
+    --dialog-padding: 16px;
+  }
+  #workspace-dialog textarea {
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 900px) {
+  /* Clip the rounded edges without creating a non-scrolling ancestor for feedback actions. */
+  #detail {
+    overflow: clip;
+  }
 }

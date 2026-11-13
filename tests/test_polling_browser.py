@@ -367,7 +367,7 @@ def test_short_pickers_skip_the_keyboard_on_touch_screens(
     page.goto(url + "/#prs")
     role = page.get_by_role("combobox", name="Filter pull requests by role", exact=True)
     expect(role).to_be_visible()
-    assert role.get_attribute("inputmode") is None  # A mouse keeps typing everywhere.
+    assert role.evaluate("e => e.tagName") == "SELECT"  # Fixed choices use a native picker.
     context = browser.new_context(
         has_touch=True, is_mobile=True, viewport={"width": 390, "height": 844}
     )
@@ -381,9 +381,10 @@ def test_short_pickers_skip_the_keyboard_on_touch_screens(
             "inputmode", "none"
         )
         phone.locator("#pr-filters-toggle").click()
-        expect(
-            phone.get_by_role("combobox", name="Filter pull requests by role", exact=True)
-        ).to_have_attribute("inputmode", "none")
+        role = phone.get_by_role("combobox", name="Filter pull requests by role", exact=True)
+        assert role.evaluate("e => e.tagName") == "SELECT"
+        role.select_option("reviewer")
+        expect(role).to_have_value("reviewer")
         repo = phone.get_by_role("combobox", name="Filter pull requests by repository")
         expect(repo).to_be_visible()
         assert repo.get_attribute("inputmode") is None

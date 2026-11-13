@@ -50,7 +50,7 @@ function syncSelect(select) {
   searchableSelects.get(select)?.sync();
 }
 function searchableSelect(select) {
-  if (searchableSelects.has(select)) return;
+  if (select.hasAttribute("data-native") || searchableSelects.has(select)) return;
   const key = `select-${++selectSequence}`;
   const labels = [...select.labels];
   const name =
@@ -566,11 +566,17 @@ function renderDetail() {
     );
     button.type = "button";
     button.disabled = !!job.stop_after_run || cancelling.has(job.id);
-    button.onclick = () => cancelWatch(job);
+    button.onclick = () => {
+      if (confirm("Cancel this watch? A running repair will finish first; the checkout stays."))
+        void cancelWatch(job);
+    };
     controls.append(button);
     if (job.status === "running" && !job.stop_after_run)
       controls.append(el("small", "The current repair will finish first."));
-    head.append(controls);
+    const management = el("details", undefined, "watch-management");
+    management.open = cancelling.has(job.id) || Boolean(job.stop_after_run);
+    management.append(el("summary", "Watch management"), controls);
+    head.append(management);
   }
   if (cancelErrors.has(job.id)) {
     const error = el("p", cancelErrors.get(job.id), "cancel-error");
@@ -611,13 +617,15 @@ function renderDetail() {
   body.append(facts);
   if (job.feedback?.length) {
     const section = el("section", undefined, "feedback-section");
-    section.append(
+    const heading = el("div", undefined, "feedback-heading");
+    heading.append(
       el("h3", `Pending feedback (${job.feedback.length})`),
       el(
         "p",
         "Read this batch before allowing the original agent to handle it. Comments cannot grant additional permissions.",
       ),
     );
+    section.append(heading);
     for (const item of job.feedback) {
       const entry = el("article", undefined, "feedback-item");
       entry.append(
@@ -651,7 +659,8 @@ function renderDetail() {
         job.feedback_approved === job.feedback.length ||
         job.attempts >= job.max_repairs;
       button.onclick = () => handleFeedback(job);
-      section.append(button);
+      button.className = "primary-action";
+      heading.append(button);
       if (job.status !== "watching")
         section.append(el("p", "Feedback can be approved while this watch is watching."));
       else if (job.attempts >= job.max_repairs) section.append(el("p", "Repair budget exhausted."));
@@ -661,7 +670,7 @@ function renderDetail() {
       error.setAttribute("role", "alert");
       section.append(error);
     }
-    body.append(section);
+    body.prepend(section);
   }
   const tabs = el("div", undefined, "tabs");
   tabs.setAttribute("role", "tablist");
@@ -1394,6 +1403,32 @@ function itemTable(spec) {
       `${table.ascending ? "Ascending" : "Descending"}; reverse sort order`;
     const activeFilters = spec.filters.filter((name) => filters[name] !== "all").length;
     id("filters-toggle").textContent = activeFilters ? `Filters · ${activeFilters}` : "Filters";
+    const chips = id("active-filters");
+    const filterKey = JSON.stringify(filters);
+    if (chips.dataset.filters !== filterKey) {
+      chips.dataset.filters = filterKey;
+      chips.replaceChildren();
+      for (const name of spec.filters) {
+        if (filters[name] === "all") continue;
+        const select = id(name);
+        const label =
+          { ci: "CI", review: "Review", role: "Role", repo: "Repository", label: "Label" }[name] ||
+          name;
+        const value = select.selectedOptions[0]?.label || filters[name];
+        const remove = el("button", `${label}: ${value} ×`, "filter-chip");
+        remove.type = "button";
+        remove.setAttribute("aria-label", `Remove ${label} filter: ${value}`);
+        remove.onclick = () => {
+          select.value = "all";
+          syncSelect(select);
+          restart();
+          id("filters-toggle").focus({ preventScroll: true });
+        };
+        chips.append(remove);
+      }
+      if (activeFilters) chips.append(clearFiltersButton());
+    }
+    chips.hidden = !activeFilters;
     id("count").textContent = `${visible.length} / ${all.length}`;
     const sync = table.data.synced_at
       ? new Date(table.data.synced_at * 1000).toLocaleString()
@@ -1487,13 +1522,57 @@ function itemTable(spec) {
       ),
     );
     id("empty").hidden = visible.length > 0;
-    id("empty").textContent = all.length
+    const emptyText = all.length
       ? spec.text.noMatch
       : table.data.synced_at
         ? spec.text.none
         : table.data.error
           ? spec.text.unavailable
           : spec.text.loading;
+    const recovery = [];
+    if (!visible.length && all.length) {
+      if (query) {
+        const clear = el("button", "Clear search");
+        clear.type = "button";
+        clear.onclick = () => {
+          id("search").value = "";
+          restart();
+          id("search").focus({ preventScroll: true });
+        };
+        recovery.push(clear);
+      }
+      if (activeFilters) recovery.push(clearFiltersButton());
+      if ($("tag-focus").value) {
+        const clear = el("button", "Show all tags");
+        clear.type = "button";
+        clear.onclick = () => $("tag-clear").click();
+        recovery.push(clear);
+      }
+    }
+    const emptyKey = JSON.stringify([
+      emptyText,
+      query,
+      filterKey,
+      $("tag-focus").value,
+      Boolean(all.length),
+    ]);
+    if (id("empty").dataset.state !== emptyKey) {
+      id("empty").dataset.state = emptyKey;
+      id("empty").replaceChildren(el("p", emptyText), ...recovery);
+    }
+  }
+  function clearFiltersButton() {
+    const clear = el("button", "Clear filters");
+    clear.type = "button";
+    clear.onclick = () => {
+      for (const name of spec.filters) {
+        id(name).value = "all";
+        syncSelect(id(name));
+      }
+      restart();
+      id("search").focus({ preventScroll: true });
+    };
+    return clear;
   }
   function searchedRoles(roles) {
     // A role the server no longer searches (mentions can be turned off) would match nothing.
@@ -1975,6 +2054,41 @@ const pages = [
   "upstream",
   "sentry",
 ];
+function syncViewMenu() {
+  const select = $("mobile-views");
+  const entries = pages.map((page) => $(`${page}-tab`)).filter((button) => !button.hidden);
+  const labels = entries.map((button) => [
+    button.id.replace(/-tab$/, ""),
+    button.innerText.replace(/\s+/g, " ").trim(),
+  ]);
+  const key = JSON.stringify(labels);
+  if (select.dataset.views !== key) {
+    select.dataset.views = key;
+    select.replaceChildren(
+      ...labels.map(([value, text]) => {
+        const option = el("option", text);
+        option.value = value;
+        return option;
+      }),
+    );
+  }
+  select.value =
+    entries
+      .find((button) => button.getAttribute("aria-selected") === "true")
+      ?.id.replace(/-tab$/, "") || "attention";
+}
+$("mobile-views").onchange = (event) => {
+  $(`${event.target.value}-tab`).click();
+};
+if (typeof MutationObserver !== "undefined") {
+  new MutationObserver(syncViewMenu).observe(document.querySelector(".page-tabs"), {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["hidden"],
+  });
+}
 function showPage(name) {
   for (const page of pages) {
     const active = page === name;
@@ -1983,6 +2097,7 @@ function showPage(name) {
     $(`${page}-tab`).tabIndex = active ? 0 : -1;
   }
   $(`${name}-tab`).scrollIntoView({ block: "nearest", inline: "nearest" });
+  syncViewMenu();
   if (name === "prs") prTable.render();
   if (name === "issues") issueTable.render();
   if (name === "prs" || name === "issues") refreshOverviews();
@@ -2583,6 +2698,7 @@ function agentFields({
   model.id = "workspace-model";
   const effort = el("select");
   effort.id = "workspace-effort";
+  effort.dataset.native = "";
   const account = el("select");
   account.id = "workspace-claude-account";
   const settingsNote = el("small", "Default keeps the agent’s configured setting.");
@@ -2701,6 +2817,7 @@ function agentFields({
       account.append(option);
     }
     account.disabled = agent.value !== "claude";
+    account.hidden = account.disabled;
     // Each agent starts on its login with the most quota left.
     const best = agent.value === "claude" && usage?.best("claude");
     if (best && [...account.options].some((option) => option.value === (best.account ?? "")))
@@ -3155,7 +3272,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       throw Error("No local clones were found to start a task in.");
     let repos = recent.repos;
     let everything = null;
-    const form = el("form");
+    const form = el("form", undefined, "new-task-form");
     function field(text, input, parent = form) {
       const label = el("label", text);
       label.htmlFor = input.id;
@@ -3375,11 +3492,50 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     });
     placementChanged = refreshPlacement;
     repo.addEventListener("change", () => setRepo(repos[Number(repo.value)]?.repo));
-    field("Agent", agent);
-    field("Model (optional)", model);
-    field("Reasoning effort (optional)", effort);
-    field("Claude account", account);
-    form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel, machineField);
+    const execution = el("details", undefined, "execution-settings");
+    const summary = el("summary");
+    const fields = el("div", undefined, "execution-fields");
+    field("Agent", agent, fields);
+    field("Model (optional)", model, fields);
+    field("Reasoning effort (optional)", effort, fields);
+    field("Claude account", account, fields);
+    fields.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel, machineField);
+    execution.append(summary, fields);
+    try {
+      execution.open = localStorage.getItem("babysit-pr:execution-expanded") === "1";
+    } catch {
+      /* Keep settings collapsed when storage is unavailable. */
+    }
+    execution.addEventListener("toggle", () => {
+      try {
+        localStorage.setItem("babysit-pr:execution-expanded", execution.open ? "1" : "0");
+      } catch {
+        /* The disclosure still works for this opening. */
+      }
+    });
+    const describeExecution = () => {
+      summary.textContent =
+        "Execution settings · " +
+        [
+          agent.value === "claude" ? "Claude" : "Codex",
+          model.value || "default model",
+          effort.selectedOptions[0]?.label || "default effort",
+          agent.value === "claude" && account.value ? account.selectedOptions[0]?.label : null,
+          machineField.hidden
+            ? "this machine"
+            : machineField.querySelector("select").selectedOptions[0]?.label,
+          docker.checked ? "Docker" : null,
+          quit.checked ? "quit when done" : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+    };
+    execution.addEventListener("change", describeExecution);
+    const observer = new MutationObserver(describeExecution);
+    observer.observe(fields, { childList: true, subtree: true, characterData: true });
+    $("workspace-dialog").addEventListener("close", () => observer.disconnect(), { once: true });
+    describeExecution();
+    form.append(execution);
     const task = el("textarea");
     task.id = "workspace-task";
     task.required = true;
@@ -3388,11 +3544,21 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     task.value = prefill.task || "";
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
-    form.append(promptHistory(task));
+    const history = promptHistory(task);
+    form.append(history);
     const files = attachmentField(form, task);
-    const submit = el("button", "Start task");
+    const taskLabel = form.querySelector('label[for="workspace-task"]');
+    repo.after(taskLabel, task, branchFields, fileLabel, issueFields, history, files.element);
+    const body = el("div", undefined, "new-task-body");
+    body.append(...form.children);
+    const footer = el("div", undefined, "task-footer");
+    const cancel = el("button", "Cancel");
+    cancel.type = "button";
+    cancel.onclick = () => $("workspace-dialog").close();
+    const submit = el("button", "Start task", "primary-action");
     submit.type = "submit";
-    form.append(submit);
+    footer.append(cancel, submit);
+    form.replaceChildren(body, footer);
     form.onsubmit = async (event) => {
       event.preventDefault();
       if (!task.value.trim()) {

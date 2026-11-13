@@ -66,76 +66,78 @@
             Connecting</button
           ><small id="updated">Reading watcher state…</small>
         </div>
-        <button
-          id="usage-toggle"
-          type="button"
-          aria-label="Usage"
-          aria-haspopup="dialog"
-          aria-controls="usage-dialog"
-          title="Subscription usage"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            width="18"
-            height="18"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            aria-hidden="true"
+        <div class="header-utilities">
+          <button
+            id="usage-toggle"
+            type="button"
+            aria-label="Usage"
+            aria-haspopup="dialog"
+            aria-controls="usage-dialog"
+            title="Subscription usage"
           >
-            <path d="M4 18a8 8 0 1 1 16 0M12 18l4-6" />
-          </svg>
-          <span id="usage-value" aria-hidden="true">–</span>
-        </button>
-        <button
-          id="voice-toggle"
-          type="button"
-          aria-label="Voice assistant"
-          aria-controls="voice-bar"
-          aria-expanded="false"
-          title="Voice assistant (Alt+V)"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            width="18"
-            height="18"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+            <svg
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              aria-hidden="true"
+            >
+              <path d="M4 18a8 8 0 1 1 16 0M12 18l4-6" />
+            </svg>
+            <span id="usage-value" aria-hidden="true">–</span>
+          </button>
+          <button
+            id="voice-toggle"
+            type="button"
+            aria-label="Voice assistant"
+            aria-controls="voice-bar"
+            aria-expanded="false"
+            title="Voice assistant (Alt+V)"
           >
-            <rect x="9" y="3" width="6" height="11" rx="3" />
-            <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" />
-          </svg>
-        </button>
-        <button
-          id="settings-toggle"
-          type="button"
-          aria-label="Settings"
-          aria-haspopup="dialog"
-          aria-controls="settings-dialog"
-          title="Settings"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            width="18"
-            height="18"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+            <svg
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="9" y="3" width="6" height="11" rx="3" />
+              <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" />
+            </svg>
+          </button>
+          <button
+            id="settings-toggle"
+            type="button"
+            aria-label="Settings"
+            aria-haspopup="dialog"
+            aria-controls="settings-dialog"
+            title="Settings"
           >
-            <circle cx="12" cy="12" r="3.2" />
-            <path
-              d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6 18 18M18 6l-1.4 1.4M7.4 16.6 6 18"
-            />
-          </svg>
-        </button>
+            <svg
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="3.2" />
+              <path
+                d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6 18 18M18 6l-1.4 1.4M7.4 16.6 6 18"
+              />
+            </svg>
+          </button>
+        </div>
         <a
           id="agents-waiting"
           class="agents-waiting"
@@ -253,9 +255,12 @@
       <p class="notifications-caption">
         Kept with the watcher, so every device that opens this dashboard uses them.
       </p>
+      <h3>General settings</h3>
+      <p class="notifications-caption">Changes save automatically.</p>
+      <p id="settings-auto-status" class="notifications-caption"></p>
       <div class="settings-field">
         <label for="settings-reviewer">Main reviewer</label>
-        <select id="settings-reviewer"></select>
+        <select data-native id="settings-reviewer"></select>
       </div>
       <p id="settings-reviewer-note" class="notifications-caption"></p>
       <div id="settings-capacity-field" class="settings-field" hidden>
@@ -274,9 +279,11 @@
         a launch where its repository is cloned, and otherwise picks the less busy machine. A launch
         no other machine can take still starts here.
       </p>
+      <h3>Prompt templates</h3>
+      <p id="settings-prompt-status" class="notifications-caption" role="status"></p>
       <div class="settings-field">
         <label for="settings-task">Task prompt</label>
-        <select id="settings-task"></select>
+        <select data-native id="settings-task"></select>
       </div>
       <textarea
         id="settings-prompt"
@@ -434,6 +441,10 @@
             Sentry
           </button>
         </div>
+        <div class="mobile-view-picker">
+          <label for="mobile-views">View</label>
+          <select id="mobile-views" aria-label="Dashboard view" data-native></select>
+        </div>
         <div class="tag-focus-bar">
           <label for="tag-focus">Focus tag</label>
           <select id="tag-focus" aria-label="Focus tag">
@@ -563,7 +574,7 @@
             </label>
             <label for="agents-state"
               >State
-              <select id="agents-state" aria-label="Filter agents by state">
+              <select data-native id="agents-state" aria-label="Filter agents by state">
                 <option value="">All states</option>
                 <option value="blocked">Waiting for you</option>
                 <option value="working">Working</option>
@@ -572,7 +583,7 @@
             </label>
             <label for="agents-origin"
               >Started by
-              <select id="agents-origin" aria-label="Filter agents by who started them">
+              <select data-native id="agents-origin" aria-label="Filter agents by who started them">
                 <option value="">Anyone</option>
                 <option value="you">You</option>
                 <option value="watch">Babysit watches</option>
@@ -1013,7 +1024,7 @@
           </label>
           <label for="pr-ci"
             >CI state
-            <select id="pr-ci" aria-label="Filter pull requests by CI">
+            <select data-native id="pr-ci" aria-label="Filter pull requests by CI">
               <option value="all">All CI states</option>
               <option value="SUCCESS">Passed</option>
               <option value="FAILURE">Failed</option>
@@ -1026,7 +1037,7 @@
           </label>
           <label for="pr-review"
             >Review status
-            <select id="pr-review" aria-label="Filter pull requests by review status">
+            <select data-native id="pr-review" aria-label="Filter pull requests by review status">
               <option value="all">All review statuses</option>
               <option value="draft">Draft</option>
               <option value="ready">Ready for review</option>
@@ -1037,7 +1048,7 @@
           </label>
           <label for="pr-role"
             >Your role
-            <select id="pr-role" aria-label="Filter pull requests by role">
+            <select data-native id="pr-role" aria-label="Filter pull requests by role">
               <option value="all">All roles</option>
               <option value="author">My PRs</option>
               <option value="reviewer">Reviewer</option>
@@ -1047,6 +1058,7 @@
             </select>
           </label>
         </div>
+        <div id="pr-active-filters" class="active-filters" aria-label="Active filters" hidden></div>
         <p id="pr-sync" class="pr-sync" role="status">Loading your pull requests…</p>
         <p id="pr-pins-status" class="pr-sync" role="status" hidden></p>
         <p id="pr-changes" class="pr-sync" role="status" hidden></p>
@@ -1121,7 +1133,7 @@
           <p id="pr-more" class="pr-more" hidden>
             <button id="pr-more-button" type="button"></button>
           </p>
-          <p id="pr-empty" class="pr-empty" hidden></p>
+          <div id="pr-empty" class="pr-empty" hidden></div>
         </div>
       </section>
       <section
@@ -1208,7 +1220,7 @@
           </label>
           <label for="issue-role"
             >Your role
-            <select id="issue-role" aria-label="Filter issues by role">
+            <select data-native id="issue-role" aria-label="Filter issues by role">
               <option value="all">All roles</option>
               <option value="author">My issues</option>
               <option value="assignee">Assignee</option>
@@ -1231,6 +1243,12 @@
             </select>
           </label>
         </div>
+        <div
+          id="issue-active-filters"
+          class="active-filters"
+          aria-label="Active filters"
+          hidden
+        ></div>
         <p id="issue-sync" class="pr-sync" role="status">Loading your open issues…</p>
         <p id="issue-pins-status" class="pr-sync" role="status" hidden></p>
         <p id="issue-changes" class="pr-sync" role="status" hidden></p>
@@ -1321,7 +1339,7 @@
           <p id="issue-more" class="pr-more" hidden>
             <button id="issue-more-button" type="button"></button>
           </p>
-          <p id="issue-empty" class="pr-empty" hidden></p>
+          <div id="issue-empty" class="pr-empty" hidden></div>
         </div>
       </section>
       <footer>
