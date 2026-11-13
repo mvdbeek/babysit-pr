@@ -80,7 +80,7 @@
       select.append(option);
     }
     select.value = saved.reviewer;
-    // Every select on the page is the searchable picker; it reads its options again.
+    // Refresh a searchable control if this field uses one.
     window.dashboardAgents?.sync(select);
     byId("reviewer-note").textContent =
       `Review pull request starts ${NAMES[saved.reviewer]}. A card that needs you also ` +
@@ -89,6 +89,7 @@
   function showPrompt() {
     byId("prompt").value = prompt(chosen);
     shown = byId("prompt").value;
+    promptState();
   }
   function renderTasks() {
     const select = byId("task");
@@ -129,19 +130,36 @@
   function dirty() {
     return byId("prompt").value !== prompt(chosen);
   }
+  function promptState() {
+    const text = dirty() ? "Unsaved changes" : "Prompt is up to date.";
+    const note = byId("prompt-status");
+    note.dataset.dirty = String(dirty());
+    if (note.textContent !== text) note.textContent = text;
+  }
+  byId("prompt").addEventListener("input", promptState);
+  function autoStatus(text) {
+    byId("auto-status").textContent = text;
+    status(text);
+  }
+  function requestClose() {
+    if (!dirty() || confirm("Discard the unsaved prompt?")) dialog.close();
+  }
   async function savePrompt(text) {
     const save = byId("save");
+    const task = chosen;
+    const draft = byId("prompt").value;
     save.disabled = true;
     status("Saving…");
     try {
-      await send({ task: chosen, prompt: text });
-      showPrompt();
+      await send({ task, prompt: text });
+      if (chosen === task && byId("prompt").value === draft) showPrompt();
       renderTasks();
       status(text ? "Saved." : "Back to the default.");
     } catch (error) {
       status(`Could not save: ${error.message}`);
     } finally {
       save.disabled = false;
+      promptState();
     }
   }
   function other(agent) {
@@ -164,14 +182,14 @@
   byId("reviewer").onchange = async (event) => {
     const select = event.target;
     select.disabled = true;
-    status("Saving…");
+    autoStatus("Saving…");
     try {
       await send({ reviewer: select.value });
       renderReviewer();
-      status("Saved.");
+      autoStatus("Saved.");
     } catch (error) {
       renderReviewer();
-      status(`Could not save: ${error.message}`);
+      autoStatus(`Could not save: ${error.message}`);
     } finally {
       select.disabled = false;
     }
@@ -180,17 +198,17 @@
     const input = event.target;
     const value = Number(input.value);
     if (!Number.isInteger(value) || value < 1 || value > 200) {
-      status("Choose a whole number of agents from 1 to 200");
+      autoStatus("Choose a whole number of agents from 1 to 200");
       input.value = String(saved.local_max_agents);
       return;
     }
     input.disabled = true;
-    status("Saving…");
+    autoStatus("Saving…");
     try {
       await send({ local_max_agents: value });
-      status("Saved.");
+      autoStatus("Saved.");
     } catch (error) {
-      status(`Could not save: ${error.message}`);
+      autoStatus(`Could not save: ${error.message}`);
       input.value = String(saved.local_max_agents);
     } finally {
       renderCapacity();
@@ -199,6 +217,7 @@
   };
   document.getElementById("settings-toggle").onclick = async () => {
     status("");
+    byId("auto-status").textContent = "";
     render();
     void showCapacity();
     dialog.showModal();
@@ -210,7 +229,11 @@
       status(`Showing this page’s defaults: ${error.message}`);
     }
   };
-  byId("close").onclick = () => dialog.close();
+  byId("close").onclick = requestClose;
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    requestClose();
+  });
   dialog.addEventListener("close", () => {
     // An unsaved prompt is a draft, not a setting: the next opening shows what is saved.
     shown = null;
@@ -232,7 +255,7 @@
     pressedOnBackdrop = onBackdrop(event);
   });
   dialog.addEventListener("click", (event) => {
-    if (pressedOnBackdrop && onBackdrop(event)) dialog.close();
+    if (pressedOnBackdrop && onBackdrop(event)) requestClose();
     pressedOnBackdrop = false;
   });
   // The tasks the page prefills, and who reviews, for the rest of the dashboard.

@@ -186,8 +186,8 @@
     margin-left: 0;
   }
 }
-/* The eight columns need about 840px, so below 940px each workspace stacks into a card. */
-@media (max-width: 940px) {
+/* Stack before paths and local state become narrow fragments on tablets. */
+@media (max-width: 1100px) {
   .pr-table-wrap:has(> .ws-table) {
     max-height: none;
     overflow: visible;
@@ -231,4 +231,15 @@
 }
 .ws-table .ws-machine {
   margin-left: 6px;
+}
+
+@media (pointer: coarse) {
+  .ws-table .ws-select {
+    width: 56px;
+  }
+}
+@media (pointer: coarse) and (max-width: 1100px) {
+  .ws-table tr {
+    padding-left: 64px;
+  }
 }

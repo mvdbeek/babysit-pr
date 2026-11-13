@@ -9,19 +9,6 @@
   border-color: var(--red);
   color: var(--red);
 }
-/* The first header row is full on a phone: the mic ends the connection status row instead. */
-@media (max-width: 440px) {
-  #voice-toggle {
-    order: 3;
-    width: 32px;
-    height: 32px;
-    padding: 0;
-  }
-  .header-tools .connection {
-    flex-basis: calc(100% - 44px);
-    min-width: 0;
-  }
-}
 .voice-bar {
   position: fixed;
   left: 50%;

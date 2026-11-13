@@ -206,6 +206,7 @@ def test_link_prefilled_task_says_it_came_from_a_link(page: Page, dashboard_site
     expect(dialog.get_by_label("Task", exact=True)).to_have_value("Investigate the parser")
     expect(dialog.get_by_label("New branch")).to_have_value("parser-fix")
     assert notice.evaluate("node => node.nextElementSibling.tagName") == "FORM"
+    expect(dialog.get_by_role("button", name="Start task", exact=True)).to_be_in_viewport(ratio=1)
     assert page.url == url + "/#watcher"
     page.keyboard.press("Escape")
     expect(dialog).to_be_hidden()

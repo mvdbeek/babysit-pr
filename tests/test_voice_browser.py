@@ -497,13 +497,13 @@ def test_presses_that_are_hard_to_undo_wait_for_confirmation(page: Page, dashboa
     command(page, "use the default")
     command(page, "confirm")
     expect(prompt).not_to_have_value("A custom prompt {url}")
-    # A setting saves for every device as it changes, through its searchable picker.
+    # A setting saves for every device as it changes, through its native picker.
     reviewer = dialog.locator("#settings-reviewer")
     before = reviewer.input_value()
     after = "claude" if before == "codex" else "codex"
     command(page, f"set main reviewer to {after}")
     expect(status).to_contain_text("Say “confirm” to set")
-    expect(dialog.locator(".searchable-select.voice-pending")).to_have_count(1)
+    expect(reviewer).to_have_class("voice-pending")
     assert reviewer.input_value() == before
     command(page, "confirm")
     expect(reviewer).to_have_value(after)

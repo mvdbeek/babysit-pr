@@ -47,9 +47,7 @@ def test_a_saved_prompt_is_what_the_handle_button_prefills(
     expect(dialog.locator("#settings-status")).to_have_text("Saved.")
     # The task the person changed is marked, so the default is not mistaken for it.
     expect(dialog.locator("#settings-task")).to_contain_text("Handle failing tests (edited)")
-    expect(dialog.get_by_role("combobox", name="Task prompt")).to_have_value(
-        "Handle failing tests (edited)"
-    )
+    expect(dialog.get_by_role("combobox", name="Task prompt")).to_have_value("ci")
     dialog.get_by_role("button", name="Close settings").click()
     page.locator("#pr-list tr").first.get_by_role("button", name="Handle failing tests").click()
     expect(page.locator("#workspace-task")).to_have_value(

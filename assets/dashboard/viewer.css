@@ -665,6 +665,11 @@
   gap: 8px;
 }
 .ws-message textarea {
+  padding: 10px 12px;
+  border: 1px solid var(--field-line);
+  border-radius: 7px;
+  background: var(--field-bg);
+  color: var(--ink);
   flex: 1;
   min-width: 0;
   font: inherit;
@@ -1055,4 +1060,33 @@ body.ws-tray-shown main {
 #ws-viewer[data-mode="terminal"] #ws-message,
 #ws-viewer[data-mode="terminal"] #ws-agent-interaction {
   display: none;
+}
+
+@media (max-width: 650px) {
+  .ws-viewer-header {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  #ws-viewer-title {
+    order: -2;
+    width: 100%;
+    margin: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .ws-viewer-actions {
+    float: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    margin: 0;
+    width: 100%;
+  }
+  #ws-viewer-links {
+    margin: 0;
+  }
+  .ws-viewer-bar {
+    width: 100%;
+  }
 }

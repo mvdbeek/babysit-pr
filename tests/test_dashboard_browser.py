@@ -672,6 +672,8 @@ def test_stale_feedback_click_is_rejected_without_approving_new_text(
 def test_cancel_keeps_history_and_running_repairs_finish_first(page: Page, dashboard_site) -> None:
     url, home = dashboard_site
     open_watch(page, url, "test/repo")
+    page.locator(".watch-management > summary").click()
+    page.once("dialog", lambda dialog: dialog.accept())
     page.get_by_role("button", name="Cancel watch", exact=True).click()
     expect(page.locator("#ended")).to_have_text("2")
     page.locator("#show-ended").click()
@@ -679,6 +681,8 @@ def test_cancel_keeps_history_and_running_repairs_finish_first(page: Page, dashb
     assert read_job(home, "feedback")["status"] == "stopped"
     choose_option(page.get_by_role("combobox", name="Filter watches", exact=True), "active")
     page.get_by_role("button", name="test/running, feature,", exact=False).click()
+    page.locator(".watch-management > summary").click()
+    page.once("dialog", lambda dialog: dialog.accept())
     page.get_by_role("button", name="Cancel watch", exact=True).click()
     expect(page.get_by_role("button", name="Cancellation pending", exact=True)).to_be_disabled()
     job = read_job(home, "running")
@@ -838,7 +842,7 @@ def test_pr_overview_filters_ci_roles_times_and_safe_titles(page: Page, dashboar
     page.get_by_label("Search pull requests").fill("colleague")
     expect(rows).to_contain_text(["Assigned PR"])
     page.get_by_label("Search pull requests").fill("missing")
-    expect(page.locator("#pr-empty")).to_have_text("No matching pull requests.")
+    expect(page.locator("#pr-empty p")).to_have_text("No matching pull requests.")
     assert len(dashboard.read_jobs(home)) == 3  # Discovery creates no repair watches.
     page.set_viewport_size({"width": 390, "height": 844})
     page.get_by_label("Search pull requests").fill("")
@@ -868,10 +872,9 @@ def test_role_filter_offers_only_searched_roles(page: Page, dashboard_site) -> N
     searched.update(roles=["author", "assignee", "reviewer"], mentioned=False)
     page.evaluate("() => prTable.refresh()")
     expect(rows).to_have_count(2)
-    expect(role).to_have_value("All roles")
-    role.fill("Mentioned")
-    wrapper = role.locator("xpath=../..")
-    expect(wrapper.get_by_role("status")).to_have_text("No matches")
+    expect(role).to_have_value("all")
+    expect(role.locator('option[value="mentioned"]')).to_have_attribute("disabled", "")
+    expect(role.locator('option[value="mentioned"]')).to_have_attribute("hidden", "")
 
 
 def test_pr_sync_failure_and_empty_state_are_distinct(page: Page, dashboard_site) -> None:
@@ -1010,9 +1013,8 @@ def test_pr_metadata_and_mobile_sort_survive_refresh_and_filtering(
     expect(filters).to_have_attribute("aria-expanded", "false")
     expect(page.locator("#pr-filters")).to_be_hidden()
     first = page.locator("#pr-list tr").first
-    # With the filters folded away the first card is on the first screen. Phones of 380px or
-    # less have a second header row for the connection status, so allow for it.
-    assert first.bounding_box()["y"] < 340
+    # Full-width tabs and the labeled view/tag controls keep the first card on screen.
+    assert first.bounding_box()["y"] < 480
     refresh = page.get_by_role("button", name="Refresh", exact=True)
     assert refresh.bounding_box()["width"] == 44
     assert refresh.bounding_box()["y"] == page.locator("#pr-search").bounding_box()["y"]
@@ -1068,7 +1070,7 @@ def test_pr_filters_combine_and_keep_repository_selection_on_refresh(
     expect(rows).to_contain_text(["Assigned PR"])
     choose_option(review, "ready")
     expect(rows).to_have_count(0)
-    expect(page.locator("#pr-empty")).to_have_text("No matching pull requests.")
+    expect(page.locator("#pr-empty p")).to_have_text("No matching pull requests.")
     expect(page.locator("#pr-repo option")).to_have_count(3)
     choose_option(repo, "test/alpha")
     choose_option(ci, "FAILURE")
@@ -1085,8 +1087,8 @@ def test_pr_filters_combine_and_keep_repository_selection_on_refresh(
     page.get_by_role("button", name="Refresh", exact=True).click()
     expect(rows).to_have_count(0)
     expect(repo).to_have_value("test/alpha")
-    expect(review).to_have_value("Ready for review")
-    expect(ci).to_have_value("Failed")
+    expect(review).to_have_value("ready")
+    expect(ci).to_have_value("FAILURE")
     page.unroute("**/api/prs")
     page.get_by_role("button", name="Refresh", exact=True).click()
     expect(rows).to_have_count(1)
@@ -2202,7 +2204,7 @@ def test_issue_overview_columns_filters_linked_prs_and_safe_titles(
     page.get_by_label("Search issues").fill("kind/bug")
     expect(rows).to_have_count(1)
     page.get_by_label("Search issues").fill("missing")
-    expect(page.locator("#issue-empty")).to_have_text("No matching issues.")
+    expect(page.locator("#issue-empty p")).to_have_text("No matching issues.")
     page.get_by_label("Search issues").fill("")
     assert len(dashboard.read_jobs(home)) == 3  # Discovery creates no repair watches.
     expect(page.locator("#pr-count")).to_have_text("2 / 2")  # The PR tab is untouched.
@@ -2478,12 +2480,14 @@ def test_searchable_picker_refresh_preserves_query_selection_and_hidden_filters(
     picker = page.locator(f"#{prefix}-repo").locator("..").get_by_role("combobox")
     choose_option(picker, "test/beta")
     picker.fill("alp")
-    expect(page.get_by_role("option")).to_have_text(["test/alpha"])
+    expect(page.locator(".select-popup:visible").get_by_role("option")).to_have_text(["test/alpha"])
     picker.press("ArrowLeft")
     caret = picker.evaluate("node => node.selectionStart")
     snapshot[kind][1]["repo"] = "test/alpine"
     page.evaluate(f"{prefix}Table.refresh()")
-    expect(page.get_by_role("option")).to_have_text(["test/alpha", "test/alpine"])
+    expect(page.locator(".select-popup:visible").get_by_role("option")).to_have_text(
+        ["test/alpha", "test/alpine"]
+    )
     expect(picker).to_have_value("alp")
     expect(picker).to_be_focused()
     assert picker.evaluate("node => node.selectionStart") == caret
@@ -2496,7 +2500,9 @@ def test_searchable_picker_refresh_preserves_query_selection_and_hidden_filters(
     page.get_by_role("tab", name="Pull requests" if kind == "prs" else "Issues", exact=True).click()
     expect(picker).to_have_value("test/beta")
     picker.click()
-    expect(page.get_by_role("option")).to_have_text(["All repositories", "test/beta"])
+    expect(page.locator(".select-popup:visible").get_by_role("option")).to_have_text(
+        ["All repositories", "test/beta"]
+    )
 
 
 @pytest.mark.parametrize("width", [1280, 390])
@@ -2512,7 +2518,7 @@ def test_searchable_long_plain_text_choices_and_layout(page, dashboard_site, wid
         page.locator("#issue-filters-toggle").click()
     picker = page.get_by_role("combobox", name="Filter issues by label", exact=True)
     picker.fill("TEAM/")
-    option = page.get_by_role("option")
+    option = page.locator(".select-popup:visible").get_by_role("option")
     expect(option).to_have_text(label)
     assert option.evaluate("node => node.scrollWidth <= node.clientWidth")
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
@@ -2528,7 +2534,9 @@ def test_searchable_long_plain_text_choices_and_layout(page, dashboard_site, wid
     if width == 390:
         sort = page.get_by_role("combobox", name="Sort issues by", exact=True)
         sort.fill("Last")
-        expect(page.get_by_role("option")).to_have_text(["Last updated"])
+        expect(page.locator(".select-popup:visible").get_by_role("option")).to_have_text(
+            ["Last updated"]
+        )
         popup = page.locator(".select-popup:visible")
         bounds = popup.bounding_box()
         assert bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width
@@ -2600,20 +2608,20 @@ def test_workspace_optional_model_effort(page, dashboard_site, request, kind, cl
     effort = dialog.get_by_role("combobox", name="Reasoning effort (optional)", exact=True)
     native_effort = dialog.locator("#workspace-effort")
     expect(model).to_have_value("Default")
-    expect(effort).to_have_value("Default")
+    expect(effort).to_have_value("")
     expect(native_model.locator("option").first).to_have_text("Default")
     expect(native_effort.locator("option").first).to_have_text("Default")
     choose_option(model, "fixture-codex")
     choose_option(effort, "ultra")
     dialog.get_by_label("Agent", exact=True).select_option("claude")
     expect(model).to_have_value("Default")
-    expect(effort).to_have_value("Default")
+    expect(effort).to_have_value("")
     expect(native_model.locator("option[value=fixture-codex]")).to_have_count(0)
     expect(native_effort.locator("option[value=ultra]")).to_have_count(0)
     choose_option(model, "opus")
     choose_option(effort, "high")
     choose_option(model, "haiku")
-    expect(effort).to_have_value("Default")
+    expect(effort).to_have_value("")
     expect(native_effort.locator("option")).to_have_count(1)
     dialog.get_by_label("Agent", exact=True).select_option("codex")
     if settings != "default":
@@ -2686,7 +2694,7 @@ def test_saved_effort_defaults_name_default_and_save_from_the_picker(
     ).click()
     dialog = page.get_by_role("dialog")
     effort = dialog.get_by_role("combobox", name="Reasoning effort (optional)", exact=True)
-    expect(effort).to_have_value("Default (low)")
+    expect(effort.locator("option:checked")).to_have_text("Default (low)")
     expect(dialog).to_contain_text(
         "Default effort is low, saved for all projects. Support depends on the agent’s configured model."
     )
@@ -2697,11 +2705,11 @@ def test_saved_effort_defaults_name_default_and_save_from_the_picker(
     dialog.get_by_role("button", name="Save defaults", exact=True).click()
     expect(dialog.locator(".effort-default-status")).to_have_text("Saved.")
     assert saved == [{"repo": "test/alpha", "effort": "ultra"}]
-    expect(effort).to_have_value("Default (ultra)")
+    expect(effort.locator("option:checked")).to_have_text("Default (ultra)")
     expect(dialog).to_contain_text("Default effort is ultra, saved for test/alpha.")
     # Claude has no ultra, so the default for all projects applies instead.
     dialog.get_by_label("Agent", exact=True).select_option("claude")
-    expect(effort).to_have_value("Default (low)")
+    expect(effort.locator("option:checked")).to_have_text("Default (low)")
     # The server resolves Default at launch, so nothing is sent for it.
     dialog.get_by_label("Task", exact=True).fill("Fix this")
     dialog.get_by_role("button", name="Create workspace", exact=True).click()
@@ -5434,6 +5442,7 @@ def test_new_task_names_a_branch_or_files_an_issue_first(page, dashboard_site, v
     expect(dialog.get_by_label("Issue title")).to_be_focused()  # Required and empty.
     assert len(sent) == 1
     dialog.get_by_label("Issue title").fill("Crash on start")
+    dialog.locator(".execution-settings > summary").click()
     dialog.get_by_label("Allow Docker in the agent’s sandbox").check()
     dialog.get_by_label("Quit the agent when it is done").check()
     page.screenshot(path="reports/new-task.png")
