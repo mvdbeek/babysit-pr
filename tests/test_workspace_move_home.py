@@ -959,6 +959,7 @@ def test_a_staged_file_is_fetched_only_by_its_name_and_within_its_limit(rig):
             machines.get_file(rig.home, machine, remote_probe.MOVE_STATE, name, limit=10)
     with pytest.raises(ValueError, match="larger than 10 bytes"):
         machines.get_file(rig.home, machine, remote_probe.MOVE_STATE, "big.bundle", limit=10)
+    assert (folder / "big.bundle").exists()  # Refused, so left for a larger limit.
     (folder / "link.bundle").symlink_to(folder / "big.bundle")
     with pytest.raises(ValueError, match="not a staged file"):
         machines.get_file(rig.home, machine, remote_probe.MOVE_STATE, "link.bundle", limit=200)
