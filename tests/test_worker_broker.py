@@ -476,6 +476,32 @@ def test_the_broker_finds_the_rollout_its_sandboxs_codex_writes(codex_sandbox, t
     assert found() is None
 
 
+def test_no_linked_directory_is_entered_to_find_a_rollout(tmp_path, monkeypatch):
+    config, sid = tmp_path / ".codex", str(uuid.uuid4())
+    path = codex_rollout(config, sid)
+    assert worker_broker.transcript("codex", config, sid) == str(path)
+    # The sandbox writes the store, and may link a year, month or day anywhere: /proc,
+    # say, which a search would then walk. A rollout behind a link is not looked for.
+    behind = codex_rollout(tmp_path / "behind", str(uuid.uuid4()))
+    sessions = config / "sessions"
+    (sessions / "2027").symlink_to(behind.parents[2])
+    (sessions / "2026" / "12").symlink_to(behind.parents[1])
+    (sessions / "2026" / "11" / "08").symlink_to(behind.parent)
+    seen = []
+    scandir = os.scandir
+
+    def listed(folder):
+        seen.append(os.path.realpath(folder))
+        return scandir(folder)
+
+    monkeypatch.setattr(os, "scandir", listed)
+    behind_sid = behind.name.removesuffix(".jsonl")[-36:]
+    with pytest.raises(ValueError, match="not one of this sandbox's own"):
+        worker_broker.transcript("codex", config, behind_sid)
+    assert worker_broker.transcript("codex", config, sid) == str(path)
+    assert seen and not any(folder.startswith(str(tmp_path / "behind")) for folder in seen)
+
+
 def test_the_broker_reads_what_a_real_codex_process_holds_open(tmp_path):
     if not Path("/proc/self/fdinfo").is_dir():
         pytest.skip("needs Linux /proc")

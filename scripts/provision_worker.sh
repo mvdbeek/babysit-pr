@@ -920,6 +920,7 @@ user_checks() {
   gpg_checks
   claude_account_checks
   session_hook_checks
+  session_service_checks
   instruction_checks
 }
 
@@ -969,6 +970,42 @@ session_hook_checks() {
       warn "herdr's Claude session hook is ${state:-unknown} for $config, so the dashboard cannot tell the session of a Claude started by hand with it; rerun the user step"
     fi
   done
+}
+
+# herdr's Codex hook cannot name a Codex started by hand here: Codex runs hooks in its
+# shared background server, with the environment of the pane that started it first.
+# worker_sessions.py reads the session from /proc instead, as a user service that every
+# user step restarts on the commit it deployed. Its unit file names only the deployed
+# copy, which no sandbox can write.
+SESSIONS_UNIT=babysit-codex-sessions.service
+install_session_service() {
+  local unit=$HOME/.config/systemd/user/$SESSIONS_UNIT
+  local content="[Unit]
+Description=babysit-pr: tell herdr the session of a Codex started by hand
+
+[Service]
+ExecStart=/usr/bin/env python3 -I %h/$APP/scripts/worker_sessions.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target"
+  run mkdir -p "$(dirname "$unit")"
+  write_file "$unit" 0644 "$content" || true
+  if ((dry)); then
+    printf '  would run: systemctl --user enable %s and restart it\n' "$SESSIONS_UNIT"
+  elif ! { systemctl --user daemon-reload && systemctl --user enable --quiet "$SESSIONS_UNIT" &&
+    systemctl --user restart "$SESSIONS_UNIT"; } >/dev/null 2>&1; then
+    warn "could not start $SESSIONS_UNIT (systemctl --user); the dashboard cannot tell the session of a Codex started by hand here"
+  fi
+}
+
+session_service_checks() {
+  if systemctl --user is-active --quiet "$SESSIONS_UNIT" 2>/dev/null; then
+    ok "$SESSIONS_UNIT names the session of a Codex started by hand"
+  else
+    warn "$SESSIONS_UNIT is not running, so the dashboard cannot tell the session of a Codex started by hand here; rerun the user step (journalctl --user -u $SESSIONS_UNIT)"
+  fi
 }
 
 # babysit-bwrap turns a missing CLAUDE.md or AGENTS.md into an empty placeholder, so a
@@ -1100,6 +1137,9 @@ user_step() {
 
   say "herdr's Claude session hook"
   install_session_hooks
+
+  say "Codex session reporter"
+  install_session_service
 
   say "git identity"
   if [[ -n ${GIT_USER_NAME:-} && -n ${GIT_USER_EMAIL:-} ]]; then

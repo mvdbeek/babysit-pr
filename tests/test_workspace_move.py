@@ -763,6 +763,10 @@ def test_launch_settings_come_from_the_command_line_and_are_checked():
 
 def test_the_receive_probe_refuses_files_not_staged_for_a_move(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    # A file that is there, outside the staging directory: a sandbox the suite runs in
+    # may hide the machine's own, such as /etc/passwd.
+    elsewhere = tmp_path / "bundle"
+    elsewhere.write_bytes(b"not staged")
     with pytest.raises(ValueError, match="Moves are taken only from"):
         remote_probe._host_move_receive(
             "~/src/repo",
@@ -770,7 +774,7 @@ def test_the_receive_probe_refuses_files_not_staged_for_a_move(tmp_path, monkeyp
             "~/src/worktrees/repo",
             "x",
             "x",
-            "/etc/passwd",
+            str(elsewhere),
             "0" * 32,
             "0" * 40,
             "0" * 40,
@@ -781,7 +785,7 @@ def test_the_receive_probe_refuses_files_not_staged_for_a_move(tmp_path, monkeyp
             "default",
             "safehouse",
         )
-    assert Path("/etc/passwd").exists()
+    assert elsewhere.read_bytes() == b"not staged"
 
 
 def test_the_session_probe_refuses_paths_out_of_the_store(tmp_path, monkeypatch):
