@@ -7,11 +7,11 @@
   const VISIBLE_POLL = 3000;
   const HIDDEN_POLL = 30000;
   const STATES = {
-    blocked: ["Waiting for you", "red", 0],
-    working: ["Working", "amber", 1],
-    idle: ["Idle", "green", 2],
-    done: ["Done", "green", 3],
-    unknown: ["Unknown", "", 4],
+    blocked: ["Waiting for you", "red"],
+    working: ["Working", "amber"],
+    idle: ["Idle", "green"],
+    done: ["Done", "green"],
+    unknown: ["Unknown", ""],
   };
   const ORIGINS = { watch: ["Watch", "blue"], cron: ["Cron", "blue"] };
   const KINDS = { claude: "Claude", codex: "Codex" };
@@ -35,7 +35,7 @@
   function visible() {
     return !byId("agents-panel").hidden && !document.hidden;
   }
-  // "4m", "2h", "3d": how long an agent has been in its state, as far as the dashboard saw.
+  // "4m", "2h", "3d": how long ago, at the dashboard's last answer.
   function age(since, now) {
     if (!since) return "";
     const seconds = Math.max(0, now - since);
@@ -46,6 +46,17 @@
   }
   function machineName(agent) {
     return agent.machine_label || "This machine";
+  }
+  function working(agent) {
+    return agent.status === "working";
+  }
+  // What an agent's row counts from. One at work is active now, and its transcript's time
+  // moves with every poll: it shows how long it has been working, as far as the dashboard
+  // saw. Any other shows when it was last active.
+  function shownTime(agent) {
+    return working(agent) || !agent.activity
+      ? [agent.since, "In this state since"]
+      : [agent.activity, "Last active"];
   }
   function workers() {
     return (snapshot?.machines || []).filter((machine) => !machine.local);
@@ -79,9 +90,10 @@
       )
       .sort(
         (a, b) =>
-          (STATES[a.status] || STATES.unknown)[2] - (STATES[b.status] || STATES.unknown)[2] ||
-          // Waiting longest first; otherwise the latest change first.
-          (a.status === "blocked" ? 1 : -1) * ((a.since || 0) - (b.since || 0)) ||
+          // Those at work first, the latest to start on top; then every other by when it
+          // was last active, the most recent on top.
+          working(b) - working(a) ||
+          (working(a) ? (b.since || 0) - (a.since || 0) : (b.activity || 0) - (a.activity || 0)) ||
           a.id.localeCompare(b.id),
       );
   }
@@ -142,10 +154,10 @@
     button.setAttribute("aria-current", String(agent.id === selected));
     const head = node("span", undefined, "agents-head");
     head.append(badge(label, tone));
-    const since = age(agent.since, now);
-    if (since) {
-      const time = node("span", since, "agents-age");
-      time.title = `In this state since ${new Date(agent.since * 1000).toLocaleString()}`;
+    const [when, what] = shownTime(agent);
+    if (when) {
+      const time = node("span", age(when, now), "agents-age");
+      time.title = `${what} ${new Date(when * 1000).toLocaleString()}`;
       head.append(time);
     }
     head.append(node("span", KINDS[agent.agent] || agent.agent || "Agent", "agents-kind"));
@@ -239,8 +251,10 @@
     const shown = filtered();
     byId("agents-count").textContent = String(snapshot.agents.length);
     byId("agents-status").textContent = statusLine();
-    // Rebuilt only on a change, so focus and scroll stay; ages tick with each poll.
-    const key = JSON.stringify([shown, selected, now - (now % 60), workers().length]);
+    // Rebuilt only on a change, so focus and scroll stay; ages tick with each poll. What a
+    // row neither shows nor is ordered by, an agent at work's last write, is no change.
+    const drawn = shown.map((agent) => (working(agent) ? { ...agent, activity: null } : agent));
+    const key = JSON.stringify([drawn, selected, now - (now % 60), workers().length]);
     if (!force && key === renderedKey) return;
     renderedKey = key;
     const list = byId("agents-list");

@@ -1,5 +1,6 @@
 """The Agents tab and the viewer's Terminal view in real Chromium, against mocked APIs."""
 
+import re
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -40,8 +41,6 @@ def agent(id_, status, **fields):
 
 
 AGENTS = [
-    agent("w2:p1", "idle", origin="cron", origin_label="Cron: nightly"),
-    agent("w1:p1", "working"),
     agent(
         "mini/w1:p1",
         "blocked",
@@ -51,7 +50,11 @@ AGENTS = [
         origin="watch",
         origin_label="Watch w-7",
         origin_url="https://github.com/o/r/pull/7",
+        activity=NOW - 60,
     ),
+    agent("w2:p1", "idle", origin="cron", origin_label="Cron: nightly", activity=NOW - 7200),
+    # Its transcript's time moves with every poll; it is at work, which says enough.
+    agent("w1:p1", "working", activity=NOW - 9000),
 ]
 MACHINES = [
     {"id": None, "label": "This machine", "local": True, "pending": False, "error": None},
@@ -111,18 +114,28 @@ def rows(page: Page):
     return page.locator("#agents-list .agents-row")
 
 
-def test_agents_are_listed_by_state_with_a_badge_and_filters(page, dashboard_site, agents_routes):
+def test_agents_are_listed_by_last_activity_with_a_badge_and_filters(
+    page, dashboard_site, agents_routes
+):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 1280, "height": 900})
     page.goto(url + "/#agents")
     expect(rows(page)).to_have_count(3)
-    # Waiting for an answer first, then working, then settled.
-    expect(rows(page).nth(0)).to_contain_text("Waiting for you")
-    expect(rows(page).nth(0)).to_contain_text("Mac mini")
-    expect(rows(page).nth(0)).to_contain_text("Watch")
-    expect(rows(page).nth(1)).to_contain_text("Working")
+    # The one at work first, then the most recently active, whichever machine it is on.
+    expect(rows(page).nth(0)).to_contain_text("Working")
+    expect(rows(page).nth(0).locator(".agents-age")).to_have_text("5m")
+    expect(rows(page).nth(0).locator(".agents-age")).to_have_attribute(
+        "title", re.compile("^In this state since ")
+    )
+    expect(rows(page).nth(1)).to_contain_text("Waiting for you")
+    expect(rows(page).nth(1)).to_contain_text("Mac mini")
+    expect(rows(page).nth(1)).to_contain_text("Watch")
+    expect(rows(page).nth(1).locator(".agents-age")).to_have_text("1m")
+    expect(rows(page).nth(1).locator(".agents-age")).to_have_attribute(
+        "title", re.compile("^Last active ")
+    )
     expect(rows(page).nth(2)).to_contain_text("Cron")
-    expect(rows(page).nth(1)).to_contain_text("5m")
+    expect(rows(page).nth(2).locator(".agents-age")).to_have_text("2h")
     expect(page.locator("#agents-tab-count")).to_have_text("3")
     expect(page.locator("#agents-tab-count")).to_have_class("count attention-count")
     expect(page.locator("#agents-tab-needs")).to_have_text("1 waiting for you")
