@@ -21,10 +21,12 @@ from types import SimpleNamespace
 from urllib.parse import quote
 
 import dashboard
+import dufs_share
 import machines
 import pr_workspaces as pw
 import pytest
 import remote_probe
+import workspace_artefacts
 import workspace_overview as wso
 import workspace_viewer as wv
 from playwright.sync_api import expect
@@ -385,6 +387,30 @@ def test_remote_search_reads_the_workers_sessions_and_then_only_what_is_new(work
     assert (hit["session"], hit["index"]) == (CLAUDE_SID, 2)
     # The listing is still fresh: one read of each transcript's new bytes.
     assert tails == ["tail", "tail"]
+
+
+def test_a_workers_artefacts_are_found_by_the_links_its_agents_gave(worker, tmp_path):
+    outbox = tmp_path / "share" / "outbox"
+    (outbox / "mini").mkdir(parents=True)
+    (outbox / "mini" / "report.md").write_text("pulled from the worker")
+    (outbox / "mini" / "local.md").write_text("a path of the worker's own")
+    with dufs_share.serve(outbox.parent) as base:
+        url = f"{base}/outbox"
+        config = worker.home / "experiments" / "artefacts" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"enabled": True, "url": url, "root": str(outbox)}))
+        with worker.claude.open("a") as stream:
+            # The same directory on the worker's disk is another machine's path.
+            text = f"Report: {url}/mini/report.md, kept at {outbox}/mini/local.md"
+            stream.write(json.dumps(claude_turn("assistant", worker.checkout, text)) + "\n")
+        value = workspace_artefacts.Artefacts(worker.home).listing(
+            str(worker.checkout), worker.machine
+        )
+    [folder] = value["folders"]
+    [report] = folder["files"]
+    assert (folder["path"], report["name"], folder["others"]) == ("mini", "report.md", 1)
+    assert (report["named"]["session"], report["named"]["index"]) == (CLAUDE_SID, 2)
+    assert (value["searched"], value["behind"], value["missing"]) == (2, 0, [])
 
 
 def test_remote_tail_refuses_files_outside_the_session_stores(worker):

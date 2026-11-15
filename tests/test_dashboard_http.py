@@ -170,6 +170,11 @@ class Server:
         def known_origin(origin):
             return False
 
+    class artefacts:
+        @staticmethod
+        def image_source():
+            return None
+
 
 class GoneClient:
     """A socket whose peer hung up: every write fails."""

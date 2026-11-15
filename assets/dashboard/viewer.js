@@ -26,6 +26,20 @@
     getJSON,
     paneLabel,
   });
+  // The Artefacts tab (artefacts.js): what the workspace's agents left on the share.
+  const artefacts = window.workspaceArtefacts({
+    // The transcript entry that named an artefact, as a search hit opens one.
+    showEntry: (session, index) =>
+      change((state) => {
+        state.mode = "transcript";
+        state.query = null;
+        state.session = session;
+        state.jump = index;
+      }),
+    external,
+    stamp,
+    refreshButton,
+  });
 
   function node(tag, text, className) {
     const element = document.createElement(tag);
@@ -298,11 +312,14 @@
       ["ws-view-diff", "diff"],
       ["ws-view-transcript", "transcript"],
       ["ws-view-terminal", "terminal"],
+      ["ws-view-artefacts", "artefacts"],
     ]) {
       byId(id).setAttribute("aria-selected", String(viewer?.mode === mode));
     }
     // A pane can only be shown in a herdr workspace.
     byId("ws-view-terminal").hidden = !viewer?.entry.workspace;
+    // Artefacts only where the dashboard has a share to read.
+    byId("ws-view-artefacts").hidden = !artefacts.offered();
     byId("ws-viewer").dataset.mode = viewer?.mode || "";
     terminal.reset();
   }
@@ -344,6 +361,7 @@
   function openViewer(entry, mode, siblings = null, state = null) {
     const last = viewer?.siblings === siblings ? viewer.position : -1;
     if (mode === "terminal" && !entry.workspace) mode = "transcript";
+    if (mode === "artefacts" && !artefacts.offered()) mode = "transcript";
     // An entry for one agent (the Agents tab's) starts on its session and pane.
     viewer = {
       entry,
@@ -450,6 +468,11 @@
         current.data = data;
         current.pane = data.pane;
         terminal.render(data);
+      } else if (current.mode === "artefacts") {
+        const data = await getJSON("/api/workspace-artefacts", where(current.entry));
+        if (token !== viewerRequest || viewer !== current) return;
+        current.data = data;
+        artefacts.render(data);
       } else if (current.mode === "diff") {
         const data = await getJSON("/api/workspace-diff", {
           ...where(current.entry),
@@ -503,6 +526,8 @@
         byId("ws-viewer-error").textContent = error.message;
         // A failed diff still offers its other choices, such as uncommitted changes only.
         if (current.mode === "diff") diffControls(null);
+        // A share that could not be read can be asked again.
+        if (current.mode === "artefacts") artefacts.failed();
       }
     } finally {
       viewerInflight -= 1;
@@ -2884,6 +2909,7 @@
   byId("ws-view-diff").onclick = () => setMode("diff");
   byId("ws-view-transcript").onclick = () => setMode("transcript");
   byId("ws-view-terminal").onclick = () => setMode("terminal");
+  byId("ws-view-artefacts").onclick = () => setMode("artefacts");
   byId("ws-viewer-close").onclick = () => byId("ws-viewer").close();
   byId("ws-viewer-prev").onclick = () => step("previous");
   byId("ws-viewer-next").onclick = () => step("next");
@@ -3013,8 +3039,9 @@
     // names it, as a restarted herdr reuses IDs.
     const path = draft?.path || null;
     const { scope, base, commit, session } = viewer;
-    // The tray restores diffs and transcripts; a terminal comes back as its transcript.
-    const mode = viewer.mode === "terminal" ? "transcript" : viewer.mode;
+    // The tray restores diffs and transcripts; a terminal or the artefacts come back as
+    // the transcript.
+    const mode = ["diff", "transcript"].includes(viewer.mode) ? viewer.mode : "transcript";
     const item = {
       id,
       entry,
