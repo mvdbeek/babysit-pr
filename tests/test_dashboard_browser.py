@@ -4533,6 +4533,80 @@ def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
 
 
 @pytest.mark.parametrize("width", [1280, 390])
+def test_transcript_code_blocks_copy_their_text(page, dashboard_site, viewer_routes, width):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    command = "uv run --locked tox -e unit -- " + "tests/test_dashboard_browser.py " * 4
+    text = (
+        f"Run:\n\n```sh\n{command}\nnpm test\n```\n\n> ```\n> quoted\n> ```\n\n"
+        "Then `inline`.\n\n```\ncut off\n… (9 more characters)"
+    )
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": [{"role": "assistant", "text": text}],
+                "start": 0,
+                "total": 1,
+            }
+        ),
+    )
+    # The clipboard is the browser's own, shared by every test: record what would reach it.
+    page.add_init_script(
+        """
+        window.copied = [];
+        Clipboard.prototype.writeText = async (text) => {
+          if (window.clipboardRefused) throw new Error("refused");
+          window.copied.push(text);
+        };
+        """
+    )
+    page.clock.install()
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    blocks = viewer.locator(".ws-md .md-code")
+    # Every closed fenced block has a button, a quoted one too; inline code has none, nor
+    # has a block that clipping cut off, whose last line is the clip marker.
+    expect(blocks).to_have_count(3)
+    expect(viewer.get_by_role("button", name="Copy code")).to_have_count(2)
+    assert blocks.last.get_by_role("button").count() == 0
+    # A reply ending in a block has no gap below it.
+    assert blocks.last.evaluate("el => getComputedStyle(el).marginBottom") == "0px"
+    copy = blocks.first.get_by_role("button")
+    # The button lies inside its block, clear of the text, and nothing overflows.
+    box, block = copy.bounding_box(), blocks.first.bounding_box()
+    assert block["x"] <= box["x"] and box["x"] + box["width"] <= block["x"] + block["width"]
+    assert block["y"] <= box["y"] and box["y"] + box["height"] <= block["y"] + block["height"]
+    assert blocks.first.locator("code").evaluate(
+        "(code, button) => [...code.getClientRects()].every("
+        "(line) => line.right <= button.getBoundingClientRect().left)",
+        copy.element_handle(),
+    )
+    assert viewer.evaluate("el => el.scrollWidth <= el.clientWidth")
+    page.screenshot(path=f"reports/transcript-copy-{width}.png", full_page=True)
+    # The whole block is copied as written, without the fence or its language.
+    copy.click()
+    assert page.evaluate("window.copied") == [f"{command}\nnpm test"]
+    expect(copy).to_have_accessible_name("Copied")
+    expect(copy).to_have_class(re.compile(r"\bmd-copied\b"))
+    page.clock.run_for(2100)
+    expect(copy).to_have_accessible_name("Copy code")
+    expect(copy).not_to_have_class(re.compile(r"\bmd-copied\b"))
+    blocks.nth(1).get_by_role("button").click()
+    assert page.evaluate("window.copied[1]") == "quoted"
+    # Without clipboard access the block is selected instead, ready to copy by hand.
+    page.evaluate("window.clipboardRefused = true")
+    copy.click()
+    expect(copy).to_have_accessible_name("Selected: copy it from here")
+    assert page.evaluate("getSelection().toString()") == f"{command}\nnpm test"
+    assert page.evaluate("window.copied.length") == 2
+
+
+@pytest.mark.parametrize("width", [1280, 390])
 def test_consecutive_tool_calls_collapse_and_follow_live_updates(
     page, dashboard_site, viewer_routes, width
 ):

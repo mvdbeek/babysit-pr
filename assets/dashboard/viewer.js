@@ -206,6 +206,43 @@
     }
     return [element, index];
   }
+  // Agents put the commands they suggest in fenced blocks; the button copies one whole.
+  const COPY_ICON = "M9 9h11v11H9zM5 15H4V4h11v1";
+  const COPIED_ICON = "M4 12.5l5 5L20 6.5";
+  function copyButton(code) {
+    const button = node("button", undefined, "md-copy");
+    button.type = "button";
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("aria-hidden", "true");
+    icon.setAttribute("focusable", "false");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    icon.append(path);
+    button.append(icon);
+    let timer;
+    const show = (label, copied) => {
+      path.setAttribute("d", copied ? COPIED_ICON : COPY_ICON);
+      button.classList.toggle("md-copied", copied);
+      button.setAttribute("aria-label", label);
+      button.title = label;
+    };
+    show("Copy code", false);
+    button.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(code.textContent);
+        show("Copied", true);
+      } catch {
+        // No clipboard here (a plain-http address, or permission refused): select the
+        // block, so the usual copy shortcut or menu takes it.
+        getSelection().selectAllChildren(code);
+        show("Selected: copy it from here", false);
+      }
+      // Cleared here, after the wait, so a second click's timer replaces the first's.
+      clearTimeout(timer);
+      timer = setTimeout(() => show("Copy code", false), 2000);
+    };
+    return button;
+  }
   function markdown(text, className) {
     const root = node("div", undefined, className);
     const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
@@ -220,10 +257,17 @@
         const closes = (text) =>
           text.length >= fence[1].length && [...text].every((c) => c === fence[1][0]);
         while (index < lines.length && !closes(lines[index].trim())) body.push(lines[index++]);
+        const closed = index < lines.length;
         index++;
         const pre = node("pre");
-        pre.append(node("code", body.join("\n")));
-        root.append(pre);
+        const code = node("code", body.join("\n"));
+        pre.append(code);
+        // The button sits beside the block, not in it, so it stays put as the block scrolls.
+        const block = node("div", undefined, "md-code");
+        block.append(pre);
+        // A block left open was cut off by clipping: its end is not the agent's text.
+        if (closed) block.append(copyButton(code));
+        root.append(block);
         continue;
       }
       if (!line.trim()) {
