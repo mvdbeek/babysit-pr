@@ -95,13 +95,29 @@ HERDR_TIMEOUT = 10
 MAX_BACKOFF = 60  # Seconds between reports herdr keeps refusing.
 
 
+def _rollouts(store, session):
+    """The rollouts of ``session`` in a Codex store, by year, month and day. Whoever
+    writes the store may link a directory anywhere (``/proc``, say): none is entered."""
+    level = [store]
+    for _ in range(3):
+        below = []
+        for folder in level:
+            with contextlib.suppress(OSError), os.scandir(folder) as entries:
+                below += [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+        level = below
+    found: list = []
+    for folder in level:
+        found += Path(folder).glob(f"rollout-*{session}.jsonl")
+    return found
+
+
 def transcript(agent, config_dir, session):
     """The one transcript of ``session`` in this launch's configuration directory."""
     root = Path(os.path.realpath(config_dir))
     if agent == "claude":
         found = list((root / "projects").glob(f"*/{session}.jsonl"))
     else:
-        found = list((root / "sessions").glob(f"*/*/*/rollout-*{session}.jsonl"))
+        found = _rollouts(root / "sessions", session)
     found = [Path(os.path.realpath(path)) for path in found]
     # Resolved, still exactly in the store: no link leads to another account's.
     if len(found) != 1 or not (
@@ -349,14 +365,14 @@ def _rollout_meta(path, held):
     return item["payload"] if isinstance(item.get("payload"), dict) else None
 
 
-def _held_rollouts(proc, pid, config_dir):
+def held_rollouts(proc, pid, config_dir):
     """The conversations ``pid`` writes the rollouts of in this launch's store, as
-    {(ID, transcript)}: not a subagent's, nor one Codex runs for itself."""
+    {(ID, transcript): its session_meta}: not a subagent's, nor one Codex runs for itself."""
     try:
         fds = list((proc / str(pid) / "fd").iterdir())
     except OSError:
-        return set()
-    found = set()
+        return {}
+    found = {}
     for fd in fds:
         try:
             match = ROLLOUT.fullmatch(os.path.basename(os.readlink(fd)))
@@ -372,7 +388,7 @@ def _held_rollouts(proc, pid, config_dir):
             continue
         source = meta.get("source")
         if not (isinstance(source, dict) and source.keys() & {"subagent", "internal"}):
-            found.add((session, path))
+            found[(session, path)] = meta
     return found
 
 
@@ -388,9 +404,9 @@ def running_codex_session(parent, config_dir, proc=Path("/proc")):
     for _ in range(SESSION_DEPTH):
         below = []
         for pid in level:
-            held = _held_rollouts(proc, pid, config_dir)
+            held = held_rollouts(proc, pid, config_dir)
             if held:
-                return held.pop() if len(held) == 1 else None
+                return next(iter(held)) if len(held) == 1 else None
             # npm's codex runs the native one, which is named codex. One with nothing
             # written yet: what it runs is not the launch's.
             if _name(proc, pid) != "codex":

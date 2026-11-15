@@ -192,9 +192,39 @@ shows as **Status unknown**. A Claude started before the hook was installed is n
 once it is restarted. `hooks/` and `settings.json` are read-only in every sandbox.
 An account added later gets the hook at the next user step or `make deploy`;
 `--check` warns about a configuration without it, or whose `settings.json` no
-longer runs it. Codex gets no such hook on a
-worker: Codex asks to trust a new hook and records that in `config.toml`, which
-sandboxed launches share and cannot write.
+longer runs it.
+
+Codex gets no such hook on a worker. Codex runs hooks in its shared background
+server, with the environment of whichever pane started that server first, so a
+second Codex would be reported in the first one's pane; and it runs a hook only once
+you trust it, which it records in `config.toml`, a file sandboxed launches share and
+cannot write. The user step instead installs and restarts a systemd user service,
+`babysit-codex-sessions.service` (`~/.config/systemd/user/`), which runs
+`worker_sessions.py` from the deployed copy and tells herdr the session of each Codex
+started by hand in a pane, read from `/proc` every five seconds:
+
+- Started as `codex --no-daemon`, the Codex writes its conversation's rollout
+  itself, and that is its session.
+- Otherwise the background server writes the rollouts of every Codex of that home.
+  The pane's Codex is given the one the server last wrote among those recorded in
+  the directory the Codex runs in. This is a guess from how Codex works today: two
+  Codex of the server in one directory are not named at all, and after a `/new` or
+  `/resume` the name follows at the conversation's first write. A Codex started
+  with `resume`, `fork` or `-C` may run a conversation recorded in another
+  directory, which would pass for that directory's: while it has none recorded in
+  its own directory, no Codex of that server is named.
+
+Sandboxed launches are not touched (they run in a PID namespace of their own, which
+the service passes over, and their broker reports them). Their agents do write the
+Codex home the background server uses: by writing to a rollout the server holds they
+can make it pass for its directory's latest, or leave a pane unnamed, and no more. A
+session's name grants nothing, since every action on a pane checks the pane itself.
+`--check` warns when the
+service is not running; `journalctl --user -u babysit-codex-sessions.service` shows
+why, and `python3 -I ~/.local/share/babysit-pr/app/scripts/worker_sessions.py
+--print` shows what one look finds without telling herdr. To stop it:
+`systemctl --user disable --now babysit-codex-sessions.service`; the next user step
+enables it again.
 
 The deployed copy is kept apart from `~/src`, where agents work: babysit-bwrap
 refuses to grant `~/.local/share/babysit-pr`, its own checkout and that checkout's

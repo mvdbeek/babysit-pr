@@ -252,7 +252,7 @@ def test_user_step_moves_path_from_the_old_clone_to_the_deployed_copy(tmp_path):
     fakes = tmp_path / "bin"
     fakes.mkdir()
     calls = tmp_path / "calls"
-    for tool in ("git", "npm", "bwrap", "docker", "id"):
+    for tool in ("git", "npm", "bwrap", "docker", "id", "systemctl"):
         answer = "echo babysit" if tool == "id" else ""
         (fakes / tool).write_text(f'#!/bin/sh\necho "{tool} $*" >> "{calls}"\n{answer}\n')
         (fakes / tool).chmod(0o755)
@@ -537,7 +537,7 @@ def test_user_step_installs_herdrs_session_hook_for_every_claude_configuration(t
     fakes = tmp_path / "bin"
     fakes.mkdir()
     calls = tmp_path / "calls"
-    for tool in ("git", "npm", "bwrap", "docker", "id"):
+    for tool in ("git", "npm", "bwrap", "docker", "id", "systemctl"):
         answer = "echo babysit" if tool == "id" else ""
         (fakes / tool).write_text(f"#!/bin/sh\n{answer}\n")
         (fakes / tool).chmod(0o755)
@@ -635,3 +635,72 @@ def test_user_check_warns_about_a_claude_configuration_without_the_session_hook(
     assert f"WARNING: herdr's Claude session hook is not installed for {bare}," in output
     assert f"WARNING: herdr's Claude session hook is not in settings.json for {replaced}," in output
     assert "rerun the user step" in output
+
+
+UNIT = "babysit-codex-sessions.service"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the user step refuses root")
+@pytest.mark.parametrize("starts", [True, False])
+def test_user_step_runs_the_codex_session_reporter_from_the_deployed_copy(tmp_path, starts):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    calls = tmp_path / "calls"
+    for tool in ("git", "npm", "bwrap", "docker", "id"):
+        answer = "echo babysit" if tool == "id" else ""
+        (fakes / tool).write_text(f"#!/bin/sh\n{answer}\n")
+    # A machine without a user manager refuses every `systemctl --user`.
+    (fakes / "systemctl").write_text(
+        f'#!/bin/sh\necho "$*" >> "{calls}"\nexit {0 if starts else 1}\n'
+    )
+    for fake in fakes.iterdir():
+        fake.chmod(0o755)
+    home = tmp_path / "home"
+    (home / ".local/share/babysit-pr/app/.git").mkdir(parents=True)
+    (home / ".bashrc").write_text("# Ubuntu's own\n")
+    unit = home / ".config/systemd/user" / UNIT
+
+    def step():
+        done = subprocess.run(
+            ["bash", str(SCRIPT), "--user-step", "--sha", "0123abc" * 5 + "01234"],
+            capture_output=True,
+            text=True,
+            env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+            timeout=30,
+        )
+        return done.stdout + done.stderr
+
+    output = step()
+    # The deployed copy, which no sandbox can write, isolated from the environment.
+    assert (
+        "ExecStart=/usr/bin/env python3 -I %h/.local/share/babysit-pr/app/scripts/worker_sessions.py\n"
+        in unit.read_text()
+    ), output
+    assert "WantedBy=default.target" in unit.read_text()
+    started = [line for line in calls.read_text().splitlines() if "gpg" not in line]
+    if starts:
+        # Restarted on every step, so it runs the commit just deployed.
+        assert started[:3] == [
+            "--user daemon-reload",
+            f"--user enable --quiet {UNIT}",
+            f"--user restart {UNIT}",
+        ]
+        assert f"ok: {UNIT} names the session of a Codex started by hand" in output
+        assert UNIT not in output.split("==> Warnings")[-1]
+        written = unit.stat().st_mtime_ns
+        step()
+        assert unit.stat().st_mtime_ns == written  # Unchanged, so not rewritten.
+        assert calls.read_text().count(f"--user restart {UNIT}") == 2
+    else:
+        assert started[0] == "--user daemon-reload"
+        # Reported without failing the worker's update over it.
+        assert f"WARNING: could not start {UNIT} (systemctl --user)" in output
+        assert f"WARNING: {UNIT} is not running" in output
+        assert f"PROBLEM: {UNIT}" not in output and "PROBLEM: could not start" not in output
+
+
+def test_user_step_dry_run_plans_the_codex_session_reporter(run):
+    done = run("--user-step", "--dry-run", "--sha", "0123abc" * 5 + "01234")
+    assert done.returncode == 0, done.stderr
+    assert re.search(rf"would write \S*/\.config/systemd/user/{UNIT} \(mode 0644\)", done.stdout)
+    assert f"would run: systemctl --user enable {UNIT} and restart it" in done.stdout
