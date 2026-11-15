@@ -97,6 +97,8 @@
 }
 .ws-viewer-tabs {
   display: flex;
+  /* Four tabs are wider than a narrow phone. */
+  flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 0;
 }
@@ -1129,6 +1131,139 @@ body.ws-tray-shown main {
 #ws-viewer[data-mode="terminal"] #ws-message,
 #ws-viewer[data-mode="terminal"] #ws-agent-interaction {
   display: none;
+}
+/* Artefacts: what the workspace's agents left on the share, by folder. */
+.ws-artefacts {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 12px;
+}
+/* Beside the Refresh button, centred on it rather than on the controls' baseline. */
+.ws-artefact-share {
+  align-self: center;
+}
+.ws-artefact-note {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--alert-line);
+  border-radius: 8px;
+  background: var(--alert-bg);
+  color: var(--alert-fg);
+  font-size: 13px;
+}
+.ws-artefact-folder h3 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin: 0 0 8px;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.ws-artefact-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.ws-artefact-folder > .pr-meta {
+  margin: 0 0 8px;
+}
+.ws-artefact-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ws-artefact {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 8px 12px 8px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+}
+/* A thumbnail, or the file's extension where there is no picture of it. */
+.ws-artefact-tile {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--faint);
+}
+.ws-artefact-tile img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top left;
+}
+.ws-artefact-kind {
+  color: var(--soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.ws-artefact-main {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+}
+.ws-artefact-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.ws-artefact-facts {
+  color: var(--muted);
+  font-size: 12px;
+}
+/* The time sits in the sentence here, not at the end of a transcript line. */
+.ws-artefacts .ws-time {
+  margin-left: 0;
+  font-size: inherit;
+}
+.ws-artefact-source {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--blue);
+  font-size: 12px;
+  text-align: left;
+}
+.ws-artefact-source .ws-time {
+  color: inherit;
+}
+@media (hover: hover) {
+  .ws-artefact-source:hover {
+    text-decoration: underline;
+  }
+}
+.ws-artefact-missing ul {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+.ws-artefact-missing code {
+  overflow-wrap: anywhere;
+}
+@media (pointer: coarse) {
+  .ws-artefact-source {
+    min-height: 32px;
+  }
 }
 
 @media (max-width: 650px) {

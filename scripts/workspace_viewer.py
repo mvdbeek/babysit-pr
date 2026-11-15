@@ -1175,54 +1175,21 @@ def transcript_page(listed, key_of, read, session, before, after, prefer, around
 
 def search(path, text):
     """Entries of this checkout's sessions that contain ``text``, newest sessions first."""
-    return search_sessions(sessions(path), lambda file: ("", str(file)), local_read, text)
+    expression = transcript_store.match_expression(text)
+    return search_result(text, matching(path, expression, SEARCH_RESULTS))
 
 
 def remote_search(home, machine, path, text):
     """``search`` of a worker's checkout, reading its transcripts on through the probe."""
-
-    def tail(**args):
-        return probe(home, machine, "tail", **args)
-
-    stop = time.monotonic() + SEARCH_BUDGET
-    return search_sessions(
-        remote_sessions(home, machine, path),
-        lambda file: (machine.id, file),
-        lambda parser, file, save: parser.update_remote(tail, file, save, stop),
-        text,
-        stop,
-    )
-
-
-def search_sessions(listed, key_of, read, text, stop=None):
-    """Search ``listed`` sessions, bringing each up to date first until ``stop``.
-
-    Sessions not read to their end in time (or busy, or unreadable) are searched as far
-    as they were saved and counted in ``behind``; searching again reads on.
-    """
     expression = transcript_store.match_expression(text)
-    stop = time.monotonic() + SEARCH_BUDGET if stop is None else stop
-    rows: dict[int, dict] = {}
-    behind = 0
-    for session in listed:
-        key = key_of(session["_file"])
-        row = None
-        if time.monotonic() < stop:
-            try:
-                row = bring_up_to_date(key, session["agent"], read, wait=0)
-            except (OSError, ValueError):
-                if key[0]:
-                    stop = 0  # A worker that no longer answers: search what is kept.
-        if row is None:
-            row = store().row(*key)
-        if row is None or not row["ready"]:
-            behind += 1
-        if row is not None:
-            rows[row["id"]] = session
-    matches, counts = store().search(list(rows), expression, SEARCH_RESULTS)
+    return search_result(text, remote_matching(home, machine, path, expression, SEARCH_RESULTS))
+
+
+def search_result(text, answer):
+    """What the viewer shows of ``matching``'s ``answer`` to a search for ``text``."""
+    matches, total, searched, behind = answer
     found = []
-    for transcript_id, index, entry, snippet in matches:
-        session = rows[transcript_id]
+    for session, index, entry, snippet in matches:
         found.append(
             {
                 "session": session["id"],
@@ -1243,7 +1210,67 @@ def search_sessions(listed, key_of, read, text, stop=None):
     return {
         "query": " ".join(text.split()),
         "results": found,
-        "total": sum(counts.values()),
-        "searched": len(rows),
+        "total": total,
+        "searched": searched,
         "behind": behind,
     }
+
+
+def matching(path, expression, limit):
+    """This checkout's entries matching an FTS ``expression``, as ``matching_sessions``."""
+    return matching_sessions(
+        sessions(path), lambda file: ("", str(file)), local_read, expression, limit
+    )
+
+
+def remote_matching(home, machine, path, expression, limit):
+    """``matching`` of a worker's checkout, reading its transcripts on through the probe."""
+
+    def tail(**args):
+        return probe(home, machine, "tail", **args)
+
+    stop = time.monotonic() + SEARCH_BUDGET
+    return matching_sessions(
+        remote_sessions(home, machine, path),
+        lambda file: (machine.id, file),
+        lambda parser, file, save: parser.update_remote(tail, file, save, stop),
+        expression,
+        limit,
+        stop,
+    )
+
+
+def matching_sessions(listed, key_of, read, expression, limit, stop=None):
+    """Entries of ``listed`` sessions matching ``expression``, bringing each session up
+    to date first until ``stop``.
+
+    Returns (matches, total, searched, behind): at most ``limit`` (session, index, entry,
+    snippet) tuples, newest session first and newest entry first within it, every
+    match's count, and how many sessions were searched. Sessions not read to their end
+    in time (or busy, or unreadable) are searched as far as they were saved and counted
+    in ``behind``; searching again reads on.
+    """
+    stop = time.monotonic() + SEARCH_BUDGET if stop is None else stop
+    rows: dict[int, dict] = {}
+    behind = 0
+    for session in listed:
+        key = key_of(session["_file"])
+        row = None
+        if time.monotonic() < stop:
+            try:
+                row = bring_up_to_date(key, session["agent"], read, wait=0)
+            except (OSError, ValueError):
+                if key[0]:
+                    stop = 0  # A worker that no longer answers: search what is kept.
+        if row is None:
+            row = store().row(*key)
+        if row is None or not row["ready"]:
+            behind += 1
+        if row is not None:
+            rows[row["id"]] = session
+    matches, counts = store().search(list(rows), expression, limit)
+    found = [
+        (rows[transcript_id], index, entry, snippet)
+        for transcript_id, index, entry, snippet in matches
+    ]
+    return found, sum(counts.values()), len(rows), behind

@@ -36,6 +36,7 @@ import voice_assistant
 import work_tags
 import worker_api
 import workspace_agents
+import workspace_artefacts
 import workspace_move
 import workspace_viewer
 from dashboard_push import check_result
@@ -196,6 +197,7 @@ API_ROUTES = frozenset(
         "/api/voice-turn",
         "/api/watch",
         "/api/workspace-agents",
+        "/api/workspace-artefacts",
         "/api/workspace-diff",
         "/api/workspace-overview",
         "/api/workspace-prompts",
@@ -542,6 +544,8 @@ class DashboardServer(ThreadingHTTPServer):
         self.home = home
         self.tags = work_tags.Tags(home)
         workspace_viewer.use_store(home)
+        # The dufs share the viewer's Artefacts tab reads; disabled unless configured.
+        self.artefacts = workspace_artefacts.Artefacts(home)
         # None while auth is off: every request is answered as before Phase 1.
         self.auth = auth
         # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.
@@ -724,9 +728,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Vary", ", ".join(vary))
             for name, value in headers:
                 self.send_header(name, value)
+            # Thumbnails in the Artefacts tab load from the configured share, and only images.
+            share = self.server.artefacts.image_source()
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+                "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+                + (f"img-src 'self' {share}; " if share else "")
+                + "frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
             )
             self.end_headers()
             view = memoryview(body)
@@ -1711,7 +1719,11 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 value["machine_label"] = machine.label if machine else local_label(self.server.home)
                 self.send_json(200, value)
+            elif route.path == "/api/workspace-artefacts" and not route.query:
+                # Asked once per page: whether the viewer offers its Artefacts tab.
+                self.send_json(200, self.server.artefacts.status())
             elif route.path in {
+                "/api/workspace-artefacts",
                 "/api/workspace-diff",
                 "/api/workspace-transcript",
                 "/api/workspace-search",
@@ -1750,7 +1762,11 @@ class Handler(BaseHTTPRequestHandler):
                         path = self.server.remote_checkout(machine, workspace_id)
                     elif path is None:
                         path = self.server.workspace_checkout(workspace_id)
-                    if route.path == "/api/workspace-diff":
+                    if route.path == "/api/workspace-artefacts":
+                        if single:
+                            raise ValueError("Unknown artefacts parameter")
+                        value = self.server.artefacts.listing(path, machine)
+                    elif route.path == "/api/workspace-diff":
                         if set(single) - {"scope", "base", "commit"}:
                             raise ValueError("Unknown diff parameter")
                         scope, base = single.get("scope", "branch"), single.get("base")
@@ -1961,6 +1977,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/agents.css": ("agents.css", "text/css"),
                     "/viewer.js": ("viewer.js", "text/javascript"),
                     "/terminal.js": ("terminal.js", "text/javascript"),
+                    "/artefacts.js": ("artefacts.js", "text/javascript"),
                     "/attachments.js": ("attachments.js", "text/javascript"),
                     "/viewer.css": ("viewer.css", "text/css"),
                     "/sentry.js": ("sentry.js", "text/javascript"),
