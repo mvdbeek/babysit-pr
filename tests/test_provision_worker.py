@@ -508,3 +508,130 @@ def test_user_check_warns_about_agents_without_instructions(tmp_path):
         home / ".codex/AGENTS.md",
     ):
         assert f"WARNING: {missing} is missing or empty" in output
+
+
+def fake_herdr(fakes, calls, *, installs=True):
+    """A herdr whose Claude integration is a file in the configuration it is run for."""
+    herdr = fakes / "herdr"
+    herdr.write_text(
+        "#!/bin/sh\n"
+        f'echo "$CLAUDE_CONFIG_DIR: $*" >> "{calls}"\n'
+        "hook=$CLAUDE_CONFIG_DIR/hooks/herdr-agent-state.sh\n"
+        'case "$*" in\n'
+        '  "integration install claude")\n'
+        f"    [ {int(installs)} = 1 ] || exit 1\n"
+        '    mkdir -p "$CLAUDE_CONFIG_DIR/hooks" && : > "$hook" &&\n'
+        '      echo "{\\"hooks\\": \\"bash \'$hook\' session\\"}" > "$CLAUDE_CONFIG_DIR/settings.json" ;;\n'
+        '  "integration status")\n'
+        '    echo "pi: not installed ($HOME/.pi/herdr-agent-state.ts)"\n'
+        '    if [ -e "$hook" ]; then echo "claude: current (v11) ($hook)"\n'
+        '    else echo "claude: not installed ($hook)"; fi ;;\n'
+        "esac\n"
+    )
+    herdr.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the user step refuses root")
+@pytest.mark.parametrize("installs", [True, False])
+def test_user_step_installs_herdrs_session_hook_for_every_claude_configuration(tmp_path, installs):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    calls = tmp_path / "calls"
+    for tool in ("git", "npm", "bwrap", "docker", "id"):
+        answer = "echo babysit" if tool == "id" else ""
+        (fakes / tool).write_text(f"#!/bin/sh\n{answer}\n")
+        (fakes / tool).chmod(0o755)
+    fake_herdr(fakes, calls, installs=installs)
+    home = tmp_path / "home"
+    (home / ".local/share/babysit-pr/app/.git").mkdir(parents=True)
+    (home / ".bashrc").write_text("# Ubuntu's own\n")
+    default, account = home / ".claude", home / ".claude/accounts/psu"
+    account.mkdir(parents=True)
+    (home / ".claude/accounts/README").write_text("not an account\n")
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--user-step", "--sha", "0123abc" * 5 + "01234"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    output = done.stdout + done.stderr
+    # A Claude started by hand uses the default configuration or an account's.
+    assert calls.read_text().splitlines()[:2] == [
+        f"{default}: integration install claude",
+        f"{account}: integration install claude",
+    ], output
+    for config in (default, account):
+        named = f"ok: herdr names the session of a Claude started by hand with {config}\n"
+        assert (named in output) == installs
+        # A failed install is reported without failing the worker's update over it.
+        failed = f"WARNING: herdr integration install claude failed for {config};"
+        assert (failed in output) != installs
+        assert (f"herdr's Claude session hook is not installed for {config}," in output) != installs
+    assert "PROBLEM: herdr" not in output
+
+
+def test_user_step_dry_run_plans_the_session_hook_without_running_herdr(tmp_path):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    calls = tmp_path / "calls"
+    fake_herdr(fakes, calls)
+    home = tmp_path / "home"
+    (home / ".claude/accounts/psu").mkdir(parents=True)
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--user-step", "--dry-run", "--sha", "0123abc" * 5 + "01234"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    for config in (home / ".claude", home / ".claude/accounts/psu"):
+        planned = f"would run: CLAUDE_CONFIG_DIR={config} herdr integration install claude\n"
+        assert planned in done.stdout
+    assert not calls.exists()
+    assert not (home / ".claude/hooks").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root --check inspects the host instead")
+def test_user_check_warns_about_a_claude_configuration_without_the_session_hook(tmp_path):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    for tool in ("bwrap", "docker", "gpg", "systemctl", "git"):
+        (fakes / tool).write_text("#!/bin/sh\necho rootless\nexit 0\n")
+    (fakes / "id").write_text('#!/bin/sh\ncase "$1" in -u) echo 1000 ;; *) echo babysit ;; esac\n')
+    for fake in fakes.iterdir():
+        fake.chmod(0o755)
+    home = tmp_path / "home"
+    hooked, bare = home / ".claude", home / ".claude/accounts/bare"
+    replaced = home / ".claude/accounts/replaced"
+    for config in (hooked, replaced):
+        (config / "hooks").mkdir(parents=True)
+        (config / "hooks/herdr-agent-state.sh").write_text("#!/bin/sh\n")
+    command = f"bash '{hooked}/hooks/herdr-agent-state.sh' session"
+    settings = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": command}]}]}}
+    (hooked / "settings.json").write_text(json.dumps(settings))
+    # The hook's script is there, but the settings that ran it were written anew.
+    (replaced / "settings.json").write_text('{"skipDangerousModePermissionPrompt": true}')
+    bare.mkdir(parents=True)
+
+    def check():
+        done = subprocess.run(
+            ["bash", str(SCRIPT), "--check"],
+            capture_output=True,
+            text=True,
+            env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+            timeout=30,
+        )
+        return done.stdout + done.stderr
+
+    # Without herdr on PATH nothing is known, which is not reported as installed.
+    output = check()
+    assert "herdr names the session" not in output
+    assert f"WARNING: herdr's Claude session hook is unknown for {hooked}," in output
+    fake_herdr(fakes, tmp_path / "calls")
+    output = check()
+    assert f"ok: herdr names the session of a Claude started by hand with {hooked}\n" in output
+    assert f"WARNING: herdr's Claude session hook is not installed for {bare}," in output
+    assert f"WARNING: herdr's Claude session hook is not in settings.json for {replaced}," in output
+    assert "rerun the user step" in output
