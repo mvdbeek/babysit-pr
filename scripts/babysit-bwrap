@@ -209,7 +209,10 @@ fi
 # bwrap starts (below), never a tmpfs, which would keep all an agent writes there in
 # this machine's memory.
 runs=$home/.cache/babysit-sandbox/runs
-run=$(mktemp -d -u "$runs/XXXXXXXXXX")
+# Only a name is taken here, in a directory that exists: BSD mktemp -u makes the
+# directory before removing it, and $runs is made at the launch.
+run=$(mktemp -d -u "${TMPDIR:-/tmp}/XXXXXXXXXX") || die "cannot name a run directory"
+run=$runs/${run##*/}
 argv=(bwrap --die-with-parent ${session[@]+"${session[@]}"} --unshare-pid --unshare-ipc
   --unshare-uts --clearenv --proc /proc --dev /dev --bind "$run/tmp" /tmp
   --bind "$run/home" "$home")

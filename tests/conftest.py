@@ -266,12 +266,16 @@ def safehouse_sandbox(monkeypatch, tmp_path_factory):
     a test-only ``sitecustomize``, since no production setting selects a sandbox.
     """
     monkeypatch.setattr(sandbox, "DEFAULT", "safehouse")
+    # The suite may itself run inside an agent's sandbox, which is not the tests' own:
+    # those about a confined run say so themselves.
+    monkeypatch.setattr(sandbox, "confined", lambda: False)
     site = tmp_path_factory.getbasetemp() / "sandbox-site"
     if not (site / "sitecustomize.py").exists():
         site.mkdir(exist_ok=True)
         (site / "sitecustomize.py").write_text(
             f"import sys\nsys.path.append({str(Path(sandbox.__file__).parent)!r})\n"
             "import sandbox\nsandbox.DEFAULT = 'safehouse'\n"
+            "sandbox.confined = lambda: False\n"
         )
     paths = [str(site), *filter(None, [os.environ.get("PYTHONPATH")])]
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(paths))

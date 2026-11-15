@@ -20,6 +20,7 @@ from test_machine_loads import settle
 from test_pr_workspaces import finish, local  # noqa: F401 (fixture)
 from test_remote_cron import git, short_tmp  # noqa: F401 (fixture)
 from test_remote_launch import register, remote, remote_commands, store  # noqa: F401 (fixture)
+from test_sandbox import fd_bash, util_linux
 from test_subtasks import launch, parent
 
 
@@ -79,6 +80,8 @@ os.execvpe(command[0], command, env)
     return remote
 
 
+@fd_bash
+@util_linux
 @pytest.mark.parametrize(
     "target,account", [("claude", "default"), ("claude", "oss"), ("codex", "")]
 )
@@ -190,6 +193,8 @@ def test_review_requests_expire_cancel_and_count_against_lineage_limits(local): 
         manager.subtask(review(), worker_parent())
 
 
+@fd_bash
+@util_linux
 def test_approved_review_waits_for_room_and_survives_restart_with_its_scope(review_worker):
     from test_waiting_launches import busy, reloaded
 

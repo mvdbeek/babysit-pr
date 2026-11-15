@@ -25,6 +25,8 @@ def safehouse_sandbox(monkeypatch):
     """In-process launch lines are Safehouse's on every platform; the bwrap tests name
     their backend. Child processes follow their platform."""
     monkeypatch.setattr(sandbox, "DEFAULT", "safehouse")
+    # The suite may itself run inside an agent's sandbox, which is not the tests' own.
+    monkeypatch.setattr(sandbox, "confined", lambda: False)
 
 
 @pytest.fixture(autouse=True)

@@ -2065,6 +2065,7 @@ def test_bwrap_keeps_the_code_in_the_agent_configuration_read_only(checkout):
     assert (config / "projects" / "t").exists()
 
 
+@util_linux
 def test_linux_account_login_and_status_run_claude_auth_in_the_account_alone(
     default_home, monkeypatch, tmp_path
 ):
