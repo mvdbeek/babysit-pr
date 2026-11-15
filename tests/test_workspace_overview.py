@@ -1255,6 +1255,7 @@ def test_diff_and_transcript_views_read_only_listed_checkouts(server, site, monk
         (f"/api/workspace-diff?key={key}&key={key}", "once"),
         (f"/api/workspace-diff?key={key}&path=%2Fetc", "Unknown diff parameter"),
         (f"/api/workspace-diff?key={key}&base=HEAD", "listed base"),
+        (f"/api/workspace-diff?key={key}&commit=HEAD", "commit ID"),
         (f"/api/workspace-transcript?key={key}&before=-1", "numeric"),
         (f"/api/workspace-transcript?key={key}&session=..%2Fx", "listed session"),
         (f"/api/workspace-transcript?key={key}&file=x", "Unknown transcript parameter"),

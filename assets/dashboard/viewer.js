@@ -340,7 +340,7 @@
   }
   // A viewer opened from a list can step through it. `siblings` returns the list as it
   // is now, so a filter or refresh changed since is followed. `state` picks the scope,
-  // base and session to start with, as a restored viewer does. Settles once loaded.
+  // base, commit and session to start with, as a restored viewer does. Settles once loaded.
   function openViewer(entry, mode, siblings = null, state = null) {
     const last = viewer?.siblings === siblings ? viewer.position : -1;
     if (mode === "terminal" && !entry.workspace) mode = "transcript";
@@ -350,6 +350,7 @@
       mode,
       scope: "branch",
       base: null,
+      commit: null,
       session: entry.session ?? null,
       pane: entry.pane ?? null,
       ...state,
@@ -420,6 +421,7 @@
     if (used.disabled && !other.disabled) other.focus();
   }
   function change(update) {
+    viewer.refocus = null;
     update(viewer);
     viewer.data = null;
     viewer.nodes = [];
@@ -453,10 +455,13 @@
           ...where(current.entry),
           scope: current.scope,
           base: current.scope === "branch" ? current.base : null,
+          commit: current.scope === "branch" ? current.commit : null,
         });
         if (token !== viewerRequest || viewer !== current) return;
         current.data = data;
         current.base = data.base;
+        // A commit rewritten since is no longer listed: the diff then shows every change.
+        current.commit = data.commit ?? null;
         renderDiff(data);
       } else if (current.query) {
         const data = await getJSON("/api/workspace-search", {
@@ -550,6 +555,7 @@
           change((state) => {
             state.scope = value;
             state.base = null;
+            state.commit = null;
           }),
       ),
     );
@@ -559,21 +565,98 @@
           "Base",
           data.bases.map((base) => [base.ref, `${base.ref} (${base.ahead} ahead)`]),
           data.base,
-          (value) => change((state) => (state.base = value)),
+          (value) =>
+            change((state) => {
+              state.base = value;
+              state.commit = null;
+            }),
+        ),
+      );
+    }
+    if (data?.scope === "branch" && data.commits.length) {
+      const count = data.commits.length;
+      controls.append(
+        choice(
+          "Commit",
+          [
+            ["", `All ${count} commit${count === 1 ? "" : "s"}, with uncommitted`],
+            ...data.commits.map((commit) => [commit.sha, commitLabel(commit)]),
+          ],
+          data.commit || "",
+          (value) => showCommit(value || null, "select"),
         ),
       );
     }
     controls.append(refreshButton());
+  }
+  const shortSha = (sha) => sha.slice(0, 9);
+  function commitLabel(commit) {
+    const subject = commit.subject.length > 72 ? `${commit.subject.slice(0, 71)}…` : commit.subject;
+    return `${shortSha(commit.sha)} ${subject}`;
+  }
+  // One commit's changes, or all of them for null. `refocus` names the control that asked
+  // ("select", "older", "newer" or "all"), where the keyboard returns once they show.
+  function showCommit(sha, refocus) {
+    change((state) => {
+      state.commit = sha;
+      state.refocus = refocus;
+    });
+  }
+  // The commit whose changes show: its message, and steps to its neighbours.
+  function shownCommit(data, shown) {
+    const at = data.commits.indexOf(shown);
+    const count = data.commits.length;
+    const head = node("div", undefined, "ws-commit-shown");
+    const title = node("div");
+    title.append(node("code", shortSha(shown.sha)), " ", linked("strong", shown.subject));
+    head.append(
+      title,
+      node(
+        "small",
+        // Listed newest first, so counted from the oldest one listed.
+        `${shown.author} · ${date(shown.time)} · commit ${count - at} of ${count}`,
+        "pr-meta",
+      ),
+    );
+    if (shown.body) head.append(linked("div", shown.body, "ws-commit-body"));
+    const steps = node("div", undefined, "ws-commit-steps");
+    for (const [label, step, target] of [
+      ["Older", "older", data.commits[at + 1]],
+      ["Newer", "newer", data.commits[at - 1]],
+    ]) {
+      const button = node("button", label);
+      button.type = "button";
+      button.dataset.step = step;
+      button.disabled = !target;
+      if (target) {
+        button.title = commitLabel(target);
+        button.onclick = () => showCommit(target.sha, step);
+      }
+      steps.append(button);
+    }
+    const all = node("button", "All changes");
+    all.type = "button";
+    all.dataset.step = "all";
+    all.onclick = () => showCommit(null, "select");
+    steps.append(all);
+    head.append(steps);
+    return head;
   }
   function renderDiff(data) {
     syncInteraction();
     viewer.scope = data.scope;
     diffControls(data);
     const files = data.files.length;
+    const shown =
+      (data.commit && data.commits.find((commit) => commit.sha === data.commit)) || null;
     byId("ws-viewer-meta").textContent =
       (data.note ? `${data.note} ` : "") +
       `${files} file${files === 1 ? "" : "s"} changed, +${data.added} −${data.removed}` +
-      (data.scope === "branch" ? ` since ${data.base}` : " since the last commit") +
+      (shown
+        ? ` in commit ${shortSha(shown.sha)}`
+        : data.scope === "branch"
+          ? ` since ${data.base}`
+          : " since the last commit") +
       "." +
       (data.truncated ? " The diff was cut short at its size limit." : "") +
       (files && draft ? " Click a line to comment on it." : "");
@@ -587,8 +670,23 @@
       for (const commit of data.commits) {
         const line = node(commit.body ? "details" : "div", undefined, "ws-commit");
         const heading = commit.body ? node("summary") : line;
-        heading.append(node("code", commit.sha.slice(0, 9)), " ", linked("span", commit.subject));
+        heading.append(node("code", shortSha(commit.sha)), " ", linked("span", commit.subject));
+        const current = commit === shown;
+        const view = node(
+          "button",
+          current ? "Show all changes" : "Show changes",
+          "ws-commit-view",
+        );
+        view.type = "button";
+        if (!current) view.setAttribute("aria-label", `Show changes of ${commitLabel(commit)}`);
+        view.onclick = (event) => {
+          // In a summary, the click would also fold or unfold the commit's message.
+          event.preventDefault();
+          showCommit(current ? null : commit.sha, "all");
+        };
+        heading.append(" ", view);
         heading.append(node("small", `${commit.author} · ${date(commit.time)}`, "pr-meta"));
+        if (current) line.classList.add("ws-commit-current");
         if (commit.body) {
           line.append(heading, linked("div", commit.body, "ws-commit-body"));
         }
@@ -596,6 +694,7 @@
       }
       content.append(commits);
     }
+    if (shown) content.append(shownCommit(data, shown));
     if (!files && !data.untracked.length) {
       content.append(node("p", "No changes.", "pr-meta"));
     }
@@ -618,6 +717,14 @@
       // added lines on the new side, context lines on both.
       let oldLine = 0;
       let newLine = 0;
+      // Each row with its old and new line number, for the gutter.
+      const rows = [];
+      let highest = 0;
+      const row = (span, before, after) => {
+        rows.push([span, before, after]);
+        highest = Math.max(highest, before ?? 0, after ?? 0);
+        return span;
+      };
       for (const line of file.lines) {
         const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
         const kind = line.startsWith("@@")
@@ -631,18 +738,22 @@
         if (hunk) {
           oldLine = Number(hunk[1]);
           newLine = Number(hunk[2]);
+          row(span);
         } else if (line.startsWith("+")) {
+          row(span, null, newLine);
           Object.assign(span.dataset, { side: "new", line: newLine++ });
         } else if (line.startsWith("-")) {
+          row(span, oldLine);
           Object.assign(span.dataset, { side: "old", line: oldLine++ });
         } else if (line.startsWith(" ") || line === "") {
+          row(span, oldLine++, newLine);
           Object.assign(span.dataset, { side: "new", line: newLine++ });
-          oldLine++;
-        }
+        } else row(span);
         lines.append(span);
         for (const comment of draft?.comments || []) {
           if (
             comment.path === file.path &&
+            (comment.commit ?? null) === (shown?.sha ?? null) &&
             comment.side === span.dataset.side &&
             String(comment.line) === span.dataset.line
           )
@@ -660,8 +771,17 @@
         pre.onkeydown = (event) => diffKeys(file, event);
         for (const line of pre.querySelectorAll("span[data-line]")) line.tabIndex = -1;
       }
-      if (!file.lines.length) pre.append(node("span", "No text changes to show.\n", "ws-hunk"));
-      if (file.truncated) pre.append(node("span", "… cut short\n", "ws-hunk"));
+      if (!file.lines.length)
+        pre.append(row(node("span", "No text changes to show.\n", "ws-hunk")));
+      if (file.truncated) pre.append(row(node("span", "… cut short\n", "ws-hunk")));
+      // The gutter is generated content, so it stays out of selections, copied text and
+      // the code a comment quotes: both numbers, and the line's own one for narrow screens.
+      const width = String(highest).length;
+      const padded = (number) => String(number ?? "").padStart(width);
+      for (const [span, before, after] of rows) {
+        span.dataset.gutter = `${padded(before)} ${padded(after)}`;
+        span.dataset.number = padded(after ?? before);
+      }
       item.append(pre);
       content.append(item);
     }
@@ -679,6 +799,15 @@
       if (data.untracked_more) list.append(node("li", `… and ${data.untracked_more} more`));
       untracked.append(list);
       content.append(untracked);
+    }
+    const refocus = viewer.refocus;
+    viewer.refocus = null;
+    if (refocus) {
+      const steps = (which) => content.querySelector(`.ws-commit-steps ${which}:not(:disabled)`);
+      (
+        (refocus !== "select" && (steps(`[data-step="${refocus}"]`) || steps("button"))) ||
+        byId("ws-viewer-controls").querySelector('select[aria-label="Commit"]')
+      )?.focus();
     }
   }
   function sessionLabel(session) {
@@ -2439,6 +2568,8 @@
       const comment = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         path: file.path,
+        // On one commit's changes, lines are numbered as that commit left the file.
+        commit: viewer.data?.commit ?? null,
         side: span.dataset.side,
         line: Number(span.dataset.line),
         code: span.textContent.replace(/\n$/, ""),
@@ -2501,7 +2632,9 @@
     list.append(head);
     for (const comment of draft.comments) {
       const item = node("div", undefined, "ws-comment-chip");
-      const where = `${comment.path}:${comment.line}${comment.side === "old" ? " (removed)" : ""}`;
+      const where =
+        `${comment.path}:${comment.line}${comment.side === "old" ? " (removed)" : ""}` +
+        (comment.commit ? ` in ${shortSha(comment.commit)}` : "");
       const remove = node("button", "Remove");
       remove.type = "button";
       remove.setAttribute("aria-label", `Remove comment on ${where}`);
@@ -2517,7 +2650,10 @@
       parts.push("Review comments on your changes:");
       for (const comment of comments) {
         const side = comment.side === "old" ? "removed line" : "line";
-        parts.push(`${comment.path}, ${side} ${comment.line}:\n> ${comment.code}\n${comment.text}`);
+        const commit = comment.commit ? ` of commit ${shortSha(comment.commit)}` : "";
+        parts.push(
+          `${comment.path}, ${side} ${comment.line}${commit}:\n> ${comment.code}\n${comment.text}`,
+        );
       }
     }
     if (message.trim()) parts.push(message.trim());
@@ -2780,8 +2916,8 @@
     }
   };
   // Minimized viewers wait as chips in a tray at the bottom of the page, kept across
-  // reloads, until one is restored as it was left: same tab, session, diff scope and base,
-  // and reading position. Minimizing a workspace again replaces its chip; restoring one
+  // reloads, until one is restored as it was left: same tab, session, diff scope, base and
+  // commit, and reading position. Minimizing a workspace again replaces its chip; restoring one
   // takes it out of the tray. The page behind an open viewer is inert, so chips are only
   // restored while no viewer is open.
   const TRAY_KEY = "ws-viewer-tray";
@@ -2802,6 +2938,7 @@
       ["diff", "transcript"].includes(item.mode) &&
       [undefined, "branch", "uncommitted"].includes(item.scope) &&
       optional(item.base) &&
+      optional(item.commit) &&
       optional(item.session) &&
       optional(item.path) &&
       (item.position === undefined || typeof item.position === "object")
@@ -2875,10 +3012,20 @@
     // The checkout its agents were read from: a restore checks its workspace ID still
     // names it, as a restarted herdr reuses IDs.
     const path = draft?.path || null;
-    const { scope, base, session } = viewer;
+    const { scope, base, commit, session } = viewer;
     // The tray restores diffs and transcripts; a terminal comes back as its transcript.
     const mode = viewer.mode === "terminal" ? "transcript" : viewer.mode;
-    const item = { id, entry, path, mode, scope, base, session, position: readingPosition() };
+    const item = {
+      id,
+      entry,
+      path,
+      mode,
+      scope,
+      base,
+      commit,
+      session,
+      position: readingPosition(),
+    };
     tray = [item, ...tray.filter((other) => other.id !== id)].slice(0, TRAY_LIMIT);
     if (viewer.siblings) traySiblings.set(id, viewer.siblings);
     storeTray();
@@ -2973,6 +3120,7 @@
       loading = openViewer(item.entry, item.mode, traySiblings.get(id) || null, {
         scope: item.scope || "branch",
         base: item.base ?? null,
+        commit: item.commit ?? null,
         session: known ? item.session : null,
       });
     } catch (error) {
@@ -2993,8 +3141,9 @@
       current.base &&
       /listed base branches/.test(byId("ws-viewer-error").textContent)
     ) {
-      // Its base branch is gone: the default one instead.
+      // Its base branch is gone: the default one instead, and all its commits.
       current.base = null;
+      current.commit = null;
       resetViewer("Loading…");
       await loadViewer();
     }
@@ -3002,7 +3151,9 @@
     const same =
       current.mode === item.mode &&
       (item.mode === "diff"
-        ? current.scope === item.scope && (!item.base || current.base === item.base)
+        ? current.scope === item.scope &&
+          (!item.base || current.base === item.base) &&
+          current.commit === (item.commit ?? null)
         : current.session === item.session);
     if (viewer === current && current.data && same) restorePosition(item.position);
   }

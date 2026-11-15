@@ -1751,14 +1751,15 @@ class Handler(BaseHTTPRequestHandler):
                     elif path is None:
                         path = self.server.workspace_checkout(workspace_id)
                     if route.path == "/api/workspace-diff":
-                        if set(single) - {"scope", "base"}:
+                        if set(single) - {"scope", "base", "commit"}:
                             raise ValueError("Unknown diff parameter")
                         scope, base = single.get("scope", "branch"), single.get("base")
+                        commit = single.get("commit")
                         value = (
-                            workspace_viewer.diff(path, scope, base)
+                            workspace_viewer.diff(path, scope, base, commit)
                             if machine is None
                             else workspace_viewer.remote_diff(
-                                self.server.home, machine, path, scope, base
+                                self.server.home, machine, path, scope, base, commit
                             )
                         )
                     elif route.path == "/api/workspace-search":

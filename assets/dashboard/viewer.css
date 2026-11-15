@@ -256,8 +256,12 @@
 .ws-removed {
   color: var(--red);
 }
-/* Diffs keep the dashboard's dark code blocks, with line colors tuned for them. */
+/* Diffs keep the dashboard's dark code blocks, with line colors tuned for them. One grid
+   column makes every row as wide as the longest line, so a short line's color and line
+   numbers reach across however far a long one scrolls. */
 .ws-diff {
+  display: grid;
+  container-type: inline-size;
   margin: 0;
   padding: 8px 0;
   border-radius: 0;
@@ -284,6 +288,38 @@
   color: var(--hunk-fg);
   background: var(--hunk-bg);
 }
+/* Old and new line numbers, which stay in view while a long line scrolls sideways. */
+.ws-diff [data-gutter] {
+  padding-left: 0;
+}
+.ws-diff [data-gutter]::before {
+  content: attr(data-gutter);
+  position: sticky;
+  left: 0;
+  display: inline-block;
+  margin-right: 10px;
+  padding: 0 8px 0 12px;
+  border-right: 1px solid var(--code-line);
+  color: color-mix(in srgb, currentColor 60%, transparent);
+  background: var(--code-bg);
+}
+.ws-diff .ws-add::before {
+  background: var(--add-bg);
+}
+.ws-diff .ws-del::before {
+  background: var(--del-bg);
+}
+.ws-diff .ws-hunk::before {
+  background: var(--hunk-bg);
+}
+@media (max-width: 600px) {
+  /* One number per line: the new file's, or the old one's on a removed line. */
+  .ws-diff [data-gutter]::before {
+    content: attr(data-number);
+    margin-right: 6px;
+    padding: 0 6px 0 8px;
+  }
+}
 .ws-commit {
   padding: 6px 12px;
   border-top: 1px solid var(--line);
@@ -298,6 +334,31 @@
 .ws-commit-body {
   margin-top: 8px;
   white-space: pre-wrap;
+}
+.ws-commit-view,
+.ws-commit-steps button {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+.ws-commit-current {
+  background: var(--bg);
+}
+/* The one commit whose changes show, above its files. */
+.ws-commit-shown {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+.ws-commit-shown small {
+  display: block;
+}
+.ws-commit-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
 }
 .ws-untracked {
   margin: 0;
@@ -627,6 +688,14 @@
     sans-serif;
   color: var(--ink);
   background: var(--paper);
+}
+/* As wide as the diff shows, and in view however far its lines are scrolled. */
+.ws-diff > .ws-comment-box,
+.ws-diff > .ws-comment-note {
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+  width: calc(100cqi - 24px);
 }
 .ws-comment-box textarea {
   flex: 1 1 100%;

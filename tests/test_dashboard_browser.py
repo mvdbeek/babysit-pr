@@ -3770,6 +3770,215 @@ def test_diff_comments_and_a_follow_up_reach_the_chosen_agent(page, dashboard_si
     expect(page.locator("#ws-message-comments")).to_be_empty()
 
 
+def commit_diffs(page):
+    """Serve COMMENT_DIFF with three commits, each with its own changes; return the asks."""
+    commits = [
+        {
+            "sha": "ccc333ccc333",
+            "author": "C",
+            "time": 3,
+            "subject": "Third",
+            "body": "Why the third.\n\nSee https://example.com/third",
+        },
+        {"sha": "bbb222bbb222", "author": "B", "time": 2, "subject": "Second", "body": ""},
+        {"sha": "aaa111aaa111", "author": "A", "time": 1, "subject": "First", "body": ""},
+    ]
+    asked = []
+
+    def diff(route):
+        found = re.search(r"[?&]commit=([0-9a-f]+)", route.request.url)
+        commit = found[1] if found else None
+        asked.append(commit)
+        data = copy.deepcopy(COMMENT_DIFF)
+        data.update(commits=commits, commit=commit)
+        if commit:
+            data["files"][0]["lines"] = [
+                "@@ -98,3 +98,3 @@ def name():",
+                " context",
+                f"-before {commit[:3]}",
+                f"+after {commit[:3]}",
+                " tail " + "long " * 400,
+                "\\ No newline at end of file",
+            ]
+            data["files"][0]["truncated"] = True
+        route.fulfill(json=data)
+
+    page.route("**/api/workspace-diff?*", diff)
+    return asked
+
+
+def gutter(line: Locator) -> str:
+    """The line numbers a diff line shows before its text."""
+    return line.evaluate("el => JSON.parse(getComputedStyle(el, '::before').content)")
+
+
+def test_diff_lines_are_numbered_without_joining_their_text(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    asked = commit_diffs(page)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    lines = viewer.locator("pre.ws-diff > span")
+    # Old and new numbers side by side: both on context, one on a changed line.
+    assert [gutter(lines.nth(index)) for index in range(4)] == ["     ", "10 10", "11   ", "   11"]
+    # Numbers are not text: a selection, a copy and a comment's quote carry the code only.
+    assert viewer.locator(".ws-add").text_content() == "+new name\n"
+    viewer.get_by_label("Commit", exact=True).select_option("bbb222bbb222")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("in commit bbb222bbb")
+    # One width per file, set by its highest line number.
+    assert [gutter(lines.nth(index)) for index in range(7)] == [
+        "       ",
+        " 98  98",
+        " 99    ",
+        "     99",
+        "100 100",
+        # Neither the note about a missing newline nor "cut short" is a line of the file.
+        "       ",
+        "       ",
+    ]
+    expect(lines.nth(6)).to_have_text("… cut short\n")
+    # The numbers stay in view while a long line scrolls sideways: every row, a short one
+    # and a comment box too, reaches across what the diff shows of it.
+    diff = viewer.locator("pre.ws-diff")
+    viewer.locator(".ws-add").click()
+    box = viewer.locator(".ws-comment-box")
+    expect(box).to_be_visible()
+    diff.evaluate("el => (el.scrollLeft = el.scrollWidth)")
+    assert diff.evaluate("el => el.scrollLeft") > 1000
+    assert lines.nth(1).evaluate("el => getComputedStyle(el, '::before').position") == "sticky"
+    within = """(el, pre) => {
+        const [row, shown] = [el.getBoundingClientRect(), pre.getBoundingClientRect()];
+        // Within a pixel: scrolled boxes land on fractions of one.
+        return [row.left <= shown.left + 1 && row.right >= shown.right - 1,
+                row.left >= shown.left - 1 && row.right <= shown.right + 1];
+    }"""
+    for index in range(7):
+        assert lines.nth(index).evaluate(within, diff.element_handle())[0], index
+    assert box.evaluate(within, diff.element_handle())[1]
+    viewer.get_by_role("button", name="Cancel").click()
+    diff.evaluate("el => (el.scrollLeft = 0)")
+    page.screenshot(path="reports/viewer-commit.png")
+    # A phone shows one number per line: the new file's, or the old one's where removed.
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert [gutter(lines.nth(index)) for index in range(5)] == ["   ", " 98", " 99", " 99", "100"]
+    page.screenshot(path="reports/viewer-commit-phone.png")
+    assert asked == [None, "bbb222bbb222"]
+
+
+def test_one_commit_at_a_time_from_the_menu_the_list_and_by_steps(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    asked = commit_diffs(page)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    menu = viewer.get_by_label("Commit", exact=True)
+    shown = viewer.locator(".ws-commit-shown")
+    expect(menu).to_have_value("")
+    expect(menu.locator("option")).to_have_text(
+        [
+            "All 3 commits, with uncommitted",
+            "ccc333ccc Third",
+            "bbb222bbb Second",
+            "aaa111aaa First",
+        ]
+    )
+    expect(shown).to_have_count(0)
+    menu.select_option("bbb222bbb222")
+    expect(shown).to_contain_text("bbb222bbb Second")
+    expect(shown).to_contain_text("commit 2 of 3")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text(
+        "1 file changed, +1 −1 in commit bbb222bbb."
+    )
+    expect(viewer.locator(".ws-add")).to_have_text("+after bbb\n")
+    # The keyboard stays on the control used, so arrow keys keep stepping.
+    expect(menu).to_be_focused()
+    expect(menu).to_have_value("bbb222bbb222")
+    shown.get_by_role("button", name="Newer").click()
+    expect(shown).to_contain_text("ccc333ccc Third")
+    expect(shown.locator(".ws-commit-body")).to_contain_text("Why the third.")
+    expect(shown.get_by_role("link")).to_have_attribute("href", "https://example.com/third")
+    # At the newest commit there is nothing newer; the keyboard moves to the other step.
+    expect(shown.get_by_role("button", name="Newer")).to_be_disabled()
+    expect(shown.get_by_role("button", name="Older")).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(shown).to_contain_text("bbb222bbb Second")
+    expect(shown.get_by_role("button", name="Older")).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(shown).to_contain_text("commit 1 of 3")
+    expect(shown.get_by_role("button", name="Older")).to_be_disabled()
+    shown.get_by_role("button", name="All changes").click()
+    expect(shown).to_have_count(0)
+    expect(menu).to_have_value("")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("since origin/main")
+    # A commit in the list opens its changes without unfolding its message.
+    viewer.locator(".ws-commits > summary").click()
+    third = viewer.locator(".ws-commit").first
+    third.get_by_role("button", name="Show changes of ccc333ccc Third").click()
+    expect(shown).to_contain_text("ccc333ccc Third")
+    expect(viewer.locator(".ws-commits")).not_to_have_attribute("open", "")
+    viewer.locator(".ws-commits > summary").click()
+    expect(third).to_have_class(re.compile(r"\bws-commit-current\b"))
+    expect(third.locator(".ws-commit-body")).to_be_hidden()
+    third.get_by_role("button", name="Show all changes").click()
+    expect(shown).to_have_count(0)
+    # Another base or scope starts from all of its commits again.
+    menu.select_option("aaa111aaa111")
+    expect(shown).to_be_visible()
+    viewer.get_by_label("Changes", exact=True).select_option("uncommitted")
+    expect(shown).to_have_count(0)
+    assert asked == [
+        None,
+        "bbb222bbb222",
+        "ccc333ccc333",
+        "bbb222bbb222",
+        "aaa111aaa111",
+        None,
+        "ccc333ccc333",
+        None,
+        "aaa111aaa111",
+        None,
+    ]
+
+
+def test_a_comment_on_one_commit_names_it_and_shows_only_there(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    commit_diffs(page)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
+    viewer = page.locator("#ws-viewer")
+    menu = viewer.get_by_label("Commit", exact=True)
+    menu.select_option("aaa111aaa111")
+    viewer.locator(".ws-add").click()
+    viewer.get_by_label("Comment on app.py line 99").fill("Squash this into the next one")
+    viewer.get_by_role("button", name="Add comment").click()
+    expect(viewer.locator(".ws-comment-note")).to_have_count(1)
+    expect(page.locator("#ws-message-comments")).to_contain_text("app.py:99 in aaa111aaa")
+    # The same line number elsewhere is another line: the note shows on its commit only.
+    for other in ("bbb222bbb222", ""):
+        menu.select_option(other)
+        expect(menu).to_have_value(other)
+        expect(viewer.locator(".ws-add")).to_be_visible()
+        expect(viewer.locator(".ws-comment-note")).to_have_count(0)
+    expect(page.locator("#ws-message-comments")).to_contain_text("1 diff comment will be sent")
+    viewer.locator(".ws-add").click()
+    viewer.get_by_label("Comment on app.py line 11").fill("Rename it")
+    viewer.get_by_role("button", name="Add comment").click()
+    menu.select_option("aaa111aaa111")
+    expect(viewer.locator(".ws-comment-note")).to_have_text(
+        re.compile("Squash this into the next one")
+    )
+    viewer.get_by_label("Agent", exact=True).select_option("w1:p2")
+    viewer.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w1:p2.")
+    assert viewer_routes["sent"][-1][1]["text"] == (
+        "Review comments on your changes:\n\n"
+        "app.py, line 99 of commit aaa111aaa:\n> +after aaa\nSquash this into the next one\n\n"
+        "app.py, line 11:\n> +new name\nRename it"
+    )
+
+
 @pytest.mark.parametrize("width", [1280, 390])
 def test_commit_messages_expand_with_keyboard_and_preserve_body_text(
     page, dashboard_site, viewer_routes, width

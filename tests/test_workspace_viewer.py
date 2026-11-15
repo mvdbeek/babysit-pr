@@ -6,6 +6,7 @@ import threading
 import time
 
 import pytest
+import remote_probe
 import workspace_viewer as wv
 
 
@@ -89,6 +90,68 @@ def test_commit_bodies_preserve_paragraphs_and_do_not_split_commit_records(repo)
     assert [c["body"] for c in commits] == ["Another body.", body, "", ""]
     assert commits[0]["sha"] == git("rev-parse", "HEAD")[:12]
     assert all(c["author"] == "Fixture" and c["time"] > 0 for c in commits)
+
+
+def test_one_commit_shows_only_its_own_changes(repo):
+    path, git = repo
+    (path / "keep.txt").write_text("ONE\ntwo\nthree\nfour\n")
+    git("commit", "-am", "Shout")
+    (path / "keep.txt").write_text("ONE\ntwo\nthree\nFOUR\n")
+    shout, rename = git("rev-parse", "HEAD"), git("rev-parse", "HEAD~2")
+    value = wv.diff(path, commit=shout[:12])
+    assert value["commit"] == shout[:12] and value["scope"] == "branch"
+    # The whole branch stays listed, to step through; the uncommitted FOUR is left out.
+    assert [c["subject"] for c in value["commits"]][0] == "Shout" and len(value["commits"]) == 3
+    assert [f["path"] for f in value["files"]] == ["keep.txt"]
+    assert value["files"][0]["lines"] == [
+        "@@ -1,4 +1,4 @@",
+        "-one",
+        "+ONE",
+        " two",
+        " three",
+        " four",
+    ]
+    assert (value["added"], value["removed"], value["untracked"]) == (1, 1, [])
+    # A full ID names the same commit; an earlier one shows its rename, not later edits.
+    value = wv.diff(path, commit=rename)
+    assert value["commit"] == rename[:12]
+    assert sorted(f["path"] for f in value["files"]) == ["gone.txt", "image.bin", "new.txt"]
+
+
+def test_a_commit_that_is_not_listed_shows_all_changes(repo):
+    path, git = repo
+    everything = wv.diff(path)
+    # A commit of the base, or one rewritten since, is never handed to Git.
+    for commit in (git("rev-parse", "origin/main"), "0123456789ab"):
+        value = wv.diff(path, commit=commit)
+        assert "no longer on this branch" in value["note"] and value["commit"] is None
+        assert value["files"] == everything["files"] and value["untracked"] == ["notes.txt"]
+    for commit in ("HEAD", "--output=/tmp/x", "abc", "ABCDEF123456", ""):
+        with pytest.raises(ValueError, match="commit ID"):
+            wv.diff(path, commit=commit)
+    value = wv.diff(path, "uncommitted", commit="0123456789ab")
+    assert value["commit"] is None and value["note"] is None
+
+
+def test_merge_and_root_commits_are_compared_with_their_first_parent(repo):
+    path, git = repo
+    git("stash", "-q")
+    git("switch", "-q", "--orphan", "island")
+    (path / "island.txt").write_text("alone\n")
+    git("add", "island.txt")
+    git("commit", "-q", "-m", "Root of an island")
+    root = git("rev-parse", "HEAD")
+    git("switch", "-q", "feature")
+    git("merge", "-q", "--allow-unrelated-histories", "-m", "Merge the island", "island")
+    merge = git("rev-parse", "HEAD")
+    for commit in (root, merge):
+        value = wv.diff(path, commit=commit)
+        assert value["commit"] == commit[:12]
+        assert [(f["path"], f["status"], f["lines"][1:]) for f in value["files"]] == [
+            ("island.txt", "added", ["+alone"])
+        ]
+        # A worker's hardened Git reads them the same way.
+        assert remote_probe.diff(remote_probe.host_output, str(path), commit=commit) == value
 
 
 def test_uncommitted_diff_compares_with_head_only(repo):
