@@ -153,6 +153,9 @@ def send(request, machine=None):
         try:
             if keys:
                 herdr("pane", "send-keys", pane, *keys, machine=machine)
+            elif text and request["enter"] and machines.terminals() == "hc":
+                # herdr-core submits a line whole; only single keys can stay unsent there.
+                run(*machines.herdr_argv(machine, "pane", "run", pane, text))
             else:
                 if text:
                     herdr("pane", "send-text", pane, text, machine=machine)

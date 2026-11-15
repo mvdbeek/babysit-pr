@@ -63,8 +63,13 @@ It:
 4. Downloads pinned releases and checks each against a pinned SHA-256 before use:
    Node.js LTS (official tarball, checksum from `SHASUMS256.txt`) into `/opt` with
    links in `/usr/local/bin`; uv and uvx into `/usr/local/bin`; herdr (GitHub release
-   asset digest) into `/usr/local/bin`. Override with `NODE_VERSION`/`NODE_SHA256`,
-   `UV_VERSION`/`UV_SHA256`, `HERDR_VERSION`/`HERDR_SHA256`. Archives are extracted with
+   asset digest) into `/usr/local/bin`; herdr-core (`herdr-core`, with `hc` linked to it;
+   digest from `https://releases.herdr.dev/core/<version>/manifest.json`) into
+   `/usr/local/bin`. Override with `NODE_VERSION`/`NODE_SHA256`,
+   `UV_VERSION`/`UV_SHA256`, `HERDR_VERSION`/`HERDR_SHA256`, `HC_VERSION`/`HC_SHA256`.
+   A root-owned `hc` is updated by a new pin here, not by `hc update` or
+   `hc machine update`; remove an earlier `~/.local/bin/hc`, which would shadow it.
+   Archives are extracted with
    `--no-same-owner --no-same-permissions` and installed `root:root`, so an archive's
    uid (often `babysit`'s) never survives. Each verified install leaves a root-owned
    marker `/usr/local/share/babysit-provision/<tool>-<version>-<arch>.sha256`; reruns
@@ -465,6 +470,16 @@ self-updates outside these checks; reinstall via the script with a new pin inste
    ```
 
    Always address the machine by label (`--machine=<label>`), as babysit does.
+
+   Where the controller keeps its terminals in herdr-core
+   ([herdr-core.md](herdr-core.md)), add the worker to its core instead, under the
+   same label, and check its line:
+
+   ```sh
+   hc machine add <box> --name <label>
+   hc machine ls                      # state: connected
+   hc exec --on <label> -- hostname
+   ```
 
 3. Add the worker to `machines.json` in the dashboard's `--home` (the registry from
    the multi-machine plan; until it lands this entry is inert):

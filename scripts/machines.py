@@ -16,6 +16,7 @@ import re
 import shlex
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -60,6 +61,8 @@ FIELDS = {
     "skills",
 }
 REQUIRED = {"id", "label", "ssh", "os"}
+TERMINALS = ("herdr", "hc")
+HC_PANES = Path(__file__).with_name("hc_panes.py")
 # sshd's MaxSessions defaults to 10; stay well below it on one multiplexed connection.
 CHANNELS = 4
 # macOS sun_path is 104 bytes including the NUL; ssh hashes %C to 40 hex characters
@@ -360,10 +363,46 @@ def resolve(home, machine_id: str | None, *, placing=False) -> Machine | None:
     return machine
 
 
+def terminals() -> str:
+    """The runtime that holds this machine's terminals: ``herdr``, or ``hc`` for herdr-core.
+
+    ``$BABYSIT_TERMINALS`` wins, then the first word of ``~/.config/babysit-pr/terminals``.
+    A file rather than an option, because the dashboard, the watcher, ``wt`` and a command
+    an agent runs must all agree, and no one of them starts the others. Without either it
+    is herdr, except on a worker (``worker.json``): there a process inside an hc terminal
+    (``$HC_TERMINAL_ID``) is on herdr-core. That is how a line the controller types into
+    a worker's terminal knows, with no setting on the worker; a worker's terminals are
+    reached through the controller's runtime, so the workers of an ``hc`` controller run
+    herdr-core as well.
+    """
+    config = Path.home() / ".config" / "babysit-pr"
+    chosen = os.environ.get("BABYSIT_TERMINALS")
+    if not chosen:
+        try:
+            chosen = (config / "terminals").read_text()
+        except OSError:
+            chosen = ""
+    words = chosen.split()
+    if not words:
+        worker = os.environ.get("BABYSIT_WORKER") or (config / "worker.json").exists()
+        return "hc" if worker and os.environ.get("HC_TERMINAL_ID") else "herdr"
+    if words[0] not in TERMINALS:
+        raise ValueError(
+            f"Unknown terminal runtime {words[0]!r}: use one of {', '.join(TERMINALS)}"
+        )
+    return words[0]
+
+
 def herdr_argv(m: Machine | None, *args) -> list[str]:
-    # herdr addresses saved machines by their label, not our id.
+    """The command line for one herdr command, on ``m`` or here.
+
+    Where herdr-core holds the terminals, the same command goes to ``hc_panes``, which
+    answers it from ``hc`` in herdr's shapes.
+    """
+    command = ["herdr"] if terminals() == "herdr" else [sys.executable, str(HC_PANES)]
+    # Both address a saved machine by its label, not our id.
     # The = form (labels never start with -) keeps the label from reading as an option.
-    return ["herdr", *args] if m is None else ["herdr", f"--machine={m.label}", *args]
+    return [*command, *args] if m is None else [*command, f"--machine={m.label}", *args]
 
 
 def _private_dir(path: Path) -> Path:

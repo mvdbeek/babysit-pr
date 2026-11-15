@@ -1095,6 +1095,9 @@ def test_wrapper_protects_session_and_git_startup_files(checkout, path):
     "path",
     [
         ".config/herdr",  # herdr.sock drives panes outside the sandbox
+        ".config/herdr-core",  # herdr-core's socket and config
+        ".local/state/herdr-core",
+        ".local/share/herdr-core",
         ".local/share/systemd",  # user units
         ".local/share/dbus-1",  # session bus services
         ".bash_aliases",  # sourced by Ubuntu's .bashrc

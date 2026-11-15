@@ -182,6 +182,49 @@ def test_restart_keeps_an_auto_mode_claude_in_auto_mode(rig, tmp_path):
     assert "dangerously" not in command and "safe claude" not in command
 
 
+@pytest.mark.parametrize("rig", ["claude"], indirect=True)
+def test_a_restart_on_herdr_core_submits_one_exit_instead_of_typing_it(rig, tmp_path, monkeypatch):
+    monkeypatch.setenv("BABYSIT_TERMINALS", "hc")
+    # A placeholder, which plain text cannot tell from a draft, does not stop it.
+    rig.screen = "─" * 40 + '\n❯ Try "fix lint errors"\n' + "─" * 40
+    submitted = []
+
+    def submit_exit(pane, machine=None):
+        submitted.append(pane)
+        rig.procs["foreground_processes"] = [{"pid": 100}]
+
+    monkeypatch.setattr(docker.handoff, "submit_exit", submit_exit)
+    messages.change_docker(rig.target, True, tmp_path)
+    assert submitted == ["w1:p1"]
+    # /exit was never typed key by key, where hc would not wait for a person's draft.
+    assert not any(c[:2] in (("pane", "send-text"), ("agent", "send-keys")) for c in rig.calls)
+    assert rig.calls[-1][-4:-2] == ("pane", "run")
+
+
+@pytest.mark.parametrize("rig", ["claude"], indirect=True)
+def test_an_exit_herdr_core_refuses_is_not_a_restart(rig, tmp_path, monkeypatch):
+    monkeypatch.setenv("BABYSIT_TERMINALS", "hc")
+
+    refusal = docker.handoff.NotSent("hc did not submit /exit: t1 is working, not idle")
+
+    def submit_exit(pane, machine=None):
+        raise refusal
+
+    monkeypatch.setattr(docker.handoff, "submit_exit", submit_exit)
+    with pytest.raises(ValueError, match="t1 is working, not idle"):
+        messages.change_docker(rig.target, True, tmp_path)
+    assert not rig.calls
+    # Nothing was typed, so the restart may be tried again.
+    with pytest.raises(ValueError, match="t1 is working, not idle"):
+        messages.change_docker(rig.target, True, tmp_path)
+    # One that may have been typed is never tried twice.
+    refusal = RuntimeError("hc did not submit /exit: hc held the text")
+    with pytest.raises(ValueError, match="hc held the text"):
+        messages.change_docker(rig.target, True, tmp_path)
+    with pytest.raises(ValueError, match="An exit was already attempted"):
+        messages.change_docker(rig.target, True, tmp_path)
+
+
 def test_matching_access_does_not_restart_even_while_working(rig, tmp_path, monkeypatch):
     rig.info["agent_status"] = "working"
     monkeypatch.setattr(docker, "has_access", lambda pid: True)

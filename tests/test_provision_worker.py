@@ -92,6 +92,9 @@ def test_system_dry_run_plans_every_step_without_changing_anything(run):
     assert re.search(r"node-v[\d.]+-linux-x64\.tar\.xz and verify sha256 [0-9a-f]{64}", out)
     assert re.search(r"uv-x86_64-unknown-linux-gnu\.tar\.gz and verify sha256 [0-9a-f]{64}", out)
     assert re.search(r"herdr-linux-x86_64 and verify sha256 [0-9a-f]{64}", out)
+    assert re.search(r"herdr-core-linux-x86_64\.tar\.gz and verify sha256 [0-9a-f]{64}", out)
+    assert "ln -sfn herdr-core /usr/local/bin/hc" in out
+    assert "would record /usr/local/share/babysit-provision/herdr-core-" in out
     assert "60-babysit-worker.conf" in out
     # The machine's rootful docker is left alone.
     assert "docker.service" not in out
@@ -146,6 +149,7 @@ def test_system_dry_run_follows_architecture_and_options(run):
     assert "linux-arm64.tar.xz" in done.stdout
     assert "uv-aarch64-unknown-linux-gnu" in done.stdout
     assert "herdr-linux-aarch64" in done.stdout
+    assert "herdr-core-linux-aarch64.tar.gz" in done.stdout
     assert "claude-code" not in done.stdout
     assert "--user-group worker" in done.stdout
 

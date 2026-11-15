@@ -100,14 +100,15 @@ resolve() {
 }
 
 # Never writable, nor any directory holding one: credentials, babysit's own state and
-# launchers, toolchains that also run outside, herdr's socket (which drives unsandboxed
-# panes), the agent homes (each binds only as its own --claude-config-dir or
+# launchers, toolchains that also run outside, herdr's and herdr-core's sockets (which drive
+# unsandboxed panes), the agent homes (each binds only as its own --claude-config-dir or
 # --codex-home, below), and shell, session, service and git startup files, all of
 # which run or authorize code outside.
 protected=()
 for path in .ssh .gnupg .config/gh .sentryclirc .config/matrix-commander .config/babysit-pr .local/state/babysit-pr .local/bin \
   .local/share/babysit-pr \
-  .local/share/uv .local/share/claude .nvm .npm-global .docker .config/herdr .claude .codex \
+  .local/share/uv .local/share/claude .nvm .npm-global .docker .config/herdr .config/herdr-core .local/state/herdr-core \
+  .local/share/herdr-core .claude .codex \
   .cache/babysit-sandbox .bashrc .bashrc.d .bash_aliases .bash_profile .bash_login \
   .bash_logout .profile .inputrc .zshenv .zprofile .zshrc .zlogin .zlogout .config/fish \
   .tmux.conf .config/tmux .pam_environment .config/systemd .local/share/systemd \
@@ -121,6 +122,10 @@ for path in .ssh .gnupg .config/gh .sentryclirc .config/matrix-commander .config
     protected+=("$(resolve "$target")")
   fi
 done
+# Where a login has a runtime directory, herdr-core's socket is there instead of in
+# its state directory, so a grant of that directory would expose it too.
+runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+protected+=("${runtime%/}/herdr-core")
 
 # This launcher's own directory and, when that is a checkout's scripts/, the checkout
 # and its git common directory: an agent writing either would change what the next

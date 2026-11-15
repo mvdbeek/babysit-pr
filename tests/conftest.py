@@ -1,8 +1,8 @@
-"""Fake gh/herdr/ssh/tmux/cmux/agent executables shared by the process integration tests.
+"""Fake gh/herdr/hc/ssh/tmux/cmux/agent executables shared by the process integration tests.
 
 Every fake records its argv in the JSON state file named by ``$FAKE_HERDR`` so tests
-can assert on the exact commands issued. Nothing here touches a live herdr, tmux or
-cmux, and no real agent is ever started.
+can assert on the exact commands issued. Nothing here touches a live herdr, herdr-core,
+tmux or cmux, and no real agent is ever started.
 """
 
 import json
@@ -10,6 +10,7 @@ import os
 import sys
 from pathlib import Path
 
+import hc_panes
 import pytest
 import safe_git
 import sandbox
@@ -129,6 +130,110 @@ elif a[:2] == ['pane','run']:
 save(); print(json.dumps({'result':result}))
 """
 
+# herdr-core: the API over ``hc connect`` (one JSON-RPC request on stdin), and the two CLI
+# commands the worker broker runs. Its state is the ``hc`` key of the same file:
+# ``terminals`` (records as hc gives them, a worker's addressed ``<label>/t1``),
+# ``machines`` (the lines to workers), ``calls`` (every request), ``sent`` and ``keys``
+# (what was typed), and optionally ``screens`` (per terminal, stepped by what was typed)
+# and ``trees`` (per pid, what ``machine.exec`` finds under a foreground program).
+# A line sent to a shell terminal is run, as fake herdr's ``pane run`` is, so a fake agent
+# started by it takes the terminal's foreground and reports a status there.
+HC = """import json,os,sys,subprocess
+from pathlib import Path
+p=Path(os.environ['FAKE_HERDR']); store=json.loads(p.read_text()); a=sys.argv[1:]
+if a[:1] == ['--version']: print('hc 0.0.0-fixture'); sys.exit()
+def state(s): return s.setdefault('hc',{'terminals':[],'machines':[],'calls':[]})
+hc=state(store)
+def save():
+ t=p.with_name(f'{p.name}.{os.getpid()}'); t.write_text(json.dumps(store)); os.replace(t,p)
+# Run on a worker (over the fake ssh), hc there sees that machine's terminals as its own.
+here=os.environ.get('FAKE_HERDR_LOCAL')
+def full(address): return f'{here}/{address}' if here and '/' not in address else address
+def shown(t): return dict(t,address=t['address'].split('/')[-1]) if here else t
+def find(address): return next((t for t in hc['terminals'] if t['address']==full(address)),None)
+def leave(t):
+ t['foreground']={'pid':t['pid'],'name':'zsh','argv':t['argv'],'cwd':t['foreground']['cwd']}
+ t['status']=None
+def fail(kind,message): raise SystemExit(json.dumps({'kind':kind,'message':message}))
+def call(method,q):
+ global store,hc
+ hc['calls'].append([method,q])
+ target=q.get('terminal'); machine=(full(target).split('/')[0] if target and '/' in full(target) else q.get('on'))
+ if machine and machine in os.environ.get('FAKE_HC_DOWN','').split(','): fail('unavailable',f'{machine} is reconnecting')
+ if method == 'server.status': return {'version':'0.0.0-fixture'}
+ if method == 'terminal.list':
+  down=os.environ.get('FAKE_HC_DOWN','').split(',')
+  lines=[dict(m,state='reconnecting' if m['name'] in down else m.get('state','connected')) for m in hc['machines']]
+  found=[t for t in hc['terminals'] if t['state']=='live' or q.get('all')]
+  if here: return {'terminals':[shown(t) for t in found if t['address'].startswith(here+'/')],'machines':[]}
+  return {'terminals':[t for t in found if t['address'].split('/')[0] not in down],'machines':lines}
+ if method == 'terminal.run':
+  if q.get('on') and not any(m['name']==q['on'] for m in hc['machines']): fail('machine_unknown',f"no machine {q['on']}")
+  if os.environ.get('FAKE_HC_RUN_ERROR'): fail('spawn_failed',os.environ['FAKE_HC_RUN_ERROR'])
+  if q.get('name') and any(t.get('name')==q['name'] and t['state']=='live' for t in hc['terminals']): fail('name_taken',f"a live terminal is already named {q['name']}")
+  n=hc['next']=hc.get('next',0)+1; pid=1000+n; argv=['/bin/zsh','-l']
+  t={'address':full(f"{q['on']}/t{n}" if q.get('on') else f't{n}'),'name':q.get('name'),'cwd':q['cwd'],'labels':q.get('labels',{}),
+     'argv':argv,'pid':pid,'foreground':{'pid':pid,'name':'zsh','argv':argv,'cwd':q['cwd']},'state':'live','status':None,
+     'status_ms':None,'turn':0,'keep':bool(q.get('keep')),'title':'','rows':120,'parent':None}
+  hc['terminals'].append(t); return shown(t)
+ t=find(target) if target else None
+ if method == 'machine.exec':
+  hc.setdefault('executed',[]).append(q)
+  return {'exit_code':0,'stdout':json.dumps(hc.get('trees',{}).get(q['argv'][-1],[])),'stderr':''}
+ if t is None: fail('not_found',f'no terminal {target}')
+ if method == 'terminal.get': return shown(t)
+ if method == 'terminal.label':
+  for k,v in q['labels'].items():
+   if v: t['labels'][k]=v
+   else: t['labels'].pop(k,None)
+  return shown(t)
+ if method == 'terminal.kill': t['state']='finished'; t['foreground']=None; return shown(t)
+ if method == 'terminal.rm': hc['terminals'].remove(t); return {'removed':target}
+ if t['state'] != 'live': fail('finished',f'{target} has ended')
+ if method == 'terminal.read':
+  typed=[c for c in hc['calls'] if c[0] in ('terminal.send','terminal.keys') and c[1].get('terminal')==target]
+  screens=hc.get('screens',{}).get(t['address']) or ['']
+  return {'text':screens[min(len(typed),len(screens)-1)],'complete':True,'how':'screen'}
+ if method == 'terminal.wait': return {'ended':os.environ.get('FAKE_HC_WAIT','ended')=='ended','terminal':target,'reason':'status'}
+ if method == 'terminal.keys':
+  hc.setdefault('keys',[]).append([t['address'],q['keys']])
+  if 'ctrl+d' in q['keys'] and t['foreground']['pid'] != t['pid'] and not os.environ.get('FAKE_HERDR_KEEP_AGENT'): leave(t)
+  return {'status':None,'turn':t['turn']}
+ if method == 'terminal.send':
+  # A person typing there: hc holds the line, here for as long as the test says.
+  if os.environ.get('FAKE_HC_HOLD'): save(); import time; time.sleep(float(os.environ['FAKE_HC_HOLD'])); store=json.loads(p.read_text()); hc=state(store); t=find(target)
+  status=(t.get('status') or {}).get('state')
+  if status == 'blocked' and not q.get('force'): fail('blocked',f'{target} is blocked (permission)')
+  # Decided when the hold ends: an agent that left for its shell reports nothing.
+  if q.get('if') and status != q['if']: fail('status_mismatch',f"{target} is {status or 'silent'}, not {q['if']}")
+  hc.setdefault('sent',[]).append([t['address'],q['text'],bool(q.get('force'))])
+  hc.setdefault('required',[]).append(q.get('if'))
+  if t['foreground']['pid'] == t['pid']:
+   # A line typed at the shell's prompt runs there; a fake agent then takes the foreground.
+   save(); env={**os.environ,'FAKE_HC_TERMINAL':t['address'],'FAKE_WORKSPACE':'','HC_TERMINAL_ID':t['address'].split('/')[-1]}
+   env.pop('FAKE_HERDR_LOCAL',None)
+   if '/' in t['address']: env['FAKE_MACHINE']=t['address'].split('/')[0]
+   subprocess.check_call(['/bin/zsh','-fc',q['text']],cwd=t['foreground']['cwd'],env=env)
+   store=json.loads(p.read_text()); hc=state(store)
+   return {'started':None,'status':None,'turn':t['turn']}
+  if q['text'] == '/exit' and not os.environ.get('FAKE_HERDR_KEEP_AGENT'): leave(t)
+  return {'started':os.environ.get('FAKE_HC_STARTED','true')=='true','status':status,'turn':t['turn']}
+ fail('invalid_params',f'no fake for {method}')
+if a[:1] == ['connect']:
+ request=json.loads(sys.stdin.readline())
+ try: reply={'result':call(request['method'],request.get('params') or {})}
+ except SystemExit as stop:
+  e=json.loads(str(stop)); reply={'error':{'code':-32000,'message':e['message'],'data':{'kind':e['kind'],'hint':''}}}
+ save(); print(json.dumps({'jsonrpc':'2.0','id':request['id'],**reply}))
+elif a[:1] in (['label'],['get']):
+ words=[w for w in a[2:] if w != '--json']
+ try:
+  out=call('terminal.label',{'terminal':a[1],'labels':dict(w.split('=',1) for w in words)}) if a[0]=='label' else call('terminal.get',{'terminal':a[1]})
+ except SystemExit as stop: save(); print(str(stop),file=sys.stderr); sys.exit(3)
+ save(); print(json.dumps(out))
+else: sys.exit(2)
+"""
+
 AGENT = """import json,os,sys
 from pathlib import Path
 if sys.argv[1:] == ['--version']:
@@ -137,6 +242,18 @@ if sys.argv[1:] in (['auth', 'status'], ['login', 'status']):
     ok = os.environ.get('FAKE_AGENT_AUTH', '1') == '1'
     print(json.dumps({'loggedIn': ok})); sys.exit(0 if ok else 1)
 p=Path(os.environ['FAKE_HERDR']); data=json.loads(p.read_text())
+if os.environ.get('FAKE_HC_TERMINAL'):
+ # Typed into an hc terminal: the agent takes its foreground and reports a status there.
+ t=next(x for x in data['hc']['terminals'] if x['address']==os.environ['FAKE_HC_TERMINAL'])
+ name=Path(sys.argv[0]).name
+ t['foreground']={'pid':t['pid']+500,'name':name,'argv':[name,*sys.argv[1:]],'cwd':os.getcwd()}
+ t['status']={'state':'working','app':'claude-code' if name == 'claude' else 'codex'}; t['status_ms']=1
+ t['task']=sys.argv[-1]
+ t['env']={k:os.environ[k] for k in ('SAFE_ENABLE','SAFEHOUSE_ADD_DIRS','CLAUDE_CONFIG_DIR') if k in os.environ}
+ for flag in ('resume','--resume'):
+  # As the sandbox's broker labels it; this machine's own agents are read from the process.
+  if flag in sys.argv[1:]: t['labels']['babysit.session']=sys.argv[sys.argv.index(flag)+1]
+ p.write_text(json.dumps(data)); sys.exit()
 agent={'workspace_id':os.environ['FAKE_WORKSPACE'],'agent':Path(sys.argv[0]).name,'cwd':os.getcwd(),'task':sys.argv[-1],'argv':sys.argv[1:]}
 if os.environ.get('FAKE_PANE'): agent.update(pane_id=os.environ['FAKE_PANE'],agent_status='working')
 if os.environ.get('SAFE_ENABLE'): agent['safe_enable']=os.environ['SAFE_ENABLE']
@@ -207,6 +324,7 @@ sys.exit(subprocess.call(['/bin/sh','-c',command],cwd=home,env=env))
 FAKES = {
     "gh": GH,
     "herdr": HERDR,
+    "hc": HC,
     "ssh": SSH,
     "tmux": TMUX,
     "cmux": CMUX,
@@ -252,6 +370,22 @@ def github_token_from_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def herdr_terminals(monkeypatch):
+    """Terminals are herdr's unless a test chooses herdr-core, whatever this machine's own
+    setting is and whether or not the tests themselves run in an hc terminal."""
+    monkeypatch.setenv("BABYSIT_TERMINALS", "herdr")
+    # A test run inside a real herdr pane or hc terminal must never report to either.
+    for name in ("HC_TERMINAL_ID", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_BIN_PATH"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def hc_terminals(monkeypatch):
+    """This machine keeps its terminals in herdr-core (the fake ``hc``)."""
+    monkeypatch.setenv("BABYSIT_TERMINALS", "hc")
+
+
+@pytest.fixture(autouse=True)
 def no_claude_trust(monkeypatch):
     """Launches never mark folders trusted in the user's real Claude config; the trust
     tests turn it back on against a fake home."""
@@ -263,12 +397,15 @@ def safehouse_sandbox(monkeypatch, tmp_path_factory):
     """Launch lines are Safehouse's on every platform; the bwrap tests name their backend.
 
     Child Python processes (``wt``, cron and dashboard helpers) get the same default from
-    a test-only ``sitecustomize``, since no production setting selects a sandbox.
+    a test-only ``sitecustomize``, since no production setting selects a sandbox. The same
+    file keeps herdr-core's terminals, here and in those processes, from being matched
+    against this machine's real processes.
     """
     monkeypatch.setattr(sandbox, "DEFAULT", "safehouse")
     # The suite may itself run inside an agent's sandbox, which is not the tests' own:
     # those about a confined run say so themselves.
     monkeypatch.setattr(sandbox, "confined", lambda: False)
+    monkeypatch.setattr(hc_panes, "processes", lambda: [])
     site = tmp_path_factory.getbasetemp() / "sandbox-site"
     if not (site / "sitecustomize.py").exists():
         site.mkdir(exist_ok=True)
@@ -276,6 +413,9 @@ def safehouse_sandbox(monkeypatch, tmp_path_factory):
             f"import sys\nsys.path.append({str(Path(sandbox.__file__).parent)!r})\n"
             "import sandbox\nsandbox.DEFAULT = 'safehouse'\n"
             "sandbox.confined = lambda: False\n"
+            # The fake hc's terminals name made-up process ids; a real process that
+            # happens to have one must never be taken for what runs in them.
+            "import hc_panes\nhc_panes.processes = lambda: []\n"
         )
     paths = [str(site), *filter(None, [os.environ.get("PYTHONPATH")])]
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(paths))

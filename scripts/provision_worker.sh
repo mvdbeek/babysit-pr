@@ -48,7 +48,8 @@
 #                       already installed, else docker-ce; or force docker-ce / docker.io.
 #                       The machine's rootful docker is never stopped or masked.
 #   BWRAP_ACCEPT_OLD    1 accepts a bubblewrap older than 0.10.0 (no --bind-fd)
-#   NODE_VERSION, NODE_SHA256, UV_VERSION, UV_SHA256, HERDR_VERSION, HERDR_SHA256
+#   NODE_VERSION, NODE_SHA256, UV_VERSION, UV_SHA256, HERDR_VERSION, HERDR_SHA256,
+#                       HC_VERSION, HC_SHA256
 #                       override the pinned downloads below (the SHA256 must match
 #                       the machine's architecture)
 #   ARCH                amd64 or arm64 (default: dpkg --print-architecture)
@@ -62,7 +63,8 @@
 set -euo pipefail
 
 # Pinned downloads. Node's checksums come from nodejs.org's SHASUMS256.txt, uv's and
-# herdr's from the GitHub release asset digests.
+# herdr's from the GitHub release asset digests, herdr-core's (hc) from the release
+# manifest https://releases.herdr.dev/core/<version>/manifest.json.
 NODE_DEFAULT=v24.22.1
 NODE_SHA256_x64=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
 NODE_SHA256_arm64=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e
@@ -72,6 +74,9 @@ UV_SHA256_aarch64=4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c4
 HERDR_DEFAULT=v0.9.5
 HERDR_SHA256_x86_64=14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
 HERDR_SHA256_aarch64=17d7536f2da50859523680ef279dffcac8e4a235f4e46fe8da6c2ec44141897c
+HC_DEFAULT=0.1.21
+HC_SHA256_x86_64=78424755c10a40dde38a0bdb55c20ac19706e9ae05ed68fc2acf1fcff0d941c1
+HC_SHA256_aarch64=e844a2bfab48a226097679d076bc83042fe57fccef5387ef802e5b24e78b529a
 CODEX_DEFAULT=0.164.0
 # Primary key fingerprints of the apt repositories' signing keys.
 GH_KEY_FPR=2C6106201985B60E6C7AC87323F3D4EA75716059
@@ -597,10 +602,11 @@ system_step() {
   fi
   local node_version=${NODE_VERSION:-$NODE_DEFAULT}
   local node_sha_var=NODE_SHA256_$node_arch uv_sha_var=UV_SHA256_$tool_arch
-  local herdr_sha_var=HERDR_SHA256_$tool_arch
+  local herdr_sha_var=HERDR_SHA256_$tool_arch hc_sha_var=HC_SHA256_$tool_arch
   local node_sha=${NODE_SHA256:-${!node_sha_var}}
   local uv_version=${UV_VERSION:-$UV_DEFAULT} uv_sha=${UV_SHA256:-${!uv_sha_var}}
   local herdr_version=${HERDR_VERSION:-$HERDR_DEFAULT} herdr_sha=${HERDR_SHA256:-${!herdr_sha_var}}
+  local hc_version=${HC_VERSION:-$HC_DEFAULT} hc_sha=${HC_SHA256:-${!hc_sha_var}}
   export DEBIAN_FRONTEND=noninteractive
   if ((dry)); then
     work=/tmp/provision-worker.XXXXXX
@@ -716,7 +722,8 @@ system_step() {
   # archive's uid), then trust nothing but the root-owned markers.
   if ((!dry)); then
     find /opt -maxdepth 1 -name 'node-*' -exec chown -hR root:root {} + -exec chmod -R go-w {} +
-    for f in /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/herdr; do
+    for f in /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/herdr \
+      /usr/local/bin/herdr-core /usr/local/bin/hc; do
       [[ ! -e $f && ! -L $f ]] || chown -h root:root "$f"
       [[ ! -f $f || -L $f ]] || chmod go-w "$f"
     done
@@ -763,6 +770,20 @@ system_step() {
       "$herdr_sha" "$work/herdr"
     run install -o root -g root -m 0755 "$work/herdr" /usr/local/bin/herdr
     record_install "herdr-$herdr_version-$tool_arch" "$herdr_sha" /usr/local/bin/herdr
+  fi
+
+  say "herdr-core $hc_version (pinned sha256)"
+  if ((!dry)) && install_ok "herdr-core-$hc_version-$tool_arch" "$hc_sha" /usr/local/bin/herdr-core /usr/local/bin/hc; then
+    ok "herdr-core $hc_version matches its verified checksum marker"
+  else
+    fetch_verified "https://releases.herdr.dev/core/$hc_version/herdr-core-linux-$tool_arch.tar.gz" \
+      "$hc_sha" "$work/herdr-core.tar.gz"
+    run mkdir "$work/herdr-core"
+    run tar -xzf "$work/herdr-core.tar.gz" -C "$work/herdr-core" --no-same-owner \
+      --no-same-permissions herdr-core
+    run install -o root -g root -m 0755 "$work/herdr-core/herdr-core" /usr/local/bin/herdr-core
+    run ln -sfn herdr-core /usr/local/bin/hc
+    record_install "herdr-core-$hc_version-$tool_arch" "$hc_sha" /usr/local/bin/herdr-core /usr/local/bin/hc
   fi
 
   say "sshd keepalive"
@@ -1165,10 +1186,10 @@ Next steps on this machine (interactive; nothing here pipes an installer into a 
   npm install -g @openai/codex@$codex                 # npm checks the registry's sha512 integrity
   codex login --device-auth
   claude-account login <name>                         # always a named account on a worker
-  herdr --version && claude --version && codex --version
+  herdr --version && hc --version && claude --version && codex --version
   babysit-bwrap --claude-config-dir="\$HOME/.claude/accounts/<name>" -- true
 
-Then on the controller: herdr machine add, machines.json (references/worker-setup.md).
+Then on the controller: herdr machine add (or, for herdr-core, hc machine add <ssh target> --name <label>), machines.json (references/worker-setup.md).
 EOF
   finish
 }

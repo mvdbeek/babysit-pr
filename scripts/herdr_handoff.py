@@ -19,6 +19,8 @@ import time
 import uuid
 from pathlib import Path
 
+import hc
+import hc_panes
 import machines
 import pr_supervisor as supervisor
 import remote_probe
@@ -45,6 +47,10 @@ class ScreenNotReady(RuntimeError):
     """The final receipt or empty input has not finished rendering."""
 
 
+class NotSent(RuntimeError):
+    """hc typed nothing: the agent was not in a state to be asked, or hc refused."""
+
+
 class Unreachable(RuntimeError):
     """A worker's herdr failed; whether the worker or the command, it cannot tell."""
 
@@ -57,6 +63,12 @@ AGENTS = {
 }
 CLAUDE_EXIT_HINT = "Press Ctrl-D again to exit"
 RULE = re.compile(r"^\s*─+\s*$")
+
+
+def styled_screens() -> bool:
+    """Whether a screen is read with its styles. herdr's is; herdr-core's is plain text,
+    so a placeholder there reads like typed input and the composer cannot be judged."""
+    return machines.terminals() == "herdr"
 
 
 def herdr(*args, machine: machines.Machine | None = None):
@@ -275,7 +287,9 @@ def verify_screen(target, info, screen, *, confirming=False):
         raise RuntimeError("Queued input or background work is visible; agent left open")
     if (CLAUDE_EXIT_HINT in plain and not confirming) or "Press Ctrl-C again" in plain:
         raise RuntimeError("Exit keys are already being pressed in this pane; handoff cancelled")
-    if not empty_composer(screen, agent):
+    # herdr-core holds what it submits while a person has an unsent draft, and its
+    # screens carry no styles to tell a draft from a placeholder: nothing to judge here.
+    if styled_screens() and not empty_composer(screen, agent):
         prompt_char = "❯" if agent == "claude" else "›"
         prompts = [
             line.lstrip()[1:].strip()
@@ -479,6 +493,39 @@ def pane_lock(home, pane, machine=None, *, wait=True):
         yield
 
 
+def submit_exit(pane, machine=None):
+    """Ask the Claude in an hc terminal to leave with one submitted /exit.
+
+    hc pastes it and presses Enter in one step, and decides at that moment: an agent
+    seen idle must still be idle, so one that began a turn or left for its shell since
+    is not typed into, and one showing a dialog never is. hc can require that of an idle
+    agent only: one that reports ``done`` is covered by the short hold alone. While a
+    person is typing there hc holds the line; it is held briefly only, then taken back,
+    so /exit does not follow a turn the person started meanwhile. A draft left untouched
+    for over a minute is not held for: /exit would be submitted after it, which hc's
+    plain screens cannot show. ``NotSent`` says nothing was typed.
+    """
+    name = machine.label if machine is not None else None
+    try:
+        state = hc_panes.status(hc.get(pane, name)).get("state")
+        if state not in {"idle", "done"}:
+            raise NotSent(f"The agent is {state or 'not reporting'}; /exit not sent")
+        hc.send(
+            pane,
+            sandbox.typed("/exit"),
+            name,
+            only_if="idle" if state == "idle" else None,
+            hold=hc.BRIEF_HOLD,
+        )
+    except hc.Error as exc:
+        if isinstance(exc, hc.Unreachable):
+            failure = Unreachable if machine else RuntimeError
+        else:
+            # Refused before a key: only a hold cut short may have ended in typing.
+            failure = RuntimeError if exc.kind == "held" else NotSent
+        raise failure(f"hc did not submit /exit: {exc}") from exc
+
+
 def send_exit(target, expected, before, owned, save, machine=None, home=None, *, typed=False):
     """Press Ctrl-D in a verified idle TUI, then confirm its process exited.
 
@@ -489,11 +536,18 @@ def send_exit(target, expected, before, owned, save, machine=None, home=None, *,
     before it can read that worker. Enter follows only once the composer holds exactly
     /exit, so it never answers a dialog that opened meanwhile. ``typed`` asks a Claude on
     this machine the same way, for a caller without a transcript turn to check against.
+
+    On herdr-core every Claude is asked with /exit, submitted whole (``submit_exit``):
+    there is no composer to read back and no second key.
     """
     agent = target.get("agent", "codex")
     pane = target["pane_id"]
-    typed = agent == "claude" and (typed or machine is not None)
-    if typed:
+    whole = agent == "claude" and not styled_screens()
+    typed = agent == "claude" and (typed or machine is not None or whole)
+    if whole:
+        owned()
+        submit_exit(pane, machine)
+    elif typed:
         herdr("pane", "send-text", pane, sandbox.typed("/exit"), machine=machine)
         typed_by = time.monotonic() + TYPED_EXIT_WAIT
         while (shown := unwrapped_composer(read_screen(pane, machine))) != "/exit":
@@ -689,7 +743,7 @@ def perform(target, home, db):
                 or state.get("state_change_seq") is None
                 or state2.get("state_change_seq") != state.get("state_change_seq")
                 or target["marker"] not in SGR.sub("", screen2)
-                or not empty_composer(screen2, agent)
+                or (styled_screens() and not empty_composer(screen2, agent))
                 or rollout_now() != before
                 or turn_now() != (turn, complete)
             ):

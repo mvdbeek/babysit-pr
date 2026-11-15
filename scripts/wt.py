@@ -2,8 +2,8 @@
 """Portable ``wt``, ``wti`` and ``wtpr`` Git worktree helpers.
 
 Create (or reattach to) a worktree for a branch, a GitHub issue or a pull request,
-then open it in a terminal multiplexer (herdr, tmux or cmux) with a coding agent
-already started in the left pane. This replaces the zsh functions of the same names:
+then open it in a terminal multiplexer (herdr, herdr-core, tmux or cmux) with a coding
+agent already started in the left pane. This replaces the zsh functions of the same names:
 same command line, but a plain program that any caller can run directly.
 
 Only the standard library is used and imports stay cheap; the real cost of a run is
@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import NamedTuple, Protocol, TextIO
 
 import claude_accounts
+import machines
 import safe_git
 import sandbox
 import work_tags
@@ -33,7 +34,13 @@ import worker_api
 COMMANDS = ("wt", "wti", "wtpr")
 ALIASES = {"wri": "wti", "wtissue": "wti"}
 DEFAULT_REPO = "galaxy"
-MULTIPLEXERS = ("herdr", "tmux", "cmux", "none", "auto")
+MULTIPLEXERS = ("herdr", "hc", "tmux", "cmux", "none", "auto")
+# The multiplexers that give a session ids the dashboard can follow, by the command
+# that speaks herdr's pane commands to each (hc_panes for herdr-core).
+PANE_COMMANDS: dict[str, tuple[str, ...]] = {
+    "herdr": ("herdr",),
+    "hc": (sys.executable, str(machines.HC_PANES)),
+}
 
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -159,9 +166,10 @@ out -- in the main clone or in a worktree under another name -- is opened where
 it is instead of being checked out a second time. Without an origin remote,
 branches are created from the requested local base.
 
-The multiplexer is chosen by $WT_MULTIPLEXER (herdr|tmux|cmux|none|auto), set
+The multiplexer is chosen by $WT_MULTIPLEXER (herdr|hc|tmux|cmux|none|auto), set
 in the env or as a KEY=VALUE line in ~/.config/worktree/config; "auto" (default)
-uses herdr when a herdr server is running, cmux inside cmux, else tmux.
+uses herdr-core (hc) where babysit-pr is set to it, else herdr when a herdr server
+is running, cmux inside cmux, else tmux.
 With "none" the worktree path is printed on stdout so a shell function can cd
 to it: wt() { local d; d="$(WT_MULTIPLEXER=none command wt "$@")" && cd "$d"; }
 
@@ -220,7 +228,7 @@ dashboard options (a new branch from the remote default branch unless <base> is 
 The prompt only applies to a session being created; if one is already running for
 the worktree it is reattached and the prompt is ignored (with a warning).
 
---exit-when-done needs a prompt and herdr. The prompt asks the agent to end its final
+--exit-when-done needs a prompt and herdr or herdr-core. The prompt asks the agent to end its final
 answer with a marker line, and a watch is recorded for the dashboard (in
 $BABYSIT_HOME, default ~/.local/state/babysit-pr). Once the agent's first turn ends
 with the marker and it stays idle, the dashboard exits it and closes its pane, or its
@@ -267,7 +275,7 @@ options:
   --machine <id>|auto|local  only this machine: workers take new branches from wt
                 (see wt --help), so auto runs here and a worker is refused
   --name <name>           reserve a new worktree and branch with this explicit name
-  --label <label>         herdr workspace label (default: the branch name)
+  --label <label>         herdr or hc workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
   --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
@@ -308,7 +316,7 @@ options:
   --machine <id>|auto|local  only this machine: workers take new branches from wt
                 (see wt --help), so auto runs here and a worker is refused
   --name <name>           reserve a new worktree and branch with this explicit name
-  --label <label>         herdr workspace label (default: the branch name)
+  --label <label>         herdr or hc workspace label (default: the branch name)
   --no-focus              leave native herdr focus unchanged
   --repo-path <path>      use this main clone (overrides -r location)
   --github-repo <o/r>     the GitHub repository it is a clone of: fetches from it get
@@ -845,12 +853,16 @@ def select_multiplexer(
     env: Mapping[str, str],
     which: Callable[[str], str | None],
     herdr_running: Callable[[], bool],
+    terminals: str = "herdr",
 ) -> str:
-    """``$WT_MULTIPLEXER`` wins; ``auto`` prefers a running herdr, then cmux inside cmux,
-    then tmux, then none."""
+    """``$WT_MULTIPLEXER`` wins; ``auto`` prefers herdr-core where ``terminals`` (this
+    machine's ``machines.terminals``) is ``hc``, then a running herdr, then cmux inside
+    cmux, then tmux, then none."""
     chosen = env.get("WT_MULTIPLEXER") or "auto"
     if chosen != "auto":
         return chosen
+    if terminals == "hc" and which("hc"):
+        return "hc"
     if which("herdr") and (env.get("HERDR_ENV") == "1" or herdr_running()):
         return "herdr"
     if env.get("CMUX_SURFACE_ID") and which("cmux"):
@@ -870,22 +882,23 @@ class HerdrOpen(NamedTuple):
     workspace_id: str = ""
 
 
-def parse_herdr_open(output: str) -> HerdrOpen:
+def parse_herdr_open(output: str, mux: str = "herdr") -> HerdrOpen:
     """``already_open``, the root pane id and the workspace id from ``herdr worktree open``.
 
     A reply without the workspace names it in the root pane id, ``<workspace>:<pane>``.
+    ``mux`` is the multiplexer that answered, for the messages.
     """
     try:
         reply = json.loads(output)
     except ValueError:
-        raise WtError(f"wt: herdr returned no JSON: {output.strip()[:200]}") from None
+        raise WtError(f"wt: {mux} returned no JSON: {output.strip()[:200]}") from None
     if not isinstance(reply, dict):
-        raise WtError("wt: unexpected herdr reply")
+        raise WtError(f"wt: unexpected {mux} reply")
     if reply.get("error"):
-        raise WtError(f"wt: herdr worktree open failed: {herdr_error_message(output)}")
+        raise WtError(f"wt: {mux} worktree open failed: {herdr_error_message(output)}")
     result = reply.get("result")
     if not isinstance(result, dict):
-        raise WtError("wt: unexpected herdr reply")
+        raise WtError(f"wt: unexpected {mux} reply")
     root = result.get("root_pane")
     pane = root.get("pane_id") if isinstance(root, dict) else None
     pane = pane if isinstance(pane, str) else ""
@@ -1632,7 +1645,13 @@ class Tool:
         return not result.returncode and herdr_is_running(result.stdout)
 
     def multiplexer(self) -> str:
-        return select_multiplexer(self.env, self.runner.which, self.herdr_running)
+        terminals = "herdr"
+        if (self.env.get("WT_MULTIPLEXER") or "auto") == "auto":
+            try:
+                terminals = machines.terminals()
+            except ValueError as exc:
+                raise WtError(f"wt: {exc}") from None
+        return select_multiplexer(self.env, self.runner.which, self.herdr_running, terminals)
 
     def command_for(
         self,
@@ -1664,7 +1683,7 @@ class Tool:
             raise WtError(f"wt: {exc}") from exc
 
     def open_session(self, options: Options, directory: str, name: str, repo_path: str) -> None:
-        """Left pane runs the agent, right pane is a spare terminal (herdr: the agent only).
+        """Left pane runs the agent, right pane is a spare terminal (herdr, hc: the agent only).
 
         The prompt only applies to a session being created; an existing one already
         has an agent in it, so reattaching warns and ignores the prompt.
@@ -1684,11 +1703,11 @@ class Tool:
             except (OSError, ValueError, sqlite3.Error) as exc:
                 raise WtError(f"wt: cannot save tags: {exc}") from exc
         mux = self.multiplexer()
-        if mux in ("herdr", "tmux", "cmux") and not self.runner.which(mux):
+        if mux in ("herdr", "hc", "tmux", "cmux") and not self.runner.which(mux):
             self.warn(f"wt: {mux} is not on PATH; opening nothing")
             mux = "none"
-        if mux == "herdr":
-            self.session_herdr(options, directory, name, repo_path)
+        if mux in PANE_COMMANDS:
+            self.session_herdr(options, directory, name, repo_path, mux)
         elif mux == "tmux":
             self.session_tmux(options, directory, name)
         elif mux == "cmux":
@@ -1707,38 +1726,43 @@ class Tool:
                 "wt: the running agent keeps its sandbox; restart it to write to --with checkouts"
             )
 
-    def session_herdr(self, options: Options, directory: str, name: str, repo_path: str) -> None:
+    def session_herdr(
+        self, options: Options, directory: str, name: str, repo_path: str, mux: str = "herdr"
+    ) -> None:
         # herdr models a worktree as a workspace with checkout provenance and groups it
         # under a workspace for the parent checkout, which it creates on first use. The
         # open action must be issued *from* that parent (--cwd), not from the worktree.
         # The worktree already exists on disk, so open rather than create; open is
         # idempotent and reports already_open.
+        # herdr-core (hc) takes the same commands through hc_panes: there the workspace
+        # is a shell terminal labelled with the checkout, and the agent is typed into it.
+        tool = list(PANE_COMMANDS[mux])
         focus = "--focus" if options.focus else "--no-focus"
-        argv = ["herdr", "worktree", "open", "--cwd", repo_path, "--path", directory]
+        argv = [*tool, "worktree", "open", "--cwd", repo_path, "--path", directory]
         argv += ["--label", sanitize_session_name(options.label or name), focus]
         result = self.runner.run(argv)
         if result.returncode:
             detail = herdr_error_message(result.stdout + result.stderr)
-            raise WtError(f"wt: herdr worktree open failed: {detail}")
-        reply = parse_herdr_open(result.stdout)
+            raise WtError(f"wt: {mux} worktree open failed: {detail}")
+        reply = parse_herdr_open(result.stdout, mux)
         if reply.already_open:
             # Existing workspaces retain their agents; focus follows the explicit option.
             if options.prompt:
                 also = " and --exit-when-done" if options.exit_when_done else ""
                 self.warn(
-                    f"wt: a herdr workspace for {directory} already exists; "
+                    f"wt: a {mux} workspace for {directory} already exists; "
                     f"ignoring the prompt{also}"
                 )
             self.warn_reattached(options)
             return
         if not reply.root_pane:
-            raise WtError(f"wt: herdr did not return a root pane for {directory}")
+            raise WtError(f"wt: {mux} did not return a root pane for {directory}")
         watch, marker = None, ""
         if options.exit_when_done:
             import exit_watch
 
             if not reply.workspace_id:
-                raise WtError(f"wt: herdr did not name the workspace for {directory}")
+                raise WtError(f"wt: {mux} did not name the workspace for {directory}")
             marker = exit_watch.new_marker()
             # Last, after any --with note: the brief asks for the marker as the final line.
             options.prompt += exit_watch.brief(marker)
@@ -1750,13 +1774,14 @@ class Tool:
         # holds just the agent; open reviewr with its toggle action when wanted.
         # pane run submits text + Enter; the pty buffers it until the new shell reads it.
         try:
-            result = self.runner.run(["herdr", "pane", "run", reply.root_pane, command])
+            result = self.runner.run([*tool, "pane", "run", reply.root_pane, command])
         except BaseException:
             self.forget_watch(watch)
             raise
         if result.returncode:
             self.forget_watch(watch)
-            raise WtError(f"wt: herdr pane run failed: {result.stderr.strip()}".rstrip(": "))
+            detail = result.stderr.strip() or herdr_error_message(result.stdout)
+            raise WtError(f"wt: {mux} pane run failed: {detail}".rstrip(": "))
         if options.exit_when_done and options.exit_watch_json:
             # Only for an agent that was typed: the controller records it once wt returns.
             print(
@@ -2161,18 +2186,18 @@ class Tool:
         import exit_watch
 
         mux = self.multiplexer()
-        if mux != "herdr" or not self.runner.which("herdr"):
+        if mux not in PANE_COMMANDS or not self.runner.which(mux):
             chosen = self.env.get("WT_MULTIPLEXER") or "auto"
             reason = (
-                "herdr is not on PATH"
-                if mux == "herdr"
+                f"{mux} is not on PATH"
+                if mux in PANE_COMMANDS
                 else f"WT_MULTIPLEXER={chosen} chose {mux}"
                 if chosen == "auto"
                 else f"WT_MULTIPLEXER is {chosen}"
             )
             raise WtError(
-                f"{command}: --exit-when-done needs herdr ({reason}): "
-                "the dashboard finds, exits and closes the agent through its herdr pane"
+                f"{command}: --exit-when-done needs herdr or herdr-core ({reason}): "
+                "the dashboard finds, exits and closes the agent through its pane there"
             )
         if options.exit_watch_json:
             return
