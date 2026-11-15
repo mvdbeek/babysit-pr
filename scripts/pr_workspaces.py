@@ -31,6 +31,7 @@ import claude_accounts
 import dashboard_settings
 import exit_watch
 import github_cli
+import hc_panes
 import machines
 import placement
 import remote_probe
@@ -54,7 +55,10 @@ def collie_url(machine, workspace_id):
     A worker's comes from its registry ``collie_url``; without one there is no link. A
     worker that is a member of this machine's Collie crew (``collie_host``) opens through
     the lead, this machine's Collie unless ``collie_url`` names another, addressed to it.
+    Collie shows herdr: a herdr-core workspace has no page there.
     """
+    if hc_panes.is_workspace(workspace_id):
+        return None
     if machine is None:
         base = COLLIE_URL
     else:
@@ -1591,11 +1595,17 @@ class Workspaces:
                     raise ValueError("Workspace is missing")
                 run(*machines.herdr_argv(None, "workspace", "focus", target["workspace_id"]))
             if action == "copy":
-                args = (
-                    ["herdr", "workspace", "focus", target["workspace_id"]]
-                    if target["workspace_id"]
-                    else [
-                        "herdr",
+                if target["workspace_id"] and hc_panes.is_workspace(target["workspace_id"]):
+                    # herdr-core has no window to focus: the command attaches a terminal.
+                    panes = herdr("pane", "list", "--workspace", target["workspace_id"])["panes"]
+                    if not panes:
+                        raise ValueError("Workspace changed; refresh before opening")
+                    args = ["hc", "attach", panes[0]["pane_id"]]
+                elif target["workspace_id"]:
+                    args = ["herdr", "workspace", "focus", target["workspace_id"]]
+                else:
+                    args = machines.herdr_argv(
+                        None,
                         "worktree",
                         "open",
                         "--cwd",
@@ -1603,8 +1613,7 @@ class Workspaces:
                         "--path",
                         target["path"],
                         "--no-focus",
-                    ]
-                )
+                    )
                 return {"command": shlex.join(args)}
             if target["workspace_id"]:
                 return {"result": target}
@@ -3608,7 +3617,7 @@ class Workspaces:
                         # Exit watches go to this dashboard's own state home.
                         env={
                             **os.environ,
-                            "WT_MULTIPLEXER": "herdr",
+                            "WT_MULTIPLEXER": machines.terminals(),
                             "BABYSIT_HOME": str(self.home),
                         },
                     )
@@ -3813,7 +3822,7 @@ class Workspaces:
                     # The agent's pane gets neither: herdr's server starts its shell.
                     "env",
                     f"BABYSIT_WORKER={machine.id}",
-                    "WT_MULTIPLEXER=herdr",
+                    f"WT_MULTIPLEXER={machines.terminals()}",
                     python,
                     machines.remote_path(f"{machine.babysit_root.rstrip('/')}/scripts/wt.py"),
                     helper,

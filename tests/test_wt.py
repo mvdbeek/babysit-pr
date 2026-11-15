@@ -634,6 +634,88 @@ def test_select_multiplexer(env, executables, running, expected):
     )
 
 
+@pytest.mark.parametrize(
+    "env,executables,expected",
+    [
+        ({}, {"hc", "herdr", "tmux"}, "hc"),
+        ({"HERDR_ENV": "1"}, {"hc", "herdr"}, "hc"),
+        # Chosen but not installed: what herdr-less machines get.
+        ({}, {"tmux"}, "tmux"),
+        ({"WT_MULTIPLEXER": "herdr"}, {"hc", "herdr"}, "herdr"),
+        ({"WT_MULTIPLEXER": "hc"}, {"herdr"}, "hc"),
+    ],
+)
+def test_auto_prefers_herdr_core_where_babysit_is_set_to_it(env, executables, expected):
+    chosen = wt.select_multiplexer(env, lambda n: n in executables and n, lambda: False, "hc")
+    assert chosen == expected
+
+
+def test_an_explicit_multiplexer_never_reads_the_terminals_setting(monkeypatch):
+    monkeypatch.setenv("BABYSIT_TERMINALS", "screen")
+    assert tool(env={"WT_MULTIPLEXER": "tmux"}).multiplexer() == "tmux"
+    # Left to the setting, a value that is no runtime is said, not guessed around.
+    with pytest.raises(wt.WtError, match="Unknown terminal runtime 'screen'"):
+        tool().multiplexer()
+
+
+def test_hc_session_opens_a_terminal_through_hc_panes_and_types_the_agent():
+    panes = list(wt.PANE_COMMANDS["hc"])
+    assert panes == [sys.executable, str(wt.machines.HC_PANES)]
+    opened = {
+        "already_open": False,
+        "root_pane": {"pane_id": "t4"},
+        "workspace": {"workspace_id": "hc-0123456789ab"},
+    }
+    runner = FakeRunner(
+        [([*panes, "worktree", "open"], wt.Completed(0, json.dumps({"result": opened}), ""))],
+        executables={"hc"},
+    )
+    t = tool(runner, {"WT_MULTIPLEXER": "hc"})
+    t.open_session(
+        options(agent="codex", prompt="Fix", focus=False), "/wt/pr-base-7", "pr-base-7", "/clone"
+    )
+    assert [c[0] for c in runner.calls] == [
+        [*panes, "worktree", "open", "--cwd", "/clone", "--path", "/wt/pr-base-7"]
+        + ["--label", "pr-base-7", "--no-focus"],
+        [*panes, "pane", "run", "t4"]
+        + ['codex -c check_for_update_on_startup=false "$(cat /tmp/wt-prompt.fixture)"'],
+    ]
+    assert t.stderr.getvalue() == ""
+
+
+def test_hc_session_reattach_and_failures_name_hc():
+    panes = list(wt.PANE_COMMANDS["hc"])
+    again = {"already_open": True, "root_pane": {"pane_id": "t4"}}
+    runner = FakeRunner(
+        [([*panes, "worktree", "open"], wt.Completed(0, json.dumps({"result": again}), ""))],
+        executables={"hc"},
+    )
+    t = tool(runner, {"WT_MULTIPLEXER": "hc"})
+    t.open_session(options(prompt="Fix"), "/wt/x", "x", "/clone")
+    assert len(runner.calls) == 1
+    assert (
+        t.stderr.getvalue() == "wt: a hc workspace for /wt/x already exists; ignoring the prompt\n"
+    )
+    refused = json.dumps({"error": {"code": "unavailable", "message": "hc is not installed"}})
+    runner = FakeRunner(
+        [([*panes, "worktree", "open"], wt.Completed(1, refused, ""))], executables={"hc"}
+    )
+    with pytest.raises(wt.WtError, match="hc worktree open failed: hc is not installed"):
+        tool(runner, {"WT_MULTIPLEXER": "hc"}).open_session(options(), "/wt/x", "x", "/clone")
+    # Without hc on PATH nothing is opened, as for any other multiplexer.
+    t = tool(FakeRunner(), {"WT_MULTIPLEXER": "hc"})
+    t.open_session(options(), "/wt/x", "x", "/clone")
+    assert t.stderr.getvalue() == "wt: hc is not on PATH; opening nothing\n"
+
+
+def test_exit_when_done_works_on_herdr_core(tmp_path):
+    runner = FakeRunner(executables={"hc"})
+    env = {"HOME": str(tmp_path), "WT_MULTIPLEXER": "hc", "BABYSIT_HOME": str(tmp_path / "state")}
+    tool(runner, env).check_exit_when_done(options(prompt="go"), "wt")
+    with pytest.raises(wt.WtError, match="needs herdr or herdr-core \\(hc is not on PATH\\)"):
+        tool(FakeRunner(), env).check_exit_when_done(options(prompt="go"), "wt")
+
+
 def test_herdr_is_running():
     assert wt.herdr_is_running('{"running":true,"pid":1}')
     assert wt.herdr_is_running('{"running": true}')
@@ -869,13 +951,17 @@ def test_exit_when_done_is_refused_before_anything_is_made(command, tmp_path):
     with pytest.raises(wt.UsageError, match=f"{command}: --exit-when-done needs a prompt"):
         tool(runner, env).run(command, ["--exit-when-done", "7"])
     for mux in ("tmux", "cmux", "none"):
-        with pytest.raises(wt.WtError, match=f"needs herdr \\(WT_MULTIPLEXER is {mux}\\)"):
+        with pytest.raises(
+            wt.WtError, match=f"needs herdr or herdr-core \\(WT_MULTIPLEXER is {mux}\\)"
+        ):
             tool(runner, {**env, "WT_MULTIPLEXER": mux}).run(
                 command, ["--exit-when-done", "-p", "go", "7"]
             )
-    with pytest.raises(wt.WtError, match="needs herdr \\(herdr is not on PATH\\)"):
+    with pytest.raises(wt.WtError, match="needs herdr or herdr-core \\(herdr is not on PATH\\)"):
         tool(FakeRunner(), env).run(command, ["--exit-when-done", "-p", "go", "7"])
-    with pytest.raises(wt.WtError, match="needs herdr \\(WT_MULTIPLEXER=auto chose tmux\\)"):
+    with pytest.raises(
+        wt.WtError, match="needs herdr or herdr-core \\(WT_MULTIPLEXER=auto chose tmux\\)"
+    ):
         tool(FakeRunner(executables={"tmux"}), {"HOME": str(tmp_path)}).run(
             command, ["--exit-when-done", "-p", "go", "7"]
         )

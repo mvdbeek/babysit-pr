@@ -532,6 +532,128 @@ def test_the_broker_reads_what_a_real_codex_process_holds_open(tmp_path):
         parent.wait()
 
 
+def fake_hc(tmp_path, monkeypatch, body="true"):
+    """An ``hc`` that logs its commands and keeps the terminal's labels in a file."""
+    calls, labels = tmp_path / "hc-calls", tmp_path / "hc-labels"
+    labels.write_text("{}")
+    hc = tmp_path / "hc"
+    hc.write_text(
+        f"#!{sys.executable} -S\nimport json,sys\nfrom pathlib import Path\n"
+        f"calls=Path({str(calls)!r}); labels=Path({str(labels)!r}); a=sys.argv[1:]\n"
+        "calls.open('a').write(' '.join(a)+'\\n')\n"
+        "kept=json.loads(labels.read_text())\n"
+        "if a[0] == 'get': print(json.dumps({'labels': kept})); sys.exit()\n"
+        f"import subprocess\nif subprocess.call(['/bin/sh','-c',{body!r}]): sys.exit(5)\n"
+        "for word in a[2:]:\n"
+        " if '=' in word:\n"
+        "  k,v=word.split('=',1)\n"
+        "  if v: kept[k]=v\n"
+        "  else: kept.pop(k,None)\n"
+        "labels.write_text(json.dumps(kept))\n"
+    )
+    hc.chmod(0o755)
+    monkeypatch.setenv("HC_TERMINAL_ID", "t7")
+    monkeypatch.setenv("BABYSIT_HC", str(hc))
+    monkeypatch.setattr(worker_broker, "SESSION_POLL", 0)
+    return calls, labels
+
+
+def test_the_broker_labels_its_hc_terminal_with_the_session_and_takes_it_off_again(
+    sandbox, tmp_path, monkeypatch
+):
+    proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    for sid in (first, second):
+        claude_transcript(tmp_path, tree, sid)
+    session_record(store, 2, first, start="777")
+    calls, labels = fake_hc(tmp_path, monkeypatch)
+    rounds = iter(range(6))
+    seen = []
+
+    def running():
+        index = next(rounds, None)
+        if index == 3:  # A /clear starts another session in the same process.
+            session_record(store, 2, second, start="777")
+        seen.append(json.loads(labels.read_text()))
+        return index is not None
+
+    worker_broker.report_sessions("claude", 10, config, store, proc, running)
+    assert {"babysit.session": first} in seen and seen[-1] == {"babysit.session": second}
+    # Once per session, then the label is checked and removed when the sandbox ends.
+    assert calls.read_text().splitlines() == [
+        f"label t7 babysit.session={first} babysit.session-of= --json",
+        f"label t7 babysit.session={second} babysit.session-of= --json",
+        "get t7 --json",
+        "label t7 babysit.session= --json",
+    ]
+    assert json.loads(labels.read_text()) == {}
+
+
+def test_the_broker_leaves_a_session_label_that_is_no_longer_its_own(
+    sandbox, tmp_path, monkeypatch
+):
+    proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
+    session = str(uuid.uuid4())
+    claude_transcript(tmp_path, tree, session)
+    session_record(store, 2, session, start="777")
+    calls, labels = fake_hc(tmp_path, monkeypatch)
+    rounds = iter(range(3))
+
+    def running():
+        index = next(rounds, None)
+        if index is None:  # Another launch in the same terminal has labelled it since.
+            labels.write_text(json.dumps({"babysit.session": "another"}))
+        return index is not None
+
+    worker_broker.report_sessions("claude", 10, config, store, proc, running)
+    assert json.loads(labels.read_text()) == {"babysit.session": "another"}
+    assert calls.read_text().splitlines()[-1] == "get t7 --json"
+
+
+def test_the_broker_labels_again_when_hc_refused(sandbox, tmp_path, monkeypatch):
+    proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
+    session = str(uuid.uuid4())
+    claude_transcript(tmp_path, tree, session)
+    session_record(store, 2, session, start="777")
+    calls, labels = fake_hc(
+        tmp_path, monkeypatch, f'[ "$(wc -l < "{tmp_path / "hc-calls"}")" -gt 1 ]'
+    )
+    rounds = iter(range(4))
+    worker_broker.report_sessions(
+        "claude", 10, config, store, proc, lambda: next(rounds, None) is not None
+    )
+    told = [c for c in calls.read_text().splitlines() if c.startswith("label t7 babysit.session=")]
+    assert told[:2] == [f"label t7 babysit.session={session} babysit.session-of= --json"] * 2
+
+
+def test_the_broker_tells_both_runtimes_when_one_was_started_inside_the_other(
+    sandbox, tmp_path, monkeypatch
+):
+    proc, config, store, tree = (sandbox[k] for k in ("proc", "config", "store", "tree"))
+    session = str(uuid.uuid4())
+    claude_transcript(tmp_path, tree, session)
+    session_record(store, 2, session, start="777")
+    # herdr does not hold this terminal and refuses; hc takes the label.
+    herdr_calls = fake_herdr(tmp_path, monkeypatch, "false")
+    hc_calls, labels = fake_hc(tmp_path, monkeypatch)
+    rounds = iter(range(4))
+    seen = []
+
+    def running():
+        seen.append(json.loads(labels.read_text()))
+        return next(rounds, None) is not None
+
+    worker_broker.report_sessions("claude", 10, config, store, proc, running)
+    assert seen[-1] == {"babysit.session": session}
+    # One runtime taking it is enough: neither is told again.
+    assert len(herdr_calls.read_text().splitlines()) == 1
+    assert (
+        hc_calls.read_text().splitlines()[0]
+        == f"label t7 babysit.session={session} babysit.session-of= --json"
+    )
+    assert json.loads(labels.read_text()) == {}
+
+
 def test_the_broker_tells_herdr_the_codex_session(codex_sandbox, tmp_path, monkeypatch):
     proc, config = codex_sandbox["proc"], codex_sandbox["config"]
     first, second = str(uuid.uuid4()), str(uuid.uuid4())

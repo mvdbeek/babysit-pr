@@ -194,6 +194,58 @@ def test_success_exits_once_then_releases(rig, padding):
     )
 
 
+# herdr-core reads screens as plain text: a placeholder is not faint there.
+PLAIN = "› Ask Codex to do anything"
+CLAUDE_PLAIN = "─" * 40 + '\n❯\xa0Try "fix lint errors"\n' + "─" * 40
+
+
+def test_a_codex_handoff_on_herdr_core_does_not_judge_the_composer(rig, monkeypatch):
+    target, home, db, state = rig
+    state["screen"] = "[receipt]\n" + PLAIN
+    # As herdr reads it, that line is typed input and the handoff stops.
+    with pytest.raises(RuntimeError, match="Composer contains input"):
+        handoff.perform(target, home, db)
+    assert not state["sent"] and supervisor.get_job(db, "watch")["status"] == "awaiting_release"
+    with db:
+        supervisor.save_job(
+            db, dict(id="watch", status="handoff", epoch=2, handoff_token=target["token"])
+        )
+    (home / "handoffs" / (target["token"] + ".audit.json")).unlink()
+    monkeypatch.setenv("BABYSIT_TERMINALS", "hc")
+    handoff.perform(target, home, db)
+    assert len(state["sent"]) == 1
+    assert supervisor.get_job(db, "watch")["status"] == "watching"
+
+
+@pytest.mark.parametrize("rig", ["claude"], indirect=True)
+def test_a_claude_handoff_on_herdr_core_submits_one_exit(rig, monkeypatch):
+    target, home, db, state = rig
+    state["screen"] = "[receipt]\n" + CLAUDE_PLAIN
+    monkeypatch.setenv("BABYSIT_TERMINALS", "hc")
+    submitted = []
+
+    def submit_exit(pane, machine=None):
+        # Only while this handoff still owns the watch.
+        assert supervisor.get_job(db, "watch")["status"] == "handoff"
+        submitted.append(pane)
+        state["exited"] = True
+
+    monkeypatch.setattr(handoff, "submit_exit", submit_exit)
+    handoff.perform(target, home, db)
+    # One submitted /exit: no key, and no second press for a confirmation.
+    assert submitted == ["w1:p1"] and not state["sent"]
+    assert supervisor.get_job(db, "watch")["status"] == "watching"
+
+
+def test_what_plain_text_shows_still_stops_a_handoff_on_herdr_core(rig, monkeypatch):
+    target, home, db, state = rig
+    state["screen"] = "[receipt]\n" + PLAIN + "\nesc to interrupt"
+    monkeypatch.setenv("BABYSIT_TERMINALS", "hc")
+    with pytest.raises(RuntimeError, match="Queued input or background work"):
+        handoff.perform(target, home, db)
+    assert not state["sent"] and supervisor.get_job(db, "watch")["status"] == "awaiting_release"
+
+
 @pytest.mark.parametrize("screen", [EMPTY, "[receipt]", "[receipt]\n› "])
 def test_waits_for_final_display_then_exits_once(rig, screen):
     target, home, db, state = rig

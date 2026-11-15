@@ -864,7 +864,14 @@ def exit_agent(request, home=None, *, stop=True, machine=None):
 
 
 def has_draft(screen, agent):
-    """Whether the agent's composer on ``screen`` holds typed text, which an exit loses."""
+    """Whether the agent's composer on ``screen`` holds typed text, which an exit loses.
+
+    herdr-core's plain screens cannot tell a draft from a placeholder. There hc holds a
+    submitted /exit while a person is typing, and it is taken back if they keep at it;
+    only a draft left untouched for over a minute goes unseen.
+    """
+    if not herdr_handoff.styled_screens():
+        return False
     if agent == "claude":
         return bool(herdr_handoff.claude_composer(screen))
     # Codex's composer is its last "›" line, unless it shows the faint placeholder.
@@ -1009,7 +1016,13 @@ def pasted(screen, text):
 
 
 def idle_screen(pane, screen=None, machine=None):
-    """Whether the pane shows Claude's empty prompt box and no dialog below it."""
+    """Whether the pane shows Claude's empty prompt box and no dialog below it.
+
+    Only asked of herdr, which can call a Claude blocked that is not. On herdr-core the
+    status is the agent's own word and its plain screens could not tell: never idle.
+    """
+    if not herdr_handoff.styled_screens():
+        return False
     if screen is None:
         screen = herdr_handoff.read_screen(pane, machine)
     plain = herdr_handoff.SGR.sub("", screen)
@@ -1230,6 +1243,24 @@ def shows_question(question):
     return lambda screen: bool(heading.search(screen)) and all(r.search(screen) for r in rest)
 
 
+def whole_lines(steps):
+    """``steps`` as the terminal runtime can type them.
+
+    herdr types text and presses Enter as two steps, with the screen checked between
+    them. herdr-core cannot leave arbitrary text unsubmitted, so there a text followed
+    by Enter becomes one ``line``: the text pasted and submitted at once.
+    """
+    if herdr_handoff.styled_screens():
+        return list(steps)
+    out: list[tuple[str, str]] = []
+    for step in steps:
+        if step == ("key", "enter") and out and out[-1][0] == "text":
+            out[-1] = ("line", out[-1][1])
+        else:
+            out.append(step)
+    return out
+
+
 def answer_steps(questions, answers, agent="claude"):
     """Validate one answer per question; return the keys (or text) each one needs."""
     if not isinstance(answers, list) or len(answers) != len(questions):
@@ -1343,15 +1374,16 @@ def answer_locked(request, home=None, machine=None):
                     raise ValueError("the dialog changed")
             if not wait_for(pane, shows_question(question), machine=machine):
                 raise ValueError("the dialog did not show the next question")
-            for kind, value in keys:
-                if kind == "text":
+            for kind, value in whole_lines(keys):
+                if kind in {"text", "line"}:
                     # The text field opens on the keypress before; its editor hint
                     # shows once it has focus.
                     if not wait_for(
                         pane, lambda screen: "ctrl+g to edit" in screen, machine=machine
                     ):
                         raise ValueError("the answer field did not open")
-                    run(*machines.herdr_argv(machine, "pane", "send-text", pane, value))
+                    verb = "run" if kind == "line" else "send-text"
+                    run(*machines.herdr_argv(machine, "pane", verb, pane, value))
                 else:
                     if value == str(len(question["options"]) + 1) and "ctrl+g to edit" in dialog(
                         pane, machine
@@ -1469,8 +1501,9 @@ def answer_codex(request, questions, steps, machine=None):
         # An I/O error may arrive after delivery. Never offer to replay the keys.
         typed = True
         _codex_answered.add(identity)
-        if kind == "text":
-            run(*machines.herdr_argv(machine, "pane", "send-text", pane, value))
+        if kind in {"text", "line"}:
+            verb = "run" if kind == "line" else "send-text"
+            run(*machines.herdr_argv(machine, "pane", verb, pane, value))
         else:
             herdr("agent", "send-keys", pane, value, machine=machine)
 
@@ -1525,8 +1558,8 @@ def answer_codex(request, questions, steps, machine=None):
             def empty(s, placeholder=placeholder):
                 return matches(s) and bool(re.search(rf"(?m)^\s*› {re.escape(placeholder)}\s*$", s))
 
-            send("text", value, empty)
-            send("key", "enter", matches)
+            for kind, word in whole_lines([("text", value), ("key", "enter")]):
+                send(kind, word, empty if kind != "key" else matches)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         if typed:
             raise ValueError(f"Answer attempted ({exc}); check or finish it in Collie") from exc

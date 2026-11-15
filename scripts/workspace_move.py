@@ -1633,7 +1633,8 @@ class Move:
             removed, said = False, f"The checkout on {here} was kept: its cleanup failed ({exc})"
         if not removed:
             warnings.append(said)
-        space = pane.split(":")[0]
+        # herdr names the workspace in the pane id; herdr-core's pane is a bare terminal.
+        space = running.get("workspace_id") or pane.split(":")[0]
         target_id = self.machine.id if self.machine is not None else None
         return {
             "machine": target_id or HERE,

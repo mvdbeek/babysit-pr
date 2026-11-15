@@ -54,6 +54,11 @@ its session is the rollout its process holds open for writing, read from ``/proc
 Only a session whose transcript lies in CONFIG_DIR's store is reported, the same check
 a registration passes.
 
+In a herdr-core terminal (``$HC_TERMINAL_ID``) the session is told to hc instead, as the
+terminal's ``babysit.session`` label: hc knows what an agent is doing from the agent
+itself, but not which conversation it runs. The label is taken off again when the
+sandbox ends, so a later agent in that terminal is never taken for this one.
+
 Prints ``ready`` once LISTEN accepts connections, then runs until its parent exits
 (babysit-bwrap execs bwrap, so that is the sandbox), and removes LISTEN and its
 directory.
@@ -86,12 +91,15 @@ CONNECTIONS = 4
 _forwarding = threading.Lock()
 _last = dict.fromkeys(worker_api.ACTIONS, 0.0)
 _slots = threading.BoundedSemaphore(CONNECTIONS)
+_stopping = threading.Event()  # Set when the broker ends: the session reports stop at once.
 SESSION_POLL = 2  # Seconds between looks at the session the sandbox's agent runs.
 SESSION_DEPTH = 4  # bwrap, its init in the namespace, then the agent: two levels down.
 MAX_RECORD = 65536
 MAX_META = 1 << 20  # Codex's session_meta line carries its instructions.
 ROLLOUT = re.compile(r"rollout-.+-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl")
 HERDR_TIMEOUT = 10
+# The hc terminal label that names the agent conversation running in it (hc_panes.SESSION).
+SESSION_LABEL = "babysit.session"
 MAX_BACKOFF = 60  # Seconds between reports herdr keeps refusing.
 
 
@@ -445,31 +453,94 @@ def tell_herdr(agent, pane, session, path):
     return done.returncode == 0
 
 
+def hc_label(terminal, *words, capture=False):
+    """Run ``hc`` on the terminal this launch was typed into; the finished process or None."""
+    try:
+        return subprocess.run(
+            [os.environ.get("BABYSIT_HC") or "hc", *words],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=HERDR_TIMEOUT,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def tell_hc(terminal, session):
+    """Label the hc terminal with the session; whether hc took it."""
+    # The mark is hc_panes's for a session it read itself: off, so this one is trusted.
+    done = hc_label(
+        terminal, "label", terminal, f"{SESSION_LABEL}={session}", f"{SESSION_LABEL}-of=", "--json"
+    )
+    return done is not None and done.returncode == 0
+
+
+def forget_hc(terminal, session):
+    """Take the session label off the terminal again, if it is still this launch's."""
+    shown = hc_label(terminal, "get", terminal, "--json", capture=True)
+    try:
+        labels = json.loads(shown.stdout)["labels"] if shown and not shown.returncode else {}
+    except (ValueError, KeyError, TypeError):
+        labels = {}
+    if isinstance(labels, dict) and labels.get(SESSION_LABEL) == session:
+        hc_label(terminal, "label", terminal, f"{SESSION_LABEL}=", "--json")
+
+
+def session_teller():
+    """How this launch tells its terminal's runtime the session: ``tell(agent, session,
+    path)`` and ``forget(session)``, or None where neither herdr nor hc holds it.
+
+    With both in the environment, one runtime was started from inside the other and
+    nothing here says which holds this terminal: both are told. The one that does not
+    hold it refuses, or gets a label on a terminal that runs no agent.
+    """
+    terminal = os.environ.get("HC_TERMINAL_ID")
+    pane = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
+    if not terminal and not pane:
+        return None
+
+    def tell(agent, session, path):
+        told = [tell_hc(terminal, session)] if terminal else []
+        if pane:
+            told.append(tell_herdr(agent, pane, session, path))
+        return any(told)
+
+    return tell, (lambda session: forget_hc(terminal, session)) if terminal else None
+
+
 def report_sessions(agent, parent, config_dir, store, proc=Path("/proc"), running=None):
-    """Tell herdr the sandbox's session, and again whenever it changes (a /clear, a
-    /resume, a /new), while ``running()``: by default, until the sandbox exits. Outside a
-    herdr pane there is no one to tell; a refusal is tried again less and less often."""
-    pane = os.environ.get("HERDR_PANE_ID")
-    if os.environ.get("HERDR_ENV") != "1" or not pane:
+    """Tell herdr or hc the sandbox's session, and again whenever it changes (a /clear, a
+    /resume, a /new), while ``running()``: by default, until the sandbox exits. Outside
+    their terminals there is no one to tell; a refusal is tried again less and less often."""
+    teller = session_teller()
+    if teller is None:
         return
+    tell, forget = teller
     running = running or (lambda: os.getppid() == parent)
     told = None
     refusals = 0
-    while running():
-        try:
-            found = (
-                running_claude_session(parent, config_dir, store, proc)
-                if agent == "claude"
-                else running_codex_session(parent, config_dir, proc)
-            )
-            if found and found != told:
-                if tell_herdr(agent, pane, *found):
-                    told, refusals = found, 0
-                else:
-                    refusals += 1
-        except Exception:  # noqa: BLE001 - what the sandbox writes must not end the reports.
-            pass
-        time.sleep(min(SESSION_POLL * 2 ** min(refusals, 5), MAX_BACKOFF))
+    try:
+        while running() and not _stopping.is_set():
+            try:
+                found = (
+                    running_claude_session(parent, config_dir, store, proc)
+                    if agent == "claude"
+                    else running_codex_session(parent, config_dir, proc)
+                )
+                if found and found != told:
+                    if tell(agent, *found):
+                        told, refusals = found, 0
+                    else:
+                        refusals += 1
+            except Exception:  # noqa: BLE001 - what the sandbox writes must not end the reports.
+                pass
+            _stopping.wait(min(SESSION_POLL * 2 ** min(refusals, 5), MAX_BACKOFF))
+    finally:
+        if told and forget:
+            forget(told[0])
 
 
 def main(argv):
@@ -496,6 +567,7 @@ def main(argv):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     parent = os.getppid()
+    reports = None
     server = socket.socket(socket.AF_UNIX)
     try:
         server.bind(listen)
@@ -503,9 +575,10 @@ def main(argv):
         server.settimeout(1)
         print("ready", flush=True)
         os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
-        threading.Thread(
+        reports = threading.Thread(
             target=report_sessions, args=(agent, parent, config_dir, store), daemon=True
-        ).start()
+        )
+        reports.start()
         while os.getppid() == parent:
             try:
                 client, _ = server.accept()
@@ -522,12 +595,17 @@ def main(argv):
             ).start()
     finally:
         server.close()
+        _stopping.set()
         with contextlib.suppress(OSError):
             os.unlink(listen)
         # The sandbox's session records: the directory is this launch's, and gone with it.
         shutil.rmtree(store, ignore_errors=True)
         with contextlib.suppress(OSError):
             os.rmdir(os.path.dirname(listen))
+        # Last, so nothing above is skipped: the reports take an hc session label off
+        # before this process is gone (a report under way, then a look and a removal).
+        if reports is not None:
+            reports.join(3 * HERDR_TIMEOUT + 1)
 
 
 if __name__ == "__main__":

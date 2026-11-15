@@ -14,6 +14,15 @@ def github_token_from_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def herdr_terminals(monkeypatch):
+    """Terminals are herdr's unless a test chooses herdr-core, whatever this machine's own
+    setting is; and a run inside a real herdr pane or hc terminal reports to neither."""
+    monkeypatch.setenv("BABYSIT_TERMINALS", "herdr")
+    for name in ("HC_TERMINAL_ID", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_BIN_PATH"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def no_claude_trust(monkeypatch):
     """Launches never mark folders trusted in the user's real Claude config; the trust
     tests turn it back on against a fake home."""

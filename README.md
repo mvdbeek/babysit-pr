@@ -2,7 +2,7 @@
 
 A shared watcher that waits for GitHub CI and PR activity without keeping coding agents alive. Bounded Codex and Claude repairs resume the original conversation in its original herdr pane. The local dashboard shows watches, CI, feedback awaiting approval, repair logs, and cleanup readiness.
 
-The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
+The skill instructions and operating details are in [SKILL.md](SKILL.md) and [the supervisor reference](references/supervisor.md). Terminals can be kept in herdr-core instead of herdr; see [herdr-core terminals](references/herdr-core.md). The dashboard frontend lives in `assets/dashboard/`; its HTTP server is `scripts/dashboard.py`. `scripts/pr_supervisor.py` owns the queue and repair lifecycle.
 
 The [Send to Babysitter browser extension](references/browser-extension.md) sends
 page references and GitHub tasks to the dashboard, starts new workspaces, and sends
@@ -1007,11 +1007,13 @@ option; a session resumed from the dashboard after it exited starts through the 
 `claude` function again, so it bypasses permission checks as before.
 
 To use it from a shell, put `scripts/` on `PATH` or symlink the three launchers into
-a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `tmux`,
-`cmux`, `none` or `auto` (the default) from the environment or from `KEY=VALUE` lines
-in `~/.config/worktree/config` (`$XDG_CONFIG_HOME` is honoured; the environment wins).
-`auto` uses herdr when `herdr` is installed and either `HERDR_ENV=1` is set or
-`herdr status server --json` reports a running server, then cmux when
+a `bin` directory; no `source` is needed. `WT_MULTIPLEXER` selects `herdr`, `hc`
+(herdr-core), `tmux`, `cmux`, `none` or `auto` (the default) from the environment or
+from `KEY=VALUE` lines in `~/.config/worktree/config` (`$XDG_CONFIG_HOME` is honoured;
+the environment wins). `auto` uses herdr-core where babysit-pr is set to it
+([references/herdr-core.md](references/herdr-core.md)), otherwise herdr when `herdr`
+is installed and either `HERDR_ENV=1` is set or `herdr status server --json` reports
+a running server, then cmux when
 `CMUX_SURFACE_ID` is set, then tmux, then `none`. A program cannot change its
 caller's directory, so with `none` the helper prints the worktree path on stdout
 (everything else goes to stderr); a shell function turns that into a `cd`:

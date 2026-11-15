@@ -95,6 +95,8 @@ An empty run list means waiting for CI, not success. Details and examples are in
    helper validates the UUID/cwd and saves the last model.
    Identify its original herdr pane with an explicit pane ID, corroborated by
    worktree, title, and session history. Do not use the focused pane implicitly.
+   In a herdr-core terminal (`$HC_TERMINAL_ID` is set) the pane ID is that value;
+   see [references/herdr-core.md](references/herdr-core.md).
    This user's default is **all wakes in that same pane**, never hidden repairs.
 3. Reuse the running supervisor's `--home PATH` for registration and all later
    commands when it uses a custom state directory; do not create a separate queue.
@@ -126,6 +128,8 @@ An empty run list means waiting for CI, not success. Details and examples are in
    `herdr pane process-info --pane
 PANE`; never assume the currently focused pane is this agent. Match the
    worktree and conversation; if ambiguous, use the manual fallback below.
+   In a herdr-core terminal pass `--pane "$HC_TERMINAL_ID"` instead; there the
+   helper asks Claude to leave with one submitted `/exit` rather than Ctrl-D.
 
    ```sh
    python3 <skill-dir>/scripts/pr_supervisor.py --home STATE_DIR handoff WATCH_ID --pane PANE
