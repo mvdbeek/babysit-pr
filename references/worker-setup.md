@@ -182,6 +182,20 @@ and `~/.local/share/babysit-pr/app/scripts` to `PATH` at the top of `~/.bashrc`,
 above Ubuntu's early return, so non-interactive `ssh box <command>` finds the same
 tools.
 
+It also installs herdr's Claude session hook (`herdr integration install claude`) for
+`~/.claude` and each account under `~/.claude/accounts`, as the controller has it:
+a `SessionStart` hook in that configuration's `settings.json` which tells herdr the
+session a Claude runs. Sandboxed launches do not need it (their broker reports the
+session, and inside a sandbox the hook finds no herdr and leaves); it names the
+session of a Claude you start by hand in a pane there, which the dashboard otherwise
+shows as **Status unknown**. A Claude started before the hook was installed is named
+once it is restarted. `hooks/` and `settings.json` are read-only in every sandbox.
+An account added later gets the hook at the next user step or `make deploy`;
+`--check` warns about a configuration without it, or whose `settings.json` no
+longer runs it. Codex gets no such hook on a
+worker: Codex asks to trust a new hook and records that in `config.toml`, which
+sandboxed launches share and cannot write.
+
 The deployed copy is kept apart from `~/src`, where agents work: babysit-bwrap
 refuses to grant `~/.local/share/babysit-pr`, its own checkout and that checkout's
 git directory, so no agent can change the launcher or what git runs in it. Agents

@@ -919,7 +919,56 @@ user_checks() {
   fi
   gpg_checks
   claude_account_checks
+  session_hook_checks
   instruction_checks
+}
+
+# Every Claude configuration of this user, in claude_configs: the default one and each
+# account's.
+list_claude_configs() {
+  local dir
+  claude_configs=()
+  [[ -d $HOME/.claude ]] && claude_configs+=("$HOME/.claude")
+  for dir in "$HOME"/.claude/accounts/*/; do
+    [[ -d $dir ]] && claude_configs+=("${dir%/}")
+  done
+  return 0
+}
+
+# herdr learns which session a Claude runs from its own SessionStart hook, as on the
+# controller. A sandboxed launch's broker reports the session instead (worker_broker.py):
+# inside a sandbox the hook finds no herdr and leaves. The hook is for a Claude started
+# by hand in a pane, which herdr otherwise lists with no session, so the dashboard
+# cannot tell which transcript it runs ("Status unknown"). hooks/ and settings.json are
+# read-only in every sandbox, so no agent can change what the hook runs.
+install_session_hooks() {
+  local config
+  list_claude_configs
+  for config in ${claude_configs[@]+"${claude_configs[@]}"}; do
+    if ((dry)); then
+      printf '  would run: CLAUDE_CONFIG_DIR=%s herdr integration install claude\n' "$config"
+    elif ! CLAUDE_CONFIG_DIR=$config herdr integration install claude >/dev/null 2>&1; then
+      warn "herdr integration install claude failed for $config; the dashboard cannot tell the session of a Claude started by hand with it"
+    fi
+  done
+}
+
+session_hook_checks() {
+  local config state
+  list_claude_configs
+  for config in ${claude_configs[@]+"${claude_configs[@]}"}; do
+    state=$(CLAUDE_CONFIG_DIR=$config herdr integration status 2>/dev/null | sed -n 's/^claude: //p') || state=
+    # herdr's status looks at the hook's script alone, not at the settings that run it.
+    if [[ $state == current* ]] && ! grep -qF 'hooks/herdr-agent-state.sh' "$config/settings.json" 2>/dev/null; then
+      state="not in settings.json"
+    fi
+    if [[ $state == current* ]]; then
+      ok "herdr names the session of a Claude started by hand with $config"
+    else
+      state=${state%% (*}
+      warn "herdr's Claude session hook is ${state:-unknown} for $config, so the dashboard cannot tell the session of a Claude started by hand with it; rerun the user step"
+    fi
+  done
 }
 
 # babysit-bwrap turns a missing CLAUDE.md or AGENTS.md into an empty placeholder, so a
@@ -1048,6 +1097,9 @@ user_step() {
     { printf '%s\n%s\n\n' "$docker_marker" "$docker_line" && cat "$HOME/.bashrc"; } >"$HOME/.bashrc.tmp.$$"
     mv -f "$HOME/.bashrc.tmp.$$" "$HOME/.bashrc"
   fi
+
+  say "herdr's Claude session hook"
+  install_session_hooks
 
   say "git identity"
   if [[ -n ${GIT_USER_NAME:-} && -n ${GIT_USER_EMAIL:-} ]]; then
