@@ -3157,8 +3157,8 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
       field("Claude account", account);
       form.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel, machineField);
       field("Task", task);
-      form.append(promptHistory(task));
       const files = attachmentField(form, task);
+      form.append(promptHistory(task));
       const { later, laterLabel, startFields, startTime } = startLaterFields();
       form.append(laterLabel, startFields);
       for (const pending of info.scheduled ?? [])
@@ -3320,6 +3320,8 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       );
     }
     field("Repository and local clone", repo);
+    // The task and its fields follow the repository choice, and the checkbox widening it.
+    let aboveTask = repo;
     if (recent.idle) {
       const idle = el("input");
       idle.id = "new-task-idle";
@@ -3343,6 +3345,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
         }
       };
       form.append(idleLabel);
+      aboveTask = idleLabel;
     }
     // Other clones the task also covers: the branch is checked out in each and the
     // agent's sandbox may write there (`wt --with`).
@@ -3544,11 +3547,10 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     task.value = prefill.task || "";
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
-    const history = promptHistory(task);
-    form.append(history);
     const files = attachmentField(form, task);
+    const history = promptHistory(task);
     const taskLabel = form.querySelector('label[for="workspace-task"]');
-    repo.after(taskLabel, task, branchFields, fileLabel, issueFields, history, files.element);
+    aboveTask.after(taskLabel, task, files.element, history, branchFields, fileLabel, issueFields);
     const body = el("div", undefined, "new-task-body");
     body.append(...form.children);
     const footer = el("div", undefined, "task-footer");
@@ -3795,8 +3797,9 @@ async function batchDialog(items, done, { nouns: [one, many], tasks, preferred =
     task.value = template;
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
-    form.append(el("small", `${BATCH_URL} becomes each ${one}’s link.`), promptHistory(task));
+    form.append(el("small", `${BATCH_URL} becomes each ${one}’s link.`));
     const files = attachmentField(form, task);
+    form.append(promptHistory(task));
     const { later, laterLabel, startAt, startFields, startTime } = startLaterFields();
     form.append(laterLabel, startFields);
     const gap = el("input");

@@ -545,11 +545,17 @@ def put_file(
     return path
 
 
+# The exit status of GET_FILE for a file over its limit.
+FILE_TOO_LARGE = 3
 # Prints a staged file and removes it: only a regular file, never through a link, in a
-# folder reached as ``put_file`` makes one.
+# folder reached as ``put_file`` makes one. A file over the limit ``$3`` is refused before
+# it is printed: one that fits the pipe would be printed whole, and removed, before the
+# reader stopped the command.
 GET_FILE = (
     'cd -P -- "$1" || exit 1\n'
     'if [ -L "$2" ] || [ ! -f "$2" ]; then echo "$2 is not a staged file" >&2; exit 1; fi\n'
+    'size=$(wc -c < "$2") || exit 1\n'
+    f'if [ "$((size))" -gt "$3" ]; then exit {FILE_TOO_LARGE}; fi\n'
     'cat -- "$2" && rm -f -- "$2"'
 )
 
@@ -562,16 +568,19 @@ def get_file(home, m: Machine, directory, name, *, limit, timeout=30) -> bytes:
         raise ValueError(f"Invalid staged file name {name!r}")
     if not isinstance(directory, RemotePath):
         directory = remote_path(directory)
+    too_large = f"{name} on {m.label} is larger than {limit} bytes"
     try:
         result = run(
             home,
             m,
-            ["sh", "-c", GET_FILE, "sh", directory, name],
+            ["sh", "-c", GET_FILE, "sh", directory, name, str(int(limit))],
             timeout=timeout,
             max_output=limit,
         )
-    except owned_process.OutputLimitExceeded as exc:
-        raise ValueError(f"{name} on {m.label} is larger than {limit} bytes") from exc
+    except owned_process.OutputLimitExceeded as exc:  # It grew after its size was read.
+        raise ValueError(too_large) from exc
+    if result.returncode == FILE_TOO_LARGE:
+        raise ValueError(too_large)
     if result.returncode:
         detail = result.stderr.decode(errors="replace").strip()[-300:]
         raise ValueError(f"Could not fetch {name} from {m.label}: {detail or 'no output'}")

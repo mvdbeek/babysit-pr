@@ -142,6 +142,47 @@ def test_agents_are_listed_by_state_with_a_badge_and_filters(page, dashboard_sit
     expect(page.locator("#agents-list")).to_have_text("No agent matches these filters.")
 
 
+@pytest.mark.parametrize("width", [390, 768, 950, 1100, 1280, 1440])
+def test_each_filter_keeps_its_name_beside_it_and_stays_inside_the_panel(
+    page, dashboard_site, agents_routes, width
+):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#agents")
+    expect(rows(page)).to_have_count(3)
+
+    def middle(locator):
+        box = locator.bounding_box()
+        return box["y"] + box["height"] / 2
+
+    search = page.locator("#agents-search")
+    panel = page.locator("#agents-panel .toolbar").bounding_box()
+    controls = {
+        "Machine": page.get_by_role("combobox", name="Filter agents by machine"),
+        "State": page.locator("#agents-state"),
+        "Started by": page.locator("#agents-origin"),
+    }
+    for name, control in controls.items():
+        box = control.bounding_box()
+        label = page.locator("#agents-panel .filters label", has_text=name)
+        # The name is on the control's line, before it, not stacked above it.
+        text_middle = label.evaluate(
+            "(label, name) => { const range = document.createRange();"
+            " range.selectNodeContents([...label.childNodes].find(n => n.nodeType === 3"
+            " && n.textContent.trim() === name)); const r = range.getBoundingClientRect();"
+            " return r.y + r.height / 2; }",
+            name,
+        )
+        assert text_middle == pytest.approx(middle(control), abs=3), name
+        assert label.bounding_box()["x"] < box["x"], name
+        assert box["x"] + box["width"] <= panel["x"] + panel["width"] + 1, name
+        if width >= 1100:  # Room for all four on one line.
+            assert middle(control) == pytest.approx(middle(search), abs=2), name
+            assert box["height"] == pytest.approx(search.bounding_box()["height"], abs=2), name
+    page.screenshot(path=f"reports/layout-agent-filters-{width}.png")
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+
 def test_a_wide_screen_docks_the_viewer_beside_the_list(page, dashboard_site, agents_routes):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 1400, "height": 900})
