@@ -10,11 +10,69 @@
     grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
   }
 }
-@media (max-width: 650px) {
-  /* Four controls do not fit one row: the search takes its own. */
-  #agents-panel .filters {
-    flex-wrap: wrap;
+/* Each filter's name sits beside its control on one line with the search. The Machine
+   select is a searchable one, whose wrapper holds the label and would stack it on top. */
+#agents-panel .filters {
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+}
+#agents-panel .filters > input {
+  min-width: 160px;
+}
+#agents-panel .toolbar h2 {
+  flex: none;
+}
+@media (min-width: 901px) {
+  /* The search gives way before a filter wraps to a second line: a wrapping row moves
+     an item down before it shrinks one, so the search starts narrow and grows. */
+  #agents-panel .filters > input {
+    flex: 1 1 160px;
+    width: auto;
+    max-width: clamp(225px, 24vw, 360px);
   }
+}
+@media (min-width: 901px) and (max-width: 1200px) {
+  /* The heading and four controls do not fit one line: the filters take their own,
+     as on a small screen. */
+  #agents-panel .toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  #agents-panel .filters {
+    width: 100%;
+  }
+}
+@media (min-width: 1201px) {
+  #agents-panel .filters {
+    flex: 1;
+    justify-content: flex-end;
+  }
+}
+#agents-panel .filters label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--muted);
+  white-space: nowrap;
+}
+#agents-panel .filters > .searchable-select {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+}
+#agents-panel .filters .select-field {
+  width: 190px;
+}
+#agents-panel .filters .select-popup {
+  left: auto;
+  right: 0;
+  width: 190px;
+}
+@media (max-width: 900px) {
+  /* Four controls do not fit one row: the search takes its own. */
   #agents-panel .filters > input {
     flex-basis: 100%;
   }

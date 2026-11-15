@@ -83,6 +83,13 @@ def test_task_is_first_and_footer_survives_scroll_and_execution_changes(
     task = page.get_by_label("Task", exact=True)
     expect(task).to_be_in_viewport(ratio=1)
     assert task.bounding_box()["height"] >= 100
+    # Files and earlier prompts belong to the task: they follow it, ahead of the branch.
+    below = task.bounding_box()["y"] + task.bounding_box()["height"]
+    attach = page.get_by_role("button", name="Attach files…").bounding_box()
+    prompts = page.locator(".prompt-history > summary").bounding_box()
+    branch = page.get_by_label("New branch", exact=True).bounding_box()
+    assert below <= attach["y"] <= below + 16
+    assert attach["y"] < prompts["y"] < branch["y"]
     page.screenshot(path=f"reports/layout-new-task-{width}.png")
     submit = page.get_by_role("button", name="Start task", exact=True)
     expect(submit).to_be_in_viewport(ratio=1)
