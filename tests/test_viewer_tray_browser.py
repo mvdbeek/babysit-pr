@@ -501,6 +501,7 @@ def test_saved_chips_are_checked_and_capped_on_load(page, dashboard_site, tray_r
         chip(104, mode="bogus"),
         chip(105, scope="everything"),
         chip(106, base=7),
+        chip(109, commit=7),
         chip(107, session={"id": "s"}),
         chip(108, id=108),
         "not a chip",
@@ -534,6 +535,50 @@ def test_a_restored_diff_whose_base_is_gone_falls_back_to_the_default(
     expect(viewer.locator("select[aria-label=Base]")).to_have_value("origin/main")
     expect(page.locator("#ws-viewer-error")).to_be_empty()
     expect(page.locator("#ws-viewer-meta")).to_contain_text("1 file changed")
+
+
+def test_a_restored_diff_returns_to_its_commit_or_to_all_changes_once_it_is_gone(
+    page, dashboard_site, tray_routes
+):
+    url, _ = dashboard_site
+    listed = [
+        {"sha": "bbb222bbb222", "author": "B", "time": 2, "subject": "Second", "body": ""},
+        {"sha": "aaa111aaa111", "author": "A", "time": 1, "subject": "First", "body": ""},
+    ]
+
+    def diff(route):
+        asked = parse_qs(urlparse(route.request.url).query).get("commit", [None])[0]
+        data = copy.deepcopy(COMMENT_DIFF)
+        data["commits"] = listed
+        data["commit"] = asked if any(commit["sha"] == asked for commit in listed) else None
+        if asked and not data["commit"]:
+            data["note"] = "That commit is no longer on this branch; showing all changes."
+        data["files"][0]["lines"] += [f" line {index}" for index in range(200)]
+        route.fulfill(json=data)
+
+    page.route("**/api/workspace-diff?*", diff)
+    page.goto(url + "/#prs")
+    viewer = open_view(page, "test/alpha", "Diff")
+    menu = viewer.locator("select[aria-label=Commit]")
+    choose_option(menu, "aaa111aaa111")
+    expect(viewer.locator(".ws-commit-shown")).to_contain_text("aaa111aaa First")
+    viewer.get_by_text(" line 150", exact=True).evaluate("el => el.scrollIntoView()")
+    top = viewer.evaluate("el => el.scrollTop")
+    assert top > 0
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+    page.reload()
+    chips(page).first.click()
+    expect(viewer.locator(".ws-commit-shown")).to_contain_text("aaa111aaa First")
+    expect(menu).to_have_value("aaa111aaa111")
+    page.wait_for_function("top => document.querySelector('#ws-viewer').scrollTop === top", arg=top)
+    viewer.get_by_role("button", name="Minimize workspace viewer").click()
+    # Rebased meanwhile: every change shows, from the top, and says why.
+    listed[1]["sha"] = "ddd444ddd444"
+    chips(page).first.click()
+    expect(page.locator("#ws-viewer-meta")).to_contain_text("no longer on this branch")
+    expect(menu).to_have_value("")
+    expect(viewer.locator(".ws-commit-shown")).to_have_count(0)
+    assert viewer.evaluate("el => el.scrollTop") == 0
 
 
 def test_a_followed_reopen_replaces_its_chip(page, dashboard_site, tray_routes, viewer_routes):

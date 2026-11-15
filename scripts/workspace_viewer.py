@@ -374,16 +374,21 @@ def split_patch(text, truncated):
     return remote_probe.split_patch(text, truncated, MAX_FILE_LINES)
 
 
-def diff(path, scope="branch", base=None):
-    """Changes in a checkout: against its base branch (with uncommitted work) or HEAD."""
-    return remote_probe.diff(git_output, path, scope, base, MAX_FILE_LINES)
+def diff(path, scope="branch", base=None, commit=None):
+    """Changes in a checkout: against its base branch (with uncommitted work) or HEAD.
+
+    With ``commit``, one of the branch's listed commits alone.
+    """
+    return remote_probe.diff(git_output, path, scope, base, MAX_FILE_LINES, commit)
 
 
-def remote_diff(home, machine, path, scope="branch", base=None):
+def remote_diff(home, machine, path, scope="branch", base=None, commit=None):
     """``diff`` of a worker's checkout, run there with the same limits."""
     if scope not in {"branch", "uncommitted"}:
         raise ValueError("Choose the branch or uncommitted changes")
-    return probe(home, machine, "diff", path=path, scope=scope, base=base)
+    if commit is not None and not remote_probe.COMMIT.fullmatch(commit):
+        raise ValueError("Expected a commit ID")
+    return probe(home, machine, "diff", path=path, scope=scope, base=base, commit=commit)
 
 
 # Transcripts -------------------------------------------------------------------

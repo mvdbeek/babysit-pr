@@ -228,6 +228,9 @@ def test_malformed_diff_and_session_answers_are_refused(worker):
     for change in (
         {"scope": "everything"},
         {"commits": [{"sha": 1}]},
+        {"commit": "0123456789ab"},
+        {"commit": 1},
+        {"commit": []},
         {"files": [{**good["files"][0], "status": "exploded"}]},
         {"files": [{**good["files"][0], "lines": ["x"] * (remote_probe.MAX_FILE_LINES + 1)}]},
         {"untracked": ["x"] * (remote_probe.MAX_UNTRACKED + 1)},
@@ -261,6 +264,12 @@ def test_remote_diff_reads_hostile_names_verbatim_without_a_shell(worker):
         found = wv.remote_diff(worker.home, worker.machine, str(worker.checkout), scope)
         assert found == wv.diff(worker.checkout, scope)
     assert [f["path"] for f in found["files"]] == [HOSTILE]
+    # One commit of the branch is read there the same way; anything else never reaches Git.
+    for commit in [c["sha"] for c in found["commits"]] + ["0123456789ab"]:
+        one = wv.remote_diff(worker.home, worker.machine, str(worker.checkout), commit=commit)
+        assert one == wv.diff(worker.checkout, commit=commit)
+    with pytest.raises(ValueError, match="commit ID"):
+        wv.remote_diff(worker.home, worker.machine, str(worker.checkout), commit="--output=x")
     commands = [call["command"] for call in read(worker.state)["ssh"]]
     assert commands and all(HOSTILE not in command for command in commands)
     assert not list(worker.host.parent.parent.rglob("PWNED"))

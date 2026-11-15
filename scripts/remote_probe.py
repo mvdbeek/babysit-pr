@@ -532,6 +532,9 @@ MAX_DIFF = 3 * 1024 * 1024
 MAX_FILE_LINES = 4000
 MAX_UNTRACKED = 200
 MAX_COMMITS = 200
+# A commit of the diff, as its listing names it: an abbreviated or full object ID.
+COMMIT = re.compile(r"[0-9a-f]{7,64}")
+OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 MAX_SESSIONS = 50
 # Clones directly under a worker's src a placement state lists, and worktrees of each.
@@ -646,12 +649,20 @@ def split_patch(text, truncated, max_lines=MAX_FILE_LINES):
     return files
 
 
-def diff(output, path, scope="branch", base=None, max_lines=MAX_FILE_LINES):
-    """Changes in a checkout: against its base branch (with uncommitted work) or HEAD."""
+def diff(output, path, scope="branch", base=None, max_lines=MAX_FILE_LINES, commit=None):
+    """Changes in a checkout: against its base branch (with uncommitted work) or HEAD.
+
+    ``commit`` narrows the branch's changes to one of its listed commits, against that
+    commit's first parent.
+    """
     if scope not in {"branch", "uncommitted"}:
         raise ValueError("Choose the branch or uncommitted changes")
+    if commit is not None and not (isinstance(commit, str) and COMMIT.fullmatch(commit)):
+        raise ValueError("Expected a commit ID")
     found = bases(output, path) if scope == "branch" else []
     commits: list[dict] = []
+    # Each listed commit's full ID and its first parent's, None for a root commit.
+    parents: dict[str, str | None] = {}
     note = None
     if scope == "branch" and not found and base is None:
         scope = "uncommitted"
@@ -668,13 +679,17 @@ def diff(output, path, scope="branch", base=None, max_lines=MAX_FILE_LINES):
             "log",
             "-z",
             f"--max-count={MAX_COMMITS}",
-            "--format=%H%x00%an%x00%at%x00%s%x00%b",
+            "--format=%H%x00%P%x00%an%x00%at%x00%s%x00%b",
             f"{since}..HEAD",
         )
         # NUL-delimited fields keep multiline bodies separate from other commits.
         fields = log.split("\0")
-        for offset in range(0, len(fields) - 4, 5):
-            sha, author, when, subject, body = fields[offset : offset + 5]
+        for offset in range(0, len(fields) - 5, 6):
+            sha, parent, author, when, subject, body = fields[offset : offset + 6]
+            first = parent.split(" ")[0]
+            # Only what reads as an object ID is ever handed back to Git.
+            if OBJECT_ID.fullmatch(sha) and (not first or OBJECT_ID.fullmatch(first)):
+                parents[sha] = first or None
             commits.append(
                 {
                     "sha": sha[:12],
@@ -686,7 +701,16 @@ def diff(output, path, scope="branch", base=None, max_lines=MAX_FILE_LINES):
             )
     else:
         since = "HEAD"
-    # The working tree against the starting point: committed and uncommitted together.
+    # Only a listed commit is ever named to Git, by the full ID its listing gave.
+    shown = next((sha for sha in parents if sha.startswith(commit)), None) if commit else None
+    if commit and not shown and scope == "branch":
+        # A rebase or an amended commit since: all the changes rather than a failure.
+        note = "That commit is no longer on this branch; showing all changes."
+    if shown:
+        # A root commit is compared with the empty tree, which Git knows without storing.
+        since = parents[shown] or git_text(output, path, "hash-object", "-t", "tree", "/dev/null")
+    # One commit against its first parent, or the working tree against the starting
+    # point: committed and uncommitted together.
     text, truncated = output(
         path,
         "diff",
@@ -698,18 +722,23 @@ def diff(output, path, scope="branch", base=None, max_lines=MAX_FILE_LINES):
         "--src-prefix=a/",
         "--dst-prefix=b/",
         since,
+        *([shown] if shown else []),
         "--",
     )
-    # An untracked directory is listed once, not file by file.
-    untracked = git_text(
-        output,
-        path,
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "--directory",
-        "--no-empty-directory",
-    ).splitlines()
+    # An untracked directory is listed once, not file by file; no commit holds any.
+    untracked = (
+        []
+        if shown
+        else git_text(
+            output,
+            path,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+        ).splitlines()
+    )
     files = split_patch(text, truncated, max_lines)
     return {
         "scope": scope,
@@ -717,6 +746,7 @@ def diff(output, path, scope="branch", base=None, max_lines=MAX_FILE_LINES):
         "base": base,
         "bases": found[:10],
         "commits": commits,
+        "commit": shown[:12] if shown else None,
         "files": files,
         "untracked": untracked[:MAX_UNTRACKED],
         "untracked_more": max(0, len(untracked) - MAX_UNTRACKED),
@@ -1416,10 +1446,10 @@ def _host_checkout(path):
     return real
 
 
-def _host_diff(path, scope, base):
+def _host_diff(path, scope, base, commit=None):
     if base is not None and not isinstance(base, str):
         raise ValueError("Expected a base branch name")
-    return diff(host_output, _host_checkout(path), scope, base)
+    return diff(host_output, _host_checkout(path), scope, base, commit=commit)
 
 
 def _host_bases(path):
@@ -4443,6 +4473,7 @@ def validate_diff(value):
             "base",
             "bases",
             "commits",
+            "commit",
             "files",
             "untracked",
             "untracked_more",
@@ -4465,6 +4496,12 @@ def validate_diff(value):
             and _int(commit["time"]),
             "commit",
         )
+    shown = value["commit"]
+    _expect(
+        shown is None
+        or (isinstance(shown, str) and shown in {commit["sha"] for commit in commits}),
+        "shown commit",
+    )
     _expect(isinstance(value["files"], list), "files")
     for item in value["files"]:
         _expect(
