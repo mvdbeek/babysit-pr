@@ -457,6 +457,48 @@ def transcript_updates(paths, src, files, cwd_of):
     return updates
 
 
+def session_updates(sessions, projects, rollouts):
+    """When each agent session last wrote its transcript, by session ID.
+
+    ``sessions`` are (agent, session ID, working directory) triples, ``projects`` the
+    Claude project stores and ``rollouts`` the Codex session store, or None. Claude names
+    a transcript after its session, in the folder named after the directory it started
+    in, so the working directory finds it with one stat; the other folders are searched
+    only when that misses. A session with no transcript in these stores is left out,
+    and so is a file that only a link inside a store leads to.
+    """
+    updates: dict[str, float] = {}
+
+    def note(session, file, store):
+        real = Path(os.path.realpath(file))
+        if not real.is_relative_to(os.path.realpath(store)):
+            return
+        try:
+            updates[session] = max(updates.get(session, 0), real.stat().st_mtime)
+        except OSError:
+            pass  # No transcript there, or one removed since it was listed.
+
+    for agent, session, cwd in sessions:
+        if agent != "claude":
+            continue
+        if cwd:
+            folder = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+            for store in projects:
+                note(session, store / folder / f"{session}.jsonl", store)
+        if session not in updates:
+            for store in projects:
+                for file in store.glob(f"*/{session}.jsonl"):
+                    note(session, file, store)
+    codex = {session for agent, session, _ in sessions if agent == "codex"}
+    if codex and rollouts is not None:
+        # A rollout is named rollout-STARTED-SESSION.jsonl.
+        for file in rollouts.glob("*/*/*/rollout-*.jsonl"):
+            session = next((s for s in codex if file.stem.endswith(f"-{s}")), None)
+            if session:
+                note(session, file, rollouts)
+    return updates
+
+
 def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
     """One machine's whole scan: clones, worktrees, their state and session activity.
 
@@ -537,6 +579,8 @@ COMMIT = re.compile(r"[0-9a-f]{7,64}")
 OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 MAX_SESSIONS = 50
+# Agent sessions one ``activity`` probe is asked about: as many as a machine may list.
+MAX_ACTIVITY = 200
 # Clones directly under a worker's src a placement state lists, and worktrees of each.
 MAX_CLONES = 200
 MAX_WORKTREES = 500
@@ -1492,6 +1536,32 @@ def _host_sessions(root):
         )
     listed.sort(key=lambda s: s["updated"], reverse=True)
     return listed[:MAX_SESSIONS]
+
+
+def _host_activity(sessions):
+    """When each of this machine's agent sessions last wrote its transcript.
+
+    ``sessions`` are [agent, session ID, working directory or None] as herdr lists its
+    agents; only a time leaves, and only for a transcript in one of the session stores.
+    """
+    if not isinstance(sessions, list) or len(sessions) > MAX_ACTIVITY:
+        raise ValueError("Expected a list of agent sessions")
+    for item in sessions:
+        if not (isinstance(item, list) and len(item) == 3):
+            raise ValueError("Expected an agent, a session ID and a working directory")
+        agent, session, cwd = item
+        if agent not in {"claude", "codex"}:
+            raise ValueError("Expected claude or codex")
+        if not isinstance(session, str) or not SESSION.match(session):
+            raise ValueError("Expected a session ID")
+        if cwd is not None:
+            _arg_paths([cwd])
+    projects = [host_session_root(home / "projects") for home in host_claude_homes()]
+    return session_updates(
+        sessions,
+        [store for store in projects if store is not None],
+        host_session_root(host_codex_sessions()),
+    )
 
 
 def _host_transcript(file):
@@ -4232,6 +4302,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "diff": _host_diff,
     "bases": _host_bases,
     "sessions": _host_sessions,
+    "activity": _host_activity,
     "tail": _host_tail,
     "turn": _host_turn,
     "first_turn": _host_first_turn,
@@ -5059,6 +5130,15 @@ def validate_processes(value):
     return value
 
 
+def validate_activity(value):
+    """Check a worker's answer of when its agent sessions last wrote their transcripts."""
+    _expect(isinstance(value, dict) and len(value) <= MAX_ACTIVITY, "activity")
+    for session, when in value.items():
+        _expect(isinstance(session, str) and SESSION.match(session), "session id")
+        _expect(_time(when), "session activity")
+    return value
+
+
 def validate_staged(value):
     """A file a worker staged for the controller to fetch."""
     _expect(isinstance(value, dict) and set(value) == {"name", "size", "sha256"}, "fields")
@@ -5077,6 +5157,7 @@ VALIDATORS = {
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,
+    "activity": validate_activity,
     "tail": validate_tail,
     "turn": validate_turn,
     "first_turn": validate_first_turn,

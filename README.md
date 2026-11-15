@@ -256,9 +256,11 @@ choice covers both overviews and is kept in this browser.
 
 The **Agents** tab lists every agent herdr runs, on this machine and on each enabled
 worker, wherever it was started: your own launches and `wt` sessions, babysit watch
-repairs, and cron runs. Agents waiting for your answer come first (longest waiting
-first), then working ones, then idle and finished ones. Each row says what the agent
-is doing and for how long, which machine and checkout it runs in, its terminal title,
+repairs, and cron runs. Agents at work come first, the latest to start on top; every
+other agent follows by when it was last active, the most recent on top, whichever
+machine it runs on. Each row says what the agent is doing, how long it has been
+working or how long ago it was last active, which machine and checkout it runs in, its
+terminal title,
 the pull request or issue the Workspaces tab linked to that checkout, and **Watch** or
 **Cron** when babysit started it. You can filter by machine, state and who started the
 agent, and search by repository, branch or title. The tab's badge counts the running
@@ -277,9 +279,14 @@ each machine, cached in the dashboard and refreshed in the background, every 3 s
 for this machine and every 10 for a worker. Nothing is read while nobody looks: the tab
 asks every 3 seconds while it is shown, and every 30 seconds otherwise, for its badge. A
 worker that does not answer keeps the agents last seen there, and the status line says
-why. How long an agent has been in its state is what this dashboard has seen since it
-started. Origins come from the watcher's queue (a watch not yet ended that owns the
-session) and from cron's running runs (the pane they launched).
+why. An agent was last active when its session last wrote its transcript, so the order
+is the same after the dashboard or herdr restarts. The dashboard reads those times from
+this machine's session stores and asks each worker for its own, again whenever herdr
+reports a change in a machine's agents and otherwise once a minute. An agent with no
+transcript yet counts from its checkout's last change on the Workspaces tab, or from its
+last change of state. How long an agent has been working is what this dashboard has seen
+since it started. Origins come from the watcher's queue (a watch not yet ended that owns
+the session) and from cron's running runs (the pane they launched).
 
 ## Your pull requests
 

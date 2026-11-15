@@ -174,6 +174,47 @@ def test_probe_ops_answer_what_the_local_viewer_reads(worker, monkeypatch):
     assert remote_probe.validate_sessions(listed) == listed
 
 
+def test_the_activity_probe_says_when_each_listed_session_last_wrote(worker, monkeypatch):
+    rollout = next((worker.host / ".codex" / "sessions").glob(f"*/*/*/rollout-*{CODEX_SID}.jsonl"))
+    os.utime(worker.claude, (1000, 1000))
+    os.utime(rollout, (2000, 2000))
+    sessions = [
+        # The pane has moved to a subdirectory of the one the session started in.
+        ["claude", CLAUDE_SID, str(worker.checkout / "sub")],
+        ["codex", CODEX_SID, None],
+        ["claude", str(uuid.UUID(int=99)), str(worker.checkout)],
+        # Each transcript counts for its own kind of agent alone.
+        ["codex", SIBLING_SID, None],
+    ]
+    wanted = {CLAUDE_SID: 1000.0, CODEX_SID: 2000.0}
+    assert remote_probe.call(worker.home, worker.machine, "activity", 30, sessions=sessions) == (
+        wanted
+    )
+    monkeypatch.setenv("HOME", str(worker.host))
+    assert remote_probe._host_activity(sessions) == wanted
+    for refused in (
+        "x",
+        [["claude", CLAUDE_SID]],
+        [["gemini", CLAUDE_SID, None]],
+        [["claude", "../../etc", None]],
+        [["claude", "*", None]],
+        [["claude", CLAUDE_SID, "relative"]],
+        [["claude", CLAUDE_SID, None]] * (remote_probe.MAX_ACTIVITY + 1),
+    ):
+        with pytest.raises(ValueError, match="Expected"):
+            remote_probe._host_activity(refused)
+    for answer in (
+        [],
+        {"../x": 1.0},
+        {CLAUDE_SID: "now"},
+        {CLAUDE_SID: -1},
+        {CLAUDE_SID: float("inf")},
+        {str(uuid.UUID(int=n)): 1.0 for n in range(remote_probe.MAX_ACTIVITY + 1)},
+    ):
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_activity(answer)
+
+
 def test_probe_tail_reads_complete_lines_and_refuses_other_files(worker, monkeypatch):
     monkeypatch.setenv("HOME", str(worker.host))
     file = str(worker.claude)
@@ -614,6 +655,16 @@ def test_session_stores_must_be_real_folders_under_home(worker, monkeypatch, tmp
     moved_file = moved / worker.claude.relative_to(projects)
     assert moved.resolve() not in remote_probe.host_session_roots()
     assert all(agent == "codex" for agent, _ in remote_probe.host_session_files(worker.checkout))
+    listed = [["claude", CLAUDE_SID, str(worker.checkout)], ["codex", CODEX_SID, None]]
+    assert set(remote_probe._host_activity(listed)) == {CODEX_SID}
+    # Nor does a linked folder inside a store lead to a transcript outside it.
+    kept = worker.host / ".codex" / "kept"
+    day = next((worker.host / ".codex" / "sessions").glob("*/*/*"))
+    day.rename(kept)
+    day.symlink_to(kept)
+    assert remote_probe._host_activity(listed) == {}
+    day.unlink()
+    kept.rename(day)
     with pytest.raises(ValueError, match="Not a session transcript"):
         remote_probe._host_tail(str(moved_file), None, 0, 100)
     # CODEX_HOME outside HOME is refused too.
@@ -622,6 +673,7 @@ def test_session_stores_must_be_real_folders_under_home(worker, monkeypatch, tmp
     monkeypatch.setenv("CODEX_HOME", str(outside))
     assert remote_probe.host_session_roots() == []
     assert list(remote_probe.host_session_files(worker.checkout)) == []
+    assert remote_probe._host_activity(listed) == {}
     rollout = next((outside / "sessions").glob("*/*/*/rollout-*.jsonl"))
     with pytest.raises(ValueError, match="Not a session transcript"):
         remote_probe._host_tail(str(rollout), None, 0, 100)
