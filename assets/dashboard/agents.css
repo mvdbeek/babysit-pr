@@ -159,7 +159,8 @@
   min-width: 0;
 }
 @media (min-width: 1000px) {
-  /* The docked viewer stays in view while the list scrolls past it. */
+  /* The docked viewer stays in view while the list scrolls past it. Its slot is a window
+     tall whatever the viewer's own height, so the page's length does not change as it scrolls. */
   .agents-detail {
     position: sticky;
     top: 8px;
@@ -179,17 +180,40 @@
     display: none;
   }
 }
-/* Docked: a pane of the page, scrolling inside itself like the dialog does. */
-#ws-viewer.ws-viewer-docked {
+/* The viewer in the slot stands in for the placeholder. */
+.agents-detail:has(#ws-viewer[open]) #agents-placeholder {
+  display: none;
+}
+/* How much of the slot is past the window's upper and lower edges, measured by agents.js. Not
+   inherited, so the viewer's content is not restyled each time the page scrolls. */
+@property --above-window {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --below-window {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+/* Docked: a pane of the page, scrolling inside itself like the dialog does. The slot is in the
+   selector so that a viewer the user keeps full screen as a dialog is still a pane here. */
+.agents-detail > #ws-viewer.ws-viewer-docked {
   position: static;
   width: 100%;
   max-width: none;
-  height: 100%;
+  /* It keeps to the window, so its header and the composer pinned to its end are in view
+     before the page has scrolled the tabs away, and at the page's end where the slot is pushed
+     up. A short window keeps a readable pane and lets it run past the lower edge instead. */
+  height: max(calc(100% - var(--above-window) - var(--below-window)), min(100%, 480px));
   max-height: none;
-  margin: 0;
+  margin: var(--above-window) 0 0;
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: auto;
+  /* Not a modal: scrolling past its upper or lower end carries on to the page. Sideways it
+     still stops, so a swipe along a wide diff does not go back in history. */
+  overscroll-behavior: contain auto;
 }
 #ws-viewer.ws-viewer-docked #ws-viewer-full,
 #ws-viewer.ws-viewer-docked #ws-viewer-minimize {

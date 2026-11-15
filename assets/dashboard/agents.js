@@ -21,6 +21,7 @@
   let fetchedAt = 0;
   let selected = null;
   let renderedKey = null;
+  let outside = { above: 0, below: 0 };
 
   function node(tag, text, className) {
     const element = document.createElement(tag);
@@ -107,9 +108,29 @@
     const mode = current?.mode || "transcript";
     if (WIDE.matches) viewer.dock(byId("agents-detail"));
     else viewer.undock();
-    byId("agents-placeholder").hidden = WIDE.matches;
     void viewer.open(target(agent), mode, () => filtered().map(target));
     render(true);
+    fitViewer();
+  }
+  // The docked viewer keeps to the window, so its header and composer are in view however far
+  // the page is scrolled: the stylesheet takes off what of its slot is past either edge.
+  function fitViewer() {
+    const detail = byId("agents-detail");
+    const dialog = detail.querySelector("#ws-viewer");
+    if (!dialog) return;
+    const slot = detail.getBoundingClientRect();
+    // Where the tray of minimized viewers reaches under the viewer, the viewer ends above it.
+    const tray = byId("ws-tray").getBoundingClientRect();
+    const edge = tray.right > slot.left ? tray.top : document.documentElement.clientHeight;
+    const above = Math.max(0, Math.round(8 - slot.top));
+    const below = Math.max(0, Math.round(slot.bottom - edge + 8));
+    if (above === outside.above && below === outside.below) return;
+    outside = { above, below };
+    // A viewer showing the newest entries still shows them at its new height.
+    const atEnd = dialog.scrollHeight - dialog.scrollTop - dialog.clientHeight < 80;
+    dialog.style.setProperty("--above-window", `${above}px`);
+    dialog.style.setProperty("--below-window", `${below}px`);
+    if (atEnd) dialog.scrollTop = dialog.scrollHeight;
   }
   function row(agent, now) {
     const [label, tone] = STATES[agent.status] || [agent.status, ""];
@@ -261,7 +282,6 @@
     if (docked && (byId("agents-panel").hidden || !WIDE.matches)) {
       viewer.undock();
       selected = null;
-      byId("agents-placeholder").hidden = false;
       render(true);
     }
   }
@@ -273,6 +293,13 @@
     attributeFilter: ["hidden"],
   });
   WIDE.addEventListener("change", placeViewer);
+  // The slot moves with the page's scrolling, and when anything above it changes height;
+  // the tray comes and goes with its minimized viewers.
+  window.addEventListener("scroll", fitViewer, { passive: true });
+  window.addEventListener("resize", fitViewer);
+  const resized = new ResizeObserver(fitViewer);
+  resized.observe(document.body);
+  resized.observe(byId("ws-tray"));
   // The viewer stepped to another agent, or closed: the list follows.
   window.addEventListener("workspace-viewer-open", (event) => {
     const id = event.detail.id;
@@ -285,7 +312,6 @@
   byId("ws-viewer").addEventListener("close", () => {
     if (!selected) return;
     selected = null;
-    byId("agents-placeholder").hidden = false;
     render(true);
   });
   setInterval(() => {

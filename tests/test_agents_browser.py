@@ -213,6 +213,121 @@ def test_a_wide_screen_docks_the_viewer_beside_the_list(page, dashboard_site, ag
     assert page.locator("#ws-viewer").evaluate("el => el.matches(':modal')")
 
 
+def long_transcript(page):
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    entries = [{"role": "assistant", "text": f"Step {n} is done."} for n in range(60)]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": len(entries),
+            }
+        ),
+    )
+
+
+def bottom(locator):
+    box = locator.bounding_box()
+    return box["y"] + box["height"]
+
+
+def test_the_docked_viewer_keeps_its_composer_in_the_window(page, dashboard_site, agents_routes):
+    url, _ = dashboard_site
+    long_transcript(page)
+    # Full screen is a choice about the dialog: docked, the viewer is still a pane.
+    page.add_init_script("localStorage.setItem('ws-viewer-full', '1')")
+    page.set_viewport_size({"width": 1400, "height": 800})
+    page.goto(url + "/#agents")
+    rows(page).filter(has_text="working-work").locator(".agents-open").click()
+    viewer = page.locator("#agents-detail #ws-viewer")
+    composer = viewer.locator("#ws-message")
+    expect(viewer.get_by_text("Step 59 is done.")).to_be_visible()
+    expect(composer).to_be_visible()
+
+    def shows_newest():
+        viewer.evaluate(
+            "el => new Promise(done => { const check = () =>"
+            " el.scrollHeight - el.scrollTop - el.clientHeight < 2"
+            " ? done() : requestAnimationFrame(check); check(); })"
+        )
+
+    def wheel_over(locator, delta):
+        box = locator.bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.wheel(0, delta)
+
+    # Before the page has scrolled, the viewer starts under the tabs and filters and ends at
+    # the window's lower edge, with the composer in it.
+    assert page.evaluate("scrollY") == 0
+    start = viewer.bounding_box()
+    assert start["y"] > 100
+    assert bottom(viewer) == pytest.approx(792, abs=1)
+    assert bottom(composer) <= 792
+    shows_newest()
+    page.screenshot(path="reports/layout-agent-docked-top.png")
+    # Scrolling on past the transcript's end scrolls the page, which gives the viewer the
+    # rest of the window; it still shows the newest entries.
+    wheel_over(viewer, 2000)
+    page.wait_for_function("() => scrollY + innerHeight >= document.documentElement.scrollHeight")
+    page.wait_for_function(
+        "() => document.getElementById('ws-viewer').getBoundingClientRect().top > 0"
+    )
+    grown = viewer.bounding_box()
+    assert grown["y"] == pytest.approx(8, abs=1)
+    assert grown["height"] > start["height"] + 50
+    assert bottom(viewer) <= 792
+    assert bottom(composer) <= 792
+    shows_newest()
+    # Back at the top of the page the viewer is as it was, and has not lost its place.
+    wheel_over(page.locator("#agents-list"), -2000)
+    page.wait_for_function("() => scrollY === 0")
+    expect(viewer).to_have_js_property("offsetHeight", round(start["height"]))
+    assert viewer.bounding_box() == pytest.approx(start, abs=1)
+    assert bottom(composer) <= 792
+    shows_newest()
+
+
+def test_the_docked_viewer_ends_above_the_tray_of_minimized_viewers(
+    page, dashboard_site, agents_routes, workspace_routes
+):
+    url, _ = dashboard_site
+    long_transcript(page)
+    _, snapshot, _ = workspace_routes
+    snapshot["prs"]["pr-two"]["matches"][0].update(workspace_id="w2", name="Second workspace")
+    page.set_viewport_size({"width": 1000, "height": 1000})
+    page.goto(url + "/#prs")
+    tray = page.locator("#ws-tray")
+    for count, repo in enumerate(["test/alpha", "test/beta"], 1):
+        row = page.locator("#pr-list tr").filter(has_text=repo)
+        row.get_by_role("button", name="Transcript", exact=True).click()
+        page.locator("#ws-viewer-minimize").click()
+        expect(tray.locator(".ws-tray-chip")).to_have_count(count)
+    page.locator("#agents-tab").click()
+    rows(page).filter(has_text="working-work").locator(".agents-open").click()
+    viewer = page.locator("#agents-detail #ws-viewer")
+    composer = viewer.locator("#ws-message")
+    expect(composer).to_be_visible()
+    # The tray floats over the viewer's corner: the viewer, composer included, ends above it.
+    over = tray.bounding_box()
+    assert over["x"] + over["width"] > viewer.bounding_box()["x"]
+    ends_at = (
+        "edge => Math.abs("
+        "document.getElementById('ws-viewer').getBoundingClientRect().bottom - edge) < 1"
+    )
+    page.wait_for_function(ends_at, arg=over["y"] - 8)
+    assert bottom(composer) <= over["y"] - 8
+    page.screenshot(path="reports/layout-agent-docked-tray.png")
+    # Without the tray it has the window to its lower edge again.
+    for dismiss in tray.locator(".ws-tray-dismiss").all()[::-1]:
+        dismiss.click()
+    expect(tray).to_be_hidden()
+    page.wait_for_function(ends_at, arg=992)
+
+
 def test_a_narrow_screen_opens_the_viewer_as_a_dialog(page, dashboard_site, agents_routes):
     url, _ = dashboard_site
     page.set_viewport_size({"width": 390, "height": 800})
