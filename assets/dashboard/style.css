@@ -1514,6 +1514,10 @@ button:disabled {
   min-width: 0;
   font: inherit;
 }
+/* The picker's clone is not the task's while another repository is being cloned. */
+.searchable-select:has(#new-task-repo:disabled) {
+  opacity: 0.55;
+}
 .new-task-also small {
   display: block;
   margin: 6px 0;

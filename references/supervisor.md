@@ -903,8 +903,12 @@ New task only when:
   with a working or blocked agent (an idle one left open does not count; sub-task
   operations are kept a week). Otherwise the sub-task is recorded as waiting for room
   (below), checked as if placed on the machine named, else the parent's;
-- the repository has a clone on this machine (`<src>/<name>` if it is one, else the
-  first listed); a worker uses its own clone, creating it when missing as for New task.
+- on this machine it runs in the repository's clone (`<src>/<name>` if it is one, else
+  the first listed), and a repository with no clone here is cloned first as New task
+  clones one, into `<src>/<name>` or `<src>/<owner>--<name>`; with both taken it is
+  refused. Only a parent on this machine lands here, and any process here reaches New
+  task's own clone anyway (see the residual below). A worker uses its own clone,
+  creating it when missing as for New task.
 
 A sub-task always runs sandboxed: New task has no other launch, here or on a worker.
 Ordinary sub-tasks retain the same-agent/account rule. A worker's broker supports a

@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import dashboard
 import pr_supervisor as supervisor
@@ -5826,6 +5827,157 @@ def test_new_task_can_also_work_in_other_clones(page, dashboard_site, viewer_rou
     assert sent[0]["clone"] == "/fixture/alpha"
     assert sent[0]["also"] == ["/fixture/gamma"]
     assert sent[0]["also_bases"] == {"/fixture/gamma": "master"}
+
+
+def test_new_task_clones_a_repository_named_in_the_dialog(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    page.set_viewport_size({"width": 1280, "height": 900})
+    snapshot = {"prs": {}, "issues": {}, "new": {}, "error": None, "synced_at": 1234}
+    page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+    now = time.time()
+    recent = {"repo": "up/alpha", "clone": "/fixture/alpha", "remote": "origin", "active": now}
+    idle = {**recent, "repo": "old/beta", "clone": "/fixture/beta", "active": now - 400 * 86400}
+    checked = []
+
+    def listing(route):
+        query = parse_qs(urlsplit(route.request.url).query)
+        if "repo" not in query:
+            listed = [recent, idle] if "all" in query else [recent]
+            route.fulfill(json={"repos": listed, "idle": 1})
+            return
+        slug = query["repo"][0]
+        checked.append(slug)
+        clones = [idle] if slug.lower() == "old/beta" else []
+        free = not clones and slug != "full/house"
+        destination = f"/fixture/{slug.split('/')[1]}" if free else None
+        route.fulfill(json={"repo": slug, "clones": clones, "destination": destination})
+
+    page.route("**/api/workspace-repos*", listing)
+    sent = []
+
+    def start(route):
+        body = route.request.post_data_json
+        sent.append(body)
+        op = {
+            "id": f"op{len(sent)}",
+            "pr": f"new:{len(sent)}",
+            "status": "running",
+            "message": f"Cloning {body['repo']} into {body.get('destination')}",
+            "log": "",
+            "subject": {"kind": "scratch", "repo": body["repo"], "branch": body["name"]},
+        }
+        snapshot["new"] = {op["pr"]: {"operation": op}}
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    page.goto(url)
+    page.get_by_role("button", name="New task").click()
+    dialog = page.locator("#workspace-dialog")
+    picker = dialog.get_by_role("combobox", name="Repository and local clone")
+    box = dialog.get_by_label("Clone another repository from GitHub")
+    named = dialog.get_by_label("GitHub repository")
+    note = dialog.locator(".new-task-clone-note")
+    start_task = dialog.get_by_role("button", name="Start task")
+    expect(named).to_be_hidden()
+    expect(note).to_be_hidden()
+    box.check()
+    expect(picker).to_be_disabled()
+    dialog.get_by_label("New branch").fill("try-it")
+    dialog.get_by_label("Task", exact=True).fill("Explore it")
+    # Nothing starts without a repository, or with something that names none.
+    start_task.click()
+    expect(named).to_be_focused()
+    named.fill("not a repository")
+    named.press("Tab")
+    expect(note).to_have_text("Name the repository as owner/name, or paste its GitHub link.")
+    start_task.click()
+    # Both of its folders under the source directory are something else.
+    named.fill("full/house")
+    named.press("Tab")
+    expect(note).to_have_text(
+        "Both clone destinations already exist. Move conflicting content before trying again."
+    )
+    start_task.click()
+    assert sent == []
+    # A link names the repository; the note says where it is cloned.
+    named.fill(" https://github.com/New/Thing.git ")
+    named.press("Tab")
+    expect(note).to_contain_text("Cloned into /fixture/Thing before the task starts.")
+    page.screenshot(path="reports/new-task-clone.png")
+    start_task.click()
+    expect(page.locator("#workspace-progress")).to_have_text(
+        "running: Cloning New/Thing into /fixture/Thing"
+    )
+    assert sent == [
+        {
+            "repo": "New/Thing",
+            "destination": "/fixture/Thing",
+            "name": "try-it",
+            "agent": "codex",
+            "task": "Explore it",
+        }
+    ]
+    # Started with Enter straight from the field, before its check ran.
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name="New task").click()
+    box.check()
+    dialog.get_by_label("New branch").fill("again")
+    dialog.get_by_label("Task", exact=True).fill("Explore it again")
+    named.fill("git@github.com:new/other.git")
+    named.press("Enter")
+    expect(page.locator("#workspace-progress")).to_contain_text("Cloning new/other")
+    assert (sent[1]["repo"], sent[1]["destination"]) == ("new/other", "/fixture/other")
+    assert "clone" not in sent[1]
+    # A repository that already has a clone is chosen in the picker instead, also an
+    # idle one the picker had left out.
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name="New task").click()
+    box.check()
+    named.fill("Old/Beta")
+    named.press("Tab")
+    expect(note).to_have_text("Old/Beta is already cloned at /fixture/beta, which is now chosen.")
+    expect(box).not_to_be_checked()
+    expect(named).to_be_hidden()
+    expect(picker).to_be_enabled()
+    expect(dialog.locator("#new-task-repo")).to_have_value("1")
+    expect(
+        dialog.get_by_label("Include 1 idle clone (no commit or checkout in 90 days)")
+    ).to_be_checked()
+    dialog.get_by_label("New branch").fill("in-beta")
+    dialog.get_by_label("Task", exact=True).fill("Explore beta")
+    start_task.click()
+    expect(page.locator("#workspace-progress")).to_contain_text("running")
+    assert (sent[2]["repo"], sent[2]["clone"]) == ("old/beta", "/fixture/beta")
+    assert "destination" not in sent[2]
+    # A double click while the repository is still being checked starts one task.
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name="New task").click()
+    box.check()
+    dialog.get_by_label("New branch").fill("once")
+    dialog.get_by_label("Task", exact=True).fill("Explore it once")
+    named.fill("new/twice")
+    start_task.dblclick()
+    expect(page.locator("#workspace-progress")).to_contain_text("Cloning new/twice")
+    assert [body["repo"] for body in sent].count("new/twice") == 1
+    assert checked == ["full/house", "New/Thing", "new/other", "Old/Beta", "new/twice"]
+
+
+def test_new_task_offers_only_cloning_when_there_is_no_local_clone(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    snapshot = {"prs": {}, "issues": {}, "new": {}, "error": None, "synced_at": 1234}
+    page.route("**/api/workspaces", lambda route: route.fulfill(json=snapshot))
+    page.route(
+        "**/api/workspace-repos*", lambda route: route.fulfill(json={"repos": [], "idle": 0})
+    )
+    page.goto(url)
+    page.get_by_role("button", name="New task").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog.get_by_label("Clone another repository from GitHub")).to_be_checked()
+    expect(dialog.get_by_label("GitHub repository")).to_be_visible()
+    expect(dialog.get_by_role("combobox", name="Repository and local clone")).to_be_disabled()
+    expect(page.locator("#workspace-error")).to_have_text("")
 
 
 def test_new_task_floats_on_a_phone_without_zooming(page, dashboard_site, viewer_routes):

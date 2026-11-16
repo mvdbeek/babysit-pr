@@ -632,3 +632,27 @@ def test_wt_hands_a_worker_launch_through_the_dashboards_guard(serve, tmp_path):
         status, _, _ = get(server, "/api/workspace-new", {**headers, **extra}, "POST", body)
         assert status == 403
     assert len(workspaces.launched) == 1
+
+
+def test_a_repository_named_for_a_new_task_is_looked_up(serve):
+    class Workspaces:
+        def local_repositories(self, everything):
+            return {"repos": [], "idle": int(everything)}
+
+        def repository(self, repo):
+            if "/" not in repo:
+                raise ValueError("Name a GitHub repository as owner/name")
+            return {"repo": repo, "clones": [], "destination": f"/src/{repo.split('/')[1]}"}
+
+    server = serve(workspaces=Workspaces())
+    status, _, body = get(server, "/api/workspace-repos?repo=new%2Fthing")
+    assert status == 200
+    assert json.loads(body) == {"repo": "new/thing", "clones": [], "destination": "/src/thing"}
+    status, _, body = get(server, "/api/workspace-repos?repo=nope")
+    assert status == 400 and json.loads(body) == {"error": "Name a GitHub repository as owner/name"}
+    # The listing is unchanged beside it.
+    assert json.loads(get(server, "/api/workspace-repos?all=1")[2]) == {"repos": [], "idle": 1}
+    # Without workspace actions there is nothing to clone into.
+    status, _, body = get(serve(), "/api/workspace-repos?repo=new%2Fthing")
+    assert status == 400 and json.loads(body) == {"error": "Workspace actions are not enabled"}
+    assert json.loads(get(serve(), "/api/workspace-repos")[2]) == {"repos": [], "idle": 0}

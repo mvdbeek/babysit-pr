@@ -186,7 +186,9 @@ options:
   --tag <name>  add a shared local focus tag (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
-  -r repo       use ~/src/<repo> instead of ~/src/galaxy
+  -r repo       use ~/src/<repo> instead of ~/src/galaxy; owner/name names a GitHub
+                repository, cloned (gh repo clone) into ~/src/<name> first when it
+                has no clone there
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --review      request a cross-agent review on a Linux worker; requires a full
@@ -201,9 +203,10 @@ options:
 Inside an agent's sandbox that cannot write the clone (a worker's babysit-bwrap, or
 Safehouse on macOS without a grant for ~/src/<repo>) wt makes no worktree: it hands a
 new <branch> from <base> with a prompt to the controller's dashboard, which places it
-(auto unless --machine names a machine) and starts it sandboxed. There -r also takes
-owner/name, which a sandbox that cannot read the clone needs; --docker needs a launch
-that has Docker itself. Ordinary sub-tasks keep the same agent and account. From a
+(auto unless --machine names a machine) and starts it sandboxed. There -r owner/name
+is what a sandbox that cannot read the clone needs, and the controller clones a
+repository it has no clone of; --docker needs a launch that has Docker itself.
+Ordinary sub-tasks keep the same agent and account. From a
 worker broker, --review requests a separate sandbox for the other provider. Use a
 full commit SHA as base, select --claude --claude-account <account|default> or --codex,
 and supply the review scope/output in the brief. The dashboard Scheduled tab shows
@@ -267,7 +270,8 @@ options:
   --tag <name>  add a shared local focus tag (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
-  -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy
+  -r repo       use ~/src/<repo> instead of the repo from the issue URL or ~/src/galaxy;
+                owner/name is cloned first when it has no clone (see wt --help)
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --exit-when-done  have the dashboard exit the agent once it says the task is done
@@ -308,7 +312,8 @@ options:
   --tag <name>  add a shared local focus tag (repeatable)
   --model <id>  override the model for a new session only
   --effort <level>  override reasoning effort for a new session only
-  -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy
+  -r repo       use ~/src/<repo> instead of the repo from the PR URL or ~/src/galaxy;
+                owner/name is cloned first when it has no clone (see wt --help)
   -p, --prompt <text>       start the agent with this initial prompt
   -F, --prompt-file <path>  start the agent with this file's contents as the prompt
   --exit-when-done  have the dashboard exit the agent once it says the task is done
@@ -370,6 +375,7 @@ class Options:
         "docker",
         "repo",
         "repo_override",
+        "slug",
         "prompt",
         "model",
         "effort",
@@ -400,6 +406,8 @@ class Options:
         self.docker = False
         self.repo = DEFAULT_REPO
         self.repo_override = False
+        # The GitHub repository `-r owner/name` named, once resolved to its clone.
+        self.slug = ""
         self.prompt = ""
         self.model = ""
         self.effort = ""
@@ -1638,6 +1646,65 @@ class Tool:
                 f" in each of these, and you can write and commit there:\n{listed}"
             )
 
+    def named_repo(self, command: str, options: Options) -> None:
+        """``-r owner/name``: that GitHub repository's clone under ``~/src``.
+
+        ``<name>`` or ``<owner>--<name>``, as the dashboard names a repository's clone:
+        whichever is a clone whose upstream or origin names the repository (any remote,
+        when it has neither, as the dashboard lists clones), else the first that is
+        free, where ``main_clone`` clones it. A clone kept at ``~/src/<owner>/<name>``
+        is used as that folder, as before.
+        """
+        if options.repo_path or not REPO_SLUG.fullmatch(options.repo):
+            return
+        if os.path.isdir(os.path.join(self.home, "src", options.repo, ".git")):
+            return
+        try:
+            safe_git.github_url(options.repo)
+        except ValueError as exc:
+            raise WtError(f"{command}: -r: {exc}") from exc
+        owner, name = options.repo.split("/")
+        folders = {f: os.path.join(self.home, "src", f) for f in (name, f"{owner}--{name}")}
+
+        def tracks(path: str) -> bool:
+            if not os.path.isdir(os.path.join(path, ".git")):
+                return False
+            remotes = self.remote_slugs(path)
+            main = [remotes[n] for n in ("upstream", "origin") if n in remotes]
+            return options.repo.lower() in (main or remotes.values())
+
+        # A clone in either folder wins over a free folder to clone into.
+        folder = next((f for f, path in folders.items() if tracks(path)), None) or next(
+            (f for f, path in folders.items() if not os.path.lexists(path)), None
+        )
+        if folder is None:
+            raise WtError(
+                f"{command}: {' and '.join(folders.values())} are not clones of "
+                f"{options.repo}; name its clone's folder under ~/src with -r"
+            )
+        options.slug, options.repo = options.repo, folder
+
+    def main_clone(self, command: str, options: Options) -> str:
+        """The clone this run works in: ``--repo-path``, else ``~/src/<repo>``.
+
+        The repository ``-r owner/name`` named is cloned there first when it has no
+        clone yet: by ``gh``, with its login and configured protocol as the dashboard
+        clones one, which also gives a fork its ``upstream`` remote.
+        """
+        if options.repo_path:
+            return options.repo_path
+        path = os.path.join(self.home, "src", options.repo)
+        if options.slug and not os.path.lexists(path):
+            self.warn(f"{command}: no clone of {options.slug} here; cloning it into {path}")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # By name, so gh uses its configured protocol; named_repo checked that it
+            # starts like an owner, never like an option.
+            result = self.runner.run(["gh", "repo", "clone", options.slug, path], output="stderr")
+            if result.returncode:
+                detail = result.stderr.strip() or f"status {result.returncode}"
+                raise WtError(f"{command}: gh repo clone {options.slug} failed: {detail}")
+        return path
+
     # -- multiplexers --
 
     def herdr_running(self) -> bool:
@@ -1945,10 +2012,15 @@ class Tool:
             return
         base = args[0]
         branch = args[1] if len(args) > 1 else base
-        repo_path = options.repo_path or os.path.join(self.home, "src", options.repo)
+        repo_path = self.main_clone("wt", options)
         root = options.worktree_root or os.path.join(self.home, "src", "worktrees", options.repo)
         directory = os.path.join(root, branch)
         if not os.path.isdir(directory):
+            if not os.path.isdir(repo_path):
+                raise WtError(
+                    f"wt: no clone at {repo_path}; name its GitHub repository "
+                    "(-r owner/name) to clone it"
+                )
             # Git refuses to check a branch out twice, and a second checkout would be
             # the wrong thing anyway: work where the branch already lives. That covers
             # the main clone (wt main) as well as a worktree created under another name.
@@ -1962,7 +2034,7 @@ class Tool:
                     directory,
                     branch,
                     base,
-                    options.github_repo,
+                    options.github_repo or options.slug,
                     trust=self.trusts_origin(options),
                 )
         self.open_session(options, directory, branch, repo_path)
@@ -1973,7 +2045,7 @@ class Tool:
         if len(args) > 1:
             raise UsageError("wt", "wt: --name takes at most one base branch")
         validate_name(options.name, "wt")
-        repo_path = options.repo_path or os.path.join(self.home, "src", options.repo)
+        repo_path = self.main_clone("wt", options)
         root = options.worktree_root or os.path.join(self.home, "src", "worktrees", options.repo)
         if not os.path.isdir(os.path.join(repo_path, ".git")):
             raise WtError(f"wt: no main clone at {repo_path} (needed to attach a worktree)")
@@ -1984,15 +2056,9 @@ class Tool:
         if self.branch_exists(repo_path, branch):
             raise WtError(f"wt: explicit branch already exists: {branch}")
         trust = self.trusts_origin(options)
-        base = args[0] if args else self.default_branch(repo_path, options.github_repo, trust)
-        self.add_worktree(
-            repo_path,
-            directory,
-            branch,
-            base,
-            options.github_repo,
-            trust=trust,
-        )
+        slug = options.github_repo or options.slug
+        base = args[0] if args else self.default_branch(repo_path, slug, trust)
+        self.add_worktree(repo_path, directory, branch, base, slug, trust=trust)
         self.open_session(options, directory, branch, repo_path)
 
     def run_wti(self, options: Options) -> None:
@@ -2009,7 +2075,7 @@ class Tool:
         issue = args[0]
         # A positional branch name may reuse an existing checkout; --name reserves a new one.
         requested = args[1] if len(args) > 1 else options.name
-        slug = options.github_repo
+        slug = options.github_repo or options.slug
         parsed = parse_issue_url(issue)
         if parsed:
             url_owner, url_repo, issue = parsed
@@ -2018,7 +2084,7 @@ class Tool:
                 options.repo = url_repo  # unless -r was given, target ~/src/<url_repo>
         if not DIGITS.fullmatch(issue):
             raise WtError("wti: expected an issue number or GitHub issue URL")
-        repo_path = options.repo_path or os.path.join(self.home, "src", options.repo)
+        repo_path = self.main_clone("wti", options)
         root = options.worktree_root or os.path.join(self.home, "src", "worktrees", options.repo)
         if not os.path.isdir(os.path.join(repo_path, ".git")):
             raise WtError(f"wti: no main clone at {repo_path} (needed to attach a worktree)")
@@ -2065,7 +2131,7 @@ class Tool:
         if not args:
             raise UsageError("wtpr", "wtpr: expected a PR number or GitHub PR URL")
         pr = args[0]
-        slug = options.github_repo
+        slug = options.github_repo or options.slug
         parsed = parse_pr_url(pr)
         if parsed:
             url_owner, url_repo, pr = parsed
@@ -2074,7 +2140,7 @@ class Tool:
                 options.repo = url_repo
         if not DIGITS.fullmatch(pr):
             raise WtError("wtpr: expected a PR number or GitHub PR URL")
-        repo_path = options.repo_path or os.path.join(self.home, "src", options.repo)
+        repo_path = self.main_clone("wtpr", options)
         root = options.worktree_root or os.path.join(self.home, "src", "worktrees", options.repo)
         if not os.path.isdir(os.path.join(repo_path, ".git")):
             raise WtError(f"wtpr: no main clone at {repo_path}")
@@ -2297,13 +2363,15 @@ class Tool:
         if refusal:
             raise NotForWorker(refusal)
         repo_path = os.path.join(self.home, "src", options.repo)
-        remotes = self.remote_slugs(repo_path)
-        slug = remotes.get("upstream") or remotes.get("origin")
+        # Only `-r owner/name` names a repository that may have no clone here yet.
+        cloned = not options.slug or os.path.isdir(repo_path)
+        remotes = self.remote_slugs(repo_path) if cloned else {}
+        slug = options.slug or remotes.get("upstream") or remotes.get("origin")
         if not slug:
             raise NotForWorker(f"no GitHub upstream or origin remote in {repo_path}")
         branch = options.positional[1]
         directory = os.path.join(self.home, "src", "worktrees", options.repo, branch)
-        if os.path.lexists(directory) or self.branch_exists(repo_path, branch):
+        if os.path.lexists(directory) or (cloned and self.branch_exists(repo_path, branch)):
             raise NotForWorker(f"{branch} already exists here")
         return launch_request(command, options, slug, machine)
 
@@ -2539,6 +2607,7 @@ class Tool:
         if kind:
             self.launch_from_sandbox(command, options, kind)
             return
+        self.named_repo(command, options)
         machine = self.chosen_machine(command, options)
         if machine != "local" and self.launch_elsewhere(command, options, machine):
             return
