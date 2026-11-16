@@ -33,21 +33,35 @@
   border-color: var(--green);
   color: var(--green);
 }
+/* Pinned, so it is kept to two lines while there is room: the name and links beside the
+   buttons, then the tabs beside the agent's status. */
 .ws-viewer-header {
   position: sticky;
   top: calc(var(--inset-top) - var(--view-top));
   z-index: 1;
-  display: flow-root;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
   margin: calc(-1 * var(--view-top)) calc(-1 * var(--view-right)) 12px calc(-1 * var(--view-left));
-  padding: var(--view-top) var(--view-right) 12px var(--view-left);
+  padding: var(--view-top) var(--view-right) 10px var(--view-left);
   border-bottom: 1px solid var(--line);
   background: var(--paper);
 }
-.ws-viewer-actions {
-  float: right;
+.ws-viewer-heading {
   display: flex;
+  /* No width of its own: it takes what the buttons leave, and a long name wraps in that. */
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 14px;
+  min-width: 0;
+}
+.ws-viewer-actions {
+  display: flex;
+  flex: none;
+  order: 1;
   gap: 6px;
-  margin-left: 12px;
 }
 /* Previous and next step through the list the viewer was opened from. */
 .ws-viewer-nav {
@@ -64,14 +78,14 @@
   white-space: nowrap;
 }
 #ws-viewer-title {
-  margin: 0 0 6px;
+  margin: 0;
   overflow-wrap: anywhere;
 }
 #ws-viewer-links {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
-  margin: 0 0 12px;
+  margin: 0;
   overflow-wrap: anywhere;
 }
 #ws-viewer-links:empty {
@@ -91,9 +105,12 @@
 /* The tabs, and the agent's status beside them while the header has room for both. */
 .ws-viewer-bar {
   display: flex;
+  flex: 1 1 100%;
   flex-wrap: wrap;
+  order: 2;
   align-items: flex-start;
   gap: 8px 16px;
+  min-width: 0;
 }
 .ws-viewer-tabs {
   display: flex;
@@ -120,17 +137,32 @@
   gap: 10px 14px;
 }
 /* Whether an agent runs the transcript's session, in the header: it takes the rest of the
-   tabs' line, and wraps below them once less than its basis is left. */
+   tabs' line, and wraps below them once less than its basis is left. The outcome of its
+   buttons follows on the same line while that fits; a question takes a line of its own. */
 .ws-live {
   display: flex;
-  flex: 1 1 380px;
-  flex-direction: column;
-  gap: 6px;
+  flex: 1 1 240px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
   min-width: 0;
-  padding: 4px 4px 4px 12px;
+  /* As tall as the tabs beside it. */
+  min-height: 36px;
+  padding: 3px 4px 3px 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg);
+}
+#ws-live-state {
+  min-width: 0;
+}
+/* A running agent's buttons keep to the strip's far end. */
+#ws-live-state:has([data-live="true"]) {
+  flex: 1 1 auto;
+}
+#ws-live-confirm {
+  flex: 1 1 100%;
+  min-width: 0;
 }
 /* The workspace's other agents, above the transcript. */
 .ws-live-agents {
@@ -195,7 +227,10 @@
   }
 }
 #ws-live-status {
+  flex: 1 1 12em;
+  min-width: 0;
   margin: 0;
+  padding-right: 8px;
   font-size: 13px;
   overflow-wrap: anywhere;
 }
@@ -758,17 +793,24 @@
   flex: 1;
   overflow-wrap: anywhere;
 }
-#ws-docker label {
+#ws-docker:not([hidden]) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  min-width: 0;
+}
+#ws-docker label,
+#ws-message-quit-label {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
-#ws-docker input[type="checkbox"] {
+#ws-docker input[type="checkbox"],
+#ws-message-quit {
   margin: 0;
 }
-#ws-docker-status {
-  display: block;
-}
+/* Pinned to the viewer's end, so it is kept short: the message, then one line of options. */
 .ws-message {
   position: sticky;
   bottom: calc(var(--inset-bottom) - var(--view-bottom));
@@ -777,7 +819,7 @@
   gap: 6px;
   margin: 16px calc(-1 * var(--view-right)) calc(-1 * var(--view-bottom))
     calc(-1 * var(--view-left));
-  padding: 12px var(--view-right) max(16px, var(--inset-bottom)) var(--view-left);
+  padding: 10px var(--view-right) max(12px, var(--inset-bottom)) var(--view-left);
   border-top: 1px solid var(--line);
   background: var(--paper);
 }
@@ -805,9 +847,36 @@
 .ws-message-actions {
   display: flex;
   flex-wrap: wrap;
-  align-items: end;
-  justify-content: space-between;
-  gap: 8px;
+  align-items: center;
+  gap: 6px 12px;
+}
+/* The attach button joins the line of options, and the files attached follow it there, in
+   the order the keyboard reaches them. */
+#ws-message-files:not([hidden]),
+#ws-message-files .attachments {
+  display: contents;
+}
+.ws-message-actions .attachment-list {
+  min-width: 0;
+}
+/* Whom the message goes to takes the room the other options leave. */
+#ws-message-agent {
+  display: flex;
+  flex: 1 1 220px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+}
+#ws-message-agent .ws-viewer-choice {
+  flex: 1 1 auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+#ws-message-agent .ws-viewer-choice select {
+  flex: 1 1 0;
+  min-width: 0;
 }
 #ws-message-comments {
   display: flex;
@@ -858,9 +927,12 @@
   max-height: 30vh;
   max-height: 30dvh;
 }
-/* Keep focused lines and comment boxes clear of the sticky composer. */
-#ws-viewer {
-  scroll-padding-bottom: 220px;
+/* Keep focused lines and comment boxes clear of the sticky composer. A margin of the content,
+   not padding of the viewer: the composer's own field lies inside such padding, and each key
+   typed into it would scroll the transcript on towards its end. */
+#ws-viewer-content *,
+#ws-agent-interaction * {
+  scroll-margin-bottom: 220px;
 }
 @media (max-width: 600px), (max-height: 520px) {
   /* A phone screen cannot spare the room: the viewer fills it and the composer follows the content.
@@ -879,7 +951,10 @@
     margin: 0;
     border: 0;
     border-radius: 0;
-    scroll-padding-bottom: 0;
+  }
+  #ws-viewer-content *,
+  #ws-agent-interaction * {
+    scroll-margin-bottom: 0;
   }
   /* The viewer already fills a phone. */
   #ws-viewer-full {
@@ -1319,29 +1394,31 @@ body.ws-tray-shown main {
 
 @media (max-width: 650px) {
   .ws-viewer-header {
-    display: flex;
-    flex-direction: column;
+    flex-flow: column nowrap;
+    align-items: stretch;
     gap: 8px;
   }
-  #ws-viewer-title {
-    order: -2;
+  /* The name has a line of its own, cut short; its links follow below it. */
+  .ws-viewer-heading {
+    display: block;
+    flex: none;
     width: 100%;
-    margin: 0;
+  }
+  #ws-viewer-title {
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
   }
+  #ws-viewer-links:not(:empty) {
+    margin-top: 4px;
+  }
   .ws-viewer-actions {
-    float: none;
     flex-wrap: wrap;
     justify-content: flex-end;
-    margin: 0;
     width: 100%;
   }
-  #ws-viewer-links {
-    margin: 0;
-  }
   .ws-viewer-bar {
+    flex: none;
     width: 100%;
   }
 }

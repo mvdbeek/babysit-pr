@@ -304,6 +304,96 @@ def test_the_docked_viewer_keeps_its_composer_in_the_window(page, dashboard_site
     shows_newest()
 
 
+def test_the_docked_viewer_leaves_a_laptop_window_room_for_the_transcript(
+    page, dashboard_site, agents_routes, viewer_routes
+):
+    url, _ = dashboard_site
+    long_transcript(page)
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "agents": viewer_routes["agents"],
+                "sessions": viewer_routes["sessions"],
+                "path": viewer_routes["path"],
+                "url": "https://collie.example/w1",
+            }
+        ),
+    )
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.goto(url + "/#agents")
+    # With nothing to report, the list starts under its filters: the page's header already
+    # says when the dashboard last refreshed.
+    expect(rows(page)).to_have_count(3)
+    expect(page.locator("#agents-status")).to_be_hidden()
+    rows(page).filter(has_text="working-work").locator(".agents-open").click()
+    viewer = page.locator("#agents-detail #ws-viewer")
+    header = viewer.locator(".ws-viewer-header")
+    composer = viewer.locator("#ws-message")
+    expect(viewer.get_by_text("Step 59 is done.")).to_be_visible()
+    expect(viewer.get_by_label("Agent", exact=True)).to_be_visible()
+    expect(viewer.locator(".ws-live-state")).to_have_attribute("data-live", "unknown")
+    # The name and its links share the buttons' line, and the tabs the agent's status.
+    title = viewer.locator("#ws-viewer-title").bounding_box()
+    link = viewer.locator("#ws-viewer-links a").first.bounding_box()
+    close = viewer.locator("#ws-viewer-close").bounding_box()
+    assert title["y"] < link["y"] + link["height"] and link["y"] < title["y"] + title["height"]
+    assert close["y"] < title["y"] + title["height"] and title["y"] < close["y"] + close["height"]
+    tabs = viewer.get_by_role("tab", name="Transcript").bounding_box()
+    strip = viewer.locator("#ws-live").bounding_box()
+    assert strip["x"] > tabs["x"] + tabs["width"]
+    assert strip["y"] == pytest.approx(tabs["y"], abs=2)
+    # Before the page has scrolled, the pinned header and composer leave the transcript
+    # several entries of the window, with every option of the composer still in it.
+    assert page.evaluate("scrollY") == 0
+    assert bottom(composer) <= 712
+    for option in ("#ws-message-send", ".attach-button", "#ws-message-quit"):
+        assert bottom(viewer.locator(option)) <= bottom(composer)
+    room = composer.bounding_box()["y"] - bottom(header)
+    assert room >= 220, room
+    page.screenshot(path="reports/layout-agent-docked-laptop.png")
+
+
+def test_typing_a_message_leaves_the_transcript_where_the_reader_scrolled_it(
+    page, dashboard_site, agents_routes
+):
+    url, _ = dashboard_site
+    long_transcript(page)
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.goto(url + "/#agents")
+    rows(page).filter(has_text="working-work").locator(".agents-open").click()
+    viewer = page.locator("#agents-detail #ws-viewer")
+    composer = viewer.locator("#ws-message")
+    expect(viewer.get_by_text("Step 59 is done.")).to_be_visible()
+    # Reading further up, the reader starts a message: the field is pinned to the viewer's
+    # end, and neither a key nor the field growing by a line moves what is being read.
+    read = viewer.get_by_text("Step 30 is done.")
+    read.evaluate("el => el.scrollIntoView({ block: 'center' })")
+    expect(read).to_be_in_viewport()
+    at = viewer.evaluate("el => el.scrollTop")
+    place = read.bounding_box()
+    field = viewer.get_by_label("Message the agent")
+    field.click()
+    height = field.bounding_box()["height"]
+    for line in ("Please", "rerun", "the", "tests"):
+        page.keyboard.type(line)
+        page.keyboard.press("Enter")
+    assert field.bounding_box()["height"] > height + 30
+    assert viewer.evaluate("el => el.scrollTop") == at
+    assert read.bounding_box() == place
+    # What takes the focus under the composer is still scrolled clear of it.
+    covered = viewer.evaluate(
+        "el => { const edge = el.querySelector('#ws-message').getBoundingClientRect().top;"
+        " return [...el.querySelectorAll('.ws-msg')].findIndex("
+        "entry => entry.getBoundingClientRect().bottom > edge + 10); }"
+    )
+    behind = viewer.locator(".ws-msg").nth(covered)
+    behind.evaluate("el => { el.tabIndex = 0; }")
+    assert bottom(behind) > composer.bounding_box()["y"]
+    behind.focus()
+    assert bottom(behind) <= composer.bounding_box()["y"]
+
+
 def test_the_docked_viewer_ends_above_the_tray_of_minimized_viewers(
     page, dashboard_site, agents_routes, workspace_routes
 ):

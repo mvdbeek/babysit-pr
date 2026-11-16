@@ -77,6 +77,10 @@
     flex-basis: 100%;
   }
 }
+/* Empty, it takes no room; still rendered, so that what it says next is announced. */
+#agents-status:empty {
+  margin: 0;
+}
 .agents-list {
   display: flex;
   flex-direction: column;
@@ -199,6 +203,8 @@
 /* Docked: a pane of the page, scrolling inside itself like the dialog does. The slot is in the
    selector so that a viewer the user keeps full screen as a dialog is still a pane here. */
 .agents-detail > #ws-viewer.ws-viewer-docked {
+  /* A pane has less room than the dialog: its pinned header and composer are tighter. */
+  --base-y: 14px;
   position: static;
   width: 100%;
   max-width: none;

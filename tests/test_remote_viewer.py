@@ -577,7 +577,7 @@ def test_a_worker_row_opens_its_diff_transcript_and_composer(page, worker, dashb
     # No agent runs there, so the composer offers to resume a session it recorded; its
     # exit watches and uploads stay on this machine.
     expect(viewer.locator("#ws-message")).to_be_visible()
-    expect(viewer.locator("#ws-message-agent")).to_contain_text("resumes this session")
+    expect(viewer.get_by_label("Resume", exact=True)).to_be_visible()
     expect(viewer.locator("#ws-message-quit-label")).to_be_hidden()
     expect(viewer.locator("#ws-message-files")).to_be_hidden()
     viewer.get_by_role("tab", name="Transcript").click()

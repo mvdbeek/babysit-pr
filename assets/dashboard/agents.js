@@ -228,7 +228,7 @@
         );
       else if (machine.pending) parts.push(`Checking ${machine.label}…`);
     }
-    if (!parts.length) parts.push(`Updated ${new Date(snapshot.now * 1000).toLocaleTimeString()}`);
+    // Nothing to report otherwise: the header says when the dashboard last refreshed.
     return parts.join(" · ");
   }
   function badgeTab() {

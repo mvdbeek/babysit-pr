@@ -1682,22 +1682,21 @@
       );
       return;
     }
-    holder.append(
-      node("small", "No agent is running; the message resumes this session:", "pr-meta"),
-      choice(
-        "Resume",
-        sessions.map((session) => [
-          session.id,
-          // The babysit watcher resumes a watched session itself; resuming it is refused.
-          sessionLabel(session) + (session.watched ? " (babysit watch)" : ""),
-        ]),
-        keep(sessions.map((session) => session.id)),
-        () => {
-          watchQuestion = null;
-          renderWatch();
-        },
-      ),
+    const resume = choice(
+      "Resume",
+      sessions.map((session) => [
+        session.id,
+        // The babysit watcher resumes a watched session itself; resuming it is refused.
+        sessionLabel(session) + (session.watched ? " (babysit watch)" : ""),
+      ]),
+      keep(sessions.map((session) => session.id)),
+      () => {
+        watchQuestion = null;
+        renderWatch();
+      },
     );
+    resume.title = "No agent is running; the message resumes this session";
+    holder.append(resume);
     renderWatch();
   }
   // The session a message would resume, while no agent runs.
@@ -2137,17 +2136,12 @@
           : { loaded: "Not running", loading: "Checking…" }[agentsRead] || "Status unknown",
       ),
     );
-    if (where) row.append(node("span", known && shown ? `on ${where} · ` : `on ${where}`));
-    if (known && shown)
-      row.append(
-        node(
-          "span",
-          unnamed
-            ? "an agent runs here, but which session it has open is not known"
-            : "no agent has this session open right now",
-          "pr-meta",
-        ),
-      );
+    // The header is pinned: the badge says it, and hovering it says the rest.
+    if (where) row.append(node("span", unnamed ? `on ${where} · ` : `on ${where}`));
+    if (unnamed) {
+      row.append(node("span", "an agent here may have it open", "pr-meta"));
+      row.title = "An agent runs here, but which session it has open is not known";
+    } else if (known) row.title = "No agent has this session open right now";
     return row;
   }
   function agentRow(agent, data) {
