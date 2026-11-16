@@ -688,6 +688,35 @@ def test_codex_failures_follow_the_script_verdict(stores, output, failed):
     assert tool["error"] is failed
 
 
+def test_a_codex_turn_that_ended_in_an_error_is_shown(stores):
+    checkout, _, day = stores
+    path = next(day.glob(f"*{CODEX_SID}*"))
+    lines = path.read_text().splitlines()[:-1]
+    message = "This content was flagged for possible biological risk."
+    ended = [
+        {
+            "type": "event_msg",
+            "timestamp": "t9",
+            "payload": {
+                "type": "task_complete",
+                "last_agent_message": None,
+                "error": {"message": message, "codex_error_info": "bio_policy"},
+            },
+        },
+        # A turn that finished adds nothing: its reply is recorded as a message.
+        {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Ok"}},
+    ]
+    path.write_text("\n".join(lines + [json.dumps(item) for item in ended]) + "\n")
+    entries = wv.transcript(checkout, CODEX_SID)["entries"]
+    assert [e for e in entries if e["role"] == "user"][1:] == [
+        {"role": "user", "kind": "error", "text": message, "code": "bio_policy", "time": "t9"}
+    ]
+    # Found by its message and by its code.
+    for query in ("biological", "bio_policy"):
+        hits = wv.search(checkout, query)["results"]
+        assert [(hit["kind"], hit["index"]) for hit in hits] == [("error", len(entries) - 1)]
+
+
 def test_codex_prompts_keep_one_copy_whichever_comes_first(tmp_path):
     parser = wv.Transcript("codex")
     item = {

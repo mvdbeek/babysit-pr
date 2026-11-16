@@ -4478,6 +4478,12 @@ def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
         },
         {"role": "assistant", "text": TRANSCRIPT_MARKDOWN},
         {"role": "user", "kind": "notification", "text": 'Background command "tox" completed'},
+        {
+            "role": "user",
+            "kind": "error",
+            "code": "bio_policy",
+            "text": "This content was flagged. Read more: https://example.org/policy",
+        },
         {"role": "user", "kind": "output", "text": "Catch you later!"},
         {"role": "user", "text": "Plain *prompt* stays as typed"},
     ]
@@ -4517,8 +4523,14 @@ def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
     expect(viewer.locator(".ws-kind-command .ws-msg-who")).to_have_text("Command")
     expect(viewer.locator(".ws-kind-command pre")).to_have_text("/babysit-pr 23905")
     expect(viewer.locator(".ws-note")).to_have_text(
-        'Notification Background command "tox" completed'
+        [
+            'Notification Background command "tox" completed',
+            "Turn failed bio_policy This content was flagged. Read more: https://example.org/policy",
+        ]
     )
+    failed = viewer.locator(".ws-note-error")
+    expect(failed.locator(".badge.red")).to_have_text("Turn failed")
+    expect(failed.locator("a")).to_have_attribute("href", "https://example.org/policy")
     expect(viewer.locator(".ws-kind-output .ws-msg-who")).to_have_text("Command output")
     prompt = viewer.locator(".ws-kind-prompt .ws-msg-text")
     expect(prompt).to_have_text("Plain *prompt* stays as typed")
