@@ -4246,7 +4246,9 @@ def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
         "Quit Claude in w1:p2; its session can be resumed."
     )
     expect(strip).to_have_attribute("data-live", "false")
-    expect(strip).to_have_text("Not runningon this Mac · no agent has this session open right now")
+    # The pinned strip says it in two words; hovering it says the rest.
+    expect(strip).to_have_text("Not runningon this Mac")
+    expect(strip).to_have_attribute("title", "No agent has this session open right now")
     expect(live.get_by_role("button", name=re.compile("^Quit"))).to_have_count(0)
     assert quits == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
     if width == 1280:
@@ -4294,9 +4296,7 @@ def test_a_refused_quit_says_why_and_a_vanished_agent_drops_the_question(
     viewer_routes["agents"] = []
     page.clock.run_for(11000)
     expect(live.get_by_role("group", name="Confirm quitting the agent")).to_have_count(0)
-    expect(live.locator(".ws-live-state")).to_have_text(
-        "Not runningno agent has this session open right now"
-    )
+    expect(live.locator(".ws-live-state")).to_have_text("Not running")
 
 
 def test_shift_enter_sends_the_message_and_enter_starts_a_new_line(
@@ -4420,12 +4420,13 @@ def test_an_agent_whose_session_herdr_does_not_know_is_not_called_stopped(
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-live")
     strip = live.locator(".ws-live-state")
-    expect(strip).to_have_text("Not runningno agent has this session open right now")
+    expect(strip).to_have_text("Not running")
     viewer_routes["agents"] = [claude]
     page.clock.run_for(11000)
     expect(strip).to_have_attribute("data-live", "unknown")
-    expect(strip).to_have_text(
-        "Status unknownan agent runs here, but which session it has open is not known"
+    expect(strip).to_have_text("Status unknownan agent here may have it open")
+    expect(strip).to_have_attribute(
+        "title", "An agent runs here, but which session it has open is not known"
     )
     # It is listed, with what it is doing.
     others = page.locator("#ws-viewer").get_by_role("group", name="Other running agents")
@@ -4438,7 +4439,7 @@ def test_an_agent_whose_session_herdr_does_not_know_is_not_called_stopped(
     # Running another session, it is not this transcript's.
     viewer_routes["agents"][0]["session"] = "s2"
     page.clock.run_for(11000)
-    expect(strip).to_have_text("Not runningno agent has this session open right now")
+    expect(strip).to_have_text("Not running")
 
 
 TRANSCRIPT_MARKDOWN = """Both PRs are forwarded; **one** test is <img src=x onerror="window.injected=true"> open.
@@ -5433,7 +5434,7 @@ def test_files_dropped_onto_a_follow_up_message_attach(page, dashboard_site, vie
     composer = page.locator("#ws-message")
     text = page.locator("#ws-message-text")
     # Anywhere on the composer takes the drop, and shows where it will land meanwhile.
-    for target in (text, composer.get_by_text("Message the agent")):
+    for target in (text, composer.locator(".ws-message-actions")):
         highlighted = target.evaluate(
             "(target, names) => (" + DROP_FILES + ")([target, names])", ["shot.png"]
         )
@@ -6027,7 +6028,9 @@ def test_an_exited_agent_is_resumed_with_the_message(page, dashboard_site, viewe
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Diff", exact=True).click()
     viewer = page.locator("#ws-viewer")
-    expect(page.locator("#ws-message-agent")).to_contain_text("No agent is running")
+    expect(page.locator("#ws-message-agent label")).to_have_attribute(
+        "title", "No agent is running; the message resumes this session"
+    )
     viewer_routes["sessions"][1]["watched"] = True
     viewer.get_by_role("button", name="Refresh").click()
     resume = viewer.get_by_label("Resume", exact=True)

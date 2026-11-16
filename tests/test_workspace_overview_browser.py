@@ -907,7 +907,7 @@ def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
     line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
     line.get_by_role("button", name="Transcript", exact=True).click()
     dialog = page.locator("#ws-viewer")
-    expect(page.locator("#ws-message-agent")).to_contain_text("No agent is running")
+    expect(dialog.get_by_role("button", name="Resume and send")).to_be_enabled()
     assert "key=%2Fsrc%2Fworktrees%2Frepo%2Fopen-work" in agents_seen[0]
     dialog.get_by_label("Message the agent").fill("Keep going")
     dialog.get_by_role("button", name="Resume and send").click()
