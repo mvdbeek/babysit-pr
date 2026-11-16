@@ -1183,6 +1183,7 @@
     command: "Command",
     output: "Command output",
     notification: "Notification",
+    error: "Turn failed",
   };
   // Questions an agent asked ------------------------------------------------------
   // Answers go through the matching session's question dialog, for both agents.
@@ -1435,11 +1436,17 @@
       return item;
     }
     const kind = entry.role === "user" ? entry.kind || "prompt" : null;
-    if (kind === "notification") {
+    if (kind === "notification" || kind === "error") {
       const item = node("div", undefined, "ws-note");
       const when = stamp(entry.time);
       if (when) item.append(when);
-      item.append(node("strong", "Notification"), " ", linkify(entry.text));
+      if (kind === "error") {
+        // A turn Codex ended without a reply, and why: a safety filter, capacity, a limit.
+        item.classList.add("ws-note-error");
+        item.append(badge(USER_KINDS.error, "red"));
+        if (entry.code) item.append(" ", node("code", entry.code));
+      } else item.append(node("strong", USER_KINDS.notification));
+      item.append(" ", linkify(entry.text));
       return item;
     }
     const item = node("div", undefined, `ws-msg ws-${entry.role} ws-kind-${kind || "reply"}`);

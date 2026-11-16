@@ -83,7 +83,7 @@ MAX_ENTRIES = 20000
 OPEN_TOOLS = 500
 MAX_PROMPTS = 100
 # Bumped whenever parsing changes what an entry holds: saved transcripts are parsed again.
-PARSER = 1
+PARSER = 2
 # A search brings the checkout's sessions up to date first, for at most this long, and
 # answers at most SEARCH_RESULTS entries.
 SEARCH_BUDGET = 20
@@ -947,6 +947,25 @@ class Transcript:
             text = str(payload.get("message") or "").strip()
             if text:
                 self.prompt("event", text, when)
+        elif item.get("type") == "event_msg" and kind == "task_complete":
+            # A turn that ended in an error has no reply: a safety filter refused it,
+            # the model was at capacity, the usage limit was reached. Codex shows that
+            # on the screen and records it only here.
+            error = payload.get("error")
+            if isinstance(error, dict):
+                code = error.get("codex_error_info")
+                code = code if isinstance(code, str) else None
+                reason = str(error.get("message") or "").strip() or code
+                if reason:
+                    self.entries.append(
+                        {
+                            "role": "user",
+                            "kind": "error",
+                            "text": clip(reason, MAX_TEXT),
+                            "code": code,
+                            "time": when,
+                        }
+                    )
         elif item.get("type") != "response_item":
             return
         elif kind == "message" and payload.get("role") in {"user", "assistant"}:
@@ -1011,8 +1030,9 @@ def store():
 
 
 def search_text(entry):
-    """What an entry is found by: its text, or a tool call's name, input and output."""
-    parts = [entry.get(name) for name in ("name", "about", "text", "input", "output")]
+    """What an entry is found by: its text (and a failed turn's error code), or a tool
+    call's name, input and output."""
+    parts = [entry.get(name) for name in ("name", "about", "code", "text", "input", "output")]
     for question in entry.get("questions") or []:
         parts += [question["question"], *(option["label"] for option in question["options"])]
     parts += (entry.get("answers") or {}).values()

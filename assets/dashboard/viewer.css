@@ -486,6 +486,10 @@
 .ws-note strong {
   font-weight: 600;
 }
+.ws-note-error {
+  padding: 6px 12px;
+  color: var(--ink);
+}
 .ws-msg-code {
   margin: 0;
   padding: 8px 12px;
