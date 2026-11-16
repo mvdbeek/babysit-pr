@@ -347,7 +347,10 @@ one, so its `.claude.json` lives inside it; a missing one is refused rather than
 exported into the empty home) and `~/.cache/babysit-sandbox/<hash of that
 configuration directory and the enabled grants>`, a cache used only by sandboxed
 agents of that configuration (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
-`npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). Each set of grants that reaches
+`npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). uv's tools go there too
+(`UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`): their defaults lie under the read-only
+`~/.local`, where `uvx` fails. The executables `uv tool install` links are not on
+`PATH`; uv prints where they are. Each set of grants that reaches
 beyond the sandbox (`--enable=docker`) gets its own, so a launch with Docker never
 runs downloads that a launch without it could have replaced. Host caches are
 never writable: code planted there would run outside the sandbox.

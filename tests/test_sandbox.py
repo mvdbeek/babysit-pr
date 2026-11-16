@@ -586,6 +586,8 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
         "PASSED": "1",
         "XDG_CACHE_HOME": cache,
         "UV_CACHE_DIR": f"{cache}/uv",
+        "UV_TOOL_DIR": f"{cache}/uv-tools",
+        "UV_TOOL_BIN_DIR": f"{cache}/uv-tools-bin",
         "PIP_CACHE_DIR": f"{cache}/pip",
         "npm_config_cache": f"{cache}/npm",
         "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/ms-playwright",
