@@ -395,3 +395,103 @@ def test_new_task_other_clones_must_be_distinct_listed_clones(local, also):  # n
         also = [clones.get(a, a) if isinstance(a, str) else a for a in also]
     with pytest.raises(ValueError, match="Invalid new task|other repositor|share the task"):
         manager.new_task(request(manager, name="x", clone=clones["main"], also=also))
+
+
+def uncloned(manager, git):
+    """``base/repo`` with no clone here: the fixture's clone tracks another repository,
+    so the first destination is taken and the second one is free."""
+    git("remote", "set-url", "origin", "https://github.com/unrelated/repo.git")
+    return str(manager.src / "base--repo")
+
+
+def cloning(manager, destination, **changes):
+    asked = request(manager, **{"destination": destination, "name": "try-parser", **changes})
+    del asked["clone"]
+    return asked
+
+
+def clones_made(state):
+    return [
+        call
+        for call in json.loads(state.read_text()).get("gh", [])
+        if call[:2] == ["repo", "clone"]
+    ]
+
+
+def test_a_repository_named_for_a_new_task_lists_its_clones_or_its_destination(local):  # noqa: F811
+    manager, _, git, _, _ = local
+    clone = str((manager.src / "repo").resolve())
+    found = manager.repository("Base/Repo")
+    assert found["destination"] is None
+    assert [(r["repo"], r["clone"]) for r in found["clones"]] == [("base/repo", clone)]
+    destination = uncloned(manager, git)
+    assert manager.repository("base/repo") == {
+        "repo": "base/repo",
+        "clones": [],
+        "destination": destination,
+    }
+    # Nothing under src is in the way of a repository by another name.
+    assert manager.repository("new/thing")["destination"] == str(manager.src / "thing")
+    (manager.src / "base--repo").mkdir()
+    assert manager.repository("base/repo")["destination"] is None
+    for name in ("nope", "a/..", "-a/b", "a/b/c"):
+        with pytest.raises(ValueError, match="Name a GitHub repository as owner/name"):
+            manager.repository(name)
+
+
+def test_new_task_clones_a_repository_that_has_no_clone_here(local):  # noqa: F811
+    manager, _, git, state, _ = local
+    calls = helper_calls(manager)
+    destination = uncloned(manager, git)
+    with pytest.raises(ValueError, match="Clone destination changed"):
+        manager.new_task(cloning(manager, str(manager.src / "repo")))
+    with pytest.raises(ValueError, match="Invalid new task parameters"):
+        manager.new_task({**cloning(manager, destination), "clone": destination})
+    assert not clones_made(state)
+    value = manager.new_task(cloning(manager, destination, base="feature"))
+    assert value["operation"]["fresh_clone"] is True
+    op = finish(manager, value["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert op["clone"] == destination and op["branch"] == "try-parser"
+    assert clones_made(state) == [["repo", "clone", "base/repo", destination]]
+    assert calls[0][calls[0].index("--repo-path") + 1] == destination
+    assert calls[0][calls[0].index("--github-repo") + 1] == "base/repo"
+    # Its worktrees go where every other task's for that repository do.
+    assert op["path"] == str(manager.src / "worktrees/repo/try-parser")
+    assert git("rev-parse", "HEAD", cwd=op["path"]) == git("rev-parse", "feature")
+    # A dialog opened before the clone existed starts in it rather than cloning again.
+    second = manager.new_task(cloning(manager, destination))["operation"]
+    assert "fresh_clone" not in second
+    second = finish(manager, second["pr"])
+    assert second["status"] == "complete", second
+    assert second["clone"] == destination and second["branch"] == "try-parser-2"
+    assert len(clones_made(state)) == 1
+    # Asked for anywhere else, the clone that now exists is named instead: also by
+    # another spelling of its own path.
+    for other in (str(manager.src / "elsewhere"), str(manager.src / "worktrees/../base--repo")):
+        with pytest.raises(ValueError, match=f"already has a local clone at {destination}"):
+            manager.new_task(cloning(manager, other))
+
+
+def test_new_tasks_started_together_share_one_clone(local):  # noqa: F811
+    manager, _, git, state, _ = local
+    destination = uncloned(manager, git)
+    first = manager.new_task(cloning(manager, destination))["operation"]
+    # While the first clones: the same destination, never a second one beside it.
+    assert manager.repository("base/repo")["destination"] in (None, destination)
+    second = manager.new_task(cloning(manager, destination, name="other"))["operation"]
+    done = [finish(manager, op["pr"]) for op in (first, second)]
+    assert [op["status"] for op in done] == ["complete", "complete"], done
+    assert {op["clone"] for op in done} == {destination}
+    assert [op["branch"] for op in done] == ["try-parser", "other"]
+    assert len(clones_made(state)) == 1
+
+
+def test_a_failed_clone_fails_the_new_task_and_leaves_nothing(local, monkeypatch):  # noqa: F811
+    manager, _, git, state, _ = local
+    destination = uncloned(manager, git)
+    monkeypatch.setenv("FAKE_GH_FAIL", "GraphQL: Could not resolve to a Repository")
+    op = finish(manager, manager.new_task(cloning(manager, destination))["operation"]["pr"])
+    assert op["status"] == "failed" and "Could not resolve to a Repository" in op["message"]
+    assert not pw.os.path.lexists(destination)
+    assert not json.loads(state.read_text())["agents"]

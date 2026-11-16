@@ -1910,13 +1910,19 @@ class Handler(BaseHTTPRequestHandler):
                 params = {k: v[0] for k, v in parse_qs(route.query).items()}
                 self.send_json(200, self.server.workspaces.preview(params))
             elif route.path == "/api/workspace-repos":
-                everything = parse_qs(route.query).get("all", [""])[0] == "1"
-                self.send_json(
-                    200,
-                    self.server.workspaces.local_repositories(everything)
-                    if self.server.workspaces
-                    else {"repos": [], "idle": 0},
-                )
+                query = parse_qs(route.query)
+                if "repo" in query:
+                    # One repository named in New task: its clones, or where it is cloned.
+                    if not self.server.workspaces:
+                        raise ValueError("Workspace actions are not enabled")
+                    answer = self.server.workspaces.repository(query["repo"][0])
+                elif self.server.workspaces:
+                    answer = self.server.workspaces.local_repositories(
+                        query.get("all", [""])[0] == "1"
+                    )
+                else:
+                    answer = {"repos": [], "idle": 0}
+                self.send_json(200, answer)
             elif route.path == "/api/settings":
                 self.send_json(200, dashboard_settings.settings(self.server.home))
             elif route.path == "/api/voice-turn":

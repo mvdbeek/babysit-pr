@@ -644,6 +644,20 @@ records the watch in the dashboard's own state directory (`BABYSIT_HOME`), and t
 Scheduled tab lists it with the sessions started by `wt --exit-when-done`. The
 operation records `exit_when_done`.
 
+**Clone another repository from GitHub**, in New task, starts a task in a repository
+that has no clone on this machine. Name it as `owner/name` or paste its GitHub link;
+the dialog asks the server (`GET /api/workspace-repos?repo=<owner>/<name>`, which
+answers its local `clones` or the `destination`) and shows where it will be cloned:
+`~/src/<name>`, or `~/src/<owner>--<name>` when the first path is occupied, as **Clone
+and create** does for a pull request. The request then carries `destination` in place
+of `clone`, the server checks it is still the free destination, and the launch runs
+`gh repo clone` before it branches; existing content is never overwritten, and a clone
+that fails fails the task with `gh`'s message. A repository that already has a clone is
+chosen in the picker instead, and the dialog says so. New tasks started together for
+the same new repository share one clone. Placed on a worker, the task is cloned there
+under the worker's own `src`, and `destination` is not used. With no local clone at
+all, the dialog opens with this box ticked.
+
 **Also work in other repositories**, in New task, lists the other local clones (those
 the repository picker offers). Each one chosen is passed to the helper as
 `--with <clone>` (the request field is `also: [clone paths]`, at most 4, never the
@@ -955,6 +969,20 @@ wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root 
 wtpr [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
 ```
 
+`-r <repo>` names the clone `~/src/<repo>` (`galaxy` by default). `-r <owner>/<name>`
+names a GitHub repository instead: `wt` uses its clone under `~/src`, the folder
+`<name>` or `<owner>--<name>`, whichever is a clone whose `upstream` or `origin` names
+that repository (any remote, for a clone with neither, as the dashboard lists clones),
+and bases are fetched from that repository with the GitHub token. When neither is,
+`wt` clones it first with `gh repo clone` into the first of those two folders that is
+free (`gh`'s login and protocol; a fork also gets its `upstream` remote), saying so on
+stderr, and then makes the worktree under `~/src/worktrees/<folder>/` (the dashboard
+keeps a repository's worktrees under `~/src/worktrees/<name>/` whichever folder its
+clone is in). Two folders that both hold something else are refused by name. A clone
+kept at `~/src/<owner>/<name>` is still used as that folder. A `-r <repo>` whose
+folder is missing is refused with that hint rather than cloned, since a folder name
+alone names no repository.
+
 For branch worktrees, `wt` fetches the base from `origin` when that remote exists.
 Without `origin`, it uses the requested local base instead: for example,
 `wt -r repo main my-feature` creates `my-feature` from local `main` without network
@@ -1104,11 +1132,13 @@ launch's agent and Claude account, Docker only when that launch has it, at most 
 levels deep and a few an hour per lineage, a worker's never on this machine. One whose
 machine is full, not checked yet, or already running 4 working sub-task agents waits
 for room (see [Launches waiting for room](#launches-waiting-for-room)), and `wt` says so
-and returns rather than waiting with it. A worker clones
-the repository there if it is missing, as it does for other new tasks. Only
+and returns rather than waiting with it. A repository with no clone where the sub-task
+lands is cloned there first, as for other new tasks: on a worker under its `src`, on
+this machine into `~/src/<name>` or `~/src/<owner>--<name>`. Only
 `wt <base> <branch>` with a prompt is handed over; anything else is refused rather than
-run here. `-r` there also takes `owner/name`, which a sandbox that cannot read the
-clone (a worker's) needs. `wt` prints the controller's progress on stderr; from a worker
+run here. A sandbox that cannot read the clone, because it is a worker's or because
+there is none yet, names the repository as `-r owner/name`. `wt` prints the
+controller's progress on stderr; from a worker
 it waits up to four minutes for the launch, then says it is still launching there and
 not to start it again. The
 dashboard shows "Started by …" (the asking agent, its directory, machine and session)

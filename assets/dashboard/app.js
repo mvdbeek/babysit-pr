@@ -3268,8 +3268,6 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       workspaceData.agent_choices ? null : loadWorkspaces(),
     ]);
     if (workspaceDialogItem !== owner) return;
-    if (!recent.repos.length && !recent.idle)
-      throw Error("No local clones were found to start a task in.");
     let repos = recent.repos;
     let everything = null;
     const form = el("form", undefined, "new-task-form");
@@ -3322,8 +3320,10 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     field("Repository and local clone", repo);
     // The task and its fields follow the repository choice, and the checkbox widening it.
     let aboveTask = repo;
+    let idleBox = null;
     if (recent.idle) {
       const idle = el("input");
+      idleBox = idle;
       idle.id = "new-task-idle";
       idle.type = "checkbox";
       const idleLabel = el("label", undefined, "workspace-later");
@@ -3347,6 +3347,128 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       form.append(idleLabel);
       aboveTask = idleLabel;
     }
+    // A GitHub repository with no clone here, which the launch clones first:
+    // { repo, destination } once the server has said where.
+    let fresh = null;
+    // The check of the repository typed, while it runs.
+    let checking = null;
+    const cloneNew = el("input");
+    cloneNew.id = "new-task-clone-new";
+    cloneNew.type = "checkbox";
+    const cloneLabel = el("label", undefined, "workspace-later");
+    cloneLabel.append(cloneNew, " Clone another repository from GitHub");
+    const cloneFields = el("div", undefined, "new-task-fields");
+    const cloneRepo = el("input");
+    cloneRepo.id = "new-task-clone-repo";
+    cloneRepo.placeholder = "owner/name or a GitHub link";
+    cloneRepo.autocapitalize = "off";
+    cloneRepo.spellcheck = false;
+    field("GitHub repository", cloneRepo, cloneFields);
+    cloneFields.hidden = true;
+    // Outside the fields: it also says when the picker took over for an existing clone.
+    const cloneNote = el("small", undefined, "new-task-clone-note");
+    cloneNote.setAttribute("role", "status");
+    cloneNote.hidden = true;
+    const note = (text) => {
+      cloneNote.textContent = text;
+      cloneNote.hidden = !text;
+    };
+    form.append(cloneLabel, cloneFields, cloneNote);
+    aboveTask = cloneNote;
+    // The task's repository and clone: the picker's choice, or the repository to clone.
+    const chosen = () => (cloneNew.checked ? fresh : repos[Number(repo.value)]);
+    // Set once the fields that follow the repository exist, below.
+    let chosenChanged = () => {};
+    function typedRepo() {
+      const text = cloneRepo.value.trim();
+      const link =
+        text.match(/^(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+\/[^/\s?#]+)/) ||
+        text.match(/^git@github\.com:([^/\s]+\/[^/\s]+)$/);
+      const slug = (link ? link[1] : text).replace(/\.git$/, "");
+      return /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/.test(slug) && !/\/\.\.?$/.test(slug)
+        ? slug
+        : null;
+    }
+    function cloneMode(on) {
+      cloneNew.checked = on;
+      cloneFields.hidden = !on;
+      cloneRepo.required = on;
+      // A hidden field that is invalid would block the form without saying why.
+      if (!on) cloneRepo.setCustomValidity("");
+      repo.disabled = on;
+      repo.required = !on;
+      syncSelect(repo);
+    }
+    async function checkRepo() {
+      const slug = typedRepo();
+      const refuse = (text) => {
+        cloneRepo.setCustomValidity(text);
+        note(text);
+      };
+      fresh = null;
+      cloneRepo.setCustomValidity("");
+      note(slug ? `Checking ${slug}…` : "");
+      if (!slug && cloneRepo.value.trim())
+        refuse("Name the repository as owner/name, or paste its GitHub link.");
+      try {
+        const found = slug
+          ? await get(`/api/workspace-repos?repo=${encodeURIComponent(slug)}`)
+          : null;
+        // Edited meanwhile: the check of what is typed now answers.
+        if (!found || typedRepo() !== slug || !cloneNew.checked) return;
+        if (found.clones.length) {
+          // Already cloned: the picker takes over, listing every clone as of now so this
+          // one is there, also when another launch only just made it.
+          const all = (await get("/api/workspace-repos?all=1")).repos;
+          if (typedRepo() !== slug || !cloneNew.checked) return;
+          const path = found.clones[0].clone;
+          const listed = all.findIndex(
+            (choice) => choice.clone === path && choice.repo.toLowerCase() === slug.toLowerCase(),
+          );
+          if (listed < 0) {
+            refuse(`${slug} is already cloned at ${path}. Reopen this dialog to choose it.`);
+            return;
+          }
+          everything = all;
+          if (idleBox) idleBox.checked = true;
+          cloneMode(false);
+          fillRepos(everything);
+          repo.value = String(listed);
+          syncSelect(repo);
+          note(`${slug} is already cloned at ${path}, which is now chosen.`);
+        } else if (found.destination) {
+          fresh = { repo: slug, destination: found.destination };
+          note(
+            `Cloned into ${found.destination} before the task starts. On another machine it is cloned under that machine’s source directory.`,
+          );
+        } else {
+          refuse(
+            "Both clone destinations already exist. Move conflicting content before trying again.",
+          );
+        }
+      } catch (error) {
+        // Never on the hidden field of a box unticked meanwhile.
+        if (typedRepo() === slug && cloneNew.checked) refuse(error.message);
+      } finally {
+        chosenChanged();
+      }
+    }
+    cloneNew.onchange = () => {
+      cloneMode(cloneNew.checked);
+      note("");
+      if (cloneNew.checked && cloneRepo.value.trim()) checking = checkRepo();
+      else chosenChanged();
+    };
+    cloneRepo.oninput = () => {
+      fresh = null;
+      cloneRepo.setCustomValidity("");
+      note("");
+    };
+    cloneRepo.onchange = () => {
+      checking = checkRepo();
+    };
+    // With no clone to pick, cloning is the only way to start.
+    if (!recent.repos.length && !recent.idle) cloneMode(true);
     // Other clones the task also covers: the branch is checked out in each and the
     // agent's sandbox may write there (`wt --with`).
     const also = new Set();
@@ -3361,7 +3483,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     // At most this many: each lengthens the agent line the helper types.
     const ALSO_LIMIT = 4;
     function fillAlso() {
-      const main = repos[Number(repo.value)];
+      const main = chosen();
       // A clone named like the task's repository would share its worktree directory.
       const shared = main?.repo.split("/")[1].toLowerCase();
       const clones = new Map();
@@ -3487,14 +3609,18 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       machineField,
       machineChoice,
     } = agentFields({
-      repo: repos[Number(repo.value)]?.repo,
+      repo: chosen()?.repo,
       hints: () => ({
         ...(fileIssue.checked ? { kind: "issue" } : {}),
         ...(also.size ? { also: "1" } : {}),
       }),
     });
     placementChanged = refreshPlacement;
-    repo.addEventListener("change", () => setRepo(repos[Number(repo.value)]?.repo));
+    repo.addEventListener("change", () => setRepo(chosen()?.repo));
+    chosenChanged = () => {
+      fillAlso();
+      setRepo(chosen()?.repo);
+    };
     const execution = el("details", undefined, "execution-settings");
     const summary = el("summary");
     const fields = el("div", undefined, "execution-fields");
@@ -3568,7 +3694,21 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
         task.reportValidity();
         return;
       }
-      const choice = repos[Number(repo.value)];
+      if (cloneNew.checked) {
+        // Off while the check runs, so a second click cannot start a second task.
+        submit.disabled = true;
+        // Started straight from the field: its check may still run, or not have begun.
+        await checking;
+        if (cloneNew.checked && (!fresh || fresh.repo !== typedRepo()))
+          await (checking = checkRepo());
+        submit.disabled = false;
+        // Refused, or an existing clone was chosen instead: the reader looks first.
+        if (!cloneNew.checked || !fresh) {
+          cloneRepo.reportValidity();
+          return;
+        }
+      }
+      const choice = chosen();
       if (uploading(files)) return;
       submit.disabled = true;
       submit.dataset.inflight = "true";
@@ -3579,7 +3719,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
           headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-new" },
           body: JSON.stringify({
             repo: choice.repo,
-            clone: choice.clone,
+            ...(cloneNew.checked ? { destination: choice.destination } : { clone: choice.clone }),
             ...(fileIssue.checked
               ? { issue_title: title.value }
               : { name: name.value, ...(base.value.trim() ? { base: base.value.trim() } : {}) }),

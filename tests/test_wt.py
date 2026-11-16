@@ -2048,6 +2048,67 @@ def test_wt_local_branch_worktrees_without_origin(repo, monkeypatch, other_remot
     assert not (root / "invalid").exists()
 
 
+def cloned_by_gh(state):
+    return [call for call in state_of(state).get("gh", []) if call[:2] == ["repo", "clone"]]
+
+
+def test_wt_r_owner_name_uses_that_repositorys_clone_and_clones_a_missing_one(repo, monkeypatch):
+    home, git, state = repo
+    monkeypatch.setenv("FAKE_HEAD", str(home.parent / "head.git"))
+    # ~/src/repo tracks base/repo, so that is its clone.
+    run_tool("wt", "-r", "base/repo", "-p", "Go", "feature", "named")
+    path = home / "src/worktrees/repo/named"
+    assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "named"
+    assert cloned_by_gh(state) == []
+    # Once that folder is another repository's, base/repo has no clone: gh makes one
+    # in the second place the dashboard would also choose.
+    git("remote", "set-url", "origin", "https://github.com/unrelated/repo.git")
+    result = run_tool("wt", "-r", "base/repo", "-p", "Go", "feature", "fresh")
+    clone = home / "src/base--repo"
+    assert f"wt: no clone of base/repo here; cloning it into {clone}" in result.stderr
+    assert cloned_by_gh(state) == [["repo", "clone", "base/repo", str(clone)]]
+    path = home / "src/worktrees/base--repo/fresh"
+    assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "fresh"
+    assert git("rev-parse", "HEAD", cwd=path) == git("rev-parse", "feature")
+    assert state_of(state)["agents"][-1]["task"] == "Go"
+    # The next run finds that clone.
+    result = run_tool("wt", "-r", "base/repo", "main", "again")
+    assert "cloning" not in result.stderr and len(cloned_by_gh(state)) == 1
+    assert (home / "src/worktrees/base--repo/again").is_dir()
+
+
+def test_wt_says_why_it_has_no_clone_to_work_in(repo, monkeypatch):
+    home, git, state = repo
+    result = run_tool("wt", "-r", "nowhere", "main", "x", check=False)
+    assert result.returncode == 1
+    assert result.stderr == (
+        f"wt: no clone at {home}/src/nowhere; name its GitHub repository "
+        "(-r owner/name) to clone it\n"
+    )
+    # Both places a clone of else/repo could be are something else.
+    (home / "src/else--repo").mkdir()
+    result = run_tool("wt", "-r", "else/repo", "main", "x", check=False)
+    assert result.returncode == 1
+    assert result.stderr == (
+        f"wt: {home}/src/repo and {home}/src/else--repo are not clones of else/repo; "
+        "name its clone's folder under ~/src with -r\n"
+    )
+    result = run_tool("wt", "-r", "else/..", "main", "x", check=False)
+    assert result.returncode == 1 and "wt: -r: Not a GitHub repository" in result.stderr
+    assert cloned_by_gh(state) == []
+    # A clone gh cannot make stops the run before any worktree or session.
+    monkeypatch.setenv("FAKE_GH_FAIL", "Could not resolve to a Repository")
+    result = run_tool("wt", "-r", "new/thing", "-p", "Go", "main", "x", check=False)
+    assert result.returncode == 1
+    assert "Could not resolve to a Repository" in result.stderr
+    assert result.stderr.endswith("wt: gh repo clone new/thing failed: status 1\n")
+    assert not (home / "src/thing").exists() and not (home / "src/worktrees/thing").exists()
+    assert not state_of(state)["agents"]
+    # Nothing is cloned for a command line that is refused anyway.
+    result = run_tool("wt", "-r", "new/thing", "--effort", "warp", "main", "x", check=False)
+    assert result.returncode == 1 and len(cloned_by_gh(state)) == 1
+
+
 def test_wt_does_not_hide_origin_fetch_failure(repo):
     home, git, _ = repo
     # A GitHub repository the user's config sends to a clone that is not there.
@@ -2431,6 +2492,62 @@ def test_auto_runs_here_when_the_dashboard_places_it_here(tmp_path, dashboard):
         t.stderr.getvalue()
         == "wt: auto: clone present, 17/20 free; Chonk: full (6/6); running here\n"
     )
+
+
+def test_a_named_repository_resolves_to_its_folder_under_src(tmp_path):
+    t = tool(env={"HOME": str(tmp_path)})
+    t.remote_slugs = lambda path: {"origin": "mine/thing", "upstream": "new/thing"}
+    # No folder yet: where it will be cloned.
+    parsed = options(repo="New/Thing")
+    t.named_repo("wt", parsed)
+    assert (parsed.repo, parsed.slug) == ("Thing", "New/Thing")
+    # A clone with a remote naming it, whatever the case.
+    (tmp_path / "src/thing/.git").mkdir(parents=True)
+    parsed = options(repo="New/thing")
+    t.named_repo("wt", parsed)
+    assert (parsed.repo, parsed.slug) == ("thing", "New/thing")
+    # A folder name and a --repo-path are left as they are.
+    for values in ({"repo": "thing"}, {"repo": "new/thing", "repo_path": "/clones/thing"}):
+        parsed = options(**values)
+        t.named_repo("wt", parsed)
+        assert (parsed.repo, parsed.slug) == (values["repo"], "")
+    # Its clone in the second folder wins over a first folder that is free again, as
+    # after the dashboard cloned it beside something since removed.
+    (tmp_path / "src/thing").rename(tmp_path / "src/new--thing")
+    parsed = options(repo="new/thing")
+    t.named_repo("wt", parsed)
+    assert (parsed.repo, parsed.slug) == ("new--thing", "new/thing")
+    # A remote added for someone's fork does not make a clone that repository's, as
+    # the dashboard lists it; with neither upstream nor origin, any remote does.
+    t.remote_slugs = lambda path: {"origin": "mine/thing", "jdoe": "jdoe/thing"}
+    parsed = options(repo="jdoe/thing")
+    t.named_repo("wt", parsed)
+    assert (parsed.repo, parsed.slug) == ("thing", "jdoe/thing")
+    t.remote_slugs = lambda path: {"jdoe": "jdoe/thing"}
+    (tmp_path / "src/new--thing").rename(tmp_path / "src/jdoe--thing")
+    parsed = options(repo="jdoe/thing")
+    t.named_repo("wt", parsed)
+    assert (parsed.repo, parsed.slug) == ("jdoe--thing", "jdoe/thing")
+    # A clone kept at ~/src/<owner>/<name> is that folder, as it always was.
+    (tmp_path / "src/nested/thing/.git").mkdir(parents=True)
+    parsed = options(repo="nested/thing")
+    t.named_repo("wt", parsed)
+    assert (parsed.repo, parsed.slug) == ("nested/thing", "")
+
+
+def test_a_named_repository_with_no_clone_here_still_starts_on_a_worker(tmp_path, dashboard):
+    dashboard.launch()
+    t = controller(tmp_path, dashboard)
+
+    def unread(*_):
+        raise AssertionError("there is no clone here to read")
+
+    t.remote_slugs = t.branch_exists = unread
+    parsed = options(repo="new/thing", prompt="go", positional=["main", "feat"])
+    t.named_repo("wt", parsed)
+    assert t.launch_elsewhere("wt", parsed, "chonk") is True
+    assert dashboard.requests[0]["body"]["repo"] == "new/thing"
+    assert not (tmp_path / "src/thing").exists()
 
 
 def test_a_named_worker_goes_straight_to_the_dashboard(tmp_path, dashboard):

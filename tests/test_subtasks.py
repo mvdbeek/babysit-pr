@@ -131,7 +131,6 @@ def test_a_subtask_starts_here_in_this_machines_clone_and_names_who_asked(local)
         ({"name": "a\x1bb"}, "Invalid launch fields"),
         ({"machine": "Chonk"}, "Name a machine, or auto"),
         ({"repo": "nope"}, "Choose a repository"),
-        ({"repo": "other/repo"}, "This machine has no clone of other/repo"),
         ({"machine": "elsewhere"}, "Unknown machine elsewhere"),
         ({"name": "a b"}, "Name the new branch"),
         ({"task": ""}, "Supply a task"),
@@ -144,6 +143,35 @@ def test_a_subtask_is_checked_like_a_new_task_and_more(local, change, message): 
         request = {**launch(), "extra": 1}
     with pytest.raises(ValueError, match=message):
         manager.subtask(request, parent())
+    assert not [op for op in manager.state()["operations"].values() if op.get("parent")]
+
+
+def test_a_subtask_here_clones_a_repository_this_machine_has_no_clone_of(local):  # noqa: F811
+    manager, _, clone_git, state, _ = local
+    # The only clone tracks another repository: its folder is taken, the second is free.
+    clone_git("remote", "set-url", "origin", "https://github.com/unrelated/repo.git")
+    destination = str(manager.src / "base--repo")
+    op = manager.subtask(launch(), parent())["operation"]
+    assert op["clone"] == destination and op["fresh_clone"] is True
+    op = finish(manager, op["pr"])
+    assert op["status"] == "complete", op
+    gh = json.loads(state.read_text())["gh"]
+    assert [call for call in gh if call[:2] == ["repo", "clone"]] == [
+        ["repo", "clone", "base/repo", destination]
+    ]
+    # The next one finds that clone, and clones nothing.
+    again = finish(manager, manager.subtask(launch(name="next"), parent())["operation"]["pr"])
+    assert again["status"] == "complete", again
+    assert again["clone"] == str((manager.src / "base--repo").resolve())
+    assert len([c for c in json.loads(state.read_text())["gh"] if c[:2] == ["repo", "clone"]]) == 1
+
+
+def test_a_subtask_is_refused_when_nowhere_is_free_to_clone_its_repository(local):  # noqa: F811
+    manager, *_ = local
+    (manager.src / "other").mkdir()
+    (manager.src / "new--other").mkdir()
+    with pytest.raises(ValueError, match="no clone of new/other, and both places to clone it"):
+        manager.subtask(launch(repo="new/other"), parent())
     assert not [op for op in manager.state()["operations"].values() if op.get("parent")]
 
 

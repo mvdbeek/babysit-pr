@@ -1821,6 +1821,46 @@ class Workspaces:
                 found.append({"repo": slug, "clone": str(root), "remote": name, "active": active})
         return {"repos": found, "idle": idle}
 
+    def repository(self, repo):
+        """A GitHub repository named for a new task: its local clones, or with none
+        where a launch here clones it first (None when both destinations are taken)."""
+        if not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
+            raise ValueError("Name a GitHub repository as owner/name")
+        listed = self.local_repositories(everything=True)["repos"]
+        clones = [r for r in listed if r["repo"].lower() == repo.lower()]
+        destination = None if clones else self.clone_destination(repo)
+        return {"repo": repo, "clones": clones, "destination": destination}
+
+    def clone_destination(self, repo):
+        """Where a new task clones ``repo``, which has no clone here: where a launch in
+        this process is cloning it right now (its folder may exist, not yet listed as a
+        clone of ``repo``), else the first free destination; None when both are taken."""
+        for key in list(self.workers):
+            op = self.operation(key)
+            if op and op.get("fresh_clone") and op["subject"]["repo"].lower() == repo.lower():
+                return op["clone"]
+        return self.destination({"repo": repo})
+
+    def new_clone(self, repo, destination, listed):
+        """The clone a new task makes first for ``repo``, and whether it is still to be made.
+
+        ``destination`` is where the request expects it, as ``repository`` answered. A
+        clone of ``repo`` there by now is used as it is: another launch made it, or this
+        one waited for room meanwhile. One anywhere else is refused, so a request made
+        before it existed never clones the repository a second time.
+        """
+        cloned = [r["clone"] for r in listed if r["repo"].lower() == repo.lower()]
+        owner, name = repo.split("/")
+        # Only as ``destination`` spells one: never another path that resolves there.
+        offered = {str(self.src / name), str(self.src / f"{owner}--{name}")}
+        if destination in offered and (made := str(Path(destination).resolve())) in cloned:
+            return made, False
+        if cloned:
+            raise ValueError(f"{repo} already has a local clone at {cloned[0]}; choose it")
+        if not destination or destination != self.clone_destination(repo):
+            raise ValueError("Clone destination changed; refresh before confirming")
+        return destination, True
+
     def new_task(self, request, parent=None, room=None, waits=None, resume=None):
         """Start an agent on a task with no PR or issue behind it, in a new workspace.
 
@@ -1831,6 +1871,8 @@ class Workspaces:
         each and the agent's sandbox may write there (`wt --with`); on a worker, in its
         own clone of each one's repository, under its src. ``parent``, the launch
         a sub-task was asked for from (see ``subtask``), is recorded on the operation.
+        ``destination`` in place of ``clone`` names a repository with no clone on this
+        machine: a launch here clones it there first (see ``new_clone``).
 
         A machine named that has no room (or ``room``, why the one ``subtask`` named has
         none) records the task as waiting for it; ``waits`` is how ``run_waiting`` starts
@@ -1839,6 +1881,7 @@ class Workspaces:
         allowed = {
             "repo",
             "clone",
+            "destination",
             "base",
             "name",
             "issue_title",
@@ -1873,6 +1916,7 @@ class Workspaces:
             or any(not isinstance(path, str) for path in also)
             or not isinstance(bases, dict)
             or any(not isinstance(base, str) for base in bases.values())
+            or {"clone", "destination"} <= set(request)
         ):
             raise ValueError("Invalid new task parameters")
         tags = work_tags.tag_names(request.get("tags", []))
@@ -1880,6 +1924,7 @@ class Workspaces:
         if not SLUG.fullmatch(repo) or repo.split("/")[1] in {".", ".."}:
             raise ValueError("Choose a repository")
         clone = request.get("clone", "")
+        fresh = False  # Whether this launch clones the repository first.
         listed = self.local_repositories(everything=True)["repos"]
         if room is None:
             try:
@@ -1908,8 +1953,10 @@ class Workspaces:
             if request.get("issue_title", "").strip():
                 # Refused before an issue is filed for a launch that cannot start.
                 raise ValueError(worker_refusal({"kind": "issue"}, remote))
-            # The worker's own clone, checked there; nothing clones on a worker.
+            # The worker's own clone, checked there, and made there when it is missing.
             clone = f"{remote.src.rstrip('/')}/{repo.split('/')[1]}"
+        elif "destination" in request:
+            clone, fresh = self.new_clone(repo, request["destination"], listed)
         elif not any(r["repo"] == repo and r["clone"] == clone for r in listed):
             raise ValueError(f"Choose a local clone of {repo}")
         if len(also) > ALSO_LIMIT:
@@ -1971,8 +2018,9 @@ class Workspaces:
             base = request.get("base", "").strip()
 
             def valid(branch):
-                # A worker's clone is checked there; its wt checks the name again.
-                if remote is not None:
+                # A worker's clone is checked there, and one still to be made has no
+                # Git to ask; wt checks the name again in either.
+                if remote is not None or fresh:
                     return remote_probe.BRANCH.fullmatch(branch) and ".." not in branch
                 return self.valid_branch(clone, branch)
 
@@ -1991,6 +2039,7 @@ class Workspaces:
             "status": "queued",
             "machine": machine,
             "clone": clone,
+            **({"fresh_clone": True} if fresh else {}),
             "path": None,
             "agent": agent,
             "model": request.get("model") or None,
@@ -2395,14 +2444,22 @@ class Workspaces:
 
     def subtask_clone(self, repo):
         """This machine's clone for a sub-task: ``<src>/<name>`` when it is one, else the
-        first listed; a repository with no clone here is refused."""
+        first listed; a repository with no clone here is cloned first, as New task
+        clones one (only a launch on this machine asks: any process here reaches New
+        task anyway)."""
         found = [
             r
             for r in self.local_repositories(everything=True)["repos"]
             if r["repo"].lower() == repo.lower()
         ]
         if not found:
-            raise ValueError(f"This machine has no clone of {repo}")
+            destination = self.clone_destination(repo)
+            if not destination:
+                raise ValueError(
+                    f"This machine has no clone of {repo}, and both places to clone it "
+                    f"under {self.src} are taken"
+                )
+            return {"repo": repo, "destination": destination}
         own = str((self.src / repo.split("/")[1]).resolve())
         chosen = next((r for r in found if r["clone"] == own), found[0])
         return {"repo": chosen["repo"], "clone": chosen["clone"]}
@@ -3439,7 +3496,9 @@ class Workspaces:
         try:
             lock_dir = self.home / "workspace-locks"
             lock_dir.mkdir(mode=0o700, exist_ok=True)
-            key = hashlib.sha256(op["clone"].encode()).hexdigest()
+            # By its real path, which a clone still to be made has too: a launch that
+            # clones it and one that finds it listed afterwards wait for each other.
+            key = hashlib.sha256(os.path.realpath(op["clone"]).encode()).hexdigest()
             with (lock_dir / key).open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 self.save_operation(op, status="running", message="Revalidating local resources")
@@ -3447,8 +3506,14 @@ class Workspaces:
                 if op["action"] not in {"reopen", "handle"} and info["matches"]:
                     raise ValueError("A checkout appeared while queued; open or reopen it")
                 clone = Path(op["clone"])
-                if op["action"] == "clone-and-create" or (
-                    op["action"] == "handle" and not info["clones"]
+                fresh = op.get("fresh_clone")
+                # Another new task may have cloned it while this one waited for the lock.
+                if fresh and (made := checkout(clone)) and pr["repo"].lower() in made["remotes"]:
+                    fresh = False
+                if (
+                    fresh
+                    or op["action"] == "clone-and-create"
+                    or (op["action"] == "handle" and not info["clones"])
                 ):
                     if os.path.lexists(clone):
                         raise ValueError("Clone destination now exists; nothing was overwritten")
