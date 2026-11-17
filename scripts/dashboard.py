@@ -3,6 +3,7 @@
 
 import argparse
 import errno
+import functools
 import gzip
 import hashlib
 import ipaddress
@@ -1797,13 +1798,29 @@ class Handler(BaseHTTPRequestHandler):
                                 if not single[name].isdigit():
                                     raise ValueError("Expected a numeric page position")
                                 positions[name] = int(single[name])
+                        # A workspace's agent may run a session recorded outside its
+                        # checkout, which is read all the same.
+                        running = None
+                        if workspace_id is not None:
+                            running = functools.partial(
+                                agent_messages.running_sessions, workspace_id, machine
+                            )
                         value = (
                             workspace_viewer.transcript(
-                                path, single.get("session"), prefer=prefer, **positions
+                                path,
+                                single.get("session"),
+                                prefer=prefer,
+                                running=running,
+                                **positions,
                             )
                             if machine is None
                             else workspace_viewer.remote_transcript(
-                                self.server.home, machine, path, single.get("session"), **positions
+                                self.server.home,
+                                machine,
+                                path,
+                                single.get("session"),
+                                running=running,
+                                **positions,
                             )
                         )
                 except ValueError:

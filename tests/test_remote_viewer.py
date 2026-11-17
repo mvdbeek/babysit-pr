@@ -407,6 +407,50 @@ def test_remote_transcript_follows_appends_truncation_and_replacement(worker, mo
             wv.remote_transcript(worker.home, worker.machine, root, session)
 
 
+def test_the_session_probe_finds_one_session_in_any_directory(worker, monkeypatch):
+    monkeypatch.setenv("HOME", str(worker.host))
+    for session, agent, cwd in [
+        (CLAUDE_SID, "claude", worker.checkout),
+        (SIBLING_SID, "claude", worker.checkout.parent / "feature-2"),
+        (ELSEWHERE_SID, "codex", worker.host / "elsewhere"),
+    ]:
+        found = remote_probe._host_session(session)
+        assert [(s["id"], s["agent"], s["cwd"]) for s in found] == [(session, agent, str(cwd))]
+        assert remote_probe.validate_sessions(found) == found
+    assert remote_probe._host_session(str(uuid.UUID(int=9))) == []
+    # A copy under another folder: the one written last is the session's.
+    copy_of = claude_file(worker.host, worker.host / "moved", SIBLING_SID)
+    copy_of.write_text(jsonl(claude_turn("user", worker.host / "moved", "Later")))
+    os.utime(copy_of, (time.time() + 60,) * 2)
+    assert [s["title"] for s in remote_probe._host_session(SIBLING_SID)] == ["Later"]
+    for session in ("../x", "*", f"{CLAUDE_SID}\n", None):
+        with pytest.raises(ValueError, match="session ID"):
+            remote_probe._host_session(session)
+
+
+def test_a_workers_running_session_is_read_wherever_it_was_recorded(worker):
+    """An agent in the worker's workspace on a session recorded outside its checkout."""
+    root = str(worker.checkout)
+    asked = []
+
+    def running(*sessions):
+        return lambda: asked.append(sessions) or set(sessions)
+
+    args = (worker.home, worker.machine, root)
+    assert wv.remote_transcript(*args, CLAUDE_SID, running=running(SIBLING_SID))["entries"]
+    assert asked == []  # Recorded in the checkout: nobody looks at the agents.
+    for session, text in [(SIBLING_SID, "No"), (ELSEWHERE_SID, "Not here")]:
+        with pytest.raises(ValueError, match="not recorded"):
+            wv.remote_transcript(*args, session, running=running(CLAUDE_SID))
+        value = wv.remote_transcript(*args, session, running=running(session))
+        assert value["session"]["id"] == session and entries(value) == [text]
+        assert {s["id"] for s in value["sessions"]} == {CLAUDE_SID, CODEX_SID, session}
+        assert all("_file" not in s for s in value["sessions"])
+    missing = str(uuid.UUID(int=9))
+    with pytest.raises(ValueError, match="not recorded"):
+        wv.remote_transcript(*args, missing, running=running(missing))
+
+
 def test_remote_search_reads_the_workers_sessions_and_then_only_what_is_new(worker, monkeypatch):
     root = str(worker.checkout)
     found = wv.remote_search(worker.home, worker.machine, root, "codex task")
@@ -518,6 +562,26 @@ def test_views_resolve_worker_rows_and_ids_on_the_server(worker, dashboard_site,
     status, value = request(port, f"/api/workspace-transcript?key={key}&session={CLAUDE_SID}")
     assert status == 200 and entries(value) == ["Fix it", "Done"]
     assert ("mini", "w1") in wv._checkouts
+    # A session recorded outside the checkout opens once an agent in the workspace runs it.
+    elsewhere = f"/api/workspace-transcript?workspace=mini%2Fw1&session={ELSEWHERE_SID}"
+    status, value = request(port, elsewhere)
+    assert status == 400 and "not recorded" in value["error"]
+    store = read(worker.state)
+    store["machines"]["Mac mini"]["agents"] = [
+        {
+            "workspace_id": "w1",
+            "pane_id": "w1:p1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "agent_session": {"value": ELSEWHERE_SID},
+        }
+    ]
+    worker.state.write_text(json.dumps(store))
+    status, value = request(port, elsewhere)
+    assert status == 200 and entries(value) == ["Not here"]
+    # A row of the Workspaces tab names no workspace, so only its checkout's sessions.
+    status, value = request(port, f"/api/workspace-transcript?key={key}&session={ELSEWHERE_SID}")
+    assert status == 400 and "not recorded" in value["error"]
     for path, error in [
         (f"/api/workspace-diff?key={quote('m:mini:/etc', safe='')}", "Unknown workspace"),
         ("/api/workspace-diff?key=m%3Abox%3A%2Fsrc", "Unknown workspace"),

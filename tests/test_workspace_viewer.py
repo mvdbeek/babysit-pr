@@ -546,6 +546,52 @@ def test_transcript_refuses_unlisted_sessions(stores, tmp_path):
     }
 
 
+def test_a_running_agents_session_is_read_wherever_it_was_recorded(stores, tmp_path):
+    """An agent started in a pane that had left the checkout records its session under
+    that directory; the workspace it runs in shows it all the same."""
+    checkout, folder, day = stores
+    away, codex_away, nowhere = f"{SID[:-1]}2", f"{CODEX_SID[:-1]}3", f"{SID[:-1]}4"
+    common = {"sessionId": away, "cwd": "/elsewhere"}
+    write_jsonl(
+        folder.parent / "-elsewhere" / f"{away}.jsonl",
+        {"type": "user", **common, "message": {"content": "Profile the scripts"}},
+        {"type": "assistant", **common, "message": {"content": [{"type": "text", "text": "Ok."}]}},
+    )
+    write_jsonl(
+        day / f"rollout-c-{codex_away}.jsonl",
+        {"type": "session_meta", "payload": {"id": codex_away, "cwd": "/elsewhere"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Port it"}},
+    )
+    recorded = [s["id"] for s in wv.sessions(checkout)]
+    assert away not in recorded and codex_away not in recorded
+
+    def unasked():
+        raise AssertionError("a recorded session needs no look at the agents")
+
+    assert wv.transcript(checkout, SID, running=unasked)["session"]["id"] == SID
+    assert wv.transcript(checkout, running=unasked)["session"]["id"] in recorded
+    for session, agent, prompt in [
+        (away, "claude", "Profile the scripts"),
+        (codex_away, "codex", "Port it"),
+    ]:
+        with pytest.raises(ValueError, match="not recorded"):
+            wv.transcript(checkout, session)
+        # Some other session's agent does not open it either.
+        with pytest.raises(ValueError, match="not recorded"):
+            wv.transcript(checkout, session, running=lambda: {SID})
+        value = wv.transcript(checkout, session, running=lambda session=session: {session})
+        assert (value["session"]["id"], value["session"]["agent"]) == (session, agent)
+        assert value["session"]["title"] == prompt and value["entries"][0]["text"] == prompt
+        # Listed with the checkout's own, so the picker shows what is open.
+        assert sorted(s["id"] for s in value["sessions"]) == sorted([*recorded, session])
+        assert all("_file" not in s for s in value["sessions"])
+    # A session herdr names that no store holds stays unread, as does a malformed one.
+    with pytest.raises(ValueError, match="not recorded"):
+        wv.transcript(checkout, nowhere, running=lambda: {nowhere})
+    with pytest.raises(ValueError, match="listed session"):
+        wv.transcript(checkout, "../*", running=lambda: {"../*"})
+
+
 def test_long_text_is_clipped():
     assert wv.clip("x" * 30, 10).startswith("x" * 10) and "20 more" in wv.clip("x" * 30, 10)
     assert wv.clip({"a": 1}, 100) == '{"a": 1}'

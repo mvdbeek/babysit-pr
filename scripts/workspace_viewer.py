@@ -552,6 +552,10 @@ def details(path, agent):
     return found
 
 
+def codex_store():
+    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+
+
 def session_files(root):
     """Candidate transcript files: Claude folders for the checkout and its subdirectories,
     and every Codex rollout (each is matched on its recorded cwd)."""
@@ -569,8 +573,7 @@ def session_files(root):
         for entry in folders:
             for path in entry.glob("*.jsonl"):
                 yield "claude", path
-    codex = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
-    for path in codex.glob("*/*/*/rollout-*.jsonl"):
+    for path in codex_store().glob("*/*/*/rollout-*.jsonl"):
         yield "codex", path
 
 
@@ -586,32 +589,61 @@ def sessions(path):
             or not Path(found["cwd"]).is_relative_to(root)
         ):
             continue
-        try:
-            stat = file.stat()
-        except OSError:
-            continue
-        title = (found["title"] or "").strip()
-        listed.append(
-            {
-                "id": found["id"],
-                "agent": agent,
-                "updated": stat.st_mtime,
-                "size": stat.st_size,
-                "title": title.splitlines()[0][:160] if title else None,
-                "_file": file,
-            }
-        )
-        if agent == "claude":
-            home = claude_accounts.transcript_home(file)
-            account = claude_accounts.account_name(home) if home else None
-            if home and (account is not None or home != claude_accounts.current_home()):
-                listed[-1].update(
-                    claude_config_dir=str(home),
-                    claude_config_env=claude_accounts.config_environment(home),
-                    claude_account=account,
-                )
+        row = session_row(agent, file, found)
+        if row:
+            listed.append(row)
     listed.sort(key=lambda s: s["updated"], reverse=True)
     return listed[:MAX_SESSIONS]
+
+
+def session_row(agent, file, found):
+    """A listing's row for a session with these ``details``, or None once its file is gone."""
+    try:
+        stat = file.stat()
+    except OSError:
+        return None
+    title = (found["title"] or "").strip()
+    row = {
+        "id": found["id"],
+        "agent": agent,
+        "updated": stat.st_mtime,
+        "size": stat.st_size,
+        "title": title.splitlines()[0][:160] if title else None,
+        "_file": file,
+    }
+    if agent == "claude":
+        home = claude_accounts.transcript_home(file)
+        account = claude_accounts.account_name(home) if home else None
+        if home and (account is not None or home != claude_accounts.current_home()):
+            row.update(
+                claude_config_dir=str(home),
+                claude_config_env=claude_accounts.config_environment(home),
+                claude_account=account,
+            )
+    return row
+
+
+def session_anywhere(session):
+    """A session's row wherever on this machine it was recorded, or None.
+
+    ``sessions`` lists what was recorded in the checkout. An agent started in a pane
+    that had left the checkout records its session under that other directory, though
+    herdr lists it in the checkout's workspace.
+    """
+    files = [
+        ("claude", file)
+        for home in claude_accounts.homes()
+        for file in (home / "projects").glob(f"*/{session}.jsonl")
+    ]
+    # A rollout is named rollout-STARTED-SESSION.jsonl.
+    files += [("codex", file) for file in codex_store().glob(f"*/*/*/rollout-*-{session}.jsonl")]
+    rows = []
+    for agent, file in files:
+        found = details(file, agent)
+        row = session_row(agent, file, found) if found and found["id"] == session else None
+        if row:
+            rows.append(row)
+    return max(rows, key=lambda s: s["updated"], default=None)
 
 
 def remote_sessions(home, machine, path):
@@ -626,29 +658,37 @@ def remote_sessions(home, machine, path):
         cached = _sessions.get(key)
     if cached and time.monotonic() - cached[0] < SESSION_TTL:
         return cached[1]
-    listed = []
-    for found in probe(home, machine, "sessions", root=path):
-        listed.append(
-            {
-                "id": found["id"],
-                "agent": found["agent"],
-                "updated": found["updated"],
-                "size": found["size"],
-                "title": remote_probe.display_text(found["title"]),
-                "_file": found["file"],
-                "_cwd": found["cwd"],
-                "_cwd_exists": found["cwd_exists"],
-                "_home": found["home"],
-            }
-        )
-        if found["account"] is not None:
-            listed[-1]["claude_account"] = found["account"]
+    listed = [remote_row(found) for found in probe(home, machine, "sessions", root=path)]
     with _lock:
         _sessions.pop(key, None)
         _sessions[key] = (time.monotonic(), listed)
         while len(_sessions) > SESSION_LISTINGS:
             _sessions.pop(next(iter(_sessions)), None)
     return listed
+
+
+def remote_row(found):
+    """A listing's row for a session a worker's probe ``found``."""
+    row = {
+        "id": found["id"],
+        "agent": found["agent"],
+        "updated": found["updated"],
+        "size": found["size"],
+        "title": remote_probe.display_text(found["title"]),
+        "_file": found["file"],
+        "_cwd": found["cwd"],
+        "_cwd_exists": found["cwd_exists"],
+        "_home": found["home"],
+    }
+    if found["account"] is not None:
+        row["claude_account"] = found["account"]
+    return row
+
+
+def remote_session_anywhere(home, machine, session):
+    """A worker's session wherever on it it was recorded, as ``session_anywhere``."""
+    found = probe(home, machine, "session", session=session)
+    return remote_row(found[0]) if found and found[0]["id"] == session else None
 
 
 class Transcript:
@@ -1101,7 +1141,16 @@ def local_read(parser, file, save):
     return parser.update(file, save)
 
 
-def transcript(path, session=None, before=None, after=None, prefer=None, around=None, later=None):
+def transcript(
+    path,
+    session=None,
+    before=None,
+    after=None,
+    prefer=None,
+    around=None,
+    later=None,
+    running=None,
+):
     """One page of a session's conversation.
 
     The newest page by default; ``before`` pages back from an index, and ``after``
@@ -1109,6 +1158,10 @@ def transcript(path, session=None, before=None, after=None, prefer=None, around=
     ``around`` centres a page on an index (a search hit) and ``later`` pages on from
     one. Without a ``session``, ``prefer`` is chosen when it is recorded here, else the
     newest.
+
+    ``running`` answers the sessions of the agents in the checkout's workspace. It is
+    asked only about a ``session`` not recorded in the checkout, which is then read from
+    wherever it was recorded: the agent runs here, whichever directory it started in.
     """
     return transcript_page(
         sessions(path),
@@ -1120,11 +1173,21 @@ def transcript(path, session=None, before=None, after=None, prefer=None, around=
         prefer,
         around,
         later,
+        elsewhere(running, session_anywhere),
     )
 
 
 def remote_transcript(
-    home, machine, path, session=None, before=None, after=None, prefer=None, around=None, later=None
+    home,
+    machine,
+    path,
+    session=None,
+    before=None,
+    after=None,
+    prefer=None,
+    around=None,
+    later=None,
+    running=None,
 ):
     """``transcript`` of a worker's checkout: its listing and new bytes, parsed here."""
 
@@ -1141,12 +1204,23 @@ def remote_transcript(
         prefer,
         around,
         later,
+        elsewhere(running, lambda session: remote_session_anywhere(home, machine, session)),
     )
 
 
-def transcript_page(listed, key_of, read, session, before, after, prefer, around=None, later=None):
+def elsewhere(running, find):
+    """Finds a session no checkout listing has, if an agent in the workspace runs it."""
+    if running is None:
+        return None
+    return lambda session: find(session) if session in running() else None
+
+
+def transcript_page(
+    listed, key_of, read, session, before, after, prefer, around=None, later=None, unlisted=None
+):
     """A page of one ``listed`` session, kept in the store under ``key_of(file)`` and
-    brought up to date by ``read(parser, file, save)``."""
+    brought up to date by ``read(parser, file, save)``. ``unlisted(session)`` is the row
+    of an asked-for session the listing lacks, or None; it is then listed with the rest."""
     if session is None:
         if not listed:
             return {
@@ -1162,6 +1236,10 @@ def transcript_page(listed, key_of, read, session, before, after, prefer, around
         if not isinstance(session, str) or not SESSION.match(session):
             raise ValueError("Choose a listed session")
         chosen = next((s for s in listed if s["id"] == session), None)
+        if chosen is None and unlisted:
+            chosen = unlisted(session)
+            if chosen:
+                listed = sorted([chosen, *listed], key=lambda s: s["updated"], reverse=True)
         if chosen is None:
             raise ValueError("That session is not recorded for this workspace")
     # A first parse of a large file takes a while; a request meanwhile is answered from
