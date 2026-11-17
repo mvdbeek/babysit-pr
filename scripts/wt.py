@@ -953,6 +953,11 @@ def herdr_error_message(output: str) -> str:
     return output.strip()
 
 
+def dicts(value: object) -> list[dict[str, object]]:
+    """The objects in a list herdr answered, whatever else the reply holds."""
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
 def cmux_workspace_ref(listing: str, directory: str) -> str:
     """The ref of the first cmux workspace whose ``current_directory`` is the worktree."""
     try:
@@ -1888,28 +1893,35 @@ class Tool:
             sample = os.path.join(self.env.get("TMPDIR") or "/tmp", "wt-prompt.XXXXXXXX")
             self.command_for(options, lambda _: sample, directory=directory)
         # `--dir` into a workspace already open on the checkout: (workspace, pane to split).
-        held = self.workspace_in_place(directory, mux) if options.directory else None
+        held, listed = None, {}
+        if options.directory:
+            listed = self.open_workspaces(mux)
+            on_checkout = [space for space, path in listed.items() if path == directory]
+            held = self.pane_to_split(on_checkout, directory, mux) if on_checkout else None
         if held:
             # Its pane is split off below, once nothing else can refuse the launch.
             reply = HerdrOpen(False, "", held[0])
         else:
-            # A clone's own checkout is its workspace; `worktree open` is for a checkout
-            # under one, which only `--dir` tells apart.
-            verb = "worktree open"
+            # A clone's own checkout is opened as a worktree of itself (`--dir` only):
+            # herdr records no checkout for a workspace made with `workspace create`,
+            # and the dashboard finds a workspace by its checkout.
             argv = [*tool, "worktree", "open", "--cwd", repo_path, "--path", directory, *label]
-            if options.directory and repo_path == directory:
-                verb = "workspace create"
-                argv = [*tool, "workspace", "create", "--cwd", directory, *label]
             result = self.runner.run(argv)
             if result.returncode:
                 detail = herdr_error_message(result.stdout + result.stderr)
-                raise WtError(f"wt: {mux} {verb} failed: {detail}")
+                raise WtError(f"wt: {mux} worktree open failed: {detail}")
             reply = parse_herdr_open(result.stdout, mux)
         if reply.already_open and options.directory:
-            # Opened since it was looked for: its panes are someone's, and unknown here.
-            raise WtError(
-                f"wt: a {mux} workspace for {directory} was opened meanwhile; run wt again"
-            )
+            if reply.workspace_id not in listed:
+                # Opened since it was looked for: its panes are someone's, and unknown here.
+                raise WtError(
+                    f"wt: a {mux} workspace for {directory} was opened meanwhile; run wt again"
+                )
+            # Listed without a checkout, as herdr lists one opened by hand in the
+            # repository: herdr names its checkout from now on, and it is kept as any
+            # other workspace already open there.
+            held = self.pane_to_split([reply.workspace_id], directory, mux)
+            reply = HerdrOpen(False, "", held[0])
         if reply.already_open:
             # Existing workspaces retain their agents; focus follows the explicit option.
             if options.prompt:
@@ -1985,40 +1997,37 @@ class Tool:
             raise WtError(f"wt: unexpected {mux} reply to {what}")
         return found
 
-    def workspace_in_place(self, directory: str, mux: str) -> tuple[str, str] | None:
-        """The workspace already open on a ``--dir`` checkout and a pane of it to split.
-
-        None when the checkout has no workspace, so one is opened and the agent gets its
-        root pane. A workspace's own panes may hold a shell someone is typing in, so there
-        the agent gets a new split, as a resume does. A checkout takes one agent at a
-        time: a second would trip over the first one's changes, and nothing could tell
-        which of them a launch started.
-        """
-
-        def listed(value: object) -> list[dict[str, object]]:
-            items = value if isinstance(value, list) else []
-            return [item for item in items if isinstance(item, dict)]
+    def open_workspaces(self, mux: str) -> dict[str, str]:
+        """Every open workspace and the checkout it is on, "" where herdr names none."""
 
         def path_of(space: dict[str, object]) -> str:
             checkout = space.get("worktree")
             path = checkout.get("checkout_path") if isinstance(checkout, dict) else None
             return os.path.realpath(path) if isinstance(path, str) and path else ""
 
-        spaces = [
-            str(space["workspace_id"])
-            for space in listed(self.herdr_result(mux, "workspace", "list").get("workspaces"))
-            if space.get("workspace_id") and path_of(space) == directory
-        ]
-        if not spaces:
-            return None
-        agents = listed(self.herdr_result(mux, "agent", "list").get("agents"))
+        spaces = self.herdr_result(mux, "workspace", "list").get("workspaces")
+        return {
+            str(space["workspace_id"]): path_of(space)
+            for space in dicts(spaces)
+            if space.get("workspace_id")
+        }
+
+    def pane_to_split(self, spaces: list[str], directory: str, mux: str) -> tuple[str, str]:
+        """The first of the ``spaces`` open on a ``--dir`` checkout and a pane of it to split.
+
+        A workspace's own panes may hold a shell someone is typing in, so there the agent
+        gets a new split, as a resume does. A checkout takes one agent at a time: a second
+        would trip over the first one's changes, and nothing could tell which of them a
+        launch started.
+        """
+        agents = dicts(self.herdr_result(mux, "agent", "list").get("agents"))
         if any(agent.get("workspace_id") in spaces for agent in agents):
             raise WtError(
                 f"wt: an agent is already open in the {mux} workspace for {directory}; "
                 "message it there, or close it first"
             )
         panes = self.herdr_result(mux, "pane", "list", "--workspace", spaces[0]).get("panes")
-        anchor = next((pane["pane_id"] for pane in listed(panes) if pane.get("pane_id")), None)
+        anchor = next((pane["pane_id"] for pane in dicts(panes) if pane.get("pane_id")), None)
         if not isinstance(anchor, str):
             raise WtError(f"wt: the {mux} workspace for {directory} has no pane to split")
         return spaces[0], anchor

@@ -539,11 +539,13 @@ def test_a_task_in_a_directory_starts_its_agent_there_as_it_is(local):  # noqa: 
     assert (git("symbolic-ref", "--short", "HEAD"), git("rev-parse", "HEAD")) == ("main", head)
     agent = json.loads(state.read_text())["agents"][0]
     assert (agent["task"], agent["cwd"]) == ("Tidy the notes", str(clone))
-    # A clone's own checkout is its workspace, which herdr creates rather than opens.
-    assert herdr_calls(state, "workspace", "create") == [
-        ["workspace", "create", "--cwd", str(clone), "--label", "repo", "--no-focus"]
+    # A clone's own checkout is opened as a worktree of itself, so herdr lists the
+    # workspace with its checkout: it lists none for one made with `workspace create`.
+    here = ["--cwd", str(clone), "--path", str(clone)]
+    assert herdr_calls(state, "worktree", "open") == [
+        ["worktree", "open", *here, "--label", "repo", "--no-focus"]
     ]
-    assert not herdr_calls(state, "worktree", "open")
+    assert not herdr_calls(state, "workspace", "create")
     result = op["result"]
     assert (result["path"], result["branch"], result["workspace_id"]) == (str(clone), "main", "w1")
     assert result["url"] == pw.collie_url(None, "w1")
@@ -614,7 +616,26 @@ def test_a_directory_with_an_open_workspace_gets_its_agent_in_a_new_pane(local):
     # The workspace's own pane may hold someone's shell: the agent gets a split of it.
     assert data["splits"] == [["w7:p1", "--direction", "right", "--cwd", str(clone), "--no-focus"]]
     assert data["runs"][0][0] == "w7:p11" and data["agents"][0]["pane_id"] == "w7:p11"
-    assert not herdr_calls(state, "workspace", "create")
+    assert not herdr_calls(state, "worktree", "open")
+    assert op["result"]["workspace_id"] == "w7"
+
+
+def test_a_workspace_herdr_lists_without_its_checkout_is_found_once_opened(local):  # noqa: F811
+    manager, _, _, state, _ = local
+    clone = (manager.src / "repo").resolve()
+    # As herdr lists a workspace made in the clone with `workspace create`, or by hand.
+    data = json.loads(state.read_text())
+    data["workspaces"].append({"workspace_id": "w7", "label": "repo", "opened_in": str(clone)})
+    data["panes"] = [{"pane_id": "w7:p1", "workspace_id": "w7"}]
+    state.write_text(json.dumps(data))
+    op = finish(manager, manager.new_task(in_directory(clone))["operation"]["pr"])
+    assert op["status"] == "complete", op
+    data = json.loads(state.read_text())
+    # The open names its checkout, so the agent is found there, in a split of its pane.
+    assert [w["workspace_id"] for w in data["workspaces"]] == ["w7"]
+    assert data["workspaces"][0]["worktree"]["checkout_path"] == str(clone)
+    assert data["splits"] == [["w7:p1", "--direction", "right", "--cwd", str(clone), "--no-focus"]]
+    assert data["agents"][0]["pane_id"] == "w7:p11"
     assert op["result"]["workspace_id"] == "w7"
 
 

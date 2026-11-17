@@ -1901,9 +1901,10 @@ def remote_resume(home, machine, root, chosen):
 def reopen(root, machine=None, found=None):
     """Open a herdr workspace on a checkout again; its ID, and its new shell pane if any.
 
-    A linked worktree opens under its clone, as `wt` opens it; a clone's own checkout gets
-    a workspace of its own. An open that finds one already there gives no pane to type in.
-    A worker's common dir is the one its probe ``found``.
+    A linked worktree opens under its clone, as `wt` opens it; a clone's own checkout as a
+    worktree of itself, so herdr lists the workspace with its checkout (it lists none for
+    one made with `workspace create`). An open that finds one already there gives no pane
+    to type in. A worker's common dir is the one its probe ``found``.
     """
     if machine is None:
         common = Path(
@@ -1913,19 +1914,16 @@ def reopen(root, machine=None, found=None):
         )
     else:
         common = Path(found["common"])
-    if common == Path(root) / ".git":
-        opened = herdr("workspace", "create", "--cwd", root, "--no-focus", machine=machine)
-    else:
-        opened = herdr(
-            "worktree",
-            "open",
-            "--cwd",
-            str(common.parent),
-            "--path",
-            root,
-            "--no-focus",
-            machine=machine,
-        )
+    opened = herdr(
+        "worktree",
+        "open",
+        "--cwd",
+        str(common.parent),
+        "--path",
+        root,
+        "--no-focus",
+        machine=machine,
+    )
     pane = (opened.get("root_pane") or {}).get("pane_id")
     live = (opened.get("workspace") or {}).get("workspace_id") or (
         pane.split(":")[0] if isinstance(pane, str) and ":" in pane else None

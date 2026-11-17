@@ -1035,8 +1035,12 @@ a worktree of a bare repository), since that is what the sandbox is granted. It 
 no GitHub remote. It takes no branch,
 `-r`, `--with` or `--review`, and is an option of `wt` only. In herdr (and herdr-core)
 a linked worktree opens under its clone, as other worktrees do, and a clone's own
-checkout gets a workspace of its own (`herdr workspace create`), labelled with the
-directory's name. A workspace already open on the checkout is kept: the agent is typed
+checkout gets a workspace of its own, labelled with the directory's name. It too is
+opened with `herdr worktree open`, as a worktree of itself: herdr lists no checkout for
+a workspace made with `herdr workspace create`, and the dashboard finds a workspace's
+diff, transcript and agent by its checkout. A workspace someone made that way in the
+repository is taken over by the open, and counts as already open from then on.
+A workspace already open on the checkout is kept: the agent is typed
 into a new pane split off its first one, since its own panes may hold a shell in use,
 and a run typed by a person then focuses that workspace. A checkout takes one agent
 this way: when herdr lists an agent in a workspace on it, `wt` refuses rather than

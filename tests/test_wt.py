@@ -3078,9 +3078,14 @@ def test_parse_dir_option_and_what_it_cannot_be_combined_with(tmp_path):
         assert runner.calls == []
 
 
-def test_dir_opens_a_clones_own_checkout_as_its_workspace():
-    reply = {"workspace": {"workspace_id": "w3"}, "root_pane": {"pane_id": "w3:p1"}}
-    runner = herdr_replies(workspace_list={"workspaces": []}, workspace_create=reply)
+def test_dir_opens_a_clones_own_checkout_as_a_worktree_of_itself():
+    # Never `workspace create`: herdr lists no checkout for a workspace made that way.
+    reply = {
+        "already_open": False,
+        "workspace": {"workspace_id": "w3"},
+        "root_pane": {"pane_id": "w3:p1"},
+    }
+    runner = herdr_replies(workspace_list={"workspaces": []}, worktree_open=reply)
     t = tool(runner, {"HOME": "/home/u", "WT_MULTIPLEXER": "herdr"})
     t.open_session(
         options(agent="codex", prompt="Tidy", directory="/src/notes"),
@@ -3088,9 +3093,10 @@ def test_dir_opens_a_clones_own_checkout_as_its_workspace():
         "notes",
         "/src/notes",
     )
+    opened = ["worktree", "open", "--cwd", "/src/notes", "--path", "/src/notes"]
     assert [c[0] for c in runner.calls] == [
         ["herdr", "workspace", "list"],
-        ["herdr", "workspace", "create", "--cwd", "/src/notes", "--label", "notes", "--focus"],
+        ["herdr", *opened, "--label", "notes", "--focus"],
         [
             "herdr",
             "pane",
@@ -3100,6 +3106,48 @@ def test_dir_opens_a_clones_own_checkout_as_its_workspace():
         ],
     ]
     assert t.stderr.getvalue() == ""
+
+
+def test_dir_keeps_a_workspace_herdr_listed_without_its_checkout(tmp_path):
+    path = str(tmp_path)
+    # Made with `workspace create`, or by hand: listed, but on no checkout until the open.
+    unnamed = {"workspaces": [{"workspace_id": "w7"}, {"workspace_id": "w8", "worktree": None}]}
+    adopted = {
+        "already_open": True,
+        "workspace": {"workspace_id": "w7"},
+        "root_pane": {"pane_id": "w7:p1"},
+    }
+    runner = held(path, workspace_list=unnamed, worktree_open=adopted)
+    t = tool(runner, {"HOME": "/home/u", "WT_MULTIPLEXER": "herdr"})
+    t.open_session(
+        options(agent="codex", prompt="Tidy", directory=path, focus=False), path, "notes", path
+    )
+    # Its own pane may hold someone's shell, so the agent gets a split, as in any
+    # workspace that was open already.
+    assert [c[0][1:3] for c in runner.calls] == [
+        ["workspace", "list"],
+        ["worktree", "open"],
+        ["agent", "list"],
+        ["pane", "list"],
+        ["pane", "split"],
+        ["pane", "run"],
+    ]
+    assert runner.calls[-1][0][:4] == ["herdr", "pane", "run", "w7:p3"]
+    # One agent per checkout there too.
+    busy = {"agents": [{"workspace_id": "w7", "agent": "claude"}]}
+    runner = held(path, workspace_list=unnamed, worktree_open=adopted, agent_list=busy)
+    with pytest.raises(wt.WtError, match="an agent is already open in the herdr workspace"):
+        tool(runner, {"WT_MULTIPLEXER": "herdr"}).open_session(
+            options(directory=path, prompt="Go"), path, "notes", path
+        )
+    assert not [c for c in runner.calls if c[0][1:3] in (["pane", "split"], ["pane", "run"])]
+    # A workspace nobody listed was opened meanwhile, whatever herdr listed beside it.
+    unlisted = {"already_open": True, "workspace": {"workspace_id": "w9"}}
+    runner = held(path, workspace_list=unnamed, worktree_open=unlisted)
+    with pytest.raises(wt.WtError, match="was opened meanwhile; run wt again"):
+        tool(runner, {"WT_MULTIPLEXER": "herdr"}).open_session(
+            options(directory=path, prompt="Go"), path, "notes", path
+        )
 
 
 def test_dir_opens_a_linked_worktree_under_its_clone():
@@ -3214,8 +3262,21 @@ def test_dir_end_to_end_in_a_clone_a_worktree_and_a_plain_repository(repo, tmp_p
     run_tool("wt", "--dir", str(clone), "-p", "Tidy")
     data = state_of(state)
     assert data["agents"][-1]["task"] == "Tidy" and data["agents"][-1]["cwd"] == str(clone)
-    created = [c for c in data["calls"] if c[:2] == ["workspace", "create"]]
-    assert created == [["workspace", "create", "--cwd", str(clone), "--label", "repo", "--focus"]]
+    opened = [c for c in data["calls"] if c[:2] == ["worktree", "open"]]
+    assert opened == [
+        [
+            "worktree",
+            "open",
+            "--cwd",
+            str(clone),
+            "--path",
+            str(clone),
+            "--label",
+            "repo",
+            "--focus",
+        ]
+    ]
+    assert not [c for c in data["calls"] if c[:2] == ["workspace", "create"]]
     # Nothing was made, branched or switched.
     assert not (home / "src/worktrees").exists()
     assert (git("symbolic-ref", "--short", "HEAD"), git("rev-parse", "HEAD")) == ("main", head)
@@ -3367,7 +3428,7 @@ def test_dir_on_herdr_core_takes_the_same_commands_through_hc_panes():
     runner = FakeRunner(
         [
             ([*panes, "workspace", "list"], wt.Completed(0, '{"result": {"workspaces": []}}', "")),
-            ([*panes, "workspace", "create"], wt.Completed(0, json.dumps({"result": opened}), "")),
+            ([*panes, "worktree", "open"], wt.Completed(0, json.dumps({"result": opened}), "")),
         ],
         executables={"hc"},
     )
@@ -3380,7 +3441,17 @@ def test_dir_on_herdr_core_takes_the_same_commands_through_hc_panes():
     )
     assert [c[0][len(panes) :] for c in runner.calls] == [
         ["workspace", "list"],
-        ["workspace", "create", "--cwd", "/src/notes", "--label", "notes", "--no-focus"],
+        [
+            "worktree",
+            "open",
+            "--cwd",
+            "/src/notes",
+            "--path",
+            "/src/notes",
+            "--label",
+            "notes",
+            "--no-focus",
+        ],
         [
             "pane",
             "run",

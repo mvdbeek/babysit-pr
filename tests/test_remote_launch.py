@@ -1126,8 +1126,9 @@ def test_a_task_in_a_workers_directory_starts_its_agent_there_as_it_is(remote):
     mini = data["machines"]["Mac mini"]
     [agent] = mini["agents"]
     assert (agent["task"], agent["cwd"]) == ("Tidy the notes", str(clone))
-    assert [c for c in mini["calls"] if c[:2] == ["workspace", "create"]] == [
-        ["workspace", "create", "--cwd", str(clone), "--label", "repo", "--no-focus"]
+    here = ["--cwd", str(clone), "--path", str(clone)]
+    assert [c for c in mini["calls"] if c[:2] == ["worktree", "open"]] == [
+        ["worktree", "open", *here, "--label", "repo", "--no-focus"]
     ]
     [typed] = [c for c in remote_commands(state) if "/scripts/wt.py" in c]
     assert f" wt --codex --no-focus --dir {clone} --prompt-file " in typed
