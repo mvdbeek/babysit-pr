@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from unittest.mock import ANY
 from urllib.parse import quote
@@ -1312,6 +1313,42 @@ def test_views_of_a_herdr_workspace_need_no_experiment(site, tmp_path, monkeypat
             ]:
                 status, value = request(port, path)
                 assert status == 400 and error in value["error"], path
+        finally:
+            httpd.shutdown()
+            thread.join(5)
+
+
+def test_a_workspace_shows_the_session_its_agent_runs_from_another_directory(
+    site, tmp_path, monkeypatch
+):
+    """A hand-started agent whose pane had left the checkout: herdr lists it in the
+    workspace, its transcript lies under the directory it started in."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    running, idle = str(uuid.UUID(int=1)), str(uuid.UUID(int=2))
+    for session in (running, idle):
+        file = tmp_path / "claude" / "projects" / "-elsewhere" / f"{session}.jsonl"
+        file.parent.mkdir(parents=True, exist_ok=True)
+        turn = {"type": "user", "cwd": "/elsewhere", "message": {"content": f"Task {session}"}}
+        file.write_text(json.dumps(turn) + "\n")
+    state = json.loads(site[4].read_text())
+    state["agents"][0].update(agent="claude", agent_session={"value": running})
+    site[4].write_text(json.dumps(state))
+    with dashboard.DashboardServer(tmp_path / "plain", 0) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_port
+            path = "/api/workspace-transcript?workspace=w1"
+            status, value = request(port, f"{path}&session={running}")
+            assert status == 200 and value["session"]["id"] == running
+            assert [e["text"] for e in value["entries"]] == [f"Task {running}"]
+            assert [s["id"] for s in value["sessions"]] == [running]
+            # No agent of the workspace runs the other one, which stays another directory's.
+            status, value = request(port, f"{path}&session={idle}")
+            assert status == 400 and "not recorded for this workspace" in value["error"]
+            status, value = request(port, path)
+            assert status == 200 and value["session"] is None
         finally:
             httpd.shutdown()
             thread.join(5)
@@ -3345,6 +3382,23 @@ def test_a_waiting_claude_dialog_is_answered_one_question_at_a_time(asking):
     value = agent_messages.answer(answer_request(sid, [{"options": [1]}, {"options": [2, 0]}]))
     assert value == {"answered": True, "pane": "w1:p1"}
     # Blue picks and moves on; toppings toggle, Right moves on; 1 submits the review.
+    assert keys_sent(state) == [["2"], ["1"], ["3"], ["right"], ["1"]]
+
+
+def test_a_dialog_is_answered_for_a_session_recorded_in_another_directory(asking):
+    """The pane's agent was started outside the checkout; its question is read from its
+    transcript all the same."""
+    import agent_messages
+
+    state, sid, transcript = asking
+    checkout = json.loads(transcript.read_text().splitlines()[0])["cwd"]
+    away = transcript.parent.with_name("-elsewhere") / transcript.name
+    away.parent.mkdir()
+    away.write_text(transcript.read_text().replace(checkout, "/elsewhere"))
+    transcript.unlink()
+    assert wso_viewer.sessions(checkout) == []
+    value = agent_messages.answer(answer_request(sid, [{"options": [1]}, {"options": [2, 0]}]))
+    assert value == {"answered": True, "pane": "w1:p1"}
     assert keys_sent(state) == [["2"], ["1"], ["3"], ["right"], ["1"]]
 
 

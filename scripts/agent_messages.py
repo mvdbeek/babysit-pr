@@ -224,6 +224,17 @@ def agents(workspace_id, interactions=False, live=_UNSET, machine=None):
     return found
 
 
+def running_sessions(workspace_id, machine=None):
+    """The sessions the agents in a herdr workspace are on, for reading their transcripts.
+
+    None of them when herdr cannot say, or the workspace is not one the viewer shows.
+    """
+    try:
+        return {a["session"] for a in agents(workspace_id, machine=machine) if a["session"]}
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return set()
+
+
 def workspace_root(workspace_id, machine=None):
     """The checkout a workspace was opened on: this machine's, or a worker's as it spells it."""
     if machine is None:
@@ -1331,12 +1342,15 @@ def answer_locked(request, home=None, machine=None):
             raise ValueError("The question on the agent's screen changed; refresh")
     else:
         root = workspace_root(request["workspace"], machine)
+        # The pane runs this session: its transcript is read wherever it was recorded.
+        session = request["session"]
         if machine is None:
-            entries = workspace_viewer.transcript(root, request["session"])["entries"]
+            page = workspace_viewer.transcript(root, session, running=lambda: {session})
         else:
-            entries = workspace_viewer.remote_transcript(home, machine, root, request["session"])[
-                "entries"
-            ]
+            page = workspace_viewer.remote_transcript(
+                home, machine, root, session, running=lambda: {session}
+            )
+        entries = page["entries"]
         asked = next(
             (
                 e

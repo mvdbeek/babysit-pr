@@ -1372,7 +1372,23 @@ def host_session_root(path):
 
 
 def host_session_files(root):
-    """This machine's transcript candidates for ``root``, as the controller lists its own.
+    """This machine's transcript candidates for ``root``, as the controller lists its own."""
+    # Claude names a project folder after its cwd, every other character a dash.
+    folder = re.sub(r"[^A-Za-z0-9]", "-", str(root))
+    return host_stored_files(
+        lambda name: name == folder or name.startswith(folder + "-"), "*.jsonl", "rollout-*.jsonl"
+    )
+
+
+def host_session_named(session):
+    """This machine's transcripts of one session, whichever directory it was recorded in."""
+    # A rollout is named rollout-STARTED-SESSION.jsonl.
+    return host_stored_files(lambda name: True, f"{session}.jsonl", f"rollout-*-{session}.jsonl")
+
+
+def host_stored_files(folder, transcript, rollout):
+    """Claude transcripts named ``transcript`` in the project folders ``folder`` accepts,
+    and Codex rollouts named ``rollout``.
 
     Only files that really lie in a session store (``host_session_roots``) are listed:
     a symlinked folder inside one leads nowhere else.
@@ -1383,27 +1399,21 @@ def host_session_files(root):
         real = Path(os.path.realpath(path))
         return any(real.is_relative_to(store) for store in stores)
 
-    # Claude names a project folder after its cwd, every other character a dash.
-    folder = re.sub(r"[^A-Za-z0-9]", "-", str(root))
     for home in host_claude_homes():
         if host_session_root(home / "projects") is None:
             continue
         try:
-            folders = [
-                entry
-                for entry in (home / "projects").iterdir()
-                if entry.name == folder or entry.name.startswith(folder + "-")
-            ]
+            folders = [entry for entry in (home / "projects").iterdir() if folder(entry.name)]
         except OSError:
             folders = []
         for entry in folders:
-            for path in entry.glob("*.jsonl"):
+            for path in entry.glob(transcript):
                 if stored(path):
                     yield "claude", path
     codex = host_codex_sessions()
     if host_session_root(codex) is None:
         return
-    for path in codex.glob("*/*/*/rollout-*.jsonl"):
+    for path in codex.glob(f"*/*/*/{rollout}"):
         if stored(path):
             yield "codex", path
 
@@ -1503,19 +1513,31 @@ def _host_bases(path):
 def _host_sessions(root):
     """Sessions recorded in ``root`` or below it, newest first, as the viewer lists them."""
     root = Path(_host_checkout(root))
+    listed = host_session_rows(
+        host_session_files(root), lambda found: Path(found["cwd"]).is_relative_to(root)
+    )
+    return listed[:MAX_SESSIONS]
+
+
+def _host_session(session):
+    """One session as ``sessions`` lists it, whichever directory it was recorded in: a
+    listing of the newest transcript that names it, or of none."""
+    if not isinstance(session, str) or not SESSION.fullmatch(session):
+        raise ValueError("Expected a session ID")
+    return host_session_rows(host_session_named(session), lambda found: found["id"] == session)[:1]
+
+
+def host_session_rows(files, wanted):
+    """A listing of the sessions in ``files`` whose details are ``wanted``, newest first."""
     accounts = host_accounts()
     listed = []
-    for agent, file in host_session_files(root):
+    for agent, file in files:
         try:
             found = claude_details(file) if agent == "claude" else codex_details(file)
             info = file.stat()
         except (OSError, ValueError):
             continue  # Unreadable, or a rollout still writing its first line.
-        if (
-            not found
-            or not SESSION.match(found["id"])
-            or not Path(found["cwd"]).is_relative_to(root)
-        ):
+        if not found or not SESSION.match(found["id"]) or not wanted(found):
             continue
         title = (found["title"] or "").strip()
         # A Claude transcript sits in HOME/projects/FOLDER/, under a home already resolved.
@@ -1535,7 +1557,7 @@ def _host_sessions(root):
             }
         )
     listed.sort(key=lambda s: s["updated"], reverse=True)
-    return listed[:MAX_SESSIONS]
+    return listed
 
 
 def _host_activity(sessions):
@@ -4348,6 +4370,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "diff": _host_diff,
     "bases": _host_bases,
     "sessions": _host_sessions,
+    "session": _host_session,
     "activity": _host_activity,
     "tail": _host_tail,
     "turn": _host_turn,
@@ -5215,6 +5238,7 @@ VALIDATORS = {
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,
+    "session": validate_sessions,
     "activity": validate_activity,
     "tail": validate_tail,
     "turn": validate_turn,
