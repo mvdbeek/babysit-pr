@@ -2302,6 +2302,52 @@ def _host_wt_prepare(clone, repo, root, prefix, agent, account, sandbox, also=()
     }
 
 
+def _host_wt_directory(path, agent, account, sandbox):
+    """An existing checkout here that a dashboard launch's ``wt --dir`` starts its agent in.
+
+    ``path`` must be the top of a Git checkout: a clone's own, or one of its worktrees.
+    Nothing is made or switched. The answer names its real path, the clone a launch
+    there locks (the checkout itself, or the clone its linked worktree belongs to), the
+    branch it is on (None when detached) and the GitHub repository its upstream, else
+    its origin, names (None without one). Claude is trusted for it in the config its
+    sandbox reads.
+    """
+    _arg_paths([path], home=True)
+    _, _, config = _host_claude(agent, account, sandbox)
+    real = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isdir(real):
+        raise ValueError(f"No directory at {path} on this machine")
+    try:
+        top = os.path.realpath(host_git(real, "rev-parse", "--show-toplevel"))
+    except ValueError:
+        raise ValueError(f"{real} is not a Git checkout") from None
+    if top != real:
+        raise ValueError(f"{real} lies inside the checkout {top}; name that instead")
+    home = os.path.realpath(os.path.expanduser("~"))
+    if home == real or home.startswith(real.rstrip(os.sep) + os.sep):
+        # As wt refuses it there: nothing is trusted for a launch that cannot start.
+        raise ValueError(
+            f"{real} holds the home directory; an agent's sandbox would cover everything in it"
+        )
+    dot = os.path.join(real, ".git")
+    # Read from the layout, as the sandbox that is given the common dir reads it.
+    own = os.path.isdir(dot) and not os.path.islink(dot)
+    clone = real if own else os.path.dirname(_host_common_dir(real))
+    try:
+        branch = host_git(real, "symbolic-ref", "--quiet", "--short", "HEAD")
+    except ValueError:
+        branch = None
+    remotes = remote_slugs(repo_config(host_git, real))
+    if config is not None:
+        _host_trust(config, real)
+    return {
+        "path": real,
+        "clone": clone,
+        "branch": branch,
+        "repo": remotes.get("upstream") or remotes.get("origin"),
+    }
+
+
 def _host_branch_exists(clone, branch):
     try:
         host_git(clone, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
@@ -4313,6 +4359,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "version": _host_version,
     "placement_state": _host_placement_state,
     "wt_prepare": _host_wt_prepare,
+    "wt_directory": _host_wt_directory,
     "wt_checkout": _host_wt_checkout,
     "worktree": _host_worktree,
     "session_info": _host_session_info,
@@ -4848,6 +4895,17 @@ def validate_wt_prepare(value):
     return value
 
 
+def validate_wt_directory(value):
+    """The checkout a worker's ``wt --dir`` gets on its command line, and what it is."""
+    _expect(isinstance(value, dict) and set(value) == {"path", "clone", "branch", "repo"}, "fields")
+    for key in ("path", "clone"):
+        _expect(_absolute(value[key]) and not CONTROL.search(value[key]), key)
+    branch, repo = value["branch"], value["repo"]
+    _expect(branch is None or (_text(branch) and not CONTROL.search(branch)), "branch")
+    _expect(repo is None or (_text(repo) and SLUG.fullmatch(repo)), "repo")
+    return value
+
+
 def _upstream(value):
     return value is None or (
         isinstance(value, list)
@@ -5168,6 +5226,7 @@ VALIDATORS = {
     "version": validate_version,
     "placement_state": validate_placement_state,
     "wt_prepare": validate_wt_prepare,
+    "wt_directory": validate_wt_directory,
     "wt_checkout": validate_wt_checkout,
     "worktree": validate_worktree,
     "session_info": validate_session_info,

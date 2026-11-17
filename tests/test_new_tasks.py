@@ -4,7 +4,13 @@ import json
 
 import pr_workspaces as pw
 import pytest
-from test_pr_workspaces import finish, helper_calls, local  # noqa: F401 (fixture)
+from test_pr_workspaces import (  # noqa: F401 (fixture)
+    finish,
+    helper_calls,
+    local,
+    make_checkout,
+    space,
+)
 
 
 def request(manager, **changes):
@@ -494,4 +500,261 @@ def test_a_failed_clone_fails_the_new_task_and_leaves_nothing(local, monkeypatch
     op = finish(manager, manager.new_task(cloning(manager, destination))["operation"]["pr"])
     assert op["status"] == "failed" and "Could not resolve to a Repository" in op["message"]
     assert not pw.os.path.lexists(destination)
+    assert not json.loads(state.read_text())["agents"]
+
+
+def in_directory(path, **changes):
+    return {"directory": str(path), "agent": "codex", "task": "Tidy the notes", **changes}
+
+
+def herdr_calls(state, *verb):
+    return [c for c in json.loads(state.read_text())["calls"] if c[: len(verb)] == list(verb)]
+
+
+def test_a_task_in_a_directory_starts_its_agent_there_as_it_is(local):  # noqa: F811
+    manager, _, git, state, _ = local
+    calls = helper_calls(manager)
+    clone = (manager.src / "repo").resolve()
+    head = git("rev-parse", "HEAD")
+    value = manager.new_task(in_directory(clone))
+    key = value["operation"]["pr"]
+    assert key.startswith(pw.NEW_PREFIX)
+    op = finish(manager, key)
+    assert op["status"] == "complete", op
+    assert op["subject"] == {"kind": "directory", "path": str(clone), "repo": "base/repo"}
+    assert (op["path"], op["clone"], op["branch"], op["machine"]) == (
+        str(clone),
+        str(clone),
+        "main",
+        None,
+    )
+    prompt = manager.home / "workspace-prompts" / op["id"]
+    assert calls == [
+        ["wt", "--codex", "--no-focus", "--dir", str(clone), "--prompt-file", str(prompt)]
+    ]
+    assert prompt.read_text() == "Tidy the notes\n"
+    # Nothing was checked out, branched or switched: the agent works in the clone itself.
+    assert not (manager.src / "worktrees").exists()
+    assert git("branch", "--format=%(refname:short)").split() == ["feature", "main"]
+    assert (git("symbolic-ref", "--short", "HEAD"), git("rev-parse", "HEAD")) == ("main", head)
+    agent = json.loads(state.read_text())["agents"][0]
+    assert (agent["task"], agent["cwd"]) == ("Tidy the notes", str(clone))
+    # A clone's own checkout is its workspace, which herdr creates rather than opens.
+    assert herdr_calls(state, "workspace", "create") == [
+        ["workspace", "create", "--cwd", str(clone), "--label", "repo", "--no-focus"]
+    ]
+    assert not herdr_calls(state, "worktree", "open")
+    result = op["result"]
+    assert (result["path"], result["branch"], result["workspace_id"]) == (str(clone), "main", "w1")
+    assert result["url"] == pw.collie_url(None, "w1")
+    listed = manager.snapshot()["new"][key]["operation"]
+    assert listed["status"] == "complete" and listed["result"]["path"] == str(clone)
+
+
+def test_a_task_in_a_linked_worktree_opens_it_under_its_clone(local):  # noqa: F811
+    manager, _, _, state, _ = local
+    clone = (manager.src / "repo").resolve()
+    path = make_checkout(local).resolve()
+    op = finish(manager, manager.new_task(in_directory(path))["operation"]["pr"])
+    assert op["status"] == "complete", op
+    # Its clone is what a launch there locks, as a cleanup of the worktree does.
+    assert (op["path"], op["clone"], op["branch"]) == (str(path), str(clone), "feature")
+    opened = herdr_calls(state, "worktree", "open")
+    assert opened == [
+        [
+            "worktree",
+            "open",
+            "--cwd",
+            str(clone),
+            "--path",
+            str(path),
+            "--label",
+            "checkout",
+            "--no-focus",
+        ]
+    ]
+    assert json.loads(state.read_text())["agents"][0]["cwd"] == str(path)
+
+
+def test_a_directory_needs_no_github_remote_and_may_be_detached(local, tmp_path):  # noqa: F811
+    manager, _, git, state, _ = local
+    notes = tmp_path / "elsewhere" / "notes"
+    notes.mkdir(parents=True)
+    git("init", "-q", "-b", "main", cwd=notes)
+    git(
+        "-c",
+        "user.name=F",
+        "-c",
+        "user.email=f@example.test",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+        cwd=notes,
+    )
+    git("checkout", "-q", "--detach", cwd=notes)
+    op = finish(manager, manager.new_task(in_directory(notes))["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert op["subject"] == {"kind": "directory", "path": str(notes.resolve())}
+    assert op["branch"] is None and op["result"]["branch"] is None
+    assert json.loads(state.read_text())["agents"][0]["cwd"] == str(notes.resolve())
+
+
+def test_a_directory_with_an_open_workspace_gets_its_agent_in_a_new_pane(local):  # noqa: F811
+    manager, _, _, state, _ = local
+    clone = (manager.src / "repo").resolve()
+    space(state, clone, clone, wid="w7")
+    data = json.loads(state.read_text())
+    data["panes"] = [{"pane_id": "w7:p1", "workspace_id": "w7"}]
+    state.write_text(json.dumps(data))
+    op = finish(manager, manager.new_task(in_directory(clone))["operation"]["pr"])
+    assert op["status"] == "complete", op
+    data = json.loads(state.read_text())
+    # The workspace's own pane may hold someone's shell: the agent gets a split of it.
+    assert data["splits"] == [["w7:p1", "--direction", "right", "--cwd", str(clone), "--no-focus"]]
+    assert data["runs"][0][0] == "w7:p11" and data["agents"][0]["pane_id"] == "w7:p11"
+    assert not herdr_calls(state, "workspace", "create")
+    assert op["result"]["workspace_id"] == "w7"
+
+
+def test_a_directory_whose_workspace_has_an_agent_takes_no_second_one(local):  # noqa: F811
+    manager, _, _, state, _ = local
+    clone = (manager.src / "repo").resolve()
+    space(state, clone, clone, wid="w7")
+    data = json.loads(state.read_text())
+    data["agents"] = [{"workspace_id": "w7", "agent": "claude", "cwd": str(clone)}]
+    state.write_text(json.dumps(data))
+    op = finish(manager, manager.new_task(in_directory(clone))["operation"]["pr"])
+    # Refused before anything is typed, so it failed rather than may have started.
+    assert op["status"] == "failed", op
+    assert "an agent is already open in the herdr workspace" in op["message"]
+    data = json.loads(state.read_text())
+    assert len(data["agents"]) == 1 and not data.get("runs") and not data.get("splits")
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"directory": "src/repo"}, "absolute path"),
+        ({"directory": "{src}/missing"}, "not the top of a Git checkout"),
+        ({"directory": "{src}"}, "not the top of a Git checkout"),
+        ({"directory": "{src}/repo/.git"}, "not the top of a Git checkout"),
+        ({"machine": "auto"}, "Choose the machine the directory is on"),
+        ({"machine": "mini"}, "Unknown machine mini"),
+        ({"repo": "base/repo"}, "takes no repository"),
+        ({"name": "try-parser"}, "takes no repository"),
+        ({"issue_title": "Crash"}, "takes no repository"),
+        ({"also": []}, "takes no repository"),
+        ({"task": " "}, "Supply a task"),
+        ({"agent": "gemini"}, "Select Codex or Claude"),
+        ({"permission_mode": "auto"}, "Only Claude takes a permission mode"),
+        ({"docker": "yes"}, "Invalid new task parameters"),
+    ],
+)
+def test_directory_task_validation(local, changes, error):  # noqa: F811
+    manager, _, _, state, _ = local
+    request = in_directory((manager.src / "repo").resolve(), **changes)
+    request["directory"] = request["directory"].format(src=manager.src.resolve())
+    with pytest.raises(ValueError, match=error):
+        manager.new_task(request)
+    assert manager.snapshot()["new"] == {} and not json.loads(state.read_text())["calls"]
+
+
+def test_a_directory_inside_a_checkout_is_refused(local):  # noqa: F811
+    manager, _, _, _, _ = local
+    inner = manager.src / "repo" / "docs"
+    inner.mkdir()
+    with pytest.raises(ValueError, match="not the top of a Git checkout on this machine"):
+        manager.new_task(in_directory(inner.resolve()))
+
+
+def test_a_directory_the_sandbox_could_not_be_given_is_refused_when_asked(
+    local,  # noqa: F811
+    tmp_path,
+):
+    manager, _, git, state, _ = local
+    # A home directory that is a checkout (dotfiles) would put all of it in the sandbox.
+    git("init", "-q", "-b", "main", cwd=tmp_path)
+    for path in (tmp_path.resolve(), f"~/../{tmp_path.name}"):
+        with pytest.raises(ValueError, match="holds the home directory"):
+            manager.new_task(in_directory(path))
+    # The Git directory is read from the checkout's layout, as the sandbox reads it:
+    # never from a commondir file, which an agent in the checkout can write.
+    path = make_checkout(local).resolve()
+    admin = (manager.src / "repo/.git/worktrees/checkout").resolve()
+    (admin / "commondir").write_text(str(tmp_path / "elsewhere/.git"))
+    # Git itself, or the layout check after it, refuses the checkout.
+    with pytest.raises(ValueError, match="not the top of a Git checkout|commondir names"):
+        manager.new_task(in_directory(path))
+    separate = tmp_path / "work" / "separate"
+    separate.mkdir(parents=True)
+    git("init", "-q", "--separate-git-dir", str(tmp_path / "work/kept.git"), cwd=separate)
+    with pytest.raises(ValueError, match="cannot be verified"):
+        manager.new_task(in_directory(separate.resolve()))
+    assert manager.snapshot()["new"] == {} and not json.loads(state.read_text())["calls"]
+
+
+def test_a_directory_task_passes_its_agent_settings_on(local):  # noqa: F811
+    manager, _, _, state, _ = local
+    calls = helper_calls(manager)
+    clone = (manager.src / "repo").resolve()
+    request = in_directory(
+        clone,
+        model="fixture-codex",
+        effort="high",
+        docker=True,
+        exit_when_done=True,
+        machine="local",
+        tags=["notes"],
+    )
+    op = finish(manager, manager.new_task(request)["operation"]["pr"])
+    assert op["status"] == "complete", op
+    prompt = manager.home / "workspace-prompts" / op["id"]
+    assert calls == [
+        [
+            "wt",
+            "--codex",
+            "--model",
+            "fixture-codex",
+            "--effort",
+            "high",
+            "--docker",
+            "--exit-when-done",
+            "--no-focus",
+            "--dir",
+            str(clone),
+            "--prompt-file",
+            str(prompt),
+        ]
+    ]
+    assert op["tags"] == ["notes"] and op["tagged_path"] == str(clone)
+    agent = json.loads(state.read_text())["agents"][0]
+    assert agent["safe_enable"] == "docker" and "[babysit-done:" in agent["task"]
+    # Claude's auto permission mode and account reach wt the same way.
+    careful = in_directory(make_checkout(local).resolve(), agent="claude", permission_mode="auto")
+    finish(manager, manager.new_task(careful)["operation"]["pr"])
+    assert calls[1][:4] == ["wt", "--claude", "--permission-mode", "auto"]
+
+
+def test_a_directory_that_went_away_fails_its_task(local, tmp_path):  # noqa: F811
+    manager, _, git, state, _ = local
+    path = make_checkout(local).resolve()
+    request = in_directory(path)
+    original = pw.directory_checkout
+    seen = []
+
+    def gone(target):
+        # Removed between the request and the launch, as a cleanup would.
+        if seen:
+            git("worktree", "remove", "--force", str(path))
+        seen.append(target)
+        return original(target)
+
+    pw.directory_checkout = gone
+    try:
+        op = finish(manager, manager.new_task(request)["operation"]["pr"])
+    finally:
+        pw.directory_checkout = original
+    assert op["status"] == "failed" and "is not the top of a Git checkout" in op["message"]
     assert not json.loads(state.read_text())["agents"]

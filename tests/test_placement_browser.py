@@ -420,3 +420,111 @@ def test_a_worker_provisioning_does_not_manage_gets_no_update_button(page, site)
     dialog.get_by_role("button", name="Start task").click()
     expect(page.locator("#workspace-progress")).to_contain_text("Mac mini runs babysit-pr")
     expect(dialog.locator(".worker-update")).to_have_count(0)
+
+
+IN_DIRECTORY = "Work in an existing directory, as it is"
+
+
+def previewed(previews, query):
+    """Wait for the placement preview the dialog asks for after a choice changed."""
+    deadline = time.monotonic() + 5
+    while previews[-1:] != [query] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert previews[-1:] == [query]
+
+
+def test_a_task_in_a_directory_names_its_machine_and_sends_only_the_directory(page, site):
+    url, snapshot, previews, sent, _ = site
+    snapshot["machines"] = [LOCAL, MINI, BOX]
+    dialog = open_new_task(page, url)
+    select = dialog.get_by_label("Machine", exact=True)
+    expect(select).to_have_value("auto")
+    directory = dialog.get_by_label("Directory", exact=True)
+    expect(directory).to_be_hidden()
+    dialog.get_by_label(IN_DIRECTORY).check()
+    # Nothing of a repository, a branch, an issue or other clones is asked for.
+    expect(directory).to_be_visible()
+    expect(dialog.get_by_role("combobox", name="Repository and local clone")).to_be_hidden()
+    for name in ("New branch", "Base branch (optional)"):
+        expect(dialog.get_by_label(name)).to_be_hidden()
+    for text in (
+        "Clone another repository from GitHub",
+        "File it as a GitHub issue first",
+        "Also work in other repositories (optional)",
+    ):
+        expect(dialog.get_by_text(text)).to_be_hidden()
+    # A directory is one machine's: this one stands in for Auto, which is not offered.
+    expect(select).to_have_value("local")
+    expect(select.locator("option").first).to_be_disabled()
+    expect(dialog.locator(".machine-choice")).to_have_text("Runs on this machine.")
+    previewed(previews, "agent=codex&kind=directory")
+    # This machine's clones are suggested; a worker's paths are typed.
+    suggested = dialog.locator("#new-task-directories option")
+    expect(suggested).to_have_count(1)
+    assert suggested.first.get_attribute("value") == "/fixture/alpha"
+    select.select_option("mini")
+    expect(suggested).to_have_count(0)
+    expect(dialog.locator(".machine-choice")).to_have_text(
+        "full (4/4). The agent starts on Mac mini, in that directory there."
+    )
+    dialog.get_by_label("Task", exact=True).fill("Tidy the notes")
+    # A relative path names nothing on another machine: the form keeps it.
+    directory.fill("notes")
+    dialog.get_by_role("button", name="Start task").click()
+    assert not sent and directory.evaluate("e => e.validity.patternMismatch")
+    directory.fill(" ~/src/notes ")
+    page.screenshot(path="reports/new-task-directory.png")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-progress")).to_have_text(
+        "failed: Stopped by the test · On Mac mini"
+    )
+    assert sent == [
+        {"directory": "~/src/notes", "agent": "codex", "machine": "mini", "task": "Tidy the notes"}
+    ]
+
+
+def test_leaving_the_directory_mode_brings_the_repository_fields_and_auto_back(page, site):
+    url, snapshot, previews, sent, _ = site
+    snapshot["machines"] = [LOCAL, MINI, BOX]
+    dialog = open_new_task(page, url)
+    select = dialog.get_by_label("Machine", exact=True)
+    dialog.get_by_label(IN_DIRECTORY).check()
+    expect(select).to_have_value("local")
+    dialog.get_by_label(IN_DIRECTORY).uncheck()
+    expect(select).to_have_value("auto")
+    expect(select.locator("option").first).to_be_enabled()
+    # A machine the person chose meanwhile is theirs to keep.
+    dialog.get_by_label(IN_DIRECTORY).check()
+    select.select_option("mini")
+    select.select_option("local")
+    dialog.get_by_label(IN_DIRECTORY).uncheck()
+    expect(select).to_have_value("local")
+    select.select_option("auto")
+    expect(dialog.get_by_label("Directory", exact=True)).to_be_hidden()
+    previewed(previews, "agent=codex&kind=scratch&repo=up%2Falpha")
+    dialog.get_by_label("New branch").fill("try")
+    dialog.get_by_label("Task", exact=True).fill("Explore")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-progress")).to_have_text("failed: Stopped by the test")
+    assert sent[0]["name"] == "try" and sent[0]["machine"] == "auto"
+    assert "directory" not in sent[0]
+
+
+def test_on_one_machine_a_task_in_a_directory_sends_no_machine(page, site):
+    url, _, previews, sent, _ = site
+    dialog = open_new_task(page, url)
+    # What was typed for a repository stays, hidden, and never blocks this task.
+    dialog.get_by_label("New branch").fill("two words")
+    dialog.get_by_text("Clone another repository from GitHub").click()
+    dialog.get_by_label("GitHub repository").fill("not a repository")
+    # Leaving the field checks it and shows why it is refused, which moves what is below.
+    dialog.get_by_label("GitHub repository").press("Tab")
+    expect(dialog.locator(".new-task-clone-note")).to_contain_text("Name the repository")
+    dialog.get_by_label(IN_DIRECTORY).check()
+    expect(dialog.locator("#workspace-machine")).to_be_hidden()
+    dialog.get_by_label("Directory", exact=True).fill("/fixture/alpha")
+    dialog.get_by_label("Task", exact=True).fill("Tidy")
+    dialog.get_by_role("button", name="Start task").click()
+    expect(page.locator("#workspace-progress")).to_have_text("failed: Stopped by the test")
+    assert sent == [{"directory": "/fixture/alpha", "agent": "codex", "task": "Tidy"}]
+    assert not previews

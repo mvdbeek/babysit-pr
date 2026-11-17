@@ -1126,7 +1126,8 @@ that worker first.
 A launch placed on a worker (Handle or Create on a pull request, a new task, from the
 dialog or from `wt --machine` on this machine, batch review, a scheduled launch) starts
 there. Until repairs run on workers, only work that never needs them goes there: pull
-request reviews and new tasks on a branch, including tasks with other clones (`--with`).
+request reviews, new tasks on a branch, including tasks with other clones (`--with`),
+and new tasks in an existing directory of the worker (below).
 Issues, Sentry issues and new tasks that file an issue are refused with the reason.
 The launch first compares the worker's deployed
 babysit-pr commit (`git rev-parse HEAD` in its `babysit_root`) with this machine's and
@@ -1160,7 +1161,31 @@ accepted. The worker's own `wt.py` then runs over ssh with `BABYSIT_WORKER=<id>`
 when the machine has the `gpg` label, and `--exit-watch-json` for **Quit the agent when
 it is done**: it prints the exit watch instead of recording it, and the dashboard
 records it with the machine. Clone locks hash the machine with the clone. The checkout
-and agent are verified through probe ops and `herdr --machine`. Exit watches on workers
+and agent are verified through probe ops and `herdr --machine`.
+
+A new task in an existing directory of the worker (the request's `directory`, from the
+dialog's **Work in an existing directory, as it is** or `wt --dir <path> --machine <id>`)
+makes no checkout there. One probe op (`wt_directory`) checks that the path, absolute or
+under the worker's home, is the top of a Git checkout, and answers its real path, the
+clone its launches lock (the checkout itself, or the clone a linked worktree belongs to,
+read from the worktree's layout as the sandbox reads it), its branch when it is on one,
+and the GitHub repository its `upstream`, else its `origin`, names, when one does; it
+trusts the checkout for Claude as above, and refuses the home directory or one above
+it. It runs before the lock, since it names the clone to lock; the worker's `wt` reads
+the checkout again under it. The repository needs no remote, so nothing is
+cloned and nothing here names a repository to check it against: a person chose that
+directory on that machine. The launch then holds that clone's lock, compares the
+deployed commit and syncs skills as for any launch, and runs the worker's `wt --dir
+<real path>` with the same agent options, which opens a workspace on the checkout, or
+splits a pane in the one already open, and refuses a checkout whose workspace has an
+agent. A refusal there fails the launch (nothing was typed); once `wt` returns, trouble
+makes it uncertain. Only the workspace and the agent are verified afterwards, by the
+checkout's real path, since the checkout was not made by the launch. Placement never
+chooses for it: the request names the worker, Auto is refused, and the worker must
+still be able to take it (enabled, reachable, its sandbox and Docker labels, room, for
+which it waits like other launches).
+
+Exit watches on workers
 (these, scheduled launches there, and worker cron runs) are followed every minute, in
 the background, the way local ones are (`workspace_exit`), through the worker's herdr:
 the agent's own pane is pinned, its process is named by herdr's `argv0` where it

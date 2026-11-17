@@ -1518,6 +1518,11 @@ button:disabled {
 .searchable-select:has(#new-task-repo:disabled) {
   opacity: 0.55;
 }
+/* A task in an existing directory names no repository, branch, issue or other clones. */
+.new-task-form.in-directory .repo-task,
+.new-task-form.in-directory .searchable-select:has(#new-task-repo) {
+  display: none;
+}
 .new-task-also small {
   display: block;
   margin: 6px 0;

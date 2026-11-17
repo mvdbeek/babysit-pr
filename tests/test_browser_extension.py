@@ -195,6 +195,16 @@ def test_delivery_is_idempotent_across_restart(extension_server):
     )
 
 
+def test_the_extension_cannot_start_a_task_in_a_directory(extension_server):
+    server = extension_server
+    headers = pair(server)
+    asked = submission()
+    asked["payload"] = {"directory": "/fake/repo", "task": "Fix this"}
+    code, value, _ = request(server, "/api/extension", asked, headers)
+    assert code == 400 and "repository's clone only" in value["error"]
+    assert server.workspaces.calls == []
+
+
 def test_pending_or_failed_delivery_never_repeats(tmp_path):
     extension = browser_extension.Extension(tmp_path)
     calls = []

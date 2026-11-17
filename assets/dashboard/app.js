@@ -2669,6 +2669,10 @@ function savedEffort(repo, levels) {
   if (saved.effort && levels.includes(saved.effort)) return [saved.effort, null];
   return [null, null];
 }
+// What a worker that can take a launch does with it, unless the dialog says otherwise.
+function startsInOwnClone(label) {
+  return `The agent starts on ${label}, in its own clone of the repository; only reviews and new tasks can start there yet.`;
+}
 // `repo` is the project the launch is for; `mixed` launches in several projects.
 // `preferred` preselects an agent the person already chose, as a second review does.
 // `remote` describes a worker that can take the launch.
@@ -2682,8 +2686,7 @@ function agentFields({
   hints = () => ({}),
   mixed = false,
   preferred = null,
-  remote = (label) =>
-    `The agent starts on ${label}, in its own clone of the repository; only reviews and new tasks can start there yet.`,
+  remote = startsInOwnClone,
 } = {}) {
   const usage = window.dashboardUsage;
   const agent = el("select");
@@ -2960,6 +2963,24 @@ function agentFields({
   void updatePlacement();
   // The request field; none on a single machine, so its launches are unchanged.
   const machineChoice = () => (machineField.hidden ? {} : { machine: machine.value });
+  // A launch in a directory is on the machine that has it: Auto has nothing to choose
+  // there, so this machine stands in for it until the person names another.
+  let stoodIn = false;
+  // Chosen by the person since: theirs to keep when the directory mode is left.
+  machine.addEventListener("change", () => {
+    stoodIn = false;
+  });
+  function nameMachine(on) {
+    const here = machines.find((entry) => entry.local)?.id;
+    auto.disabled = on;
+    auto.hidden = on;
+    if (on && here && machine.value === "auto") {
+      machine.value = here;
+      stoodIn = true;
+    } else if (!on && stoodIn && machine.value === here) machine.value = "auto";
+    if (!on) stoodIn = false;
+    describeMachine();
+  }
   // `wt --exit-when-done`, for a launch that starts now; scheduled ones always quit.
   const quit = el("input");
   quit.id = "workspace-quit";
@@ -2984,6 +3005,7 @@ function agentFields({
     refreshPlacement: () => void updatePlacement(),
     machineField,
     machineChoice,
+    nameMachine,
   };
 }
 // A Start later checkbox and the time it reveals. `startTime()` is null to start now,
@@ -3275,7 +3297,10 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       const label = el("label", text);
       label.htmlFor = input.id;
       parent.append(label, input);
+      return label;
     }
+    // What only a task in a repository has; hidden for one in an existing directory.
+    const repoTask = (...nodes) => nodes.forEach((node) => node.classList.add("repo-task"));
     const repo = el("select");
     repo.id = "new-task-repo";
     repo.required = true;
@@ -3317,7 +3342,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
         el("p", `Choose a local clone for ${prefill.repo}; none was found automatically.`),
       );
     }
-    field("Repository and local clone", repo);
+    repoTask(field("Repository and local clone", repo));
     // The task and its fields follow the repository choice, and the checkbox widening it.
     let aboveTask = repo;
     let idleBox = null;
@@ -3345,6 +3370,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
         }
       };
       form.append(idleLabel);
+      repoTask(idleLabel);
       aboveTask = idleLabel;
     }
     // A GitHub repository with no clone here, which the launch clones first:
@@ -3374,7 +3400,39 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       cloneNote.hidden = !text;
     };
     form.append(cloneLabel, cloneFields, cloneNote);
-    aboveTask = cloneNote;
+    repoTask(cloneLabel, cloneFields, cloneNote);
+    // An existing checkout on one machine, worked in as it is (`wt --dir`): no clone,
+    // branch or worktree is made, so none of the fields above and below apply.
+    const inPlace = el("input");
+    inPlace.id = "new-task-in-directory";
+    inPlace.type = "checkbox";
+    const inPlaceLabel = el("label", undefined, "workspace-later");
+    inPlaceLabel.append(inPlace, " Work in an existing directory, as it is");
+    const directoryFields = el("div", undefined, "new-task-fields");
+    const directory = el("input");
+    directory.id = "new-task-directory";
+    directory.placeholder = "/path/to/checkout or ~/src/notes";
+    directory.maxLength = 1024;
+    // Spaces around a pasted path are trimmed when it is sent.
+    directory.pattern = "\\s*(/|~/).+";
+    directory.title = "An absolute path, or one under the home directory as ~/…";
+    directory.autocapitalize = "off";
+    directory.spellcheck = false;
+    // This machine's clones, as suggestions; another machine's paths are typed.
+    const directories = el("datalist");
+    directories.id = "new-task-directories";
+    directory.setAttribute("list", directories.id);
+    field("Directory", directory, directoryFields);
+    directoryFields.append(
+      directories,
+      el(
+        "small",
+        "The top of a Git checkout on the chosen machine. The agent starts there on whatever is checked out: nothing is cloned, fetched, branched or switched, and the repository needs no GitHub remote. A checkout with an agent already open takes no second one.",
+      ),
+    );
+    directoryFields.hidden = true;
+    form.append(inPlaceLabel, directoryFields);
+    aboveTask = directoryFields;
     // The task's repository and clone: the picker's choice, or the repository to clone.
     const chosen = () => (cloneNew.checked ? fresh : repos[Number(repo.value)]);
     // Set once the fields that follow the repository exist, below.
@@ -3550,6 +3608,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     repo.addEventListener("change", fillAlso);
     fillAlso();
     form.append(alsoBox);
+    repoTask(alsoBox);
     const fileIssue = el("input");
     fileIssue.id = "new-task-file-issue";
     fileIssue.type = "checkbox";
@@ -3585,6 +3644,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     field("Base branch (optional)", base, branchFields);
     branchFields.append(el("small", "Fetched from the clone’s origin remote."));
     form.append(issueFields, branchFields);
+    repoTask(fileLabel, issueFields, branchFields);
     fileIssue.onchange = () => {
       issueFields.hidden = !fileIssue.checked;
       branchFields.hidden = fileIssue.checked;
@@ -3608,18 +3668,55 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       refreshPlacement,
       machineField,
       machineChoice,
+      nameMachine,
     } = agentFields({
       repo: chosen()?.repo,
-      hints: () => ({
-        ...(fileIssue.checked ? { kind: "issue" } : {}),
-        ...(also.size ? { also: "1" } : {}),
-      }),
+      hints: () =>
+        inPlace.checked
+          ? { kind: "directory" }
+          : {
+              ...(fileIssue.checked ? { kind: "issue" } : {}),
+              ...(also.size ? { also: "1" } : {}),
+            },
+      remote: (label) =>
+        inPlace.checked
+          ? `The agent starts on ${label}, in that directory there.`
+          : startsInOwnClone(label),
     });
     placementChanged = refreshPlacement;
-    repo.addEventListener("change", () => setRepo(chosen()?.repo));
+    // A directory's repository is read where it is, once the task starts.
+    const taskRepo = () => (inPlace.checked ? null : chosen()?.repo);
+    repo.addEventListener("change", () => setRepo(taskRepo()));
     chosenChanged = () => {
       fillAlso();
-      setRepo(chosen()?.repo);
+      setRepo(taskRepo());
+    };
+    function suggestDirectories() {
+      const here = machineChoice().machine;
+      const local = !here || workspaceData.machines?.find((entry) => entry.id === here)?.local;
+      const clones = local ? [...new Set(repos.map((choice) => choice.clone))] : [];
+      directories.replaceChildren(
+        ...clones.map((clone) => {
+          const option = el("option");
+          option.value = clone;
+          return option;
+        }),
+      );
+    }
+    machineField.querySelector("select").addEventListener("change", suggestDirectories);
+    inPlace.onchange = () => {
+      const on = inPlace.checked;
+      form.classList.toggle("in-directory", on);
+      directoryFields.hidden = !on;
+      directory.required = on;
+      // The repository's fields are hidden but keep what was typed: one that is required
+      // or invalid would block the form without saying why, so the directory is checked
+      // by itself when the task is started.
+      form.noValidate = on;
+      nameMachine(on);
+      suggestDirectories();
+      setRepo(taskRepo());
+      placementChanged();
     };
     const execution = el("details", undefined, "execution-settings");
     const summary = el("summary");
@@ -3694,7 +3791,8 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
         task.reportValidity();
         return;
       }
-      if (cloneNew.checked) {
+      if (inPlace.checked && !directory.reportValidity()) return;
+      if (cloneNew.checked && !inPlace.checked) {
         // Off while the check runs, so a second click cannot start a second task.
         submit.disabled = true;
         // Started straight from the field: its check may still run, or not have begun.
@@ -3718,11 +3816,22 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-new" },
           body: JSON.stringify({
-            repo: choice.repo,
-            ...(cloneNew.checked ? { destination: choice.destination } : { clone: choice.clone }),
-            ...(fileIssue.checked
-              ? { issue_title: title.value }
-              : { name: name.value, ...(base.value.trim() ? { base: base.value.trim() } : {}) }),
+            ...(inPlace.checked
+              ? { directory: directory.value.trim() }
+              : {
+                  repo: choice.repo,
+                  ...(cloneNew.checked
+                    ? { destination: choice.destination }
+                    : { clone: choice.clone }),
+                  ...(fileIssue.checked
+                    ? { issue_title: title.value }
+                    : {
+                        name: name.value,
+                        ...(base.value.trim() ? { base: base.value.trim() } : {}),
+                      }),
+                  ...(also.size ? { also: [...also] } : {}),
+                  ...alsoBaseChoice(),
+                }),
             agent: agent.value,
             ...(model.value ? { model: model.value } : {}),
             ...(effort.value ? { effort: effort.value } : {}),
@@ -3730,8 +3839,6 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
             ...(docker.checked ? { docker: true } : {}),
             ...machineChoice(),
             ...(quit.checked ? { exit_when_done: true } : {}),
-            ...(also.size ? { also: [...also] } : {}),
-            ...alsoBaseChoice(),
             task: task.value,
             ...attached(files),
           }),
@@ -4357,7 +4464,7 @@ function waitingCard(op) {
     heading = el("div", undefined, "scheduled-subject");
     heading.append(
       subject.url ? link(subject.repo, subject.url) : el("span", subject.repo || ""),
-      el("span", subject.title || subject.branch || "", "scheduled-title"),
+      el("span", subject.title || subject.branch || subject.path || "", "scheduled-title"),
     );
   }
   const action =

@@ -3018,3 +3018,390 @@ def test_review_cli_requests_other_provider_and_reports_approval_without_retry(
     assert request["sessions"] == {"codex": SID, "claude": None}
     assert "Scheduled tab" in t.stderr.getvalue() and "no reviewer started" in t.stderr.getvalue()
     assert "once there is room" not in t.stderr.getvalue()
+
+
+# --- wt --dir: an agent in an existing checkout, as it is ----------------------------------
+
+
+def herdr_replies(**results):
+    """A runner answering herdr's JSON commands: ``workspace_list=...`` for ``workspace list``."""
+    return FakeRunner(
+        [
+            (["herdr", *verb.split("_")], wt.Completed(0, json.dumps({"result": result}), ""))
+            for verb, result in results.items()
+        ],
+        executables={"herdr"},
+    )
+
+
+def held(path, wid="w7", **replies):
+    """herdr with a workspace already open on ``path``, holding one pane."""
+    answers = {
+        "workspace_list": {
+            "workspaces": [
+                {"workspace_id": "w1", "worktree": {"checkout_path": "/elsewhere"}},
+                {"workspace_id": wid, "worktree": {"checkout_path": path}},
+            ]
+        },
+        "agent_list": {"agents": [{"workspace_id": "w1", "agent": "claude"}]},
+        "pane_list": {"panes": [{"pane_id": f"{wid}:p1"}, {"pane_id": f"{wid}:p2"}]},
+        "pane_split": {"pane": {"pane_id": f"{wid}:p3"}},
+    }
+    return herdr_replies(**{**answers, **replies})
+
+
+def test_parse_dir_option_and_what_it_cannot_be_combined_with(tmp_path):
+    parsed = wt.parse_args("wt", ["--dir", "~/src/notes", "-p", "Tidy"])
+    assert (parsed.directory, parsed.prompt, parsed.positional) == ("~/src/notes", "Tidy", [])
+    assert "--dir <checkout>" in wt.HELP["wt"]
+    with pytest.raises(wt.WtError, match="--dir needs a value"):
+        wt.parse_args("wt", ["--dir"])
+    for command in ("wti", "wtpr"):
+        runner = FakeRunner()
+        with pytest.raises(wt.UsageError, match=f"{command}: --dir is an option of wt"):
+            tool(runner).run(command, ["--dir", "/c", "7"])
+        assert runner.calls == []
+    for extra in (
+        ["main"],
+        ["main", "feat"],
+        ["-r", "repo"],
+        ["--with", "other"],
+        ["--name", "feat"],
+        ["--repo-path", "/clone"],
+        ["--github-repo", "base/repo"],
+        ["--worktree-root", "/wt"],
+        ["--review"],
+    ):
+        runner = FakeRunner()
+        with pytest.raises(wt.UsageError, match="--dir starts the agent in the checkout as it is"):
+            tool(runner).run("wt", ["--dir", "/c", *extra[:2], *extra[2:]])
+        assert runner.calls == []
+
+
+def test_dir_opens_a_clones_own_checkout_as_its_workspace():
+    reply = {"workspace": {"workspace_id": "w3"}, "root_pane": {"pane_id": "w3:p1"}}
+    runner = herdr_replies(workspace_list={"workspaces": []}, workspace_create=reply)
+    t = tool(runner, {"HOME": "/home/u", "WT_MULTIPLEXER": "herdr"})
+    t.open_session(
+        options(agent="codex", prompt="Tidy", directory="/src/notes"),
+        "/src/notes",
+        "notes",
+        "/src/notes",
+    )
+    assert [c[0] for c in runner.calls] == [
+        ["herdr", "workspace", "list"],
+        ["herdr", "workspace", "create", "--cwd", "/src/notes", "--label", "notes", "--focus"],
+        [
+            "herdr",
+            "pane",
+            "run",
+            "w3:p1",
+            'codex -c check_for_update_on_startup=false "$(cat /tmp/wt-prompt.fixture)"',
+        ],
+    ]
+    assert t.stderr.getvalue() == ""
+
+
+def test_dir_opens_a_linked_worktree_under_its_clone():
+    runner = herdr_replies(
+        workspace_list={"workspaces": []},
+        worktree_open={"already_open": False, "root_pane": {"pane_id": "w3:p1"}},
+    )
+    t = tool(runner, {"HOME": "/home/u", "WT_MULTIPLEXER": "herdr"})
+    t.open_session(options(directory="/wt/fix", focus=False), "/wt/fix", "fix", "/clone")
+    assert runner.calls[1][0] == [
+        "herdr",
+        "worktree",
+        "open",
+        "--cwd",
+        "/clone",
+        "--path",
+        "/wt/fix",
+        "--label",
+        "fix",
+        "--no-focus",
+    ]
+    assert runner.calls[2][0][:4] == ["herdr", "pane", "run", "w3:p1"]
+    # A workspace opened between the look and the open holds panes nobody listed.
+    runner = herdr_replies(workspace_list={"workspaces": []}, worktree_open={"already_open": True})
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr"})
+    with pytest.raises(wt.WtError, match="for /wt/fix was opened meanwhile; run wt again"):
+        t.open_session(options(directory="/wt/fix", prompt="Go"), "/wt/fix", "fix", "/clone")
+    assert not [c for c in runner.calls if c[0][1:3] == ["pane", "run"]]
+
+
+def test_dir_types_into_a_new_pane_of_a_workspace_already_open(tmp_path):
+    path = str(tmp_path)
+    runner = held(path)
+    t = tool(runner, {"HOME": "/home/u", "WT_MULTIPLEXER": "herdr"})
+    t.open_session(options(agent="codex", prompt="Tidy", directory=path), path, "notes", path)
+    assert [c[0] for c in runner.calls] == [
+        ["herdr", "workspace", "list"],
+        ["herdr", "agent", "list"],
+        ["herdr", "pane", "list", "--workspace", "w7"],
+        ["herdr", "pane", "split", "w7:p1", "--direction", "right", "--cwd", path, "--no-focus"],
+        [
+            "herdr",
+            "pane",
+            "run",
+            "w7:p3",
+            'codex -c check_for_update_on_startup=false "$(cat /tmp/wt-prompt.fixture)"',
+        ],
+        # Typed by a person: the workspace that was open already is brought forward.
+        ["herdr", "workspace", "focus", "w7"],
+    ]
+    assert t.stderr.getvalue() == ""
+    quiet = held(path)
+    tool(quiet, {"WT_MULTIPLEXER": "herdr"}).open_session(
+        options(directory=path, focus=False), path, "notes", path
+    )
+    assert quiet.calls[-1][0][:4] == ["herdr", "pane", "run", "w7:p3"]
+
+
+def test_dir_refuses_a_checkout_whose_workspace_has_an_agent(tmp_path):
+    path = str(tmp_path)
+    runner = held(path, agent_list={"agents": [{"workspace_id": "w7", "agent": "codex"}]})
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr"})
+    with pytest.raises(
+        wt.WtError,
+        match=f"an agent is already open in the herdr workspace for {path}; message it there",
+    ):
+        t.open_session(options(directory=path, prompt="Go"), path, "notes", path)
+    assert [c[0][1:3] for c in runner.calls] == [["workspace", "list"], ["agent", "list"]]
+
+
+def test_dir_leaves_no_empty_pane_or_watch_when_the_agent_is_not_typed(tmp_path):
+    path = str(tmp_path)
+    home = tmp_path / "state"
+    runner = held(path)
+    runner.results.append((["herdr", "pane", "run"], wt.Completed(1, "", "gone")))
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)})
+    with pytest.raises(wt.WtError, match="pane run failed: gone"):
+        t.open_session(
+            options(directory=path, prompt="Go", exit_when_done=True), path, "notes", path
+        )
+    assert runner.calls[-1][0] == ["herdr", "pane", "close", "w7:p3"]
+    assert watches(home) == []
+    # An agent line that cannot be typed is refused before any pane is split off.
+    runner = held(path)
+    t = tool(runner, {"WT_MULTIPLEXER": "herdr"})
+    with pytest.raises(wt.WtError, match="Claude only"):
+        t.open_session(
+            options(directory=path, agent="codex", permission_mode="auto"), path, "notes", path
+        )
+    assert not [c for c in runner.calls if c[0][1:3] == ["pane", "split"]]
+
+
+def test_dir_exit_watch_follows_the_pane_the_agent_was_typed_in(tmp_path):
+    path = str(tmp_path)
+    home = tmp_path / "state"
+    t = tool(held(path), {"WT_MULTIPLEXER": "herdr", "BABYSIT_HOME": str(home)})
+    t.open_session(
+        options(directory=path, prompt="Go", exit_when_done=True, focus=False),
+        path,
+        "notes",
+        path,
+    )
+    [watch] = watches(home)
+    assert (watch["workspace_id"], watch["pane_id"], watch["label"]) == ("w7", "w7:p3", "notes")
+    assert watch["path"] == str(tmp_path.resolve())
+
+
+def test_dir_end_to_end_in_a_clone_a_worktree_and_a_plain_repository(repo, tmp_path):
+    home, git, state = repo
+    clone = home / "src/repo"
+    head = git("rev-parse", "HEAD")
+    run_tool("wt", "--dir", str(clone), "-p", "Tidy")
+    data = state_of(state)
+    assert data["agents"][-1]["task"] == "Tidy" and data["agents"][-1]["cwd"] == str(clone)
+    created = [c for c in data["calls"] if c[:2] == ["workspace", "create"]]
+    assert created == [["workspace", "create", "--cwd", str(clone), "--label", "repo", "--focus"]]
+    # Nothing was made, branched or switched.
+    assert not (home / "src/worktrees").exists()
+    assert (git("symbolic-ref", "--short", "HEAD"), git("rev-parse", "HEAD")) == ("main", head)
+    assert git("branch", "--format=%(refname:short)").split() == ["feature", "main"]
+    # One agent per checkout: the second run is refused, naming where the first is.
+    result = run_tool("wt", "--dir", str(clone), "-p", "Again", check=False)
+    assert result.returncode == 1
+    assert f"an agent is already open in the herdr workspace for {clone}" in result.stderr
+    assert len(state_of(state)["agents"]) == 1
+    # A linked worktree, named relative to the working directory and through a symlink.
+    linked = tmp_path / "linked"
+    git("worktree", "add", "-q", str(linked), "feature")
+    os.symlink(linked, tmp_path / "alias")
+    run_tool("wt", "--codex", "--dir", "alias", "-p", "Fix", cwd=tmp_path)
+    data = state_of(state)
+    assert data["agents"][-1]["cwd"] == str(linked.resolve())
+    opened = [c for c in data["calls"] if c[:2] == ["worktree", "open"]]
+    assert opened[-1][2:6] == ["--cwd", str(clone), "--path", str(linked.resolve())]
+    # A repository with no remote at all, under the home directory.
+    notes = home / "notes"
+    notes.mkdir()
+    git("init", "-q", "-b", "trunk", cwd=notes)
+    run_tool("wt", "--dir", "~/notes", "-p", "Read")
+    assert state_of(state)["agents"][-1]["cwd"] == str(notes)
+
+
+def test_dir_must_be_the_top_of_a_git_checkout(repo, tmp_path):
+    home, git, state = repo
+    clone = home / "src/repo"
+    (clone / "docs").mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    for path, message in (
+        (tmp_path / "missing", f"wt: --dir: no directory at {tmp_path / 'missing'}"),
+        (plain, f"wt: --dir: {plain} is not a Git checkout"),
+        (clone / "docs", f"wt: --dir: {clone / 'docs'} lies inside the checkout {clone}"),
+        (clone / ".git", f"wt: --dir: {clone / '.git'} is not a Git checkout"),
+    ):
+        result = run_tool("wt", "--dir", str(path), "-p", "Go", check=False)
+        assert result.returncode == 1 and message in result.stderr, result.stderr
+    # A Git directory that is not read from the checkout's layout is not the sandbox's.
+    separate = tmp_path / "separate"
+    separate.mkdir()
+    git("init", "-q", "--separate-git-dir", str(tmp_path / "kept.git"), cwd=separate)
+    result = run_tool("wt", "--dir", str(separate), "-p", "Go", check=False)
+    assert result.returncode == 1
+    assert f"wt: --dir: The Git common dir of {separate} cannot be verified" in result.stderr
+    assert not state_of(state)["agents"] and not state_of(state)["calls"]
+    # A home directory that is a checkout (dotfiles) would put all of it in the sandbox.
+    git("init", "-q", "-b", "main", cwd=home)
+    for path in ("~", str(home)):
+        result = run_tool("wt", "--dir", path, "-p", "Go", check=False)
+        assert result.returncode == 1, result.stderr
+        assert f"wt: --dir: {home} holds the home directory" in result.stderr
+    assert not state_of(state)["calls"]
+
+
+def test_dir_a_linux_sandbox_cannot_take_is_refused_before_anything_opens(repo, monkeypatch):
+    home, git, state = repo
+    clone = home / "src/repo"
+    git("worktree", "add", "-q", str(home / "linked"), "feature")
+    monkeypatch.setattr(wt.sandbox, "DEFAULT", "bwrap")
+    env = dict(os.environ)
+    t = wt.Tool(wt.SubprocessRunner(env), env, stderr=io.StringIO(), confined=lambda: False)
+    # babysit-bwrap is given the checkout and its Git directory: a clone's own, which
+    # its worktrees share, would let this agent reach into theirs.
+    with pytest.raises(wt.WtError, match=f"Refusing to sandbox the main checkout {clone}"):
+        t.run("wt", ["--codex", "--dir", str(clone), "-p", "Go"])
+    assert not state_of(state)["calls"]
+
+
+def test_dir_without_a_multiplexer_prints_the_checkout(repo, monkeypatch):
+    home, _, _ = repo
+    monkeypatch.setenv("WT_MULTIPLEXER", "none")
+    assert run_tool("wt", "--dir", "~/src/repo").stdout == f"{home / 'src/repo'}\n"
+
+
+def test_dir_on_a_worker_goes_to_the_dashboard_with_the_workers_path(tmp_path, dashboard):
+    dashboard.launch()
+    t = controller(tmp_path, dashboard)
+    t.run("wt", ["--codex", "--dir", "~/src/notes", "--machine", "chonk", "-p", "Tidy"])
+    assert dashboard.paths() == [("POST", "/api/workspace-new"), ("GET", "/api/workspaces")]
+    # The path is the worker's: it is neither expanded nor looked at here.
+    assert dashboard.requests[0]["body"] == {
+        "directory": "~/src/notes",
+        "agent": "codex",
+        "model": "",
+        "effort": "",
+        "claude_account": "",
+        "task": "Tidy",
+        "docker": False,
+        "exit_when_done": False,
+        "permission_mode": "",
+        "machine": "chonk",
+    }
+    tagged = ["--dir", "/srv/notes", "--machine", "chonk", "--tag", "notes", "--docker"]
+    t.run("wt", [*tagged, "-p", "Tidy"])
+    body = dashboard.requests[-2]["body"]
+    assert (body["directory"], body["tags"], body["docker"]) == ("/srv/notes", ["notes"], True)
+    # An unquoted ~ reaches wt as this machine's home, which is not the worker's.
+    assert "reading a path" not in t.stderr.getvalue()
+    t.run("wt", ["--dir", f"{tmp_path}/src/notes", "--machine", "chonk", "-p", "Tidy"])
+    assert dashboard.requests[-2]["body"]["directory"] == "~/src/notes"
+    assert (
+        "wt: --dir: reading a path under this machine's home as ~/src/notes on chonk\n"
+        in t.stderr.getvalue()
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "error", "message"),
+    [
+        (["--dir", "notes", "--machine", "chonk", "-p", "x"], wt.WtError, "not a valid directory"),
+        (["--dir", "/srv/n", "--machine", "chonk"], wt.WtError, "not a valid brief for a worker"),
+        (
+            ["--dir", "/srv/n", "--machine", "auto", "-p", "x"],
+            wt.UsageError,
+            "--dir names a directory of one machine: --machine takes its id, or local",
+        ),
+    ],
+)
+def test_dir_runs_a_worker_cannot_take_are_refused(tmp_path, dashboard, args, error, message):
+    t = controller(tmp_path, dashboard)
+    with pytest.raises(error, match=message):
+        t.run("wt", args)
+    assert dashboard.requests == []
+
+
+def test_dir_with_docker_never_moves_to_the_docker_worker(tmp_path):
+    t = controller(tmp_path)
+    assert t.chosen_machine("wt", options(docker=True)) == "auto"
+    assert t.chosen_machine("wt", options(docker=True, directory="/src/notes")) == "local"
+
+
+def test_dir_is_refused_inside_a_sandbox_that_hands_tasks_over(tmp_path, dashboard):
+    t = sandboxed(tmp_path, dashboard)
+    with pytest.raises(wt.WtError, match="--dir: inside a sandbox wt hands only new branches"):
+        t.run("wt", ["--dir", str(tmp_path), "-p", "Go"])
+    assert dashboard.requests == []
+
+
+def test_dir_on_herdr_core_takes_the_same_commands_through_hc_panes():
+    panes = list(wt.PANE_COMMANDS["hc"])
+    opened = {
+        "already_open": False,
+        "root_pane": {"pane_id": "t4"},
+        "workspace": {"workspace_id": "hc-0123456789ab"},
+    }
+    runner = FakeRunner(
+        [
+            ([*panes, "workspace", "list"], wt.Completed(0, '{"result": {"workspaces": []}}', "")),
+            ([*panes, "workspace", "create"], wt.Completed(0, json.dumps({"result": opened}), "")),
+        ],
+        executables={"hc"},
+    )
+    t = tool(runner, {"WT_MULTIPLEXER": "hc"})
+    t.open_session(
+        options(agent="codex", prompt="Tidy", focus=False, directory="/src/notes"),
+        "/src/notes",
+        "notes",
+        "/src/notes",
+    )
+    assert [c[0][len(panes) :] for c in runner.calls] == [
+        ["workspace", "list"],
+        ["workspace", "create", "--cwd", "/src/notes", "--label", "notes", "--no-focus"],
+        [
+            "pane",
+            "run",
+            "t4",
+            'codex -c check_for_update_on_startup=false "$(cat /tmp/wt-prompt.fixture)"',
+        ],
+    ]
+    refused = json.dumps({"error": {"code": "unavailable", "message": "hc is not installed"}})
+    runner = FakeRunner(
+        [([*panes, "workspace", "list"], wt.Completed(1, refused, ""))], executables={"hc"}
+    )
+    with pytest.raises(wt.WtError, match="hc workspace list failed: hc is not installed"):
+        tool(runner, {"WT_MULTIPLEXER": "hc"}).open_session(
+            options(directory="/src/notes"), "/src/notes", "notes", "/src/notes"
+        )
+
+
+def test_a_launch_in_a_detached_directory_is_reported_by_its_path(tmp_path, dashboard):
+    dashboard.launch(now=True)
+    done = dashboard.answers["/api/workspace-new"]["operation"]
+    done["result"] = {"branch": None, "path": "/home/w/notes", "machine_label": "Chonk"}
+    t = controller(tmp_path, dashboard)
+    t.run("wt", ["--dir", "/home/w/notes", "--machine", "chonk", "-p", "Tidy"])
+    assert "wt: /home/w/notes on Chonk\n" in t.stderr.getvalue()
