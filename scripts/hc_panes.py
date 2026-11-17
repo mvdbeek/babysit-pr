@@ -639,11 +639,10 @@ def run(args: list[str], machine: str | None):
             records = members(records, workspace)
         listed = local_processes(machine)
         return {"panes": [pane(record, machine, listed) for record in records]}
-    if verb in {("worktree", "open"), ("workspace", "create")}:
+    if verb == ("worktree", "open"):
         cwd, path, title = take(rest, "--cwd"), take(rest, "--path"), take(rest, "--label")
         if not cwd:
             raise Refused("usage", "--cwd is required")
-        # A clone's own checkout is its workspace: herdr's ``workspace create`` names only it.
         return open_workspace(machine, path or cwd, cwd, title)
     if verb == ("workspace", "focus"):
         raise Refused(

@@ -60,7 +60,12 @@ elif a[:2] == ['worktree','open']:
  if os.environ.get('FAKE_HERDR_OPEN_ERROR'):
   save(); print(json.dumps({'error':{'message':os.environ['FAKE_HERDR_OPEN_ERROR']}})); sys.exit(1)
  path=a[a.index('--path')+1]; root=a[a.index('--cwd')+1]
- existing=next((w for w in data['workspaces'] if w['worktree']['checkout_path']==path),None)
+ existing=next((w for w in data['workspaces'] if (w.get('worktree') or {}).get('checkout_path')==path),None)
+ if not existing:
+  # One made in the repository without a checkout ('opened_in', as `workspace create`
+  # leaves it) is taken for the checkout's, and lists it from now on.
+  existing=next((w for w in data['workspaces'] if not w.get('worktree') and w.get('opened_in')==path),None)
+  if existing: existing['worktree']={'repo_root':root,'checkout_path':path}
  if existing: wid=existing['workspace_id']
  else:
   n=len(data['workspaces'])+1
@@ -69,13 +74,6 @@ elif a[:2] == ['worktree','open']:
   data['workspaces'].append({'workspace_id':wid,'label':a[a.index('--label')+1] if '--label' in a else 'Reopened','agent_status':'unknown','worktree':{'repo_root':root,'checkout_path':path}})
  result={'already_open':bool(existing),'root_pane':{'pane_id':wid+':p1'}}
  if os.environ.get('FAKE_HERDR_NO_ROOT'): result={'already_open':False}
-elif a[:2] == ['workspace','create']:
- # A workspace on a clone's own checkout; always a new one, as herdr makes it.
- path=a[a.index('--cwd')+1]; n=len(data['workspaces'])+1
- while any(w['workspace_id']=='w'+str(n) for w in data['workspaces']): n+=1
- wid='w'+str(n)
- data['workspaces'].append({'workspace_id':wid,'label':a[a.index('--label')+1] if '--label' in a else 'Workspace','agent_status':'unknown','worktree':{'repo_root':path,'checkout_path':path}})
- result={'workspace':{'workspace_id':wid},'root_pane':{'pane_id':wid+':p1'}}
 elif a[:2] == ['workspace','close']:
  data['workspaces']=[w for w in data['workspaces'] if w['workspace_id']!=a[2]]
  data['agents']=[g for g in data['agents'] if g.get('workspace_id')!=a[2]]
