@@ -375,6 +375,20 @@ def github_token_from_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_user_git_config(monkeypatch, tmp_path_factory):
+    """Git reads none of the user's own configuration, as on CI, unless a test names one.
+
+    With the user's ``commit.gpgsign`` every fixture commit would be signed with their
+    key: one gpg-agent call each, which queue up behind each other under xdist, and a
+    failure wherever the key is locked.
+    """
+    config = tmp_path_factory.mktemp("git") / "config"
+    config.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+@pytest.fixture(autouse=True)
 def herdr_terminals(monkeypatch):
     """Terminals are herdr's unless a test chooses herdr-core, whatever this machine's own
     setting is and whether or not the tests themselves run in an hc terminal."""
