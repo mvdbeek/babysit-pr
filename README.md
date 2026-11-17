@@ -658,6 +658,27 @@ the same new repository share one clone. Placed on a worker, the task is cloned 
 under the worker's own `src`, and `destination` is not used. With no local clone at
 all, the dialog opens with this box ticked.
 
+**Work in an existing directory, as it is**, in New task, starts the agent in a
+directory that already exists on one machine, in place of a new branch in a worktree.
+The directory must be the top of a Git checkout, a clone's own checkout or one of its
+worktrees; the repository needs no GitHub remote, and the checkout may be on any branch
+or detached. Nothing is cloned, fetched, branched or switched: the agent works on
+whatever is checked out. The dialog then asks for the directory alone, an absolute path
+or `~/…` (this machine's clones are suggested), and hides the repository, branch, issue
+and other-repository fields. The request carries `directory` in place of `repo`,
+`clone`, `name`, `base`, `issue_title` and `also`, which it refuses together with it.
+A directory is one machine's, so **Machine** offers no Auto here: this machine is
+chosen until another is named, and a request with `machine: "auto"` is refused. A
+directory on this machine is checked when the task is requested; one on a worker is
+checked there when the launch runs, where `~` is that worker's home. The launch runs
+`wt --dir` (see the worktree helper below), so a checkout whose herdr workspace is
+already open gets the agent in a new pane of it, and one with an agent already open
+takes no second one: the task fails before anything is typed. The operation's `subject`
+is `{"kind": "directory", "path": …}`, with `repo` when the checkout's `upstream` (else
+`origin`) names a GitHub repository, which is also the repository whose saved effort
+default applies. An agent cannot ask for one from its sandbox, where a sub-task is
+always a new branch, and neither can the browser extension.
+
 **Also work in other repositories**, in New task, lists the other local clones (those
 the repository picker offers). Each one chosen is passed to the helper as
 `--with <clone>` (the request field is `also: [clone paths]`, at most 4, never the
@@ -965,6 +986,7 @@ opens it in a multiplexer with the selected agent started in the left pane:
 wt [--codex|--claude [--permission-mode auto]] [--docker] [--with repo[:base]]... [-r repo] [-p text|-F file [--exit-when-done]] [--model id] [--effort level] [--machine id|auto|local] <base> [branch]
 wt [opts] <pr-number>                 # same as wtpr
 wt [opts] issue <number|url> [branch] # same as wti
+wt [opts] --dir <checkout>            # an agent in an existing checkout, as it is
 wti [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url> [branch]
 wtpr [opts] [--name n] [--label l] [--no-focus] [--repo-path p] [--worktree-root p] <number|url>
 ```
@@ -1000,6 +1022,37 @@ A branch that is already checked out is opened where it already lives -- the mai
 clone for `wt main`, or a worktree created under a different directory name --
 instead of failing on git's refusal to check the same branch out twice. The reused
 path is reported on stderr.
+
+`--dir <checkout>` starts the agent in an existing Git checkout as it is: `wt` makes no
+worktree and creates or switches no branch, and fetches nothing. The path (relative
+paths and `~` are resolved here, symlinks followed) must be the top of a checkout, a
+clone's own or one of its worktrees, on any branch or detached; a directory inside a
+checkout, a bare repository and a folder that is no repository are refused, so Git
+never finds a repository in a parent. The home directory itself, or one above it, is
+refused too, as the agent's sandbox may write the whole checkout, and so is a checkout
+whose Git directory cannot be read from its layout (a submodule, `--separate-git-dir`,
+a worktree of a bare repository), since that is what the sandbox is granted. It needs
+no GitHub remote. It takes no branch,
+`-r`, `--with` or `--review`, and is an option of `wt` only. In herdr (and herdr-core)
+a linked worktree opens under its clone, as other worktrees do, and a clone's own
+checkout gets a workspace of its own (`herdr workspace create`), labelled with the
+directory's name. A workspace already open on the checkout is kept: the agent is typed
+into a new pane split off its first one, since its own panes may hold a shell in use,
+and a run typed by a person then focuses that workspace. A checkout takes one agent
+this way: when herdr lists an agent in a workspace on it, `wt` refuses rather than
+start a second one in the same files. `--exit-when-done` follows the pane the agent was
+typed in. tmux and cmux reattach to a session of that name as for any other run. With
+`--machine <id>` the path is that worker's (absolute, or `'~/…'` for its home) and
+nothing about it is read here: `wt` hands the dashboard a New task with `directory`,
+which needs a prompt, and the worker's own `wt --dir` starts the agent there. A shell
+expands an unquoted `~` to this machine's home before `wt` sees it, so a path under
+this machine's home is sent as `~/…` instead, with a note on stderr. `auto`
+is refused, since a directory is one machine's, and `--docker` alone never moves a
+`--dir` run to the Docker worker. Inside a sandbox that hands its tasks to the
+dashboard `--dir` is refused: a sub-task is a new branch. On Linux the agent's
+babysit-bwrap is given the checkout and its Git directory as for any launch, so a
+clone's own checkout that has linked worktrees is refused there (its Git directory is
+shared with them); name one of the worktrees instead.
 
 `--with <repo>` (repeatable; a name under `~/src` or a clone path) is for changes that
 span repositories. Safehouse only lets the agent write to its own worktree and that

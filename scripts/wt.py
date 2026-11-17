@@ -82,6 +82,9 @@ LAUNCH_FIELDS = (
     "machine",
 )
 LAUNCH_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+# `--dir` on another machine (see directory_request): an absolute path, or one under its
+# home. It is that machine's, so nothing else about it is checked here.
+REMOTE_DIRECTORY = re.compile(r"(?:/|~/)[^\x00-\x1f\x7f]{1,1023}")
 # Why `wt` without a brief stays here: said only when a worker was asked for by name or auto.
 NO_PROMPT = "a launch on a worker needs a prompt (-p or -F)"
 # A conversation id as Claude and Codex give it to the commands they run.
@@ -107,6 +110,7 @@ VALUE_OPTIONS = {
     "--with": "also",
     "--tag": "tags",
     "--machine": "machine",
+    "--dir": "directory",
 }
 WT_OPTIONS = frozenset(
     {
@@ -127,6 +131,7 @@ WT_OPTIONS = frozenset(
         "--exit-when-done",
         "--review",
         "--machine",
+        "--dir",
     }
 )
 DASHBOARD_OPTIONS = frozenset(
@@ -152,6 +157,7 @@ WT_HELP = """\
 usage:
   wt [opts] <branch|pr-number> [dirname]
   wt [opts] issue <issue-number|issue-url> [branch-name]
+  wt [opts] --dir <checkout>
   wt tag add|remove <tag> [workspace-path|github-url ...]
   wt tag list [tag]
   wt follow-up new:<task-uuid> -p <message> | -F <message-file>
@@ -197,7 +203,17 @@ options:
   --machine <id>|auto|local  start the agent on a worker of the dashboard's machine
                 registry (auto: where the dashboard's Auto places it) instead of
                 here; --docker alone means auto when the registry prefers a Docker
-                worker. A worker takes only a new <branch> from <base> with a prompt
+                worker. A worker takes only a new <branch> from <base> with a prompt,
+                or --dir with a prompt
+  --dir <checkout>  start the agent in this existing Git checkout as it is: no
+                worktree is made and no branch is created or switched. The path is
+                the top of a checkout (a clone, or one of its worktrees). A
+                workspace already open there gets the agent in a new pane, unless
+                an agent is open in it. Takes no branch, -r or --with. With
+                --machine <id> the path is that worker's (absolute, or '~/...'
+                for its home: a path under this machine's home is read as that),
+                the run needs a prompt, and auto is refused: a directory is one
+                machine's
   -h, --help    show this help
 
 Inside an agent's sandbox that cannot write the clone (a worker's babysit-bwrap, or
@@ -245,6 +261,9 @@ examples:
   wt --codex -p 'Review this PR for security issues' 22886
   # an unattended review the dashboard exits once it is done
   wt -F /tmp/review-brief.md --exit-when-done 22886
+  # work in a checkout as it is, here or on a worker
+  wt --dir ~/src/notes -p 'Tidy the reading list'
+  wt --dir '~/src/notes' --machine mini -p 'Tidy the reading list'
 """
 
 WTI_HELP = """\
@@ -397,6 +416,7 @@ class Options:
         "exit_watch_json",
         "gpg",
         "machine",
+        "directory",
         "positional",
     )
 
@@ -433,6 +453,8 @@ class Options:
         self.gpg = False
         # `--machine`: a worker's registry id, auto or local; empty when not given.
         self.machine = ""
+        # `--dir`: an existing checkout the agent starts in as it is; empty when not given.
+        self.directory = ""
         self.positional: list[str] = []
 
 
@@ -1113,6 +1135,59 @@ def launch_request(command: str, options: Options, repo: str, machine: str) -> d
         "machine": machine,
         **({"tags": options.tags} if options.tags else {}),
         **({"review": True} if options.review else {}),
+    }
+
+
+# Why a checkout that is the home directory, or holds it, takes no `--dir` agent: the
+# sandbox lets the agent write its checkout, which babysit-bwrap refuses outright there.
+HOLDS_HOME = "holds the home directory; an agent's sandbox would cover everything in it"
+
+
+def holds_home(directory: str, home: str) -> bool:
+    """Whether the real path ``directory`` is ``home`` or one of the directories above it."""
+    home = os.path.realpath(home)
+    return home == directory or home.startswith(directory.rstrip(os.sep) + os.sep)
+
+
+def directory_request(command: str, options: Options, machine: str) -> dict[str, object]:
+    """``wt --dir`` on a worker: what the controller's New task takes for it.
+
+    ``directory`` (the worker's checkout, in place of a launch_request's ``repo``, ``base``
+    and ``name``), then the same agent fields, brief and ``machine``, which is a registry
+    id: a directory is one machine's, so Auto has nothing to choose. The worker checks
+    the directory; a field no worker can take raises NotForWorker.
+    """
+    validate_agent_options(options.agent, options.model, options.effort, options.permission_mode)
+    checks = [
+        (
+            REMOTE_DIRECTORY.fullmatch(options.directory),
+            "directory on a worker (an absolute path, or ~/...)",
+        ),
+        (
+            not options.claude_account or claude_accounts.NAME.fullmatch(options.claude_account),
+            "Claude account for a worker",
+        ),
+        (
+            options.prompt.strip() and len(options.prompt) <= 32000 and "\0" not in options.prompt,
+            "brief for a worker (1-32,000 characters)",
+        ),
+        (MACHINE.fullmatch(machine), "machine"),
+    ]
+    for ok, field in checks:
+        if not ok:
+            raise NotForWorker(f"not a valid {field}")
+    return {
+        "directory": options.directory,
+        "agent": options.agent,
+        "model": options.model,
+        "effort": options.effort,
+        "claude_account": options.claude_account,
+        "task": options.prompt,
+        "docker": options.docker,
+        "exit_when_done": options.exit_when_done,
+        "permission_mode": options.permission_mode,
+        "machine": machine,
+        **({"tags": options.tags} if options.tags else {}),
     }
 
 
@@ -1805,13 +1880,36 @@ class Tool:
         # is a shell terminal labelled with the checkout, and the agent is typed into it.
         tool = list(PANE_COMMANDS[mux])
         focus = "--focus" if options.focus else "--no-focus"
-        argv = [*tool, "worktree", "open", "--cwd", repo_path, "--path", directory]
-        argv += ["--label", sanitize_session_name(options.label or name), focus]
-        result = self.runner.run(argv)
-        if result.returncode:
-            detail = herdr_error_message(result.stdout + result.stderr)
-            raise WtError(f"wt: {mux} worktree open failed: {detail}")
-        reply = parse_herdr_open(result.stdout, mux)
+        label = ["--label", sanitize_session_name(options.label or name), focus]
+        if options.directory:
+            # Nobody made this checkout for the agent, so its line is tried before
+            # anything is opened: on Linux the sandbox takes no clone's own checkout
+            # whose Git directory other worktrees share. Staged paths look like this.
+            sample = os.path.join(self.env.get("TMPDIR") or "/tmp", "wt-prompt.XXXXXXXX")
+            self.command_for(options, lambda _: sample, directory=directory)
+        # `--dir` into a workspace already open on the checkout: (workspace, pane to split).
+        held = self.workspace_in_place(directory, mux) if options.directory else None
+        if held:
+            # Its pane is split off below, once nothing else can refuse the launch.
+            reply = HerdrOpen(False, "", held[0])
+        else:
+            # A clone's own checkout is its workspace; `worktree open` is for a checkout
+            # under one, which only `--dir` tells apart.
+            verb = "worktree open"
+            argv = [*tool, "worktree", "open", "--cwd", repo_path, "--path", directory, *label]
+            if options.directory and repo_path == directory:
+                verb = "workspace create"
+                argv = [*tool, "workspace", "create", "--cwd", directory, *label]
+            result = self.runner.run(argv)
+            if result.returncode:
+                detail = herdr_error_message(result.stdout + result.stderr)
+                raise WtError(f"wt: {mux} {verb} failed: {detail}")
+            reply = parse_herdr_open(result.stdout, mux)
+        if reply.already_open and options.directory:
+            # Opened since it was looked for: its panes are someone's, and unknown here.
+            raise WtError(
+                f"wt: a {mux} workspace for {directory} was opened meanwhile; run wt again"
+            )
         if reply.already_open:
             # Existing workspaces retain their agents; focus follows the explicit option.
             if options.prompt:
@@ -1822,7 +1920,7 @@ class Tool:
                 )
             self.warn_reattached(options)
             return
-        if not reply.root_pane:
+        if not held and not reply.root_pane:
             raise WtError(f"wt: {mux} did not return a root pane for {directory}")
         watch, marker = None, ""
         if options.exit_when_done:
@@ -1834,21 +1932,35 @@ class Tool:
             # Last, after any --with note: the brief asks for the marker as the final line.
             options.prompt += exit_watch.brief(marker)
         command = self.command_for(options, directory=directory)
-        if options.exit_when_done and not options.exit_watch_json:
-            # Recorded before the command is typed, so no agent waits on an unsaved watch.
-            watch = self.watch_exit(options, directory, name, reply, marker)
-        # No spare terminal split here: reviewr's auto_open is off, so the workspace
-        # holds just the agent; open reviewr with its toggle action when wanted.
-        # pane run submits text + Enter; the pty buffers it until the new shell reads it.
+        if held:
+            reply = reply._replace(root_pane=self.split_pane(held[1], directory, mux))
+
+        def untyped() -> None:
+            # Nothing was typed: no watch waits for an agent, and a pane split off for
+            # one is an empty shell.
+            self.forget_watch(watch)
+            if held:
+                self.runner.run([*tool, "pane", "close", reply.root_pane])
+
         try:
+            if options.exit_when_done and not options.exit_watch_json:
+                # Recorded before the command is typed, so no agent waits on an unsaved watch.
+                watch = self.watch_exit(options, directory, name, reply, marker)
+            # No spare terminal split here: reviewr's auto_open is off, so the workspace
+            # holds just the agent; open reviewr with its toggle action when wanted.
+            # pane run submits text + Enter; the pty buffers it until the new shell reads it.
             result = self.runner.run([*tool, "pane", "run", reply.root_pane, command])
         except BaseException:
-            self.forget_watch(watch)
+            untyped()
             raise
         if result.returncode:
-            self.forget_watch(watch)
+            untyped()
             detail = result.stderr.strip() or herdr_error_message(result.stdout)
             raise WtError(f"wt: {mux} pane run failed: {detail}".rstrip(": "))
+        if held and options.focus:
+            # A workspace opened here takes the focus as it opens; one that was open
+            # already is brought forward now (herdr-core has no window to focus).
+            self.runner.run([*tool, "workspace", "focus", held[0]])
         if options.exit_when_done and options.exit_watch_json:
             # Only for an agent that was typed: the controller records it once wt returns.
             print(
@@ -1856,6 +1968,70 @@ class Tool:
                 file=self.stdout,
                 flush=True,
             )
+
+    def herdr_result(self, mux: str, *args: str) -> dict[str, object]:
+        """The ``result`` of one herdr (or hc_panes) command that answers JSON."""
+        result = self.runner.run([*PANE_COMMANDS[mux], *args])
+        what = " ".join(args[:2])
+        if result.returncode:
+            detail = herdr_error_message(result.stdout + result.stderr)
+            raise WtError(f"wt: {mux} {what} failed: {detail}".rstrip(": "))
+        try:
+            reply = json.loads(result.stdout)
+        except ValueError:
+            reply = None
+        found = reply.get("result") if isinstance(reply, dict) else None
+        if not isinstance(found, dict):
+            raise WtError(f"wt: unexpected {mux} reply to {what}")
+        return found
+
+    def workspace_in_place(self, directory: str, mux: str) -> tuple[str, str] | None:
+        """The workspace already open on a ``--dir`` checkout and a pane of it to split.
+
+        None when the checkout has no workspace, so one is opened and the agent gets its
+        root pane. A workspace's own panes may hold a shell someone is typing in, so there
+        the agent gets a new split, as a resume does. A checkout takes one agent at a
+        time: a second would trip over the first one's changes, and nothing could tell
+        which of them a launch started.
+        """
+
+        def listed(value: object) -> list[dict[str, object]]:
+            items = value if isinstance(value, list) else []
+            return [item for item in items if isinstance(item, dict)]
+
+        def path_of(space: dict[str, object]) -> str:
+            checkout = space.get("worktree")
+            path = checkout.get("checkout_path") if isinstance(checkout, dict) else None
+            return os.path.realpath(path) if isinstance(path, str) and path else ""
+
+        spaces = [
+            str(space["workspace_id"])
+            for space in listed(self.herdr_result(mux, "workspace", "list").get("workspaces"))
+            if space.get("workspace_id") and path_of(space) == directory
+        ]
+        if not spaces:
+            return None
+        agents = listed(self.herdr_result(mux, "agent", "list").get("agents"))
+        if any(agent.get("workspace_id") in spaces for agent in agents):
+            raise WtError(
+                f"wt: an agent is already open in the {mux} workspace for {directory}; "
+                "message it there, or close it first"
+            )
+        panes = self.herdr_result(mux, "pane", "list", "--workspace", spaces[0]).get("panes")
+        anchor = next((pane["pane_id"] for pane in listed(panes) if pane.get("pane_id")), None)
+        if not isinstance(anchor, str):
+            raise WtError(f"wt: the {mux} workspace for {directory} has no pane to split")
+        return spaces[0], anchor
+
+    def split_pane(self, anchor: str, directory: str, mux: str) -> str:
+        """A new pane beside ``anchor``, with its shell in ``directory``."""
+        split = self.herdr_result(
+            mux, "pane", "split", anchor, "--direction", "right", "--cwd", directory, "--no-focus"
+        ).get("pane")
+        pane = split.get("pane_id") if isinstance(split, dict) else None
+        if not isinstance(pane, str) or not pane:
+            raise WtError(f"wt: {mux} did not return the new pane for {directory}")
+        return pane
 
     def forget_watch(self, watch: str | None) -> None:
         if watch:
@@ -1997,6 +2173,9 @@ class Tool:
         except ValueError as exc:
             raise WtError(f"wt: {exc}") from exc
         args = options.positional
+        if options.directory:
+            self.run_directory(options)
+            return
         if options.name:
             self.reserve_wt(options)
             return
@@ -2038,6 +2217,67 @@ class Tool:
                     trust=self.trusts_origin(options),
                 )
         self.open_session(options, directory, branch, repo_path)
+
+    def check_directory_options(self, command: str, options: Options) -> None:
+        """Refuse what ``--dir`` cannot be combined with, before anything else is looked at.
+
+        The agent starts in the checkout as it is, so nothing that names a branch, a
+        repository or where a worktree goes applies.
+        """
+        if command != "wt":
+            raise UsageError(command, f"{command}: --dir is an option of wt")
+        if (
+            options.positional
+            or options.name
+            or options.also
+            or options.repo_override
+            or options.repo_path
+            or options.github_repo
+            or options.worktree_root
+            or options.review
+        ):
+            raise UsageError(
+                command,
+                "wt: --dir starts the agent in the checkout as it is: it takes no branch, "
+                "-r, --with or --review",
+            )
+
+    def run_directory(self, options: Options) -> None:
+        """``wt --dir``: the agent starts in an existing checkout; nothing is checked out.
+
+        The directory must be a checkout's top level, so the session is the checkout's
+        and Git never searches its parents for a repository, and never the home
+        directory or one above it. A linked worktree opens under its clone, as ``wt``
+        opens one it made; a clone's own checkout is its own.
+        """
+        shown = options.directory
+        directory = os.path.realpath(os.path.expanduser(shown))
+        if not os.path.isdir(directory):
+            raise WtError(f"wt: --dir: no directory at {shown}")
+        top = self.git_query(directory, "rev-parse", "--show-toplevel")
+        if top.returncode:
+            raise WtError(f"wt: --dir: {directory} is not a Git checkout")
+        top_level = os.path.realpath(top.stdout.strip())
+        if top_level != directory:
+            raise WtError(
+                f"wt: --dir: {directory} lies inside the checkout {top_level}; name that instead"
+            )
+        if holds_home(directory, self.home):
+            raise WtError(f"wt: --dir: {directory} {HOLDS_HOME}")
+        try:
+            # From the layout, as the sandbox that is granted it reads it: never what
+            # an agent-written commondir file names.
+            common = safe_git.common_dir(directory)
+        except ValueError as exc:
+            raise WtError(f"wt: --dir: {exc}") from exc
+        own = common == os.path.realpath(os.path.join(directory, ".git"))
+        options.directory = directory
+        self.open_session(
+            options,
+            directory,
+            os.path.basename(directory),
+            directory if own else os.path.dirname(common),
+        )
 
     def reserve_wt(self, options: Options) -> None:
         """``wt --name``: a new branch and worktree for the dashboard, never a reused one."""
@@ -2285,10 +2525,18 @@ class Tool:
         machine = options.machine
         if machine not in ("", "auto", "local") and not MACHINE.fullmatch(machine):
             raise UsageError(command, f"{command}: --machine takes a machine id, auto or local")
+        if options.directory and machine == "auto":
+            raise UsageError(
+                command,
+                f"{command}: --dir names a directory of one machine: --machine takes its id, "
+                "or local",
+            )
         if machine in ("", "local"):
             implicit = (
                 not machine
                 and options.docker
+                # A directory here is this machine's, whatever the agent may use.
+                and not options.directory
                 and not dashboard_run(options)
                 and not self.on_worker()
                 and self.docker_worker(command)
@@ -2359,6 +2607,17 @@ class Tool:
         A new branch that already exists here, as a branch or a worktree directory, stays
         with its clone: on a worker it would become a second, diverging branch.
         """
+        if options.directory:
+            here = self.home.rstrip(os.sep) + os.sep
+            if options.directory.startswith(here):
+                # The shell expands an unquoted ~ to this machine's home before wt sees
+                # it; the worker's own home is what was meant.
+                options.directory = "~/" + options.directory[len(here) :]
+                self.warn(
+                    f"{command}: --dir: reading a path under this machine's home as "
+                    f"{options.directory} on {machine}"
+                )
+            return directory_request(command, options, machine)
         refusal = worker_refusal(command, options)
         if refusal:
             raise NotForWorker(refusal)
@@ -2398,7 +2657,9 @@ class Tool:
             if status == "complete":
                 result = op.get("result")
                 if isinstance(result, dict):
-                    where = f"{result.get('branch')} at {result.get('path')}"
+                    # A `--dir` checkout may be detached: then only where it is.
+                    branch = f"{result['branch']} at " if result.get("branch") else ""
+                    where = f"{branch}{result.get('path')}"
                     url = f" ({result['url']})" if result.get("url") else ""
                     machine = result.get("machine_label") or "the controller"
                     self.warn(f"{command}: {where} on {machine}{url}")
@@ -2600,10 +2861,17 @@ class Tool:
         options = parse_args(command, argv)
         if options.exit_watch_json and not options.exit_when_done:
             raise UsageError(command, f"{command}: --exit-watch-json needs --exit-when-done")
+        if options.directory:
+            self.check_directory_options(command, options)
         # The dashboard's own runs always make their worktree where they run.
         kind = "" if dashboard_run(options) else self.sandboxed(options)
         if options.review and kind != "bwrap":
             raise WtError(f"{command}: --review requires a worker's babysit-bwrap broker")
+        if kind and options.directory:
+            # A sub-task is a new branch in a clone of its repository, checked as one.
+            raise WtError(
+                f"{command}: --dir: inside a sandbox wt hands only new branches to the dashboard"
+            )
         if kind:
             self.launch_from_sandbox(command, options, kind)
             return

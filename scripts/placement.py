@@ -26,9 +26,10 @@ STATE_STALE = 600
 # Agents this machine takes before Auto prefers a worker, unless the settings say otherwise.
 LOCAL_SLOTS = 20
 # What a launch starts work on, and what of it a worker can start; anything else stays
-# here. Cron jobs are new tasks too.
-KINDS = {"pr", "issue", "sentry", "scratch", "cron"}
-WORKER_KINDS = {"pr", "scratch", "cron"}
+# here. Cron jobs are new tasks too, and so is a task in an existing directory, which is
+# always on the machine a person names for it.
+KINDS = {"pr", "issue", "sentry", "scratch", "cron", "directory"}
+WORKER_KINDS = {"pr", "scratch", "cron", "directory"}
 # The capability label a sandboxed agent needs, by operating system.
 SANDBOX = {"darwin": "safehouse", "linux": "bwrap"}
 
@@ -62,7 +63,8 @@ def request(fields, repos, docker=None):
     """A placement request from launch ``fields`` plus the registry's per-repo rules and
     its ``docker`` preference.
 
-    ``fields``: ``kind`` (``pr``, ``issue``, ``sentry``, ``scratch`` or ``cron``),
+    ``fields``: ``kind`` (``pr``, ``issue``, ``sentry``, ``scratch``, ``cron`` or
+    ``directory``),
     ``repo``, ``agent``, ``claude_account``, ``docker``, ``sandboxed`` (default true),
     ``also`` (repositories cloned beside it), ``override`` (a machine id, ``LOCAL`` or
     ``"auto"``) and ``pin`` (a machine an existing workspace is on).

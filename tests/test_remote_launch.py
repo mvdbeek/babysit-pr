@@ -1079,3 +1079,203 @@ def test_tags_on_a_worker_are_recorded_on_the_controller_once(remote):
     tags.change({"target": key, "remove": ["release"]})
     manager.save_operation(op, message="Still ready")
     assert tags.snapshot()["assignments"] == {}
+
+
+def in_directory(path, **changes):
+    return {
+        "directory": str(path),
+        "agent": "codex",
+        "task": "Tidy the notes",
+        "machine": "mini",
+        **changes,
+    }
+
+
+def test_a_task_in_a_workers_directory_starts_its_agent_there_as_it_is(remote):
+    manager, _, state, worker = remote
+    calls = helper_calls(manager)
+    clone = Path(clone_path(worker))
+    head = git("rev-parse", "HEAD", cwd=clone)
+    # Named as the worker spells it: nothing of that name is looked at here.
+    value = manager.new_task(in_directory("~/src/repo", tags=["notes"]))
+    assert value["operation"]["subject"] == {"kind": "directory", "path": "~/src/repo"}
+    op = finish(manager, value["operation"]["pr"])
+    assert op["status"] == "complete", op
+    assert (op["machine"], op["clone"], op["path"], op["branch"]) == (
+        "mini",
+        str(clone),
+        str(clone),
+        "main",
+    )
+    # The worker's probe read where it is and whose repository it is a checkout of.
+    assert op["subject"] == {"kind": "directory", "path": str(clone), "repo": "base/repo"}
+    result = op["result"]
+    assert (result["path"], result["branch"], result["workspace_id"]) == (
+        str(clone),
+        "main",
+        "mini/w1",
+    )
+    assert (result["machine"], result["machine_label"]) == ("mini", "Mac mini")
+    # Nothing was made, branched or switched there, and nothing ran or was opened here.
+    assert not (worker / "src/worktrees").exists() and not (manager.src / "worktrees").exists()
+    assert git("symbolic-ref", "--short", "HEAD", cwd=clone) == "main"
+    assert git("rev-parse", "HEAD", cwd=clone) == head
+    assert git("branch", "--format=%(refname:short)", cwd=clone).split() == ["main"]
+    data = store(state)
+    assert not calls and not data["workspaces"] and not data["agents"]
+    mini = data["machines"]["Mac mini"]
+    [agent] = mini["agents"]
+    assert (agent["task"], agent["cwd"]) == ("Tidy the notes", str(clone))
+    assert [c for c in mini["calls"] if c[:2] == ["workspace", "create"]] == [
+        ["workspace", "create", "--cwd", str(clone), "--label", "repo", "--no-focus"]
+    ]
+    [typed] = [c for c in remote_commands(state) if "/scripts/wt.py" in c]
+    assert f" wt --codex --no-focus --dir {clone} --prompt-file " in typed
+    assert "BABYSIT_WORKER=mini" in typed
+    # The tag is recorded for the worker's checkout, on the controller.
+    assert op["tagged_path"] == str(clone)
+    assert work_tags.Tags(manager.home).snapshot()["assignments"] == {
+        f"workspace:m:mini:{clone}": ["notes"]
+    }
+
+
+def test_a_task_in_a_workers_worktree_locks_its_clone_and_can_quit_when_done(remote):
+    manager, _, state, worker = remote
+    clone = Path(clone_path(worker))
+    path = worker / "elsewhere" / "fix"
+    git("worktree", "add", "-q", "-b", "fix", str(path), cwd=clone)
+    locked = []
+    original = machines.clone_lock
+
+    def clone_lock(home, machine, real):
+        locked.append(real)
+        return original(home, machine, real)
+
+    machines.clone_lock = clone_lock
+    try:
+        value = manager.new_task(in_directory(path, exit_when_done=True))
+        op = finish(manager, value["operation"]["pr"])
+    finally:
+        machines.clone_lock = original
+    assert op["status"] == "complete", op
+    real = str(path.resolve())
+    assert (op["path"], op["clone"], op["branch"]) == (real, str(clone), "fix")
+    # The lock a cleanup of that worktree takes on the worker's clone.
+    assert locked == [str(clone)]
+    mini = store(state)["machines"]["Mac mini"]
+    opened = [c for c in mini["calls"] if c[:2] == ["worktree", "open"]]
+    assert opened[0][2:6] == ["--cwd", str(clone), "--path", real]
+    # The watch the worker's wt handed back is followed here, with the machine.
+    [watch] = watches(manager.home)
+    assert (watch["machine"], watch["path"], watch["label"]) == ("mini", real, "fix")
+    assert watch["workspace_id"] == "mini/w1"
+    assert watch["marker"] in mini["agents"][0]["task"]
+
+
+@pytest.mark.parametrize(
+    ("make", "message"),
+    [
+        ("missing", "No directory at"),
+        ("plain", "is not a Git checkout"),
+        ("inside", "lies inside the checkout"),
+    ],
+)
+def test_a_workers_directory_that_is_no_checkout_fails_before_anything_runs(remote, make, message):
+    manager, _, state, worker = remote
+    path = {
+        "missing": worker / "nowhere",
+        "plain": worker / "plain",
+        "inside": Path(clone_path(worker)) / "docs",
+    }[make]
+    if make != "missing":
+        path.mkdir()
+    op = finish(manager, manager.new_task(in_directory(path))["operation"]["pr"])
+    assert op["status"] == "failed" and message in op["message"], op
+    assert not [c for c in remote_commands(state) if "/scripts/wt.py" in c]
+    assert not store(state).get("machines", {}).get("Mac mini", {}).get("agents")
+
+
+def test_a_workers_directory_with_an_agent_takes_no_second_one(remote):
+    manager, _, state, worker = remote
+    clone = clone_path(worker)
+    first = finish(manager, manager.new_task(in_directory(clone))["operation"]["pr"])
+    assert first["status"] == "complete", first
+    second = finish(manager, manager.new_task(in_directory(clone))["operation"]["pr"])
+    # wt refused before it typed anything, so the launch failed rather than may have run.
+    assert second["status"] == "failed", second
+    assert "an agent is already open in the herdr workspace" in second["message"]
+    assert len(store(state)["machines"]["Mac mini"]["agents"]) == 1
+
+
+def directory(path, **changes):
+    args = {"path": str(path), "agent": "claude", "account": None, "sandbox": "safehouse"}
+    return remote_probe.validate_wt_directory(
+        remote_probe._host_wt_directory(**{**args, **changes})
+    )
+
+
+def test_a_workers_directory_is_read_where_it_is_and_trusted(host):  # noqa: F811
+    home, clone, _ = host
+    real = str(clone.resolve())
+    assert directory(clone) == {"path": real, "clone": real, "branch": "main", "repo": "base/repo"}
+    assert directory("~/src/repo")["path"] == real
+    projects = json.loads((home / ".claude.json").read_text())["projects"]
+    assert projects[real] == {"hasTrustDialogAccepted": True}
+    # A linked worktree names the clone it belongs to; upstream names the repository.
+    linked = home / "elsewhere" / "fix"
+    git("worktree", "add", "-q", "-b", "fix", str(linked), cwd=clone)
+    git("remote", "add", "upstream", "https://github.com/Up/Repo.git", cwd=clone)
+    assert directory(linked) == {
+        "path": str(linked.resolve()),
+        "clone": real,
+        "branch": "fix",
+        "repo": "up/repo",
+    }
+    # Detached, and with no GitHub remote at all.
+    notes = home / "notes"
+    notes.mkdir()
+    git("init", "-q", "-b", "main", cwd=notes)
+    git("commit", "-q", "--allow-empty", "-m", "x", cwd=notes)
+    git("checkout", "-q", "--detach", cwd=notes)
+    assert directory(notes) == {
+        "path": str(notes.resolve()),
+        "clone": str(notes.resolve()),
+        "branch": None,
+        "repo": None,
+    }
+    (clone / "docs").mkdir()
+    for path, message in (
+        (home / "nowhere", "No directory at"),
+        (home, "is not a Git checkout"),
+        (clone / "docs", "lies inside the checkout"),
+        (clone / ".git", "is not a Git checkout"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            directory(path)
+    for change in ({"path": "src/repo"}, {"agent": "sh"}, {"sandbox": "none"}):
+        with pytest.raises(ValueError):
+            directory(change.pop("path", clone), **change)
+    # A home directory that is a checkout is refused, and nothing is trusted for it.
+    git("init", "-q", "-b", "main", cwd=home)
+    for path in (home, "~/"):
+        with pytest.raises(ValueError, match="holds the home directory"):
+            directory(path)
+    projects = json.loads((home / ".claude.json").read_text())["projects"]
+    assert str(home.resolve()) not in projects
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"path": "relative"},
+        {"clone": "/c\x1b[2J"},
+        {"branch": 7},
+        {"branch": "main\r"},
+        {"repo": "not a slug"},
+        {"extra": 1},
+    ],
+)
+def test_a_malformed_directory_answer_is_refused(change):
+    answer = {"path": "/w/notes", "clone": "/w/notes", "branch": None, "repo": None, **change}
+    with pytest.raises(ValueError, match="Malformed probe answer"):
+        remote_probe.validate_wt_directory(answer)

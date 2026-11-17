@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import selectors
 import shlex
@@ -333,6 +334,50 @@ def is_sentry(target):
 def is_scratch(target):
     """A task started from scratch on a new branch, with no issue or PR behind it."""
     return target.get("kind") == "scratch"
+
+
+def is_directory(target):
+    """A task started in an existing checkout as it is (`wt --dir`): nothing is checked out."""
+    return target.get("kind") == "directory"
+
+
+def directory_checkout(path):
+    """An existing checkout on this machine that an agent can be started in as it is.
+
+    ``path`` must be the top of a Git checkout: a clone's own, or one of its worktrees.
+    Answers its real path, its Git common dir, the clone a launch there locks (the
+    checkout itself, or the clone its linked worktree belongs to), the branch it is on
+    (None when detached) and the GitHub repository its upstream, else its origin, names
+    (None without one). ValueError says why ``path`` is no such directory: `wt --dir`
+    refuses the same ones, the home directory and a checkout whose Git common dir cannot
+    be read from its layout among them.
+    """
+    path = Path(path).resolve()
+    no_checkout = f"{path} is not the top of a Git checkout on this machine"
+    try:
+        if not path.is_dir() or Path(git(path, "rev-parse", "--show-toplevel")).resolve() != path:
+            raise ValueError(no_checkout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(no_checkout) from exc
+    except ValueError:
+        raise ValueError(no_checkout) from None
+    if wt.holds_home(str(path), os.path.expanduser("~")):
+        raise ValueError(f"{path} {wt.HOLDS_HOME}")
+    # From the layout, never what an agent-written commondir file names.
+    common = Path(safe_git.common_dir(str(path)))
+    try:
+        branch = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    except ValueError:
+        branch = None
+    remotes = remote_slugs(repo_config(path))
+    linked = common != (path / ".git").resolve()
+    return {
+        "path": str(path),
+        "common": str(common),
+        "clone": str(common.parent if linked else path),
+        "branch": branch,
+        "repo": remotes.get("upstream") or remotes.get("origin"),
+    }
 
 
 def sentry_branch(target):
@@ -1451,7 +1496,7 @@ class Workspaces:
         checkout pins Handle instead, which a preview cannot see, as it cannot see a
         worker's verified checkout counting as a prior workspace there.
         """
-        if kind in {"scratch", "cron"}:
+        if kind in {"scratch", "cron", "directory"}:
             return {placement.LOCAL: 1}
         cloned = any(repo.lower() in c["remotes"] for c in self.inventory["clones"])
         return {placement.LOCAL: 1 if cloned else 0}
@@ -1877,7 +1922,14 @@ class Workspaces:
         A machine named that has no room (or ``room``, why the one ``subtask`` named has
         none) records the task as waiting for it; ``waits`` is how ``run_waiting`` starts
         it again (this call by default), as ``resume``, that waiting operation.
+
+        With ``directory`` the task starts in that existing checkout instead, as it is
+        (see ``directory_task``).
         """
+        if "directory" in request:
+            if parent is not None or room is not None:
+                raise ValueError("A sub-task is a new branch, never a directory")
+            return self.directory_task(request, resume)
         allowed = {
             "repo",
             "clone",
@@ -1994,16 +2046,7 @@ class Workspaces:
             also_repos = {there[path]: slugs[path] for path in also}
             bases = {there[path]: base for path, base in bases.items()}
             also = [there[path] for path in also]
-        agent = request.get("agent", "codex")
-        if agent not in {"codex", "claude"}:
-            raise ValueError("Select Codex or Claude")
-        workspace_agents.validate(
-            agent, request.get("model", ""), request.get("effort", ""), self.home
-        )
-        if request.get("permission_mode", "") not in {"", "auto"} or (
-            request.get("permission_mode") and agent != "claude"
-        ):
-            raise ValueError("Only Claude takes a permission mode, and only auto")
+        agent = self.chosen_agent(request)
         validate_account(agent, request.get("claude_account"), remote)
         task = request.get("task", "")
         if not task.strip() or len(task) > 32000 or "\0" in task:
@@ -2030,35 +2073,67 @@ class Workspaces:
             if base and (base.startswith("-") or "@" in base or not valid(base)):
                 raise ValueError("The base branch is not a valid branch name")
             target = {"kind": "scratch", "repo": repo, "branch": name, "base": base or None}
+        op = self.new_operation(
+            target,
+            request,
+            resume,
+            room,
+            machine=machine,
+            clone=clone,
+            **({"fresh_clone": True} if fresh else {}),
+            path=None,
+            agent=agent,
+            also=also,
+            **({"tags": tags} if tags else {}),
+            **({"also_bases": bases} if bases else {}),
+            **({"also_repos": also_repos} if also_repos else {}),
+            **({"parent": parent, "started_by": started_by(parent)} if parent else {}),
+        )
+        return self.record_new(target, op, request, parent, room, waits, resume)
+
+    def chosen_agent(self, request):
+        """The agent a new task asks for, once its model, effort and mode are checked."""
+        agent = request.get("agent", "codex")
+        if agent not in {"codex", "claude"}:
+            raise ValueError("Select Codex or Claude")
+        workspace_agents.validate(
+            agent, request.get("model", ""), request.get("effort", ""), self.home
+        )
+        if request.get("permission_mode", "") not in {"", "auto"} or (
+            request.get("permission_mode") and agent != "claude"
+        ):
+            raise ValueError("Only Claude takes a permission mode, and only auto")
+        return agent
+
+    @staticmethod
+    def new_operation(target, request, resume, room, **fields):
+        """A new task's operation for ``target``, which gets its key: ``fields`` with the
+        agent settings ``request`` asks for; ``resume`` is the waiting operation it
+        continues, and ``room`` why it waits for a machine now."""
         key = resume["pr"] if resume else f"{NEW_PREFIX}{uuid.uuid4()}"
         target["id"] = key
-        op = {
+        return {
             "id": resume["id"] if resume else str(uuid.uuid4()),
             "pr": key,
             "action": "new",
             "status": "queued",
-            "machine": machine,
-            "clone": clone,
-            **({"fresh_clone": True} if fresh else {}),
-            "path": None,
-            "agent": agent,
             "model": request.get("model") or None,
             "effort": request.get("effort") or None,
             "claude_account": request.get("claude_account") or None,
             "docker": request.get("docker", False),
             "permission_mode": request.get("permission_mode") or None,
             "exit_when_done": request.get("exit_when_done", False),
-            "also": also,
-            **({"tags": tags} if tags else {}),
-            **({"also_bases": bases} if bases else {}),
-            **({"also_repos": also_repos} if also_repos else {}),
+            **fields,
             "subject": {k: v for k, v in target.items() if k != "id" and v is not None},
-            **({"parent": parent, "started_by": started_by(parent)} if parent else {}),
             "message": "Queued",
             "log": "",
             "created_at": resume["created_at"] if resume else time.time(),
             **(waiting(room) if room is not None else {}),
         }
+
+    def record_new(self, target, op, request, parent, room, waits, resume):
+        """Save a new task's operation and start it, or leave it waiting for ``room``."""
+        key, task = op["pr"], request["task"]
         with self.lock:
             with self.db() as db:
                 db.execute("BEGIN IMMEDIATE")
@@ -2089,6 +2164,94 @@ class Workspaces:
                 self.workers[key] = worker
             worker.start()
         return {"operation": copy.deepcopy(op)}
+
+    def directory_task(self, request, resume=None):
+        """Start an agent in an existing checkout of one machine, as it is (`wt --dir`).
+
+        ``directory`` is the top of a Git checkout there, a clone's own or one of its
+        worktrees: no worktree is made and no branch is created or switched, and the
+        repository needs no GitHub remote. ``machine`` names the machine it is on, this
+        one by default; Auto is refused, since a directory is one machine's. A checkout
+        here is checked now, a worker's there when the launch runs. A machine without
+        room records the task as waiting for it, as for other new tasks.
+        """
+        allowed = {
+            "directory",
+            "agent",
+            "model",
+            "effort",
+            "claude_account",
+            "task",
+            "task_files",
+            "docker",
+            "exit_when_done",
+            "tags",
+            "machine",
+            "permission_mode",
+        }
+        flags = {"docker", "exit_when_done"}
+        if (
+            set(request) - allowed
+            or any(not isinstance(v, str) for k, v in request.items() if k not in {*flags, "tags"})
+            or any(not isinstance(request.get(flag, False), bool) for flag in flags)
+        ):
+            raise ValueError(
+                "Invalid new task parameters: a task in a directory takes no repository, "
+                "branch, issue or other clones"
+            )
+        tags = work_tags.tag_names(request.get("tags", []))
+        directory = request["directory"].strip()
+        if not wt.REMOTE_DIRECTORY.fullmatch(directory):
+            raise ValueError("Name the directory by its absolute path, or as ~/…")
+        if request.get("machine") == "auto":
+            raise ValueError("Choose the machine the directory is on")
+        here = None
+        if request.get("machine", placement.LOCAL) == placement.LOCAL:
+            here = directory_checkout(os.path.expanduser(directory))
+        agent = self.chosen_agent(request)
+        task = request.get("task", "")
+        if not task.strip() or len(task) > 32000 or "\0" in task:
+            raise ValueError("Supply a task of 1–32,000 characters")
+        room = None
+        try:
+            machine = self.place(
+                request,
+                {
+                    "kind": "directory",
+                    # A worker's checkout names its repository once it is read there.
+                    "repo": (here or {}).get("repo") or "",
+                    "agent": agent,
+                    "claude_account": request.get("claude_account"),
+                    "docker": request.get("docker", False),
+                    "also": [],
+                },
+                {placement.LOCAL: 1},
+                wait=True,
+            )
+        except placement.NoRoom as exc:
+            if resume is not None:
+                return {"operation": self.keep_waiting(resume, exc)}
+            machine, room = exc.machine, exc
+        validate_account(agent, request.get("claude_account"), machines.resolve(self.home, machine))
+        target = {
+            "kind": "directory",
+            "path": here["path"] if here else directory,
+            "repo": (here or {}).get("repo"),
+        }
+        op = self.new_operation(
+            target,
+            request,
+            resume,
+            room,
+            machine=machine,
+            # Locked while the agent is started: a worker's is found there.
+            clone=here["clone"] if here else directory,
+            path=None,
+            agent=agent,
+            also=[],
+            **({"tags": tags} if tags else {}),
+        )
+        return self.record_new(target, op, request, None, room, None, resume)
 
     @staticmethod
     def valid_branch(clone, name):
@@ -3492,6 +3655,9 @@ class Workspaces:
         if op.get("machine") is not None:
             self.perform_remote(pr, op, task)
             return
+        if is_directory(pr):
+            self.perform_directory(pr, op, task)
+            return
         launching = False
         try:
             lock_dir = self.home / "workspace-locks"
@@ -3758,6 +3924,122 @@ class Workspaces:
                 self.workers.pop(pr["id"], None)
                 self.next_poll = 0
 
+    def perform_directory(self, pr, op, task):
+        """A launch in an existing checkout here, as it is: `wt --dir` types the agent.
+
+        Nothing is cloned, fetched or checked out. The checkout is read again under its
+        clone's lock, which cleanup and other launches there take, and `wt` opens its
+        workspace or splits a pane in the one already open, refusing a checkout that has
+        an agent open. The agent is then looked for in a workspace on the checkout.
+        """
+        launching = typed = False
+        try:
+            lock_dir = self.home / "workspace-locks"
+            lock_dir.mkdir(mode=0o700, exist_ok=True)
+            key = hashlib.sha256(os.path.realpath(op["clone"]).encode()).hexdigest()
+            with (lock_dir / key).open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.save_operation(op, status="running", message=f"Checking {pr['path']}")
+                # Read again: it may have been removed or replaced while this waited.
+                item = directory_checkout(pr["path"])
+                if item["clone"] != op["clone"]:
+                    raise ValueError(f"{pr['path']} is no longer a checkout of {op['clone']}")
+                path = item["path"]
+                self.save_operation(
+                    op,
+                    common=item["common"],
+                    path=path,
+                    branch=item["branch"],
+                    message=f"Starting the selected agent in {path}",
+                )
+                if not op.get("effort"):
+                    # Left on Default: the repository's or global saved default, if any.
+                    default = workspace_agents.default_effort(
+                        self.home, item["repo"], op["agent"], op.get("model") or ""
+                    )
+                    if default:
+                        self.save_operation(op, effort=default)
+                prompts = self.home / "workspace-prompts"
+                prompts.mkdir(mode=0o700, exist_ok=True)
+                prompt = prompts / op["id"]
+                brief = f"{task}\n"
+                if op.get("exit_marker"):
+                    brief += workspace_exit.brief(op["exit_marker"])
+                fd = os.open(prompt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as stream:
+                    stream.write(brief)
+                launching = True
+                self.run_logged(
+                    op,
+                    sys.executable,
+                    WORKTREE_HELPER,
+                    "wt",
+                    f"--{op['agent']}",
+                    *(
+                        word
+                        for option in ("model", "effort", "claude_account")
+                        if op.get(option)
+                        for word in (f"--{option.replace('_', '-')}", op[option])
+                    ),
+                    *(["--docker"] if op.get("docker") else []),
+                    *(["--permission-mode", "auto"] if op.get("permission_mode") else []),
+                    *(["--exit-when-done"] if op.get("exit_when_done") else []),
+                    "--no-focus",
+                    "--dir",
+                    path,
+                    "--prompt-file",
+                    str(prompt),
+                    timeout=600,
+                    pass_fds=(lock.fileno(),),
+                    # Exit watches go to this dashboard's own state home.
+                    env={
+                        **os.environ,
+                        "WT_MULTIPLEXER": machines.terminals(),
+                        "BABYSIT_HOME": str(self.home),
+                    },
+                )
+                # From here the agent is typed: trouble makes the launch uncertain.
+                typed = True
+                self.save_operation(op, message="Verifying agent startup")
+                for _ in range(30):
+                    for space in workspaces_by_path(
+                        {"workspaces": herdr("workspace", "list")["workspaces"]}
+                    ).get(path, []):
+                        wid = space["workspace_id"]
+                        if not agent_in(wid, path, op["agent"]):
+                            continue
+                        self.save_operation(
+                            op,
+                            status="complete",
+                            result={
+                                "path": path,
+                                "branch": item["branch"],
+                                "workspace_id": wid,
+                                "name": space.get("label") or Path(path).name,
+                                "agent_status": space.get("agent_status", "unknown"),
+                                "url": collie_url(None, wid),
+                            },
+                            message="Workspace ready — Open in Collie",
+                        )
+                        return
+                    time.sleep(1)
+                raise ValueError(
+                    "Could not verify the selected agent; inspect the workspace before retrying"
+                )
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            # wt refuses before it types; once it has, or may have, never resubmit.
+            uncertain = typed or (launching and isinstance(exc, subprocess.TimeoutExpired))
+            self.save_operation(
+                op,
+                status="uncertain" if uncertain else "failed",
+                message=str(exc),
+                log=(op["log"] + "\n" + str(exc))[-16000:],
+            )
+        finally:
+            with self.lock:
+                self.workers.pop(pr["id"], None)
+                self.next_poll = 0
+
     def perform_remote(self, pr, op, task):
         """A launch on a worker: its own clone, its deployed wt and its herdr, over ssh.
 
@@ -3769,10 +4051,14 @@ class Workspaces:
         on this machine reads a worker's paths. The worker's skills are brought to this
         machine's first (``skill_sync``): a failure stops a scheduled launch or a sub-task,
         and is a warning on the operation of one a person started.
+
+        A task in a directory (``is_directory``) makes no checkout: a probe op checks the
+        one it names there, and wt types the agent in it as it is (`wt --dir`).
         """
         import cron_agents
 
         launching = typed = False
+        in_place = is_directory(pr)
         try:
             machine = machines.resolve(self.home, op["machine"], placing=True)
             assert machine is not None
@@ -3780,9 +4066,29 @@ class Workspaces:
                 raise ValueError(
                     "Cross-agent reviewers require a Linux worker with babysit-bwrap account isolation"
                 )
-            # The worker's clone by its real path there, as its cleanup locks it; never a
-            # same-named one here.
-            real = cron_agents.probe(self.home, machine, "realpath", 30, path=op["clone"])["path"]
+            if in_place:
+                self.save_operation(
+                    op, status="running", message=f"Checking {pr['path']} on {machine.label}"
+                )
+                # The checkout as it is there, and the clone its launches lock.
+                spot = cron_agents.probe(
+                    self.home,
+                    machine,
+                    "wt_directory",
+                    60,
+                    path=pr["path"],
+                    agent=op["agent"],
+                    account=op.get("claude_account"),
+                    sandbox=cron_agents.BACKENDS[machine.os],
+                )
+                real = spot["clone"]
+                self.save_operation(op, clone=real)
+            else:
+                # The worker's clone by its real path there, as its cleanup locks it;
+                # never a same-named one here.
+                real = cron_agents.probe(self.home, machine, "realpath", 30, path=op["clone"])[
+                    "path"
+                ]
             with machines.clone_lock(self.home, machine, real).open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 self.save_operation(
@@ -3810,52 +4116,74 @@ class Workspaces:
                         if op.get("exit_marker") or op.get("parent"):
                             raise
                         self.save_operation(op, skills_warning=str(exc))
-                owner, repo = pr["repo"].split("/")
                 scratch = is_scratch(pr)
-                if scratch:
-                    helper, subject, prefix = "wt", None, pr["branch"]
+                also: list[tuple[str, str | None, str]] = []
+                label: list[str] = []
+                if in_place:
+                    helper, subject = "wt", None
+                    found = {"path": spot["path"], "clone": spot["clone"]}
+                    # The workspace is named after the directory, as `wt --dir` names it.
+                    name, branch = posixpath.basename(spot["path"]), spot["branch"]
+                    # Its repository, for the saved effort default and the operation.
+                    pr["repo"] = spot["repo"]
+                    self.save_operation(
+                        op,
+                        path=spot["path"],
+                        branch=branch,
+                        subject={
+                            **op["subject"],
+                            "path": spot["path"],
+                            **({"repo": spot["repo"]} if spot["repo"] else {}),
+                        },
+                        message=f"Starting the selected agent in {spot['path']} on {machine.label}",
+                    )
                 else:
-                    helper, subject, prefix = "wtpr", "Pull request", f"pr-{owner}-{pr['number']}"
-                self.save_operation(op, message=f"Preparing {op['clone']} on {machine.label}")
-                found = cron_agents.probe(
-                    self.home,
-                    machine,
-                    "wt_prepare",
-                    PREPARE_TIMEOUT,
-                    clone=op["clone"],
-                    repo=pr["repo"],
-                    root=f"{machine.src.rstrip('/')}/worktrees/{repo}",
-                    prefix=prefix,
-                    agent=op["agent"],
-                    account=op.get("claude_account"),
-                    sandbox=cron_agents.BACKENDS[machine.os],
-                    also=[[c, op["also_repos"][c]] for c in op.get("also", [])],
-                    **({"review": True} if op.get("parent", {}).get("review_approval") else {}),
-                )
-                name = found["name"]
-                # Each other clone's base, by the real path the probe found it at there.
-                bases = op.get("also_bases", {})
-                also = [
-                    (other["clone"], bases.get(c), other["path"])
-                    for c, other in zip(op.get("also", []), found["also"], strict=True)
-                ]
-                label = (
-                    []
-                    if scratch
-                    else ["--label", f"pr-{repo}-{pr['head_branch']}{name[len(prefix) :]}"]
-                )
-                self.save_operation(
-                    op,
-                    path=found["path"],
-                    branch=name,
-                    message=f"Fetching {subject.lower()} and starting the selected agent on {machine.label}"
-                    if subject
-                    else f"Branching {name} and starting the selected agent on {machine.label}",
-                )
+                    owner, repo = pr["repo"].split("/")
+                    if scratch:
+                        helper, subject, prefix = "wt", None, pr["branch"]
+                    else:
+                        helper, subject, prefix = (
+                            "wtpr",
+                            "Pull request",
+                            f"pr-{owner}-{pr['number']}",
+                        )
+                    self.save_operation(op, message=f"Preparing {op['clone']} on {machine.label}")
+                    found = cron_agents.probe(
+                        self.home,
+                        machine,
+                        "wt_prepare",
+                        PREPARE_TIMEOUT,
+                        clone=op["clone"],
+                        repo=pr["repo"],
+                        root=f"{machine.src.rstrip('/')}/worktrees/{repo}",
+                        prefix=prefix,
+                        agent=op["agent"],
+                        account=op.get("claude_account"),
+                        sandbox=cron_agents.BACKENDS[machine.os],
+                        also=[[c, op["also_repos"][c]] for c in op.get("also", [])],
+                        **({"review": True} if op.get("parent", {}).get("review_approval") else {}),
+                    )
+                    name = branch = found["name"]
+                    # Each other clone's base, by the real path the probe found it at there.
+                    bases = op.get("also_bases", {})
+                    also = [
+                        (other["clone"], bases.get(c), other["path"])
+                        for c, other in zip(op.get("also", []), found["also"], strict=True)
+                    ]
+                    if not scratch:
+                        label = ["--label", f"pr-{repo}-{pr['head_branch']}{name[len(prefix) :]}"]
+                    self.save_operation(
+                        op,
+                        path=found["path"],
+                        branch=name,
+                        message=f"Fetching {subject.lower()} and starting the selected agent on {machine.label}"
+                        if subject
+                        else f"Branching {name} and starting the selected agent on {machine.label}",
+                    )
                 if not op.get("effort"):
                     # Left on Default: the repository's or global saved default, if any.
                     default = workspace_agents.default_effort(
-                        self.home, pr["repo"], op["agent"], op.get("model") or ""
+                        self.home, pr.get("repo"), op["agent"], op.get("model") or ""
                     )
                     if default:
                         self.save_operation(op, effort=default)
@@ -3869,7 +4197,9 @@ class Workspaces:
                     self.save_operation(op, message=f"Copying attached files to {machine.label}")
                     # Its agent reads them there; a failed copy fails the launch untyped.
                     task = attachments.for_worker(self.home, machine, task, self.attachments)
-                brief = f"{task}\n" if scratch else f"{task}\n\n{subject}: {canonical(pr)}\n"
+                brief = (
+                    f"{task}\n" if subject is None else f"{task}\n\n{subject}: {canonical(pr)}\n"
+                )
                 if op.get("exit_marker"):
                     brief += workspace_exit.brief(op["exit_marker"])
                 staged = machines.put_file(
@@ -3907,18 +4237,30 @@ class Workspaces:
                         for word in ("--with", f"{c}:{base}" if base else c)
                     ),
                     "--no-focus",
-                    "--name",
-                    name,
-                    *label,
-                    "--repo-path",
-                    found["clone"],
-                    "--github-repo",
-                    pr["repo"],
-                    "--worktree-root",
-                    found["root"],
+                    *(
+                        ["--dir", found["path"]]
+                        if in_place
+                        else [
+                            "--name",
+                            name,
+                            *label,
+                            "--repo-path",
+                            found["clone"],
+                            "--github-repo",
+                            pr["repo"],
+                            "--worktree-root",
+                            found["root"],
+                        ]
+                    ),
                     "--prompt-file",
                     staged,
-                    *(([pr["base"]] if pr.get("base") else []) if scratch else [canonical(pr)]),
+                    *(
+                        []
+                        if in_place
+                        else ([pr["base"]] if pr.get("base") else [])
+                        if scratch
+                        else [canonical(pr)]
+                    ),
                 ]
                 launching = True
                 done = machines.run(self.home, machine, argv, timeout=600, text=True)
@@ -3936,15 +4278,22 @@ class Workspaces:
                     expected = wt.sanitize_session_name(label[1] if label else name)
                     self.record_remote_watch(machine, op, found["path"], expected, done.stdout)
                 self.save_operation(op, message="Verifying checkout and agent startup")
-                made = cron_agents.probe(
-                    self.home, machine, "wt_checkout", 30, clone=found["clone"], path=found["path"]
-                )
-                if made["path"] != found["path"] or made["branch"] != name:
-                    raise ValueError(
-                        "Resulting checkout did not match the recorded repository and branch"
+                if not in_place:
+                    # wt made this one; a directory's was read before it ran.
+                    made = cron_agents.probe(
+                        self.home,
+                        machine,
+                        "wt_checkout",
+                        30,
+                        clone=found["clone"],
+                        path=found["path"],
                     )
-                if not scratch and made["upstream"] != self.expected_upstream(pr):
-                    raise ValueError("Resulting checkout has unexpected PR head provenance")
+                    if made["path"] != found["path"] or made["branch"] != name:
+                        raise ValueError(
+                            "Resulting checkout did not match the recorded repository and branch"
+                        )
+                    if not scratch and made["upstream"] != self.expected_upstream(pr):
+                        raise ValueError("Resulting checkout has unexpected PR head provenance")
                 for c, _, path in also:
                     made = cron_agents.probe(
                         self.home, machine, "wt_checkout", 30, clone=c, path=path
@@ -3982,7 +4331,7 @@ class Workspaces:
                             status="complete",
                             result={
                                 "path": found["path"],
-                                "branch": name,
+                                "branch": branch,
                                 "workspace_id": machines.qualify(machine.id, space["workspace_id"]),
                                 "name": space.get("label") or name,
                                 "agent_status": space.get("agent_status", "unknown"),

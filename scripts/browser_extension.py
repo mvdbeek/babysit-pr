@@ -267,6 +267,9 @@ def submit(server, request):
         return {"message": agent_messages.send(payload, server.home, expected_session=session)}
     payload["task"] = text
     if mode == "new":
+        if "directory" in payload:
+            # A paired browser starts tasks in the listed clones, never in any directory.
+            raise ValueError("The extension starts tasks in a repository's clone only")
         return server.workspaces.new_task(payload)
     if mode == "target":
         if payload.get("action") != "handle":
