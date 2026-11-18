@@ -674,6 +674,21 @@ def test_cleanup_exits_agents_closes_the_workspace_and_removes_worktree_and_bran
     assert "worktree" in " ".join(results[target]["steps"]).lower()
 
 
+def test_cleanup_overrides_the_lock_a_checkout_was_made_with_and_no_other(site):
+    plugin, _, clone, worktrees, state, git = site
+    target = str(worktrees / "merged-work")
+    git("worktree", "lock", "--reason", "keep it", target)
+    results = finish(plugin, plugin.cleanup({"targets": [{"key": target}]}))
+    assert results[target]["status"] == "failed" and "keep it" in results[target]["message"]
+    assert Path(target).exists()
+    git("worktree", "unlock", target)
+    git("worktree", "lock", "--reason", wso.remote_probe.WORKTREE_LOCK, target)
+    results = finish(plugin, plugin.cleanup({"targets": [{"key": target}]}))
+    assert results[target]["status"] == "done"
+    assert not Path(target).exists()
+    assert "merged-work" not in git("branch", "--format=%(refname:short)").split()
+
+
 def test_cleanup_skips_local_only_work_until_it_is_explicitly_forced(site):
     plugin, _, clone, worktrees, state, git = site
     dirty, unpushed = str(worktrees / "dirty-work"), str(worktrees / "unpushed-work")

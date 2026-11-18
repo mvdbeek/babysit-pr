@@ -26,6 +26,7 @@ from typing import NamedTuple, Protocol, TextIO
 
 import claude_accounts
 import machines
+import remote_probe
 import safe_git
 import sandbox
 import work_tags
@@ -1567,6 +1568,7 @@ class Tool:
             "worktree",
             "add",
             "--no-checkout",
+            *remote_probe.worktree_lock(sandbox.backend()),
             *create,
             "--end-of-options",
             directory,
@@ -1576,7 +1578,8 @@ class Tool:
             self.git_action(directory, "reset", "--hard", "--quiet")
         except Exception:
             # Left behind, the empty checkout would be reused with every file deleted.
-            self.git_action(repo_path, "worktree", "remove", "--force", directory)
+            # The second --force overrides the lock just asked for.
+            self.git_action(repo_path, "worktree", "remove", "--force", "--force", directory)
             if new_branch:
                 self.git_action(repo_path, "branch", "-D", new_branch)
             raise

@@ -1744,8 +1744,18 @@ class WorkspaceOverview:
     def remove_worktree(self, job, index, row, steps, force):
         if not row["remove_worktree"] or not row["path"] or not row["repo_root"]:
             return
+        # A worktree someone locked stays, as Git has it; the lock a checkout is made
+        # with (remote_probe.worktree_lock) is overridden.
+        real = os.path.realpath(row["path"])
+        records = remote_probe.worktree_records(git, row["repo_root"])
+        named = next((path for path in records if os.path.realpath(path) == real), None)
+        flags = remote_probe.removal_flags(records.get(named, {}))
         if not Path(row["path"]).exists():
             steps.append("Checkout already removed")
+            # A registration left behind would hold the branch, and no prune clears one
+            # that is locked.
+            if named is not None:
+                git(row["repo_root"], "worktree", "remove", *flags, named, timeout=300)
             return
         self.progress(job, index, steps, f"Removing worktree {row['path']}")
         if not force:
@@ -1762,7 +1772,7 @@ class WorkspaceOverview:
                 entry.startswith("160000 ") for entry in staged.split("\0")
             ):
                 raise ValueError(f"{path} contains submodules; kept")
-        git(row["repo_root"], "worktree", "remove", "--force", row["path"], timeout=300)
+        git(row["repo_root"], "worktree", "remove", *flags, row["path"], timeout=300)
 
     def delete_branch(self, job, index, row, steps, approved):
         """Delete the branch only when no commit can be lost, and say so when it is kept.

@@ -396,6 +396,34 @@ def test_remove_deletes_nothing_of_a_locked_worktree(clone):
     with pytest.raises(ValueError, match=r"is locked \(keep it\); kept"):
         remote_probe._host_remove(str(clone), str(topic), True, "topic", True)
     assert (topic / "build.out").exists() and "topic" in branches(clone)
+    other = topic.with_name("other")
+    git("worktree", "lock", str(other), cwd=clone)
+    with pytest.raises(ValueError, match=r"is locked \(no reason\); kept"):
+        remote_probe._host_remove(str(clone), str(other), True, "other", True)
+    assert other.is_dir() and "other" in branches(clone)
+
+
+def test_remove_overrides_the_lock_a_checkout_was_made_with(clone):
+    topic = clone.parent / "worktrees" / "repo" / "topic"
+    git("worktree", "lock", "--reason", remote_probe.WORKTREE_LOCK, str(topic), cwd=clone)
+    # The clean check still decides: the lock was never anyone's wish to keep the tree.
+    (topic / "new.txt").write_text("untracked")
+    with pytest.raises(ValueError, match="uncommitted changes or untracked files; kept"):
+        remote_probe._host_remove(str(clone), str(topic), False, "topic", True)
+    (topic / "new.txt").unlink()
+    done = remote_probe._host_remove(str(clone), str(topic), False, "topic", True)
+    assert done == {"worktree": "removed", "branch": "deleted", "detail": None}
+    assert not topic.exists() and str(topic) not in git("worktree", "list", cwd=clone)
+
+
+def test_remove_unregisters_a_locked_checkout_whose_tree_is_already_gone(clone):
+    topic = clone.parent / "worktrees" / "repo" / "topic"
+    git("worktree", "lock", "--reason", remote_probe.WORKTREE_LOCK, str(topic), cwd=clone)
+    remote_probe.shutil.rmtree(topic)
+    # Locked, no prune would clear it, and it would hold its branch and its path.
+    done = remote_probe._host_remove(str(clone), str(topic), False, "topic", True)
+    assert done == {"worktree": "missing", "branch": "deleted", "detail": None}
+    assert str(topic) not in git("worktree", "list", cwd=clone)
 
 
 def test_remove_refuses_the_main_checkout_named_from_a_linked_worktree(clone):
