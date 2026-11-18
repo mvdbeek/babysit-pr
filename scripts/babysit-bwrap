@@ -280,7 +280,9 @@ done
 # `.git` file counts, so a dead entry stays prunable and a later file bind never meets a
 # directory; the outbox link below is the one later step that a placeholder would fail.
 # The total is limited so that planted entries cannot push every launch past the
-# argument limit. A checkout made after this launch has no placeholder, and remains exposed.
+# argument limit. A checkout made after this launch has no placeholder: the ones babysit
+# makes are locked (remote_probe.worktree_lock), which no prune drops, and any other
+# remains exposed.
 outbox=$home/src/agent-artefacts/outbox
 outbox_granted=0
 for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do

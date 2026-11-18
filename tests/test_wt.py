@@ -3348,6 +3348,52 @@ def test_dir_a_linux_sandbox_cannot_take_is_refused_before_anything_opens(repo, 
     assert not state_of(state)["calls"]
 
 
+def real_tool():
+    env = dict(os.environ)
+    return wt.Tool(wt.SubprocessRunner(env), env, stderr=io.StringIO(), confined=lambda: False)
+
+
+def test_a_checkout_made_beside_bwrap_agents_survives_a_prune_that_cannot_see_it(repo, monkeypatch):
+    home, git, _ = repo
+    clone = home / "src/repo"
+    monkeypatch.setattr(wt.sandbox, "DEFAULT", "bwrap")
+    path = home / "src/worktrees/repo/topic"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    real_tool().checkout_worktree(str(clone), str(path), "feature", new_branch="topic")
+    # A sibling's bwrap sandbox shows nothing at the checkout made after it started.
+    hidden = path.with_name("hidden")
+    path.rename(hidden)
+    git("worktree", "prune")
+    hidden.rename(path)
+    assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "topic"
+    # Safehouse hides no sibling, so a checkout there stays Git's to prune.
+    monkeypatch.setattr(wt.sandbox, "DEFAULT", "safehouse")
+    plain = path.with_name("plain")
+    real_tool().checkout_worktree(str(clone), str(plain), "feature", new_branch="plain")
+    assert git("worktree", "list", "--porcelain").count("\nlocked") == 1
+
+
+def test_a_locked_checkout_that_cannot_be_filled_is_taken_back(repo, monkeypatch):
+    home, git, _ = repo
+    monkeypatch.setattr(wt.sandbox, "DEFAULT", "bwrap")
+    t = real_tool()
+    run = t.runner.run
+
+    def failing(argv, **kwargs):
+        if "reset" in argv:
+            return wt.Completed(1, "", "")
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(t.runner, "run", failing)
+    path = home / "src/worktrees/repo/topic"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(wt.WtError, match="git reset failed"):
+        t.checkout_worktree(str(home / "src/repo"), str(path), "feature", new_branch="topic")
+    assert not path.exists()
+    assert git("worktree", "list", "--porcelain").count("worktree ") == 1
+    assert "topic" not in git("branch", "--format=%(refname:short)").split()
+
+
 def test_dir_without_a_multiplexer_prints_the_checkout(repo, monkeypatch):
     home, _, _ = repo
     monkeypatch.setenv("WT_MULTIPLEXER", "none")

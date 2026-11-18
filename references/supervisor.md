@@ -511,11 +511,17 @@ Known gaps of the Linux sandbox:
 - Sibling checkouts of a clone are hidden from a bwrap sandbox, whose `git worktree
 prune` (also run by `git gc`) would drop every registration it finds no `.git`
   for. babysit-bwrap therefore puts an empty directory at each registered sibling's
-  `.git` when it launches. A checkout created after the launch has none, so an agent
-  pruning in a long-lived sandbox can still unregister it; so does a registration
-  recorded through a symbolic link, which Git only leaves after a tree is moved.
-  Safehouse needs no such step: its grants keep `~/src` readable, so the siblings
-  stay visible there.
+  `.git` when it launches. A checkout created after the launch has none, so where
+  agents run in bwrap every checkout babysit makes (`wt`, a scheduled agent task, a
+  moved workspace) is added with `git worktree add --lock`: Git never prunes a locked
+  worktree. Cleanup and a failed launch or move override that lock, which names
+  babysit-pr as its reason, and no other; removing such a checkout by hand takes
+  `git worktree remove -f -f`, or `git worktree unlock` first, and one whose directory
+  was deleted keeps its registration, branch and path until then. A checkout added by hand
+  after the launch stays exposed to an agent pruning in a long-lived sandbox, as does
+  an unlocked registration recorded through a symbolic link, which Git only leaves
+  after a tree is moved. Safehouse needs neither step: its grants keep `~/src`
+  readable, so the siblings stay visible there.
 - With a bwrap older than 0.10.0 writable directories are bound by path, so a
   process that can write a bound directory's parent could swap it for a link
   between the check and the bind. Refusing shared main checkouts closes the

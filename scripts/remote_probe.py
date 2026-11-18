@@ -246,6 +246,45 @@ def bare_warning(path, label=None):
     )
 
 
+# The reason of the lock on a checkout made where agents run in bwrap (``worktree_lock``).
+# The lock is known as babysit's by this exact text: reworded, the locks already placed
+# would read as someone else's, which cleanup keeps.
+WORKTREE_LOCK = "babysit-pr: registered for agents whose sandbox cannot see this checkout"
+
+
+def worktree_lock(sandbox):
+    """``git worktree add`` options for a checkout made where agents run in ``sandbox``.
+
+    A bwrap sandbox hides every sibling checkout, so a ``git worktree prune`` run in one
+    (``git gc`` runs it too) drops each registration whose checkout it cannot see.
+    babysit-bwrap puts a placeholder at the siblings registered when it launches, which
+    leaves a checkout made later exposed; Git never prunes a locked worktree.
+    """
+    return ("--lock", "--reason", WORKTREE_LOCK) if sandbox == "bwrap" else ()
+
+
+def worktree_records(git, clone):
+    """``path -> fields`` of each worktree ``git worktree list`` names for ``clone``, the
+    clone's own checkout first."""
+    records = {}
+    for record in git(clone, "worktree", "list", "--porcelain", "-z").split("\0\0"):
+        fields = dict(
+            line.split(" ", 1) if " " in line else (line, "") for line in record.split("\0") if line
+        )
+        if "worktree" in fields:
+            records[fields["worktree"]] = fields
+    return records
+
+
+def removal_flags(fields):
+    """``git worktree remove`` flags for a worktree ``worktree_records`` lists as ``fields``.
+
+    One ``--force`` skips Git's clean check, which callers run hardened themselves. A
+    second overrides the lock ``worktree_lock`` asked for, and never another lock.
+    """
+    return ("--force", "--force") if fields.get("locked") == WORKTREE_LOCK else ("--force",)
+
+
 def scanned_roots(src, roots, repo_roots):
     """Clone roots a scan may touch: herdr's own, the configured ones, and those in ``src``."""
     found = {Path(root).resolve() for root in repo_roots}
@@ -2448,12 +2487,14 @@ def _host_cron_checkout(
                 add = [directory, branch]
             # The new worktree's branch and git dir can bring config the clone's listing
             # never sees, so its files are checked out by a reset run inside it.
-            host_git(clone, "worktree", "add", "--no-checkout", *add, timeout=120)
+            lock = worktree_lock(sandbox)
+            host_git(clone, "worktree", "add", "--no-checkout", *lock, *add, timeout=120)
             try:
                 host_git(directory, "reset", "--hard", "--quiet", timeout=120)
             except Exception:
                 # Left behind, the empty checkout would be reused with every file deleted.
-                host_git(clone, "worktree", "remove", "--force", directory, timeout=120)
+                # The second --force overrides the lock just asked for.
+                host_git(clone, "worktree", "remove", "--force", "--force", directory, timeout=120)
                 if add[0] == "-b":
                     host_git(clone, "branch", "-D", branch)
                 raise
@@ -2613,27 +2654,21 @@ def _host_remove(root, path, force, branch, safe):
     )
     if os.path.dirname(common) != root:
         raise ValueError(f"{root} is not the top of a clone")
-    listed, records = {}, {}
-    listing = host_git(root, "worktree", "list", "--porcelain", "-z", strip=False)
-    for record in listing.split("\0\0"):
-        fields = dict(
-            line.split(" ", 1) if " " in line else (line, "") for line in record.split("\0") if line
-        )
-        if "worktree" in fields:
-            listed[fields["worktree"]] = fields.get("branch")
-            records[fields["worktree"]] = fields
+    records = worktree_records(host_git, root)
     real = os.path.realpath(path)
-    named = next((entry for entry in listed if os.path.realpath(entry) == real), None)
+    named = next((entry for entry in records if os.path.realpath(entry) == real), None)
     if named is None:
         raise ValueError(f"{path} is not a worktree of {root}")
     # Git lists the main worktree first.
-    if real == root or named == next(iter(listed)):
+    if real == root or named == next(iter(records)):
         raise ValueError(f"{path} is the clone's own checkout; kept")
     if real == common or real.startswith(common + os.sep):
         raise ValueError(f"{path} lies inside {root}'s Git directory; kept")
     # Git refuses to remove a locked worktree only once asked to; nothing is deleted first.
-    if "locked" in records[named]:
-        raise ValueError(f"{path} is locked ({records[named]['locked'] or 'no reason'}); kept")
+    # The lock a checkout was made with here (worktree_lock) is no one's wish to keep it.
+    lock = records[named].get("locked")
+    if lock not in (None, WORKTREE_LOCK):
+        raise ValueError(f"{path} is locked ({lock or 'no reason'}); kept")
     worktree = "missing"
     if os.path.lexists(path):
         if not force:
@@ -2652,12 +2687,14 @@ def _host_remove(root, path, force, branch, safe):
         # then only drops the registration of a tree already gone.
         if shutil.rmtree.avoids_symlink_attacks:
             shutil.rmtree(real)
-        host_git(root, "worktree", "remove", "--force", named, timeout=300)
         worktree = "removed"
+    # Also of a tree that was gone before: its registration would hold the branch, and no
+    # prune clears one that is locked.
+    host_git(root, "worktree", "remove", *removal_flags(records[named]), named, timeout=300)
     result = {"worktree": worktree, "branch": None, "detail": None}
     if branch is None:
         return result
-    if listed[named] != f"refs/heads/{branch}":
+    if records[named].get("branch") != f"refs/heads/{branch}":
         return {**result, "branch": "kept", "detail": f"{branch} was not checked out there"}
     try:
         host_git(root, "branch", "-D" if safe else "-d", "--", branch)
@@ -3363,7 +3400,10 @@ def _host_move_receive(
             host_git(path, "clean", "-fdq", timeout=600)
         else:
             os.makedirs(root, mode=0o700, exist_ok=True)
-            host_git(clone, "worktree", "add", "-q", "--no-checkout", "-b", branch, path, head)
+            lock = worktree_lock(sandbox)
+            host_git(
+                clone, "worktree", "add", "-q", "--no-checkout", *lock, "-b", branch, path, head
+            )
         try:
             if not ours:
                 admin = host_git(path, "rev-parse", "--absolute-git-dir")
@@ -3387,8 +3427,9 @@ def _host_move_receive(
                 # Half made by this move: nothing of it stays to refuse the next one.
                 with contextlib.suppress(OSError):
                     shutil.rmtree(path)
+                # Not a prune, which would keep the registration this move locked.
                 with contextlib.suppress(ValueError):
-                    host_git(clone, "worktree", "prune")
+                    host_git(clone, "worktree", "remove", "--force", "--force", path)
                 with contextlib.suppress(ValueError):
                     host_git(clone, "branch", "-D", "--", branch)
             raise

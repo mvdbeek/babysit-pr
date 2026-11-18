@@ -693,6 +693,76 @@ def test_a_watch_is_held_through_the_move_then_registered_on_the_worker(clean_bo
     assert "babysit watch 0123456789abcdef now follows" in worker_store(rig)["agents"][0]["task"]
 
 
+def test_a_checkout_moved_beside_bwrap_agents_survives_a_prune_that_cannot_see_it(clean_box):
+    rig = clean_box
+    run_move(rig)
+    # A sibling's bwrap sandbox shows nothing at the checkout made after it started.
+    hidden = rig.target.with_name("hidden")
+    rig.target.rename(hidden)
+    git("worktree", "prune", cwd=rig.host / "src" / "repo")
+    hidden.rename(rig.target)
+    assert git("symbolic-ref", "--short", "HEAD", cwd=rig.target) == "feature"
+
+
+def test_a_refused_exit_takes_a_locked_checkout_back(clean_box, monkeypatch):
+    rig = clean_box
+
+    def exit_agent(request, home=None, **options):
+        raise ValueError("Not quit: the composer holds a draft; clear it in Collie first")
+
+    monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
+    with pytest.raises(workspace_move.Failed, match="holds a draft"):
+        run_move(rig)
+    there = rig.host / "src" / "repo"
+    assert not rig.target.exists()
+    assert str(rig.target) not in git("worktree", "list", cwd=there)
+    assert "feature" not in git("branch", "--format=%(refname:short)", cwd=there).split()
+
+
+def test_a_receive_that_fails_leaves_no_locked_registration_behind(clean_box, monkeypatch):
+    rig = clean_box
+    there = rig.host / "src" / "repo"
+    state = workspace_move.snapshot(str(rig.checkout))
+    data, fetch = workspace_move.bundle(str(rig.checkout), state, "cd" * 16)
+    monkeypatch.setenv("HOME", str(rig.host))
+    staged = rig.host / ".local/state/babysit-pr/move-staging"
+    staged.mkdir(parents=True, exist_ok=True)
+
+    def receive():
+        bundle = staged / "m.bundle"
+        bundle.write_bytes(data)
+        return remote_probe._host_move_receive(
+            str(there),
+            "base/repo",
+            str(rig.host / "src" / "worktrees" / "repo"),
+            "feature",
+            "feature",
+            str(bundle.resolve()),
+            "cd" * 16,
+            state["head"],
+            state["index_tree"],
+            state["work_tree"],
+            None,
+            fetch,
+            "claude",
+            "default",
+            "bwrap",
+        )
+
+    def trust(config, directory):
+        raise OSError("No space left on device")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(remote_probe, "_host_trust", trust)
+        with pytest.raises(OSError, match="No space left"):
+            receive()
+    assert not rig.target.exists()
+    assert str(rig.target) not in git("worktree", "list", cwd=there)
+    # Nothing of it stays to refuse the next one.
+    assert receive()["head"] == state["head"]
+    assert git("symbolic-ref", "--short", "HEAD", cwd=rig.target) == "feature"
+
+
 def test_a_failed_move_gives_the_watch_back(clean_box, monkeypatch):
     rig = clean_box
 

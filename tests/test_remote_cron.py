@@ -114,6 +114,42 @@ def test_a_workers_job_checkout_starts_from_its_repository_on_github(host):
     assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "nightly"
 
 
+def test_a_checkout_made_beside_bwrap_agents_survives_a_prune_that_cannot_see_it(host):
+    home, clone, _ = host
+    path = Path(checkout(home, clone, sandbox="bwrap")["path"])
+    # A sibling's bwrap sandbox shows nothing at the checkout made after it started.
+    hidden = path.with_name("hidden")
+    path.rename(hidden)
+    git("worktree", "prune", cwd=clone)
+    hidden.rename(path)
+    assert git("symbolic-ref", "--short", "HEAD", cwd=path) == "nightly"
+    # Safehouse hides no sibling, so a checkout there stays Git's to prune.
+    checkout(home, clone, branch="weekly")
+    listed = remote_probe.worktree_records(remote_probe.host_git, str(clone))
+    assert [fields.get("locked") for fields in listed.values()] == [
+        None,
+        remote_probe.WORKTREE_LOCK,
+        None,
+    ]
+
+
+def test_a_locked_checkout_that_cannot_be_filled_is_taken_back(host, monkeypatch):
+    home, clone, _ = host
+    real = remote_probe.host_git
+
+    def host_git(path, *args, **kwargs):
+        if args[0] == "reset":
+            raise ValueError("No space left on device")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(remote_probe, "host_git", host_git)
+    with pytest.raises(ValueError, match="No space left"):
+        checkout(home, clone, sandbox="bwrap")
+    assert not (home / "src/worktrees/repo/nightly").exists()
+    assert list(remote_probe.worktree_records(real, str(clone))) == [str(clone.resolve())]
+    assert "nightly" not in git("branch", "--format=%(refname:short)", cwd=clone).split()
+
+
 def test_a_workers_checkout_never_runs_what_its_clone_names_or_follows_its_urls(host, tmp_path):
     home, clone, upstream = host
     marker = tmp_path / "ran"

@@ -496,6 +496,40 @@ def test_the_time_limit_reports_why_a_finished_agent_was_not_exited(setup, monke
     )
 
 
+def test_a_checkout_made_beside_bwrap_agents_survives_a_prune_that_cannot_see_it(
+    setup, monkeypatch
+):
+    _, manager, git, _ = setup
+    monkeypatch.setattr(sandbox, "DEFAULT", "bwrap")
+    job = {**request(manager), "base": ""}
+    path = cron_agents.checkout(job, manager.src)
+    # A sibling's bwrap sandbox shows nothing at the checkout made after it started.
+    hidden = path.with_name("hidden")
+    path.rename(hidden)
+    git("worktree", "prune")
+    hidden.rename(path)
+    assert cron_agents.checkout(job, manager.src) == path
+    assert git("-C", str(path), "symbolic-ref", "--short", "HEAD") == "nightly"
+
+
+def test_a_locked_checkout_that_cannot_be_filled_is_taken_back(setup, monkeypatch):
+    _, manager, git, _ = setup
+    monkeypatch.setattr(sandbox, "DEFAULT", "bwrap")
+    real = cron_agents.git
+
+    def failing(clone, *args, **kwargs):
+        if args[0] == "reset":
+            raise ValueError("No space left on device")
+        return real(clone, *args, **kwargs)
+
+    monkeypatch.setattr(cron_agents, "git", failing)
+    with pytest.raises(ValueError, match="No space left"):
+        cron_agents.checkout({**request(manager), "base": ""}, manager.src)
+    assert not (manager.src / "worktrees" / "repo" / "nightly").exists()
+    assert git("worktree", "list", "--porcelain").count("worktree ") == 1
+    assert "nightly" not in git("branch", "--format=%(refname:short)").split()
+
+
 def test_a_branch_checked_out_elsewhere_is_used_where_it_is(setup):
     jobs, manager, git, _ = setup
     elsewhere = manager.src / "worktrees" / "mine"
