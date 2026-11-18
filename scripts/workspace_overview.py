@@ -8,12 +8,14 @@ anything, and its collection and cleanup failures stay inside this experiment.
 """
 
 import concurrent.futures
+import contextlib
 import copy
 import fcntl
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -1795,6 +1797,10 @@ class WorkspaceOverview:
             return None
         branch = row.get("branch")
         branch = branch if branch and BRANCH_NAME.fullmatch(branch) else None
+        # The worker lists sessions only for a checkout that is there: what its agents
+        # wrote since the last hourly sweep is kept now, or not at all.
+        with contextlib.suppress(OSError, ValueError, sqlite3.Error):
+            workspace_viewer.archive_remote(self.home, machine, row["path"])
         self.progress(job, index, steps, f"Removing worktree {row['path']} on {machine.label}")
         done = workspace_viewer.probe(
             self.home,

@@ -229,6 +229,23 @@ def viewed_workspace(home, value):
     return machine, workspace_id
 
 
+def worker_checkouts(home, workspace_overview):
+    """The checkouts the inventory lists on enabled workers, as (machine, path) pairs,
+    whose sessions the transcript archive reads there."""
+    found = []
+    for row in workspace_overview.snapshot(start=False).get("workspaces", []):
+        # A worktree's row; one that is only a herdr workspace may be no checkout.
+        if not row.get("machine") or row["key"] != f"m:{row['machine']}:{row['path']}":
+            continue
+        try:
+            machine = machines.resolve(home, row["machine"])
+        except ValueError:
+            continue  # A row of a worker since removed from the registry.
+        if machine is not None and machine.enabled:
+            found.append((machine, row["path"]))
+    return found
+
+
 def local_label(home):
     """What the viewer calls this machine beside workers; None while there are none."""
     try:
@@ -620,6 +637,21 @@ class DashboardServer(ThreadingHTTPServer):
         # Kept past a restart: a message to it once closed resumes a session there.
         self.workspaces.note_viewed(workspace_id, root)
         return root
+
+    def kept_checkout(self, workspace_id):
+        """``workspace_checkout`` for the views that read kept transcripts: once the
+        workspace is closed and its worktree removed, the path last recorded for it.
+
+        Never for a workspace herdr still lists: its ID may have named another checkout
+        before herdr restarted.
+        """
+        try:
+            return self.workspace_checkout(workspace_id)
+        except workspace_viewer.Closed:
+            path = self.workspaces and self.workspaces.recorded_checkout(workspace_id, removed=True)
+            if not path:
+                raise
+            return path
 
     def remote_checkout(self, machine, workspace_id):
         """``workspace_checkout`` for a worker's workspace, as that worker spells it."""
@@ -1761,8 +1793,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     if machine is not None and path is None:
                         path = self.server.remote_checkout(machine, workspace_id)
-                    elif path is None:
+                    elif path is None and route.path == "/api/workspace-diff":
                         path = self.server.workspace_checkout(workspace_id)
+                    elif path is None:
+                        path = self.server.kept_checkout(workspace_id)
                     if route.path == "/api/workspace-artefacts":
                         if single:
                             raise ValueError("Unknown artefacts parameter")
@@ -2065,6 +2099,7 @@ def serve(
         attachments_dir=attachments_dir,
     )
     cron = CronJobs(home, workspaces=workspaces)
+    archiver = workspace_viewer.Archiver(home, lambda: worker_checkouts(home, workspace_overview))
     ci = CiDetails(home, overview)
     ci_logs = BackgroundLogs(home, overview, ci)
     push = PushInbox(
@@ -2098,6 +2133,7 @@ def serve(
         push.start()
         notifications.start()
         workspaces.start()
+        archiver.start()
         url = f"http://127.0.0.1:{server.server_port}"
         print(
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",
@@ -2139,6 +2175,7 @@ def serve(
         except KeyboardInterrupt:
             pass
         finally:
+            archiver.close()
             cron.close()
             workspaces.close()
             notifications.close()

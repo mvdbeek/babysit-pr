@@ -11,21 +11,27 @@ answers the diff, its session listing and the new bytes of one transcript, and p
 stays here.
 
 What a transcript parses to is kept in ``transcript_store`` (the dashboard's
-``transcripts.sqlite``), so a transcript is parsed once, then only as its file grows,
-and its entries can be searched.
+``transcript-archive.sqlite``), so a transcript is parsed once, then only as its file
+grows, and its entries can be searched. It stays there once its file is gone, and is
+then listed and shown from the store alone; ``Archiver`` reads every session into it in
+the background, so one never opened here is kept as well.
 """
 
 import atexit
 import json
+import lzma
 import os
 import re
 import selectors
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+import traceback
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import claude_accounts
@@ -76,14 +82,26 @@ REMOTE_MIN_READ = 5
 MAX_LINE = 64 * 1024 * 1024
 REMOTE_MAX_LINE = remote_probe.MAX_SCAN_LINE
 # Entries a parsed transcript keeps; past it the oldest go, a tenth at a time, and the
-# page indices stay those of the whole transcript.
-MAX_ENTRIES = 20000
+# page indices stay those of the whole transcript. The store is the record of a session
+# whose file is gone, so this only bounds a file that never stops growing.
+MAX_ENTRIES = 200000
 # The newest tool calls a parser keeps for their results (a later result replaces an
 # earlier one), and the newest prompts it remembers to recognise Codex's echoes of them.
 OPEN_TOOLS = 500
 MAX_PROMPTS = 100
-# Bumped whenever parsing changes what an entry holds: saved transcripts are parsed again.
+# Bumped whenever parsing changes what an entry holds: a saved transcript is parsed again
+# when it is next opened or has grown, and stays as it was parsed once its file is gone.
 PARSER = 2
+# Sessions a transcript lists at most, those kept only in the store included.
+KEPT_SESSIONS = 200
+# The archiver's first sweep after the dashboard starts, how often it sweeps after that,
+# and its rest after each transcript it read, so requests are answered meanwhile.
+ARCHIVE_FIRST = 60
+ARCHIVE_EVERY = 3600
+ARCHIVE_PAUSE = 0.05
+ARCHIVE_FAILURES = 3
+# A session file larger than this is not kept as it is: only its transcript is.
+RAW_MAX = 1024 * 1024 * 1024
 # A search brings the checkout's sessions up to date first, for at most this long, and
 # answers at most SEARCH_RESULTS entries.
 SEARCH_BUDGET = 20
@@ -93,7 +111,7 @@ SEARCH_RESULTS = 100
 # separate threads.
 _lock = threading.Lock()
 _details: dict[str, tuple[tuple, dict | None]] = {}
-DETAIL_FILES = 5000
+DETAIL_FILES = 20000
 # The store, opened on first use: the dashboard's (``use_store``), or a private one.
 _store_path: Path | None = None
 _store: transcript_store.Store | None = None
@@ -112,6 +130,10 @@ claude_prompt = remote_probe.claude_prompt
 claude_text = remote_probe.claude_text
 claude_details = remote_probe.claude_details
 codex_details = remote_probe.codex_details
+
+
+class Closed(ValueError):
+    """The herdr workspace is not open, and no checkout of it is left to read."""
 
 
 def local_environment():
@@ -259,7 +281,7 @@ def resolve_workspace(workspace_id, spaces, known=None):
         # Closed since it was last seen: its checkout is still the one to show.
         root = known
     else:
-        raise ValueError("That herdr workspace is not open; refresh")
+        raise Closed("That herdr workspace is not open; refresh")
     if Path(git_text(root, "rev-parse", "--show-toplevel")).resolve() != Path(root):
         raise ValueError("That herdr workspace is not at the top of a Git checkout")
     return root
@@ -361,9 +383,11 @@ def probe(home, machine, op, timeout=REMOTE_TIMEOUT, **args):
     try:
         return remote_probe.call(home, machine, op, timeout, **args)
     except subprocess.TimeoutExpired as exc:
-        raise ValueError(f"{machine.label} did not answer within {timeout} seconds") from exc
+        raise remote_probe.Unreachable(
+            f"{machine.label} did not answer within {timeout} seconds"
+        ) from exc
     except OSError as exc:
-        raise ValueError(f"{machine.label} could not be reached: {exc}") from exc
+        raise remote_probe.Unreachable(f"{machine.label} could not be reached: {exc}") from exc
 
 
 def bases(path):
@@ -556,17 +580,18 @@ def codex_store():
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
 
 
-def session_files(root):
-    """Candidate transcript files: Claude folders for the checkout and its subdirectories,
-    and every Codex rollout (each is matched on its recorded cwd)."""
+def session_files(root=None):
+    """Candidate transcript files: Claude folders for the checkout and its subdirectories
+    (every folder without a ``root``), and every Codex rollout (each is matched on its
+    recorded cwd)."""
     # Claude names a project folder after its cwd, every other character a dash.
-    folder = re.sub(r"[^A-Za-z0-9]", "-", str(root))
+    folder = None if root is None else re.sub(r"[^A-Za-z0-9]", "-", str(root))
     for home in claude_accounts.homes():
         try:
             folders = [
                 entry
                 for entry in (home / "projects").iterdir()
-                if entry.name == folder or entry.name.startswith(folder + "-")
+                if folder is None or entry.name == folder or entry.name.startswith(folder + "-")
             ]
         except OSError:
             folders = []
@@ -577,21 +602,42 @@ def session_files(root):
         yield "codex", path
 
 
+def session_store(agent, file):
+    """The session store of this machine that ``file`` is in, as ``session_files`` names
+    its files: a Claude home's ``projects``, or Codex's ``sessions``. None for any other."""
+    file = Path(file)
+    if ".." in file.parts or file.suffix != ".jsonl":
+        return None
+    if agent == "claude":
+        stores = [home / "projects" for home in claude_accounts.homes()]
+        return next((found for found in stores if file.parent.parent == found), None)
+    codex = codex_store()
+    below = agent == "codex" and file.name.startswith("rollout-") and len(file.parents) > 3
+    return codex if below and file.parents[3] == codex else None
+
+
+def session_of(agent, file, root=None):
+    """A session file as the listings name it; None unless it records a session, in
+    ``root`` or below it where one is given."""
+    found = details(file, agent)
+    if (
+        not found
+        or not SESSION.match(found["id"])
+        or (root is not None and not Path(found["cwd"]).is_relative_to(root))
+    ):
+        return None
+    return session_row(agent, file, found)
+
+
 def sessions(path):
     """Agent sessions recorded in this checkout or below it, newest first."""
     root = Path(path).resolve()
     listed = []
     for agent, file in session_files(root):
-        found = details(file, agent)
-        if (
-            not found
-            or not SESSION.match(found["id"])
-            or not Path(found["cwd"]).is_relative_to(root)
-        ):
+        session = session_of(agent, file, root)
+        if session is None:
             continue
-        row = session_row(agent, file, found)
-        if row:
-            listed.append(row)
+        listed.append(session)
     listed.sort(key=lambda s: s["updated"], reverse=True)
     return listed[:MAX_SESSIONS]
 
@@ -610,6 +656,7 @@ def session_row(agent, file, found):
         "size": stat.st_size,
         "title": title.splitlines()[0][:160] if title else None,
         "_file": file,
+        "_cwd": found["cwd"],
     }
     if agent == "claude":
         home = claude_accounts.transcript_home(file)
@@ -689,6 +736,21 @@ def remote_session_anywhere(home, machine, session):
     """A worker's session wherever on it it was recorded, as ``session_anywhere``."""
     found = probe(home, machine, "session", session=session)
     return remote_row(found[0]) if found and found[0]["id"] == session else None
+
+
+def remote_kept(home, machine, path):
+    """A worker's sessions for its checkout with those kept here for it, as ``with_kept``.
+
+    A worker that does not answer, or whose checkout is gone, still shows what was kept.
+    """
+    try:
+        listed = remote_sessions(home, machine, path)
+    except (OSError, ValueError):
+        kept = with_kept([], machine.id, path)
+        if not kept:
+            raise
+        return kept
+    return with_kept(listed, machine.id, path)
 
 
 class Transcript:
@@ -1048,7 +1110,7 @@ class Transcript:
 
 
 def use_store(home):
-    """Keep parsed transcripts in ``home``'s ``transcripts.sqlite`` from now on."""
+    """Keep parsed transcripts in ``home``'s ``transcript-archive.sqlite`` from now on."""
     global _store_path, _store
     with _lock:
         _store_path, _store = Path(home) / transcript_store.FILE, None
@@ -1079,13 +1141,60 @@ def search_text(entry):
     return "\n".join(part for part in parts if isinstance(part, str))
 
 
-def bring_up_to_date(key, agent, read, wait=1.0):
+def with_kept(listed, machine, root):
+    """``listed`` sessions of a checkout and those kept in the store for it that are not
+    among them, newest first, KEPT_SESSIONS at most.
+
+    ``machine`` is the worker's id, "" for this machine, and ``root`` the checkout as
+    that machine spells it. A kept session whose file is gone, or any a worker did not
+    list, is marked ``archived``: it is shown from the store and never read on.
+    """
+    files = {str(session["_file"]) for session in listed}
+    ids = {session["id"] for session in listed}
+    kept = []
+    for row in store().recorded(machine, str(root), KEPT_SESSIONS + len(listed)):
+        if row["file"] in files or row["session"] in ids:
+            continue
+        ids.add(row["session"])
+        session = {
+            "id": row["session"],
+            "agent": row["agent"],
+            "updated": row["updated"],
+            "size": row["size"],
+            "title": row["title"],
+            "_file": row["file"],
+            "_cwd": row["cwd"],
+        }
+        if machine or not os.path.exists(row["file"]):
+            session["archived"] = True
+            # Its file was kept too, all of it as it was last listed: ``restore``.
+            if (
+                not machine
+                and row["raw_size"]
+                and row["raw_size"] >= (row["size"] or 0)
+                and session_store(row["agent"], row["file"])
+            ):
+                session["restorable"] = True
+        else:
+            # Listed no longer only because newer ones filled the list: read on as ever.
+            session["_file"] = Path(row["file"])
+        kept.append(session)
+    found = [*listed, *kept[: max(0, KEPT_SESSIONS - len(listed))]]
+    found.sort(key=lambda s: s["updated"] or 0, reverse=True)
+    return found
+
+
+def bring_up_to_date(key, agent, read, wait=1.0, session=None, index=True):
     """Parse a transcript on from where the store has it, saving as it goes.
 
     ``key`` is (machine id, file), "" for this machine. ``read(parser, file, save)``
     reads on, calling ``save`` as it goes, and says whether it reached the end. Returns
     the store row; while another request reads the same transcript for longer than
     ``wait`` seconds, the row as last saved, or None if it was never read to its end.
+
+    The row keeps what lists ``session`` (its listing entry), so the transcript is still
+    found for its checkout once the file is gone. Without ``index`` the new entries are
+    left for the first search that needs them.
     """
     with _lock:
         lock = _reading.setdefault(key, threading.Lock())
@@ -1099,6 +1208,15 @@ def bring_up_to_date(key, agent, read, wait=1.0):
     try:
         machine, file = key
         row = kept.open(machine, file, agent, PARSER)
+        if session is not None:
+            kept.describe(
+                row,
+                session["id"],
+                session.get("_cwd"),
+                session["title"],
+                session["updated"],
+                session["size"],
+            )
         parser = Transcript(
             agent,
             REMOTE_MAX_LINE if machine else None,
@@ -1131,7 +1249,8 @@ def bring_up_to_date(key, agent, read, wait=1.0):
     finally:
         lock.release()
     # Indexed once the read is done, so its saves never wait behind the indexing.
-    kept.index_soon(row["id"])
+    if index:
+        kept.index_soon(row["id"])
     if kept.prune_due():
         threading.Thread(target=kept.prune, name="transcript-prune", daemon=True).start()
     return kept.row(*key)
@@ -1164,7 +1283,7 @@ def transcript(
     wherever it was recorded: the agent runs here, whichever directory it started in.
     """
     return transcript_page(
-        sessions(path),
+        with_kept(sessions(path), "", Path(path).resolve()),
         lambda file: ("", str(file)),
         local_read,
         session,
@@ -1195,7 +1314,7 @@ def remote_transcript(
         return probe(home, machine, "tail", **args)
 
     return transcript_page(
-        remote_sessions(home, machine, path),
+        remote_kept(home, machine, path),
         lambda file: (machine.id, file),
         lambda parser, file, save: parser.update_remote(tail, file, save),
         session,
@@ -1239,16 +1358,23 @@ def transcript_page(
         if chosen is None and unlisted:
             chosen = unlisted(session)
             if chosen:
-                listed = sorted([chosen, *listed], key=lambda s: s["updated"], reverse=True)
+                listed = sorted([chosen, *listed], key=lambda s: s["updated"] or 0, reverse=True)
         if chosen is None:
             raise ValueError("That session is not recorded for this workspace")
-    # A first parse of a large file takes a while; a request meanwhile is answered from
-    # what was saved by the last complete read.
-    row = bring_up_to_date(key_of(chosen["_file"]), chosen["agent"], read)
-    if row is None:
-        raise ValueError("This transcript is still being read; try again shortly")
-    # Indices count from the transcript's start, the dropped oldest entries included.
-    first, total = row["first"], row["saved"]
+    if chosen.get("archived"):
+        row = store().row(*key_of(chosen["_file"]))
+        if row is None:
+            raise ValueError("That session is not recorded for this workspace")
+        # Nothing is left to read on: the last read that reached the file's end shows.
+        kept, first, total = store().whole(row)
+    else:
+        # A first parse of a large file takes a while; a request meanwhile is answered
+        # from what was saved by the last complete read.
+        row = bring_up_to_date(key_of(chosen["_file"]), chosen["agent"], read, session=chosen)
+        if row is None:
+            raise ValueError("This transcript is still being read; try again shortly")
+        # Indices count from the transcript's start, the dropped oldest entries included.
+        kept, first, total = row["id"], row["first"], row["saved"]
     if after is not None and first <= after <= total and total - after <= PAGE:
         start, end = after, total
     elif around is not None:
@@ -1264,7 +1390,7 @@ def transcript_page(
     return {
         "sessions": [{k: v for k, v in s.items() if not k.startswith("_")} for s in listed],
         "session": {k: v for k, v in chosen.items() if not k.startswith("_")},
-        "entries": store().page(row["id"], start, end),
+        "entries": store().page(kept, start, end),
         "start": start,
         "first": first,
         "total": total,
@@ -1317,7 +1443,11 @@ def search_result(text, answer):
 def matching(path, expression, limit):
     """This checkout's entries matching an FTS ``expression``, as ``matching_sessions``."""
     return matching_sessions(
-        sessions(path), lambda file: ("", str(file)), local_read, expression, limit
+        with_kept(sessions(path), "", Path(path).resolve()),
+        lambda file: ("", str(file)),
+        local_read,
+        expression,
+        limit,
     )
 
 
@@ -1329,7 +1459,7 @@ def remote_matching(home, machine, path, expression, limit):
 
     stop = time.monotonic() + SEARCH_BUDGET
     return matching_sessions(
-        remote_sessions(home, machine, path),
+        remote_kept(home, machine, path),
         lambda file: (machine.id, file),
         lambda parser, file, save: parser.update_remote(tail, file, save, stop),
         expression,
@@ -1345,30 +1475,268 @@ def matching_sessions(listed, key_of, read, expression, limit, stop=None):
     Returns (matches, total, searched, behind): at most ``limit`` (session, index, entry,
     snippet) tuples, newest session first and newest entry first within it, every
     match's count, and how many sessions were searched. Sessions not read to their end
-    in time (or busy, or unreadable) are searched as far as they were saved and counted
-    in ``behind``; searching again reads on.
+    in time (or busy, or unreadable), or not indexed to their end in as long again, are
+    searched as far as they were and counted in ``behind``; searching again goes on. An
+    archived session is searched as it was kept: there is nothing left to read on.
     """
     stop = time.monotonic() + SEARCH_BUDGET if stop is None else stop
     rows: dict[int, dict] = {}
+    # Sessions with nothing kept to search, and the rows of those kept only in part.
     behind = 0
+    partial = set()
     for session in listed:
         key = key_of(session["_file"])
         row = None
+        if session.get("archived"):
+            row = store().row(*key)
+            if row is not None:
+                rows[store().whole(row)[0]] = session
+            continue
         if time.monotonic() < stop:
             try:
-                row = bring_up_to_date(key, session["agent"], read, wait=0)
+                row = bring_up_to_date(key, session["agent"], read, wait=0, session=session)
             except (OSError, ValueError):
                 if key[0]:
                     stop = 0  # A worker that no longer answers: search what is kept.
         if row is None:
             row = store().row(*key)
-        if row is None or not row["ready"]:
+        if row is None:
             behind += 1
-        if row is not None:
+        else:
             rows[row["id"]] = session
-    matches, counts = store().search(list(rows), expression, limit)
+            if not row["ready"]:
+                partial.add(row["id"])
+    # What the archive read in the background is indexed here, for as long again at most.
+    matches, counts = store().search(
+        list(rows), expression, limit, stop=time.monotonic() + SEARCH_BUDGET
+    )
+    partial |= store().unindexed(list(rows))
     found = [
         (rows[transcript_id], index, entry, snippet)
         for transcript_id, index, entry, snippet in matches
     ]
-    return found, sum(counts.values()), len(rows), behind
+    return found, sum(counts.values()), len(rows), behind + len(partial)
+
+
+def archive(listed, machine, read, stop=None):
+    """Read into the store every ``listed`` session it is behind on; returns how many.
+
+    ``machine`` is the worker's id, "" for this machine, and ``read`` as
+    ``bring_up_to_date`` takes it. A session read to its end, whose file has not grown
+    since, is passed over. ``stop`` is an event that ends the work early.
+    """
+    read_to = store().read_to(machine)
+    done = 0
+    for session in listed:
+        if stop is not None and stop.is_set():
+            break
+        file = str(session["_file"])
+        if read_to.get(file) == session["size"]:
+            continue
+        try:
+            bring_up_to_date(
+                (machine, file), session["agent"], read, wait=0, session=session, index=False
+            )
+        except remote_probe.Unreachable:
+            raise  # Asking a worker that does not answer for the next would wait as long.
+        except (OSError, ValueError, sqlite3.Error):
+            continue  # This one could not be read: the others still are.
+        done += 1
+        if stop is not None:
+            stop.wait(ARCHIVE_PAUSE)
+    return done
+
+
+def archive_local(stop=None):
+    """Read every agent session recorded on this machine into the store, and keep its
+    file there as it is."""
+    listed = []
+    for agent, file in session_files():
+        if stop is not None and stop.is_set():
+            return 0
+        session = session_of(agent, file)
+        if session is not None:
+            listed.append(session)
+    done = archive(listed, "", local_read, stop)
+    keep_files(listed, stop)
+    return done
+
+
+def keep_files(listed, stop=None):
+    """Keep each ``listed`` session file of this machine as it is, for ``restore``: the
+    bytes added since it was last kept, or all of a file that took another's place.
+    Returns how many were kept on. ``stop`` is an event that ends the work early."""
+    kept = store()
+    known = kept.kept_files("")
+    done = 0
+    for session in listed:
+        if stop is not None and stop.is_set():
+            break
+        found = known.get(str(session["_file"]))
+        # One without a row had no transcript read; one as long as its file is kept,
+        # unless the copy is of no file (``restored``) and only happens to be as long.
+        if (
+            found is None
+            or (found[1] is not None and found[2] == session["size"])
+            or session["size"] > RAW_MAX
+        ):
+            continue
+        try:
+            keep_file(kept, session["_file"], *found)
+        except (OSError, ValueError, sqlite3.Error, lzma.LZMAError):
+            continue  # This one could not be kept: the others still are.
+        done += 1
+        if stop is not None:
+            stop.wait(ARCHIVE_PAUSE)
+    return done
+
+
+def keep_file(kept, file, transcript, inode, size):
+    """Keep ``file`` on from the ``size`` bytes kept of the file ``inode``."""
+    with remote_probe.open_transcript(file) as stream:
+        info = os.fstat(stream.fileno())
+
+        def read_from(offset):
+            stream.seek(offset)
+            while chunk := stream.read(CHUNK):
+                yield chunk
+
+        # Another file in its place, or a shorter one, is kept from its start.
+        if inode != info.st_ino or size > info.st_size:
+            size = 0
+        try:
+            kept.keep(transcript, info.st_ino, size, read_from(size))
+        except (transcript_store.Conflict, lzma.LZMAError):
+            if not size:
+                raise
+            # A copy that cannot be kept on is made again.
+            kept.keep(transcript, info.st_ino, 0, read_from(0))
+
+
+def resumable(path):
+    """The sessions of a checkout on this machine that can be resumed: those ``sessions``
+    lists, and the archived ones whose file the store kept (``restore``)."""
+    listed = sessions(path)
+    live = {session["id"] for session in listed}
+    return [
+        session
+        for session in with_kept(listed, "", Path(path).resolve())
+        if session["id"] in live or session.get("restorable")
+    ]
+
+
+def restore(session):
+    """Write an archived session's file back where its agent kept it, from the copy the
+    store has of it; returns the file.
+
+    Nothing resumes a session without its file, and Claude deletes one a month after it
+    last changed. It is written back as it was kept, up to its last whole line, only into
+    an agent's session store and never over a file that is there. It is a new file, so
+    Claude keeps it another month.
+    """
+    file = Path(session["_file"])
+    found = session_store(session["agent"], file)
+    row = store().row("", str(file))
+    if row is None or not row["raw_size"]:
+        raise ValueError("No copy of that session's file was kept to resume it from")
+    if found is None or not found.is_dir():
+        raise ValueError("The agent's session store that session was in is gone")
+    file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(dir=file.parent, prefix=".restoring-")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            size = end = 0
+            try:
+                for piece in store().kept(row["id"]):
+                    stream.write(piece)
+                    line = piece.rfind(b"\n")
+                    if line >= 0:
+                        end = size + line + 1
+                    size += len(piece)
+            except lzma.LZMAError as exc:
+                raise ValueError("The copy kept of that session's file cannot be read") from exc
+            if size != row["raw_size"] or not end:
+                raise ValueError("The copy kept of that session's file is not whole")
+            # A line the agent was still writing as the file was last kept is left out.
+            stream.truncate(end)
+            # On disk before it has a name: a file cut short by a power cut would be
+            # kept in place of the copy.
+            os.fsync(stream.fileno())
+            inode = os.fstat(stream.fileno()).st_ino
+        try:
+            os.link(name, file)
+        except FileExistsError:
+            return file  # Written back by another request meanwhile.
+    finally:
+        os.unlink(name)
+    store().restored(row["id"], inode, end)
+    return file
+
+
+def archive_remote(home, machine, path, stop=None):
+    """Read the sessions a worker lists for its checkout ``path`` into the store."""
+
+    def tail(**args):
+        return probe(home, machine, "tail", **args)
+
+    return archive(
+        remote_sessions(home, machine, path),
+        machine.id,
+        lambda parser, file, save: parser.update_remote(tail, file, save),
+        stop,
+    )
+
+
+class Archiver:
+    """Keeps every session's transcript in the store, before its file is gone.
+
+    Claude deletes a session file a month after it last changed, and a worker's go with
+    its worktree's cleanup or the worker itself, so a transcript nobody opened here would
+    be lost with them. A minute after the dashboard starts, and hourly after that, this
+    reads on every session of this machine's stores, and those each worker lists for the
+    checkouts ``checkouts()`` names as (machine, path) pairs: only the bytes added since
+    the last sweep, and nothing of a session that has not grown. A worker's worktree is
+    read once more as its cleanup removes it (``archive_remote``).
+    """
+
+    def __init__(self, home, checkouts=None):
+        self.home = home
+        self.checkouts: Callable[[], Iterable[tuple]] = checkouts or (lambda: [])
+        self.stopping = threading.Event()
+        self.worker: threading.Thread | None = None
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.worker = threading.Thread(target=self.run, name="transcript-archive", daemon=True)
+        self.worker.start()
+
+    def close(self):
+        self.stopping.set()
+
+    def run(self):
+        wait = ARCHIVE_FIRST
+        while not self.stopping.wait(wait):
+            wait = ARCHIVE_EVERY
+            try:
+                self.sweep()
+            except Exception:
+                traceback.print_exc()
+
+    def sweep(self):
+        """One pass over this machine's sessions, then each worker's listed checkouts."""
+        archive_local(self.stopping)
+        failed: dict[str, int] = {}
+        for machine, path in self.checkouts():
+            if self.stopping.is_set():
+                return
+            # A worker that keeps giving no answer is not asked again this sweep: each
+            # call would wait out its timeout.
+            if failed.get(machine.id, 0) >= ARCHIVE_FAILURES:
+                continue
+            try:
+                archive_remote(self.home, machine, path, self.stopping)
+            except remote_probe.Unreachable:
+                failed[machine.id] = failed.get(machine.id, 0) + 1
+            except (OSError, ValueError, sqlite3.Error):
+                pass  # This checkout only: removed since the inventory listed it, say.

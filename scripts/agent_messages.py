@@ -243,9 +243,10 @@ def workspace_root(workspace_id, machine=None):
 
 
 def recorded(root, home=None, machine=None):
-    """The sessions recorded in a checkout, read on the worker it is on."""
+    """The sessions recorded in a checkout, read on the worker it is on. On this machine,
+    also the archived ones whose file can be written back to resume them."""
     if machine is None:
-        return workspace_viewer.sessions(root)
+        return workspace_viewer.resumable(root)
     return workspace_viewer.remote_sessions(home, machine, root)
 
 
@@ -268,7 +269,7 @@ def checkout_sessions(root, home=None, machine=None):
             **{
                 k: v
                 for k, v in session.items()
-                if k in {"id", "agent", "title", "updated", "claude_account"}
+                if k in {"id", "agent", "title", "updated", "claude_account", "archived"}
             },
             "watched": session["id"] in watched,
             **(
@@ -1727,7 +1728,9 @@ def resume(
 
     Given a checkout root instead, the session resumes in the workspace open there, or
     in one opened on it again. Given the ID of the babysit watch that owns the session,
-    the reader confirmed cancelling it first. A ``machine`` names the worker it all is
+    the reader confirmed cancelling it first. An archived session of this machine has
+    its file written back first (``workspace_viewer.restore``), and the result says it
+    was ``restored``. A ``machine`` names the worker it all is
     on: its herdr, its session listing and its own paths, which its probe reports.
     ``agent_options`` (``model``, ``effort``, ``docker``) keep a resume on the settings
     the session ran with on another machine (``workspace_move``).
@@ -1739,6 +1742,21 @@ def resume(
     chosen = next((s for s in recorded(root, home, machine) if s["id"] == session_id), None)
     if chosen is None or chosen["agent"] not in RESUME:
         raise ValueError("That session is not recorded for this workspace")
+    restored = bool(chosen.get("archived"))
+    if restored:
+        # Its file is gone: written back from the archive, the session is recorded again.
+        if not chosen.get("_cwd") or not Path(chosen["_cwd"]).is_dir():
+            raise ValueError("The session's directory no longer exists")
+        workspace_viewer.restore(chosen)
+        listed = workspace_viewer.sessions(root)
+        chosen = next((s for s in listed if s["id"] == session_id), None)
+        if chosen is None:
+            raise ValueError("That session's file was written back, but it is not listed")
+
+    def result(value):
+        value = warned(value, skills_warning)
+        return {**value, "restored": True} if restored else value
+
     if machine is not None and chosen["agent"] == "claude" and not chosen.get("claude_account"):
         raise ValueError(f"That session's Claude home is not an account on {machine.label}")
     # A worker's own paths, its probe's: the checkout's real one names its lock there.
@@ -1774,7 +1792,7 @@ def resume(
             # Already running in another workspace: talk to that agent, never a second one.
             if not text:
                 raise ValueError(f"This session is already running in {elsewhere['pane']}")
-            return warned(prompt(elsewhere, text, machine), skills_warning)
+            return result(prompt(elsewhere, text, machine))
         # A session resumes from the directory it was recorded in (Claude looks its ID up
         # in that directory's project folder).
         if found is None:
@@ -1827,7 +1845,7 @@ def resume(
                 "--no-focus",
                 machine=machine,
             )
-            return warned(
+            return result(
                 launch(
                     workspace_id,
                     chosen,
@@ -1839,11 +1857,10 @@ def resume(
                     found=found,
                     mark=True,
                     agent_options=agent_options,
-                ),
-                skills_warning,
+                )
             )
         # A reopened workspace's shell starts in the checkout, not the session's directory.
-        return warned(
+        return result(
             launch(
                 workspace_id,
                 chosen,
@@ -1855,8 +1872,7 @@ def resume(
                 machine=machine,
                 found=found,
                 agent_options=agent_options,
-            ),
-            skills_warning,
+            )
         )
 
 

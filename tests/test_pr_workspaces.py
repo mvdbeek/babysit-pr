@@ -672,6 +672,68 @@ def test_viewed_workspace_still_takes_messages_once_closed_after_restart(local):
     assert [session["id"] for session in value["sessions"]] == [sid]
 
 
+def test_a_closed_workspace_whose_worktree_is_removed_still_shows_its_kept_transcript(local):
+    manager, _, git, state, _ = local
+    path = make_checkout(local)
+    space(state, path, manager.src / "repo", wid="review-space")
+    sid = "01a1064c-4c81-7232-ad79-a967ee51fac2"
+    session = (
+        Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "11" / "05" / f"rollout-{sid}.jsonl"
+    )
+    session.parent.mkdir(parents=True)
+    session.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(path.resolve())}})
+        + "\n"
+        + json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Go"}})
+        + "\n"
+    )
+
+    def view(workspaces, route):
+        with dashboard.DashboardServer(manager.home, 0, workspaces=workspaces) as httpd:
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=10)
+                conn.request("GET", f"/api/workspace-{route}?workspace=review-space")
+                response = conn.getresponse()
+                value = json.loads(response.read())
+                conn.close()
+            finally:
+                httpd.shutdown()
+                thread.join(5)
+        return response.status, value
+
+    status, opened = view(manager, "transcript")
+    assert status == 200 and [entry["text"] for entry in opened["entries"]] == ["Go"]
+    # The workspace is closed, its worktree cleaned up, and Codex's own file deleted.
+    data = json.loads(state.read_text())
+    data["workspaces"] = []
+    state.write_text(json.dumps(data))
+    git("worktree", "remove", "--force", str(path))
+    session.unlink()
+    workspace_viewer._checkouts.clear()
+    restarted = pw.Workspaces(manager.home, manager.overview, lambda: [], manager.src)
+    assert restarted.recorded_checkout("review-space") is None
+    assert restarted.recorded_checkout("review-space", removed=True) == str(path.resolve())
+    status, value = view(restarted, "transcript")
+    assert status == 200 and value["entries"] == opened["entries"]
+    assert value["session"] == {**opened["session"], "archived": True}
+    # Only the kept transcripts are read there: a diff still needs the checkout.
+    status, value = view(restarted, "diff")
+    assert status == 400 and "not open" in value["error"]
+    # A workspace herdr lists under that ID is another one: never the removed checkout.
+    space(state, path, manager.src / "repo", wid="review-space")
+    status, value = view(restarted, "transcript")
+    assert status == 400 and "no checkout to show" in value["error"]
+    data["workspaces"] = []
+    state.write_text(json.dumps(data))
+    # Anything at the path again is not taken for the checkout that was removed.
+    path.mkdir()
+    assert restarted.recorded_checkout("review-space", removed=True) is None
+    status, value = view(restarted, "transcript")
+    assert status == 400 and "not open" in value["error"]
+
+
 @pytest.mark.parametrize("change", ["branch", "common", "missing", "unknown"])
 def test_recorded_workspace_recovery_rejects_unverified_checkouts(local, change):
     manager, pr, git, _, _ = local

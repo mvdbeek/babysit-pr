@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import ANY
 from urllib.parse import quote
 
+import agent_messages
 import dashboard
 import pr_workspaces
 import pytest
@@ -2441,6 +2442,69 @@ def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
     # The agent now runs: a second resume is refused, a message goes to it instead.
     with pytest.raises(ValueError, match="already running"):
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "again"}, home)
+
+
+def test_an_archived_session_has_its_file_written_back_and_is_resumed(
+    exited, tmp_path, monkeypatch
+):
+    state, sid, checkout, home = exited
+    # Every Claude account's store is swept: none but the test's own may be found.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    file = next((tmp_path / "claude" / "projects").glob(f"*/{sid}.jsonl"))
+    kept = file.read_bytes()
+    wso_viewer.archive_local()
+    # Claude deletes a session file a month after it last changed.
+    file.unlink()
+    assert agent_messages.sessions("w1", home) == [
+        {
+            "id": sid,
+            "agent": "claude",
+            "title": "Fix it",
+            "updated": ANY,
+            "archived": True,
+            "watched": False,
+        }
+    ]
+    value = agent_messages.send({"workspace": "w1", "resume": sid, "text": "Go on"}, home)
+    assert value == {
+        "sent": True,
+        "pane": ANY,
+        "resumed": sid,
+        "warning": None,
+        "restored": True,
+    }
+    assert file.read_bytes() == kept
+    agent = read(state)["agents"][0]
+    assert agent["argv"] == ["--resume", sid, "--", "Go on"]
+    assert Path(agent["cwd"]).resolve() == checkout.resolve()
+    # A session again as any other: the next resume writes nothing back.
+    assert "archived" not in agent_messages.sessions("w1", home)[0]
+
+
+def test_an_archived_session_is_not_resumed_without_its_directory_or_its_file(
+    exited, tmp_path, monkeypatch
+):
+    state, sid, checkout, home = exited
+    monkeypatch.setenv("HOME", str(tmp_path))
+    file = next((tmp_path / "claude" / "projects").glob(f"*/{sid}.jsonl"))
+    lib = checkout / "lib"
+    lib.mkdir()
+    file.write_text(file.read_text().replace(json.dumps(str(checkout)), json.dumps(str(lib))))
+    wso_viewer.archive_local()
+    file.unlink()
+    lib.rmdir()
+    with pytest.raises(ValueError, match="directory no longer exists"):
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "Go on"}, home)
+    assert not file.exists() and read(state)["agents"] == []
+    # One whose transcript was only opened here was never kept as a file.
+    lib.mkdir()
+    with sqlite3.connect(wso_viewer.store().path) as db:
+        db.execute("DELETE FROM raw")
+        db.execute("UPDATE transcripts SET raw_size=0")
+    assert agent_messages.sessions("w1", home) == []
+    with pytest.raises(ValueError, match="not recorded for this workspace"):
+        agent_messages.send({"workspace": "w1", "resume": sid, "text": "Go on"}, home)
+    assert not file.exists()
 
 
 def test_a_codex_session_resumes_without_the_shared_background_server(exited):

@@ -882,7 +882,9 @@
   function sessionLabel(session) {
     const agent = session.agent === "claude" ? "Claude" : "Codex";
     const account = session.claude_account ? ` (${session.claude_account})` : "";
-    return `${date(session.updated)} · ${agent}${account} · ${session.title || session.id}`;
+    // Shown from the dashboard's own copy: the agent's session file is no longer listed.
+    const kept = session.archived ? " · archived" : "";
+    return `${date(session.updated)} · ${agent}${account}${kept} · ${session.title || session.id}`;
   }
   function agentName(data) {
     return data.session.agent === "claude" ? "Claude" : "Codex";
@@ -890,7 +892,13 @@
   function transcriptMeta(data) {
     byId("ws-viewer-meta").textContent =
       `${agentName(data)} session ${data.session.id}, ${data.total} entries, ` +
-      `updated ${date(data.session.updated)}.`;
+      `updated ${date(data.session.updated)}.` +
+      (data.session.archived
+        ? " Archived: shown as the dashboard kept it, now that its session file is no longer listed." +
+          (data.session.restorable
+            ? " Its file was kept too: resuming the session writes it back first."
+            : "")
+        : "");
   }
   function earlierButton(data) {
     const earlier = node(
@@ -1695,7 +1703,11 @@
         renderWatch();
       },
     );
-    resume.title = "No agent is running; the message resumes this session";
+    resume.title =
+      "No agent is running; the message resumes this session" +
+      (sessions.some((session) => session.archived)
+        ? ". An archived one has its session file written back first, from the copy the dashboard kept"
+        : "");
     holder.append(resume);
     renderWatch();
   }
@@ -1704,6 +1716,10 @@
     if (agents.length) return null;
     const picked = byId("ws-message-agent").querySelector("select")?.value;
     return sessions.find((session) => session.id === picked) || sessions[0] || null;
+  }
+  // An archived session's file is written back before the session is resumed.
+  function writtenBack(value) {
+    return value.restored ? " Its session file was written back from the archive first." : "";
   }
   function watchName(watch) {
     return `babysit watch ${watch.id} (${watch.status})`;
@@ -2776,7 +2792,9 @@
     status.textContent = stopWatch
       ? "Cancelling the watch and resuming the session…"
       : body.resume
-        ? "Resuming the session…"
+        ? session?.archived
+          ? "Writing the session's file back and resuming it…"
+          : "Resuming the session…"
         : "Sending…";
     try {
       const value = await deliver(body);
@@ -2808,7 +2826,7 @@
         status,
         value.warning ||
           (value.resumed
-            ? `${stopWatch ? `Cancelled babysit watch ${stopWatch}, resumed` : "Resumed"} the session in ${value.pane} and sent the message.${quits}`
+            ? `${stopWatch ? `Cancelled babysit watch ${stopWatch}, resumed` : "Resumed"} the session in ${value.pane} and sent the message.${writtenBack(value)}${quits}`
             : `Sent to the agent in ${value.pane}.${quits}`),
       );
       // The transcript shows the new turn soon after; load just its tail, like the poll, so
@@ -2848,7 +2866,9 @@
     renderAgents();
     status.textContent = stopWatch
       ? "Cancelling the watch and reopening the session…"
-      : "Reopening the session…";
+      : session.archived
+        ? "Writing the session's file back and reopening it…"
+        : "Reopening the session…";
     try {
       const value = await deliver({
         ...recipient(entry),
@@ -2868,7 +2888,7 @@
       tell(
         status,
         value.warning ||
-          `${stopWatch ? `Cancelled babysit watch ${stopWatch} and resumed` : "Resumed"} the session in ${value.pane}; continue in Collie.`,
+          `${stopWatch ? `Cancelled babysit watch ${stopWatch} and resumed` : "Resumed"} the session in ${value.pane}; continue in Collie.${writtenBack(value)}`,
       );
     } finally {
       sending = false;

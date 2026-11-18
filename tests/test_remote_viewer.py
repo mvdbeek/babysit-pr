@@ -520,6 +520,67 @@ def test_an_unreachable_worker_names_itself_and_leaves_local_views_alone(worker,
         wv.remote_checkout(worker.machine, "w1")
 
 
+def test_a_workers_sessions_are_kept_once_their_files_or_the_worker_are_gone(worker, monkeypatch):
+    root = str(worker.checkout)
+    opened = wv.remote_transcript(worker.home, worker.machine, root, CLAUDE_SID)
+    worker.claude.unlink()
+    wv._sessions.clear()
+    value = wv.remote_transcript(worker.home, worker.machine, root, CLAUDE_SID)
+    # As it was listed, but for its account, which is not kept.
+    assert {**value["session"], "claude_account": "default"} == {
+        **opened["session"],
+        "archived": True,
+    }
+    assert entries(value) == ["Fix it", "Done"]
+    assert {s["id"]: s.get("archived") for s in value["sessions"]} == {
+        CLAUDE_SID: True,
+        CODEX_SID: None,
+    }
+    assert all("_file" not in s and "_cwd" not in s for s in value["sessions"])
+    # A search reads the session the worker still has, and what was kept of the other.
+    found = wv.remote_search(worker.home, worker.machine, root, "fix it")
+    assert [h["session"] for h in found["results"]] == [CLAUDE_SID]
+    assert (found["searched"], found["behind"]) == (2, 0)
+    # A worker that no longer answers, or has no such checkout any more: both as kept.
+    monkeypatch.setenv("FAKE_SSH_DOWN", "mini.test")
+    wv._sessions.clear()
+    value = wv.remote_transcript(worker.home, worker.machine, root, CODEX_SID)
+    assert entries(value) == ["Codex task"] and value["session"]["archived"]
+    assert {s["id"] for s in value["sessions"]} == {CLAUDE_SID, CODEX_SID}
+    assert wv.remote_search(worker.home, worker.machine, root, "codex task")["total"] == 1
+    # Nothing was kept for another checkout there: the worker's failure is what shows.
+    with pytest.raises(ValueError, match="Mac mini"):
+        wv.remote_transcript(worker.home, worker.machine, root + "-2")
+
+
+def test_the_archive_reads_a_workers_sessions_for_a_checkout_nobody_opened(worker, monkeypatch):
+    root = str(worker.checkout)
+    assert wv.archive_remote(worker.home, worker.machine, root) == 2
+    before = ssh_calls(worker)
+    wv._sessions.clear()
+    # Nothing grew: the listing is the only call.
+    assert wv.archive_remote(worker.home, worker.machine, root) == 0
+    assert ssh_calls(worker) == before + 1
+    with worker.claude.open("a") as stream:
+        stream.write(json.dumps(claude_turn("assistant", worker.checkout, "Fixed now")) + "\n")
+    wv._sessions.clear()
+    assert wv.archive_remote(worker.home, worker.machine, root) == 1
+    shutil.rmtree(worker.host / ".claude")
+    shutil.rmtree(worker.host / ".codex")
+    wv._sessions.clear()
+    value = wv.remote_transcript(worker.home, worker.machine, root, CLAUDE_SID)
+    assert entries(value) == ["Fix it", "Done", "Fixed now"]
+    assert [(s["id"], s["archived"]) for s in value["sessions"]] == [
+        (CLAUDE_SID, True),
+        (CODEX_SID, True),
+    ]
+    # A worker that fails says so, for the sweep to leave it be.
+    monkeypatch.setenv("FAKE_SSH_DOWN", "mini.test")
+    wv._sessions.clear()
+    with pytest.raises(ValueError, match="Mac mini"):
+        wv.archive_remote(worker.home, worker.machine, root)
+
+
 # Through the dashboard -------------------------------------------------------------
 
 
@@ -596,6 +657,25 @@ def test_views_resolve_worker_rows_and_ids_on_the_server(worker, dashboard_site,
     assert status == 400 and "Mac mini probe failed (unreachable)" in value["error"]
     status, value = request(port, f"/api/workspace-diff?key={quote(str(worker.local), safe='')}")
     assert status == 200 and value["untracked"] == ["local.txt"]
+
+
+def test_the_archive_is_given_each_enabled_workers_worktree_rows(worker, monkeypatch):
+    def listed(key, **fields):
+        return {"key": key, "path": key.split(":", 2)[-1], "missing": False, **fields}
+
+    rows = [
+        listed(str(worker.local)),
+        listed(f"m:mini:{worker.checkout}", machine="mini"),
+        # Only a herdr workspace, which may be no checkout; and a worker since removed.
+        listed("workspace:mini:w7", machine="mini"),
+        listed("m:box:/src/repo", machine="box"),
+    ]
+    overview = SimpleNamespace(snapshot=lambda start: {"workspaces": rows})
+    found = dashboard.worker_checkouts(worker.home, overview)
+    assert [(machine.id, path) for machine, path in found] == [("mini", str(worker.checkout))]
+    assert dashboard.worker_checkouts(worker.home, SimpleNamespace(snapshot=lambda start: {})) == []
+    register(worker.home, {**MINI, "enabled": False})
+    assert dashboard.worker_checkouts(worker.home, overview) == []
 
 
 def test_a_closed_worker_workspace_still_takes_messages_after_a_restart(worker, short_tmp):
