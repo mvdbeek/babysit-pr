@@ -26,7 +26,7 @@ import workspace_overview as wso
 import workspace_viewer as wv
 from playwright.sync_api import expect
 from test_remote_inventory import BOX, MINI, fleet, git, make_clone, read, register, short_tmp
-from test_remote_viewer import CLAUDE_SID, CODEX_SID, worker
+from test_remote_viewer import CLAUDE_SID, CODEX_SID, claude_file, claude_turn, jsonl, worker
 from test_workspace_overview import FakeGitHub, request
 from test_workspace_overview_browser import row
 
@@ -77,6 +77,23 @@ def test_a_worker_checkout_is_removed_there_with_its_branch(fleet, plugin):
     # Nothing on this machine was touched, and only the worker's herdr was asked.
     assert (fleet["local"] / "local-work").exists()
     assert not any(call[:2] == ["workspace", "close"] for call in read(fleet["state"])["calls"])
+
+
+def test_a_worker_checkouts_transcripts_are_kept_as_it_is_removed(fleet, plugin):
+    """The worker lists sessions only for a checkout that is there, so a cleanup reads
+    them once more before it removes the worktree."""
+    checkout = fleet["mini"] / "dirty-work"
+    claude_file(fleet["hosts"] / "mini.test", checkout, CLAUDE_SID).write_text(
+        jsonl(claude_turn("user", checkout, "Fix it"), claude_turn("assistant", checkout, "Done"))
+    )
+    key = f"m:mini:{checkout}"
+    result = cleanup(plugin, (key, ["dirty"]))[key]
+    assert result["status"] == "done" and not checkout.exists(), result
+    machine = machines.load(fleet["home"])["mini"]
+    wv._sessions.clear()  # The listing the cleanup read, kept for half a minute.
+    value = wv.remote_transcript(fleet["home"], machine, str(checkout))
+    assert (value["session"]["id"], value["session"]["archived"]) == (CLAUDE_SID, True)
+    assert [entry["text"] for entry in value["entries"]] == ["Fix it", "Done"]
 
 
 def test_an_unapproved_blocker_on_a_worker_is_skipped(fleet, plugin):

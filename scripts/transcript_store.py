@@ -1,20 +1,26 @@
 """Parsed agent transcripts kept in SQLite, with a full-text index over their entries.
 
-The agents' JSONL session files stay the record; this is what the viewer parsed from
-them, so a transcript opened again (after a restart, or once others pushed it out of
-memory) is read on from where it stopped rather than parsed from the start. Each row
-names its file and its machine ('' for this one) and keeps the parser's place in it;
-entries keep their index in the whole transcript and their clipped JSON, and their
-text feeds an FTS5 trigram index, so any three or more characters can be searched.
-Indexing costs more than parsing, so entries are saved unindexed and indexed soon after
-by a thread of their own, or first by a search that needs them.
+This is what the viewer parsed from the agents' JSONL session files, so a transcript
+opened again (after a restart, or once others pushed it out of memory) is read on from
+where it stopped rather than parsed from the start. Each row names its file and its
+machine ('' for this one) and keeps the parser's place in it; entries keep their index
+in the whole transcript and their clipped JSON, and their text feeds an FTS5 trigram
+index, so any three or more characters can be searched. Indexing costs more than
+parsing, so entries are saved unindexed and indexed soon after by a thread of their
+own, or first by a search that needs them.
 
-Everything here can be rebuilt from the session files: an unknown schema or parser
-version discards what was kept, and rows for files that are gone are pruned.
+It is also the record of a session once its file is gone (Claude deletes its own after
+a month, and a worker's go with the worker): a row keeps its session's ID, working
+directory, title and last change, so the session is still listed for its checkout, and
+nothing here drops a transcript. Only the session details are a cache.
+
+A session of this machine also has its file kept as it was, compressed, so that a
+session whose file is gone can be given it back and resumed.
 """
 
 import contextlib
 import json
+import lzma
 import os
 import re
 import sqlite3
@@ -22,12 +28,33 @@ import threading
 import time
 from pathlib import Path
 
-FILE = "transcripts.sqlite"
-# Bumped when the tables change; a store of another version is emptied, not migrated.
-SCHEMA = 1
-# Rows not read for this long are dropped, and the least recently read past the cap.
-KEEP_DAYS = 30
-MAX_TRANSCRIPTS = 2000
+FILE = "transcript-archive.sqlite"
+# The name while the store was a cache that dropped a transcript once its file was gone.
+# It is taken over under the new name, so that code from before, run on the same home,
+# starts a cache of its own rather than emptying this one.
+CACHE_FILE = "transcripts.sqlite"
+# Bumped when the tables change. An older store gains what it lacks. One written by
+# newer code is left as it is for that code, and this one keeps a store of its own
+# beside it, named after its version.
+SCHEMA = 2
+# What a row keeps of its session, to list it once its file is gone.
+SESSION_COLUMNS = {
+    "session": "TEXT",
+    "cwd": "TEXT",
+    "title": "TEXT",
+    "updated": "REAL",
+    "size": "INTEGER",
+}
+# How much of its session file a row keeps, and of which file: one read on, by its inode.
+FILE_COLUMNS = {
+    "raw_inode": "INTEGER",
+    "raw_size": "INTEGER NOT NULL DEFAULT 0",
+}
+# A session file is kept in pieces of this many of its bytes, each compressed alone, so
+# a file that grew is kept on by writing its last piece again and no other.
+PIECE = 4 * 1024 * 1024
+# The fastest xz preset: session files shrink to about a seventh, at some 70 MB a second.
+PRESET = 1
 MAX_DETAILS = 20000
 PRUNE_EVERY = 24 * 3600
 # Search terms: FTS5's trigram index matches nothing shorter than three characters.
@@ -68,17 +95,19 @@ class Store:
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.path.name == FILE and not self.path.exists():
+            move_store(self.path.with_name(CACHE_FILE), self.path)
         os.close(os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600))
         self.lock = threading.Lock()
         self.pruned = 0.0
         with self.db() as db:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA:
+            # Written by code newer than this, which finds it untouched when it runs again.
+            self.path = self.path.with_name(f"{self.path.name}.v{SCHEMA}")
+            os.close(os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600))
+        with self.db() as db:
             db.execute("PRAGMA journal_mode=WAL")
-            if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA:
-                for kind, name in db.execute(
-                    "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'trigger')"
-                    " AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'search_%'"
-                ).fetchall():
-                    db.execute(f'DROP {kind.upper()} IF EXISTS "{name}"')
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS transcripts (
@@ -96,7 +125,20 @@ class Store:
                     ready INTEGER NOT NULL DEFAULT 0,
                     generation INTEGER NOT NULL DEFAULT 0,
                     seen REAL NOT NULL,
+                    session TEXT,
+                    cwd TEXT,
+                    title TEXT,
+                    updated REAL,
+                    size INTEGER,
+                    raw_inode INTEGER,
+                    raw_size INTEGER NOT NULL DEFAULT 0,
                     UNIQUE (machine, file)
+                );
+                CREATE TABLE IF NOT EXISTS raw (
+                    transcript INTEGER NOT NULL,
+                    piece INTEGER NOT NULL,
+                    data BLOB NOT NULL,
+                    PRIMARY KEY (transcript, piece)
                 );
                 CREATE TABLE IF NOT EXISTS entries (
                     transcript INTEGER NOT NULL,
@@ -115,6 +157,14 @@ class Store:
                 );
                 """
             )
+            # In one transaction: another dashboard opening the same store adds them once.
+            db.execute("BEGIN IMMEDIATE")
+            had = {column[1] for column in db.execute("PRAGMA table_info(transcripts)")}
+            for name, kind in {**SESSION_COLUMNS, **FILE_COLUMNS}.items():
+                if name not in had:
+                    db.execute(f"ALTER TABLE transcripts ADD COLUMN {name} {kind}")
+            db.execute("COMMIT")
+            db.execute("CREATE INDEX IF NOT EXISTS transcripts_cwd ON transcripts (machine, cwd)")
             indexed = db.execute("SELECT 1 FROM sqlite_master WHERE name='search'").fetchone()
             try:
                 db.executescript(
@@ -158,8 +208,8 @@ class Store:
     def db(self):
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         try:
-            # The session files are the record: losing the last commits to a crash only
-            # means reading those bytes again.
+            # In WAL mode a commit lost to a power cut leaves the store whole, and its
+            # bytes are read again from the session file, which is still there so soon.
             db.execute("PRAGMA synchronous=NORMAL")
             # A replaced entry leaves the search index through its delete trigger.
             db.execute("PRAGMA recursive_triggers=ON")
@@ -182,9 +232,11 @@ class Store:
     # Transcripts ---------------------------------------------------------------
 
     def open(self, machine, file, agent, parser):
-        """The row for ``file`` on ``machine`` as a dict, made if new.
+        """The row for ``file`` on ``machine`` as a dict, made if new, to read the file on.
 
-        A row kept by another parser version, or for the other agent, starts again.
+        A row kept by another parser version, or for the other agent, is read again from
+        the file's start: it loses its place, and its entries go when that read saves
+        its first, so they are still there if the file can no longer be read.
         """
         with self.db() as db:
             row = self.row_of(db, machine, file, extra=", agent, parser, seen")
@@ -198,9 +250,11 @@ class Store:
                 (machine, file),
             ).fetchone()
             if found and (found[1] != agent or found[2] != parser):
-                db.execute("DELETE FROM entries WHERE transcript=?", (found[0],))
-                db.execute("DELETE FROM transcripts WHERE id=?", (found[0],))
-                found = None
+                db.execute(
+                    "UPDATE transcripts SET agent=?, parser=?, inode=NULL, offset=0, skipping=0,"
+                    " generation=generation+1 WHERE id=?",
+                    (agent, parser, found[0]),
+                )
             if found is None:
                 db.execute(
                     "INSERT INTO transcripts (machine, file, agent, parser, seen)"
@@ -215,8 +269,9 @@ class Store:
     @staticmethod
     def row_of(db, machine, file, extra=""):
         cursor = db.execute(
-            "SELECT id, inode, offset, skipping, saved, first, state, ready, generation"
-            f"{extra} FROM transcripts WHERE machine=? AND file=?",
+            "SELECT id, inode, offset, skipping, saved, first, state, ready, generation,"
+            f" {', '.join(SESSION_COLUMNS)}, raw_size{extra} FROM transcripts"
+            " WHERE machine=? AND file=?",
             (machine, file),
         )
         values = cursor.fetchone()
@@ -229,28 +284,82 @@ class Store:
         with self.db() as db:
             return self.row_of(db, machine, file)
 
+    def describe(self, row, session, cwd, title, updated, size):
+        """Keep what lists ``row``'s session, written only when it changed."""
+        found = dict(zip(SESSION_COLUMNS, (session, cwd, title, updated, size), strict=True))
+        if all(row.get(name) == value for name, value in found.items()):
+            return
+        with self.write() as db:
+            db.execute(
+                f"UPDATE transcripts SET {', '.join(f'{name}=?' for name in found)} WHERE id=?",
+                (*found.values(), row["id"]),
+            )
+        row.update(found)
+
+    def recorded(self, machine, root, limit):
+        """The newest ``limit`` sessions kept for ``machine`` whose working directory is
+        ``root`` or below it, as dicts naming their file and agent; none without entries."""
+        root = root.rstrip("/") or "/"
+        below = root.rstrip("/") + "/"
+        with self.db() as db:
+            cursor = db.execute(
+                f"SELECT file, agent, {', '.join(SESSION_COLUMNS)}, raw_size FROM transcripts"
+                " WHERE machine=? AND (cwd=? OR (cwd>=? AND cwd<?)) AND (saved>0 OR EXISTS"
+                " (SELECT 1 FROM entries WHERE entries.transcript=-transcripts.id))"
+                " ORDER BY updated DESC LIMIT ?",
+                # Every path below the root sorts from "root/" up to "root0", the next
+                # character after the slash.
+                (machine, root, below, below[:-1] + "0", limit),
+            )
+            names = [column[0] for column in cursor.description]
+            return [dict(zip(names, values, strict=True)) for values in cursor]
+
+    def read_to(self, machine):
+        """Where each of ``machine``'s files was read to, as {file: offset}: those read
+        to their end whose session is recorded."""
+        with self.db() as db:
+            return dict(
+                db.execute(
+                    "SELECT file, offset FROM transcripts"
+                    " WHERE machine=? AND ready=1 AND session IS NOT NULL",
+                    (machine,),
+                )
+            )
+
     def save(self, transcript, generation, *, restarted, added, changed, place, ready=None):
         """Store one read's progress in a single transaction; returns the next generation.
 
-        ``restarted`` drops what was kept first (the file was replaced or truncated);
-        ``added`` and ``changed`` are (index, entry JSON, search text) triples; ``place``
-        is the parser's position (inode, offset, skipping, saved, first, state); entries
-        before ``first`` go. ``ready`` marks a read that reached the end of the file.
-        Refused, with nothing written, unless the row is still at ``generation``: another
-        reader saved it since this one began.
+        ``restarted`` starts again from the file's start (it was replaced or truncated, or
+        the parser changed); ``added`` and ``changed`` are (index, entry JSON, search
+        text) triples; ``place`` is the parser's position (inode, offset, skipping, saved,
+        first, state); entries before ``first`` go. ``ready`` marks a read that reached
+        the end of the file. Refused, with nothing written, unless the row is still at
+        ``generation``: another reader saved it since this one began.
+
+        What a read that reached the file's end had kept is not dropped by a restart but
+        set aside, under the row's negated ID, until the new read reaches the end too:
+        should the file go before that, the transcript set aside is the record
+        (``whole``).
         """
         inode, offset, skipping, saved, first, state = place
         with self.write() as db:
-            if (
-                db.execute(
-                    "SELECT 1 FROM transcripts WHERE id=? AND generation=?",
-                    (transcript, generation),
-                ).fetchone()
-                is None
-            ):
+            was = db.execute(
+                "SELECT ready FROM transcripts WHERE id=? AND generation=?",
+                (transcript, generation),
+            ).fetchone()
+            if was is None:
                 raise Conflict("The transcript was read elsewhere meanwhile; refresh")
             if restarted:
-                db.execute("DELETE FROM entries WHERE transcript=?", (transcript,))
+                aside = db.execute(
+                    "SELECT 1 FROM entries WHERE transcript=? LIMIT 1", (-transcript,)
+                ).fetchone()
+                if was[0] and not aside:
+                    db.execute(
+                        "UPDATE entries SET transcript=? WHERE transcript=?",
+                        (-transcript, transcript),
+                    )
+                else:
+                    db.execute("DELETE FROM entries WHERE transcript=?", (transcript,))
             db.execute("DELETE FROM entries WHERE transcript=? AND idx<?", (transcript, first))
             db.executemany(
                 "INSERT OR REPLACE INTO entries (transcript, idx, data, body) VALUES (?, ?, ?, ?)",
@@ -266,13 +375,29 @@ class Store:
                 " generation=generation+1 WHERE id=?",
                 (inode, offset, int(skipping), saved, first, state, ready, ready, transcript),
             )
+            if ready:
+                db.execute("DELETE FROM entries WHERE transcript=?", (-transcript,))
         return generation + 1
 
-    def index(self, transcript, batch=INDEX_BATCH):
-        """Index ``transcript``'s unindexed entries, ``batch`` per transaction."""
+    def whole(self, row):
+        """The last whole read of ``row``'s transcript, as (entries ID, first, total):
+        its own entries, or those set aside while a read from the file's start has not
+        reached its end."""
+        if not row["ready"]:
+            with self.db() as db:
+                first, last = db.execute(
+                    "SELECT min(idx), max(idx) FROM entries WHERE transcript=?", (-row["id"],)
+                ).fetchone()
+            if first is not None:
+                return -row["id"], first, last + 1
+        return row["id"], row["first"], row["saved"]
+
+    def index(self, transcript, batch=INDEX_BATCH, stop=None):
+        """Index ``transcript``'s unindexed entries, ``batch`` per transaction, until
+        monotonic ``stop`` if one is given."""
         if not self.searchable:
             return
-        while True:
+        while stop is None or time.monotonic() < stop:
             with self.write() as db:
                 done = db.execute(
                     "UPDATE entries SET indexed = 1 WHERE rowid IN (SELECT rowid FROM entries"
@@ -329,18 +454,20 @@ class Store:
                 )
             ]
 
-    def search(self, ranked, expression, limit):
+    def search(self, ranked, expression, limit, stop=None):
         """Entries of the ``ranked`` transcripts (ids, best first) matching ``expression``.
 
         Returns (matches, counts): at most ``limit`` (transcript, index, entry, snippet)
         tuples, newest first within each transcript, and every match's count per id.
+        Entries not indexed yet are indexed first, until monotonic ``stop`` if one is
+        given: ``unindexed`` then names the transcripts searched only in part.
         """
         if not self.searchable:
             raise ValueError("Search needs SQLite with FTS5 and its trigram tokenizer")
         if not ranked:
             return [], {}
         for id_ in ranked:
-            self.index(id_)
+            self.index(id_, stop=stop)
         listed = ",".join("(?, ?)" for _ in ranked)
         order = [value for rank, id_ in enumerate(ranked) for value in (id_, rank)]
         with self.db() as db:
@@ -368,6 +495,117 @@ class Store:
                 raise ValueError(f"Could not search for that: {exc}") from exc
         return [(t, idx, json.loads(data), snip) for t, idx, data, snip in rows], counts
 
+    def unindexed(self, transcripts):
+        """Those of ``transcripts`` (ids) with entries a search does not find yet."""
+        if not transcripts:
+            return set()
+        with self.db() as db:
+            return {
+                id_
+                for (id_,) in db.execute(
+                    "SELECT DISTINCT transcript FROM entries WHERE indexed = 0 AND transcript IN"
+                    f" ({', '.join('?' for _ in transcripts)})",
+                    list(transcripts),
+                )
+            }
+
+    # Session files ---------------------------------------------------------------
+
+    def kept_files(self, machine):
+        """How much of each of ``machine``'s session files is kept, and of which file, as
+        {file: (transcript, inode, bytes)}."""
+        with self.db() as db:
+            return {
+                file: found
+                for file, *found in db.execute(
+                    "SELECT file, id, raw_inode, raw_size FROM transcripts WHERE machine=?",
+                    (machine,),
+                )
+            }
+
+    def keep(self, transcript, inode, offset, chunks):
+        """Keep ``chunks``, the bytes of ``transcript``'s session file from ``offset`` on.
+
+        ``offset`` is where the copy kept so far ends, or 0 to make it again, as when
+        another file (by its ``inode``) took the place of the one kept. It is all
+        written at once, so the copy is whole at any time. Refused, with nothing
+        written, when the copy does not end at ``offset``.
+        """
+        with self.db() as db:
+            kept = db.execute(
+                "SELECT raw_inode, raw_size FROM transcripts WHERE id=?", (transcript,)
+            ).fetchone()
+            if kept is None or (offset and (kept[0] != inode or kept[1] != offset)):
+                raise Conflict("The session file was kept elsewhere meanwhile")
+            # The last piece is filled up first, so every piece but the last is whole.
+            piece, held = divmod(offset, PIECE)
+            unfilled = bytearray()
+            if held:
+                last = db.execute(
+                    "SELECT data FROM raw WHERE transcript=? AND piece=?", (transcript, piece)
+                ).fetchone()
+                if last is None:
+                    raise Conflict("The copy kept of the session file is not whole")
+                unfilled += lzma.decompress(last[0])
+        # Compressed before the write, which others wait behind.
+        size = offset - held
+        pieces = []
+        for chunk in chunks:
+            unfilled += chunk
+            while len(unfilled) >= PIECE:
+                pieces.append((piece, lzma.compress(bytes(unfilled[:PIECE]), preset=PRESET)))
+                piece += 1
+                size += PIECE
+                del unfilled[:PIECE]
+        if unfilled:
+            pieces.append((piece, lzma.compress(bytes(unfilled), preset=PRESET)))
+            size += len(unfilled)
+        with self.write() as db:
+            if not offset:
+                db.execute("DELETE FROM raw WHERE transcript=?", (transcript,))
+            db.executemany(
+                "INSERT OR REPLACE INTO raw (transcript, piece, data) VALUES (?, ?, ?)",
+                [(transcript, *found) for found in pieces],
+            )
+            moved = db.execute(
+                "UPDATE transcripts SET raw_inode=?, raw_size=?"
+                " WHERE id=? AND (?=0 OR (raw_inode IS ? AND raw_size=?))",
+                (inode, size, transcript, offset, inode, offset),
+            ).rowcount
+            if not moved:
+                raise Conflict("The session file was kept elsewhere meanwhile")
+
+    def kept(self, transcript):
+        """``transcript``'s session file as it was kept, a piece of its bytes at a time."""
+        piece = 0
+        while True:
+            with self.db() as db:
+                found = db.execute(
+                    "SELECT data FROM raw WHERE transcript=? AND piece=?", (transcript, piece)
+                ).fetchone()
+            if found is None:
+                return
+            yield lzma.decompress(found[0])
+            piece += 1
+
+    def restored(self, transcript, inode, size):
+        """``transcript``'s file was written back from its copy as the file ``inode``,
+        the first ``size`` bytes of the copy.
+
+        The copy is of that file now, if all of it was written. The transcript is read
+        on in that file from its place, if it was read from the file the copy was made
+        of and no further than was written. Any other copy or transcript starts again
+        from the file's start: it names no file, as an inode can be given out again.
+        """
+        with self.write() as db:
+            db.execute(
+                "UPDATE transcripts SET"
+                " inode=CASE WHEN inode IS raw_inode AND offset<=? THEN ? ELSE NULL END,"
+                " raw_inode=CASE WHEN raw_size=? THEN ? ELSE NULL END,"
+                " generation=generation+1 WHERE id=?",
+                (size, inode, size, inode, transcript),
+            )
+
     # Session details -------------------------------------------------------------
 
     def details(self, file, version):
@@ -393,38 +631,33 @@ class Store:
         return (time.time() if now is None else now) - self.pruned >= PRUNE_EVERY
 
     def prune(self, now=None, exists=os.path.exists):
-        """Drop rows of this machine's files that are gone, rows not read for KEEP_DAYS,
-        and the least recently read past the caps. At most once per PRUNE_EVERY."""
+        """Drop the details of files that are gone, and the oldest past the cap; at most
+        once per PRUNE_EVERY. Transcripts stay: one whose file is gone is the record."""
         now = time.time() if now is None else now
         with self.lock:
             if not self.prune_due(now):
                 return
             self.pruned = now
         with self.db() as db:
-            kept = db.execute("SELECT id, machine, file, seen FROM transcripts").fetchall()
             files = [file for (file,) in db.execute("SELECT file FROM details")]
-        gone = [
-            id_
-            for id_, machine, file, seen in kept
-            if seen < now - KEEP_DAYS * 86400 or (machine == "" and not exists(file))
-        ]
         stale = [file for file in files if not exists(file)]
         with self.write() as db:
-            for id_ in gone:
-                db.execute("DELETE FROM entries WHERE transcript=?", (id_,))
-                db.execute("DELETE FROM transcripts WHERE id=?", (id_,))
             db.executemany("DELETE FROM details WHERE file=?", [(f,) for f in stale])
-            for (id_,) in db.execute(
-                "SELECT id FROM transcripts ORDER BY seen DESC LIMIT -1 OFFSET ?",
-                (MAX_TRANSCRIPTS,),
-            ).fetchall():
-                db.execute("DELETE FROM entries WHERE transcript=?", (id_,))
-                db.execute("DELETE FROM transcripts WHERE id=?", (id_,))
             db.execute(
                 "DELETE FROM details WHERE rowid IN"
                 " (SELECT rowid FROM details ORDER BY rowid DESC LIMIT -1 OFFSET ?)",
                 (MAX_DETAILS,),
             )
+
+
+def move_store(source, target):
+    """Rename a store that exists, with its write-ahead log beside it: the store itself
+    last, as it is what another process looks for."""
+    if not source.exists():
+        return
+    for suffix in ("-wal", "-shm", ""):
+        with contextlib.suppress(FileNotFoundError):
+            os.rename(f"{source}{suffix}", f"{target}{suffix}")
 
 
 def snippet_parts(text):

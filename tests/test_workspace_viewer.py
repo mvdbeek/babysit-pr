@@ -1,9 +1,12 @@
 """Diff and transcript views over temporary repositories and session stores."""
 
 import json
+import shutil
+import sqlite3
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import remote_probe
@@ -887,6 +890,10 @@ def prompt_line(text):
     return (json.dumps({"type": "user", "message": {"content": text}}) + "\n").encode()
 
 
+# A listing entry for a transcript the test feeds through its own ``read``.
+LISTED = {"id": SID, "agent": "claude", "title": None, "updated": 0, "size": 0, "_file": "f"}
+
+
 def test_a_long_transcript_keeps_its_newest_entries_and_whole_transcript_indices(monkeypatch):
     monkeypatch.setattr(wv, "MAX_ENTRIES", 10)
     tool = {"type": "tool_use", "id": "old", "name": "Bash", "input": {"command": "ls"}}
@@ -905,7 +912,7 @@ def test_a_long_transcript_keeps_its_newest_entries_and_whole_transcript_indices
 
     def page(**args):
         return wv.transcript_page(
-            [{"id": SID, "agent": "claude", "_file": "f"}],
+            [LISTED],
             lambda file: ("w", file),
             read,
             SID,
@@ -970,7 +977,7 @@ def test_a_line_too_long_to_parse_is_skipped_once(tmp_path, monkeypatch):
 
 
 def test_a_busy_transcript_answers_from_its_last_complete_read(monkeypatch):
-    listed = [{"id": SID, "agent": "claude", "_file": "f"}]
+    listed = [LISTED]
     reads = []
 
     def read(parser, file, save):
@@ -995,7 +1002,7 @@ def test_a_busy_transcript_answers_from_its_last_complete_read(monkeypatch):
 
 
 def test_a_transcript_saved_by_another_reader_meanwhile_is_not_overwritten(monkeypatch):
-    listed = [{"id": SID, "agent": "claude", "_file": "f"}]
+    listed = [LISTED]
 
     def read(parser, file, save):
         parser.consume(prompt_line("mine"))
@@ -1076,3 +1083,387 @@ def test_search_reads_unopened_sessions_within_its_budget_and_says_what_it_skipp
         value = wv.search(checkout, "Done")
     assert (value["total"], value["searched"], value["behind"]) == (1, 1, 1)
     assert wv.search(checkout, "Done")["behind"] == 0
+
+
+# Kept once the file is gone ----------------------------------------------------------
+
+
+def texts(value):
+    return [entry.get("text") or entry.get("name") for entry in value["entries"]]
+
+
+def test_a_session_whose_file_is_gone_is_still_listed_shown_and_searched(stores, tmp_path):
+    checkout, folder, _ = stores
+    opened = wv.transcript(checkout, SID)
+    assert "archived" not in opened["session"]
+    # Claude deletes a session file a month after it last changed.
+    (folder / f"{SID}.jsonl").unlink()
+    assert [s["id"] for s in wv.sessions(checkout)] == [CODEX_SID]
+    value = wv.transcript(checkout, SID)
+    assert value["session"] == {**opened["session"], "archived": True}
+    assert texts(value) == texts(opened) == ["Fix the crash", "Looking.", "Bash", "Done."]
+    assert {s["id"]: s.get("archived") for s in value["sessions"]} == {SID: True, CODEX_SID: None}
+    assert all("_file" not in s and "_cwd" not in s for s in value["sessions"])
+    assert wv.transcript(checkout, SID, before=2)["entries"] == opened["entries"][:2]
+    # The one never opened was not kept, and is gone with its file.
+    (tmp_path / "codex").rename(tmp_path / "codex-gone")
+    assert [s["id"] for s in wv.transcript(checkout)["sessions"]] == [SID]
+    found = wv.search(checkout, "a.py")
+    assert (found["total"], found["searched"], found["behind"]) == (1, 1, 0)
+    assert found["results"][0]["session"] == SID
+    # Its worktree removed as well, the checkout's path still finds it; another's does not.
+    shutil.rmtree(checkout)
+    assert texts(wv.transcript(checkout)) == texts(opened)
+    assert wv.transcript(checkout.with_name("repo"))["sessions"] == []
+    with pytest.raises(ValueError, match="not recorded"):
+        wv.transcript(checkout.with_name("repo"), SID)
+
+
+def test_a_kept_transcript_outlives_a_parser_change_once_its_file_is_gone(stores, monkeypatch):
+    checkout, folder, _ = stores
+    opened = wv.transcript(checkout, SID)
+
+    def as_another_parser_left_it():
+        with sqlite3.connect(wv.store().path) as db:
+            db.execute("UPDATE entries SET data = replace(data, 'Done.', 'Old.')")
+        monkeypatch.setattr(wv, "PARSER", wv.PARSER + 1)
+
+    # While the file is there it is parsed again, from its start.
+    as_another_parser_left_it()
+    assert texts(wv.transcript(checkout, SID)) == texts(opened)
+    (folder / f"{SID}.jsonl").unlink()
+    as_another_parser_left_it()
+    assert texts(wv.transcript(checkout, SID)) == [*texts(opened)[:-1], "Old."]
+
+
+def test_a_reread_cut_short_leaves_the_whole_transcript_as_the_record(stores, monkeypatch):
+    checkout, folder, _ = stores
+    file = folder / f"{SID}.jsonl"
+    opened = wv.transcript(checkout, SID)
+    assert len(opened["entries"]) == 4
+    # The parser changed, and the read from the start fails after its first lines.
+    monkeypatch.setattr(wv, "PARSER", wv.PARSER + 1)
+    lines = file.read_bytes().split(b"\n")
+
+    def cut_short(parser, path, save):
+        parser.position(file.stat().st_ino, file.stat().st_size)
+        parser.absorb(b"\n".join(lines[:2]) + b"\n")
+        save()
+        raise OSError("The worker went away")
+
+    monkeypatch.setattr(wv, "local_read", cut_short)
+    with pytest.raises(OSError):
+        wv.transcript(checkout, SID)
+    assert wv.store().row("", str(file))["saved"] == 1
+    # Then the file is gone: what the last whole read kept is shown and searched.
+    file.unlink()
+    value = wv.transcript(checkout, SID)
+    assert value["session"]["archived"] and value["entries"] == opened["entries"]
+    assert (value["start"], value["first"], value["total"]) == (0, 0, 4)
+    assert wv.transcript(checkout, SID, before=2)["entries"] == opened["entries"][:2]
+    [hit] = wv.search(checkout, "Done")["results"]
+    assert (hit["session"], hit["index"]) == (SID, 3)
+
+
+def test_the_archive_keeps_sessions_nobody_opened_and_reads_only_what_grew(
+    stores, monkeypatch, tmp_path
+):
+    checkout, folder, day = stores
+    # Every Claude account's store is swept: none but the test's own may be found.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # A file that ends in an unfinished line is read again for its end; these do not.
+    for file in (*folder.parent.glob("*/*.jsonl"), *day.glob("*.jsonl")):
+        file.write_text(file.read_text().removesuffix('{"partial'))
+    read = []
+    real = wv.local_read
+    monkeypatch.setattr(
+        wv, "local_read", lambda parser, file, save: read.append(file) or real(parser, file, save)
+    )
+    # Every session of this machine's stores, the other checkouts' too.
+    assert wv.archive_local() == 4 and len(read) == 4
+    assert wv.archive_local() == 0 and len(read) == 4
+    with (folder / f"{SID}.jsonl").open("a") as stream:
+        stream.write(json.dumps({"type": "user", "message": {"content": "And now?"}}) + "\n")
+    assert wv.archive_local() == 1 and read[4:] == [str(folder / f"{SID}.jsonl")]
+    # Kept unindexed, until a search needs them.
+    with sqlite3.connect(wv.store().path) as db:
+        assert db.execute("SELECT count(*) FROM entries WHERE indexed").fetchone() == (0,)
+    shutil.rmtree(folder)
+    shutil.rmtree(day)
+    value = wv.transcript(checkout)
+    assert [(s["id"], s["archived"], s["title"]) for s in value["sessions"]] == [
+        (SID, True, "Fix the crash"),
+        (CODEX_SID, True, "Add a button"),
+    ]
+    assert texts(value) == ["Fix the crash", "Looking.", "Bash", "Done.", "And now?"]
+    assert texts(wv.transcript(checkout, CODEX_SID)) == ["Add a button", "On it.", "exec"]
+    assert wv.search(checkout, "button")["results"][0]["session"] == CODEX_SID
+    assert wv.transcript(checkout / "lib")["sessions"][0]["id"] == CODEX_SID
+
+
+def test_an_archived_session_s_file_is_written_back_as_it_was_kept(stores, monkeypatch, tmp_path):
+    checkout, folder, day = stores
+    monkeypatch.setenv("HOME", str(tmp_path))
+    file, rollout = folder / f"{SID}.jsonl", day / f"rollout-a-{CODEX_SID}.jsonl"
+    whole = file.read_bytes().removesuffix(b'{"partial')
+    codex = rollout.read_bytes().removesuffix(b'{"partial')
+    rollout.write_bytes(codex)
+    opened = wv.transcript(checkout, SID)
+    # A session only opened here has a transcript, but no copy of its file yet.
+    assert wv.store().row("", str(file))["raw_size"] == 0
+    wv.archive_local()
+    assert wv.store().row("", str(file))["raw_size"] == len(whole) + len('{"partial')
+    assert all("restorable" not in s for s in wv.resumable(checkout))
+    file.unlink()
+    shutil.rmtree(day.parents[1])
+    listed = {s["id"]: s for s in wv.resumable(checkout)}
+    assert {(s["archived"], s["restorable"]) for s in listed.values()} == {(True, True)}
+    assert wv.transcript(checkout, SID)["session"]["restorable"] is True
+    # Written back up to its last whole line, as a file of its owner's alone.
+    assert wv.restore(listed[SID]) == file and file.read_bytes() == whole
+    assert file.stat().st_mode & 0o777 == 0o600
+    assert [p.name for p in folder.iterdir()] == [file.name]
+    assert wv.restore(listed[CODEX_SID]) == rollout and rollout.read_bytes() == codex
+    # Sessions again as any other, and nothing of them is parsed a second time.
+    read = []
+    with monkeypatch.context() as patch:
+        patch.setattr(wv.Transcript, "feed", lambda self, item: read.append(item))
+        assert [s.get("archived") for s in wv.sessions(checkout)] == [None, None]
+        value = wv.transcript(checkout, SID)
+        assert texts(value) == texts(opened) and "archived" not in value["session"]
+        wv.archive_local()
+    assert read == []
+    # Resumed, it grows: kept on, and written back with what it gained.
+    with file.open("a") as stream:
+        stream.write(json.dumps({"type": "user", "message": {"content": "And now?"}}) + "\n")
+    grown = file.read_bytes()
+    wv.archive_local()
+    file.unlink()
+    (again,) = [s for s in wv.resumable(checkout) if s["id"] == SID]
+    wv.restore(again)
+    assert file.read_bytes() == grown
+    assert texts(wv.transcript(checkout, SID))[-1] == "And now?"
+    # One written back without its unfinished last line is kept again from its start,
+    # never on from where the copy with that line ended.
+    with file.open("a") as stream:
+        stream.write('{"partial')
+    wv.archive_local()
+    file.unlink()
+    wv.restore(again)
+    assert file.read_bytes() == grown
+    row = wv.store().row("", str(file))
+    # Also when the file then grows to just the length of that copy.
+    with file.open("a") as stream:
+        stream.write('{"a": 1}\n')
+    assert file.stat().st_size == row["raw_size"]
+    wv.archive_local()
+    assert b"".join(wv.store().kept(row["id"])) == file.read_bytes()
+    with file.open("a") as stream:
+        stream.write(json.dumps({"type": "user", "message": {"content": "Once more"}}) + "\n")
+    grown = file.read_bytes()
+    wv.archive_local()
+    row = wv.store().row("", str(file))
+    assert b"".join(wv.store().kept(row["id"])) == grown
+    assert texts(wv.transcript(checkout, SID))[-2:] == ["And now?", "Once more"]
+    # Never over a file that is there.
+    file.write_bytes(b"its own\n")
+    assert wv.restore(again) == file and file.read_bytes() == b"its own\n"
+    # A copy that cannot be kept on (a piece of it is damaged) is made again.
+    file.unlink()
+    wv.restore(again)
+    row = wv.store().row("", str(file))
+    assert wv.store().kept_files("")[str(file)] == [row["id"], file.stat().st_ino, len(grown)]
+    with sqlite3.connect(wv.store().path) as db:
+        db.execute("UPDATE raw SET data=x'00' WHERE transcript=?", (row["id"],))
+    with file.open("a") as stream:
+        stream.write(json.dumps({"type": "user", "message": {"content": "Still?"}}) + "\n")
+    wv.archive_local()
+    assert b"".join(wv.store().kept(row["id"])) == file.read_bytes()
+    with sqlite3.connect(wv.store().path) as db:
+        db.execute("DELETE FROM raw WHERE transcript=?", (row["id"],))
+    with file.open("a") as stream:
+        stream.write(json.dumps({"type": "user", "message": {"content": "And yet?"}}) + "\n")
+    wv.archive_local()
+    assert b"".join(wv.store().kept(row["id"])) == file.read_bytes()
+
+
+def test_a_copy_that_is_behind_its_file_is_not_offered_to_resume_from(
+    stores, monkeypatch, tmp_path
+):
+    checkout, folder, _ = stores
+    monkeypatch.setenv("HOME", str(tmp_path))
+    file = folder / f"{SID}.jsonl"
+    file.write_bytes(file.read_bytes().removesuffix(b'{"partial'))
+    wv.archive_local()
+    kept = file.stat().st_size
+    # Grown past what is kept as it is: its transcript is read on, its copy is not.
+    monkeypatch.setattr(wv, "RAW_MAX", kept)
+    with file.open("a") as stream:
+        stream.write(json.dumps({"type": "user", "message": {"content": "And now?"}}) + "\n")
+    wv.archive_local()
+    row = wv.store().row("", str(file))
+    assert (row["raw_size"], row["size"]) == (kept, file.stat().st_size)
+    file.unlink()
+    value = wv.transcript(checkout, SID)
+    assert texts(value)[-1] == "And now?" and value["session"]["archived"]
+    assert "restorable" not in value["session"]
+    assert SID not in [s["id"] for s in wv.resumable(checkout)]
+    # Nor one whose agent's store is no longer one of this machine's.
+    monkeypatch.setattr(wv, "RAW_MAX", 1 << 30)
+    with sqlite3.connect(wv.store().path) as db:
+        db.execute("UPDATE transcripts SET size=raw_size WHERE id=?", (row["id"],))
+    assert SID in [s["id"] for s in wv.resumable(checkout)]
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "another"))
+    assert SID not in [s["id"] for s in wv.resumable(checkout)]
+
+
+def test_a_session_is_written_back_only_from_a_whole_copy_into_an_agent_s_store(
+    stores, monkeypatch, tmp_path
+):
+    checkout, folder, _ = stores
+    monkeypatch.setenv("HOME", str(tmp_path))
+    file = folder / f"{SID}.jsonl"
+    wv.transcript(checkout, SID)
+    session = next(s for s in wv.sessions(checkout) if s["id"] == SID)
+    file.unlink()
+    # Opened, never swept: its transcript shows, but there is no file to resume it from.
+    assert [s["id"] for s in wv.resumable(checkout)] == [CODEX_SID]
+    assert "restorable" not in wv.transcript(checkout, SID)["session"]
+    with pytest.raises(ValueError, match="No copy of that session's file was kept"):
+        wv.restore(session)
+    row = wv.store().row("", str(file))
+    wv.store().keep(row["id"], 1, 0, [b"no line end"])
+    with pytest.raises(ValueError, match="is not whole"):
+        wv.restore(session)
+    wv.store().keep(row["id"], 1, 0, [b'{"type": "user"}\n'])
+    with sqlite3.connect(wv.store().path) as db:
+        db.execute("UPDATE raw SET data=x'00' WHERE transcript=?", (row["id"],))
+    with pytest.raises(ValueError, match="cannot be read"):
+        wv.restore(session)
+    assert not file.exists() and list(folder.iterdir()) == []
+    # A row naming a file outside the agents' stores writes nothing anywhere.
+    for agent, path in [
+        ("claude", tmp_path / "elsewhere" / "x" / f"{SID}.jsonl"),
+        ("claude", folder.parent / ".." / f"{SID}.jsonl"),
+        ("claude", folder / "notes.txt"),
+        ("codex", tmp_path / "codex" / "sessions" / f"rollout-{SID}.jsonl"),
+        ("codex", folder / f"{SID}.jsonl"),
+    ]:
+        kept = wv.store().open("", str(path), agent, wv.PARSER)
+        wv.store().keep(kept["id"], 1, 0, [b'{"type": "user"}\n'])
+        with pytest.raises(ValueError, match="session store that session was in is gone"):
+            wv.restore({"agent": agent, "_file": str(path)})
+        assert not path.exists()
+
+
+def test_the_archive_passes_over_a_session_it_cannot_read_but_not_a_silent_worker(monkeypatch):
+    def session(name, size=5):
+        return {
+            "id": f"session-{name}",
+            "agent": "claude",
+            "title": None,
+            "updated": 1.0,
+            "size": size,
+            "_file": f"/s/{name}.jsonl",
+            "_cwd": "/wt/repo",
+        }
+
+    def read(parser, file, save):
+        if "broken" in file:
+            raise ValueError("The transcript changed while it was read; refresh")
+        if "silent" in file:
+            raise remote_probe.Unreachable("Mac mini did not answer within 60 seconds")
+        parser.reset(1)
+        parser.absorb(prompt_line(file))
+        parser.offset = 5  # As far as the listing says the file goes.
+        return True
+
+    listed = [session("one"), session("broken"), session("two")]
+    assert wv.archive(listed, "mini", read) == 2
+    assert [s["id"] for s in wv.with_kept([], "mini", "/wt/repo")] == ["session-one", "session-two"]
+    # Read to their end, they are passed over until they grow.
+    assert wv.archive(listed, "mini", read) == 0
+    assert wv.archive([session("one", size=9), session("two")], "mini", read) == 1
+    with pytest.raises(remote_probe.Unreachable):
+        wv.archive([session("silent"), session("three")], "mini", read)
+    assert len(wv.with_kept([], "mini", "/wt/repo")) == 2
+
+
+def test_a_search_names_the_sessions_it_had_no_time_to_index(stores, monkeypatch, tmp_path):
+    checkout, _, _ = stores
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert wv.archive_local() == 4
+    # The archive leaves its entries unindexed: a search with no time left finds none.
+    monkeypatch.setattr(wv, "SEARCH_BUDGET", 0)
+    nothing = wv.search(checkout, "Done")
+    assert (nothing["total"], nothing["searched"], nothing["behind"]) == (0, 2, 2)
+    monkeypatch.setattr(wv, "SEARCH_BUDGET", 20)
+    found = wv.search(checkout, "Done")
+    assert (found["total"], found["searched"], found["behind"]) == (1, 2, 0)
+
+
+def test_a_transcript_lists_a_bounded_number_of_kept_sessions_newest_first(stores, monkeypatch):
+    checkout, folder, _ = stores
+    kept = wv.store()
+
+    def keep(file, session, updated, text):
+        row = kept.open("", file, "claude", wv.PARSER)
+        kept.describe(row, session, str(checkout), None, updated, 1)
+        entry = {"role": "user", "kind": "prompt", "text": text, "time": None}
+        kept.save(
+            row["id"],
+            row["generation"],
+            restarted=False,
+            added=[(0, json.dumps(entry), text)],
+            changed=[],
+            place=(1, 1, False, 1, 0, "{}"),
+            ready=True,
+        )
+
+    for number in range(6):
+        keep(f"/gone/{number}.jsonl", f"gone-session-{number}", float(number), f"Prompt {number}")
+    monkeypatch.setattr(wv, "KEPT_SESSIONS", 5)
+    listed = wv.transcript(checkout)["sessions"]
+    # The two with files, which are newest, then the newest three of the six kept.
+    assert [s["id"] for s in listed[2:]] == [f"gone-session-{n}" for n in (5, 4, 3)]
+    assert {s["id"] for s in listed[:2]} == {SID, CODEX_SID}
+    assert texts(wv.transcript(checkout, "gone-session-4")) == ["Prompt 4"]
+    # One kept under another file is the same session: listed once, from its file.
+    keep("/moved/elsewhere.jsonl", SID, time.time() + 60, "Its older copy")
+    again = wv.transcript(checkout, SID)
+    assert [s["id"] for s in again["sessions"]].count(SID) == 1
+    assert texts(again)[0] == "Fix the crash" and "archived" not in again["session"]
+
+
+def test_the_archiver_sweeps_this_machine_then_each_workers_checkouts(monkeypatch, tmp_path):
+    calls = []
+    mini, box = SimpleNamespace(id="mini"), SimpleNamespace(id="box")
+
+    def remote(home, machine, path, stop):
+        calls.append((machine.id, path))
+        if machine.id == "box":
+            raise remote_probe.Unreachable("Box could not be reached")
+        if path == "/b":
+            raise ValueError("Not at the top of a Git checkout")
+
+    monkeypatch.setattr(wv, "archive_local", lambda stop: calls.append("local"))
+    monkeypatch.setattr(wv, "archive_remote", remote)
+    monkeypatch.setattr(wv, "ARCHIVE_FAILURES", 2)
+    checkouts = [(box, "/a"), (mini, "/b"), (box, "/c"), (box, "/d"), (mini, "/e")]
+    archiver = wv.Archiver(tmp_path, lambda: checkouts)
+    archiver.sweep()
+    # A worker that keeps giving no answer is left for the next sweep; one that only
+    # lost a checkout is asked for its others.
+    assert calls == ["local", ("box", "/a"), ("mini", "/b"), ("box", "/c"), ("mini", "/e")]
+    # Started, it sweeps after its first wait and stops when closed.
+    monkeypatch.setattr(wv, "ARCHIVE_FIRST", 0)
+    monkeypatch.setattr(wv, "ARCHIVE_EVERY", 60)
+    del calls[:]
+    archiver.start()
+    for _ in range(200):
+        if len(calls) == 5:
+            break
+        time.sleep(0.01)
+    archiver.close()
+    archiver.worker.join(5)
+    assert len(calls) == 5 and not archiver.worker.is_alive()

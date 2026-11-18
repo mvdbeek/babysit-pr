@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 import re
 import threading
 import time
@@ -861,7 +862,7 @@ def test_searching_sessions_opens_the_entry_found_and_reads_on_from_there(
     expect(later).to_be_hidden()
     expect(dialog.locator(".ws-msg").last).to_contain_text("Step 259")
     # The transcript is parsed into the dashboard's store, and searched from it.
-    assert (tmp_path / "transcripts.sqlite").exists()
+    assert (tmp_path / "transcript-archive.sqlite").exists()
     search = dialog.get_by_role("searchbox", name="Search this checkout's transcripts")
     search.fill("no such words")
     search.press("Enter")
@@ -869,6 +870,65 @@ def test_searching_sessions_opens_the_entry_found_and_reads_on_from_there(
     dialog.get_by_role("button", name="Back to the transcript").click()
     expect(meta).to_contain_text("261 entries")
     expect(dialog.locator(".ws-msg").last).to_contain_text("Step 259")
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_a_session_whose_file_was_deleted_is_still_read_and_searched_as_archived(
+    page, site, tmp_path, monkeypatch, width
+):
+    url, plugin, _ = site
+    checkout = tmp_path / "wt" / "kept"
+    checkout.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    folder = tmp_path / "claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(checkout))
+    folder.mkdir(parents=True)
+
+    def session(sid, prompt, reply):
+        records = [
+            {"type": "user", "cwd": str(checkout), "message": {"content": prompt}},
+            {
+                "type": "assistant",
+                "cwd": str(checkout),
+                "message": {"content": [{"type": "text", "text": reply}]},
+            },
+        ]
+        file = folder / f"{sid}.jsonl"
+        file.write_text("".join(json.dumps(record) + "\n" for record in records))
+        return file
+
+    old = session("8f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10", "Fix the old crash", "It was a typo.")
+    os.utime(old, (1_700_000_000, 1_700_000_000))
+    session("9f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10", "Add a new button", "Added.")
+    plugin.value["workspaces"] = [row("kept", key=str(checkout), path=str(checkout))]
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("kept", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    meta = page.locator("#ws-viewer-meta")
+    menu = dialog.get_by_role("combobox", name="Session")
+    expect(dialog.locator(".ws-msg").last).to_contain_text("Added.")
+    menu.select_option("8f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10")
+    expect(dialog.locator(".ws-msg").last).to_contain_text("It was a typo.")
+    expect(meta).not_to_contain_text("Archived")
+    # Claude deletes its file; the dashboard kept what it read of it.
+    old.unlink()
+    dialog.get_by_role("button", name="Refresh").click()
+    expect(meta).to_contain_text("Archived: shown as the dashboard kept it")
+    expect(dialog.locator(".ws-msg").last).to_contain_text("It was a typo.")
+    labels = menu.locator("option").all_text_contents()
+    assert ["archived" in label for label in labels] == [False, True]
+    assert labels[1].endswith("· Claude · archived · Fix the old crash")
+    search = dialog.get_by_role("searchbox", name="Search this checkout's transcripts")
+    search.fill("typo")
+    search.press("Enter")
+    expect(meta).to_have_text("1 match for “typo” in 2 sessions.")
+    dialog.locator(".ws-hit").click()
+    expect(dialog.locator(".ws-found")).to_contain_text("It was a typo.")
+    expect(meta).to_contain_text("Archived")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/workspaces-transcript-archived-{width}.png")
 
 
 def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
@@ -924,6 +984,100 @@ def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
     dialog.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator("#ws-message-status")).to_have_text("Sent to the agent in w4:p1.")
     assert sent[-1] == {"workspace": "w4", "pane": "w4:p1", "text": "And add a test"}
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_an_archived_session_is_resumed_with_its_file_written_back(page, site, width):
+    url, _, _ = site
+    key = "/src/worktrees/repo/open-work"
+    session = {
+        "id": "s1",
+        "agent": "claude",
+        "title": "Fix the crash",
+        "updated": 1,
+        "archived": True,
+    }
+    reopened = {"workspace": None}
+    sent = []
+
+    def agents(route):
+        live = reopened["workspace"]
+        route.fulfill(
+            json={
+                "agents": (
+                    [{"pane": f"{live}:p1", "agent": "claude", "status": "working"}] if live else []
+                ),
+                "sessions": [session],
+                "path": key,
+                "workspace": live,
+                "url": live and f"https://collie.example.ts.net/space/{live}",
+            }
+        )
+
+    def message(route):
+        sent.append(route.request.post_data_json)
+        reopened["workspace"] = "w4"
+        route.fulfill(json={"sent": True, "pane": "w4:p1", "resumed": "s1", "restored": True})
+
+    kept = {**session, "size": 1, "restorable": True}
+    page.route("**/api/workspace-agents?*", agents)
+    page.route("**/api/workspace-message", message)
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(json={**transcript(), "sessions": [kept], "session": kept}),
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text(
+        "Its file was kept too: resuming the session writes it back first."
+    )
+    expect(page.locator("#ws-message-agent label")).to_have_attribute(
+        "title",
+        "No agent is running; the message resumes this session. An archived one has its "
+        "session file written back first, from the copy the dashboard kept",
+    )
+    resume = dialog.locator("#ws-message-agent select")
+    expect(resume.locator("option")).to_have_text(
+        [re.compile(r"· Claude · archived · Fix the crash$")]
+    )
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.screenshot(path=f"reports/workspaces-archived-resume-{width}.png")
+    dialog.get_by_label("Message the agent").fill("Keep going")
+    dialog.get_by_role("button", name="Resume and send").click()
+    expect(page.locator("#ws-message-status")).to_have_text(
+        "Resumed the session in w4:p1 and sent the message. "
+        "Its session file was written back from the archive first."
+    )
+    assert sent == [{"key": key, "resume": "s1", "text": "Keep going"}]
+
+
+def test_an_archived_session_is_reopened_in_collie_with_its_file_written_back(page, site):
+    url, _, _ = site
+    session = {"id": "s1", "agent": "claude", "title": "Fix", "updated": 1, "archived": True}
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={"agents": [], "sessions": [session], "path": "/p", "workspace": None, "url": None}
+        ),
+    )
+    page.route(
+        "**/api/workspace-message",
+        lambda route: route.fulfill(
+            json={"sent": True, "pane": "w4:p1", "resumed": "s1", "restored": True}
+        ),
+    )
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("open-work", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    page.locator("#ws-viewer").get_by_role("button", name="Reopen in Collie").click()
+    expect(page.locator("#ws-message-status")).to_have_text(
+        "Resumed the session in w4:p1; continue in Collie. "
+        "Its session file was written back from the archive first."
+    )
 
 
 def test_one_override_covers_every_blocked_row_in_a_batch(page, site):

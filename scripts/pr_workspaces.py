@@ -3286,7 +3286,7 @@ class Workspaces:
             )
         self.viewed[key] = root
 
-    def recorded_checkout(self, workspace_id, machine=None):
+    def recorded_checkout(self, workspace_id, machine=None, *, removed=False):
         """Recover a closed workspace's checkout from its newest record: where the viewer
         read it, an operation's result, or an exit watch.
 
@@ -3295,6 +3295,9 @@ class Workspaces:
         newest counts. Here it must still be the top of a checkout, on the recorded
         repository and branch where those were recorded. A worker's records name it by
         its qualified ID, and the worker's probe checks the path when it reads it.
+
+        With ``removed``, the answer is instead the recorded path of a checkout that is
+        no longer there, for the transcripts kept of it; None while anything is at it.
         """
         key = machines.qualify(machine.id, workspace_id) if machine else workspace_id
         with self.db() as db:
@@ -3332,6 +3335,8 @@ class Workspaces:
             return None
         if machine is not None:
             return path
+        if removed:
+            return None if os.path.lexists(path) else path
         item = checkout(path)
         if not item or identity is not None and (item["common"], item["branch"]) != identity:
             return None
