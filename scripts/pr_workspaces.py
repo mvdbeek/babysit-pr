@@ -175,7 +175,10 @@ def run(*args, cwd=None, timeout=30, pass_fds=(), env=None, machine=None, home=N
 
 def herdr(*args, machine: machines.Machine | None = None, timeout=30):
     # herdr reaches a worker's server itself, so the command always runs here.
-    value = json.loads(run(*machines.herdr_argv(machine, *args), timeout=timeout))
+    output = run(*machines.herdr_argv(machine, *args), timeout=timeout)
+    if not output:
+        return None  # ``send-keys`` and ``send-text`` print nothing when they succeed.
+    value = json.loads(output)
     if value.get("error"):
         raise ValueError(str(value["error"]))
     return value["result"]
