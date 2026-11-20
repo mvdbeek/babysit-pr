@@ -132,7 +132,9 @@ elif a[:2] == ['pane','run']:
  if label: env['FAKE_MACHINE']=label  # The agent starts on that machine.
  subprocess.check_call(['/bin/zsh','-fc',a[3]],cwd=w['worktree']['checkout_path'],env=env)
  sys.exit(0)
-save(); print(json.dumps({'result':result}))
+save()
+# Like herdr's, keys and text typed print nothing when they succeed.
+if a[1:2] not in (['send-keys'],['send-text']): print(json.dumps({'result':result}))
 """
 
 # herdr-core: the API over ``hc connect`` (one JSON-RPC request on stdin), and the two CLI
