@@ -98,6 +98,7 @@ def test_a_watch_transcript_offers_to_cancel_it_and_reopen_the_session(page, own
     dialog = page.locator("#ws-viewer")
     notice = page.locator("#ws-agent-interaction")
     expect(notice).to_contain_text("This session belongs to babysit watch w-1 (blocked)")
+
     # Loading a transcript again must preserve the watched session's card and controls.
     # Add a visible entry so the assertion waits for the new page to be rendered.
     def refreshed(route):
