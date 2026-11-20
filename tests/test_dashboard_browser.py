@@ -4256,6 +4256,61 @@ def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
+def test_the_strip_names_the_agents_model_and_effort_and_changes_them(
+    page, dashboard_site, viewer_routes, workspace_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [viewer_routes["agents"][1]]
+    claude = viewer_routes["agents"][0]
+    claude.update(session="s1", status="working", model="opus", effort="")
+    changes = []
+
+    def change(route):
+        assert route.request.headers["x-babysit-action"] == "workspace-agent-settings"
+        changes.append(route.request.post_data_json)
+        claude.update(model="sonnet", effort="max")
+        route.fulfill(json={"changed": True, "pane": "w1:p2", "warning": None})
+
+    page.route("**/api/workspace-agent-settings", change)
+    efforts = ["low", "medium", "high", "xhigh", "max"]
+    workspace_routes[1]["agent_choices"] = {
+        "claude": {
+            "models": [{"id": "opus", "efforts": efforts}, {"id": "sonnet", "efforts": efforts}],
+            "efforts": efforts,
+        }
+    }
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-live")
+    strip = live.locator(".ws-live-state")
+    expect(strip.locator(".ws-live-settings")).to_have_text("opus · default effort")
+    strip.get_by_role("button", name="Change model or effort for Claude in w1:p2").click()
+    card = live.get_by_role("group", name="Change model or effort")
+    model = card.get_by_role("combobox", name="Model")
+    expect(model).to_have_value("opus")
+    expect(model).to_be_focused()
+    # A working agent is not cut short: its turn is stopped, or finishes, first.
+    expect(card).to_contain_text("It is working now")
+    expect(card.get_by_role("button", name="Restart with these")).to_be_disabled()
+    claude["status"] = "idle"
+    page.locator("#ws-viewer").get_by_role("button", name="Refresh").click()
+    expect(card).not_to_contain_text("It is working now")
+    model.select_option("sonnet")
+    card.get_by_role("combobox", name="Reasoning effort").select_option("max")
+    live.screenshot(path="reports/viewer-strip-settings-card.png")
+    card.get_by_role("button", name="Restart with these").click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "Resumed Claude in w1:p2 on sonnet with max effort."
+    )
+    expect(card).to_have_count(0)
+    expect(strip.locator(".ws-live-settings")).to_have_text("sonnet · max effort")
+    live.screenshot(path="reports/viewer-strip-settings.png")
+    assert changes == [
+        {"workspace": "w1", "pane": "w1:p2", "session": "s1", "model": "sonnet", "effort": "max"}
+    ]
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
 def test_a_refused_quit_says_why_and_a_vanished_agent_drops_the_question(
     page, dashboard_site, viewer_routes
 ):

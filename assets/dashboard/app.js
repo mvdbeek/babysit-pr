@@ -4029,6 +4029,11 @@ window.dashboardAgents = {
     if (!workspaceData.agent_choices) await loadWorkspaces();
     return agentFields(options);
   },
+  // The models and efforts New task offers for `agent` (claude or codex).
+  async choices(agent) {
+    if (!workspaceData.agent_choices) await loadWorkspaces();
+    return workspaceData.agent_choices?.[agent] ?? null;
+  },
   repositories: () => get("/api/workspace-repos?all=1"),
   searchable: searchableSelect,
   sync: syncSelect,

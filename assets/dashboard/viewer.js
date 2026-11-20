@@ -1490,6 +1490,9 @@
   let quitQuestion = null;
   // The move asked about ({id, pane, session, machine, plan, error, loading}), likewise.
   let moveQuestion = null;
+  // The model and effort change asked about ({id, pane, session, agent, model, effort,
+  // choices}), likewise.
+  let settingsQuestion = null;
   let changingDocker = false;
   let sending = false; // A send in flight keeps the button disabled through refreshes.
   // Cancelling the babysit watch that owns the picked session: the question asked
@@ -1555,6 +1558,7 @@
     hostLabel = null;
     quitQuestion = null;
     moveQuestion = null;
+    settingsQuestion = null;
     if (!messageable(entry)) {
       // A checkout without a herdr workspace or a row has no agent to talk to.
       draft = null;
@@ -2026,6 +2030,7 @@
     // Followed by its own polls (startMove), not liveAction.
     move: { busy: "Moving…" },
     handoff: { busy: "Changing…" },
+    settings: { busy: "Restarting…" },
   };
   // The action ({pane, action}) on its way, per viewed entry: stepping to another one
   // leaves its buttons and polls alone.
@@ -2035,6 +2040,15 @@
   }
   function agentTitle(agent) {
     return { claude: "Claude", codex: "Codex" }[agent.agent] || agent.agent || "Agent";
+  }
+  // "opus · high effort"; what its command line and transcript leave unsaid is the
+  // agent's own configured default.
+  function settingsLabel(agent) {
+    if (!["claude", "codex"].includes(agent.agent) || agent.model === undefined) return null;
+    const text = `${agent.model || "default model"} · ${agent.effort ? `${agent.effort} effort` : "default effort"}`;
+    const label = node("span", text, "ws-live-settings");
+    label.title = "The model and reasoning effort this agent runs with";
+    return label;
   }
   function activity(agent) {
     if (agent.status === "blocked" && agent.interaction?.idle) return ACTIVITY.idle;
@@ -2083,9 +2097,36 @@
         focus: true,
       };
       moveQuestion = null;
+      settingsQuestion = null;
       byId("ws-live-status").textContent = "";
       renderLive();
     };
+    if (agent.session && ["claude", "codex"].includes(agent.agent)) {
+      const settings = button(
+        "settings",
+        "Model & effort…",
+        "ws-move",
+        `Change model or effort for ${name}`,
+        "Quit the agent and resume this conversation with another model or reasoning effort",
+      );
+      settings.onclick = () => {
+        quitQuestion = null;
+        moveQuestion = null;
+        settingsQuestion = {
+          id: viewer.id,
+          pane: agent.pane,
+          session: agent.session,
+          agent: agent.agent,
+          model: agent.model || "",
+          effort: agent.effort || "",
+          choices: undefined,
+          focus: true,
+        };
+        byId("ws-live-status").textContent = "";
+        renderLive();
+        void loadSettingsChoices();
+      };
+    }
     if (agent.session && draft?.path && ["claude", "codex"].includes(agent.agent)) {
       const handoff = button(
         "handoff",
@@ -2121,6 +2162,7 @@
       );
       move.onclick = () => {
         quitQuestion = null;
+        settingsQuestion = null;
         moveQuestion = {
           id: viewer.id,
           pane: agent.pane,
@@ -2154,6 +2196,7 @@
         node("span", where ? `on ${where} · ` : ""),
         node("strong", text, `ws-live-activity ${tone}`.trim()),
         node("span", `${agentTitle(mine)} in ${mine.pane}`, "pr-meta"),
+        ...[settingsLabel(mine)].filter(Boolean),
         liveButtons(mine),
       );
       return row;
@@ -2193,6 +2236,7 @@
       badge(text, tone),
       node("strong", agentTitle(agent)),
       node("span", `in ${agent.pane}`, "pr-meta"),
+      ...[settingsLabel(agent)].filter(Boolean),
     );
     if (data.sessions.some((session) => session.id === agent.session)) {
       const show = node("button", "Show its transcript");
@@ -2244,6 +2288,147 @@
       queueMicrotask(() => no.isConnected && no.focus());
     }
     return card;
+  }
+  // Changing the model or effort --------------------------------------------------------
+  // Asked inline like a quit, with the choices New task offers. Neither agent changes
+  // them in a running session from outside, so the server quits the idle agent and
+  // resumes the same conversation in its pane with them.
+  async function loadSettingsChoices() {
+    const question = settingsQuestion;
+    let choices = null;
+    try {
+      choices = (await window.dashboardAgents?.choices(question.agent)) ?? null;
+    } catch {
+      /* Offered without a list: Default only. */
+    }
+    if (settingsQuestion !== question) return;
+    question.choices = choices;
+    renderLive();
+  }
+  function settingsCard(agent) {
+    const question = settingsQuestion;
+    const card = node("div", undefined, "ws-question ws-move-confirm ws-settings-confirm");
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label", "Change model or effort");
+    card.append(node("strong", `Change model or effort of ${agentTitle(agent)} in ${agent.pane}?`));
+    if (question.choices === undefined) card.append(node("p", "Loading model choices…"));
+    const choices = question.choices || { models: [], efforts: [] };
+    const fill = (select, values, value) => {
+      select.replaceChildren();
+      for (const item of ["", ...values]) {
+        const option = node("option", item || "Default");
+        option.value = item;
+        select.append(option);
+      }
+      select.value = values.includes(value) ? value : "";
+    };
+    const model = node("select");
+    model.setAttribute("aria-label", "Model");
+    const effort = node("select");
+    effort.setAttribute("aria-label", "Reasoning effort");
+    const levels = () =>
+      choices.models.find((choice) => choice.id === question.model)?.efforts ?? choices.efforts;
+    fill(
+      model,
+      choices.models.map((choice) => choice.id),
+      question.model,
+    );
+    fill(effort, levels(), question.effort);
+    model.onchange = () => {
+      question.model = model.value;
+      fill(effort, levels(), question.effort);
+      question.effort = effort.value;
+    };
+    effort.onchange = () => (question.effort = effort.value);
+    const fields = node("div", undefined, "ws-settings-fields");
+    for (const [text, select] of [
+      ["Model ", model],
+      ["Effort ", effort],
+    ]) {
+      const field = node("label", text, "ws-move-target");
+      field.append(select);
+      fields.append(field);
+    }
+    card.append(
+      fields,
+      node(
+        "p",
+        "The agent quits and this conversation resumes in the same pane with these settings; " +
+          "Default is the agent’s own configured setting. Processes it started stop with it.",
+        "pr-meta",
+      ),
+    );
+    const idle =
+      ["idle", "done"].includes(agent.status) ||
+      (agent.status === "blocked" && agent.interaction?.idle);
+    if (!idle)
+      card.append(
+        node(
+          "p",
+          agent.status === "working"
+            ? "It is working now: stop its turn or wait until it is idle."
+            : "It waits on a question or approval: answer it first.",
+          "ws-move-warning",
+        ),
+      );
+    const actions = node("div", undefined, "ws-choices");
+    const yes = node("button", "Restart with these", "ws-move");
+    yes.type = "button";
+    yes.disabled = !idle || question.choices === undefined;
+    yes.onclick = () => void changeSettings(agent, question.model, question.effort);
+    const no = node("button", "Cancel");
+    no.type = "button";
+    no.onclick = () => {
+      settingsQuestion = null;
+      renderLive();
+    };
+    actions.append(yes, no);
+    card.append(actions);
+    if (question.focus && question.choices !== undefined) {
+      question.focus = false;
+      queueMicrotask(() => model.isConnected && model.focus());
+    }
+    return card;
+  }
+  async function changeSettings(agent, model, effort) {
+    if (!viewer || stopping()) return;
+    const { entry, id } = viewer;
+    const status = byId("ws-live-status");
+    settingsQuestion = null;
+    stops.set(id, { pane: agent.pane, action: "settings" });
+    status.textContent = "";
+    renderLive();
+    let message;
+    try {
+      const response = await fetch("/api/workspace-agent-settings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Babysit-Action": "workspace-agent-settings",
+        },
+        body: JSON.stringify({
+          workspace: entry.workspace,
+          pane: agent.pane,
+          session: agent.session,
+          model,
+          effort,
+        }),
+      });
+      const value = await response.json();
+      message =
+        value.error ||
+        value.warning ||
+        `Resumed ${agentTitle(agent)} in ${value.pane} on ` +
+          `${model || "its default model"} with ${effort ? `${effort} effort` : "its default effort"}.`;
+    } catch {
+      message = "The restart could not be confirmed; refresh or check Collie.";
+    } finally {
+      stops.delete(id);
+    }
+    if (viewer?.id !== id) return;
+    tell(status, message);
+    renderLive();
+    await fetchAgents(entry);
   }
   // Moving an agent to a worker, or a worker's back here ------------------------------
   // Asked inline like a quit: the server's plan says what goes where and what stops, and
@@ -2508,6 +2693,14 @@
           )
         : undefined;
     if (moveQuestion && !moving) moveQuestion = null;
+    const adjusting =
+      settingsQuestion?.id === viewer.id
+        ? agents.find(
+            (agent) =>
+              agent.pane === settingsQuestion.pane && agent.session === settingsQuestion.session,
+          )
+        : undefined;
+    if (settingsQuestion && !adjusting) settingsQuestion = null;
     // Polls redraw only on a change, so a focused button stays focused.
     const key = JSON.stringify([
       shown,
@@ -2520,6 +2713,7 @@
         moveQuestion.error,
         moveQuestion.plan,
       ],
+      settingsQuestion && [settingsQuestion.pane, settingsQuestion.choices === undefined],
       agentsRead,
       hostLabel,
       workerLabel(viewer.entry),
@@ -2530,6 +2724,8 @@
         agent.status,
         agent.session,
         Boolean(agent.interaction?.idle),
+        agent.model,
+        agent.effort,
       ]),
     ]);
     if (holder.dataset.state === key) return;
@@ -2539,7 +2735,15 @@
       ...agents.filter((agent) => agent !== mine).map((agent) => agentRow(agent, data)),
     );
     byId("ws-live-confirm").replaceChildren(
-      ...(stopping() ? [] : asked ? [quitCard(asked)] : moving ? [moveCard(moving)] : []),
+      ...(stopping()
+        ? []
+        : asked
+          ? [quitCard(asked)]
+          : moving
+            ? [moveCard(moving)]
+            : adjusting
+              ? [settingsCard(adjusting)]
+              : []),
     );
   }
   async function liveAction(agent, action) {
