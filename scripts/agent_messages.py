@@ -26,12 +26,14 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 
 import agent_docker
+import agent_settings
 import claude_accounts
 import cron_agents
 import exit_watch
@@ -41,6 +43,7 @@ import remote_probe
 import sandbox
 import session_locks
 import skill_sync
+import workspace_agents
 import workspace_viewer
 import wt
 from pr_workspaces import PANE, herdr, run
@@ -418,6 +421,7 @@ def docker_status(workspace_id, live=_UNSET, machine=None):
     """Report observed access; a failed probe must never look like disabled access.
 
     A worker's agents have none to report: their sandbox is not Safehouse on this Mac.
+    Each agent's ``model`` and ``effort`` are reported too, "" where unknown.
     """
     result = agents(workspace_id, interactions=True, live=live, machine=machine)
     if machine is not None:
@@ -426,18 +430,37 @@ def docker_status(workspace_id, live=_UNSET, machine=None):
                 docker=None,
                 docker_supported=False,
                 docker_error="Docker access can only be inspected for agents on this Mac",
+                **worker_settings(target, machine),
             )
         return result
     for target in result:
-        target["docker"] = None
+        target.update(docker=None, model="", effort="")
         try:
             info, _, _, proc = agent_docker.inspect(target)
             if (info.get("agent_session") or {}).get("value") != target["session"]:
                 raise ValueError("The agent changed; refresh")
+            target.update(
+                agent_settings.observed(proc.get("argv") or [], target["agent"], target["session"])
+            )
             target["docker"] = agent_docker.has_access(proc["pid"])
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             target["docker_error"] = str(exc)
     return result
+
+
+def worker_settings(target, machine):
+    """A worker's agent's settings, as its command line there names them."""
+    kind = target.get("agent")
+    try:
+        procs = herdr_handoff.result(
+            "pane", "process-info", "--pane", target["pane"], machine=machine
+        )["process_info"]
+        found = [p for p in procs["foreground_processes"] if herdr_handoff.program(p) == kind]
+        if kind in RESUME and len(found) == 1 and isinstance(found[0].get("argv"), list):
+            return agent_settings.from_argv(found[0]["argv"], kind)
+    except (ValueError, RuntimeError, KeyError, TypeError, OSError, subprocess.SubprocessError):
+        pass
+    return {"model": "", "effort": ""}
 
 
 def set_docker(request, home=None):
@@ -538,6 +561,62 @@ def change_docker(target, enabled, home):
         return {"pane": target["pane"], "docker": observed, "warning": result["warning"]}
     except RuntimeError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def change_settings(request, home=None, machine=None):
+    """Continue an idle agent's conversation on another model or reasoning effort.
+
+    Neither agent changes them in a running session from its command line, so the agent
+    is quit as its own exit does (``exit_agent``, which refuses a busy one) and its
+    session resumed in the same pane with them (``resume``). An empty value is the
+    agent's configured default. Docker access an agent here has is kept.
+    """
+    fields = ("workspace", "pane", "session", "model", "effort")
+    if set(request) != set(fields) or not (
+        all(isinstance(request[k], str) for k in fields)
+        and all(request[k] for k in ("workspace", "pane", "session"))
+    ):
+        raise ValueError("Invalid model or effort parameters")
+    pane, session = request["pane"], request["session"]
+    target = next(
+        (a for a in agents(request["workspace"], machine=machine) if a["pane"] == pane), None
+    )
+    if target is None or target.get("session") != session:
+        raise ValueError("That session is no longer running in this pane; refresh")
+    if target.get("agent") not in RESUME:
+        raise ValueError("Only Claude and Codex agents can change model or effort")
+    workspace_agents.validate(target["agent"], request["model"], request["effort"], home)
+    docker = False
+    if machine is None and sys.platform == "darwin":
+        # Safehouse's grant, read as a move reads it; unknown access is not granted again.
+        with contextlib.suppress(ValueError, RuntimeError, OSError, subprocess.SubprocessError):
+            docker = agent_docker.has_access(agent_docker.inspect(target)[3]["pid"])
+    quit_ = exit_agent(
+        {"workspace": request["workspace"], "pane": pane, "session": session},
+        home,
+        stop=False,
+        machine=machine,
+    )
+    if not quit_["quit"]:
+        return {"changed": False, "pane": pane, "warning": quit_["warning"]}
+    settings = {"model": request["model"], "effort": request["effort"], "docker": docker}
+    try:
+        resumed = resume(
+            request["workspace"],
+            session,
+            "",
+            home,
+            machine=machine,
+            agent_options=settings,
+            into=pane,
+        )
+    except ValueError as exc:
+        raise ValueError(f"The agent quit, but its session did not resume: {exc}") from exc
+    return {
+        "changed": True,
+        "pane": resumed.get("pane"),
+        "warning": resumed.get("warning"),
+    }
 
 
 def prompt(target, text, machine=None):
@@ -1723,6 +1802,7 @@ def resume(
     stop_watch=None,
     machine=None,
     agent_options=None,
+    into=None,
 ):
     """Resume a recorded session in the workspace with the message, if any, as its prompt.
 
@@ -1733,7 +1813,9 @@ def resume(
     was ``restored``. A ``machine`` names the worker it all is
     on: its herdr, its session listing and its own paths, which its probe reports.
     ``agent_options`` (``model``, ``effort``, ``docker``) keep a resume on the settings
-    the session ran with on another machine (``workspace_move``).
+    the session ran with on another machine (``workspace_move``), or new ones
+    (``change_settings``). ``into`` is the pane its agent was just quit in: the session
+    resumes in that pane's shell while it is open, and other agents may run beside it.
     """
     if not isinstance(session_id, str) or not workspace_viewer.SESSION.match(session_id):
         raise ValueError("Choose a recorded session to resume")
@@ -1779,7 +1861,8 @@ def resume(
     ):
         if workspace_id is None:
             workspace_id = workspace_viewer.checkout_workspace(root, machine)
-        if workspace_id and agents(workspace_id, machine=machine):
+        running = workspace_id and agents(workspace_id, machine=machine)
+        if running and (into is None or any(a["pane"] == into for a in running)):
             # Two agents on one conversation would interleave; talk to the running one.
             raise ValueError("An agent is already running in this workspace; send to it instead")
         recent = _recent.get(session_id)
@@ -1823,14 +1906,28 @@ def resume(
                 )
         if pane is None:
             cron_agents.sweep_run_panes(live, machine)
-            anchor = next(
-                (
-                    p.get("pane_id")
-                    for p in herdr("pane", "list", "--workspace", live, machine=machine)["panes"]
-                    if isinstance(p, dict)
-                ),
-                None,
-            )
+            panes = [
+                p.get("pane_id")
+                for p in herdr("pane", "list", "--workspace", live, machine=machine)["panes"]
+                if isinstance(p, dict)
+            ]
+            if into is not None and into in panes:
+                # Its agent quit, leaving the pane's shell to type in.
+                return result(
+                    launch(
+                        workspace_id,
+                        chosen,
+                        pane_id(into, machine),
+                        text,
+                        home,
+                        cwd=cwd,
+                        worktree=root,
+                        machine=machine,
+                        found=found,
+                        agent_options=agent_options,
+                    )
+                )
+            anchor = next(iter(panes), None)
             if anchor is None:
                 raise ValueError("That herdr workspace has no pane to split")
             pane_id(anchor, machine)

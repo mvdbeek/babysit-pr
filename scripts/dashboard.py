@@ -114,6 +114,7 @@ WORKER_ACTIONS = {
     "workspace-message",
     "workspace-interrupt",
     "workspace-quit",
+    "workspace-agent-settings",
     "workspace-answer",
     "workspace-choose",
     "workspace-keys",
@@ -142,6 +143,7 @@ ACTIONS = frozenset(
         "workspace-docker",
         "workspace-interrupt",
         "workspace-quit",
+        "workspace-agent-settings",
         "workspace-move",
         "workspace-prompt-forget",
         "workspace-keys",
@@ -1261,6 +1263,15 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     self.send_json(
                         200, agent_messages.exit_agent(request, self.server.home, machine=machine)
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
+                return
+            if action == "workspace-agent-settings":
+                try:
+                    self.send_json(
+                        200,
+                        agent_messages.change_settings(request, self.server.home, machine=machine),
                     )
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})

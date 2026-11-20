@@ -234,6 +234,16 @@
   font-size: 13px;
   overflow-wrap: anywhere;
 }
+.ws-live-settings {
+  color: var(--muted);
+  font-size: 13px;
+}
+.ws-settings-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 6px 0;
+}
 .ws-move-confirm p {
   margin: 6px 0;
 }

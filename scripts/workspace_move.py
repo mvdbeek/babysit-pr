@@ -58,6 +58,7 @@ from pathlib import Path
 
 import agent_docker
 import agent_messages
+import agent_settings
 import herdr_handoff
 import machines
 import owned_process
@@ -285,40 +286,14 @@ def settings(argv, kind, rollout=None, text=None):
     """The model and effort the agent was started with, as `wt` would pass them again;
     a Codex session's last turn says what its command line does not: its ``rollout``
     file here, or the ``text`` of one read from a worker."""
-    model = effort = ""
-    words = iter(argv[1:])
-    for word in words:
-        name, joined, value = word.partition("=")
-        if not joined and name in {"--model", "-m", "--effort", "-c", "--config"}:
-            value = next(words, "")
-        if name == "--model" or (name == "-m" and kind == "codex"):
-            model = value
-        elif name == "--effort" and kind == "claude":
-            effort = value
-        elif name in {"-c", "--config"} and kind == "codex":
-            key, _, setting = value.partition("=")
-            if key.strip() == "model_reasoning_effort":
-                effort = setting.strip().strip("\"'")
-            elif key.strip() == "model":
-                model = setting.strip().strip("\"'")
-    if kind == "codex" and (rollout or text is not None) and not (model and effort):
-        context = {}
+    found = agent_settings.from_argv(argv, kind)
+    if kind == "codex" and (rollout or text is not None) and not all(found.values()):
         if text is None:
             with contextlib.suppress(OSError):
                 text = Path(rollout).read_text(errors="replace")
-        for line in (text or "").splitlines():
-            if '"turn_context"' in line:
-                with contextlib.suppress(ValueError):
-                    item = json.loads(line)
-                    if item.get("type") == "turn_context" and isinstance(item.get("payload"), dict):
-                        context = item["payload"]
-        model = model or str(context.get("model") or "")
-        effort = effort or str(context.get("effort") or "")
-    efforts = wt.EFFORTS | (wt.CODEX_EFFORTS if kind == "codex" else set())
-    return {
-        "model": model if wt.MODEL.fullmatch(model) else "",
-        "effort": effort if effort in efforts else "",
-    }
+        recorded = agent_settings.from_text(text or "", kind)
+        found = {key: found[key] or recorded[key] for key in found}
+    return found
 
 
 def related_watch(home, session, root, machine=None):

@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 import agent_messages
 import dashboard
+import herdr_handoff
 import pr_workspaces
 import pytest
 import workspace_overview as wso
@@ -1485,6 +1486,9 @@ def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
                     "title": None,
                     "session": None,
                     "docker": True,
+                    # Started without settings: the agent's defaults.
+                    "model": "",
+                    "effort": "",
                 }
             ]
             assert value["path"].endswith("merged-work") and value["sessions"] == []
@@ -2457,6 +2461,89 @@ def test_a_message_resumes_an_exited_session_in_a_new_pane(exited):
     # The agent now runs: a second resume is refused, a message goes to it instead.
     with pytest.raises(ValueError, match="already running"):
         agent_messages.send({"workspace": "w1", "resume": sid, "text": "again"}, home)
+
+
+@pytest.fixture
+def adjusting(exited, monkeypatch):
+    """An idle Claude runs the recorded session in pane w1:p2, started without settings."""
+    state, sid, checkout, home = exited
+    ps = state.parent / "bin" / "ps"
+    ps.write_text(f"#!{sys.executable} -S\n" + PS)
+    ps.chmod(0o700)
+    monkeypatch.setattr(agent_messages, "PS", str(ps))
+    agent, procs, screens = quit_agent_state(session=sid)
+    procs["foreground_processes"][0]["cwd"] = str(checkout)
+    data = read(state)
+    data["agents"] = [{**agent, "workspace_id": "w1"}]
+    data["process_info"]["w1:p2"] = procs
+    data["screens"] = {"w1:p2": screens}
+    state.write_text(json.dumps(data))
+
+    def kill(pid, signal):
+        if not any(a.get("pane_id") == "w1:p2" for a in read(state)["agents"]):
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(herdr_handoff.os, "kill", kill)
+    return exited
+
+
+def settings_request(sid, **extra):
+    return {
+        "workspace": "w1",
+        "pane": "w1:p2",
+        "session": sid,
+        "model": "opus",
+        "effort": "high",
+        **extra,
+    }
+
+
+def test_a_settings_change_resumes_the_session_in_its_pane_with_them(adjusting):
+    state, sid, checkout, home = adjusting
+    value = agent_messages.change_settings(settings_request(sid), home)
+    assert value == {"changed": True, "pane": "w1:p2", "warning": None}
+    data = read(state)
+    assert data["typed_text"] == [["w1:p2", "/exit"]]
+    # Typed in the shell the agent left, not a new split.
+    assert "splits" not in data
+    assert [run[0] for run in data["runs"]] == ["w1:p2"]
+    assert data["runs"][0][1].startswith(f"cd {checkout.resolve()} && claude ")
+    agent = data["agents"][0]
+    assert agent["pane_id"] == "w1:p2"
+    assert agent["argv"] == ["--model", "opus", "--effort", "high", "--resume", sid]
+
+
+def test_a_settings_change_is_refused_before_quitting_a_busy_or_unknown_choice(adjusting):
+    state, sid, checkout, home = adjusting
+    with pytest.raises(ValueError, match="supported reasoning effort"):
+        agent_messages.change_settings(settings_request(sid, model="haiku"), home)
+    data = read(state)
+    data["agents"][0]["agent_status"] = "working"
+    state.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="busy"):
+        agent_messages.change_settings(settings_request(sid), home)
+    data = read(state)
+    assert "typed_text" not in data and "runs" not in data
+    assert calls(state, ["agent", "send-keys"]) == []
+
+
+def test_the_agent_list_names_each_agents_model_and_effort(adjusting):
+    state, sid, checkout, home = adjusting
+    data = read(state)
+    data["process_info"]["w1:p2"]["foreground_processes"][0]["argv"] = [
+        "claude",
+        "--effort",
+        "max",
+    ]
+    state.write_text(json.dumps(data))
+    folder = next((Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects").iterdir())
+    with (folder / f"{sid}.jsonl").open("a") as stream:
+        stream.write(
+            json.dumps({"type": "assistant", "message": {"model": "claude-opus-5-5"}}) + "\n"
+        )
+    [agent] = agent_messages.docker_status("w1")
+    # The command line's effort; the model its configured default, as its reply names it.
+    assert (agent["model"], agent["effort"]) == ("claude-opus-5-5", "max")
 
 
 def test_an_archived_session_has_its_file_written_back_and_is_resumed(
