@@ -505,8 +505,13 @@ def test_call_bounds_and_checks_the_worker_answer(
 ):
     register(tmp_path, MINI)
     sent = []
+    real_run = machines.run
 
     def run(home, machine, argv, **kwargs):
+        # A previous workspace snapshot may still be refreshing in another thread.
+        # Do not replace its unrelated Git or SSH calls with this probe response.
+        if home != tmp_path or machine is None or machine.id != "mini":
+            return real_run(home, machine, argv, **kwargs)
         sent.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, returncode, stdout, b"e" * 10000)
 

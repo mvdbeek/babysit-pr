@@ -317,9 +317,9 @@ def local_agents(rig):
 
 
 def files(path):
-    """Every file under ``path`` but Git's own, by name, with its content and mode."""
+    """Files and the executable bit Git carries, independent of the process umask."""
     return {
-        str(f.relative_to(path)): (f.read_bytes(), os.stat(f).st_mode & 0o777)
+        str(f.relative_to(path)): (f.read_bytes(), bool(os.stat(f).st_mode & 0o100))
         for f in path.rglob("*")
         if f.is_file() and ".git" not in f.relative_to(path).parts
     }
@@ -357,7 +357,7 @@ def test_an_idle_claude_moves_with_its_branch_changes_and_conversation(rig, monk
     # Unpushed commits, staged, unstaged and untracked changes; ignored files stay here.
     expected = {k: v for k, v in before.items() if not k.startswith(".venv/")}
     assert files(target) == expected
-    assert files(target)["tool.sh"][1] & 0o100
+    assert files(target)["tool.sh"][1]
     assert git("diff", "--cached", "--name-status", cwd=target) == staged
     assert "?? notes/todo.md" in git("status", "--porcelain", "--untracked-files=all", cwd=target)
     assert git("config", "branch.feature.merge", cwd=target) == "refs/heads/feature"

@@ -1044,7 +1044,10 @@
   // The live question box depends on the transcript; it is redrawn only while it is the
   // agents' box being shown, not a message standing in for it.
   function syncInteraction() {
-    if ("state" in byId("ws-agent-interaction").dataset) renderInteraction();
+    if ("state" in byId("ws-agent-interaction").dataset) {
+      if (agents.length) renderInteraction();
+      else renderWatch();
+    }
   }
   function nearBottom() {
     const scroller = byId("ws-viewer");

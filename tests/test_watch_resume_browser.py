@@ -98,6 +98,19 @@ def test_a_watch_transcript_offers_to_cancel_it_and_reopen_the_session(page, own
     dialog = page.locator("#ws-viewer")
     notice = page.locator("#ws-agent-interaction")
     expect(notice).to_contain_text("This session belongs to babysit watch w-1 (blocked)")
+    # Loading a transcript again must preserve the watched session's card and controls.
+    # Add a visible entry so the assertion waits for the new page to be rendered.
+    def refreshed(route):
+        response = route.fetch()
+        data = response.json()
+        data["entries"].append({"role": "assistant", "text": "Refreshed transcript"})
+        data["total"] += 1
+        route.fulfill(response=response, json=data)
+
+    page.route("**/api/workspace-transcript?*", refreshed)
+    dialog.get_by_role("button", name="Refresh").click()
+    expect(dialog.get_by_text("Refreshed transcript")).to_be_visible()
+    expect(notice).to_contain_text("This session belongs to babysit watch w-1 (blocked)")
     dialog.get_by_role("button", name="Cancel watch and reopen…").click()
     expect(notice).to_contain_text("resumed in a workspace to continue in Collie; nothing is sent")
     assert load_watch(home)["status"] == "blocked"
