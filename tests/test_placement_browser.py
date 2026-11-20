@@ -528,3 +528,96 @@ def test_on_one_machine_a_task_in_a_directory_sends_no_machine(page, site):
     expect(page.locator("#workspace-progress")).to_have_text("failed: Stopped by the test")
     assert sent == [{"directory": "/fixture/alpha", "agent": "codex", "task": "Tidy"}]
     assert not previews
+
+
+@pytest.mark.parametrize("source,target", [("claude", "codex"), ("codex", "claude")])
+def test_change_agent_quits_then_starts_in_the_same_checkout(page, site, source, target):
+    url, snapshot, _, sent, _ = site
+    snapshot["agent_choices"] = {
+        target: {"models": [{"id": "model-1", "efforts": ["high"]}], "efforts": ["high"]},
+        source: {"models": [], "efforts": []},
+    }
+    actions = []
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={
+                "path": "/fixture/alpha",
+                "agents": [{"pane": "w1:p1", "session": "s1", "agent": source}],
+            }
+        ),
+    )
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "session": {"id": "s1"},
+                "entries": [
+                    {"role": "user", "text": "Fix the tests"},
+                    {"role": "assistant", "text": "Investigating"},
+                    {"role": "tool", "output": "private tool output"},
+                ],
+            }
+        ),
+    )
+
+    def quit_agent(route):
+        actions.append(route.request.post_data_json)
+        route.fulfill(json={"quit": True})
+
+    page.route("**/api/workspace-quit", quit_agent)
+    page.goto(url)
+    page.evaluate(
+        """source => window.dashboardTasks.create({handoff: {
+        workspace: 'w1', pane: 'w1:p1', session: 's1', agent: source,
+        path: '/fixture/alpha', machine: 'local'
+    }})""",
+        source,
+    )
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog.get_by_label("Directory", exact=True)).to_have_value("/fixture/alpha")
+    expect(dialog.locator("#workspace-agent")).to_have_value(target)
+    dialog.locator("#workspace-model").select_option("model-1", force=True)
+    dialog.locator("#workspace-effort").select_option("high", force=True)
+    dialog.get_by_role("button", name="Quit and start new agent").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Stopped by the test")
+    assert actions == [{"workspace": "w1", "pane": "w1:p1", "session": "s1"}]
+    assert len(sent) == 1
+    assert (sent[0]["directory"], sent[0]["agent"], sent[0]["model"], sent[0]["effort"]) == (
+        "/fixture/alpha",
+        target,
+        "model-1",
+        "high",
+    )
+    assert "user: Fix the tests" in sent[0]["task"]
+    assert "assistant: Investigating" in sent[0]["task"]
+    assert "private tool output" not in sent[0]["task"]
+
+
+def test_change_agent_does_not_start_when_quit_is_uncertain(page, site):
+    url, _, _, sent, _ = site
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={"path": "/fixture/alpha", "agents": [{"pane": "w1:p1", "session": "s1"}]}
+        ),
+    )
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(json={"session": {"id": "s1"}, "entries": []}),
+    )
+    page.route(
+        "**/api/workspace-quit",
+        lambda route: route.fulfill(json={"quit": False, "warning": "Check the pane in Collie"}),
+    )
+    page.goto(url)
+    page.evaluate("""() => window.dashboardTasks.create({handoff: {
+        workspace: 'w1', pane: 'w1:p1', session: 's1', agent: 'claude',
+        path: '/fixture/alpha', machine: 'local'
+    }})""")
+    dialog = page.locator("#workspace-dialog")
+    button = dialog.get_by_role("button", name="Quit and start new agent")
+    button.click()
+    expect(page.locator("#workspace-error")).to_contain_text("Check the pane in Collie")
+    expect(button).to_be_disabled()
+    assert not sent

@@ -6311,3 +6311,22 @@ def test_codex_async_question_answers_in_the_transcript(
     expect(page.locator("#ws-message-text")).to_have_value("")
     expect(card.get_by_role("button", name="Answer in w1:p1")).to_be_disabled()
     page.screenshot(path=f"reports/codex-transcript-answer-{width}.png", full_page=True)
+
+
+def test_transcript_offers_change_agent_in_its_checkout(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [
+        {"pane": "w1:p2", "agent": "claude", "status": "idle", "session": "s1"}
+    ]
+    page.route(
+        "**/api/workspace-repos*",
+        lambda route: route.fulfill(json={"repos": [], "idle": 0}),
+    )
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_role("button", name="Change agent for Claude in w1:p2").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(dialog).to_be_visible()
+    expect(dialog.get_by_label("Directory", exact=True)).to_have_value("/fixture/checkout")
+    expect(dialog.locator("#workspace-agent")).to_have_value("codex")
+    expect(dialog.get_by_role("button", name="Quit and start new agent")).to_be_visible()

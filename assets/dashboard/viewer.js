@@ -2022,6 +2022,7 @@
     },
     // Followed by its own polls (startMove), not liveAction.
     move: { busy: "Moving…" },
+    handoff: { busy: "Changing…" },
   };
   // The action ({pane, action}) on its way, per viewed entry: stepping to another one
   // leaves its buttons and polls alone.
@@ -2082,6 +2083,27 @@
       byId("ws-live-status").textContent = "";
       renderLive();
     };
+    if (agent.session && draft?.path && ["claude", "codex"].includes(agent.agent)) {
+      const handoff = button(
+        "handoff",
+        "Change agent…",
+        "ws-move",
+        `Change agent for ${name}`,
+        "Start a new conversation in this checkout with another agent, model or effort",
+      );
+      handoff.onclick = () => {
+        void window.dashboardTasks.create({
+          handoff: {
+            workspace: viewer.entry.workspace,
+            pane: agent.pane,
+            session: agent.session,
+            agent: agent.agent,
+            path: draft.path,
+            machine: /^([a-z][a-z0-9-]*)\//.exec(viewer.entry.workspace || "")?.[1] || "local",
+          },
+        });
+      };
+    }
     // Only where workers are registered, and for an agent whose session can resume there:
     // one here goes to a worker, a worker's comes back to this machine.
     if (hostLabel && agent.session && ["claude", "codex"].includes(agent.agent)) {
