@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -313,14 +314,20 @@ def extension_browser(playwright, tmp_path, extension_server):
             f"--load-extension={extension_path}",
         ],
     ) as context:
-        worker = (
-            context.service_workers[0]
-            if context.service_workers
-            else context.wait_for_event("serviceworker")
-        )
+        # Register before checking the existing workers: one can start between a
+        # check and wait_for_event, leaving that wait expecting a second event.
+        started = []
+        context.on("serviceworker", lambda worker: started.append(worker))
+        page = context.new_page()
+        deadline = time.monotonic() + 60
+        while not started and not context.service_workers:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("The extension service worker did not start")
+            # Yield to Playwright so it can dispatch a worker event or update its list.
+            page.wait_for_timeout(100)
+        worker = (started or context.service_workers)[0]
         client = worker.url.split("/")[2]
         base = f"http://127.0.0.1:{extension_server.server_port}"
-        page = context.new_page()
         page.goto(f"{base}/extension.html#id={client}")
         expect(page.locator("#extension-id")).to_have_value(client)
         page.get_by_role("button", name="Create pairing token").click()

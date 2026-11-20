@@ -3274,7 +3274,7 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
   // Stands in for the dialog's item; its id becomes the operation's once one starts.
   const owner = { id: null, newTask: true };
   workspaceDialogItem = owner;
-  $("workspace-title").textContent = "New task";
+  $("workspace-title").textContent = prefill.handoff ? "Change agent" : "New task";
   $("workspace-error").textContent = "";
   const loading = el("p", "Finding local clones…");
   $("workspace-content").replaceChildren(loading);
@@ -3718,6 +3718,25 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       setRepo(taskRepo());
       placementChanged();
     };
+    if (prefill.handoff) {
+      inPlace.checked = true;
+      inPlace.onchange();
+      inPlaceLabel.hidden = true;
+      directory.value = prefill.handoff.path;
+      directory.readOnly = true;
+      const machine = machineField.querySelector("select");
+      if (prefill.handoff.machine !== "local") machine.value = prefill.handoff.machine;
+      machine.disabled = true;
+      agent.value = prefill.handoff.agent === "claude" ? "codex" : "claude";
+      agent.dispatchEvent(new Event("change"));
+      directoryFields.append(
+        el(
+          "p",
+          "The current agent will be stopped and quit. The new agent starts a new conversation in the same checkout, with recent conversation text as context. Earlier messages and tool output may be omitted; the original transcript remains available.",
+          "alert",
+        ),
+      );
+    }
     const execution = el("details", undefined, "execution-settings");
     const summary = el("summary");
     const fields = el("div", undefined, "execution-fields");
@@ -3728,7 +3747,8 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     fields.append(usageNote, settingsNote, effortDefaults, dockerLabel, quitLabel, machineField);
     execution.append(summary, fields);
     try {
-      execution.open = localStorage.getItem("babysit-pr:execution-expanded") === "1";
+      execution.open =
+        Boolean(prefill.handoff) || localStorage.getItem("babysit-pr:execution-expanded") === "1";
     } catch {
       /* Keep settings collapsed when storage is unavailable. */
     }
@@ -3767,7 +3787,11 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     task.required = true;
     task.maxLength = 32000;
     task.rows = 6;
-    task.value = prefill.task || "";
+    task.value =
+      prefill.task ||
+      (prefill.handoff
+        ? "Continue the work in this checkout using the conversation context below. Inspect the current changes and verify what remains to be done."
+        : "");
     task.oninput = () => task.setCustomValidity("");
     field("Task", task);
     const files = attachmentField(form, task);
@@ -3780,12 +3804,20 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     const cancel = el("button", "Cancel");
     cancel.type = "button";
     cancel.onclick = () => $("workspace-dialog").close();
-    const submit = el("button", "Start task", "primary-action");
+    const submit = el(
+      "button",
+      prefill.handoff ? "Quit and start new agent" : "Start task",
+      "primary-action",
+    );
     submit.type = "submit";
     footer.append(cancel, submit);
     form.replaceChildren(body, footer);
+    let handoffQuit = false;
+    let handoffUncertain = false;
+    let handoffTranscript = null;
     form.onsubmit = async (event) => {
       event.preventDefault();
+      if (handoffUncertain) return;
       if (!task.value.trim()) {
         task.setCustomValidity("Enter a task");
         task.reportValidity();
@@ -3812,47 +3844,145 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       submit.dataset.inflight = "true";
       $("workspace-error").textContent = "";
       try {
-        const response = await fetch("/api/workspace-new", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-new" },
-          body: JSON.stringify({
-            ...(inPlace.checked
-              ? { directory: directory.value.trim() }
-              : {
-                  repo: choice.repo,
-                  ...(cloneNew.checked
-                    ? { destination: choice.destination }
-                    : { clone: choice.clone }),
-                  ...(fileIssue.checked
-                    ? { issue_title: title.value }
-                    : {
-                        name: name.value,
-                        ...(base.value.trim() ? { base: base.value.trim() } : {}),
-                      }),
-                  ...(also.size ? { also: [...also] } : {}),
-                  ...alsoBaseChoice(),
+        let prompt = task.value;
+        if (prefill.handoff) {
+          const source = prefill.handoff;
+          if (source.machine !== "local" && machineChoice().machine !== source.machine)
+            throw Error("The worker is no longer available; reopen the handoff.");
+          const query = new URLSearchParams({
+            workspace: source.workspace,
+            session: source.session,
+          });
+          if (!handoffQuit) {
+            const live = await get(
+              `/api/workspace-agents?${new URLSearchParams({ workspace: source.workspace })}`,
+            );
+            if (
+              live.path !== source.path ||
+              live.agents.length !== 1 ||
+              live.agents[0].pane !== source.pane ||
+              live.agents[0].session !== source.session
+            )
+              throw Error("The checkout or its agents changed; reopen the handoff.");
+            handoffTranscript = await get(`/api/workspace-transcript?${query}`);
+            if (
+              handoffTranscript.session?.id !== source.session ||
+              !Array.isArray(handoffTranscript.entries)
+            )
+              throw Error("The original session transcript is unavailable; nothing was quit.");
+            let quit;
+            try {
+              quit = await fetch("/api/workspace-quit", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Babysit-Action": "workspace-quit",
+                },
+                body: JSON.stringify({
+                  workspace: source.workspace,
+                  pane: source.pane,
+                  session: source.session,
                 }),
-            agent: agent.value,
-            ...(model.value ? { model: model.value } : {}),
-            ...(effort.value ? { effort: effort.value } : {}),
-            ...(agent.value === "claude" && account.value ? { claude_account: account.value } : {}),
-            ...(docker.checked ? { docker: true } : {}),
-            ...machineChoice(),
-            ...(quit.checked ? { exit_when_done: true } : {}),
-            task: task.value,
-            ...attached(files),
-          }),
-        });
+              });
+              const result = await quit.json();
+              if (!quit.ok) throw Error(result.error || `HTTP ${quit.status}`);
+              if (!result.quit) {
+                handoffUncertain = true;
+                throw Error(result.warning || "The quit could not be confirmed; check Collie.");
+              }
+            } catch (error) {
+              if (!quit || quit.status !== 400) handoffUncertain = true;
+              throw error;
+            }
+            handoffQuit = true;
+          }
+          let transcript = handoffTranscript;
+          try {
+            const updated = await get(`/api/workspace-transcript?${query}`);
+            if (updated.session?.id === source.session && Array.isArray(updated.entries))
+              transcript = updated;
+          } catch {
+            // The pane may have closed the workspace on exit; keep the earlier page.
+          }
+          const lines = transcript.entries
+            .filter(
+              (entry) =>
+                ["user", "assistant"].includes(entry.role) && typeof entry.text === "string",
+            )
+            .map((entry) => `${entry.role}: ${entry.text}`);
+          const context = lines.join("\n\n");
+          const header =
+            "\n\nRecent messages from the previous conversation (possibly truncated; tool output omitted):\n";
+          const room = Math.max(0, 32000 - prompt.length - header.length);
+          if (room) prompt += header + context.slice(-room);
+        }
+        let launchAttempted = false;
+        const response = await (async () => {
+          launchAttempted = true;
+          try {
+            return await fetch("/api/workspace-new", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Babysit-Action": "workspace-new" },
+              body: JSON.stringify({
+                ...(inPlace.checked
+                  ? { directory: directory.value.trim() }
+                  : {
+                      repo: choice.repo,
+                      ...(cloneNew.checked
+                        ? { destination: choice.destination }
+                        : { clone: choice.clone }),
+                      ...(fileIssue.checked
+                        ? { issue_title: title.value }
+                        : {
+                            name: name.value,
+                            ...(base.value.trim() ? { base: base.value.trim() } : {}),
+                          }),
+                      ...(also.size ? { also: [...also] } : {}),
+                      ...alsoBaseChoice(),
+                    }),
+                agent: agent.value,
+                ...(model.value ? { model: model.value } : {}),
+                ...(effort.value ? { effort: effort.value } : {}),
+                ...(agent.value === "claude" && account.value
+                  ? { claude_account: account.value }
+                  : {}),
+                ...(docker.checked ? { docker: true } : {}),
+                ...machineChoice(),
+                ...(quit.checked ? { exit_when_done: true } : {}),
+                task: prompt,
+                ...attached(files),
+              }),
+            });
+          } catch (error) {
+            if (prefill.handoff && launchAttempted) handoffUncertain = true;
+            throw error;
+          }
+        })();
+        if (prefill.handoff) handoffUncertain = true;
         const value = await response.json();
-        if (!response.ok) throw Error(value.error || `HTTP ${response.status}`);
+        if (!response.ok) {
+          if (response.status === 400) handoffUncertain = false;
+          throw Error(value.error || `HTTP ${response.status}`);
+        }
+        if (prefill.handoff && !value.operation?.pr)
+          throw Error("The launch response was incomplete.");
+        handoffUncertain = false;
         delete submit.dataset.inflight;
         owner.id = value.operation.pr;
         owner.operation = value.operation;
         updateWorkspaceOperation();
       } catch (error) {
         delete submit.dataset.inflight;
-        workspaceError(error);
-        submit.disabled = false;
+        workspaceError(
+          new Error(
+            (handoffQuit ? "The previous agent has quit; its session and checkout remain. " : "") +
+              error.message +
+              (handoffUncertain
+                ? " The result is uncertain; check Collie before trying again."
+                : ""),
+          ),
+        );
+        submit.disabled = handoffUncertain;
       }
     };
     $("workspace-content").replaceChildren(form);

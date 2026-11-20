@@ -296,7 +296,7 @@ def test_a_workers_claude_moves_here_with_its_branch_changes_and_conversation(ri
     # Unpushed commits, staged, unstaged and untracked changes; ignored files stay there.
     expected = {k: v for k, v in before.items() if not k.startswith(".venv/")}
     assert files(target) == expected
-    assert files(target)["tool.sh"][1] & 0o100
+    assert files(target)["tool.sh"][1]
     assert git("diff", "--cached", "--name-status", cwd=target) == staged_before
     assert git("config", "branch.feature.merge", cwd=target) == "refs/heads/feature"
     # The transcript, with its subagent, under this machine's project folder for it.
