@@ -358,6 +358,46 @@ def test_a_tidy_card_names_the_checkouts_it_can_clean_up():
     assert found["workspace:/w/gone"]["cleanup"] == ["/w/gone"]
 
 
+def test_decisions_and_broken_worktrees_are_tidy_cards_on_every_machine():
+    link = {"kind": "pr", "number": 6, "url": "https://github.com/base/repo/pull/6"}
+    dirty = [{"kind": "dirty", "text": "2 uncommitted change(s)"}]
+    broken = [{"kind": "broken", "text": "Its directory has no .git"}]
+    worker = {"machine": "box", "machine_label": "Linux box"}
+    rows = [
+        workspace_row(
+            key="/w/decide",
+            status="decide",
+            removable=True,
+            blockers=dirty,
+            links=[{**link, "state": "merged"}],
+        ),
+        workspace_row(key="/w/broken", status="broken", removable=False, blockers=broken),
+        workspace_row(
+            key="m:box:/w/far",
+            status="decide",
+            removable=True,
+            blockers=dirty,
+            links=[{**link, "number": 7, "url": "u/7", "state": "closed"}],
+            agents=[{"status": "done"}],
+            **worker,
+        ),
+        workspace_row(key="m:box:/w/broken", status="broken", blockers=broken, **worker),
+        # A worker's other rows still stay on the Workspaces tab.
+        workspace_row(key="m:box:/w/ready", status="ready", removable=True, **worker),
+    ]
+    found = by_key(
+        attention.collect(workspace_overview={"enabled": True, "workspaces": rows}, now=NOW)
+    )
+    assert codes(found[link["url"]]) == ["workspace_blocked"]
+    assert found[link["url"]]["cleanup"] == ["/w/decide"]
+    assert codes(found["workspace:/w/broken"]) == ["workspace_broken"]
+    assert "cleanup" not in found["workspace:/w/broken"]
+    # A worker's finished agent is its own scans' to report, not this row's.
+    assert codes(found["u/7"]) == ["workspace_blocked"]
+    assert codes(found["workspace:m:box:/w/broken"]) == ["workspace_broken"]
+    assert "workspace:m:box:/w/ready" not in found
+
+
 def test_a_finished_watch_cleans_up_a_checkout_its_open_issue_keeps_active(tmp_path):
     checkout = tmp_path / "fix"
     checkout.mkdir()
@@ -634,6 +674,35 @@ def test_cron_jobs_report_their_last_run():
     assert found["cron:2"]["group"] == "answer"
     assert feed["agents_waiting"] == 2
     assert attention.collect(cron={"enabled": False, "jobs": jobs}, now=NOW)["items"] == []
+
+
+def test_a_filling_disk_is_its_own_item_on_the_workspaces_tab():
+    def entry(id_, percent, local=False, report=None):
+        disk = {"size": 400 * 2**30, "free": 30 * 2**30, "percent": percent, "report": report}
+        return {"id": id_, "label": id_.title(), "local": local, "disk": disk}
+
+    machines = [
+        entry("chonk", 91, report={"generated_at": NOW - 60}),
+        entry("mini", 85),
+        entry("box", 79),
+        # This machine launches through Safehouse, which refuses nothing.
+        entry("local", 95, local=True),
+    ]
+    found = by_key(attention.collect(machines={"machines": machines}, now=NOW))
+    assert set(found) == {"machine:chonk", "machine:mini", "machine:local"}
+    chonk = found["machine:chonk"]
+    assert chonk["reasons"] == [
+        {
+            "code": "disk_full",
+            "group": "unblock",
+            "text": "Disk 91% full (30 GiB free): new sandboxed launches are refused",
+            "page": "workspaces",
+        }
+    ]
+    assert (chonk["kind"], chonk["title"], chonk["since"]) == ("machine", "Chonk disk", NOW - 60)
+    assert found["machine:mini"]["reasons"][0]["code"] == "disk_low"
+    assert found["machine:mini"]["group"] == "tidy"
+    assert found["machine:local"]["reasons"][0]["text"] == "Disk 95% full (30 GiB free)"
 
 
 def test_a_dismissed_cron_run_needs_nobody_until_a_newer_run_does():

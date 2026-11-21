@@ -655,6 +655,16 @@ def load_counts(spaces):
     }
 
 
+def local_disk(home):
+    """The disk of this machine's state directory ``home``, as a worker's placement state
+    has its own, with a housekeeping report there if any; None when unreadable."""
+    try:
+        report = remote_probe.disk_report(str(Path(home) / "disk-usage.json"))
+        return {**remote_probe.disk_usage(str(home)), "report": report}
+    except OSError:
+        return None
+
+
 class MachineLoads:
     """Agent counts per registered machine from its herdr, cached so requests never wait.
 
@@ -709,6 +719,8 @@ class MachineLoads:
                     **load,
                     "pending": load["synced_at"] is None,
                     "clones": state["clones"] if known else None,
+                    # Its disk and housekeeping's report of what uses it, as last listed.
+                    "disk": state.get("disk") if known else None,
                     "state_synced_at": synced,
                     "state_error": state.get("error"),
                 }
@@ -721,8 +733,34 @@ class MachineLoads:
             # Before the first workspace scan its agents are unknown, not zero.
             "pending": inventory["synced_at"] is None,
             "max_agents": dashboard_settings.settings(self.home)["local_max_agents"],
+            "disk": local_disk(self.home),
         }
         return config, loads
+
+    def disks(self, now=None):
+        """Each machine's disk as last listed, asking none of them again: what the attention
+        feed reads, which the Workspaces snapshots keep fresh. Unknown ones are left out."""
+        try:
+            config = machines.load_config(self.home) or {"machines": {}}
+        except (OSError, ValueError):
+            config = {"machines": {}}
+        now = time.time() if now is None else now
+        found = [{"id": placement.LOCAL, "label": placement.label(None, {}), "local": True}]
+        found[0]["disk"] = local_disk(self.home)
+        with self.lock:
+            for machine_id, machine in config["machines"].items():
+                state = self.states.get(machine_id) or {}
+                synced = state.get("synced_at")
+                if machine.enabled and synced and now - synced <= placement.STATE_STALE:
+                    found.append(
+                        {
+                            "id": machine_id,
+                            "label": machine.label,
+                            "local": False,
+                            "disk": state.get("disk"),
+                        }
+                    )
+        return [entry for entry in found if entry["disk"]]
 
     def current(self, wait=LOAD_TIMEOUT + 2):
         """``snapshot`` once the refreshes it starts, or finds under way, have answered,

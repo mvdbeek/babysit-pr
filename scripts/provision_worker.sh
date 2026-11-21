@@ -942,6 +942,7 @@ user_checks() {
   claude_account_checks
   session_hook_checks
   session_service_checks
+  housekeeping_checks
   instruction_checks
 }
 
@@ -1026,6 +1027,52 @@ session_service_checks() {
     ok "$SESSIONS_UNIT names the session of a Codex started by hand"
   else
     warn "$SESSIONS_UNIT is not running, so the dashboard cannot tell the session of a Codex started by hand here; rerun the user step (journalctl --user -u $SESSIONS_UNIT)"
+  fi
+}
+
+# housekeeping.py keeps the disk from filling up: it prunes rootless Docker, removes
+# sandbox caches and scratch directories nothing uses, and reports what uses the disk for
+# the dashboard, once a day. Like the session reporter, its units name only the deployed
+# copy, which no sandbox can write; -E -s rather than -I, which would keep it from
+# importing remote_probe beside it.
+HOUSEKEEPING=babysit-housekeeping
+install_housekeeping() {
+  local dir=$HOME/.config/systemd/user
+  local service="[Unit]
+Description=babysit-pr: free disk space and report what uses it
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 -E -s %h/$APP/scripts/housekeeping.py
+Nice=19
+IOSchedulingClass=idle"
+  local timer="[Unit]
+Description=babysit-pr: daily disk housekeeping
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target"
+  run mkdir -p "$dir"
+  write_file "$dir/$HOUSEKEEPING.service" 0644 "$service" || true
+  write_file "$dir/$HOUSEKEEPING.timer" 0644 "$timer" || true
+  if ((dry)); then
+    printf '  would run: systemctl --user enable --now %s.timer\n' "$HOUSEKEEPING"
+  elif ! { systemctl --user daemon-reload &&
+    systemctl --user enable --now --quiet "$HOUSEKEEPING.timer"; } >/dev/null 2>&1; then
+    warn "could not start $HOUSEKEEPING.timer (systemctl --user); nothing frees disk space here"
+  fi
+}
+
+housekeeping_checks() {
+  if systemctl --user is-active --quiet "$HOUSEKEEPING.timer" 2>/dev/null; then
+    ok "$HOUSEKEEPING.timer frees disk space daily"
+  else
+    warn "$HOUSEKEEPING.timer is not active, so nothing frees disk space here; rerun the user step"
   fi
 }
 
@@ -1161,6 +1208,9 @@ user_step() {
 
   say "Codex session reporter"
   install_session_service
+
+  say "disk housekeeping"
+  install_housekeeping
 
   say "git identity"
   if [[ -n ${GIT_USER_NAME:-} && -n ${GIT_USER_EMAIL:-} ]]; then

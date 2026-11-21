@@ -231,6 +231,55 @@ why, and `python3 -I ~/.local/share/babysit-pr/app/scripts/worker_sessions.py
 `systemctl --user disable --now babysit-codex-sessions.service`; the next user step
 enables it again.
 
+### Disk housekeeping
+
+Agents fill a worker's disk in a few places: Docker images and stopped containers,
+runtime data kept in the sandbox cache, and checkouts with their environments. The
+user step installs a daily systemd user timer, `babysit-housekeeping.timer`, which runs
+`housekeeping.py` from the deployed copy, outside every sandbox:
+
+- **Docker.** In the rootless daemon, it prunes stopped containers older than 72 hours
+  and images unused for a week. An image labelled `keep` stays.
+- **Scratch directories.** It removes the scratch directory (`$BABYSIT_SCRATCH`, below)
+  of each checkout that no longer exists. Workspaces cleanup already removes them when
+  it removes the checkout, so this catches checkouts removed any other way.
+- **Stale cache entries.** Inside each sandbox cache, it removes anything that is not
+  a known tool cache, the artefacts or the scratch directories, once nothing in it has
+  changed for 7 days.
+- **Unused caches.** It removes a whole cache that no launch has used for 30 days, or
+  whose agent configuration is gone. It never removes the cache of a running sandbox.
+- **Tool caches.** Once a week it runs `uv cache prune`, `npm cache verify` and
+  `pnpm store prune` in each cache. Each runs in a bubblewrap sandbox that can write
+  only that cache, since agents wrote what these tools read.
+
+After each run it writes `~/.local/state/babysit-pr/disk-usage.json`. That report
+lists the size of each cache and scratch directory, the 50 largest checkouts, Docker's
+use, and what the run removed. The dashboard's Workspaces tab shows it per machine,
+and Needs you lists a machine once its disk is 80% full.
+
+To see what a run would remove, without removing anything:
+
+```sh
+python3 ~/.local/share/babysit-pr/app/scripts/housekeeping.py --dry-run
+```
+
+`systemctl --user start babysit-housekeeping.service` runs it now, and
+`journalctl --user -u babysit-housekeeping.service` shows what it did. `--check`
+warns when the timer is not active.
+
+At 90% use, babysit-bwrap refuses every new sandboxed launch on that disk and says
+why. Without the refusal, an agent would only find out from `ENOSPC` partway through
+its run. The dashboard's Auto placement stops choosing the worker at the same point.
+To change the threshold, set `BABYSIT_DISK_LIMIT` (a percentage, or `off`) in the
+environment the launcher runs in.
+
+To find what housekeeping looks at, babysit-bwrap writes a record on each launch to
+`~/.cache/babysit-sandbox/index/`, which no sandbox can see:
+
+- `index/keys/<cache>`: the cache's agent configuration and grants. The file's time is
+  that cache's last launch.
+- `index/scratch/<id>`: the checkout of each scratch directory.
+
 The deployed copy is kept apart from `~/src`, where agents work: babysit-bwrap
 refuses to grant `~/.local/share/babysit-pr`, its own checkout and that checkout's
 git directory, so no agent can change the launcher or what git runs in it. Agents
@@ -291,7 +340,23 @@ so without them, worker agents run without your rules. Copy the controller's
 `~/.codex/AGENTS.md`. Use real files, not links, because babysit-bwrap refuses links
 there. In the copy, inline any `@` import, drop or adapt instructions that name
 helpers or paths the worker lacks, and point sandboxed agents at
-`$BABYSIT_ARTIFACT_DIR` for files meant for you. Helpers in `~/.local/bin` are on
+`$BABYSIT_ARTIFACT_DIR` for files meant for you. Also tell them where large data goes,
+for example:
+
+```markdown
+## Disk use
+
+- Put large runtime data (Nextflow, Galaxy or planemo work directories, reference
+  data, test outputs) in `$BABYSIT_SCRATCH`, not in `$XDG_CACHE_HOME` or the checkout.
+  It persists across sessions and is removed with the checkout.
+- In a Galaxy checkout, the virtualenv is `$GALAXY_VIRTUAL_ENV`, not `.venv`: activate
+  it with `. "$GALAXY_VIRTUAL_ENV/bin/activate"`, and run `make` with
+  `VENV="$GALAXY_VIRTUAL_ENV"`.
+- Run containers with `docker run --rm` unless you need the stopped container, and
+  label images you build and want to keep with `--label keep`.
+```
+
+Helpers in `~/.local/bin` are on
 the sandbox's PATH (read-only). A Matrix token in `~/.config/matrix-commander` is
 bound read-only into every sandbox, like `~/.config/gh`, so any worker agent can read
 it. Claude's auto-memory stays on the

@@ -15,6 +15,8 @@ import threading
 import time
 from pathlib import Path
 
+import placement
+
 # Display order; a merged item takes the first group any of its reasons belongs to.
 GROUPS = (
     ("answer", "Answer an agent"),
@@ -385,11 +387,15 @@ class Feed:
         if not (snapshot or {}).get("enabled"):
             return
         for row in snapshot.get("workspaces") or []:
-            # A worker's rows are listed on the Workspaces tab only, until they can be acted on.
-            if row.get("machine"):
+            # A worker's rows are listed on the Workspaces tab only, except the two that only
+            # a person can settle there: work left behind on a finished item, and a checkout
+            # that is broken. Its agents are reported by the workspace scans.
+            if row.get("machine") and row.get("status") not in {"decide", "broken"}:
                 continue
             agents = row.get("agents") or []
-            reasons = self.agent_reasons([a.get("status") for a in agents])
+            reasons = (
+                [] if row.get("machine") else self.agent_reasons([a.get("status") for a in agents])
+            )
             links = [
                 link
                 for link in row.get("links") or []
@@ -403,7 +409,7 @@ class Feed:
                 reasons.append(
                     reason("workspace_ready", "tidy", "Its items are closed: ready to clean up")
                 )
-            elif row.get("status") == "blocked" and settled:
+            elif row.get("status") in {"blocked", "decide"} and settled:
                 blockers = "; ".join(b.get("text", "") for b in row.get("blockers") or [])
                 reasons.append(
                     reason("workspace_blocked", "tidy", f"Its items are closed, but: {blockers}")
@@ -412,6 +418,9 @@ class Feed:
                 reasons.append(
                     reason("workspace_missing", "tidy", "Its checkout is gone: close the workspace")
                 )
+            elif row.get("status") == "broken":
+                text = "; ".join(b.get("text", "") for b in row.get("blockers") or [])
+                reasons.append(reason("workspace_broken", "tidy", f"Broken worktree: {text}"))
             link = next((link for link in links if link.get("url")), None)
             key = str(row.get("key") or "")
             self.add(
@@ -432,6 +441,31 @@ class Feed:
                 workspace_id=(row.get("workspace_ids") or [None])[0],
                 agent={"status": row.get("agent_status")} if row.get("agent_status") else None,
                 **({"cleanup": cleanup} if cleanup else {}),
+            )
+
+    def machines(self, snapshot):
+        """A machine whose disk fills up: its own item, on the Workspaces tab, which shows
+        what uses the disk and cleans up checkouts. A worker refuses sandboxed launches
+        once full (babysit-bwrap's BABYSIT_DISK_LIMIT)."""
+        for machine in (snapshot or {}).get("machines") or []:
+            disk = machine.get("disk") or {}
+            percent = disk.get("percent")
+            if not isinstance(percent, int) or percent < placement.DISK_WARN:
+                continue
+            free = f"{disk.get('free', 0) / 2**30:.0f} GiB free"
+            if percent >= placement.DISK_FULL and not machine.get("local"):
+                text = f"Disk {percent}% full ({free}): new sandboxed launches are refused"
+                found = reason("disk_full", "unblock", text)
+            else:
+                found = reason("disk_low", "tidy", f"Disk {percent}% full ({free})")
+            report = disk.get("report") or {}
+            self.add(
+                f"machine:{machine.get('id')}",
+                [found],
+                ["workspaces"],
+                kind="machine",
+                title=f"{machine.get('label') or machine.get('id')} disk",
+                since=epoch(report.get("generated_at")),
             )
 
     def scheduled(self, snapshot, now):
@@ -567,6 +601,7 @@ def collect(
     workspace_overview=None,
     scheduled=None,
     cron=None,
+    machines=None,
     now=None,
     triage=None,
 ):
@@ -582,6 +617,7 @@ def collect(
         ("workspace_overview", workspace_overview),
         ("scheduled", scheduled),
         ("cron", cron),
+        ("machines", machines),
     ):
         if callable(provider):
             values[name], sources[name] = source(name, provider)
@@ -610,6 +646,7 @@ def collect(
     feed.workspaces(values["workspace_overview"])
     feed.scheduled(values["scheduled"], now)
     feed.cron(values["cron"])
+    feed.machines(values["machines"])
     return feed.result(now, sources, triage)
 
 

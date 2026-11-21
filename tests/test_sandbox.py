@@ -481,12 +481,18 @@ def environment(home, bwrap="path", **extra):
     """
     path = os.environ["PATH"] if bwrap is None else f"{FAKE_BWRAP / bwrap}:{os.environ['PATH']}"
     base = {"PATH": path, "HOME": str(home), "TERM": "dumb", "LANG": "C"}
+    # A launch on a nearly full test machine must not be refused (tested on its own).
+    extra = {"BABYSIT_DISK_LIMIT": "off", **extra}
     return {**base, "USER": "fixture", "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
 
 def sandbox_cache(home, config_var="", config_dir="", granted=""):
     key = hashlib.sha256(f"{config_var}\0{config_dir}\0{granted}".encode()).hexdigest()[:16]
     return str(home / ".cache/babysit-sandbox" / key)
+
+
+def scratch_id(worktree):
+    return hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
 
 
 def run_wrapper(cwd, env, *options, stdin=subprocess.DEVNULL):
@@ -592,6 +598,8 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
         "npm_config_cache": f"{cache}/npm",
         "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/ms-playwright",
         "BABYSIT_ARTIFACT_DIR": f"{cache}/artifacts",
+        "BABYSIT_SCRATCH": f"{cache}/scratch/{scratch_id(worktree)}",
+        "GALAXY_VIRTUAL_ENV": f"{cache}/scratch/{scratch_id(worktree)}/galaxy-venv",
         "CLAUDE_CONFIG_DIR": str(account),
     }
     assert not any("docker" in word for word in argv)
@@ -1790,6 +1798,93 @@ def test_the_outbox_leads_to_the_persistent_artifacts(checkout):
     assert (f"{sandbox_cache(home)}/artifacts", outbox) in pairs(argv, "--symlink")
     # Made in the empty home, so it must come after the bind that provides it.
     assert argv.index(str(home)) < argv.index(outbox)
+
+
+def test_the_checkout_gets_a_scratch_directory_in_its_cache(checkout, tmp_path):
+    worktree, common, home = checkout
+    argv = printed(worktree, environment(home), f"--add-dirs={worktree}:{common}", "true")
+    cache = sandbox_cache(home)
+    scratch = f"{cache}/scratch/{scratch_id(worktree)}"
+    # Made inside the namespace once the cache is bound, never through it from outside.
+    assert argv[argv.index(scratch) - 3 : argv.index(scratch) + 1] == [
+        "--perms",
+        "0700",
+        "--dir",
+        scratch,
+    ]
+    assert argv.index(scratch) > argv.index(cache)
+    env = dict(pairs(argv, "--setenv"))
+    assert env["BABYSIT_SCRATCH"] == scratch
+    assert env["GALAXY_VIRTUAL_ENV"] == f"{scratch}/galaxy-venv"
+    # The same checkout from a subdirectory; none when working outside every grant.
+    (worktree / "lib").mkdir()
+    again = printed(worktree / "lib", environment(home), f"--add-dirs={worktree}", "true")
+    assert dict(pairs(again, "--setenv"))["BABYSIT_SCRATCH"] == scratch
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    outside = printed(elsewhere, environment(home), f"--add-dirs={worktree}", "true")
+    assert "BABYSIT_SCRATCH" not in dict(pairs(outside, "--setenv"))
+    assert not any("/scratch/" in word for word in outside)
+
+
+@pytest.mark.parametrize(
+    ("limit", "used", "refused_at"),
+    [(None, "89", False), (None, "90", True), ("95", "93", False), ("off", "100", False)],
+)
+def test_a_launch_is_refused_while_the_disk_is_nearly_full(checkout, limit, used, refused_at):
+    worktree, common, home = checkout
+    env = environment(home)
+    if limit is None:
+        del env["BABYSIT_DISK_LIMIT"]
+    else:
+        env["BABYSIT_DISK_LIMIT"] = limit
+    options = (f"--disk-used={used}", f"--add-dirs={worktree}:{common}", "true")
+    if refused_at:
+        message = refused(worktree, env, *options)
+        assert f"refusing to start: the disk holding {home} is {used}% full" in message
+        assert "BABYSIT_DISK_LIMIT" in message
+    else:
+        printed(worktree, env, *options)
+
+
+def test_the_disk_limit_and_its_test_hook_are_checked(checkout):
+    worktree, common, home = checkout
+    env = {**environment(home), "BABYSIT_DISK_LIMIT": "most"}
+    assert "must be a percentage or off" in refused(worktree, env, "true")
+    result = subprocess.run(
+        ["bash", WRAPPER, "--disk-used=10", "true"],
+        cwd=worktree,
+        env=environment(home),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2 and "--disk-used only applies with --print-argv" in result.stderr
+
+
+@fd_bash
+@util_linux
+def test_a_launch_records_its_cache_and_checkout_for_housekeeping(checkout, tmp_path):
+    worktree, common, home = checkout
+    fake = tmp_path / "launching-bwrap"
+    fake.mkdir()
+    (fake / "bwrap").write_text("#!/bin/sh\nexit 0\n")
+    (fake / "bwrap").chmod(0o755)
+    env = environment(home)
+    env["PATH"] = f"{fake}:{os.environ['PATH']}"
+    result = subprocess.run(
+        ["bash", WRAPPER, f"--add-dirs={worktree}:{common}", "--", "agent"],
+        cwd=worktree,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    index = home / ".cache/babysit-sandbox/index"
+    key = Path(sandbox_cache(home)).name
+    assert (index / "keys" / key).read_text() == "configuration -\ngrants -\n"
+    assert (index / "scratch" / scratch_id(worktree)).read_text() == f"{worktree}\n"
+    assert stat.S_IMODE(index.stat().st_mode) == 0o700
 
 
 def sandbox_runs(home):

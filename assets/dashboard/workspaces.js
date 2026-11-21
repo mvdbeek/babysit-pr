@@ -11,10 +11,14 @@
     ready: ["Ready to clean up", "green"],
     active: ["Open work", "blue"],
     unlinked: ["No linked item", "amber"],
+    decide: ["Needs a decision", "amber"],
     blocked: ["Needs an override", "amber"],
     protected: ["Protected", "red"],
     missing: ["Checkout missing", "amber"],
+    broken: ["Broken worktree", "red"],
   };
+  // How each automatic cleanup result reads in the tab's summary.
+  const OUTCOMES = { done: "cleaned up", skipped: "skipped", kept: "kept", failed: "failed" };
   let snapshot = null;
   let busy = false;
   let pending = null;
@@ -121,6 +125,10 @@
     const cell = node("td", undefined, "ws-local");
     if (row.missing) {
       cell.append(node("span", "Checkout no longer exists"));
+      return cell;
+    }
+    if (row.broken) {
+      cell.append(node("span", "Not a Git checkout"));
       return cell;
     }
     if (row.changes === null) {
@@ -236,7 +244,7 @@
   // read through that workspace. A worker's rows are keyed by machine and read there.
   function viewTarget(entry) {
     const own = entry.machine ? `m:${entry.machine}:${entry.path}` : entry.path;
-    const scanned = entry.key === own && !entry.missing;
+    const scanned = entry.key === own && !entry.missing && !entry.broken;
     if (!scanned && !entry.workspace_ids.length) return null;
     return {
       id: entry.key,
@@ -357,10 +365,15 @@
       ? "No workspace matches these filters."
       : "No worktrees or herdr workspaces were found.";
     const ready = rows().filter((entry) => entry.status === "ready").length;
+    const decide = rows().filter((entry) => entry.status === "decide").length;
+    const broken = rows().filter((entry) => entry.status === "broken").length;
     line.textContent =
       `${data.loading ? "Scanning… " : ""}${data.stale ? "Stale inventory — " : ""}` +
-      `${rows().length} workspaces, ${ready} ready to clean up. ` +
-      `Observed ${date(data.synced_at)}. Local state is verified again before anything is removed.`;
+      `${rows().length} workspaces, ${ready} ready to clean up` +
+      (decide ? `, ${decide} need a decision` : "") +
+      (broken ? `, ${broken} broken` : "") +
+      `. Observed ${date(data.synced_at)}. Local state is verified again before anything is removed.`;
+    renderAuto(data.auto_cleanup);
     const notices = byId("ws-notices");
     notices.replaceChildren();
     for (const warning of [data.error, ...(data.warnings || [])].filter(Boolean).slice(0, 6)) {
@@ -376,6 +389,50 @@
     byId("ws-cleanup").disabled = selected.size === hidden || Boolean(running());
     window.workspaceViewer?.listChanged();
     renderDialog();
+  }
+  // Automatic cleanup: what it takes, when it last looked and what that batch did.
+  function renderAuto(auto) {
+    const box = byId("ws-auto");
+    box.hidden = !auto || (!auto.enabled && !auto.error);
+    if (box.hidden) return;
+    const state = JSON.stringify(auto);
+    if (box.dataset.state === state) return;
+    box.dataset.state = state;
+    const parts = [];
+    if (auto.enabled) {
+      parts.push(
+        `Automatic cleanup removes, once a day, workspaces that need no override and whose items have been closed for ${auto.after_days} day(s).`,
+      );
+    }
+    const last = auto.last;
+    if (last) {
+      const counts = {};
+      for (const item of last.items) counts[item.status] = (counts[item.status] || 0) + 1;
+      const outcome = last.items.length
+        ? Object.entries(counts)
+            .map(([status, count]) => `${count} ${OUTCOMES[status] || status}`)
+            .join(", ")
+        : "nothing to clean up";
+      parts.push(`Last looked ${date(last.started_at)}: ${outcome}.`);
+    }
+    if (auto.enabled) {
+      parts.push(
+        auto.next_run
+          ? `Next look after ${date(auto.next_run)}.`
+          : "Next look after the next scan.",
+      );
+    }
+    box.replaceChildren(node("p", parts.join(" ")));
+    if (auto.error) box.append(node("p", auto.error, "alert"));
+    if (last && last.items.length) {
+      const details = node("details");
+      details.append(node("summary", `Workspaces of the last automatic cleanup`));
+      for (const item of last.items) {
+        const where = item.machine_label ? ` (${item.machine_label})` : "";
+        details.append(node("small", `${item.name}${where}: ${item.status}. ${item.message}`));
+      }
+      box.append(details);
+    }
   }
   function running() {
     return snapshot && snapshot.cleanup && snapshot.cleanup.status === "running"
@@ -474,12 +531,16 @@
       byId("ws-cancel").textContent = "Cancel";
       return;
     }
+    const active = job && job.status === "running";
     byId("ws-dialog-title").textContent =
-      job && job.status === "running" ? "Cleaning up…" : "Cleanup results";
-    byId("ws-dialog-intro").textContent =
-      job && job.status === "running"
-        ? "Each workspace is revalidated, then cleaned up one at a time."
-        : "The inventory below is rescanned automatically.";
+      job && job.automatic
+        ? `Automatic cleanup${active ? ": cleaning up…" : " results"}`
+        : active
+          ? "Cleaning up…"
+          : "Cleanup results";
+    byId("ws-dialog-intro").textContent = active
+      ? "Each workspace is revalidated, then cleaned up one at a time."
+      : "The inventory below is rescanned automatically.";
     for (const result of results()) {
       const item = node("div", undefined, "ws-target");
       item.append(node("strong", names.get(result.key) || result.key));

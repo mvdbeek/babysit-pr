@@ -176,13 +176,31 @@ def provenance(path, common, branch, sha, config, remotes):
     }
 
 
-def clone_worktrees(git, root, wanted=None, config=None):
+def broken_worktree(fields, path):
+    """Why a registered worktree is no checkout any more, or None while it still is one.
+
+    Git marks an unlocked entry whose checkout is gone prunable, and `git gc` drops it in
+    time; a locked one (babysit locks those it makes beside bwrap agents) is never marked
+    and never pruned, so a directory that is gone or holds no `.git` is noticed here.
+    """
+    if "prunable" in fields:
+        return f"Git can prune it: {fields['prunable'] or 'its checkout is gone'}"
+    if not path.is_dir():
+        return "Its directory is gone, but its registration is locked against pruning"
+    if not os.path.lexists(path / ".git"):
+        return "Its directory has no .git; it is no longer a Git checkout"
+    return None
+
+
+def clone_worktrees(git, root, wanted=None, config=None, broken=None):
     """The clone at ``root`` and its attached worktrees, or None when not a wanted clone.
 
     Three Git calls per clone replace five per worktree: the shared config supplies
     remotes and branch upstreams, ``worktree list`` supplies every path, head and
     branch. Bare, detached and prunable entries are skipped, as ``checkout`` skips them.
     ``wanted`` of None accepts every clone, for callers that inventory all of them.
+    Registered worktrees that are no checkout any more are added to the list ``broken``
+    when one is given, each with its path, branch, common directory and why.
     """
     config = repo_config(git, root) if config is None else config
     remotes = remote_slugs(config)
@@ -198,24 +216,32 @@ def clone_worktrees(git, root, wanted=None, config=None):
     if Path(toplevel).resolve() != root:
         return None
     common = Path(common).resolve()
-    items = []
+    items, found = [], []
     for record in records:
         fields = dict(
             line.split(" ", 1) if " " in line else (line, "") for line in record.split("\0") if line
         )
-        if (
-            "worktree" not in fields
-            or "bare" in fields
-            or "prunable" in fields
-            or not fields.get("branch", "").startswith("refs/heads/")
-        ):
+        if "worktree" not in fields or "bare" in fields:
             continue
         path = Path(fields["worktree"]).resolve()
-        if not path.is_dir():
+        branch = fields.get("branch", "")
+        if path != root and (why := broken_worktree(fields, path)):
+            found.append(
+                {
+                    "path": str(path),
+                    "branch": branch.removeprefix("refs/heads/") or None,
+                    "common": str(common),
+                    "reason": why,
+                }
+            )
             continue
-        branch = fields["branch"].removeprefix("refs/heads/")
+        if not branch.startswith("refs/heads/") or not path.is_dir():
+            continue
+        branch = branch.removeprefix("refs/heads/")
         items.append(provenance(path, common, branch, fields.get("HEAD", ""), config, remotes))
     main = next((item for item in items if item["path"] == str(root)), None)
+    if main and broken is not None:
+        broken.extend(found)
     return (main, items) if main else None
 
 
@@ -551,10 +577,12 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
 
     def survey(root):
         config = repo_config(git, root)
-        return root, config, clone_worktrees(git, root, None, config)
+        broken: list[dict] = []
+        return root, config, clone_worktrees(git, root, None, config, broken), broken
 
-    clones, checkouts, bare = [], {}, []
-    for root, config, result in parallel_map(survey, found):
+    clones, checkouts, bare, broken = [], {}, [], []
+    for root, config, result, damaged in parallel_map(survey, found):
+        broken.extend(damaged[:MAX_WORKTREES])
         if not result:
             if bare_checkout(git, root):
                 bare.append(str(root))
@@ -584,6 +612,7 @@ def inventory(git, files, cwd_of, src, roots, repo_roots, opened):
         "updates": updates,
         "paths": paths,
         "bare": bare,
+        "broken": broken,
     }
 
 
@@ -2018,6 +2047,140 @@ def _host_clone(clone, repo, create=False):
     return clone, tracking, os.path.realpath(common)
 
 
+# The sandbox cache and disk use ------------------------------------------------
+#
+# babysit-bwrap keeps each agent configuration's caches in ``SANDBOX_CACHE/<key>``, with a
+# scratch directory per checkout at ``<key>/scratch/<id>``, and records in ``index/``
+# (which no sandbox sees) the checkout each scratch directory belongs to. Removing a
+# checkout removes its scratch directories (``remove_scratch``); housekeeping.py removes
+# the rest of what is no longer used and writes ``DISK_REPORT``, which the placement
+# state carries to the controller.
+
+SANDBOX_CACHE = "~/.cache/babysit-sandbox"
+DISK_REPORT = "~/.local/state/babysit-pr/disk-usage.json"
+MAX_DISK_REPORT = 512 * 1024
+CACHE_KEY = re.compile(r"[0-9a-f]{16}")
+
+
+def scratch_id(path):
+    """The scratch directory name of the checkout at ``path``, as babysit-bwrap names it."""
+    return hashlib.sha256(os.path.realpath(path).encode()).hexdigest()[:16]
+
+
+def open_directory(name, dir_fd=None):
+    """A descriptor of directory ``name`` that never follows a link to reach it."""
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+
+
+def remove_at(parent, name):
+    """Remove ``name`` in directory descriptor ``parent`` and everything beneath it.
+
+    Agents write what this removes, so every step goes by descriptor and never follows a
+    link: a link is removed, not what it leads to. Read-only directories (Go's module
+    cache) are made writable first, as babysit-bwrap's own scrub does. False when there
+    was nothing to remove.
+    """
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent)
+        return True
+    directory = open_directory(name, parent)
+    try:
+        os.fchmod(directory, 0o700)
+        for entry in os.listdir(directory):
+            remove_at(directory, entry)
+    finally:
+        os.close(directory)
+    os.rmdir(name, dir_fd=parent)
+    return True
+
+
+def sandbox_keys(root):
+    """The cache keys in the sandbox cache at descriptor ``root``."""
+    return sorted(name for name in os.listdir(root) if CACHE_KEY.fullmatch(name))
+
+
+def remove_scratch(path, home=None):
+    """Remove the scratch directories of the checkout at ``path`` from every cache, and
+    its index entry; how many there were. Nothing outside the sandbox cache is touched."""
+    name = scratch_id(path)
+    try:
+        root = open_directory(os.path.expanduser(home or SANDBOX_CACHE))
+    except OSError:
+        return 0
+    removed = 0
+    try:
+        for key in sandbox_keys(root):
+            try:
+                cache = open_directory(key, root)
+            except OSError:
+                continue
+            try:
+                scratch = open_directory("scratch", cache)
+            except OSError:
+                os.close(cache)
+                continue
+            try:
+                removed += remove_at(scratch, name)
+            finally:
+                os.close(scratch)
+                os.close(cache)
+        with contextlib.suppress(OSError):
+            index = open_directory("index", root)
+            try:
+                scratches = open_directory("scratch", index)
+                try:
+                    remove_at(scratches, name)
+                finally:
+                    os.close(scratches)
+            finally:
+                os.close(index)
+    finally:
+        os.close(root)
+    return removed
+
+
+def disk_usage(path="~"):
+    """The filesystem holding ``path``: its size and free bytes, and its use as ``df``
+    rounds it, the figure babysit-bwrap refuses launches by."""
+    found = os.statvfs(os.path.expanduser(path))
+    used = (found.f_blocks - found.f_bfree) * found.f_frsize
+    free = found.f_bavail * found.f_frsize
+    total = used + free
+    return {
+        "size": found.f_blocks * found.f_frsize,
+        "free": free,
+        "percent": math.ceil(used * 100 / total) if total else 0,
+    }
+
+
+def disk_report(path=DISK_REPORT):
+    """housekeeping.py's last report, or None while there is none to read."""
+    try:
+        directory = open_directory(os.path.dirname(os.path.expanduser(path)))
+    except OSError:
+        return None
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(os.path.basename(path), flags, dir_fd=directory), "rb") as stream:
+            data = stream.read(MAX_DISK_REPORT + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(directory)
+    if len(data) > MAX_DISK_REPORT:
+        return None
+    try:
+        report = json.loads(data)
+        validate_disk_report(report)
+    except ValueError:
+        return None
+    return report
+
+
 def _host_placement_state(src):
     """Each clone directly under ``src`` by its name there, with its GitHub remotes and
     worktrees, in one round trip: what Auto needs to keep launches beside a clone.
@@ -2055,7 +2218,10 @@ def _host_placement_state(src):
             ],
         }
 
-    return {"clones": [clone for clone in parallel_map(survey, names) if clone]}
+    return {
+        "clones": [clone for clone in parallel_map(survey, names) if clone],
+        "disk": {**disk_usage(), "report": disk_report()},
+    }
 
 
 def _host_version(babysit_root):
@@ -2691,7 +2857,9 @@ def _host_remove(root, path, force, branch, safe):
     # Also of a tree that was gone before: its registration would hold the branch, and no
     # prune clears one that is locked.
     host_git(root, "worktree", "remove", *removal_flags(records[named]), named, timeout=300)
-    result = {"worktree": worktree, "branch": None, "detail": None}
+    # What its sandboxed agents kept beside it goes with it (babysit-bwrap's scratch).
+    scratch = remove_scratch(real)
+    result = {"worktree": worktree, "branch": None, "detail": None, "scratch": scratch}
     if branch is None:
         return result
     if records[named].get("branch") != f"refs/heads/{branch}":
@@ -4564,9 +4732,21 @@ def _constant(name):
 def validate_inventory(value):
     """Check a worker's inventory answer field by field before the controller reads it."""
     _expect(isinstance(value, dict), "not an object")
-    _expect(set(value) == {"roots", "clones", "states", "updates", "paths", "bare"}, "fields")
+    fields = {"roots", "clones", "states", "updates", "paths", "bare"}
+    _expect(set(value) in (fields, fields | {"broken"}), "fields")
     _expect(isinstance(value["roots"], list) and all(map(_absolute, value["roots"])), "roots")
     _expect(isinstance(value["bare"], list) and all(map(_absolute, value["bare"])), "bare")
+    _expect(isinstance(value.setdefault("broken", []), list), "broken")
+    for entry in value["broken"]:
+        _expect(
+            isinstance(entry, dict)
+            and set(entry) == {"path", "branch", "common", "reason"}
+            and _absolute(entry["path"])
+            and _absolute(entry["common"])
+            and (entry["branch"] is None or _text(entry["branch"]))
+            and _text(entry["reason"]),
+            "broken worktree",
+        )
     _expect(isinstance(value["clones"], list), "clones")
     for clone in value["clones"]:
         _expect(isinstance(clone, dict) and set(clone) == {"main", "items", "config"}, "clone")
@@ -4834,9 +5014,71 @@ def validate_cron_checkout(value):
     return value
 
 
+def _size(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**63
+
+
+def _when(value):
+    return value is None or (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 <= value <= LATEST_TIME
+    )
+
+
+def validate_disk(value):
+    """A filesystem's size, free bytes and use, with housekeeping's last report or None."""
+    _expect(isinstance(value, dict) and set(value) == {"size", "free", "percent", "report"}, "disk")
+    _expect(_size(value["size"]) and _size(value["free"]), "disk size")
+    _expect(_size(value["percent"]) and value["percent"] <= 100, "disk use")
+    if value["report"] is not None:
+        validate_disk_report(value["report"])
+    return value
+
+
+def validate_disk_report(value):
+    """housekeeping.py's report: what each sandbox cache, scratch directory and checkout
+    uses, what Docker keeps, and what its last run removed, each list bounded."""
+    fields = {"generated_at", "caches", "worktrees", "docker", "removed", "errors"}
+    _expect(isinstance(value, dict) and set(value) == fields, "report")
+    _expect(_when(value["generated_at"]) and value["generated_at"] is not None, "report time")
+    caches = value["caches"]
+    _expect(isinstance(caches, list) and len(caches) <= 200, "caches")
+    for cache in caches:
+        keys = {"key", "bytes", "configuration", "grants", "last_used", "scratch"}
+        _expect(isinstance(cache, dict) and set(cache) == keys, "cache")
+        _expect(isinstance(cache["key"], str) and CACHE_KEY.fullmatch(cache["key"]), "cache key")
+        _expect(_size(cache["bytes"]) and _when(cache["last_used"]), "cache size")
+        _expect(cache["configuration"] is None or _text(cache["configuration"]), "configuration")
+        _expect(_text(cache["grants"]), "grants")
+        _expect(isinstance(cache["scratch"], list) and len(cache["scratch"]) <= 100, "scratch")
+        for item in cache["scratch"]:
+            _expect(isinstance(item, dict) and set(item) == {"worktree", "bytes"}, "scratch")
+            _expect(item["worktree"] is None or _absolute(item["worktree"]), "scratch checkout")
+            _expect(_size(item["bytes"]), "scratch size")
+    for name, limit in (("worktrees", 100), ("removed", 200)):
+        items = value[name]
+        _expect(isinstance(items, list) and len(items) <= limit, name)
+        for item in items:
+            keys = {"path", "bytes"} | ({"why"} if name == "removed" else set())
+            _expect(isinstance(item, dict) and set(item) == keys, name)
+            _expect(_absolute(item["path"]) and _size(item["bytes"]), name)
+            _expect(name != "removed" or _text(item["why"]), "why")
+    docker = value["docker"]
+    _expect(docker is None or (isinstance(docker, list) and len(docker) <= 10), "docker")
+    for item in docker or []:
+        _expect(isinstance(item, dict) and set(item) == {"type", "size", "reclaimable"}, "docker")
+        _expect(all(_text(item[key]) for key in item), "docker")
+    errors = value["errors"]
+    _expect(isinstance(errors, list) and len(errors) <= 50, "errors")
+    _expect(all(_text(error) for error in errors), "errors")
+    return value
+
+
 def validate_placement_state(value):
-    """A worker's clones by name with their remotes and worktrees, bounded."""
-    _expect(isinstance(value, dict) and set(value) == {"clones"}, "fields")
+    """A worker's clones by name with their remotes and worktrees, bounded, and its disk."""
+    _expect(isinstance(value, dict) and set(value) == {"clones", "disk"}, "fields")
+    validate_disk(value["disk"])
     clones = value["clones"]
     _expect(isinstance(clones, list) and len(clones) <= MAX_CLONES, "clones")
     for clone in clones:
@@ -4998,7 +5240,9 @@ def validate_resolve(value):
 
 
 def validate_remove(value):
-    _expect(isinstance(value, dict) and set(value) == {"worktree", "branch", "detail"}, "fields")
+    fields = {"worktree", "branch", "detail", "scratch"}
+    _expect(isinstance(value, dict) and set(value) == fields, "fields")
+    _expect(_size(value["scratch"]) and value["scratch"] <= 1000, "scratch")
     _expect(value["worktree"] in {"removed", "missing"}, "worktree")
     _expect(value["branch"] in {None, "deleted", "kept"}, "branch")
     _expect(_optional_text(value["detail"]), "detail")

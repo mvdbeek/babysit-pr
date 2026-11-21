@@ -30,6 +30,10 @@ LOCAL_SLOTS = 20
 # always on the machine a person names for it.
 KINDS = {"pr", "issue", "sentry", "scratch", "cron", "directory"}
 WORKER_KINDS = {"pr", "scratch", "cron", "directory"}
+# A worker's disk use, in percent, at which its babysit-bwrap refuses to launch (its
+# BABYSIT_DISK_LIMIT default), and at which the dashboard starts to warn.
+DISK_FULL = 90
+DISK_WARN = 80
 # The capability label a sandboxed agent needs, by operating system.
 SANDBOX = {"darwin": "safehouse", "linux": "bwrap"}
 
@@ -120,6 +124,7 @@ def exclusions(req, machines, loads, reservations, now):
         job_clone = (
             cloned(load, req["repo"]) if req.get("kind") == "cron" and req.get("repo") else True
         )
+        disk = (load.get("disk") or {}).get("percent") or 0
         if not machine.enabled:
             excluded[machine_id] = Exclusion("disabled", False)
         elif since is not None and not stale and now - since > LOAD_TTL:
@@ -130,6 +135,9 @@ def exclusions(req, machines, loads, reservations, now):
             excluded[machine_id] = Exclusion("only takes pull request work and new tasks", False)
         elif machine_id != LOCAL and req.get("kind") == "cron" and not req.get("sandboxed", True):
             excluded[machine_id] = Exclusion("runs jobs only in their sandbox", False)
+        elif machine_id != LOCAL and disk >= DISK_FULL:
+            # Its babysit-bwrap would refuse the launch; housekeeping or a person frees room.
+            excluded[machine_id] = Exclusion(f"disk {disk}% full", False)
         elif machine_id != LOCAL and job_clone is False:
             # Launches clone a missing repository; a cron job needs its clone already.
             # Listed up to minutes ago, so a person may still choose it by name.

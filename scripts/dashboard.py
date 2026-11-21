@@ -629,6 +629,9 @@ class DashboardServer(ThreadingHTTPServer):
             ),
             scheduled=self.workspaces.scheduled_tasks if self.workspaces else None,
             cron=self.cron.snapshot if self.cron else None,
+            machines=(
+                (lambda: {"machines": self.workspaces.loads.disks()}) if self.workspaces else None
+            ),
             triage=self.triage,
         )
 
@@ -2145,6 +2148,7 @@ def serve(
         notifications.start()
         workspaces.start()
         archiver.start()
+        workspace_overview.start()
         url = f"http://127.0.0.1:{server.server_port}"
         print(
             f"Babysitter dashboard: {url}\nReading {home}\nPress Ctrl-C to close the dashboard; monitoring continues.",

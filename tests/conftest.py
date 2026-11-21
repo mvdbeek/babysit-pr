@@ -12,6 +12,7 @@ from pathlib import Path
 
 import hc_panes
 import pytest
+import remote_probe
 import safe_git
 import sandbox
 
@@ -404,6 +405,14 @@ def herdr_terminals(monkeypatch):
 def hc_terminals(monkeypatch):
     """This machine keeps its terminals in herdr-core (the fake ``hc``)."""
     monkeypatch.setenv("BABYSIT_TERMINALS", "hc")
+
+
+@pytest.fixture(autouse=True)
+def own_sandbox_cache(monkeypatch, tmp_path_factory):
+    """Removing a checkout never looks for its scratch directories in this machine's own
+    sandbox cache; the housekeeping tests point it at their fake home again."""
+    cache = tmp_path_factory.mktemp("sandbox-cache")
+    monkeypatch.setattr(remote_probe, "SANDBOX_CACHE", str(cache))
 
 
 @pytest.fixture(autouse=True)

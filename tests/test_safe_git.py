@@ -259,7 +259,9 @@ def plant_driver(clone, marker, name, config):
 
 
 def remove(row, force):
-    stub = type("Stub", (), {"progress": lambda *args: None})()
+    stub = type(
+        "Stub", (), {"progress": lambda *args: None, "remove_scratch": lambda *args: None}
+    )()
     workspace_overview.WorkspaceOverview.remove_worktree(stub, {}, 0, row, [], force)
 
 

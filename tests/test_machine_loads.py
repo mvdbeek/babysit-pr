@@ -83,6 +83,9 @@ def test_loads_come_from_each_machines_herdr_and_isolate_failures(
     # Nothing is known yet; the answer never waited for herdr.
     assert first["mini"]["synced_at"] is None and first["mini"]["agents"] == 0
     assert first["mini"]["pending"] is True
+    # This machine's disk is its state directory's, and it has no housekeeping report.
+    disk = first["local"].pop("disk")
+    assert set(disk) == {"size", "free", "percent", "report"} and disk["report"] is None
     assert first["local"] == {
         "workspaces": 3,
         "agents": 2,

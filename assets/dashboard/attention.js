@@ -5,7 +5,13 @@
   // Tabs whose badge counts the items listed here; Scheduled and Cron keep their own.
   const BADGED = ["watcher", "prs", "issues", "workspaces"];
   const TONES = { answer: "red", review: "green", unblock: "amber", tidy: "", start: "blue" };
-  const KINDS = { pr: "PR", issue: "Issue", branch: "Branch", cron: "Cron job" };
+  const KINDS = {
+    pr: "PR",
+    issue: "Issue",
+    branch: "Branch",
+    cron: "Cron job",
+    machine: "Machine",
+  };
   const WATCH = {
     watching: "Watching",
     running: "Repairing",

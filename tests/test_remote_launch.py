@@ -825,13 +825,63 @@ def test_a_workers_placement_state_lists_the_clones_in_its_src(host, monkeypatch
     assert state(src=str(home / "missing"))["clones"] == []
     with pytest.raises(ValueError, match="absolute paths"):
         state(src="src")
+    # Its disk, and housekeeping's report of what uses it once there is one.
+    disk = state()["disk"]
+    assert 0 <= disk["percent"] <= 100 and 0 < disk["free"] < disk["size"]
+    assert disk["report"] is None
+    report = {
+        "generated_at": 1.0,
+        "caches": [],
+        "worktrees": [{"path": str(path), "bytes": 4096}],
+        "docker": None,
+        "removed": [],
+        "errors": [],
+    }
+    written = home / ".local/state/babysit-pr/disk-usage.json"
+    written.parent.mkdir(parents=True)
+    written.write_text(json.dumps(report))
+    assert state()["disk"]["report"] == report
+    # One that does not validate is left out rather than failing the placement state.
+    written.write_text(json.dumps({**report, "errors": [3]}))
+    assert state()["disk"]["report"] is None
 
 
 def test_a_malformed_placement_state_is_refused(monkeypatch):
     item = {"path": "/h/src/repo", "branch": "main", "sha": "a" * 40, "upstream": None}
     clone = {"name": "repo", "remotes": ["base/repo"], "worktrees": [item]}
-    good = {"clones": [clone]}
+    disk = {"size": 100, "free": 40, "percent": 60, "report": None}
+    good = {"clones": [clone], "disk": disk}
     assert remote_probe.validate_placement_state(good) == good
+    cache = {
+        "key": "0" * 16,
+        "bytes": 1,
+        "configuration": "/h/.claude",
+        "grants": "-",
+        "last_used": 1.0,
+        "scratch": [{"worktree": None, "bytes": 0}],
+    }
+    report = {
+        "generated_at": 1.0,
+        "caches": [cache],
+        "worktrees": [{"path": "/h/src/repo", "bytes": 1}],
+        "docker": [{"type": "Images", "size": "1GB", "reclaimable": "0B"}],
+        "removed": [{"path": "/h/x", "bytes": 1, "why": "gone"}],
+        "errors": ["x"],
+    }
+    assert remote_probe.validate_placement_state({**good, "disk": {**disk, "report": report}})
+    bad_disks = [
+        {**disk, "percent": 101},
+        {**disk, "free": -1},
+        {**disk, "report": {**report, "generated_at": None}},
+        {**disk, "report": {**report, "caches": [{**cache, "key": "../x"}]}},
+        {**disk, "report": {**report, "caches": [{**cache, "scratch": [{"worktree": "x"}]}]}},
+        {**disk, "report": {**report, "worktrees": [{"path": "relative", "bytes": 1}]}},
+        {**disk, "report": {**report, "removed": [{"path": "/h/x", "bytes": 1}]}},
+        {**disk, "report": {**report, "docker": "48GB"}},
+    ]
+    for bad in bad_disks:
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_placement_state({**good, "disk": bad})
     bad_items = [
         {**item, "path": "src/repo"},
         {**item, "sha": "main"},
@@ -848,8 +898,9 @@ def test_a_malformed_placement_state_is_refused(monkeypatch):
         {**clone, "extra": 1},
     ]
     for bad in (
-        *({"clones": [c]} for c in bad_clones),
-        {"clones": [clone, clone]},
+        *({"clones": [c], "disk": disk} for c in bad_clones),
+        {"clones": [clone, clone], "disk": disk},
+        {"clones": [clone]},
         {**good, "extra": 1},
         [],
     ):
