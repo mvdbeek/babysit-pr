@@ -12,7 +12,7 @@ Create `experiments/workspaces/config.json` under the dashboard's `--home` direc
 }
 ```
 
-Optional keys: `src` (the directory scanned for clones, `~/src` by default) and `roots` (extra clone paths outside it). Configuration is read at dashboard startup. The experiment does no scanning and no network work when disabled. The existing authenticated `gh` executable needs read access to the repositories you work in; `herdr` is read through its socket API.
+Optional keys: `src` (the directory scanned for clones, `~/src` by default), `roots` (extra clone paths outside it) and `auto_cleanup` (see [Automatic cleanup](#automatic-cleanup)). Configuration is read at dashboard startup. The experiment does no scanning and no network work when disabled. The existing authenticated `gh` executable needs read access to the repositories you work in; `herdr` is read through its socket API.
 
 ## What is listed
 
@@ -88,7 +88,9 @@ A checkout is matched to the pull request and issue it belongs to, from evidence
 
 Each result is shown with its state: **Open**, **Draft**, **Closed**, or **Merged**, linked to GitHub. A checkout with no match shows _None found_, and one whose lookup has not completed yet shows _Checking GitHub…_. Matching is a strong hint, not proof: a branch can be reused, and a fork can carry several pull requests for one branch (the newest wins). The 20 newest pull requests from a branch name, across all forks, are read at once; when other forks fill all 20, the owner's own pull request is looked up exactly instead.
 
-Row status combines that with local state. **Ready to clean up** means every matched item is closed or merged and nothing blocks removal. **Open work** means at least one matched item is still open. **Needs an override** means something would be lost. **Protected** means the workspace can never be removed here.
+Row status combines that with local state. **Ready to clean up** means every matched item is closed or merged and nothing blocks removal. **Open work** means at least one matched item is still open. **Needs a decision** means every matched item is closed or merged, but the checkout still holds uncommitted changes or commits only its branch has: keep them, push them, or remove the workspace anyway. **Needs an override** means something else would be lost. **Protected** means the workspace can never be removed here. **Broken worktree** means a worktree Git still has registered is no checkout any more (see below).
+
+A registered worktree whose directory is gone, or holds no `.git`, is listed as a broken worktree with what is wrong and the commands that drop its registration (`git worktree unlock`, then `git worktree prune`, in its clone). Git prunes an unlocked one by itself in time; one babysit locked beside a bwrap agent stays until someone does. Nothing here removes a broken worktree, views its files or offers it for cleanup: its directory may hold files no Git knows about. A worker's broken worktrees are listed the same way.
 
 ## What blocks a cleanup
 
@@ -99,6 +101,8 @@ Local state is read without touching it: `git status --porcelain` for uncommitte
 - an agent still `working` or `blocked` in that workspace
 - local state that could not be verified
 - a clone's own checkout, where only the herdr workspace is closed
+
+Needs you lists a workspace that needs a decision, and a broken worktree, on any machine; a worker's other workspaces are listed on this tab only.
 
 Two conditions can never be overridden: a checkout an **unfinished watch** is using (cancel the watch in the Watcher tab first) and a herdr workspace whose checkout lies outside the scanned clones. Watches marked `closed` or `stopped` remain in history but no longer protect their checkout; paused, blocked, and running watches still do, including a repair finishing after cancellation. A cleanup target whose clone is not one the scan reaches is refused outright, however the request arrives, so the blast radius is never wider than the list. Everything recorded here is re-read immediately before anything is removed, so a stale selection is never acted on; a workspace that changed in the meantime is skipped or fails rather than removed on old evidence.
 
@@ -114,6 +118,21 @@ Selected workspaces are cleaned up one at a time, under the same per-clone lock 
 A worker's row is cleaned up on that worker, never a disabled one. Its herdr listings are read again there (a listing that fails stops the cleanup), and one probe re-reads the row's clone, which must be among the worker's own scanned roots. Its agents and workspaces are reached with `herdr --machine=<label>`, and a second probe removes the worktree and branch: the worker checks again that the path is a worktree `git worktree list` names for that clone, neither its own checkout nor inside its Git directory, runs the clean check with its hardened Git unless uncommitted changes or unknown state were approved, deletes the tree without following any symlink in it before Git drops its registration, and deletes the branch only while that worktree had it checked out (a name starting with `-` is never deleted, here or there). A locked worktree (`git worktree lock`) is refused before anything is deleted, on this machine as on a worker; the lock babysit puts on the checkouts it makes beside bwrap agents (`supervisor.md`, Permissions and scope) is not one, and is overridden. The per-clone lock is held on this machine, keyed by the machine and the clone's real path on the worker: the same lock the launches, resumes and scheduled agent tasks on that worker hold until their agent is typed. Once a cleanup holds it, the row is read again and skipped if anything changed meanwhile, on this machine too: approval is by kind of blocker, so a workspace or agent pane the first read did not show skips the row as well.
 
 Clones, remote branches, transcripts, and the watcher queue are never touched. A failure stops that workspace and the batch continues with the next one; each result keeps its own status, message, and steps. Progress is in memory only: a dashboard restart during a batch loses the report, not the work, and the next scan shows what actually remains. One batch runs at a time, with at most 50 workspaces per batch; requesting another while one runs is refused, reported in the dialog, and leaves the selection intact. An unexpected failure is recorded against its own workspace and the batch continues.
+
+## Automatic cleanup
+
+Off unless the configuration turns it on:
+
+```json
+{
+  "enabled": true,
+  "auto_cleanup": { "enabled": true, "after_days": 3 }
+}
+```
+
+`after_days` (0 to 365, 3 by default) is how long every item a checkout is matched to must have been merged or closed. Once a day, at the end of a scan, the rows a plain cleanup would remove with no override form one batch, which runs exactly as one started from the tab: on this machine and on workers, one at a time, each re-read under its clone's lock first. A row qualifies only when its status is **Ready to clean up**: no uncommitted changes, no commits only its branch has, no agent working, no unfinished watch, not a clone's own checkout. Idle agents are asked to exit and their workspaces closed, as in any batch. Rows whose GitHub lookups are stale, whose worker did not answer the last scan, and items cached before their closing time was recorded (closed items are looked up again within six hours) wait. At most 50 workspaces go in one day's batch; the rest wait for the next day. Rows that **Need a decision** are never taken; they are listed for you, and in Needs you.
+
+The look never starts while another cleanup runs: it waits for the next scan. Since scans otherwise run only while the tab is open, the dashboard asks for one every ten minutes while a look is due. The tab says when the last look was, what its batch did with each workspace, and when the next is due; the time of the last look and its outcome are kept in `experiments/workspaces/auto-cleanup.json` (mode 0600), so a restart does not look again early. An unreadable `auto_cleanup` value keeps it off and says so on the tab.
 
 ## Refresh, limits, and failure states
 

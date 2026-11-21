@@ -328,9 +328,11 @@ def test_the_removal_probe_outlasts_its_git_calls():
 
 
 @pytest.fixture
-def clone(tmp_path):
+def clone(tmp_path, monkeypatch):
     clone = tmp_path / "src" / "repo"
     make_clone(clone, ["topic", "other"])
+    # Removal also removes the checkout's scratch directories: from a sandbox cache here.
+    monkeypatch.setattr(remote_probe, "SANDBOX_CACHE", str(tmp_path / "sandbox-cache"))
     return clone
 
 
@@ -360,7 +362,7 @@ def test_remove_runs_the_hardened_clean_check_unless_forced(clone):
         remote_probe._host_remove(str(clone), str(topic), False, "topic", True)
     assert topic.is_dir()
     done = remote_probe._host_remove(str(clone), str(topic), True, "topic", True)
-    assert done == {"worktree": "removed", "branch": "deleted", "detail": None}
+    assert done == {"worktree": "removed", "branch": "deleted", "detail": None, "scratch": 0}
     assert remote_probe.validate_remove(done) == done
     assert not topic.exists() and "topic" not in branches(clone)
 
@@ -412,7 +414,7 @@ def test_remove_overrides_the_lock_a_checkout_was_made_with(clone):
         remote_probe._host_remove(str(clone), str(topic), False, "topic", True)
     (topic / "new.txt").unlink()
     done = remote_probe._host_remove(str(clone), str(topic), False, "topic", True)
-    assert done == {"worktree": "removed", "branch": "deleted", "detail": None}
+    assert done == {"worktree": "removed", "branch": "deleted", "detail": None, "scratch": 0}
     assert not topic.exists() and str(topic) not in git("worktree", "list", cwd=clone)
 
 
@@ -422,8 +424,21 @@ def test_remove_unregisters_a_locked_checkout_whose_tree_is_already_gone(clone):
     remote_probe.shutil.rmtree(topic)
     # Locked, no prune would clear it, and it would hold its branch and its path.
     done = remote_probe._host_remove(str(clone), str(topic), False, "topic", True)
-    assert done == {"worktree": "missing", "branch": "deleted", "detail": None}
+    assert done == {"worktree": "missing", "branch": "deleted", "detail": None, "scratch": 0}
     assert str(topic) not in git("worktree", "list", cwd=clone)
+
+
+def test_remove_takes_the_checkouts_scratch_directories_with_it(clone, tmp_path):
+    topic = clone.parent / "worktrees" / "repo" / "topic"
+    name = remote_probe.scratch_id(topic)
+    caches = tmp_path / "sandbox-cache"
+    for key in ("a" * 16, "b" * 16):
+        (caches / key / "scratch" / name / "galaxy-venv").mkdir(parents=True)
+    other = caches / ("a" * 16) / "scratch" / remote_probe.scratch_id(topic.with_name("other"))
+    other.mkdir()
+    done = remote_probe._host_remove(str(clone), str(topic), True, "topic", True)
+    assert done["scratch"] == 2 and remote_probe.validate_remove(done) == done
+    assert not list(caches.glob(f"*/scratch/{name}")) and other.is_dir()
 
 
 def test_remove_refuses_the_main_checkout_named_from_a_linked_worktree(clone):
@@ -492,7 +507,9 @@ def test_malformed_resolve_answers_are_refused(clone, change):
     "answer",
     [
         {"worktree": "removed", "branch": None},
-        {"worktree": "gone", "branch": None, "detail": None},
+        {"worktree": "removed", "branch": None, "detail": None},
+        {"worktree": "removed", "branch": None, "detail": None, "scratch": -1},
+        {"worktree": "gone", "branch": None, "detail": None, "scratch": 0},
         {"worktree": "removed", "branch": "maybe", "detail": None},
         {"worktree": "removed", "branch": "kept", "detail": 3},
     ],

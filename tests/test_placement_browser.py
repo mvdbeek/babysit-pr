@@ -621,3 +621,65 @@ def test_change_agent_does_not_start_when_quit_is_uncertain(page, site):
     expect(page.locator("#workspace-error")).to_contain_text("Check the pane in Collie")
     expect(button).to_be_disabled()
     assert not sent
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_workspaces_show_what_uses_each_machines_disk(page, site, dashboard_site, width):
+    url, snapshot, _, _, _ = site
+    register_workers(dashboard_site[1])
+    gib = 2**30
+    report = {
+        "generated_at": time.time() - 3 * 3600,
+        "caches": [
+            {
+                "key": "4aaa12cdaae531ab",
+                "bytes": 69 * gib,
+                "configuration": "/home/babysit/.claude/accounts/psu",
+                "grants": "docker",
+                "last_used": time.time() - 600,
+                "scratch": [
+                    {"worktree": "/home/babysit/src/worktrees/galaxy/fix", "bytes": 2 * gib}
+                ],
+            }
+        ],
+        "worktrees": [{"path": "/home/babysit/src/worktrees/galaxy/fix", "bytes": 5 * gib}],
+        "docker": [{"type": "Images", "size": "48.2GB", "reclaimable": "40GB (83%)"}],
+        "removed": [
+            {
+                "path": "/home/babysit/.cache/babysit-sandbox/4aaa12cdaae531ab/bacass-runtime",
+                "bytes": 12 * gib,
+                "why": "not a tool cache, and unchanged for 7 days",
+            }
+        ],
+        "errors": ["bwrap is not installed; tool caches were not pruned"],
+    }
+    disk = {"size": 385 * gib, "free": 34 * gib, "percent": 91, "report": report}
+    snapshot["machines"] = [
+        {**LOCAL, "disk": {"size": 500 * gib, "free": 300 * gib, "percent": 40, "report": None}},
+        {**BOX, "error": None, "available": False, "reason": "disk 91% full", "disk": disk},
+    ]
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#workspaces")
+    expect(page.locator("#ws-machines .badge")).to_have_text(
+        ["This machine · 2 agents", "Linux box · disk 91% full"]
+    )
+    # Only a machine with a report or a nearly full disk is listed, folded.
+    disks = page.locator("#ws-disk details")
+    expect(disks).to_have_count(1)
+    summary = disks.locator("summary")
+    expect(summary).to_contain_text("Linux box: disk 91% full")
+    expect(summary).to_contain_text("34 GiB free of 385 GiB · housekeeping 3h ago")
+    expect(summary.locator(".badge")).to_have_class("badge red")
+    summary.click()
+    rows = disks.locator("tr")
+    expect(rows.nth(0)).to_contain_text("psu +docker (4aaa12cdaae531ab)69 GiBused 10m ago")
+    expect(rows.nth(1)).to_contain_text("scratch: galaxy/fix2.0 GiB")
+    expect(rows.nth(2)).to_contain_text("galaxy/fix5.0 GiB")
+    expect(rows.nth(3)).to_contain_text("Images48.2GBreclaimable 40GB (83%)")
+    expect(rows.nth(4)).to_contain_text("12 GiBnot a tool cache, and unchanged for 7 days")
+    expect(disks.locator(".ci-error")).to_have_text(report["errors"])
+    # Opened stays open across the machines' next refresh.
+    page.evaluate("renderMachines()")
+    expect(page.locator("#ws-disk details")).to_have_attribute("open", "")
+    assert page.evaluate("document.documentElement.scrollWidth") <= width
+    page.screenshot(path=f"reports/disk-use-{width}.png")

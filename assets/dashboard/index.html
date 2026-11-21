@@ -646,6 +646,7 @@
             </button>
           </div>
         </div>
+        <div id="ws-disk" aria-label="Disk use" hidden></div>
         <div class="pr-filters">
           <label for="ws-repo"
             >Repository
@@ -660,9 +661,11 @@
               <option value="ready">Ready to clean up</option>
               <option value="active">Open pull request or issue</option>
               <option value="unlinked">No linked item</option>
+              <option value="decide">Needs a decision</option>
               <option value="blocked">Needs an override</option>
               <option value="protected">Protected</option>
               <option value="missing">Checkout missing</option>
+              <option value="broken">Broken worktree</option>
               <option value="agents">Has an agent</option>
             </select>
           </label>
@@ -678,6 +681,7 @@
           </button>
         </div>
         <p id="ws-status-line" class="pr-sync" role="status">Loading your workspaces…</p>
+        <div id="ws-auto" class="pr-sync" hidden></div>
         <div id="ws-notices" role="status"></div>
         <div class="ws-batch">
           <label><input id="ws-all" type="checkbox" /> Select all shown</label>

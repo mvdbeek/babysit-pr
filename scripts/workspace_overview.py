@@ -7,6 +7,7 @@ worktree, delete the local branch. It never starts an agent, pushes, or repairs
 anything, and its collection and cleanup failures stay inside this experiment.
 """
 
+import calendar
 import concurrent.futures
 import contextlib
 import copy
@@ -78,6 +79,13 @@ MAX_REMOTE_AGENTS = 1000
 MAX_REMOTE_TEXT = 4096
 EXIT_WAIT = 5
 CACHE_VERSION = 1
+# Opt-in automatic cleanup: how often it looks, how long an item must have been merged or
+# closed (unless configured), and how often a quiet dashboard is asked for a scan to act on.
+AUTO_FILE = "auto-cleanup.json"
+AUTO_INTERVAL = 86400
+AUTO_AFTER_DAYS = 3
+AUTO_POLL = 600
+MAX_AUTO_STATE = 256 * 1024
 WORKING = {"working", "blocked"}
 # A cleanup override approves these by kind, so a changed count is not a new blocker
 # but a newly appeared condition is, and is never swept along by one tick.
@@ -86,6 +94,8 @@ OVERRIDABLE = {"main", "dirty", "unpushed", "agent", "unknown", "detached"}
 # approval must not sweep away what it writes until its workspace closes.
 CLEAN_OVERRIDES = {"dirty", "unknown"}
 CLOSED = {"closed", "merged"}
+# Blockers that are local work a person must keep or let go of.
+DECISIONS = {"dirty", "unpushed"}
 ISSUE_NAME = re.compile(r"^issue-(\d+)(?:-|$)")
 PR_NAME = re.compile(r"^pr-([A-Za-z0-9][A-Za-z0-9-]*?)-(\d+)(?:-\d+)?$")
 # A branch name cleanup deletes; one starting with `-` would read as an option.
@@ -206,10 +216,12 @@ def link_record(kind, value, base):
             "url": None,
             "state": "none",
             "draft": False,
+            "closed_at": None,
         }
     pull = value.get("pull_request") if kind == "issue" else None
     # A single pull request carries `merged`; list entries and issues carry `merged_at`.
-    merged = bool(value.get("merged") or value.get("merged_at") or (pull or {}).get("merged_at"))
+    merged_at = value.get("merged_at") or (pull or {}).get("merged_at")
+    merged = bool(value.get("merged") or merged_at)
     state = "merged" if merged else str(value.get("state") or "unknown").lower()
     return {
         "kind": "pr" if kind == "pr" or pull else "issue",
@@ -219,11 +231,26 @@ def link_record(kind, value, base):
         "url": value.get("html_url"),
         "state": state,
         "draft": bool(value.get("draft")),
+        # When it was merged or closed, which automatic cleanup waits on; None while open
+        # and for entries cached before this was recorded, which no cleanup takes.
+        "closed_at": github_time(merged_at or value.get("closed_at")) if state in CLOSED else None,
     }
 
 
-PULL_FIELDS = "__typename number title url state isDraft headRepositoryOwner { login }"
-ISSUE_FIELDS = "__typename number title url state"
+def github_time(value):
+    """Seconds since the epoch of a GitHub ISO-8601 timestamp; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+PULL_FIELDS = (
+    "__typename number title url state isDraft closedAt mergedAt headRepositoryOwner { login }"
+)
+ISSUE_FIELDS = "__typename number title url state closedAt"
 
 
 def lookup_query(targets):
@@ -263,6 +290,8 @@ def graph_link(node, base):
         "html_url": node.get("url"),
         "state": node.get("state"),
         "merged": node.get("state") == "MERGED",
+        "merged_at": node.get("mergedAt"),
+        "closed_at": node.get("closedAt"),
         "draft": node.get("isDraft"),
     }
     return link_record("pr" if pull else "issue", value, base)
@@ -352,12 +381,73 @@ def link_ttl(link):
 
 
 def row_status(row):
-    if row["blockers"]:
-        return "blocked" if row["removable"] else "protected"
     links = [link for link in row["links"] if link["state"] not in {"none", "unknown", "error"}]
+    settled = bool(links) and all(link["state"] in CLOSED for link in links)
+    if row["blockers"]:
+        if not row["removable"]:
+            return "protected"
+        # Done with on GitHub, yet holding work only this checkout has: neither automatic
+        # cleanup nor a plain batch removes it, so it is listed for a decision instead.
+        kinds = {item["kind"] for item in row["blockers"]}
+        return "decide" if settled and kinds & DECISIONS else "blocked"
     if not links:
         return "unlinked"
-    return "ready" if all(link["state"] in CLOSED for link in links) else "active"
+    return "ready" if settled else "active"
+
+
+def auto_config(value):
+    """The ``auto_cleanup`` configuration: off unless ``enabled`` is exactly true.
+
+    A value it cannot read keeps it off and says why, rather than guess at a deletion.
+    """
+    found = {"enabled": False, "after_days": AUTO_AFTER_DAYS, "error": None}
+    if value is None:
+        return found
+    days = value.get("after_days", AUTO_AFTER_DAYS) if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) - {"enabled", "after_days"}
+        or not isinstance(value.get("enabled", False), bool)
+        or isinstance(days, bool)
+        or not isinstance(days, (int, float))
+        or not 0 <= days <= 365
+    ):
+        return {
+            **found,
+            "error": "auto_cleanup needs enabled (true or false) and after_days (0-365)",
+        }
+    return {**found, "enabled": value.get("enabled") is True, "after_days": days}
+
+
+def load_auto_state(directory):
+    """When automatic cleanup last looked and what it did; empty when never or unreadable."""
+    try:
+        path = directory / AUTO_FILE
+        if not path.exists() or path.stat().st_size > MAX_AUTO_STATE:
+            return {}
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict) or not isinstance(value.get("last_run"), (int, float)):
+        return {}
+    return {"last_run": value["last_run"], "last": value.get("last")}
+
+
+def write_private(directory, name, payload):
+    """``payload`` as ``directory/name``, mode 0600, through a temporary file and a rename."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=directory, suffix=".tmp", delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+        try:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary.replace(directory / name)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 class WorkspaceOverview:
@@ -388,6 +478,9 @@ class WorkspaceOverview:
         # many scans in a row each has failed.
         self.retry: dict[str, float] = {}
         self.failures: dict[str, int] = {}
+        # Automatic cleanup, off unless the configuration turns it on, and what it last did.
+        self.auto = auto_config(None)
+        self.auto_state: dict = {"last_run": None, "last": None, "error": None}
         try:
             config_path = self.directory / "config.json"
             if not config_path.exists():
@@ -399,6 +492,9 @@ class WorkspaceOverview:
             if src is None and isinstance(self.config.get("src"), str):
                 self.src = Path(self.config["src"]).expanduser()
             self.roots = [Path(p).expanduser() for p in self.config.get("roots") or []]
+            self.auto = auto_config(self.config.get("auto_cleanup"))
+            if self.enabled and self.auto["enabled"]:
+                self.auto_state = {**self.auto_state, **load_auto_state(self.directory)}
             cache_path = self.directory / "cache.json"
             if self.enabled and cache_path.exists() and cache_path.stat().st_size <= MAX_STATE:
                 cache = json.loads(cache_path.read_text())
@@ -455,6 +551,7 @@ class WorkspaceOverview:
                 "loading": self.loading,
                 "error": self.error,
                 "cleanup": copy.deepcopy(self.job),
+                "auto_cleanup": self.auto_snapshot(),
                 "stale": bool(
                     self.value.get("synced_at")
                     and (self.error or time.time() - self.value["synced_at"] >= INTERVAL)
@@ -488,6 +585,11 @@ class WorkspaceOverview:
                 publish=self.publish_row, local_done=lambda value: complete(value, False)
             )
             complete(value, True)
+            try:
+                self.auto_cleanup()
+            except Exception as exc:  # The inventory itself is fine; only the look failed.
+                with self.lock:
+                    self.auto_state["error"] = f"Automatic cleanup failed: {exc}"
         except Exception as exc:
             with self.lock:
                 self.error = f"Workspace inventory failed: {exc}"
@@ -549,19 +651,7 @@ class WorkspaceOverview:
             with self.lock:
                 self.error = "Workspace cache exceeded its size limit; it was not saved"
             return
-        self.directory.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=self.directory, suffix=".tmp", delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            try:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-                temporary.replace(self.directory / "cache.json")
-            finally:
-                temporary.unlink(missing_ok=True)
+        write_private(self.directory, "cache.json", payload)
 
     def spaces(self, warnings, machine=None, timeout=HERDR_TIMEOUT):
         try:
@@ -588,15 +678,22 @@ class WorkspaceOverview:
         )
 
     def inventory(self, warnings):
-        """Every clone's worktrees plus the herdr workspaces and agents attached to them."""
+        """Every clone's worktrees plus the herdr workspaces and agents attached to them,
+        and the registered worktrees that are no checkout any more."""
         spaces = self.spaces(warnings)
         agents = self.agents(warnings)
         roots = self.scanned_roots(spaces)
         ordered = sorted(roots)
+
+        def survey(root):
+            broken: list[dict] = []
+            return remote_probe.clone_worktrees(git, root, broken=broken), broken
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            found = list(pool.map(clone_worktrees, ordered))
-        clones, checkouts = {}, {}
-        for root, result in zip(ordered, found, strict=True):
+            found = list(pool.map(survey, ordered))
+        clones, checkouts, broken = {}, {}, []
+        for root, (result, damaged) in zip(ordered, found, strict=True):
+            broken.extend(damaged)
             if not result:
                 if remote_probe.bare_checkout(git, root):
                     warnings.append(remote_probe.bare_warning(root))
@@ -605,7 +702,7 @@ class WorkspaceOverview:
             clones[main["path"]] = main
             for item in items:
                 checkouts[item["path"]] = item
-        return clones, checkouts, spaces, agents
+        return clones, checkouts, spaces, agents, broken
 
     def base_repo(self, clone, budget, warnings, config=None, key=None):
         """The repository pull requests target: an `upstream` remote, or origin's parent.
@@ -756,7 +853,7 @@ class WorkspaceOverview:
         self.parents = subtask_parents(self.home)
         # Workers scan in their own threads while this machine scans as it always has.
         scans = self.start_scans(self.remote_machines(warnings))
-        clones, checkouts, spaces, agents = self.inventory(warnings)
+        clones, checkouts, spaces, agents, broken = self.inventory(warnings)
         watched = self.watched_checkouts()
         opened = {
             str(Path(space["worktree"]["checkout_path"]).resolve())
@@ -769,7 +866,7 @@ class WorkspaceOverview:
         selected.sort(key=lambda path: (path not in opened, path))
         budget = Budget(self.fetch)
         updates = transcript_updates(set(selected), self.src.resolve())
-        rows = self.orphan_rows(spaces, agents, checkouts)
+        rows = self.orphan_rows(spaces, agents, checkouts) + self.broken_rows(broken)
         for row in rows:
             if publish:
                 publish(row)
@@ -966,6 +1063,7 @@ class WorkspaceOverview:
             notes.append(f"{label}: inventory truncated to its first {len(states)} checkouts")
         return {
             **found,
+            "broken": (found.get("broken") or [])[:MAX_REMOTE_ROWS],
             "clones": clones,
             "states": states,
             "updates": {path: when for path, when in found["updates"].items() if path in states},
@@ -1131,6 +1229,7 @@ class WorkspaceOverview:
         checkouts = {item["path"]: item for clone in found["clones"] for item in clone["items"]}
         watched = self.watched_checkouts(machine, jobs)
         rows = self.orphan_rows(spaces, agents, checkouts, machine)
+        rows += self.broken_rows(found.get("broken") or [], machine)
         bases: dict = {}
         own: dict[str, tuple] = {}
         pending = []
@@ -1331,6 +1430,47 @@ class WorkspaceOverview:
                 self.on_machine(rows[-1], machine)
         return rows
 
+    def broken_rows(self, entries, machine=None):
+        """Registered worktrees that are no checkout any more: flagged, never touched.
+
+        Nothing here removes one: its directory may hold files no Git knows about, so
+        the row says what is wrong and leaves the decision to whoever reads it.
+        """
+        rows = []
+        for entry in entries:
+            root = str(Path(entry["common"]).parent)
+            hint = f"git -C {root} worktree unlock {entry['path']}; git -C {root} worktree prune"
+            row = {
+                "created_at": None,
+                "updated_at": None,
+                "key": entry["path"],
+                "path": entry["path"],
+                "name": Path(entry["path"]).name,
+                "label": None,
+                "repo": Path(root).name,
+                "repo_root": root,
+                "branch": entry.get("branch"),
+                "sha": "",
+                "main": False,
+                "missing": False,
+                "broken": True,
+                "upstream": None,
+                "workspace_ids": [],
+                "workspace_url": None,
+                "agent_status": None,
+                "agents": [],
+                "changes": None,
+                "unpushed": None,
+                "links": [],
+                "stale_links": False,
+                "blockers": [blocker("broken", f"{entry['reason']}. To drop it: {hint}")],
+                "remove_worktree": False,
+                "removable": False,
+                "status": "broken",
+            }
+            rows.append(self.on_machine(row, machine) if machine else row)
+        return rows
+
     def open_workspace(self, request):
         """Open a listed workspace, creating only its herdr container when absent."""
         key = request.get("key")
@@ -1384,7 +1524,13 @@ class WorkspaceOverview:
             row = next((entry for entry in listed if entry["key"] == key), None)
         if row is not None and row.get("machine"):
             raise ValueError(f"Not available for workspaces on {row['machine_label']} yet")
-        if row is None or row["path"] != key or row["missing"] or not Path(key).is_dir():
+        if (
+            row is None
+            or row["path"] != key
+            or row["missing"]
+            or row.get("broken")
+            or not Path(key).is_dir()
+        ):
             raise ValueError("Unknown workspace; refresh the list")
         return key
 
@@ -1408,6 +1554,7 @@ class WorkspaceOverview:
             or not row.get("machine")
             or key != f"m:{row['machine']}:{row['path']}"
             or row["missing"]
+            or row.get("broken")
         ):
             raise ValueError("Unknown workspace; refresh the list")
         machine = machines.resolve(self.home, row["machine"])
@@ -1415,15 +1562,151 @@ class WorkspaceOverview:
             raise ValueError(f"{row['machine_label']} is disabled")
         return machine, row["path"]
 
+    # Automatic cleanup ---------------------------------------------------------
+
+    def start(self):
+        """With automatic cleanup on, ask for a scan whenever its daily look is due.
+
+        Scans otherwise start only while someone has the tab open; a scan's end is where
+        the look happens (``auto_cleanup``), so a quiet dashboard still gets one a day.
+        """
+        if not (self.enabled and self.auto["enabled"]):
+            return
+
+        def loop():
+            while True:
+                with self.lock:
+                    due = time.time() - (self.auto_state["last_run"] or 0) >= AUTO_INTERVAL
+                if due:
+                    self.snapshot()
+                time.sleep(AUTO_POLL)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def auto_snapshot(self):
+        """What the tab says about automatic cleanup: its settings, last look and outcome."""
+        last_run = self.auto_state["last_run"]
+        return {
+            "enabled": self.auto["enabled"],
+            "after_days": self.auto["after_days"],
+            "error": self.auto["error"] or self.auto_state["error"],
+            "last_run": last_run,
+            # None: at the end of the next scan.
+            "next_run": last_run + AUTO_INTERVAL if self.auto["enabled"] and last_run else None,
+            "last": copy.deepcopy(self.auto_state["last"]),
+        }
+
+    def auto_eligible(self, row, now):
+        """Whether automatic cleanup may take ``row``: one a plain batch removes with no
+        override, whose every item has been merged or closed for ``after_days``.
+
+        Rows whose lookups are stale, whose worker did not answer, or whose items were
+        cached before their closing time was recorded wait for a fresh answer.
+        """
+        links = [
+            link
+            for link in row.get("links") or []
+            if link.get("state") not in {"none", "unknown", "error"}
+        ]
+        after = self.auto["after_days"] * 86400
+        return (
+            row.get("status") == "ready"
+            and not row.get("blockers")
+            and row.get("removable")
+            and row.get("remove_worktree")
+            and not row.get("main")
+            and not row.get("missing")
+            and not row.get("broken")
+            and not row.get("machine_stale")
+            and not row.get("stale_links")
+            and bool(links)
+            and all(
+                link.get("state") in CLOSED
+                and isinstance(link.get("closed_at"), (int, float))
+                and now - link["closed_at"] >= after
+                for link in links
+            )
+        )
+
+    def auto_cleanup(self, now=None):
+        """Once a day after a scan: one batch of every row ``auto_eligible`` allows.
+
+        It approves no blocker, so the batch's own revalidation skips any row that changed
+        since the scan. A batch someone started is never interrupted or queued behind: the
+        look waits for the next scan. Returns the batch started, if any.
+        """
+        if not (self.enabled and self.auto["enabled"]):
+            return None
+        now = time.time() if now is None else now
+        with self.lock:
+            last_run = self.auto_state["last_run"] or 0
+            if now - last_run < AUTO_INTERVAL or (self.job and self.job["status"] == "running"):
+                return None
+            rows = [row for row in self.value["workspaces"] if self.auto_eligible(row, now)]
+        rows = rows[:MAX_TARGETS]  # The rest go in tomorrow's batch.
+        items = [
+            {
+                "key": row["key"],
+                "name": row["name"],
+                "machine_label": row.get("machine_label"),
+                "status": "pending",
+                "message": "Queued",
+            }
+            for row in rows
+        ]
+        # Recorded first: a quick batch may finish before ``cleanup`` returns.
+        with self.lock:
+            previous = self.auto_state["last_run"], self.auto_state["last"]
+            last = {"started_at": now, "finished_at": None if rows else now, "job": None}
+            self.auto_state.update(last_run=now, error=None, last={**last, "items": items})
+        started = None
+        if rows:
+            started = self.cleanup(
+                {"targets": [{"key": row["key"], "approve": []} for row in rows]}, automatic=True
+            )
+            with self.lock:
+                if not started["accepted"]:
+                    self.auto_state["last_run"], self.auto_state["last"] = previous
+                    return None
+                self.auto_state["last"]["job"] = started["cleanup"]["id"]
+        self.save_auto()
+        return started
+
+    def auto_finished(self, job, finished):
+        """Keep what an automatic batch did, for the tab and past a restart."""
+        with self.lock:
+            last = self.auto_state["last"]
+            if not last or last.get("job") not in (None, job["id"]):
+                return
+            outcome = {result["key"]: result for result in job["results"]}
+            last.update(job=job["id"], finished_at=finished)
+            for item in last["items"]:
+                result = outcome.get(item["key"]) or {}
+                item["status"] = result.get("status", "failed")
+                item["message"] = str(result.get("message") or "")[:400]
+        self.save_auto()
+
+    def save_auto(self):
+        with self.lock:
+            payload = json.dumps(
+                {"last_run": self.auto_state["last_run"], "last": self.auto_state["last"]}
+            )
+        try:
+            write_private(self.directory, AUTO_FILE, payload)
+        except OSError as exc:
+            with self.lock:
+                self.auto_state["error"] = f"Automatic cleanup state was not saved: {exc}"
+
     # Cleanup -------------------------------------------------------------------
 
-    def cleanup(self, request, guard=None):
+    def cleanup(self, request, guard=None, automatic=False):
         """Validate and start one batch; a running batch is reported, never queued.
 
         ``guard`` (in-process callers only, for this machine's rows) is asked about each
         row under its clone's lock, before its workspaces close and again before its
         worktree goes: None lets it go on; text keeps the worktree, saying why; a
-        ValueError skips the row, or after the close keeps the worktree.
+        ValueError skips the row, or after the close keeps the worktree. ``automatic``
+        marks a batch ``auto_cleanup`` started, whose outcome it keeps.
         """
         if set(request) - {"id", "action", "targets"}:
             raise ValueError("Invalid cleanup parameters")
@@ -1454,6 +1737,7 @@ class WorkspaceOverview:
                 return {"cleanup": copy.deepcopy(self.job), "accepted": False}
             job = {
                 "id": str(uuid.uuid4()),
+                "automatic": automatic,
                 "status": "running",
                 "started_at": time.time(),
                 "finished_at": None,
@@ -1480,9 +1764,12 @@ class WorkspaceOverview:
                     # Any failure belongs to its own target; the batch continues.
                     self.record(job, index, status="failed", message=str(exc)[-400:] or repr(exc))
         finally:
+            finished = time.time()
+            if job.get("automatic"):
+                self.auto_finished(job, finished)  # Kept before the batch reads as done.
             with self.lock:
                 job["status"] = "complete"
-                job["finished_at"] = time.time()
+                job["finished_at"] = finished
                 self.next_poll = 0.0
 
     def worker_label(self, key):
@@ -1756,6 +2043,7 @@ class WorkspaceOverview:
             # that is locked.
             if named is not None:
                 git(row["repo_root"], "worktree", "remove", *flags, named, timeout=300)
+            self.remove_scratch(job, index, steps, remote_probe.remove_scratch(real))
             return
         self.progress(job, index, steps, f"Removing worktree {row['path']}")
         if not force:
@@ -1773,6 +2061,13 @@ class WorkspaceOverview:
             ):
                 raise ValueError(f"{path} contains submodules; kept")
         git(row["repo_root"], "worktree", "remove", *flags, row["path"], timeout=300)
+        self.remove_scratch(job, index, steps, remote_probe.remove_scratch(real))
+
+    def remove_scratch(self, job, index, steps, removed):
+        """Say that the checkout's scratch directories (babysit-bwrap's) went with it."""
+        if removed:
+            plural = "y" if removed == 1 else "ies"
+            self.progress(job, index, steps, f"Removed {removed} scratch director{plural}")
 
     def delete_branch(self, job, index, row, steps, approved):
         """Delete the branch only when no commit can be lost, and say so when it is kept.
@@ -1825,6 +2120,7 @@ class WorkspaceOverview:
         )
         if done["worktree"] == "missing":
             steps[-1] = "Checkout already removed"
+        self.remove_scratch(job, index, steps, done["scratch"])
         if done["branch"] == "deleted":
             self.progress(job, index, steps, f"Deleted local branch {branch}")
         elif done["branch"] == "kept":

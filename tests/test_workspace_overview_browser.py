@@ -258,6 +258,96 @@ def test_listing_filters_links_keyboard_and_responsive_screenshots(page, site, w
 
 
 @pytest.mark.parametrize("width", [1440, 390])
+def test_decisions_broken_worktrees_and_automatic_cleanup_are_shown(page, site, width):
+    url, plugin, _ = site
+    now = time.time()
+    plugin.value["workspaces"] = [
+        row(
+            "left-behind",
+            links=[link("pr", 7, "merged", "Merged work")],
+            status="decide",
+            unpushed=5,
+            blockers=[{"kind": "unpushed", "text": "5 commit(s) only on this branch"}],
+        ),
+        row(
+            "half-gone",
+            status="broken",
+            broken=True,
+            changes=None,
+            unpushed=None,
+            removable=False,
+            remove_worktree=False,
+            blockers=[
+                {
+                    "kind": "broken",
+                    "text": "Its directory has no .git; it is no longer a Git checkout",
+                }
+            ],
+        ),
+        row("still-open", links=[link("pr", 8, "open")], status="active"),
+    ]
+    plugin.auto = {"enabled": True, "after_days": 3, "error": None}
+    plugin.auto_state = {
+        "last_run": now - 3600,
+        "error": None,
+        "last": {
+            "started_at": now - 3600,
+            "finished_at": now - 3500,
+            "job": "j1",
+            "items": [
+                {
+                    "key": "/a",
+                    "name": "gone-work",
+                    "machine_label": None,
+                    "status": "done",
+                    "message": "Cleaned up",
+                },
+                {
+                    "key": "/b",
+                    "name": "far-work",
+                    "machine_label": "Linux box",
+                    "status": "skipped",
+                    "message": "Skipped: 1 uncommitted change(s)",
+                },
+            ],
+        },
+    }
+    page.set_viewport_size({"width": width, "height": 1000})
+    page.goto(url + "/#workspaces")
+    expect(page.locator("#ws-status-line")).to_contain_text(
+        "3 workspaces, 0 ready to clean up, 1 need a decision, 1 broken"
+    )
+    auto = page.locator("#ws-auto")
+    expect(auto).to_contain_text("closed for 3 day(s)")
+    expect(auto).to_contain_text("1 cleaned up, 1 skipped")
+    auto.get_by_text("Workspaces of the last automatic cleanup").click()
+    expect(auto).to_contain_text("far-work (Linux box): skipped. Skipped: 1 uncommitted change(s)")
+    broken = page.locator("#ws-list tr").filter(has=page.get_by_text("half-gone", exact=True))
+    expect(broken).to_contain_text("Broken worktree")
+    expect(broken).to_contain_text("Not a Git checkout")
+    expect(broken).to_contain_text("no longer a Git checkout")
+    expect(broken.get_by_role("checkbox")).to_be_disabled()
+    expect(broken.get_by_role("button", name="Diff", exact=True)).to_have_count(0)
+    status = page.get_by_role("combobox", name="Filter workspaces by cleanup status")
+    choose_option(status, "decide")
+    expect(page.locator("#ws-list tr")).to_have_count(1)
+    expect(page.locator("#ws-list")).to_contain_text("Needs a decision")
+    expect(page.locator("#ws-list")).to_contain_text("5 commit(s) only on this branch")
+    choose_option(status, "broken")
+    expect(page.locator("#ws-list tr")).to_have_count(1)
+    expect(page.locator("#ws-list")).to_contain_text("half-gone")
+    page.screenshot(path=f"reports/workspaces-decisions-{width}.png", full_page=True)
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+def test_automatic_cleanup_says_nothing_while_it_is_off(page, site):
+    url, _, _ = site
+    page.goto(url + "/#workspaces")
+    expect(page.locator("#ws-status-line")).to_contain_text("5 workspaces")
+    expect(page.locator("#ws-auto")).to_be_hidden()
+
+
+@pytest.mark.parametrize("width", [1440, 390])
 def test_worker_rows_show_their_machine_and_are_not_opened_from_here(page, site, width):
     url, plugin, _ = site
     remote = {"machine": "mini", "machine_label": "Mac mini"}

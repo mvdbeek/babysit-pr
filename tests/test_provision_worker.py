@@ -703,6 +703,41 @@ def test_user_step_runs_the_codex_session_reporter_from_the_deployed_copy(tmp_pa
         assert f"PROBLEM: {UNIT}" not in output and "PROBLEM: could not start" not in output
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="the user step refuses root")
+def test_user_step_schedules_disk_housekeeping_from_the_deployed_copy(tmp_path):
+    fakes = tmp_path / "bin"
+    fakes.mkdir()
+    calls = tmp_path / "calls"
+    for tool in ("git", "npm", "bwrap", "docker", "id"):
+        answer = "echo babysit" if tool == "id" else ""
+        (fakes / tool).write_text(f"#!/bin/sh\n{answer}\n")
+    (fakes / "systemctl").write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\n')
+    for fake in fakes.iterdir():
+        fake.chmod(0o755)
+    home = tmp_path / "home"
+    (home / ".local/share/babysit-pr/app/.git").mkdir(parents=True)
+    (home / ".bashrc").write_text("# Ubuntu's own\n")
+    done = subprocess.run(
+        ["bash", str(SCRIPT), "--user-step", "--sha", "0123abc" * 5 + "01234"],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(home)},
+        timeout=30,
+    )
+    units = home / ".config/systemd/user"
+    service = (units / "babysit-housekeeping.service").read_text()
+    # The deployed copy, beside remote_probe.py, which it imports.
+    assert (
+        "ExecStart=/usr/bin/env python3 -E -s "
+        "%h/.local/share/babysit-pr/app/scripts/housekeeping.py\n" in service
+    ), done.stdout + done.stderr
+    assert "Type=oneshot" in service and "IOSchedulingClass=idle" in service
+    timer = (units / "babysit-housekeeping.timer").read_text()
+    assert "OnCalendar=daily" in timer and "Persistent=true" in timer
+    assert "--user enable --now --quiet babysit-housekeeping.timer" in calls.read_text()
+    assert "ok: babysit-housekeeping.timer frees disk space daily" in done.stdout
+
+
 def test_user_step_dry_run_plans_the_codex_session_reporter(run):
     done = run("--user-step", "--dry-run", "--sha", "0123abc" * 5 + "01234")
     assert done.returncode == 0, done.stderr

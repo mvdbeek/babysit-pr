@@ -195,8 +195,9 @@ activity first, and a group heading collapses its rows:
   day, or an enabled cron job whose last run failed.
 - **Tidy up**: a watch whose pull request merged or closed while its checkout is still
   on disk, a workspace whose linked
-  items are all closed or merged (with the blockers that would stop its cleanup), or a
-  herdr workspace whose checkout is gone.
+  items are all closed or merged (with the blockers that would stop its cleanup, on a
+  worker too when that is work left behind), a herdr workspace whose checkout is gone, or
+  a registered worktree that is no Git checkout any more.
 - **Pick up**: an issue assigned to you with no open linked pull request, no checkout
   and no scheduled task.
 
@@ -524,6 +525,17 @@ lists waiting launches under **Waiting for room**, each with the reason and **Ca
 One that has waited 6 hours, or that can no longer start (its clone or item is gone),
 fails with the reason. Waiting launches survive a dashboard restart. Auto still places a
 person's launch as before, on this machine when nothing else can take it.
+
+### Disk use
+
+A machine's badge beside the Workspaces heading shows its disk once it is 80% full. A
+**Disk** entry under the heading shows what uses it, from the worker's daily
+housekeeping: each sandbox cache with its scratch directories, the largest checkouts,
+Docker, and what housekeeping last removed. From 80%, Needs you lists the machine
+under Tidy up. From 90%, a worker takes no launches: Auto passes it over, it cannot
+be chosen by name, and its babysit-bwrap refuses sandboxed launches started there.
+The [worker setup](references/worker-setup.md#disk-housekeeping) says what
+housekeeping removes and when.
 
 ### Handling several issues
 

@@ -353,14 +353,46 @@ def test_worker_rows_are_cleaned_up_there_but_not_opened_from_here(fleet):
     assert plugin.resolve(key)["key"] == key
 
 
-def test_worker_rows_stay_out_of_needs_you(fleet):
+def test_worker_rows_reach_needs_you_only_when_they_need_a_decision(fleet):
     register(fleet["home"], MINI)
     value = {**wso.WorkspaceOverview(fleet["home"], FakeGitHub()).collect(), "enabled": True}
-    assert "mini" not in json.dumps(attention.collect(workspace_overview=value)["items"])
+    items = attention.collect(workspace_overview=value)["items"]
+    # Its closed pull request left uncommitted work behind: only a person can settle that.
+    dirty = f"m:mini:{fleet['mini'] / 'dirty-work'}"
+    assert [item["cleanup"] for item in items if "mini" in json.dumps(item)] == [[dirty]]
+    assert [r["code"] for item in items for r in item["reasons"]] == ["workspace_blocked"]
     # The same rows from this machine would be cards: a working agent, a missing checkout.
     local = [{k: v for k, v in row.items() if k != "machine"} for row in value["workspaces"]]
     items = attention.collect(workspace_overview={**value, "workspaces": local})["items"]
     assert "workspace:mini:w2" in json.dumps(items)
+
+
+def test_a_workers_broken_worktree_is_flagged_and_reaches_needs_you(fleet):
+    register(fleet["home"], MINI)
+    clone = fleet["mini"].parent.parent / "repo"
+    broken = fleet["mini"] / "locked-gone"
+    git("worktree", "add", "-q", "-b", "locked-gone", str(broken), cwd=clone)
+    git("worktree", "lock", str(broken), cwd=clone)
+    shutil.rmtree(broken)
+    plugin = wso.WorkspaceOverview(fleet["home"], FakeGitHub())
+    plugin.value = plugin.collect()
+    row = by_key(plugin.value)[f"m:mini:{broken}"]
+    assert row["status"] == "broken" and not row["removable"] and row["machine"] == "mini"
+    assert row["blockers"][0]["text"].startswith("Its directory is gone")
+    with pytest.raises(ValueError, match="Unknown workspace"):
+        plugin.worker_checkout(row["key"])
+    items = attention.collect(workspace_overview={**plugin.value, "enabled": True})["items"]
+    assert any(r["code"] == "workspace_broken" for item in items for r in item["reasons"]), items
+
+
+def test_an_inventory_with_a_malformed_broken_entry_is_refused():
+    value = {"roots": [], "clones": [], "states": {}, "updates": {}, "paths": {}, "bare": []}
+    assert remote_probe.validate_inventory(dict(value))["broken"] == []
+    entry = {"path": "/w/x", "branch": None, "common": "/c/.git", "reason": "gone"}
+    assert remote_probe.validate_inventory({**value, "broken": [entry]})["broken"] == [entry]
+    for bad in ({**entry, "path": "rel"}, {**entry, "extra": 1}, {**entry, "reason": 3}):
+        with pytest.raises(ValueError):
+            remote_probe.validate_inventory({**value, "broken": [bad]})
 
 
 # The probe in-process -----------------------------------------------------------
@@ -467,6 +499,7 @@ def test_probe_entry_checks_protocol_op_and_arguments(capsys, tmp_path):
             "updates": {},
             "paths": {},
             "bare": [],
+            "broken": [],
         },
     }
 

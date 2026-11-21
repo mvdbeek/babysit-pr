@@ -113,8 +113,10 @@ class FakeGitHub:
             "title": value["title"],
             "url": value["html_url"],
             "state": "MERGED" if merged else value["state"].upper(),
+            "closedAt": value.get("closed_at") or merged,
         }
         if typename == "PullRequest":
+            node["mergedAt"] = merged
             node["isDraft"] = bool(value.get("draft"))
             node["headRepositoryOwner"] = {"login": owner} if owner else None
         return node
@@ -266,11 +268,13 @@ def test_lists_worktrees_with_links_agents_and_local_state(site):
             "url": f"https://github.com/{BASE}/pull/7",
             "state": "merged",
             "draft": False,
+            "closed_at": wso.github_time("2026-09-01T00:00:00Z"),
         }
     ]
     assert merged["agents"] == [{"agent": "codex", "status": "idle", "pane": "w1:p1"}]
     assert merged["workspace_ids"] == ["w1"] and merged["removable"]
-    assert found["dirty-work"]["status"] == "blocked"
+    # Its pull request is closed, so the change left behind needs a decision.
+    assert found["dirty-work"]["status"] == "decide"
     assert texts(found["dirty-work"]) == ["1 uncommitted change(s)"]
     assert texts(found["unpushed-work"]) == ["1 commit(s) only on this branch"]
     assert found["issue-12-crash"]["links"][0]["number"] == 12
@@ -435,6 +439,7 @@ def test_review_checkout_links_renamed_tracking_branch_after_cached_miss(site, h
             "url": f"https://github.com/{BASE}/pull/9",
             "state": "open",
             "draft": True,
+            "closed_at": None,
         }
     ]
     assert row["status"] == "active" and not row["stale_links"]
@@ -673,6 +678,19 @@ def test_cleanup_exits_agents_closes_the_workspace_and_removes_worktree_and_bran
     assert not Path(target).exists()
     assert "merged-work" not in git("branch", "--format=%(refname:short)").split()
     assert "worktree" in " ".join(results[target]["steps"]).lower()
+
+
+def test_cleanup_takes_the_checkouts_scratch_directories_with_it(site):
+    plugin, _, clone, worktrees, state, git = site
+    target = str(worktrees / "merged-work")
+    caches = Path(wso.remote_probe.SANDBOX_CACHE)
+    name = wso.remote_probe.scratch_id(target)
+    for key in ("a" * 16, "b" * 16):
+        (caches / key / "scratch" / name / "galaxy-venv").mkdir(parents=True)
+    results = finish(plugin, plugin.cleanup({"targets": [{"key": target}]}))
+    assert results[target]["status"] == "done"
+    assert "Removed 2 scratch directories" in results[target]["steps"]
+    assert not list(caches.glob(f"*/scratch/{name}"))
 
 
 def test_cleanup_overrides_the_lock_a_checkout_was_made_with_and_no_other(site):
@@ -942,6 +960,14 @@ def test_disabled_and_missing_configuration_do_no_work(tmp_path):
         "loading": False,
         "error": None,
         "cleanup": None,
+        "auto_cleanup": {
+            "enabled": False,
+            "after_days": wso.AUTO_AFTER_DAYS,
+            "error": None,
+            "last_run": None,
+            "next_run": None,
+            "last": None,
+        },
         "stale": False,
     }
     with pytest.raises(ValueError):
@@ -1101,6 +1127,170 @@ def test_cleanup_revalidates_a_checkout_from_restored_inventory(site):
     assert "uncommitted" in results[str(target)]["message"]
     assert (target / "new-work.txt").exists()
     assert not calls(state, ["workspace", "close"])
+
+
+def automatic(site, after_days=3):
+    """The site's experiment again, with automatic cleanup turned on."""
+    plugin, fake, *_ = site
+    config = read(plugin.directory / "config.json")
+    config["auto_cleanup"] = {"enabled": True, "after_days": after_days}
+    (plugin.directory / "config.json").write_text(json.dumps(config))
+    return wso.WorkspaceOverview(plugin.home, fake)
+
+
+def test_link_records_keep_when_their_item_closed():
+    merged = {"number": 1, "state": "closed", "merged_at": "2026-09-01T00:00:00Z"}
+    closed = {"number": 2, "state": "closed", "closed_at": "2026-09-02T00:00:00Z"}
+    assert wso.link_record("pr", merged, BASE)["closed_at"] == 1788220800
+    assert wso.link_record("issue", closed, BASE)["closed_at"] == 1788307200
+    assert wso.link_record("issue", {**closed, "state": "open"}, BASE)["closed_at"] is None
+    node = {"__typename": "PullRequest", "state": "MERGED", "mergedAt": "2026-09-01T00:00:00Z"}
+    assert wso.graph_link(node, BASE)["closed_at"] == 1788220800
+    assert wso.graph_link({**node, "mergedAt": "yesterday"}, BASE)["closed_at"] is None
+
+
+def test_automatic_cleanup_is_off_unless_configured(site):
+    plugin, *_ = site
+    plugin._refresh()
+    assert plugin.job is None and not plugin.snapshot()["auto_cleanup"]["enabled"]
+    assert not (plugin.directory / wso.AUTO_FILE).exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"enabled": "yes"}, {"enabled": True, "after_days": -1}, {"enabled": True, "other": 1}, []],
+)
+def test_an_unreadable_automatic_cleanup_setting_keeps_it_off(site, value):
+    plugin, fake, *_ = site
+    config = read(plugin.directory / "config.json")
+    (plugin.directory / "config.json").write_text(json.dumps({**config, "auto_cleanup": value}))
+    restarted = wso.WorkspaceOverview(plugin.home, fake)
+    assert restarted.enabled and not restarted.auto["enabled"]
+    assert "auto_cleanup" in restarted.snapshot(start=False)["auto_cleanup"]["error"]
+
+
+def test_automatic_cleanup_takes_only_what_needs_no_override_once_closed_long_enough(site):
+    _, fake, _, worktrees, state, git = site
+    # The issue closed a day ago: not yet three.
+    fake.issues["12"]["closed_at"] = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400)
+    )
+    plugin = automatic(site)
+    plugin._refresh()
+    job = plugin.job
+    assert job["automatic"] and [r["key"] for r in job["results"]] == [
+        str(worktrees / "merged-work")
+    ]
+    results = finish(plugin)
+    assert results[str(worktrees / "merged-work")]["status"] == "done"
+    # The idle agent was asked to exit and its workspace closed, as a batch does.
+    assert calls(state, ["workspace", "close", "w1"])
+    for kept in ("dirty-work", "unpushed-work", "issue-12-crash"):
+        assert (worktrees / kept).exists()
+    auto = plugin.snapshot(start=False)["auto_cleanup"]
+    assert auto["enabled"] and auto["after_days"] == 3
+    assert auto["next_run"] == auto["last_run"] + wso.AUTO_INTERVAL
+    assert [(item["name"], item["status"]) for item in auto["last"]["items"]] == [
+        ("merged-work", "done")
+    ]
+    assert auto["last"]["finished_at"] == job["finished_at"]
+    saved = read(plugin.directory / wso.AUTO_FILE)
+    assert saved["last"]["items"][0]["status"] == "done"
+    assert (plugin.directory / wso.AUTO_FILE).stat().st_mode & 0o777 == 0o600
+
+
+def test_automatic_cleanup_looks_once_a_day_even_past_a_restart(site):
+    plugin = automatic(site, after_days=0)
+    plugin._refresh()
+    finish(plugin)
+    first = plugin.auto_state["last_run"]
+    plugin._refresh()
+    assert plugin.auto_cleanup() is None and plugin.auto_state["last_run"] == first
+    restarted = wso.WorkspaceOverview(plugin.home, plugin.fetch)
+    assert restarted.auto_state["last_run"] == first
+    assert restarted.auto_cleanup() is None
+    # A day later it looks again; with nothing left that qualifies it starts no batch.
+    restarted.value = plugin.value
+    assert restarted.auto_cleanup(now=first + wso.AUTO_INTERVAL) is None
+    assert restarted.auto_state["last_run"] == first + wso.AUTO_INTERVAL
+    assert restarted.auto_state["last"]["items"] == [] and restarted.job is None
+
+
+def test_automatic_cleanup_never_starts_beside_a_manual_batch(site, monkeypatch):
+    plugin = automatic(site)
+    plugin.value = plugin.collect()
+    gate = threading.Event()
+    monkeypatch.setattr(
+        wso.WorkspaceOverview, "remove", lambda *args, **kwargs: gate.wait(timeout=10)
+    )
+    manual = plugin.cleanup({"targets": [{"key": "/nowhere"}]})
+    assert plugin.auto_cleanup() is None and plugin.auto_state["last_run"] is None
+    assert plugin.job["id"] == manual["cleanup"]["id"] and not plugin.job["automatic"]
+    gate.set()
+    finish(plugin)
+    assert plugin.auto_cleanup()["accepted"] and plugin.job["automatic"]
+    finish(plugin)
+
+
+def test_automatic_cleanup_skips_stale_rows_and_links_cached_without_a_closing_time(site):
+    plugin = automatic(site)
+    plugin.value = plugin.collect()
+    row = next(r for r in plugin.value["workspaces"] if r["name"] == "merged-work")
+    now = time.time()
+    assert plugin.auto_eligible(row, now)
+    for change in (
+        {"stale_links": True},
+        {"machine_stale": True},
+        {"links": [{**row["links"][0], "closed_at": None}]},
+        {"links": [{**row["links"][0], "closed_at": now - 86400}]},
+        {"blockers": [wso.blocker("agent", "1 agent(s) still working")], "status": "blocked"},
+    ):
+        assert not plugin.auto_eligible({**row, **change}, now)
+
+
+def test_closed_items_with_local_work_need_a_decision(site):
+    plugin, *_ = site
+    found = rows(plugin)
+    assert found["dirty-work"]["status"] == "decide"
+    # Work only this branch has, on an item still open, merely needs an override.
+    assert found["unpushed-work"]["status"] == "blocked"
+    assert (
+        wso.row_status(
+            {
+                "blockers": [wso.blocker("unpushed", "1 commit(s) only on this branch")],
+                "removable": True,
+                "links": [{"state": "open"}],
+            }
+        )
+        == "blocked"
+    )
+
+
+def test_broken_worktrees_are_flagged_and_never_touched(site):
+    plugin, _, clone, worktrees, _, git = site
+    gone, empty, pruned = (worktrees / name for name in ("gone-dir", "no-git", "pruned"))
+    for path in (gone, empty, pruned):
+        git("worktree", "add", "-b", path.name, str(path))
+    git("worktree", "lock", "--reason", wso.remote_probe.WORKTREE_LOCK, str(gone))
+    git("worktree", "lock", str(empty))
+    subprocess.run(["rm", "-rf", str(gone), str(pruned)], check=True)
+    (empty / ".git").unlink()
+    (empty / "notes.txt").write_text("not in any repository")
+    found = rows(plugin)
+    reasons = {name: texts(found[name])[0] for name in ("gone-dir", "no-git", "pruned")}
+    assert reasons["gone-dir"].startswith("Its directory is gone")
+    assert reasons["no-git"].startswith("Its directory has no .git")
+    assert reasons["pruned"].startswith("Git can prune it")
+    assert all(f"git -C {clone} worktree prune" in text for text in reasons.values())
+    for name in reasons:
+        row = found[name]
+        assert row["status"] == "broken" and row["broken"] and not row["removable"]
+        assert row["repo_root"] == str(clone) and row["branch"] == name
+    plugin.value = plugin.collect()
+    with pytest.raises(ValueError, match="Unknown workspace"):
+        plugin.checkout(str(empty))
+    assert not plugin.auto_eligible(found["no-git"], time.time())
+    assert (empty / "notes.txt").exists()
 
 
 def test_a_refresh_failure_keeps_the_previous_inventory_and_reports_it(site, monkeypatch):

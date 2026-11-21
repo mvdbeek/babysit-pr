@@ -2277,10 +2277,107 @@ function machineName(id) {
 // `available` and `reason` are the server's placement verdict, so the badges and the
 // select refuse exactly the machines a launch would be refused on.
 function machineText(entry) {
-  if (entry.local) return `${entry.label} · ${entry.agents} agents`;
+  if (entry.local) return `${entry.label} · ${entry.agents} agents${diskText(entry)}`;
   if (!entry.available) return `${entry.label} · ${entry.reason}`;
   if (entry.pending) return `${entry.label} · checking…`;
-  return `${entry.label} · ${entry.agents}/${entry.max_agents} busy`;
+  return `${entry.label} · ${entry.agents}/${entry.max_agents} busy${diskText(entry)}`;
+}
+// A worker refuses sandboxed launches from DISK_FULL percent (babysit-bwrap); the
+// dashboard warns from DISK_WARN (placement.py).
+const DISK_WARN = 80;
+const DISK_FULL = 90;
+function diskText(entry) {
+  const percent = entry.disk?.percent;
+  return percent >= DISK_WARN ? ` · disk ${percent}%` : "";
+}
+function bytes(value) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let size = value ?? 0;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit >= 3 && size < 10 ? 1 : 0)} ${units[unit]}`;
+}
+// What uses each machine's disk, from its last housekeeping report (housekeeping.py):
+// sandbox caches with their scratch directories, the largest checkouts, Docker, and
+// what housekeeping removed. A machine without a report shows only a nearly full disk.
+function diskSection(title, rows) {
+  if (!rows.length) return [];
+  const table = el("table", undefined, "ws-disk-table");
+  for (const [name, size, note] of rows) {
+    const row = el("tr");
+    row.append(el("td", name, "ws-disk-name"), el("td", size, "ws-disk-size"));
+    row.append(el("td", note ?? "", "ws-disk-note"));
+    table.append(row);
+  }
+  return [el("h4", title), table];
+}
+function shortPath(path) {
+  return path ? path.split("/").slice(-2).join("/") : "unknown checkout";
+}
+function diskDetails(entry) {
+  const disk = entry.disk;
+  const report = disk.report;
+  const box = el("details", undefined, "ws-disk");
+  box.dataset.machine = entry.id;
+  const tone = disk.percent >= DISK_FULL ? "red" : disk.percent >= DISK_WARN ? "amber" : "";
+  const summary = el("summary");
+  summary.append(
+    el("span", `${entry.label}: disk ${disk.percent}% full`, `badge ${tone}`.trim()),
+    ` ${bytes(disk.free)} free of ${bytes(disk.size)}`,
+    report ? ` · housekeeping ${ago(report.generated_at)}` : "",
+  );
+  box.append(summary);
+  if (!report) {
+    box.append(el("p", "No housekeeping report from this machine yet.", "pr-meta"));
+    return box;
+  }
+  const caches = [];
+  for (const cache of [...report.caches].sort((a, b) => b.bytes - a.bytes)) {
+    const owner = cache.configuration ? cache.configuration.split("/").pop() : "no agent";
+    const grants = cache.grants && cache.grants !== "-" ? ` +${cache.grants}` : "";
+    caches.push([
+      `${owner}${grants} (${cache.key})`,
+      bytes(cache.bytes),
+      cache.last_used ? `used ${ago(cache.last_used)}` : "",
+    ]);
+    for (const scratch of [...cache.scratch].sort((a, b) => b.bytes - a.bytes))
+      caches.push([`  scratch: ${shortPath(scratch.worktree)}`, bytes(scratch.bytes), ""]);
+  }
+  const worktrees = report.worktrees.map((item) => [shortPath(item.path), bytes(item.bytes)]);
+  const docker = (report.docker ?? []).map((item) => [
+    item.type,
+    item.size,
+    `reclaimable ${item.reclaimable}`,
+  ]);
+  const removed = report.removed.map((item) => [item.path, bytes(item.bytes), item.why]);
+  box.append(
+    ...diskSection("Sandbox caches", caches),
+    ...diskSection("Largest checkouts", worktrees),
+    ...diskSection("Docker", docker),
+    ...diskSection("Removed by the last housekeeping", removed),
+  );
+  for (const error of report.errors) box.append(el("p", error, "ci-error"));
+  return box;
+}
+function renderDisks(machines) {
+  const box = $("ws-disk");
+  const open = new Set(
+    [...box.querySelectorAll("details[open]")].map((details) => details.dataset.machine),
+  );
+  const shown = machines.filter(
+    (entry) => entry.disk && (entry.disk.report || entry.disk.percent >= DISK_WARN),
+  );
+  box.hidden = !shown.length;
+  box.replaceChildren(
+    ...shown.map((entry) => {
+      const details = diskDetails(entry);
+      details.open = open.has(entry.id);
+      return details;
+    }),
+  );
 }
 // A worker's personal skills as its last sync left them; null when it keeps none in sync.
 function skillsText(skills) {
@@ -2302,12 +2399,14 @@ function renderMachines() {
   box.replaceChildren(
     ...(box.hidden ? [] : machines).map((entry) => {
       const tone = entry.local
-        ? "green"
+        ? entry.disk?.percent >= DISK_WARN
+          ? "amber"
+          : "green"
         : !entry.enabled || (entry.pending && entry.available)
           ? ""
           : !entry.available
             ? "red"
-            : entry.error || entry.agents >= entry.max_agents
+            : entry.error || entry.agents >= entry.max_agents || entry.disk?.percent >= DISK_WARN
               ? "amber"
               : "green";
       const badge = el("span", machineText(entry), `badge ${tone}`.trim());
@@ -2322,6 +2421,7 @@ function renderMachines() {
       return link;
     }),
   );
+  renderDisks(machines);
 }
 // Overview ids are globally unique; watch ids carry a separate prefix.
 function workspaceInfo(item) {

@@ -6,8 +6,16 @@
   margin-right: auto;
 }
 #ws-status-line,
-#ws-notices {
+#ws-notices,
+#ws-auto {
   overflow-wrap: anywhere;
+}
+#ws-auto p {
+  margin: 0 0 4px;
+}
+#ws-auto small {
+  display: block;
+  color: var(--muted);
 }
 #ws-sort-direction {
   align-self: end;
@@ -242,4 +250,39 @@
   .ws-table tr {
     padding-left: 64px;
   }
+}
+/* Disk use per machine, from its last housekeeping report. */
+#ws-disk {
+  display: grid;
+  gap: 4px;
+  margin: 4px 0 8px;
+}
+.ws-disk summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.ws-disk h4 {
+  margin: 8px 0 2px;
+  font-size: 0.9em;
+}
+.ws-disk-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9em;
+}
+.ws-disk-table td {
+  padding: 1px 8px 1px 0;
+  vertical-align: top;
+}
+.ws-disk-name {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ws-disk-size {
+  text-align: right;
+  white-space: nowrap;
+}
+.ws-disk-note {
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }

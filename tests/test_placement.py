@@ -83,6 +83,14 @@ def test_hard_filter_reasons():
     assert "gone" not in pl.exclusions({}, fleet, recent, {}, NOW)
 
 
+def test_a_worker_whose_disk_is_full_takes_nothing():
+    disk = {"size": 100, "free": 9, "percent": pl.DISK_FULL, "report": None}
+    loads = {"box": load(disk=disk), "mini": load(disk={**disk, "percent": pl.DISK_FULL - 1})}
+    found = pl.exclusions({}, FLEET, loads, {}, NOW)
+    # Its babysit-bwrap would refuse the launch, so not even a person may choose it.
+    assert found == {"box": pl.Exclusion(f"disk {pl.DISK_FULL}% full", False)}
+
+
 @pytest.mark.parametrize("kind", ["issue", "sentry"])
 def test_workers_only_take_pull_request_work_and_new_tasks(kind):
     req = {"sandboxed": False, "kind": kind}

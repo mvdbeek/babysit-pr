@@ -19,6 +19,12 @@
 # and later), each writable directory is opened once, checked through its descriptor and bound by it, so
 # a path swapped after the check cannot redirect the bind. --print-argv prints the bwrap
 # argv, NUL-separated, instead of running it. Needs bash 4.1 or later (`exec {fd}<`).
+#
+# A launch is refused while the disk holding $HOME or the working directory is at least
+# $BABYSIT_DISK_LIMIT percent full (90 by default, `off` to never refuse): an agent
+# would otherwise only find out from ENOSPC halfway through its run. Each checkout the
+# launch works in has a scratch directory in the cache, $BABYSIT_SCRATCH, for large
+# runtime data that should outlive the session but not the checkout (see below).
 set -euo pipefail
 
 die() {
@@ -70,6 +76,8 @@ while (($#)); do
     --print-argv) print=1 ;;
     # Test hook for the TIOCSTI check below; honoured only by a dry run.
     --tiocsti-sysctl=*) tiocsti=${option#*=} && fake_tiocsti=1 ;;
+    # Test hook for the disk check below, the use it sees; honoured only by a dry run.
+    --disk-used=*) disk_used=${option#*=} ;;
     --)
       shift
       break
@@ -81,10 +89,31 @@ while (($#)); do
 done
 (($#)) || die "no command to run"
 [[ -z ${fake_tiocsti:-} ]] || ((print)) || die "--tiocsti-sysctl only applies with --print-argv"
+[[ -z ${disk_used:-} ]] || ((print)) || die "--disk-used only applies with --print-argv"
 
 home=${HOME:?}
 [[ $home == /* ]] || die "HOME must be absolute"
 real_home=$(realpath -- "$home" 2>/dev/null) || real_home=$home
+
+# Before anything is made on disk. A dry run checks only the use it is given.
+limit=${BABYSIT_DISK_LIMIT:-90}
+[[ $limit == off || $limit =~ ^[0-9]+$ ]] || die "BABYSIT_DISK_LIMIT must be a percentage or off"
+if [[ $limit != off ]] && { ((!print)) || [[ -n ${disk_used:-} ]]; }; then
+  for path in "$home" "$PWD"; do
+    if ((print)); then
+      used=$disk_used free=
+    else
+      # POSIX output: one line per filesystem, use and free space in fixed columns.
+      read -r _ _ _ free used _ < <(df -Pk -- "$path" 2>/dev/null | sed -n 2p) || continue
+      used=${used%\%}
+      free=" ($((free / 1048576)) GiB free)"
+    fi
+    [[ $used =~ ^[0-9]+$ ]] || continue
+    if ((used >= limit)); then
+      die "refusing to start: the disk holding $path is $used% full$free; free some space (the dashboard's Workspaces tab shows what uses it) or set BABYSIT_DISK_LIMIT"
+    fi
+  done
+fi
 
 # Like GNU `realpath -m`, which macOS lacks: resolves the longest existing ancestor of
 # an absolute path and appends the rest, so a symlinked parent cannot hide an entry.
@@ -262,7 +291,8 @@ fi
 sha=(sha256sum)
 command -v sha256sum >/dev/null || sha=(shasum -a 256) # macOS dry runs
 key=$(printf '%s\0%s\0%s' "$config_var" "$config_dir" "$granted" | "${sha[@]}")
-cache=$home/.cache/babysit-sandbox/${key:0:16}
+key=${key:0:16}
+cache=$home/.cache/babysit-sandbox/$key
 
 granted_dirs=()
 for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
@@ -270,6 +300,22 @@ for path in ${add_dirs[@]+"${add_dirs[@]}"}; do
   real=$(writable "$path")
   [[ -n $real ]] || continue
   granted_dirs+=("$real")
+done
+# The checkout this launch works in: the grant holding its working directory. Its scratch
+# directory is in the cache rather than the checkout, so that a Python environment made
+# there hard-links into the uv cache: a link across two of bwrap's binds fails (EXDEV)
+# even on one filesystem, and uv then copies every file. One per cache, so a launch with
+# other grants gets another, like its other caches. Workspaces cleanup removes it with
+# the checkout, and housekeeping.py once the checkout is gone.
+cwd=$(pwd -P)
+scratch_id=
+for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
+  if [[ $cwd == "$real" || $cwd == "$real"/* ]]; then
+    scratch_id=$(printf '%s' "$real" | "${sha[@]}")
+    scratch_id=${scratch_id:0:16}
+    scratch_for=$real
+    break
+  fi
 done
 # `git worktree prune`, which `git gc` also runs, drops a worktree's registration from the
 # common directory when the `.git` that registration names is missing, and from here
@@ -315,6 +361,7 @@ argv+=(--bind "$cache" "$cache")
 # Create the persistent outbox inside the namespace, after binding the cache. Do
 # not follow an agent-writable cache entry from the host to create directories.
 argv+=(--perms 0700 --dir "$cache/artifacts")
+[[ -z $scratch_id ]] || argv+=(--perms 0700 --dir "$cache/scratch/$scratch_id")
 [[ -z $config_var ]] || grant "$config_dir"
 for real in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
   # A grant holding the configuration could move it, read-only entries and all.
@@ -336,7 +383,6 @@ fi
 # that exact working directory for this invocation. Codex checks its cwd before the
 # main repository's path, so this also covers linked worktrees without reading git
 # files or granting trust to their siblings. Never infer trust from mere visibility.
-cwd=$(pwd -P)
 if [[ $config_var == CODEX_HOME && ${command[0]##*/} == codex ]]; then
   for path in ${granted_dirs[@]+"${granted_dirs[@]}"}; do
     if [[ $path == "$cwd" ]]; then
@@ -571,6 +617,9 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
   --setenv PIP_CACHE_DIR "$cache/pip" --setenv npm_config_cache "$cache/npm"
   --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright"
   --setenv BABYSIT_ARTIFACT_DIR "$cache/artifacts")
+# Galaxy makes its environment wherever GALAXY_VIRTUAL_ENV says (scripts/common_startup.sh).
+[[ -z $scratch_id ]] || argv+=(--setenv BABYSIT_SCRATCH "$cache/scratch/$scratch_id"
+  --setenv GALAXY_VIRTUAL_ENV "$cache/scratch/$scratch_id/galaxy-venv")
 [[ -z $other_agent ]] || argv+=(--setenv PATH "/tmp/babysit-bin:${PATH:-/usr/bin:/bin}")
 [[ -z $config_var ]] || argv+=(--setenv "$config_var" "$config_dir")
 ((!gpg)) || argv+=(--setenv GNUPGHOME "$gnupghome")
@@ -591,10 +640,19 @@ argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
 if ((!print)); then
   command -v bwrap >/dev/null || die "bubblewrap (bwrap) is not installed"
   command -v flock >/dev/null && command -v setsid >/dev/null || die "flock and setsid are not installed"
-  mkdir -p "$cache"
   (umask 077 && mkdir -p -- "$runs") || die "cannot create $runs"
   exec {runs_lock}<>"$runs/.lock" || die "cannot open $runs/.lock"
   flock "$runs_lock" || die "cannot lock $runs/.lock"
+  # Under the lock, which housekeeping (housekeeping.py) holds while it judges caches and
+  # sets unused ones aside: this launch's cache is recorded as used, and its run below
+  # as live, before housekeeping can look again. The records are where no sandbox can
+  # see or change them: each cache's configuration and the checkout of each scratch
+  # directory, with the last launch as each file's time.
+  mkdir -p "$cache"
+  index=$home/.cache/babysit-sandbox/index
+  (umask 077 && mkdir -p -- "$index/keys" "$index/scratch") || die "cannot create $index"
+  printf 'configuration %s\ngrants %s\n' "${config_dir:--}" "${granted:--}" >"$index/keys/$key"
+  [[ -z $scratch_id ]] || printf '%s\n' "$scratch_for" >"$index/scratch/$scratch_id"
   stale=()
   for entry in "$runs"/*; do
     [[ -d $entry && ! -L $entry ]] || continue
@@ -602,7 +660,7 @@ if ((!print)); then
   done
   mkdir -m 0700 -- "$run" && mkdir -m 0700 -- "$run/home" "$run/tmp" || die "cannot create $run"
   # Beside, not inside, what the sandbox sees: which launch uses the disk there.
-  printf 'pid %s\ncwd %s\nconfiguration %s\n' "$$" "$cwd" "${config_dir:--}" >"$run/info"
+  printf 'pid %s\ncwd %s\nconfiguration %s\ncache %s\n' "$$" "$cwd" "${config_dir:--}" "$key" >"$run/info"
   : >"$run/lock"
   exec {lock}<"$run/lock" || die "cannot open $run/lock"
   flock -n "$lock" || die "cannot lock $run/lock"

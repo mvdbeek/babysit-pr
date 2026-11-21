@@ -472,6 +472,20 @@ printf '%s\n' "$BABYSIT_ARTIFACT_DIR/review.txt"
 The printed absolute path also names the file on the worker host. In the sandbox,
 `~/src/agent-artefacts/outbox` is a link to `$BABYSIT_ARTIFACT_DIR`, unless that
 directory is explicitly granted. Other home paths are temporary.
+
+Large runtime data that must outlive the session, such as workflow work directories,
+reference data and test outputs, goes in `$BABYSIT_SCRATCH`. That is the scratch
+directory of the checkout the launch works in, at
+`<cache>/scratch/<sha256 of the checkout's path, first 16 hex digits>`. Workspaces
+cleanup removes it with the checkout, and the worker's housekeeping removes it once the
+checkout is gone. Data kept anywhere else in the cache is removed after 7 days without a
+change, unless it is a known tool cache (see the worker setup's disk housekeeping).
+Galaxy creates its virtualenv at `$GALAXY_VIRTUAL_ENV`, `$BABYSIT_SCRATCH/galaxy-venv`.
+Like the uv cache, that path is inside the cache's bind, so uv hard-links packages
+into it. A `.venv` in the checkout is a separate bind, so the link fails with `EXDEV`
+and uv copies every file instead, about 1.6 GiB per Galaxy checkout. Scratch, like the
+rest of the cache, is separate for each set of grants: after Docker is turned on or off
+for a checkout, a launch sees a new, empty scratch directory.
 The artifact directory inherits the cache's agent configuration and grant separation:
 another account or a launch with different grants cannot use it as a shared inbox.
 Keep secrets out of reports and transcripts; hand another reviewer the repository's
