@@ -670,7 +670,8 @@
     othersBox.id = "cron-other-clones";
     const othersSummary = node("summary");
     const othersList = node("div", undefined, "new-task-also-list");
-    const OTHERS_LIMIT = 8;
+    // As many as the server takes (cron_agents.OTHER_CLONES_LIMIT).
+    const OTHERS_LIMIT = 24;
     const othersText = () =>
       `Other clones it may add worktrees to${others.size ? ` (${others.size})` : " (optional)"}`;
     const limitOthers = () => {
