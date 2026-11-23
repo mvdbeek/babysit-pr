@@ -426,6 +426,8 @@ def test_a_worker_transcript_shows_its_agent_there_and_quits_it_there(page, site
         "status": "working",
         "title": None,
         "session": "s1",
+        "model": "claude-opus-5-5",
+        "effort": "high",
         "docker": None,
         "docker_supported": False,
     }
@@ -448,6 +450,7 @@ def test_a_worker_transcript_shows_its_agent_there_and_quits_it_there(page, site
     strip = live.locator(".ws-live-state")
     expect(strip).to_have_attribute("data-live", "true")
     expect(strip.locator(".ws-live-machine")).to_have_text("Mac mini")
+    expect(strip.locator(".ws-live-settings")).to_have_text("opus 5.5 · high")
     expect(strip.get_by_role("button", name="Stop the turn of Claude in w3:p2")).to_be_enabled()
     expect(page.locator("#ws-docker")).to_be_hidden()
     live.screenshot(path="reports/viewer-strip-worker.png")

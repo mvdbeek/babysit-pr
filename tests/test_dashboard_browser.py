@@ -4228,10 +4228,12 @@ def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
     strip = live.locator(".ws-live-state")
-    # This machine goes unsaid; the pane is in the name's title and the menu.
+    # This machine goes unsaid; the pane is in the agent's title and the menu.
     expect(strip).to_have_text(re.compile(r"^WorkingClaude"))
     expect(strip.get_by_text("this Mac")).to_be_hidden()
-    expect(strip.locator(".ws-live-name")).to_have_attribute("title", "Claude in w1:p2")
+    expect(strip.locator(".ws-live-settings")).to_have_attribute(
+        "title", re.compile(r"^Claude in w1:p2; its model and effort are not known")
+    )
     expect(strip.get_by_role("button", name="Stop the turn of Claude in w1:p2")).to_be_visible()
     if width == 1280:
         # Status, model and buttons share one line beside the tabs.
@@ -4301,8 +4303,11 @@ def test_the_strip_names_the_agents_model_and_effort_and_changes_them(
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-live")
     strip = live.locator(".ws-live-state")
-    # The effort goes unsaid while it is the agent's default.
-    expect(strip.locator(".ws-live-settings")).to_have_text("opus")
+    # The model names the agent; the effort goes unsaid while it is the agent's default.
+    expect(strip).to_have_text(re.compile(r"^Workingopus■ Stop"))
+    expect(strip.locator(".ws-live-settings")).to_have_attribute(
+        "title", re.compile(r"^Claude in w1:p2: opus with its default effort\.")
+    )
     strip.get_by_role("button", name="Change model or effort for Claude in w1:p2").click()
     card = live.get_by_role("group", name="Change model or effort")
     model = card.get_by_role("combobox", name="Model")

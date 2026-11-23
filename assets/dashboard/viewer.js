@@ -2078,10 +2078,11 @@
   function paneAgent(agent) {
     return `${agentTitle(agent)} in ${agent.pane}`;
   }
-  // "opus 5.5 · high": a Claude model without its prefix or release date, and the effort
-  // only when one was chosen. What is left unsaid is the agent's own configured default.
+  // What names the agent: "opus 5.5 · high", a Claude model without its prefix or release
+  // date, and the effort only when one was chosen. Without a model, the agent's name
+  // ("Claude · high"): what is left unsaid is its own configured default.
   function settingsText(agent) {
-    let model = agent.model || "default model";
+    let model = agent.model || agentTitle(agent);
     if (model.startsWith("claude-"))
       model = model
         .slice("claude-".length)
@@ -2091,7 +2092,11 @@
     return agent.effort ? `${model} · ${agent.effort}` : model;
   }
   function settingsTitle(agent) {
-    return `${agent.model || "Default model"} with ${agent.effort ? `${agent.effort} effort` : "the default effort"}`;
+    if (agent.model === undefined) return `${paneAgent(agent)}; its model and effort are not known`;
+    return (
+      `${paneAgent(agent)}: ${agent.model || "its default model"} with ` +
+      (agent.effort ? `${agent.effort} effort` : "its default effort")
+    );
   }
   function activity(agent) {
     if (agent.status === "blocked" && agent.interaction?.idle) return ACTIVITY.idle;
@@ -2112,24 +2117,21 @@
     element.setAttribute("aria-label", aria);
     return element;
   }
-  // The model and effort, as a button that changes them where the session can be resumed.
-  function settingsControl(agent) {
-    if (!["claude", "codex"].includes(agent.agent)) return null;
-    const known = agent.model !== undefined;
-    if (!agent.session) {
-      if (!known) return null;
-      const label = node("span", settingsText(agent), "ws-live-settings");
-      label.title = `${settingsTitle(agent)}: the model and reasoning effort this agent runs with`;
-      return label;
+  // The agent, named by its model and effort: a button that changes them where its session
+  // can be resumed. Its pane is in the title.
+  function agentIdentity(agent) {
+    if (!["claude", "codex"].includes(agent.agent) || !agent.session) {
+      const name = node("strong", settingsText(agent), "ws-live-settings");
+      name.title = settingsTitle(agent);
+      return name;
     }
     const button = actionButton(
       agent,
       "settings",
-      known ? settingsText(agent) : "Model & effort",
+      settingsText(agent),
       "ws-live-settings",
       `Change model or effort for ${paneAgent(agent)}`,
-      (known ? `${settingsTitle(agent)}. ` : "") +
-        "Change them: quit the agent and resume this conversation with others",
+      `${settingsTitle(agent)}. Change them: quit the agent and resume this conversation with others`,
     );
     button.onclick = () => {
       quitQuestion = null;
@@ -2326,13 +2328,10 @@
       row.dataset.status = mine.status || "";
       const state = badge(text, tone);
       state.title = `Live: ${paneAgent(mine)} has this session open${where ? ` on ${where}` : ""}`;
-      const name = node("strong", agentTitle(mine), "ws-live-name");
-      name.title = paneAgent(mine);
       row.append(
         state,
         ...(worker ? [machineChip(worker)] : []),
-        name,
-        ...[settingsControl(mine)].filter(Boolean),
+        agentIdentity(mine),
         liveButtons(mine),
       );
       return row;
@@ -2370,9 +2369,8 @@
     row.dataset.status = agent.status || "";
     row.append(
       badge(text, tone),
-      node("strong", agentTitle(agent)),
+      agentIdentity(agent),
       node("span", `in ${agent.pane}`, "pr-meta"),
-      ...[settingsControl(agent)].filter(Boolean),
     );
     if (data.sessions.some((session) => session.id === agent.session)) {
       const show = node("button", "Show its transcript");

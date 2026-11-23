@@ -279,11 +279,10 @@
   font-size: 13px;
   overflow-wrap: anywhere;
 }
+/* The agent, by its model and effort; as a button, a label that opens a choice of others. */
 .ws-live-settings {
-  color: var(--muted);
-  font-size: 13px;
+  font-weight: 600;
 }
-/* The model and effort read as a label that opens a choice of others. */
 button.ws-live-settings {
   padding: 3px 6px;
   border-color: transparent;
