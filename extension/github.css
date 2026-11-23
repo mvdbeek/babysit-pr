@@ -143,3 +143,107 @@ a.babysit-chip:hover {
   background: var(--button-default-bgColor-hover, #eff2f5);
   text-decoration: none;
 }
+/* An issue's Handle form and a pull request's questions. */
+.babysit-card [hidden] {
+  display: none !important;
+}
+.babysit-tools {
+  margin-top: 10px;
+}
+.babysit-input {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 4px 0;
+  padding: 5px 8px;
+  border: 1px solid var(--borderColor-default, #d0d7de);
+  border-radius: 6px;
+  background: var(--bgColor-default, #fff);
+  color: var(--fgColor-default, #1f2328);
+  font: inherit;
+  resize: vertical;
+}
+.babysit-row {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  align-items: center;
+}
+.babysit-row .babysit-button {
+  margin-top: 0;
+}
+.babysit-select {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--borderColor-default, #d0d7de);
+  border-radius: 6px;
+  background: var(--bgColor-default, #fff);
+  color: var(--fgColor-default, #1f2328);
+  font: inherit;
+}
+button.babysit-button {
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+button.babysit-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.babysit-primary {
+  border-color: var(--button-primary-borderColor-rest, #1f883d) !important;
+  background: var(--button-primary-bgColor-rest, #1f883d) !important;
+  color: var(--button-primary-fgColor-rest, #fff) !important;
+}
+.babysit-status {
+  overflow-wrap: anywhere;
+}
+.babysit-conversation {
+  max-height: 60vh;
+  overflow: auto;
+}
+.babysit-turn {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--borderColor-muted, #d0d7deb3);
+}
+.babysit-question {
+  font-weight: 600;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.babysit-answer {
+  overflow-wrap: anywhere;
+}
+.babysit-answer p,
+.babysit-answer ul,
+.babysit-answer ol {
+  margin: 6px 0;
+}
+.babysit-answer ul,
+.babysit-answer ol {
+  padding-left: 18px;
+}
+.babysit-answer-heading {
+  font-weight: 600;
+}
+.babysit-answer code {
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--bgColor-neutral-muted, #818b981f);
+  font-size: 12px;
+}
+.babysit-answer pre {
+  margin: 6px 0;
+  padding: 6px 8px;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: var(--bgColor-muted, #f6f8fa);
+}
+.babysit-answer pre code {
+  padding: 0;
+  background: none;
+  white-space: pre;
+}
+.babysit-activity {
+  font-style: italic;
+}

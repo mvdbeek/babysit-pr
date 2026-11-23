@@ -1,7 +1,8 @@
 // Registered on github.com only after you turn it on in Settings. It finds the pull
 // requests and issues a page shows, asks the extension's background (which holds the
-// pairing token) what Babysitter knows about them, and shows that as text. Nothing is sent
-// to GitHub.
+// pairing token) what Babysitter knows about them, and shows that as text. An issue's card
+// can start an agent on it, and a pull request's can ask Babysitter about it. Nothing is
+// sent to GitHub.
 (() => {
   if (window.babysitGitHub) return;
   window.babysitGitHub = true;
@@ -12,7 +13,11 @@
   const FRESH = 60 * 1000;
   const known = new Map();
   const asking = new Set();
+  // Each item page's forms and conversation, kept while GitHub redraws the page around them.
+  const tools = new Map();
   let error = null;
+  // The item whose corner card was closed, until another page.
+  let hidden = null;
 
   function itemURL(href) {
     try {
@@ -29,6 +34,16 @@
     if (className) element.className = className;
     return element;
   }
+  function send(message) {
+    return new Promise((resolve, reject) =>
+      chrome.runtime.sendMessage(message, (answer) => {
+        if (chrome.runtime.lastError) reject(Error(chrome.runtime.lastError.message));
+        else if (!answer || answer.error) reject(Error(answer?.error || "No answer"));
+        else resolve(answer);
+      }),
+    );
+  }
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   // Review text comes from agents' files: it is only ever text, and only web links link.
   function link(text, href, className) {
     const element = node("a", text, className);
@@ -148,29 +163,10 @@
     return list;
   }
 
-  // The item's own page: a card in its sidebar, or in a corner without one. It always
-  // shows, so a page Babysitter knows nothing about says so.
-  function card(url, page) {
-    const sidebar = document.querySelector("#partial-discussion-sidebar");
-    let box = document.querySelector(".babysit-card");
-    const state = digest([url, page, error, Boolean(sidebar)]);
-    if (box?.dataset.state === state) return;
-    box?.remove();
-    box = node("section", undefined, `babysit-card${sidebar ? " babysit-in-sidebar" : ""}`);
-    box.dataset.state = state;
-    box.setAttribute("aria-label", "Babysitter");
-    const heading = node("div", undefined, "babysit-heading");
-    heading.append(node("strong", "Babysitter"));
-    if (!sidebar) {
-      const close = node("button", "×", "babysit-close");
-      close.type = "button";
-      close.title = "Hide until the next page";
-      close.setAttribute("aria-label", "Hide Babysitter");
-      close.onclick = () => box.remove();
-      heading.append(close);
-    }
-    box.append(heading);
-    if (error) box.append(node("p", error, "babysit-muted"));
+  // What Babysitter knows about the item, redrawn whenever that changes.
+  function details(page) {
+    const parts = [];
+    if (error) parts.push(node("p", error, "babysit-muted"));
     const review = page?.review;
     if (review) {
       const line = node("p");
@@ -184,9 +180,9 @@
           "babysit-muted",
         ),
       );
-      box.append(line);
+      parts.push(line);
       if (stale(page))
-        box.append(
+        parts.push(
           node("p", "The pull request has new commits since this review.", "babysit-warning"),
         );
       if (review.findings.length) {
@@ -202,27 +198,283 @@
         }
         if (review.findings.length > 8)
           list.append(node("li", `and ${review.findings.length - 8} more`, "babysit-muted"));
-        box.append(list);
+        parts.push(list);
       }
-      if (review.note) box.append(node("p", review.note, "babysit-muted"));
+      if (review.note) parts.push(node("p", review.note, "babysit-muted"));
       const links = node("p", undefined, "babysit-links");
       if (review.links?.report) links.append(link("Report", review.links.report));
       if (review.links?.reply) links.append(link("Draft reply", review.links.reply));
-      if (links.childElementCount) box.append(links);
+      if (links.childElementCount) parts.push(links);
     } else if (page?.kind !== "issue" && !error) {
-      box.append(node("p", "No agent review found.", "babysit-muted"));
+      parts.push(node("p", "No agent review found.", "babysit-muted"));
     }
     if (page?.workspaces?.length) {
-      box.append(node("p", "Workspaces", "babysit-subheading"));
-      box.append(workspaceList(page));
+      parts.push(node("p", "Workspaces", "babysit-subheading"), workspaceList(page));
     } else if (page && !error) {
-      box.append(node("p", "No linked workspace.", "babysit-muted"));
+      parts.push(node("p", "No linked workspace.", "babysit-muted"));
     }
     if (page && !page.dashboard && !error)
-      box.append(node("p", "Not in your dashboard's overview.", "babysit-muted"));
-    if (page?.dashboard) box.append(openButton(page, "babysit-button"));
-    if (sidebar) sidebar.prepend(box);
-    else document.body.append(box);
+      parts.push(node("p", "Not in your dashboard's overview.", "babysit-muted"));
+    if (page?.dashboard) parts.push(openButton(page, "babysit-button"));
+    return parts;
+  }
+
+  // The item's own page: a card in its sidebar, or in a corner without one. It always
+  // shows, so a page Babysitter knows nothing about says so.
+  function card(url, page) {
+    if (hidden === url) return;
+    const sidebar = document.querySelector("#partial-discussion-sidebar");
+    let box = document.querySelector(".babysit-card");
+    if (box && (box.dataset.url !== url || box.parentElement !== (sidebar || document.body))) {
+      box.remove();
+      box = null;
+    }
+    if (!box) {
+      box = node("section", undefined, `babysit-card${sidebar ? " babysit-in-sidebar" : ""}`);
+      box.dataset.url = url;
+      box.setAttribute("aria-label", "Babysitter");
+      const heading = node("div", undefined, "babysit-heading");
+      heading.append(node("strong", "Babysitter"));
+      if (!sidebar) {
+        const close = node("button", "×", "babysit-close");
+        close.type = "button";
+        close.title = "Hide until the next page";
+        close.setAttribute("aria-label", "Hide Babysitter");
+        close.onclick = () => {
+          hidden = url;
+          box.remove();
+        };
+        heading.append(close);
+      }
+      box.append(heading, node("div", undefined, "babysit-details"));
+      if (sidebar) sidebar.prepend(box);
+      else document.body.append(box);
+    }
+    const shown = box.querySelector(".babysit-details");
+    const state = digest([page, error]);
+    if (shown.dataset.state !== state) {
+      shown.dataset.state = state;
+      shown.replaceChildren(...details(page));
+    }
+    if (!tools.has(url)) tools.set(url, url.includes("/pull/") ? askTools(url) : handleTools(url));
+    const own = tools.get(url);
+    if (own.parentElement !== box) box.append(own);
+  }
+
+  function textarea(placeholder, rows) {
+    const box = node("textarea", undefined, "babysit-input");
+    box.rows = rows;
+    box.placeholder = placeholder;
+    box.setAttribute("aria-label", placeholder);
+    return box;
+  }
+  function button(text, className = "babysit-button") {
+    const element = node("button", text, className);
+    element.type = "button";
+    return element;
+  }
+
+  // An issue's card: start an agent on it with the dashboard's issue task, plus whatever
+  // the box adds.
+  function handleTools(url) {
+    const form = node("form", undefined, "babysit-tools");
+    const instructions = textarea("Extra instructions (optional)", 3);
+    const agent = node("select", undefined, "babysit-select");
+    agent.setAttribute("aria-label", "Agent");
+    for (const [value, label] of [
+      ["", "Usual agent"],
+      ["codex", "Codex"],
+      ["claude", "Claude"],
+    ]) {
+      const option = node("option", label);
+      option.value = value;
+      agent.append(option);
+    }
+    const start = node("button", "Handle issue", "babysit-button babysit-primary");
+    start.type = "submit";
+    const status = node("p", undefined, "babysit-muted babysit-status");
+    status.setAttribute("role", "status");
+    const row = node("div", undefined, "babysit-row");
+    row.append(agent, start);
+    form.append(node("p", "Handle this issue", "babysit-subheading"), instructions, row, status);
+    instructions.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) form.requestSubmit();
+    });
+
+    async function follow(operation) {
+      for (;;) {
+        status.replaceChildren(
+          operation.status === "complete"
+            ? operation.message || "Started"
+            : `${operation.status}: ${operation.message || "accepted"}`,
+        );
+        if (operation.result?.url)
+          status.append(" ", link("Open in Collie", operation.result.url, "babysit-small"));
+        // A launch waiting for a machine with room may wait for hours: the dashboard shows it.
+        if (!["queued", "running"].includes(operation.status)) return operation;
+        await sleep(2000);
+        operation = (await send({ type: "github-status", id: operation.id })).operation;
+      }
+    }
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      start.disabled = true;
+      status.textContent = "Starting…";
+      try {
+        const answer = await send({
+          type: "github-handle",
+          url,
+          instructions: instructions.value,
+          agent: agent.value,
+        });
+        if (!answer.operation) status.textContent = "Accepted; the dashboard shows its progress.";
+        else if ((await follow(answer.operation)).status !== "failed") instructions.value = "";
+      } catch (failure) {
+        status.textContent = failure.message;
+      } finally {
+        start.disabled = false;
+      }
+    };
+    return form;
+  }
+
+  // An answer's markdown, as text nodes only: paragraphs, headings, lists, code.
+  function inline(parent, text) {
+    for (const part of text.split(/(`[^`]+`|\*\*[^*]+\*\*)/)) {
+      if (/^`[^`]+`$/.test(part)) parent.append(node("code", part.slice(1, -1)));
+      else if (/^\*\*[^*]+\*\*$/.test(part)) parent.append(node("strong", part.slice(2, -2)));
+      else if (part) parent.append(part);
+    }
+  }
+  function markdown(text) {
+    const root = node("div", undefined, "babysit-answer");
+    let list = null;
+    let paragraph = null;
+    let code = null;
+    for (const line of text.split("\n")) {
+      if (code) {
+        if (/^\s*```/.test(line)) code = null;
+        else code.textContent += `${line}\n`;
+        continue;
+      }
+      const item = /^\s*([-*]|\d+\.)\s+(.*)$/.exec(line);
+      const heading = /^#{1,6}\s+(.*)$/.exec(line);
+      if (/^\s*```/.test(line)) {
+        const pre = node("pre");
+        code = node("code");
+        pre.append(code);
+        root.append(pre);
+      } else if (heading) {
+        const element = node("p", undefined, "babysit-answer-heading");
+        inline(element, heading[1]);
+        root.append(element);
+      } else if (item) {
+        if (!list) root.append((list = node(/\d/.test(item[1]) ? "ol" : "ul")));
+        const element = node("li");
+        inline(element, item[2]);
+        list.append(element);
+        paragraph = null;
+        continue;
+      } else if (line.trim()) {
+        if (paragraph) paragraph.append(document.createElement("br"));
+        else root.append((paragraph = node("p")));
+        inline(paragraph, line);
+        list = null;
+        continue;
+      }
+      list = paragraph = null;
+    }
+    return root;
+  }
+
+  // A pull request's card: questions about it, each answered by an agent the dashboard
+  // starts, streamed in as it writes. Earlier answers go along as the conversation.
+  function askTools(url) {
+    const section = node("div", undefined, "babysit-tools");
+    const conversation = node("div", undefined, "babysit-conversation");
+    const form = node("form");
+    const question = textarea("Ask about this pull request", 2);
+    const ask = node("button", "Ask", "babysit-button babysit-primary");
+    ask.type = "submit";
+    const stop = button("Stop");
+    const clear = button("Clear");
+    stop.hidden = clear.hidden = true;
+    const row = node("div", undefined, "babysit-row");
+    row.append(clear, stop, ask);
+    form.append(question, row);
+    section.append(node("p", "Ask about this pull request", "babysit-subheading"));
+    section.append(conversation, form);
+    const turns = [];
+    let current = null;
+
+    function draw(turn) {
+      const parts = [node("p", turn.question, "babysit-question")];
+      if (turn.answer) parts.push(markdown(turn.answer));
+      if (turn.failure) parts.push(node("p", turn.failure, "babysit-warning"));
+      else if (["pending", "running"].includes(turn.status))
+        parts.push(
+          node(
+            "p",
+            turn.activity?.at(-1) || (turn.status === "pending" ? "Waiting…" : "Thinking…"),
+            "babysit-muted babysit-activity",
+          ),
+        );
+      turn.element.replaceChildren(...parts);
+    }
+    function idle() {
+      current = null;
+      ask.disabled = false;
+      stop.hidden = true;
+      clear.hidden = !turns.length;
+    }
+    question.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+    clear.onclick = () => {
+      turns.length = 0;
+      conversation.replaceChildren();
+      idle();
+    };
+    stop.onclick = () => {
+      if (current?.id) void send({ type: "github-ask-cancel", id: current.id }).catch(() => {});
+    };
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const text = question.value.trim();
+      if (!text || current) return;
+      const history = turns
+        .filter((turn) => turn.status === "done")
+        .map((turn) => ({ question: turn.question, answer: turn.answer }));
+      const turn = { question: text, answer: "", status: "pending", element: node("div") };
+      turn.element.className = "babysit-turn";
+      turns.push(turn);
+      conversation.append(turn.element);
+      current = turn;
+      ask.disabled = true;
+      clear.hidden = true;
+      question.value = "";
+      draw(turn);
+      try {
+        turn.id = (await send({ type: "github-ask", url, question: text, history })).id;
+        stop.hidden = false;
+        while (["pending", "running"].includes(turn.status)) {
+          await sleep(700);
+          Object.assign(turn, await send({ type: "github-answer", id: turn.id }));
+          draw(turn);
+          turn.element.scrollIntoView({ block: "nearest" });
+        }
+      } catch (failure) {
+        Object.assign(turn, { status: "error", failure: failure.message });
+        if (!turn.id) question.value = text;
+        draw(turn);
+      } finally {
+        idle();
+      }
+    };
+    return section;
   }
 
   function ask(urls) {
@@ -249,6 +501,7 @@
 
   function render() {
     const own = ITEM.exec(location.pathname) ? itemURL(location.href) : null;
+    if (hidden !== own) hidden = null;
     if (own) {
       ask([own]);
       if (known.has(own)) card(own, known.get(own).page);

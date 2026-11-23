@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Send to Babysitter",
-  "version": "0.4.0",
-  "description": "Send page references, GitHub tasks and follow-ups to your babysit-pr dashboard, and see agent reviews and workspaces on GitHub pull requests and issues.",
+  "version": "0.5.0",
+  "description": "Send page references, GitHub tasks and follow-ups to your babysit-pr dashboard, and see agent reviews and workspaces, handle issues and ask about pull requests on GitHub.",
   "permissions": ["activeTab", "contextMenus", "scripting", "storage"],
   "optional_host_permissions": ["https://*/*", "http://127.0.0.1/*", "http://localhost/*"],
   "action": { "default_title": "Send to Babysitter" },

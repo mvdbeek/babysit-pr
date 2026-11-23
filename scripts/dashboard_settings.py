@@ -22,6 +22,12 @@ URL = "{url}"
 # A prompt is a paragraph or two. The textarea that writes it allows far more, so a
 # rejection here says the text is too long rather than silently keeping part of it.
 LIMIT = 8000
+# The issue task's default wording, as settings.js has it (a test keeps the two equal):
+# the browser extension's Handle issue starts from it without the page.
+DEFAULT_PROMPTS = {
+    "issue": f"Investigate and resolve {URL}. Read the issue and relevant code, implement the "
+    "fix, and run the appropriate tests. Summarize the changes and validation.",
+}
 DEFAULT_REVIEWER = "codex"
 # Agents this machine runs before Auto prefers a worker; it still takes a launch no
 # worker can. Only matters with a machine registry.
@@ -63,6 +69,12 @@ def settings(home):
         "reviewer": reviewer if reviewer in AGENTS else DEFAULT_REVIEWER,
         "local_max_agents": capacity if local_max_agents(capacity) else DEFAULT_LOCAL_MAX_AGENTS,
     }
+
+
+def task_prompt(home, task, url):
+    """A task's wording for ``url``: the saved one, or the default."""
+    text = settings(home)["task_prompts"].get(task) or DEFAULT_PROMPTS[task]
+    return text.replace(URL, url)
 
 
 def save(home, request):

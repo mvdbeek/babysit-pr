@@ -14,6 +14,7 @@ import agent_messages
 import agent_reviews
 import browser_extension
 import dashboard
+import pr_questions
 import pytest
 from playwright.sync_api import expect
 
@@ -68,6 +69,29 @@ class FakeWorkspaces:
         return self.operations.get(key, {}).get("operation")
 
     action = new_task
+
+
+ISSUE = "https://github.com/test/repo/issues/3"
+
+
+def with_issue(manager, monkeypatch, clones=None):
+    """test/repo#3 in the issue overview, with these local clones of its repository."""
+    targets = [
+        *manager.targets(),
+        {
+            "id": "issue-three",
+            "kind": "issue",
+            "repo": "test/repo",
+            "url": ISSUE,
+            "title": "Broken",
+        },
+    ]
+    monkeypatch.setattr(manager, "targets", lambda: targets)
+    snapshot = manager.snapshot()
+    snapshot["issues"] = {
+        "issue-three": {"clones": clones or [], "destination": "/src/repo", "matches": []}
+    }
+    monkeypatch.setattr(manager, "snapshot", lambda: snapshot)
 
 
 @pytest.fixture
@@ -855,3 +879,186 @@ def test_github_pages_show_reviews_workspaces_and_open_babysitter(extension_brow
     page.reload()
     page.wait_for_timeout(500)
     expect(page.locator(".babysit-card")).to_have_count(0)
+
+
+def handle(url, **extra):
+    return {"action": "handle-issue", "request_id": "handle-1234567890ab", "url": url, **extra}
+
+
+def test_handle_issue_runs_the_issue_task_with_the_extra_instructions(
+    extension_server, monkeypatch
+):
+    headers = pair(extension_server)
+    manager = extension_server.workspaces
+    with_issue(manager, monkeypatch)
+    request_ = handle(ISSUE, instructions="  Only touch the parser.  ", agent="claude")
+    code, value, _ = request(extension_server, "/api/extension", request_, headers)
+    assert code == 200 and value["operation"]["status"] == "complete"
+    assert manager.calls == [
+        {
+            "id": "issue-three",
+            "action": "handle",
+            "agent": "claude",
+            # No clone here yet: Handle clones it where the dashboard would.
+            "destination": "/src/repo",
+            "task": f"Investigate and resolve {ISSUE}. Read the issue and relevant code, "
+            "implement the fix, and run the appropriate tests. Summarize the changes and "
+            "validation.\n\nAdditional instructions:\nOnly touch the parser.",
+        }
+    ]
+    # The same request again is answered without a second launch.
+    assert request(extension_server, "/api/extension", request_, headers)[1] == value
+    assert len(manager.calls) == 1
+
+
+def test_handle_issue_outside_the_overview_starts_a_task_in_a_local_clone(
+    extension_server, monkeypatch
+):
+    headers = pair(extension_server)
+    manager = extension_server.workspaces
+    extension_server.home.joinpath("dashboard-settings.json").write_text(
+        json.dumps({"task_prompts": {"issue": "Fix {url}."}})
+    )
+    url = "https://github.com/test/repo/issues/9"
+    code, value, _ = request(extension_server, "/api/extension", handle(url), headers)
+    assert code == 200
+    assert manager.calls == [
+        {"repo": "test/repo", "clone": "/fake/repo", "name": "issue-9", "task": f"Fix {url}."}
+    ]
+    other = handle("https://github.com/elsewhere/repo/issues/1", request_id="handle-other-12345")
+    code, value, _ = request(extension_server, "/api/extension", other, headers)
+    assert "No clone of elsewhere/repo" in value["error"]
+    for invalid in (
+        handle("https://github.com/test/repo/pull/1", request_id="handle-pull-123456"),
+        handle(url, request_id="handle-long-1234567", instructions="x" * 8001),
+        handle(url, request_id="handle-field-123456", directory="/"),
+    ):
+        assert "error" in request(extension_server, "/api/extension", invalid, headers)[1]
+    assert len(manager.calls) == 1
+
+
+def test_questions_are_asked_and_read_back_by_the_extension_that_asked(extension_server):
+    headers = pair(extension_server)
+    home = extension_server.home
+    url = "https://github.com/test/repo/pull/1"
+    code, value, _ = request(
+        extension_server,
+        "/api/extension",
+        {"action": "ask", "url": url, "question": "Why?"},
+        headers,
+    )
+    assert code == 400 and "supervisor is not running" in value["error"]
+    (home / "heartbeat.json").write_text(json.dumps({"time": time.time(), "pid": 1}))
+    code, value, _ = request(
+        extension_server,
+        "/api/extension",
+        {"action": "ask", "url": url, "question": "Why?"},
+        headers,
+    )
+    assert code == 200
+    question_id = value["id"]
+    saved = json.loads((home / "pr-questions" / f"{question_id}.json").read_text())
+    # The supervisor reads the code from this machine's clone of the repository.
+    assert saved["clone"] == "/fake/repo" and saved["client"] == CLIENT
+    answer = {"action": "answer", "id": question_id}
+    code, value, _ = request(extension_server, "/api/extension", answer, headers)
+    assert code == 200 and value["status"] == "pending"
+    cancel = {"action": "ask-cancel", "id": question_id}
+    assert request(extension_server, "/api/extension", cancel, headers)[1] == {"cancelled": True}
+    assert request(extension_server, "/api/extension", {**answer, "x": 1}, headers)[0] == 400
+    assert request(extension_server, "/api/extension", answer)[0] == 403
+    assert pr_questions.status(home, question_id, CLIENT)["status"] == "pending"
+
+
+@pytest.fixture
+def answering(extension_server):
+    """The supervisor's question worker, answering in two steps with a fake Claude."""
+    home = extension_server.home
+    asked = []
+
+    def answer(entry, update):
+        asked.append(entry)
+        update(force=True, activity=["Reading app.py"], answer="It prints")
+        time.sleep(1)
+        return f"It prints for **debugging** in `app.py`.\n\n- Asked: {entry['question']}"
+
+    worker = pr_questions.Worker(home, answer=answer)
+    stop = threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            (home / "heartbeat.json").write_text(json.dumps({"time": time.time(), "pid": 1}))
+            worker.tick()
+            time.sleep(0.1)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    yield asked
+    stop.set()
+    thread.join(5)
+
+
+@pytest.mark.browser
+def test_github_pages_handle_issues_and_answer_questions(
+    extension_browser, extension_server, monkeypatch, answering
+):
+    context, worker, _, _ = extension_browser
+    manager = extension_server.workspaces
+    with_issue(manager, monkeypatch, clones=["/fake/repo"])
+    pages = {"/test/repo/issues/3": ISSUE_PAGE, "/test/repo/pull/1": PULL_PAGE}
+    context.route(
+        "https://github.com/**",
+        lambda route: route.fulfill(
+            body=pages.get(route.request.url.removeprefix("https://github.com"), "missing"),
+            content_type="text/html",
+        ),
+    )
+    worker.evaluate("chrome.storage.local.set({github: true})")
+    worker.evaluate(
+        """async () => {
+          while (!(await chrome.scripting.getRegisteredContentScripts()).length)
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }"""
+    )
+    page = context.new_page()
+    page.goto(ISSUE)
+    card = page.locator(".babysit-card")
+    card.get_by_label("Extra instructions (optional)").fill("Keep it small.")
+    card.get_by_label("Agent").select_option("claude")
+    card.get_by_role("button", name="Handle issue").click()
+    expect(card.locator(".babysit-status")).to_have_text("Started Open in Collie")
+    expect(card.get_by_role("link", name="Open in Collie")).to_have_attribute(
+        "href", "http://127.0.0.1:8787/space/fake"
+    )
+    [call] = manager.calls
+    assert call["id"] == "issue-three" and call["agent"] == "claude"
+    assert call["task"].endswith("Additional instructions:\nKeep it small.")
+    expect(card.get_by_label("Extra instructions (optional)")).to_have_value("")
+    expect(card.get_by_label("Ask about this pull request")).to_have_count(0)
+
+    page.goto("https://github.com/test/repo/pull/1")
+    card = page.locator("#partial-discussion-sidebar > .babysit-card")
+    box = card.get_by_label("Ask about this pull request")
+    box.fill("Why print?")
+    box.press("Enter")
+    turn = card.locator(".babysit-turn")
+    expect(turn.locator(".babysit-question")).to_have_text("Why print?")
+    # The answer streams in, with what the agent is doing.
+    expect(turn.locator(".babysit-answer")).to_have_text("It prints")
+    expect(turn.locator(".babysit-activity")).to_have_text("Reading app.py")
+    expect(card.get_by_role("button", name="Stop")).to_be_visible()
+    answer = turn.locator(".babysit-answer")
+    expect(answer.locator("strong")).to_have_text("debugging")
+    expect(answer.locator("code")).to_have_text("app.py")
+    expect(answer.locator("li")).to_have_text("Asked: Why print?")
+    expect(turn.locator(".babysit-activity")).to_have_count(0)
+    expect(card.get_by_role("button", name="Stop")).to_be_hidden()
+    # A follow-up carries the conversation so far.
+    box.fill("And then?")
+    card.get_by_role("button", name="Ask").click()
+    expect(card.locator(".babysit-turn")).to_have_count(2)
+    expect(card.locator(".babysit-turn").nth(1).locator("li")).to_have_text("Asked: And then?")
+    first = "It prints for **debugging** in `app.py`.\n\n- Asked: Why print?"
+    assert answering[1]["history"] == [{"question": "Why print?", "answer": first}]
+    card.get_by_role("button", name="Clear").click()
+    expect(card.locator(".babysit-turn")).to_have_count(0)
