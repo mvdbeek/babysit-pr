@@ -426,6 +426,8 @@ def test_a_worker_transcript_shows_its_agent_there_and_quits_it_there(page, site
         "status": "working",
         "title": None,
         "session": "s1",
+        "model": "claude-opus-5-5",
+        "effort": "high",
         "docker": None,
         "docker_supported": False,
     }
@@ -447,7 +449,8 @@ def test_a_worker_transcript_shows_its_agent_there_and_quits_it_there(page, site
     live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
     strip = live.locator(".ws-live-state")
     expect(strip).to_have_attribute("data-live", "true")
-    expect(strip).to_contain_text("on Mac mini")
+    expect(strip.locator(".ws-live-machine")).to_have_text("Mac mini")
+    expect(strip.locator(".ws-live-settings")).to_have_text("opus 5.5 · high")
     expect(strip.get_by_role("button", name="Stop the turn of Claude in w3:p2")).to_be_enabled()
     expect(page.locator("#ws-docker")).to_be_hidden()
     live.screenshot(path="reports/viewer-strip-worker.png")
@@ -459,6 +462,8 @@ def test_a_worker_transcript_shows_its_agent_there_and_quits_it_there(page, site
         route.fulfill(json={"quit": True, "pane": "w3:p2", "warning": None})
 
     page.route("**/api/workspace-quit", quit_)
+    strip.get_by_role("button", name="More actions for Claude in w3:p2").click()
+    expect(strip.locator(".ws-live-menu-head")).to_have_text("Claude in w3:p2 · on Mac mini")
     quit_button = strip.get_by_role("button", name="Quit Claude in w3:p2")
     expect(quit_button).to_be_enabled()
     quit_button.click()
@@ -785,12 +790,12 @@ def test_a_stop_on_its_way_holds_only_the_row_it_was_sent_from(page, site):
     dialog.get_by_role("button", name="Next workspace").click()
     expect(page.locator("#ws-viewer-title")).to_have_text("merged-work")
     stop = dialog.get_by_role("button", name="Stop the turn of Claude in merged-work:p1")
-    expect(stop).to_have_text("Stop turn")
+    expect(stop).to_have_text("■ Stop")
     expect(stop).to_be_enabled()
     dialog.get_by_role("button", name="Previous workspace").click()
     expect(dialog.locator(".ws-stop")).to_have_text("Stopping…")
     held[0].fulfill(json={"stopped": True, "pane": "dirty-work:p1", "warning": None})
-    expect(dialog.locator(".ws-stop")).to_have_text("Stop turn")
+    expect(dialog.locator(".ws-stop")).to_have_text("■ Stop")
     assert held[0].request.post_data_json["pane"] == "dirty-work:p1"
 
 

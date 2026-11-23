@@ -4155,7 +4155,7 @@ def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopp
     state = live.locator(".ws-live-state")
     rows = viewer.get_by_role("group", name="Other running agents").locator(".ws-live-agent")
     expect(state).to_have_attribute("data-live", "true")
-    expect(state).to_contain_text("LiveWorkingClaude in w1:p2")
+    expect(state).to_contain_text("WorkingClaude")
     expect(rows).to_have_count(1)
     expect(rows.nth(0)).to_contain_text("IdleCodexin w1:p1")
     # The session choice marks each session an agent is running.
@@ -4164,14 +4164,21 @@ def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopp
     expect(options.nth(1)).to_contain_text("● Idle · ")
     # Only a working agent has a turn to stop; every live agent can be quit.
     expect(rows.nth(0).get_by_role("button", name=re.compile("^Stop"))).to_have_count(0)
-    expect(rows.nth(0).get_by_role("button", name="Quit Codex in w1:p1")).to_have_text("Quit agent")
+    # Quitting is in the "⋯" menu, whose first line names the agent's pane.
+    rows.nth(0).get_by_role("button", name="More actions for Codex in w1:p1").click()
+    menu = rows.nth(0).get_by_role("group", name="Actions for Codex in w1:p1")
+    expect(menu.locator(".ws-live-menu-head")).to_have_text("Codex in w1:p1")
+    expect(menu.get_by_role("button", name="Quit Codex in w1:p1")).to_have_text("Quit agent")
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+    expect(viewer).to_be_visible()
     stop = state.get_by_role("button", name="Stop the turn of Claude in w1:p2")
-    expect(stop).to_have_text("Stop turn")
+    expect(stop).to_have_text("■ Stop")
     expect(stop).to_have_attribute("title", re.compile("the agent keeps running"))
     page.screenshot(path=f"reports/viewer-running-agents-{width}.png")
     stop.click()
     expect(page.locator("#ws-live-status")).to_have_text("Stopped the turn of Claude in w1:p2.")
-    expect(state).to_contain_text("LiveIdleClaude in w1:p2")
+    expect(state).to_contain_text("IdleClaude")
     expect(live.get_by_role("button", name=re.compile("^Stop"))).to_have_count(0)
     expect(options.nth(0)).to_contain_text("● Idle · ")
     assert stops == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
@@ -4179,7 +4186,7 @@ def test_running_agents_show_above_the_transcript_and_a_working_one_can_be_stopp
     # Another running session's transcript is one click away.
     rows.nth(0).get_by_role("button", name="Show its transcript").click()
     expect(viewer.locator(".ws-msg-text")).to_have_text("Working on Earlier")
-    expect(state).to_contain_text("LiveIdleCodex in w1:p1")
+    expect(state).to_contain_text("IdleCodex")
     expect(rows.nth(0)).to_contain_text("IdleClaudein w1:p2")
     assert asked[-1] == "s2"
 
@@ -4247,10 +4254,22 @@ def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
     strip = live.locator(".ws-live-state")
-    expect(strip).to_have_text(re.compile(r"^Liveon this Mac · WorkingClaude in w1:p2"))
+    # This machine goes unsaid; the pane is in the agent's title and the menu.
+    expect(strip).to_have_text(re.compile(r"^WorkingClaude"))
+    expect(strip.get_by_text("this Mac")).to_be_hidden()
+    expect(strip.locator(".ws-live-settings")).to_have_attribute(
+        "title", re.compile(r"^Claude in w1:p2; its model and effort are not known")
+    )
     expect(strip.get_by_role("button", name="Stop the turn of Claude in w1:p2")).to_be_visible()
     if width == 1280:
+        # Status, model and buttons share one line beside the tabs.
+        assert live.bounding_box()["height"] < 50
         live.screenshot(path="reports/viewer-strip-live-local.png")
+    more = strip.get_by_role("button", name="More actions for Claude in w1:p2")
+    more.click()
+    expect(strip.locator(".ws-live-menu-head")).to_have_text("Claude in w1:p2 · on this Mac")
+    if width == 1280:
+        page.screenshot(path="reports/viewer-strip-menu.png")
     quit_button = strip.get_by_role("button", name="Quit Claude in w1:p2")
     quit_button.click()
     card = live.get_by_role("group", name="Confirm quitting the agent")
@@ -4264,7 +4283,8 @@ def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
     assert not quits
     claude["status"] = "idle"
     page.locator("#ws-viewer").get_by_role("button", name="Refresh").click()
-    expect(strip).to_contain_text("Liveon this Mac · Idle")
+    expect(strip).to_have_text(re.compile(r"^IdleClaude"))
+    more.click()
     quit_button.click()
     expect(card).not_to_contain_text("stopped first")
     card.get_by_role("button", name="Yes, quit").click()
@@ -4273,7 +4293,7 @@ def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
     )
     expect(strip).to_have_attribute("data-live", "false")
     # The pinned strip says it in two words; hovering it says the rest.
-    expect(strip).to_have_text("Not runningon this Mac")
+    expect(strip).to_have_text("Not running")
     expect(strip).to_have_attribute("title", "No agent has this session open right now")
     expect(live.get_by_role("button", name=re.compile("^Quit"))).to_have_count(0)
     assert quits == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
@@ -4294,7 +4314,7 @@ def test_the_strip_names_the_agents_model_and_effort_and_changes_them(
     def change(route):
         assert route.request.headers["x-babysit-action"] == "workspace-agent-settings"
         changes.append(route.request.post_data_json)
-        claude.update(model="sonnet", effort="max")
+        claude.update(model="claude-sonnet-5-5", effort="max")
         route.fulfill(json={"changed": True, "pane": "w1:p2", "warning": None})
 
     page.route("**/api/workspace-agent-settings", change)
@@ -4309,7 +4329,11 @@ def test_the_strip_names_the_agents_model_and_effort_and_changes_them(
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-live")
     strip = live.locator(".ws-live-state")
-    expect(strip.locator(".ws-live-settings")).to_have_text("opus · default effort")
+    # The model names the agent; the effort goes unsaid while it is the agent's default.
+    expect(strip).to_have_text(re.compile(r"^Workingopus■ Stop"))
+    expect(strip.locator(".ws-live-settings")).to_have_attribute(
+        "title", re.compile(r"^Claude in w1:p2: opus with its default effort\.")
+    )
     strip.get_by_role("button", name="Change model or effort for Claude in w1:p2").click()
     card = live.get_by_role("group", name="Change model or effort")
     model = card.get_by_role("combobox", name="Model")
@@ -4329,7 +4353,7 @@ def test_the_strip_names_the_agents_model_and_effort_and_changes_them(
         "Resumed Claude in w1:p2 on sonnet with max effort."
     )
     expect(card).to_have_count(0)
-    expect(strip.locator(".ws-live-settings")).to_have_text("sonnet · max effort")
+    expect(strip.locator(".ws-live-settings")).to_have_text("sonnet 5.5 · max")
     live.screenshot(path="reports/viewer-strip-settings.png")
     assert changes == [
         {"workspace": "w1", "pane": "w1:p2", "session": "s1", "model": "sonnet", "effort": "max"}
@@ -4357,20 +4381,22 @@ def test_a_refused_quit_says_why_and_a_vanished_agent_drops_the_question(
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-live")
     # Without workers, the strip names no machine, as before them.
-    expect(live.locator(".ws-live-state")).to_have_text(re.compile(r"^LiveIdleClaude in w1:p2"))
+    expect(live.locator(".ws-live-state")).to_have_text(re.compile(r"^IdleClaude"))
+    live.get_by_role("button", name="More actions for Claude in w1:p2").click()
     live.get_by_role("button", name="Quit Claude in w1:p2").click()
     live.get_by_role("button", name="Yes, quit").click()
     expect(page.locator("#ws-live-status")).to_have_text(
         "Not quit: Composer contains input or an unknown layout; no exit key sent"
     )
     expect(live.locator(".ws-live-state")).to_have_attribute("data-live", "true")
+    live.get_by_role("button", name="More actions for Claude in w1:p2").click()
     live.get_by_role("button", name="Quit Claude in w1:p2").click()
     expect(live.get_by_role("group", name="Confirm quitting the agent")).to_be_visible()
     # A poll that redraws the open question leaves the reader's focus where it is.
     page.locator("#ws-message-text").focus()
     viewer_routes["agents"][0]["status"] = "done"
     page.clock.run_for(11000)
-    expect(live.locator(".ws-live-state")).to_contain_text("LiveDone")
+    expect(live.locator(".ws-live-state")).to_contain_text("Done")
     expect(live.get_by_role("group", name="Confirm quitting the agent")).to_be_visible()
     expect(page.locator("#ws-message-text")).to_be_focused()
     # The agent exits on its own before the answer: nothing is left to confirm.
@@ -4454,7 +4480,7 @@ def test_the_agent_status_sits_beside_the_tabs_while_the_header_has_room(
     tabs = header.get_by_role("tablist", name="Workspace view")
 
     def placed():
-        expect(live.locator(".ws-live-state")).to_contain_text("LiveDoneClaude in w1:p2")
+        expect(live.locator(".ws-live-state")).to_contain_text("DoneClaude")
         bar, box = tabs.bounding_box(), live.bounding_box()
         if width >= 1000:
             # On the tabs' line, to their right.
@@ -4472,6 +4498,7 @@ def test_the_agent_status_sits_beside_the_tabs_while_the_header_has_room(
     expect(others).to_contain_text("IdleCodexin w1:p1")
     expect(header.get_by_role("group", name="Other running agents")).to_have_count(0)
     # The question a quit asks, and its outcome, stay by the button in the pinned header.
+    live.get_by_role("button", name="More actions for Claude in w1:p2").click()
     live.get_by_role("button", name="Quit Claude in w1:p2").click()
     card = header.get_by_role("group", name="Confirm quitting the agent")
     expect(card).to_be_in_viewport()
@@ -4516,7 +4543,7 @@ def test_an_agent_whose_session_herdr_does_not_know_is_not_called_stopped(
     viewer_routes["agents"][0]["session"] = "s1"
     page.clock.run_for(11000)
     expect(strip).to_have_attribute("data-live", "true")
-    expect(strip).to_contain_text("LiveWorkingClaude in w1:p2")
+    expect(strip).to_contain_text("WorkingClaude")
     # Running another session, it is not this transcript's.
     viewer_routes["agents"][0]["session"] = "s2"
     page.clock.run_for(11000)
@@ -6405,6 +6432,7 @@ def test_transcript_offers_change_agent_in_its_checkout(page, dashboard_site, vi
     )
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_role("button", name="More actions for Claude in w1:p2").click()
     page.get_by_role("button", name="Change agent for Claude in w1:p2").click()
     dialog = page.locator("#workspace-dialog")
     expect(dialog).to_be_visible()

@@ -1507,6 +1507,8 @@
   // The model and effort change asked about ({id, pane, session, agent, model, effort,
   // choices}), likewise.
   let settingsQuestion = null;
+  // The agent whose "⋯" menu is open ({id, pane}); a redraw while it is open keeps it so.
+  let menuOpen = null;
   let changingDocker = false;
   let sending = false; // A send in flight keeps the button disabled through refreshes.
   // Cancelling the babysit watch that owns the picked session: the question asked
@@ -1573,6 +1575,7 @@
     quitQuestion = null;
     moveQuestion = null;
     settingsQuestion = null;
+    menuOpen = null;
     if (!messageable(entry)) {
       // A checkout without a herdr workspace or a row has no agent to talk to.
       draft = null;
@@ -2072,92 +2075,163 @@
   function agentTitle(agent) {
     return { claude: "Claude", codex: "Codex" }[agent.agent] || agent.agent || "Agent";
   }
-  // "opus · high effort"; what its command line and transcript leave unsaid is the
-  // agent's own configured default.
-  function settingsLabel(agent) {
-    if (!["claude", "codex"].includes(agent.agent) || agent.model === undefined) return null;
-    const text = `${agent.model || "default model"} · ${agent.effort ? `${agent.effort} effort` : "default effort"}`;
-    const label = node("span", text, "ws-live-settings");
-    label.title = "The model and reasoning effort this agent runs with";
-    return label;
+  function paneAgent(agent) {
+    return `${agentTitle(agent)} in ${agent.pane}`;
+  }
+  // What names the agent: "opus 5.5 · high", a Claude model without its prefix or release
+  // date, and the effort only when one was chosen. Without a model, the agent's name
+  // ("Claude · high"): what is left unsaid is its own configured default.
+  function settingsText(agent) {
+    let model = agent.model || agentTitle(agent);
+    if (model.startsWith("claude-"))
+      model = model
+        .slice("claude-".length)
+        .replace(/-\d{8}(?=\[|$)/, "")
+        .replace(/-(\d+)-(\d+)(?=\[|$)/, " $1.$2")
+        .replace(/-(\d+)(?=\[|$)/, " $1");
+    return agent.effort ? `${model} · ${agent.effort}` : model;
+  }
+  function settingsTitle(agent) {
+    if (agent.model === undefined) return `${paneAgent(agent)}; its model and effort are not known`;
+    return (
+      `${paneAgent(agent)}: ${agent.model || "its default model"} with ` +
+      (agent.effort ? `${agent.effort} effort` : "its default effort")
+    );
   }
   function activity(agent) {
     if (agent.status === "blocked" && agent.interaction?.idle) return ACTIVITY.idle;
     return ACTIVITY[agent.status] || [agent.status || "Unknown", ""];
   }
-  function liveButtons(agent) {
+  // A button for one of LIVE_ACTIONS: it says so while that action is on its way, and
+  // waits, as every other one does, while any is.
+  function actionButton(agent, action, label, className, aria, title) {
     const busy = stopping();
+    const element = node(
+      "button",
+      busy?.pane === agent.pane && busy.action === action ? LIVE_ACTIONS[action].busy : label,
+      className,
+    );
+    element.type = "button";
+    element.disabled = Boolean(busy);
+    element.title = title;
+    element.setAttribute("aria-label", aria);
+    return element;
+  }
+  // The agent, named by its model and effort: a button that changes them where its session
+  // can be resumed. Its pane is in the title.
+  function agentIdentity(agent) {
+    if (!["claude", "codex"].includes(agent.agent) || !agent.session) {
+      const name = node("strong", settingsText(agent), "ws-live-settings");
+      name.title = settingsTitle(agent);
+      return name;
+    }
+    const button = actionButton(
+      agent,
+      "settings",
+      settingsText(agent),
+      "ws-live-settings",
+      `Change model or effort for ${paneAgent(agent)}`,
+      `${settingsTitle(agent)}. Change them: quit the agent and resume this conversation with others`,
+    );
+    button.onclick = () => {
+      quitQuestion = null;
+      moveQuestion = null;
+      settingsQuestion = {
+        id: viewer.id,
+        pane: agent.pane,
+        session: agent.session,
+        agent: agent.agent,
+        model: agent.model || "",
+        effort: agent.effort || "",
+        choices: undefined,
+        focus: true,
+      };
+      byId("ws-live-status").textContent = "";
+      renderLive();
+      void loadSettingsChoices();
+    };
+    return button;
+  }
+  function closeMenus() {
+    menuOpen = null;
+    for (const menu of document.querySelectorAll(".ws-live-menu")) {
+      menu.querySelector(".ws-live-menu-items").hidden = true;
+      menu.querySelector(".ws-live-more").setAttribute("aria-expanded", "false");
+    }
+  }
+  document.addEventListener("click", (event) => {
+    if (menuOpen && !event.target.closest?.(".ws-live-menu")) closeMenus();
+  });
+  // Escape closes the menu, not the dialog around it.
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key !== "Escape" || !menuOpen) return;
+      const open = document.querySelector(".ws-live-menu-items:not([hidden])");
+      closeMenus();
+      if (!open) return;
+      event.preventDefault();
+      event.stopPropagation();
+      open.parentElement.querySelector(".ws-live-more").focus();
+    },
+    true,
+  );
+  // The actions used less often, behind "⋯": its first line names the agent's pane and
+  // machine, which the strip leaves to hovering, so a phone has them too.
+  function agentMenu(agent, items) {
+    const name = paneAgent(agent);
+    const where = workerLabel(viewer.entry) || hostLabel;
+    const busy = stopping();
+    const mine =
+      busy?.pane === agent.pane && items.some((item) => item.dataset.action === busy.action);
+    const menu = node("div", undefined, "ws-live-menu");
+    const toggle = node("button", mine ? LIVE_ACTIONS[busy.action].busy : "⋯", "ws-live-more");
+    toggle.type = "button";
+    toggle.disabled = Boolean(busy);
+    toggle.title = "More actions";
+    toggle.setAttribute("aria-label", `More actions for ${name}`);
+    const list = node("div", undefined, "ws-live-menu-items");
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", `Actions for ${name}`);
+    list.append(node("p", where ? `${name} · on ${where}` : name, "ws-live-menu-head"), ...items);
+    const open = !busy && menuOpen?.id === viewer.id && menuOpen.pane === agent.pane;
+    list.hidden = !open;
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.onclick = () => {
+      const opening = list.hidden;
+      closeMenus();
+      if (!opening) return;
+      menuOpen = { id: viewer.id, pane: agent.pane };
+      list.hidden = false;
+      toggle.setAttribute("aria-expanded", "true");
+      list.querySelector("button")?.focus();
+    };
+    for (const item of items) item.addEventListener("click", closeMenus);
+    menu.append(toggle, list);
+    return menu;
+  }
+  function liveButtons(agent) {
     const buttons = [];
-    const button = (action, label, className, aria, title) => {
-      const element = node(
-        "button",
-        busy?.pane === agent.pane && busy.action === action ? LIVE_ACTIONS[action].busy : label,
-        className,
-      );
-      element.type = "button";
-      element.disabled = Boolean(busy);
-      element.title = title;
-      element.setAttribute("aria-label", aria);
-      buttons.push(element);
+    const menu = [];
+    const button = (action, ...args) => {
+      const element = actionButton(agent, action, ...args);
+      element.dataset.action = action;
       return element;
     };
-    const name = `${agentTitle(agent)} in ${agent.pane}`;
-    if (agent.status === "working")
-      button(
+    const name = paneAgent(agent);
+    if (agent.status === "working") {
+      const stop = button(
         "stop",
-        "Stop turn",
+        "■ Stop",
         "ws-stop",
         `Stop the turn of ${name}`,
         "Interrupt the current turn, as Esc does; the agent keeps running",
-      ).onclick = () => void liveAction(agent, "stop");
-    const quit = button(
-      "quit",
-      "Quit agent",
-      "ws-quit",
-      `Quit ${name}`,
-      "End the agent's process; its session can be resumed. A pane babysit opened for it closes; any other keeps its shell",
-    );
+      );
+      stop.onclick = () => void liveAction(agent, "stop");
+      buttons.push(stop);
+    }
     // A worker's agent is quit through that worker's herdr, as a stop is.
     const worker = workerLabel(viewer.entry);
-    quit.onclick = () => {
-      // Focused once, on this click; a redraw while it is open leaves focus alone.
-      quitQuestion = {
-        id: viewer.id,
-        pane: agent.pane,
-        session: agent.session ?? null,
-        focus: true,
-      };
-      moveQuestion = null;
-      settingsQuestion = null;
-      byId("ws-live-status").textContent = "";
-      renderLive();
-    };
-    if (agent.session && ["claude", "codex"].includes(agent.agent)) {
-      const settings = button(
-        "settings",
-        "Model & effort…",
-        "ws-move",
-        `Change model or effort for ${name}`,
-        "Quit the agent and resume this conversation with another model or reasoning effort",
-      );
-      settings.onclick = () => {
-        quitQuestion = null;
-        moveQuestion = null;
-        settingsQuestion = {
-          id: viewer.id,
-          pane: agent.pane,
-          session: agent.session,
-          agent: agent.agent,
-          model: agent.model || "",
-          effort: agent.effort || "",
-          choices: undefined,
-          focus: true,
-        };
-        byId("ws-live-status").textContent = "";
-        renderLive();
-        void loadSettingsChoices();
-      };
-    }
     if (agent.session && draft?.path && ["claude", "codex"].includes(agent.agent)) {
       const handoff = button(
         "handoff",
@@ -2178,6 +2252,7 @@
           },
         });
       };
+      menu.push(handoff);
     }
     // Only where workers are registered, and for an agent whose session can resume there:
     // one here goes to a worker, a worker's comes back to this machine.
@@ -2207,13 +2282,42 @@
         byId("ws-live-status").textContent = "";
         void loadMovePlan();
       };
+      menu.push(move);
     }
+    const quit = button(
+      "quit",
+      "Quit agent",
+      "ws-quit",
+      `Quit ${name}`,
+      "End the agent's process; its session can be resumed. A pane babysit opened for it closes; any other keeps its shell",
+    );
+    quit.onclick = () => {
+      // Focused once, on this click; a redraw while it is open leaves focus alone.
+      quitQuestion = {
+        id: viewer.id,
+        pane: agent.pane,
+        session: agent.session ?? null,
+        focus: true,
+      };
+      moveQuestion = null;
+      settingsQuestion = null;
+      byId("ws-live-status").textContent = "";
+      renderLive();
+    };
+    menu.push(quit);
+    buttons.push(agentMenu(agent, menu));
     const holder = node("span", undefined, "ws-live-actions");
     holder.append(...buttons);
     return holder;
   }
+  // A worker's name, set off as a chip; this machine goes unsaid.
+  function machineChip(worker) {
+    const chip = node("span", worker, "ws-live-machine");
+    chip.title = `On ${worker}`;
+    return chip;
+  }
   // The headline for the session shown: live (and doing what), not running, or not
-  // known, with the machine it is on once workers are registered.
+  // known, with the worker it is on. The pane and machine are in its title and menu.
   function liveState(shown, mine) {
     const worker = workerLabel(viewer.entry);
     const where = worker || hostLabel;
@@ -2222,12 +2326,12 @@
       const [text, tone] = activity(mine);
       row.dataset.live = "true";
       row.dataset.status = mine.status || "";
+      const state = badge(text, tone);
+      state.title = `Live: ${paneAgent(mine)} has this session open${where ? ` on ${where}` : ""}`;
       row.append(
-        badge("Live", "green"),
-        node("span", where ? `on ${where} · ` : ""),
-        node("strong", text, `ws-live-activity ${tone}`.trim()),
-        node("span", `${agentTitle(mine)} in ${mine.pane}`, "pr-meta"),
-        ...[settingsLabel(mine)].filter(Boolean),
+        state,
+        ...(worker ? [machineChip(worker)] : []),
+        agentIdentity(mine),
         liveButtons(mine),
       );
       return row;
@@ -2252,7 +2356,7 @@
       ),
     );
     // The header is pinned: the badge says it, and hovering it says the rest.
-    if (where) row.append(node("span", unnamed ? `on ${where} · ` : `on ${where}`));
+    if (worker) row.append(machineChip(worker));
     if (unnamed) {
       row.append(node("span", "an agent here may have it open", "pr-meta"));
       row.title = "An agent runs here, but which session it has open is not known";
@@ -2265,9 +2369,8 @@
     row.dataset.status = agent.status || "";
     row.append(
       badge(text, tone),
-      node("strong", agentTitle(agent)),
+      agentIdentity(agent),
       node("span", `in ${agent.pane}`, "pr-meta"),
-      ...[settingsLabel(agent)].filter(Boolean),
     );
     if (data.sessions.some((session) => session.id === agent.session)) {
       const show = node("button", "Show its transcript");
