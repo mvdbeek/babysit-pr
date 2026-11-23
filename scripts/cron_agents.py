@@ -62,8 +62,9 @@ FENCE = re.compile(r"`{3,}\w*")
 # The label of a pane split off for an agent, which its shell may be closed by later.
 RUN_PANE_LABEL = "babysit agent"
 # Other clones a job's sandbox may write the git directories of. The grants are staged in
-# a file, so this bounds the list rather than the typed line.
-OTHER_CLONES_LIMIT = 8
+# a file, so this bounds the list rather than the typed line. A review sweep takes one for
+# every repository it reviews. assets/dashboard/cron.js offers as many.
+OTHER_CLONES_LIMIT = 24
 
 
 class Busy(Exception):

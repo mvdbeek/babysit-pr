@@ -299,6 +299,11 @@ def test_too_many_other_clones_are_refused(setup, monkeypatch):
         jobs.save(request(manager, other_clones=others))
 
 
+def test_the_job_form_offers_as_many_other_clones_as_are_taken():
+    form = (Path(__file__).resolve().parents[1] / "assets" / "dashboard" / "cron.js").read_text()
+    assert f"const OTHERS_LIMIT = {cron_agents.OTHER_CLONES_LIMIT};" in form
+
+
 def test_a_claude_job_trusts_its_checkout_in_its_account_before_starting(setup, monkeypatch):
     import claude_accounts
 
