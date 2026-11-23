@@ -80,7 +80,7 @@ const chrome = {
     ],
   },
 };
-vm.runInNewContext(await readFile(new URL("../extension/background.js", import.meta.url), "utf8"), {
+vm.runInNewContext(await readFile(new URL("../extension/capture.js", import.meta.url), "utf8"), {
   chrome,
   crypto,
   URL,

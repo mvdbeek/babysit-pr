@@ -1,7 +1,8 @@
 """A file share for tests that answers as dufs does: JSON listings, and the files.
 
 ``serve(root)`` runs an in-process stand-in on a free loopback port. It answers as
-dufs 0.46 does with ``--allow-all``: a missing directory is an empty one it could create
+dufs 0.46 does with ``--allow-all``: a search (``?q=``) names what it found by its path
+below the folder searched; a missing directory is an empty one it could create
 (``dir_exists: false``), a file answers ``?json`` with its own details, and a folder's
 size counts its entries. ``serve(root, real=True)`` runs the dufs binary instead; the
 tests that take both run against it wherever ``dufs`` is on PATH, which is what shows
@@ -69,7 +70,27 @@ class Handler(BaseHTTPRequestHandler):
         if not target.is_relative_to(self.server.root):
             self.answer(403, b"Forbidden", "text/plain")
             return
-        if "json" in parse_qs(route.query, keep_blank_values=True):
+        query = parse_qs(route.query, keep_blank_values=True)
+        if "json" in query and query.get("q") and target.is_dir():
+            # A search (--allow-search): everything below whose name holds the text,
+            # ignoring case, named by its path below the folder searched.
+            needle = query["q"][0].lower()
+            found = [
+                details(entry, entry.relative_to(target).as_posix())
+                for entry in sorted(target.rglob("*"))
+                if needle in entry.name.lower()
+            ]
+            value = {
+                "href": "/" + relative,
+                "kind": "Index",
+                "uri_prefix": "/",
+                "allow_upload": True,
+                "allow_search": True,
+                "dir_exists": True,
+                "paths": found,
+            }
+            self.answer(200, json.dumps(value).encode(), "application/json")
+        elif "json" in query:
             if target.is_file():
                 value = details(target, relative)
             else:

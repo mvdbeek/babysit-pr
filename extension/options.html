@@ -24,6 +24,17 @@
         <button type="submit">Save connection</button>
       </form>
       <p id="status" role="status"></p>
+      <h2>GitHub pull requests</h2>
+      <label for="github">
+        <input id="github" type="checkbox" />
+        Show pr-review summaries and an Open in Babysitter button on GitHub
+      </label>
+      <p>
+        Needs access to github.com. Pull request lists and pages then ask your dashboard about the
+        pull requests they show; nothing is sent to GitHub. Reload open GitHub tabs after turning it
+        on.
+      </p>
+      <p id="github-status" role="status"></p>
       <p>
         Your token stays in this browser profile; it is not synced. Revoke access on the dashboard
         pairing page.

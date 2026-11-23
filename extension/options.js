@@ -1,4 +1,4 @@
-import { dashboardURL } from "./shared.js";
+import { dashboardURL, GITHUB_ORIGINS } from "./shared.js";
 const $ = (id) => document.getElementById(id);
 $("extension-id").textContent = chrome.runtime.id;
 const { config } = await chrome.storage.local.get("config");
@@ -30,5 +30,23 @@ $("settings").onsubmit = async (event) => {
     $("status").textContent = "Saved. Return to your task; its choices will refresh automatically.";
   } catch (error) {
     $("status").textContent = error.message;
+  }
+};
+const { github } = await chrome.storage.local.get("github");
+$("github").checked =
+  Boolean(github) && (await chrome.permissions.contains({ origins: GITHUB_ORIGINS }));
+$("github").onchange = async () => {
+  const on = $("github").checked;
+  try {
+    // Asked first, while the click still counts as a user gesture.
+    if (on && !(await chrome.permissions.request({ origins: GITHUB_ORIGINS })))
+      throw Error("GitHub access was not granted.");
+    await chrome.storage.local.set({ github: on });
+    $("github-status").textContent = on
+      ? "On. Reload open GitHub tabs to see it there."
+      : "Off. GitHub pages no longer ask the dashboard.";
+  } catch (error) {
+    $("github").checked = false;
+    $("github-status").textContent = error.message;
   }
 };

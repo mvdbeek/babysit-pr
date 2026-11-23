@@ -32,6 +32,7 @@ import dashboard_auth
 import dashboard_settings
 import llm_usage
 import machines
+import pr_reviews
 import service_control
 import voice_assistant
 import work_tags
@@ -566,6 +567,7 @@ class DashboardServer(ThreadingHTTPServer):
         workspace_viewer.use_store(home)
         # The dufs share the viewer's Artefacts tab reads; disabled unless configured.
         self.artefacts = workspace_artefacts.Artefacts(home)
+        self.reviews = pr_reviews.Reviews(self.artefacts)
         # None while auth is off: every request is answered as before Phase 1.
         self.auth = auth
         # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.

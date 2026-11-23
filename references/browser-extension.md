@@ -45,7 +45,55 @@ To update an unpacked installation, update the dashboard backend, replace the
 extension files in the **same directory**, click **Reload** on its
 `chrome://extensions` card, and open a fresh composer. Keeping the directory
 preserves its extension ID, connection and pairing. No new browser permissions
-are required. If you load a different directory, pair the new ID.
+are required unless you turn on GitHub pages (below). If you load a different
+directory, pair the new ID.
+
+## On GitHub pull requests
+
+Version 0.3 can show what Babysitter knows on GitHub's pull request lists and pull
+request pages. Turn on **Show pr-review summaries and an Open in Babysitter button on
+GitHub** in the extension's Settings and accept the request for github.com access,
+then reload open GitHub tabs. It needs a paired dashboard.
+
+- **List pages** (`/<owner>/<repo>/pulls` and `/pulls`): beside a pull request's
+  title, a chip with its latest pr-review round and its findings by priority
+  (`Review r2: 1 P1 · 3 P3`), linking to the findings, and **Open workspace** or
+  **Open in Babysitter**. Hover the chip for the finding titles and the risk verdict.
+- **A pull request's page**: a Babysitter section at the top of the sidebar (a card in
+  the corner on tabs without one, such as Files changed) with the round, its date and
+  reviewed commit, up to eight finding titles, the risk verdict, links to the findings
+  and the draft reply, and the same button.
+- **Open workspace** appears when the pull request has a checkout with a herdr
+  workspace. It opens the dashboard's PR list at that row and then the workspace's
+  conversation. **Open in Babysitter** opens the row alone, with its workspace
+  actions. Pull requests that are neither in the dashboard's overview nor reviewed
+  show nothing.
+
+Reviews are the folders the pr-review skill writes, `pr-review-<owner>-<repo>-<number>`.
+The dashboard reads its own machine's from disk: `~/src/agent-artefacts/outbox`,
+each sandbox's `~/.cache/babysit-sandbox/<key>/artifacts` and
+`~/.local/state/pr-review`. Workers' reviews are found on the artefacts share, when the
+[artefacts experiment](artefacts.md) is configured and dufs runs with
+`--allow-search` (or `--allow-all`): one search for `pr-review-` per minute finds them all.
+Findings and draft-reply links need the share; reviews found only on disk show their
+summary without links. Summaries are reused for a minute. The newest round with a
+`verified.md` counts, with its latest trim.
+
+The page asks the extension's background for the pull requests it shows, and the
+background asks the dashboard with the pairing token; the page never sees the token.
+Only this extension's script on a github.com page is answered. The summary is shown as
+text, never markup. It is added to GitHub's page, so GitHub's own scripts can read it
+like the rest of the page. Turning the setting off unregisters the script; the github.com
+permission stays granted until you remove it on the extension's details page.
+
+### Open in the installed app
+
+The dashboard's web app manifest focuses an already open Babysitter window
+(`launch_handler` `focus-existing`) and routes the link there without a reload. For
+Chrome to open dashboard links in the installed app at all, install the dashboard as an
+app and turn on **Open supported links** in its settings (`chrome://app-settings`, or
+the app window's menu → **App info** → **Settings**). Otherwise the link opens in a
+browser tab.
 
 ## Install and connect
 
@@ -155,5 +203,5 @@ revocation, and token-free dashboard handoff. No test uses the live watcher.
 
 After editing the extension, click **Reload** on its `chrome://extensions` card and
 open a fresh composer. Restart the test dashboard after Python changes. Extension
-pages use bundled scripts only, with no remotely hosted code or content scripts
-running persistently on websites.
+pages use bundled scripts only, with no remotely hosted code. The only content
+script runs on github.com, and only while GitHub pages are turned on in Settings.

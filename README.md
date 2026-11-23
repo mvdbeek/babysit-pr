@@ -8,6 +8,9 @@ The [Send to Babysitter browser extension](references/browser-extension.md) send
 page references and GitHub tasks to the dashboard, starts new workspaces, and sends
 follow-ups to existing agents. It supports paired direct submission, a monitoring
 instruction checkbox, and a token-free handoff to the dashboard's New task dialog.
+Turned on in its Settings, it also shows each pull request's latest pr-review round on
+GitHub's pull request lists and pages, with a button that opens the pull request's
+workspace in the dashboard (in the installed app, if Chrome opens its links there).
 Installation and manual testing instructions are in the linked guide.
 
 On mobile, selecting a watch card scrolls to its details and actions. Background

@@ -369,7 +369,7 @@ def test_extension_forgets_drafts_whose_composer_never_loaded(page: Page) -> Non
     first, later = page.evaluate(
         BACKGROUND,
         [
-            (ROOT / "extension/background.js").read_text(),
+            (ROOT / "extension/capture.js").read_text(),
             drafts,
             tabs,
             [start, start + 10 * minute],

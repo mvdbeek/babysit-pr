@@ -3,6 +3,8 @@ const $ = (id) => document.getElementById(id);
 const ended = new Set(["closed", "stopped"]);
 const attention = new Set(["blocked", "awaiting_release", "handoff"]);
 let navigationTarget = null;
+// A PR whose workspace a link asked to open (`view=1`), until its row and workspaces load.
+let viewerRequest = null;
 // Declared early: opening the dashboard on #scheduled refreshes it during startup.
 let scheduledData = null,
   scheduledBusy = false;
@@ -2129,6 +2131,11 @@ function pageFromURL() {
     ["prs", "issues", "watcher"].includes(name)
       ? { page: name, url: item }
       : null;
+  // `view=1` (the browser extension's link) also opens the item's workspace, if it has one.
+  viewerRequest =
+    navigationTarget && name === "prs" && new URLSearchParams(location.search).get("view") === "1"
+      ? item
+      : null;
   $("navigation-status").hidden = true;
   if (navigationTarget) revealNotification(name);
 }
@@ -2161,8 +2168,10 @@ function revealNotification(page) {
     return;
   navigationTarget = null;
   let found = false;
-  if (table) found = table.reveal(target.url);
-  else {
+  if (table) {
+    found = table.reveal(target.url);
+    if (found) openRequestedViewer();
+  } else {
     const job = data.jobs.find((job) => sameSubject(job.url, target.url));
     if (job) {
       $("search").value = "";
@@ -2180,6 +2189,20 @@ function revealNotification(page) {
     ? ""
     : "This item is no longer in the current dashboard view.";
   window.dashboardNotifications?.seen([target.url]);
+}
+// Opened once the PR's row is shown and a workspace snapshot has loaded: the
+// conversation of the PR's first checkout with a herdr workspace. Without one, the row
+// alone is shown, with its workspace actions.
+function openRequestedViewer() {
+  if (!viewerRequest || navigationTarget || !workspaceLoadedAt) return;
+  const item = prTable.items().find((entry) => sameSubject(entry.url, viewerRequest));
+  viewerRequest = null;
+  const match = ((item && workspaceInfo(item)?.matches) || []).find((m) => m.workspace_id);
+  if (!match || !window.workspaceViewer) return;
+  void window.workspaceViewer.open(
+    { workspace: match.workspace_id, name: match.name, links: subjectLinks(item) },
+    "transcript",
+  );
 }
 window.dashboardNavigation = {
   open(href) {
@@ -2222,6 +2245,11 @@ for (const page of pages) {
 }
 window.addEventListener("hashchange", routeChanged);
 pageFromURL();
+// An installed app asked to open a link while already running (the manifest's
+// launch_handler focuses the existing window) navigates that window, without a reload.
+window.launchQueue?.setConsumer((params) => {
+  if (params.targetURL) window.dashboardNavigation.open(params.targetURL);
+});
 $("show-attention").onclick = () => {
   $("filter").value = "attention";
   $("search").value = "";
@@ -2455,6 +2483,7 @@ async function refreshWorkspaces() {
     await loadWorkspaces();
     prTable.render();
     issueTable.render();
+    openRequestedViewer();
     // The watcher's detail waits for its own status; a snapshot can arrive first, and a
     // throw here would mark the snapshot failed, sending every dialog to load another.
     if (data) renderDetail();
