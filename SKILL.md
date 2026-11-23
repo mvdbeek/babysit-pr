@@ -1,6 +1,6 @@
 ---
 name: babysit-pr
-description: Monitor GitHub PRs or branch CI, including Actions on a fork, using a shared watcher that resumes bounded Codex or Claude repairs. Use when asked to watch or babysit a PR or branch CI; supports one-shot status checks too.
+description: Monitor GitHub PRs or branch CI, including Actions on a fork, using a shared watcher that resumes bounded Codex or Claude repairs. Use when asked to watch or babysit a PR or branch CI; supports one-shot status checks too. Also runs the review sweep, which reviews every open PR of configured repositories and every pending review request, from its cron job or when asked to review the open PRs.
 ---
 
 # PR Babysitter
@@ -232,3 +232,10 @@ use `blocked` when input is required. Do not wait for more CI inside the agent.
 The continuation is consumed once after success, survives restarts while pending,
 and shares the watch's normal wake budget and timeout. Ordinary CI monitoring
 continues afterward; a new commit does not repeat the completed continuation.
+
+## Review sweep
+
+When a cron job or the user asks you to run the review sweep, or to review the open or
+non-draft PRs or the pending review requests, follow
+[references/review-sweep.md](references/review-sweep.md). For a follow-up question about a
+PR the sweep reviewed, use its Follow-ups section.

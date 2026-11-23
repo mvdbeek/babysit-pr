@@ -94,14 +94,34 @@ a.babysit-chip:hover {
   font-weight: 600;
   font-size: 12px;
 }
-.babysit-P1 {
+.babysit-priority.babysit-danger {
   color: var(--fgColor-danger, #d1242f);
 }
-.babysit-P2 {
+.babysit-priority.babysit-attention {
   color: var(--fgColor-attention, #9a6700);
 }
-.babysit-P3 {
+.babysit-priority.babysit-muted,
+.babysit-chip.babysit-muted {
   color: var(--fgColor-muted, #59636e);
+}
+.babysit-warning {
+  color: var(--fgColor-attention, #9a6700);
+}
+.babysit-subheading {
+  margin-top: 10px !important;
+  font-weight: 600;
+}
+.babysit-workspaces {
+  margin: 4px 0;
+  padding-left: 0;
+  list-style: none;
+}
+.babysit-workspaces li {
+  margin: 3px 0;
+  overflow-wrap: anywhere;
+}
+.babysit-small {
+  font-size: 12px;
 }
 .babysit-links {
   display: flex;

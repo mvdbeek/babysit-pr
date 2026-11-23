@@ -606,6 +606,7 @@
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       snapshot = await response.json();
       render();
+      openRequestedWorkspace();
     } catch (error) {
       byId("ws-status-line").textContent =
         `Workspace API unavailable: ${error.message}. Displayed workspaces may be stale.`;
@@ -668,8 +669,36 @@
     byId("ws-status").value = "all";
     render();
   }
+  // A link to one checkout (`?workspace=<row key>`, the browser extension's): its
+  // conversation opens once the scan lists it.
+  let requestedWorkspace = null;
+  function takeRequestedWorkspace() {
+    if (location.hash !== "#workspaces") return;
+    const key = new URLSearchParams(location.search).get("workspace");
+    if (!key) return;
+    const url = new URL(location.href);
+    url.searchParams.delete("workspace");
+    history.replaceState(null, "", url);
+    requestedWorkspace = key;
+  }
+  function openRequestedWorkspace() {
+    // Before the first scan has listed anything, keep waiting.
+    if (!requestedWorkspace || !snapshot?.enabled || !rows().length) return;
+    const entry = rows().find((row) => row.key === requestedWorkspace);
+    requestedWorkspace = null;
+    const target = entry && viewTarget(entry);
+    if (!target) {
+      byId("ws-status-line").textContent = "That checkout is no longer in the workspace list.";
+      return;
+    }
+    byId("ws-search").value = entry.name;
+    byId("ws-status").value = "all";
+    render();
+    void window.workspaceViewer.open(target, "transcript", viewTargets);
+  }
   window.addEventListener("workspaces-visible", () => {
     searchRequestedItem();
+    takeRequestedWorkspace();
     void refresh();
   });
   // A cleanup started from Needs you is followed in the dialog, with this tab hidden.
@@ -694,5 +723,6 @@
   };
   window.addEventListener("tags-changed", render);
   searchRequestedItem();
+  takeRequestedWorkspace();
   void refresh();
 })();

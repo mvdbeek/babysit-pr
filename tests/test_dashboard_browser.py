@@ -3615,6 +3615,30 @@ def test_any_collie_workspace_offers_its_diff_and_transcript(
     assert "workspace-transcript?watch=feedback" in seen[-1]
 
 
+def test_the_pr_list_shows_the_newest_agent_review(page, dashboard_site):
+    url, _ = dashboard_site
+    pr = page.request.get(f"{url}/api/prs").json()["prs"][0]
+    review = {
+        "source": "sweep",
+        "label": "2026-11-23",
+        "date": "2026-11-23",
+        "head": pr["head_sha"][:11] if pr.get("head_sha") else None,
+        "verdict": "changes needed",
+        "counts": [{"severity": "Major", "count": 1, "tone": "danger"}],
+        "findings": [{"severity": "Major", "title": "Data loss", "tone": "danger"}],
+        "links": {"report": "https://share.example/report.md?view"},
+    }
+    key = f"{pr['repo'].lower()}#{pr['number']}"
+    reviews = {key: review}
+    page.route("**/api/agent-reviews", lambda route: route.fulfill(json={"reviews": reviews}))
+    page.goto(url + "/#prs")
+    chip = page.locator("#pr-list tr").first.locator(".pr-agent-review")
+    expect(chip).to_have_text("Agent: changes needed")
+    expect(chip).to_have_attribute("href", "https://share.example/report.md?view")
+    expect(chip).to_have_class(re.compile(r"\bred\b"))
+    assert "Major: Data loss" in chip.get_attribute("title")
+
+
 def test_a_link_with_view_opens_the_pull_requests_workspace(page, dashboard_site, workspace_routes):
     """The browser extension's Open workspace link: the PR's row, then its conversation."""
     url, _ = dashboard_site
