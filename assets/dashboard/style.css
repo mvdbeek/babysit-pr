@@ -387,6 +387,72 @@ header p {
 #settings-status:empty {
   display: none;
 }
+/* Only the last row of actions stays pinned to the bottom of a long dialog. */
+.settings-actions.settings-shortcuts {
+  position: static;
+}
+#settings-shortcuts-note:empty,
+#shortcuts-status:empty {
+  display: none;
+}
+#shortcuts-dialog {
+  width: 520px;
+}
+.shortcuts-table {
+  width: 100%;
+  margin-top: 12px;
+  border-collapse: collapse;
+}
+.shortcuts-table th,
+.shortcuts-table td {
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+}
+.shortcuts-table th {
+  font-weight: 600;
+}
+.shortcuts-table kbd {
+  display: inline-block;
+  min-width: 2em;
+  padding: 2px 8px;
+  border: 1px solid var(--field-line);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--field-bg);
+  color: var(--ink);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
+}
+.shortcuts-table kbd.shortcut-off {
+  color: var(--muted);
+}
+.shortcuts-table td.shortcut-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.shortcut-actions button {
+  padding: 4px 10px;
+  font-size: 0.9em;
+}
+.shortcut-actions button + button {
+  margin-left: 6px;
+}
+@media (max-width: 480px) {
+  .shortcuts-table td.shortcut-actions {
+    white-space: normal;
+  }
+  .shortcut-actions button + button {
+    margin: 6px 0 0;
+  }
+}
+.shortcuts-table td.shortcut-fixed {
+  color: var(--muted);
+  text-align: right;
+}
 @media (max-width: 600px) {
   #settings-prompt {
     font-size: 16px;

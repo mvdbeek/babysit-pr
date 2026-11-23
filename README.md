@@ -20,6 +20,12 @@ record of finished reviews live in the dashboard (`/api/review-sweep`,
 `/api/agent-reviews`); the PR list's review column shows the newest agent review.
 Installation and manual testing instructions are in the linked guide.
 
+Keyboard shortcuts work anywhere on the page except while you type in a field or a
+dialog is open: **?** lists them, **/** searches the current view, **N** starts a new
+task, **[** and **]** step through the views, **B** opens recent updates and **,** opens
+Settings. **Settings → Keyboard shortcuts…** (or **?**) changes or turns off each key;
+the choice is kept in that browser, and header buttons name their key in their tooltip.
+
 On mobile, selecting a watch card scrolls to its details and actions. Background
 refreshes leave the scroll position alone; reduced-motion settings are respected.
 

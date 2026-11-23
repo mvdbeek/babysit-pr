@@ -2067,6 +2067,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/codex_update.js": ("codex_update.js", "text/javascript"),
                     "/service.js": ("service.js", "text/javascript"),
                     "/settings.js": ("settings.js", "text/javascript"),
+                    "/shortcuts.js": ("shortcuts.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
                     "/sw.js": ("sw.js", "text/javascript"),
                     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
