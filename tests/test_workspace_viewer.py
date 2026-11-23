@@ -1,6 +1,7 @@
 """Diff and transcript views over temporary repositories and session stores."""
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -547,6 +548,112 @@ def test_transcript_refuses_unlisted_sessions(stores, tmp_path):
         "first": 0,
         "total": 0,
     }
+
+
+PARENT = "5b0d3c1e-8a2f-4c6d-9e1b-7f3a2c4d5e6f"
+
+
+def subagent(folder, session, agent, *items, meta=None):
+    """A Claude subagent transcript of ``session``, recorded in project ``folder``."""
+    file = folder / session / "subagents" / f"agent-{agent}.jsonl"
+    write_jsonl(file, *items)
+    if meta:
+        file.with_name(f"agent-{agent}.meta.json").write_text(json.dumps(meta))
+    return file
+
+
+def side_call(cwd, name, value):
+    content = [{"type": "tool_use", "id": f"t-{name}", "name": name, "input": value}]
+    return {"type": "assistant", "isSidechain": True, "cwd": cwd, "message": {"content": content}}
+
+
+def test_a_fork_that_worked_here_is_listed_and_read_though_its_session_is_elsewhere(
+    stores, tmp_path, monkeypatch
+):
+    checkout, folder, _ = stores
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(wv, "_scanned", {})
+    monkeypatch.setattr(wv, "_subagents", {})
+    elsewhere = folder.parent / "-elsewhere"
+    fork = subagent(
+        elsewhere,
+        PARENT,
+        "a1b2c3d4e5f6",
+        {"type": "fork-context-ref", "parentSessionId": PARENT},
+        {"type": "user", "isSidechain": True, "cwd": "/elsewhere", "message": {"content": "Go"}},
+        side_call("/elsewhere", "Edit", {"file_path": f"{checkout}/a.py", "old_string": "a"}),
+        {
+            "type": "assistant",
+            "isSidechain": True,
+            "cwd": "/elsewhere",
+            "message": {"content": [{"type": "text", "text": "Pushed the fix."}]},
+        },
+        meta={"agentType": "fork", "description": "Fix it in the other checkout"},
+    )
+    # Commands that only read it, a sibling checkout, and a subagent of a session recorded
+    # here (listed already) are not listed.
+    reader = subagent(
+        elsewhere,
+        PARENT,
+        "b0",
+        side_call("/elsewhere", "Bash", {"command": f"cd {checkout}; git log"}),
+    )
+    subagent(
+        elsewhere,
+        PARENT,
+        "c0",
+        side_call("/elsewhere", "Bash", {"command": f"cd {checkout}-old && git commit -m x"}),
+    )
+    subagent(
+        folder, SID, "d0", side_call(str(checkout), "Write", {"file_path": f"{checkout}/b.py"})
+    )
+    # Its shell spells the checkout from ~, and commits there.
+    tilde = f"~/{checkout.relative_to(tmp_path)}"
+    committer = subagent(
+        elsewhere,
+        PARENT,
+        "e0",
+        side_call("/elsewhere", "Bash", {"command": f"cd {tilde} && git commit -qm x"}),
+    )
+    for file, when in ((committer, 1_700_000_000), (fork, time.time() + 60)):
+        os.utime(file, (when, when))
+
+    listed = wv.forks(checkout)
+    assert [
+        (r["id"], r["fork_of"], r["recorded_in"], r["subagent"], r["title"]) for r in listed
+    ] == [
+        ("agent-a1b2c3d4e5f6", PARENT, "/elsewhere", "fork", "Fix it in the other checkout"),
+        ("agent-e0", PARENT, "/elsewhere", None, None),
+    ]
+    # Shown, but a session recorded here is still what the view opens on.
+    value = wv.transcript(checkout)
+    assert value["sessions"][0]["id"] == "agent-a1b2c3d4e5f6"
+    assert value["session"]["id"] == value["sessions"][1]["id"] in {SID, CODEX_SID}
+    value = wv.transcript(checkout, "agent-a1b2c3d4e5f6")
+    assert {k: value["session"][k] for k in ("fork_of", "recorded_in", "subagent")} == {
+        "fork_of": PARENT,
+        "recorded_in": "/elsewhere",
+        "subagent": "fork",
+    }
+    assert "_file" not in value["session"]
+    assert [(e["role"], e.get("text") or e.get("name")) for e in value["entries"]] == [
+        ("user", "Go"),
+        ("tool", "Edit"),
+        ("assistant", "Pushed the fix."),
+    ]
+    assert [h["session"] for h in wv.search(checkout, "pushed the fix")["results"]] == [
+        "agent-a1b2c3d4e5f6"
+    ]
+    # Read, never resumed: Claude resumes its session, not the fork.
+    assert "agent-a1b2c3d4e5f6" not in {s["id"] for s in wv.resumable(checkout)}
+    # A file is read on from where the last listing stopped, and listed once it commits.
+    assert wv._scanned[(str(reader), str(checkout.resolve()))][2] is False
+    reader.write_text(
+        reader.read_text().replace('{"partial', "")
+        + json.dumps(side_call("/elsewhere", "Bash", {"command": f"git -C {checkout} push"}))
+        + "\n"
+    )
+    assert "agent-b0" in {r["id"] for r in wv.forks(checkout)}
 
 
 def test_a_running_agents_session_is_read_wherever_it_was_recorded(stores, tmp_path):

@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import math
+import mmap
 import os
 import re
 import selectors
@@ -647,6 +648,9 @@ COMMIT = re.compile(r"[0-9a-f]{7,64}")
 OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 SESSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 MAX_SESSIONS = 50
+# A Claude subagent's transcript is agent-ID.jsonl, its ID listed as a session's would be.
+SUBAGENT = re.compile(r"agent-[0-9A-Za-z]{2,57}")
+MAX_META = 64 * 1024  # Bytes of a subagent's meta.json read for its kind and task.
 # Agent sessions one ``activity`` probe is asked about: as many as a machine may list.
 MAX_ACTIVITY = 200
 # Clones directly under a worker's src a placement state lists, and worktrees of each.
@@ -1176,6 +1180,207 @@ def claude_details(path):
     }
 
 
+def subagent_transcript(file):
+    """Whether ``file`` is a Claude subagent's transcript, which Claude keeps beside its
+    session's: ``PROJECTS/FOLDER/SESSION/subagents/agent-ID.jsonl``. Every entry of one
+    is a sidechain of that session."""
+    path = Path(file)
+    return (
+        path.suffix == ".jsonl"
+        and path.parent.name == "subagents"
+        and SUBAGENT.fullmatch(path.stem) is not None
+        and SESSION.match(path.parent.parent.name) is not None
+    )
+
+
+def checkout_names(root, home):
+    """``root`` as a transcript names it, as bytes: in full, and from ``~/`` below ``home``."""
+    root = str(root).rstrip("/")
+    names = [root]
+    home = str(home).rstrip("/")
+    if home and root.startswith(home + "/"):
+        names.append("~" + root[len(home) :])
+    return [name.encode() for name in names]
+
+
+def checkout_made(root):
+    """When the checkout ``root`` was made, or 0 when its ``.git`` cannot say.
+
+    A linked worktree's ``.git`` is a file Git writes once, as the worktree is made; a
+    clone's is a folder whose own times change with every commit.
+    """
+    try:
+        info = os.lstat(os.path.join(root, ".git"))
+    except OSError:
+        return 0
+    if stat.S_ISREG(info.st_mode):
+        return info.st_mtime
+    return getattr(info, "st_birthtime", 0)
+
+
+def works_in_checkout(stream, names, start=0):
+    """Whether the complete lines of an open Claude transcript from ``start`` on (a line's
+    start) have a tool call that works in the checkout, and where those lines end.
+
+    Only lines that mention one of its ``names`` are parsed, found as bytes first: most
+    transcripts never do.
+    """
+    size = os.fstat(stream.fileno()).st_size
+    if size <= start:
+        return False, start
+    with mmap.mmap(stream.fileno(), size, access=mmap.ACCESS_READ) as data:
+        done = data.rfind(b"\n", start) + 1
+        if done <= start:
+            return False, start  # No line was finished since.
+        shown = [name.decode() for name in names]
+        for name in names:
+            at = data.find(name, start, done)
+            while at >= 0:
+                first = data.rfind(b"\n", start, at) + 1 or start
+                last = data.find(b"\n", at, done)
+                if last - first <= MAX_SCAN_LINE:
+                    with contextlib.suppress(ValueError, RecursionError):
+                        if tool_works_in(json.loads(data[first:last]), shown):
+                            return True, done
+                at = data.find(name, last, done)
+    return False, done
+
+
+def tool_works_in(item, names):
+    """Whether a Claude transcript entry calls a tool that works in the checkout ``names``
+    spell: one that writes a file in it, or a shell command that ``cd``s or points Git
+    there and changes the repository. Reading it does not, nor running commands only to
+    read it: agents read other checkouts for reference."""
+    if not isinstance(item, dict) or item.get("type") != "assistant":
+        return False
+    content = (item.get("message") or {}).get("content")
+    for block in content if isinstance(content, list) else []:
+        if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+            continue
+        value = block.get("input")
+        if not isinstance(value, dict):
+            continue
+        if block.get("name") in WRITING_TOOLS:
+            path = value.get("file_path") or value.get("notebook_path")
+            if isinstance(path, str) and any(
+                path == name or path.startswith(name + "/") for name in names
+            ):
+                return True
+        elif block.get("name") == "Bash" and isinstance(value.get("command"), str):
+            command = value["command"]
+            if GIT_CHANGE.search(command) and any(
+                shell_enters(name).search(command) for name in names
+            ):
+                return True
+    return False
+
+
+WRITING_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
+# A Git command that changes a repository: its commits, branches, index or files.
+GIT_CHANGE = re.compile(
+    r"\bgit\s+(?:-C\s*\S+\s+)?(?:commit|push|am|apply|cherry-pick|rebase|merge|reset"
+    r"|revert|restore|checkout|switch|stash|worktree\s+add)(?![\w-])"
+)
+
+
+def shell_enters(name):
+    """A shell command's ``cd``, ``pushd`` or ``git -C`` into the checkout ``name``."""
+    found = _entering.get(name)
+    if found is None:
+        quoted = re.escape(name)
+        found = re.compile(
+            rf"(?:(?:^|[\s;&|(])(?:cd|pushd)\s+|\bgit\s+-C\s*)['\"]?{quoted}"
+            r"(?![A-Za-z0-9._-])"
+        )
+        if len(_entering) > 64:
+            _entering.clear()
+        _entering[name] = found
+    return found
+
+
+_entering: dict[str, re.Pattern] = {}
+
+
+def subagent_files(homes, since):
+    """The Claude subagent transcripts in ``homes`` written at or after ``since``, as
+    (home, file, its stat): only those can have worked in a checkout made then."""
+    for home in homes:
+        for file in (home / "projects").glob("*/*/subagents/agent-*.jsonl"):
+            try:
+                info = os.lstat(file)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_mtime >= since and subagent_transcript(file):
+                yield home, file, info
+
+
+def subagent_details(file):
+    """Where a subagent's session was recorded, what kind of subagent it is, and what it
+    was asked to do: from its first entry and the ``agent-ID.meta.json`` beside it."""
+    cwd = None
+    with open_transcript(file) as stream:
+        for item in records(transcript_lines(stream)):
+            if item.get("type") in {"user", "assistant"} and isinstance(item.get("cwd"), str):
+                cwd = item["cwd"]
+                break
+    if not cwd or not os.path.isabs(cwd):
+        return None
+    meta = {}
+    with contextlib.suppress(OSError, ValueError, RecursionError):
+        with open_transcript(file.with_name(f"{file.stem}.meta.json")) as stream:
+            loaded = json.loads(stream.read(MAX_META).decode("utf-8", errors="replace"))
+        meta = loaded if isinstance(loaded, dict) else {}
+    kind, title = meta.get("agentType"), meta.get("description")
+    return {
+        "cwd": str(Path(cwd).resolve()),
+        "subagent": kind[:64] if isinstance(kind, str) and kind.strip() else None,
+        "title": title.strip().splitlines()[0][:160]
+        if isinstance(title, str) and title.strip()
+        else None,
+    }
+
+
+def subagents_in(root, homes, home, scanned=None, details=subagent_details):
+    """Claude subagent transcripts that name the checkout ``root`` though their session was
+    recorded outside it, newest first, as (Claude home, file, stat, details).
+
+    A fork Claude starts in one checkout may do all its work in another; its transcript
+    stays with its session's, so no listing of that other checkout has it. One whose
+    session was recorded in ``root`` is left out: its session is listed already.
+
+    ``scanned`` keeps, by (file, root), how far each file was read and whether it worked
+    in ``root``, so a later listing reads only what was added since. ``home`` is the
+    ``~`` of the transcripts' paths.
+    """
+    root = str(Path(root).resolve())
+    names = checkout_names(root, home)
+    found = []
+    for claude_home, file, info in subagent_files(homes, checkout_made(root)):
+        key = (str(file), root)
+        inode, read, named = (scanned or {}).get(key, (None, 0, False))
+        if inode != info.st_ino or info.st_size < read:
+            read, named = 0, False
+        if not named and info.st_size > read:
+            try:
+                with open_transcript(file) as stream:
+                    named, read = works_in_checkout(stream, names, read)
+            except (OSError, ValueError):
+                continue
+            if scanned is not None:
+                scanned.pop(key, None)
+                scanned[key] = (info.st_ino, read, named)
+        if not named:
+            continue
+        try:
+            facts = details(file)
+        except (OSError, ValueError):
+            continue
+        if facts and not Path(facts["cwd"]).is_relative_to(root):
+            found.append((claude_home, file, info, facts))
+    found.sort(key=lambda item: item[2].st_mtime, reverse=True)
+    return found[:MAX_SESSIONS]
+
+
 def codex_details(path):
     """Session ID, working directory and first typed prompt of a Codex rollout."""
     with open_transcript(path) as stream:
@@ -1585,6 +1790,38 @@ def _host_sessions(root):
         host_session_files(root), lambda found: Path(found["cwd"]).is_relative_to(root)
     )
     return listed[:MAX_SESSIONS]
+
+
+def _host_forks(root):
+    """Subagent transcripts that worked in ``root`` though their session was recorded
+    elsewhere (``subagents_in``), newest first. Only files in a session store are listed:
+    they are the only ones ``tail`` reads."""
+    root = Path(_host_checkout(root))
+    stores = host_session_roots()
+    homes = [home for home in host_claude_homes() if host_session_root(home / "projects")]
+    accounts = host_accounts()
+    listed = []
+    for home, file, info, facts in subagents_in(
+        root, homes, os.path.realpath(os.path.expanduser("~"))
+    ):
+        real = Path(os.path.realpath(file))
+        if not any(real.is_relative_to(store) for store in stores):
+            continue
+        listed.append(
+            {
+                "id": file.stem,
+                "agent": "claude",
+                "fork_of": file.parent.parent.name,
+                "subagent": facts["subagent"],
+                "cwd": facts["cwd"],
+                "title": facts["title"],
+                "updated": info.st_mtime,
+                "size": info.st_size,
+                "file": str(file),
+                "account": accounts.get(home),
+            }
+        )
+    return listed
 
 
 def _host_session(session):
@@ -4579,6 +4816,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "diff": _host_diff,
     "bases": _host_bases,
     "sessions": _host_sessions,
+    "forks": _host_forks,
     "session": _host_session,
     "activity": _host_activity,
     "tail": _host_tail,
@@ -5514,6 +5752,53 @@ def validate_staged(value):
     return value
 
 
+def validate_forks(value):
+    """Check a worker's listing of subagent transcripts that worked in a checkout."""
+    _expect(isinstance(value, list) and len(value) <= MAX_SESSIONS, "forks")
+    for item in value:
+        _expect(
+            isinstance(item, dict)
+            and set(item)
+            == {
+                "id",
+                "agent",
+                "fork_of",
+                "subagent",
+                "cwd",
+                "title",
+                "updated",
+                "size",
+                "file",
+                "account",
+            },
+            "fork",
+        )
+        _expect(isinstance(item["id"], str) and SUBAGENT.fullmatch(item["id"]), "fork id")
+        _expect(item["agent"] == "claude", "fork agent")
+        _expect(isinstance(item["fork_of"], str) and SESSION.match(item["fork_of"]), "fork session")
+        _expect(
+            item["subagent"] is None or (_text(item["subagent"]) and len(item["subagent"]) <= 64),
+            "subagent kind",
+        )
+        _expect(_absolute(item["cwd"]), "fork cwd")
+        _expect(
+            item["title"] is None or (_text(item["title"]) and len(item["title"]) <= 160), "title"
+        )
+        _expect(_time(item["updated"]) and _int(item["size"]), "fork file facts")
+        _expect(
+            _absolute(item["file"])
+            and subagent_transcript(item["file"])
+            and Path(item["file"]).stem == item["id"],
+            "fork file",
+        )
+        _expect(
+            item["account"] is None
+            or (isinstance(item["account"], str) and ACCOUNT.fullmatch(item["account"])),
+            "fork account",
+        )
+    return value
+
+
 VALIDATORS = {
     "inventory": validate_inventory,
     "resolve": validate_resolve,
@@ -5523,6 +5808,7 @@ VALIDATORS = {
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,
+    "forks": validate_forks,
     "session": validate_sessions,
     "activity": validate_activity,
     "tail": validate_tail,
