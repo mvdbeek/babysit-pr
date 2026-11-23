@@ -1055,6 +1055,13 @@ def test_a_fork_that_worked_in_a_checkout_is_shown_there_with_its_session(
         json.dumps({"agentType": "fork", "description": "Fix the other checkout"})
     )
     plugin.value["workspaces"] = [row("forked", key=str(checkout), path=str(checkout))]
+    # No agent runs there, and no session recorded there can be resumed.
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={"agents": [], "sessions": [], "path": str(checkout), "workspace": None}
+        ),
+    )
     page.goto(url + "/#workspaces")
     line = page.locator("#ws-list tr").filter(has=page.get_by_text("forked", exact=True))
     line.get_by_role("button", name="Transcript", exact=True).click()
