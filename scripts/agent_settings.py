@@ -12,6 +12,7 @@ import os
 import threading
 from pathlib import Path
 
+import claude_accounts
 import workspace_viewer
 import wt
 
@@ -86,17 +87,33 @@ def tail(path):
     return data.decode(errors="replace")
 
 
-def from_transcript(session, kind):
-    """The newest turn's settings in this machine's transcript of ``session``."""
+def transcript(session, kind):
+    """This machine's transcript file of ``session``, or None."""
     with _lock:
         file = _files.get(session)
     if file is None or not file.exists():
         row = workspace_viewer.session_anywhere(session)
         if row is None or row["agent"] != kind:
-            return checked("", "", kind)
+            return None
         file = Path(row["_file"])
         with _lock:
             remember(_files, session, file)
+    return file
+
+
+def account(session):
+    """The Claude account whose store holds ``session``, as ``claude_accounts`` names it;
+    None for a configuration that is not one of them, or no transcript here."""
+    file = transcript(session, "claude")
+    home = file and claude_accounts.transcript_home(file)
+    return claude_accounts.account_name(home) if home else None
+
+
+def from_transcript(session, kind):
+    """The newest turn's settings in this machine's transcript of ``session``."""
+    file = transcript(session, kind)
+    if file is None:
+        return checked("", "", kind)
     try:
         stat = file.stat()
         with _lock:

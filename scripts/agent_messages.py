@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -421,7 +422,8 @@ def docker_status(workspace_id, live=_UNSET, machine=None):
     """Report observed access; a failed probe must never look like disabled access.
 
     A worker's agents have none to report: their sandbox is not Safehouse on this Mac.
-    Each agent's ``model`` and ``effort`` are reported too, "" where unknown.
+    Each agent's ``model`` and ``effort`` are reported too, "" where unknown, and a
+    Claude agent's ``claude_account``, None where unknown.
     """
     result = agents(workspace_id, interactions=True, live=live, machine=machine)
     if machine is not None:
@@ -435,6 +437,8 @@ def docker_status(workspace_id, live=_UNSET, machine=None):
         return result
     for target in result:
         target.update(docker=None, model="", effort="")
+        if target["agent"] == "claude" and target["session"]:
+            target["claude_account"] = agent_settings.account(target["session"])
         try:
             info, _, _, proc = agent_docker.inspect(target)
             if (info.get("agent_session") or {}).get("value") != target["session"]:
@@ -564,20 +568,25 @@ def change_docker(target, enabled, home):
 
 
 def change_settings(request, home=None, machine=None):
-    """Continue an idle agent's conversation on another model or reasoning effort.
+    """Continue an idle agent's conversation on another model, reasoning effort or account.
 
     Neither agent changes them in a running session from its command line, so the agent
     is quit as its own exit does (``exit_agent``, which refuses a busy one) and its
     session resumed in the same pane with them (``resume``). An empty value is the
     agent's configured default. Docker access an agent here has is kept.
+
+    An ``account`` names the Claude login to continue on (``claude_accounts``); empty
+    keeps the one it runs on. Claude looks a session up in its own configuration's
+    store, so the transcript moves there between the quit and the resume.
     """
     fields = ("workspace", "pane", "session", "model", "effort")
-    if set(request) != set(fields) or not (
-        all(isinstance(request[k], str) for k in fields)
+    if set(request) - {"account"} != set(fields) or not (
+        all(isinstance(request[k], str) for k in (*fields, *request.keys() & {"account"}))
         and all(request[k] for k in ("workspace", "pane", "session"))
     ):
         raise ValueError("Invalid model or effort parameters")
     pane, session = request["pane"], request["session"]
+    account = request.get("account", "")
     target = next(
         (a for a in agents(request["workspace"], machine=machine) if a["pane"] == pane), None
     )
@@ -586,6 +595,13 @@ def change_settings(request, home=None, machine=None):
     if target.get("agent") not in RESUME:
         raise ValueError("Only Claude and Codex agents can change model or effort")
     workspace_agents.validate(target["agent"], request["model"], request["effort"], home)
+    move = None
+    if account:
+        if target["agent"] != "claude":
+            raise ValueError("Only a Claude agent can change account")
+        if machine is not None:
+            raise ValueError(f"An agent on {machine.label} keeps the account it runs on there")
+        move = account_move(session, account)
     docker = False
     if machine is None and sys.platform == "darwin":
         # Safehouse's grant, read as a move reads it; unknown access is not granted again.
@@ -599,6 +615,13 @@ def change_settings(request, home=None, machine=None):
     )
     if not quit_["quit"]:
         return {"changed": False, "pane": pane, "warning": quit_["warning"]}
+    moved = None
+    if move:
+        try:
+            move_transcript(*move)
+        except OSError as exc:
+            # The agent is gone already: it comes back on its own account, never not at all.
+            moved = f"Its conversation could not move to {account} ({exc}); it stays on its own."
     settings = {"model": request["model"], "effort": request["effort"], "docker": docker}
     try:
         resumed = resume(
@@ -615,8 +638,51 @@ def change_settings(request, home=None, machine=None):
     return {
         "changed": True,
         "pane": resumed.get("pane"),
-        "warning": resumed.get("warning"),
+        "warning": warned(resumed, moved).get("warning"),
     }
+
+
+def account_move(session, account):
+    """Where a running Claude session's files go to continue on ``account``, as
+    ``(transcript, destination, cwd)``; None when it already runs there. Refused before
+    anything is quit when the account is unknown or already holds that session."""
+    destination_home = claude_accounts.account_home(account)
+    held = {
+        home: list((home / "projects").glob(f"*/{session}.jsonl"))
+        for home in {*claude_accounts.homes(), destination_home}
+    }
+    if held[destination_home]:
+        if not any(files for home, files in held.items() if home != destination_home):
+            return None
+        raise ValueError(f"The account {account} already holds a copy of this session")
+    row = workspace_viewer.session_anywhere(session)
+    if row is None or row["agent"] != "claude":
+        raise ValueError("That session's transcript is not on this machine; refresh")
+    file = Path(row["_file"])
+    destination = destination_home / "projects" / file.parent.name / file.name
+    if destination.with_suffix("").exists():
+        raise ValueError(f"The account {account} already holds files of this session")
+    return file, destination, row["_cwd"]
+
+
+def move_transcript(file, destination, cwd):
+    """Move a Claude transcript and its folder (subagents, tool results) to another
+    account's store, and accept that account's folder trust dialog for its directory.
+
+    The folder goes first and comes back if the transcript cannot follow, so the session
+    is never split between two accounts."""
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder, moved = file.with_suffix(""), None
+    if folder.is_dir() and not folder.is_symlink():
+        moved = shutil.move(folder, destination.with_suffix(""))
+    try:
+        shutil.move(file, destination)
+    except OSError:
+        if moved:
+            shutil.move(moved, folder)
+        raise
+    # A resume types no directory for wt to trust; the old account's trust is not this one's.
+    claude_accounts.trust(destination.parent.parent.parent, cwd)
 
 
 def prompt(target, text, machine=None):

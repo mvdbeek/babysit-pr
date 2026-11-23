@@ -4385,6 +4385,63 @@ def test_the_strip_names_the_agents_model_and_effort_and_changes_them(
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
+def test_the_settings_card_moves_a_claude_agent_to_another_login(
+    page, dashboard_site, viewer_routes, workspace_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [viewer_routes["agents"][1]]
+    claude = viewer_routes["agents"][0]
+    claude.update(session="s1", status="idle", model="opus", effort="", claude_account="oss")
+    changes = []
+
+    def change(route):
+        changes.append(route.request.post_data_json)
+        claude.update(claude_account="psu")
+        route.fulfill(json={"changed": True, "pane": "w1:p2", "warning": None})
+
+    page.route("**/api/workspace-agent-settings", change)
+    workspace_routes[1]["agent_choices"] = {
+        "claude": {
+            "accounts": [{"id": "oss", "label": "oss"}, {"id": "psu", "label": "psu"}],
+            "models": [{"id": "opus", "efforts": ["high"]}],
+            "efforts": ["high"],
+        }
+    }
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-live")
+    strip = live.locator(".ws-live-state")
+    expect(strip.locator(".ws-live-settings")).to_have_attribute(
+        "title", re.compile(r"^Claude in w1:p2: opus with its default effort on the oss account\.")
+    )
+    strip.get_by_role("button", name="Change model or effort for Claude in w1:p2").click()
+    card = live.get_by_role("group", name="Change model or effort")
+    expect(card).to_contain_text("Change model, effort or account of Claude in w1:p2?")
+    account = card.get_by_role("combobox", name="Account")
+    # Starts on the login it runs on; the default login is the same as a named one.
+    expect(account).to_have_value("oss")
+    expect(account.locator("option")).to_have_text(["oss", "psu"])
+    expect(card).not_to_contain_text("transcript moves")
+    account.select_option("psu")
+    expect(card).to_contain_text("Its transcript moves to the psu account")
+    live.screenshot(path="reports/viewer-strip-account-card.png")
+    card.get_by_role("button", name="Restart with these").click()
+    expect(page.locator("#ws-live-status")).to_have_text(
+        "Resumed Claude in w1:p2 on opus with its default effort on the psu account."
+    )
+    assert changes == [
+        {
+            "workspace": "w1",
+            "pane": "w1:p2",
+            "session": "s1",
+            "model": "opus",
+            "effort": "",
+            "account": "psu",
+        }
+    ]
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
 def test_a_refused_quit_says_why_and_a_vanished_agent_drops_the_question(
     page, dashboard_site, viewer_routes
 ):
