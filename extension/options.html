@@ -24,6 +24,18 @@
         <button type="submit">Save connection</button>
       </form>
       <p id="status" role="status"></p>
+      <h2>Version</h2>
+      <p>This is version <span id="version"></span>.</p>
+      <p id="update" hidden>
+        Version <span id="update-version"></span> is on your dashboard:
+        <a id="update-link" target="_blank" rel="noopener">download it</a>, unzip it over this
+        extension's folder and reload it.
+      </p>
+      <button id="reload-extension" type="button">Reload extension</button>
+      <p>
+        Reloading picks up new files in the extension's folder: an unzipped update, or the
+        dashboard's checkout after a pull when it is loaded from there.
+      </p>
       <h2>GitHub pull requests and issues</h2>
       <label for="github">
         <input id="github" type="checkbox" />

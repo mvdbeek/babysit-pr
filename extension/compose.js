@@ -1,4 +1,4 @@
-import { api, dashboardURL, safeLink, taskText } from "./shared.js";
+import { api, availableUpdate, dashboardURL, safeLink, taskText } from "./shared.js";
 import { infer, suggestedTask, branchName, pageKey } from "./inference.js";
 const $ = (id) => document.getElementById(id);
 let draftId = location.hash.slice(1);
@@ -257,6 +257,12 @@ async function load() {
       preferences = (await chrome.storage.local.get(preferenceKey))[preferenceKey] || {};
     }
     context = await api({ action: "context" });
+    const update = await availableUpdate();
+    $("update").hidden = !update;
+    if (update) {
+      $("update-version").textContent = update.version;
+      $("update-link").href = update.download;
+    }
     options(
       "repo",
       context.repos.map((r) => ({

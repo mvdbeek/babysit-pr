@@ -41,12 +41,28 @@ Choices refresh when you return to the composer or save the connection settings.
 Typed instructions and explicit choices survive refreshes. Uncertain delivery
 freezes the submitted request for retries even if the available defaults change.
 
-To update an unpacked installation, update the dashboard backend, replace the
-extension files in the **same directory**, click **Reload** on its
-`chrome://extensions` card, and open a fresh composer. Keeping the directory
-preserves its extension ID, connection and pairing. No new browser permissions
-are required unless you turn on GitHub pages (below). If you load a different
-directory, pair the new ID.
+## Updates from the dashboard
+
+The dashboard serves the extension it ships: **Download the extension** on its pairing
+page (`/extension.html`) downloads `/extension.zip`, built from the checkout's
+`extension/` folder, under a `babysitter-extension/` folder. Every reply to the
+extension names that version (`X-Babysit-Extension-Version`), so when the dashboard
+ships a newer one, the extension's Settings, its composer and its GitHub card say so
+and link to the download. Chrome does not install extensions from other sites, and
+Manifest V3 runs no code fetched from a server, so an update is still yours to load:
+
+- **Downloaded:** unzip the new download over the old `babysitter-extension` folder
+  (`unzip -o ~/Downloads/babysitter-extension-*.zip -d ~`, if that is where it lives)
+  and click **Reload extension** in its Settings, or **Reload** on its
+  `chrome://extensions` card.
+- **Loaded from the dashboard's checkout** (the browser and the dashboard on one
+  machine): after the checkout updates, click **Reload extension**.
+
+The manifest's `key` fixes the extension's ID (`ljkolpgamhbplbfdeominlmhjandgfie`),
+wherever its folder is, so updates and a moved folder keep its pairing. The pairing
+page fills that ID in. Version 0.6 is the first with the key: an older install had an
+ID from its folder's path and needs pairing once more. No new browser permissions are
+required unless you turn on GitHub pages (below).
 
 ## On GitHub pull requests and issues
 
@@ -154,8 +170,10 @@ browser tab.
    changed. For normal use, run the updated dashboard with your usual shared
    state directory. The extension never needs its own watcher process.
 
-2. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**,
-   and select this checkout's `extension/` directory. Pin **Send to Babysitter**
+2. Download the extension from the dashboard's pairing page and unzip it (see
+   [Updates from the dashboard](#updates-from-the-dashboard)), or use this checkout's
+   `extension/` directory. Open `chrome://extensions`, enable **Developer mode**,
+   choose **Load unpacked**, and select that folder. Pin **Send to Babysitter**
    if you want its toolbar button. The same files target Chromium browsers; the
    automated browser tests run in Chromium. Firefox and Safari packaging is not
    included.
@@ -175,9 +193,9 @@ the dashboard host's existing configuration. Pairing tokens are saved in browser
 local storage, restricted to extension contexts, never Chrome Sync. On the server,
 only their hashes are saved in the private `browser-extension.sqlite` file under
 the chosen state directory. Pairing again rotates the token; **Revoke access** on
-the pairing page disables that extension immediately. Different browser profiles
-using the same unpacked extension ID share one pairing slot; re-pairing invalidates
-the other profile's token.
+the pairing page disables that extension immediately. The extension's ID is fixed,
+so every browser profile that loads it shares one pairing slot on a dashboard:
+pairing one profile invalidates another's token.
 
 ## Try it
 

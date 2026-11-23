@@ -1,4 +1,4 @@
-import { api, dashboardURL, GITHUB_ORIGINS } from "./shared.js";
+import { api, availableUpdate, dashboardURL, GITHUB_ORIGINS } from "./shared.js";
 
 // GitHub pages: the content script is registered only while Settings turns it on and
 // github.com access is granted, and checked again each time this worker starts.
@@ -41,7 +41,7 @@ async function githubPages(urls) {
     for (const workspace of page.workspaces || [])
       workspace.dashboard = absolute(workspace.dashboard);
   }
-  return { pages: pages || {} };
+  return { pages: pages || {}, update: await availableUpdate() };
 }
 function item(url, kind) {
   const match = typeof url === "string" && ITEM.exec(url);

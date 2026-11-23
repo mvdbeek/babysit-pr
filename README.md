@@ -6,7 +6,8 @@ The skill instructions and operating details are in [SKILL.md](SKILL.md) and [th
 
 The [Send to Babysitter browser extension](references/browser-extension.md) sends
 page references and GitHub tasks to the dashboard, starts new workspaces, and sends
-follow-ups to existing agents. It supports paired direct submission, a monitoring
+follow-ups to existing agents. The dashboard serves it for download from its pairing
+page, and the extension says when the dashboard has a newer version. It supports paired direct submission, a monitoring
 instruction checkbox, and a token-free handoff to the dashboard's New task dialog.
 Turned on in its Settings, it also shows each pull request's newest agent review and
 every linked checkout on GitHub's pull request and issue lists and pages, with a button

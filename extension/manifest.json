@@ -1,11 +1,20 @@
 {
   "manifest_version": 3,
   "name": "Send to Babysitter",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Send page references, GitHub tasks and follow-ups to your babysit-pr dashboard, and see agent reviews and workspaces, handle issues and ask about pull requests on GitHub.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAob2BGtXXW5NpQVXNEFbaAOAVgdZl3eI4ZkfvfFI51EJdWSUVA3CXuLT26n8rXRk619E24QqZmPv45Rlfq3xuPhRgap/4Yg/yIR0EoGqJIobpuzDdT1jFLDxVvq5sYdT9Ta4W2tHY1aO3EvylEKsWi5+gVib3dKTsHg73axGppH65wYNLCdt2F5tZlgBIy7HF7PVAHLYtNMcSRqHxfw9lkLNNxKvQnsK99NHlxsohVBJlIOSOdMaF4QJsQm8H2uLhJiRhG9S+zcvh+XCqlnhdTlz+GSUBu4ooqYwba9OvvyTyhgBtGkqX75HuQNDbm5QlqjhnMUABj7Djtprm98JujQIDAQAB",
   "permissions": ["activeTab", "contextMenus", "scripting", "storage"],
   "optional_host_permissions": ["https://*/*", "http://127.0.0.1/*", "http://localhost/*"],
-  "action": { "default_title": "Send to Babysitter" },
-  "background": { "service_worker": "background.js", "type": "module" },
-  "options_ui": { "page": "options.html", "open_in_tab": true }
+  "action": {
+    "default_title": "Send to Babysitter"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
 }
