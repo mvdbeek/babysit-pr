@@ -23,6 +23,7 @@
     <script src="/codex_update.js" defer></script>
     <script src="/service.js" defer></script>
     <script src="/settings.js" defer></script>
+    <script src="/shortcuts.js" defer></script>
     <script src="/attachments.js" defer></script>
     <script src="/terminal.js" defer></script>
     <script src="/artefacts.js" defer></script>
@@ -300,6 +301,34 @@
         <button id="settings-reset" type="button">Use the default</button>
       </div>
       <p id="settings-status" class="notifications-caption" role="status"></p>
+      <h3>Keyboard shortcuts</h3>
+      <p id="settings-shortcuts-note" class="notifications-caption"></p>
+      <div class="settings-actions settings-shortcuts">
+        <button id="settings-shortcuts" type="button" aria-haspopup="dialog">
+          Keyboard shortcuts…
+        </button>
+      </div>
+    </dialog>
+    <dialog id="shortcuts-dialog" aria-labelledby="shortcuts-title">
+      <div class="dialog-header">
+        <div class="notifications-heading">
+          <h2 id="shortcuts-title">Keyboard shortcuts</h2>
+          <button id="shortcuts-close" type="button" aria-label="Close keyboard shortcuts">
+            ×
+          </button>
+        </div>
+      </div>
+      <p class="notifications-caption">
+        Kept in this browser. They wait while you type in a field or a dialog is open. Choose
+        Change, then press the new key; Backspace turns it off and Escape cancels.
+      </p>
+      <table class="shortcuts-table">
+        <tbody id="shortcuts-list"></tbody>
+      </table>
+      <p id="shortcuts-status" class="notifications-caption" role="status"></p>
+      <div class="settings-actions">
+        <button id="shortcuts-reset" type="button">Restore the default keys</button>
+      </div>
     </dialog>
     <main>
       <p id="navigation-status" role="status" hidden></p>
