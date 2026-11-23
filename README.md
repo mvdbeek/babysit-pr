@@ -11,7 +11,9 @@ instruction checkbox, and a token-free handoff to the dashboard's New task dialo
 Turned on in its Settings, it also shows each pull request's newest agent review and
 every linked checkout on GitHub's pull request and issue lists and pages, with a button
 that opens the item's workspace in the dashboard (in the installed app, if Chrome opens
-its links there).
+its links there). An issue's page can start an agent on it, with extra instructions; a
+pull request's page can ask questions about it, answered by a read-only Claude that the
+supervisor runs, streamed into the page.
 
 The [review sweep](references/review-sweep.md) reviews every open pull request of the
 repositories you configure, and every pending review request, from a dashboard cron job:

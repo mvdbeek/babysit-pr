@@ -51,8 +51,8 @@ directory, pair the new ID.
 ## On GitHub pull requests and issues
 
 Version 0.4 shows what Babysitter knows on GitHub's pull request and issue lists and
-pages. Turn on **Show agent reviews, workspaces and an Open in Babysitter button on
-GitHub** in the extension's Settings and accept the request for github.com access, then
+pages; version 0.5 adds **Handle issue** to issue pages and **Ask about this pull request**
+to pull request pages. Turn on **Show Babysitter on GitHub** in the extension's Settings and accept the request for github.com access, then
 reload open GitHub tabs. It needs a paired dashboard.
 
 - **List pages** (`/<owner>/<repo>/pulls`, `/issues`, and `/pulls`): beside a title,
@@ -74,6 +74,40 @@ reload open GitHub tabs. It needs a paired dashboard.
   workspace. It opens the dashboard's PR list at that row and then the workspace's
   conversation. **Open in Babysitter** opens the row alone, with its workspace actions.
   A checkout's own link opens the Workspaces tab with that checkout's conversation.
+
+- **Handle issue** (an issue's card): a box for extra instructions, an agent choice and
+  a **Handle issue** button. It starts the dashboard's issue task (Settings → task prompts,
+  **Handle issue**) for this issue, with the box's text appended under "Additional
+  instructions". An issue in the dashboard's overview gets its Handle action, as the
+  dashboard's own button does: in its preferred clone, or cloned first when there is none.
+  Any other issue starts a new task on branch `issue-<number>` in a clone of its
+  repository on the dashboard's machine; with none, it says so. **Usual agent** uses the
+  agent, model, effort, account and clone the composer last used for this repository
+  (Codex if it never did); picking the other agent keeps only the clone. The card follows
+  the launch and links to the agent in Collie. Cmd/Ctrl+Enter in the box submits.
+- **Ask about this pull request** (a pull request's card): type a question and press
+  Enter (Shift+Enter for a new line). The answer streams into the card as Claude writes
+  it, with what it is reading; **Stop** cancels it. Follow-up questions carry the
+  conversation so far (up to six exchanges); **Clear** starts over. The conversation lives
+  in the tab: reloading the page drops it.
+
+Questions are answered by the watcher's supervisor, as the voice assistant's are, since
+it can use the Claude login the launchd dashboard cannot: the dashboard queues each
+question as a private file under `pr-questions/` in its state directory, and the
+extension polls it. Without a running supervisor, asking says so. Claude (`opus`) gets the
+pull request's metadata, description, comments, reviews, inline review comments and diff
+(up to 150,000 characters), read with the dashboard's GitHub login, labelled untrusted.
+When the dashboard's machine has a clone of the repository, the pull request's head
+commit is unpacked from it (`git archive`, after fetching `refs/pull/<n>/head` into the
+clone's object store if it is missing; no ref, branch, worktree or `FETCH_HEAD` changes)
+into `pr-questions/checkouts/<sha>`, reused by follow-ups and removed two hours after its
+last use. Claude runs there with `--restricted` and only the Read, Grep and Glob tools,
+which cannot reach outside that folder; without a clone it has no tools and answers from
+the diff. It cannot run code, change files or act on GitHub. At most three questions are
+answered at once; one takes at most ten minutes. Only the extension that asked can read
+an answer, and answers are deleted 30 minutes after they finish. The answer is rendered as
+text (paragraphs, lists, code), never markup, and like the rest of the card GitHub's own
+scripts can read it.
 
 Reviews come from the dashboard's store of agent reviews (`GET /api/agent-reviews`):
 the [review sweep](review-sweep.md)'s, which it records as each review finishes, and

@@ -16,6 +16,8 @@ from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 import agent_messages
+import dashboard_settings
+import pr_questions
 from pr_workspaces import collie_url, herdr
 
 EXTENSION_ID = re.compile(r"[a-p]{32}")
@@ -25,6 +27,9 @@ ITEM = re.compile(
 )
 # Pull requests or issues one GitHub page may ask about: a list page shows 25 by default.
 MAX_PAGES = 100
+# What a GitHub page's Handle issue box adds to the dashboard's issue task.
+MAX_INSTRUCTIONS = 8000
+AGENT_CHOICES = ("agent", "model", "effort", "claude_account")
 
 
 class Extension:
@@ -122,12 +127,21 @@ class Extension:
         return result
 
     def dispatch(self, server, client, request):
-        if request.get("action") == "pages":
+        action = request.get("action")
+        if action == "pages":
             return pages(server, request)
+        if action == "ask":
+            question = {k: v for k, v in request.items() if k != "action"}
+            clone = local_clone(server, question.get("url"))
+            return pr_questions.enqueue(server.home, question, clone=clone, client=client)
+        if action in {"answer", "ask-cancel"}:
+            if set(request) - {"action", "id"}:
+                raise ValueError("Invalid question request")
+            call = pr_questions.status if action == "answer" else pr_questions.cancel
+            return call(server.home, request.get("id"), client)
         workspaces = server.workspaces
         if not workspaces:
             raise ValueError("Workspace actions are not enabled")
-        action = request.get("action")
         if action == "context":
             snapshot = workspaces.snapshot()
             targets = [
@@ -177,6 +191,8 @@ class Extension:
             return {"operation": operation}
         if action == "submit":
             return self.once(client, request, lambda: submit(server, request))
+        if action == "handle-issue":
+            return self.once(client, request, lambda: handle_issue(server, request))
         raise ValueError("Unknown extension action")
 
     @staticmethod
@@ -297,6 +313,81 @@ def pages(server, request):
             "dashboard": f"/?{urlencode(query)}{page}" if query else None,
         }
     return {"pages": found}
+
+
+def local_clone(server, url):
+    """A clone of a pull request's repository on this machine, for questions about it to
+    read its code; None without one, or without workspace actions."""
+    match = ITEM.fullmatch(url) if isinstance(url, str) else None
+    if not match or not server.workspaces:
+        return None
+    clones = repository_clones(server.workspaces, match)
+    return max(clones, key=lambda r: r.get("active") or 0)["clone"] if clones else None
+
+
+def repository_clones(workspaces, match):
+    slug = f"{match[1]}/{match[2]}".lower()
+    repos = workspaces.local_repositories(everything=True)["repos"]
+    return [r for r in repos if r["repo"].lower() == slug]
+
+
+def handle_issue(server, request):
+    """Handle a GitHub issue from its page: the dashboard's issue task, with the page's
+    extra instructions. An issue in the overview gets its Handle action; any other is a
+    new task, on branch issue-<number>, in a clone of its repository on this machine."""
+    fields = ("url", "instructions", "clone", *AGENT_CHOICES)
+    if set(request) - {"action", "request_id", *fields} or any(
+        not isinstance(request.get(k, ""), str) for k in fields
+    ):
+        raise ValueError("Invalid Handle issue request")
+    match = ITEM.fullmatch(request.get("url", ""))
+    if not match or match[3] != "issues":
+        raise ValueError("Handle a GitHub issue")
+    url = request["url"]
+    instructions = request.get("instructions", "").strip()
+    if len(instructions) > MAX_INSTRUCTIONS:
+        raise ValueError(f"Keep the instructions under {MAX_INSTRUCTIONS} characters")
+    task = dashboard_settings.task_prompt(server.home, "issue", url)
+    if instructions:
+        task += f"\n\nAdditional instructions:\n{instructions}"
+    choices = {k: request[k] for k in AGENT_CHOICES if request.get(k)}
+    workspaces = server.workspaces
+    target = next(
+        (
+            t
+            for t in workspaces.targets()
+            if t.get("kind") == "issue" and str(t.get("url", "")).lower() == url.lower()
+        ),
+        None,
+    )
+    clone = request.get("clone")
+    if target is not None:
+        payload = {"id": target["id"], "action": "handle", "task": task, **choices}
+        info = workspaces.snapshot().get("issues", {}).get(target["id"]) or {}
+        if clone and clone in (info.get("clones") or []):
+            payload["clone"] = clone
+        elif not info.get("clones") and info.get("destination"):
+            # No clone yet: Handle clones it where the dashboard would.
+            payload["destination"] = info["destination"]
+        return workspaces.action(payload)
+    repos = repository_clones(workspaces, match)
+    if not repos:
+        raise ValueError(
+            f"No clone of {match[1]}/{match[2]} on the dashboard's machine; "
+            "clone it from the dashboard first"
+        )
+    chosen = next((r for r in repos if r["clone"] == clone), None) or max(
+        repos, key=lambda r: r.get("active") or 0
+    )
+    return workspaces.new_task(
+        {
+            "repo": chosen["repo"],
+            "clone": chosen["clone"],
+            "name": f"issue-{match[4]}",
+            "task": task,
+            **choices,
+        }
+    )
 
 
 def shown_review(review):

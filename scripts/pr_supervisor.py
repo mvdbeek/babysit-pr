@@ -27,6 +27,7 @@ import github_cli
 import llm_usage
 import machines
 import owned_process
+import pr_questions
 import remote_probe
 import safe_git
 import sandbox
@@ -925,6 +926,10 @@ def serve(home, max_workers):
         voice_worker = voice_assistant.Worker(home)
         voice_worker.stop_on_terminate()
         voice_error: str | None = None
+        # Questions asked about a pull request from its GitHub page, answered the same way.
+        question_worker = pr_questions.Worker(home)
+        question_worker.stop_on_terminate()
+        question_error: str | None = None
         checking: dict[str, concurrent.futures.Future] = {}
         next_check: dict[str, float] = {}
         # Remote sessions left held by a lost worker, each asked about once a minute.
@@ -1058,6 +1063,13 @@ def serve(home, max_workers):
                     if str(exc) != voice_error:
                         voice_error = str(exc)
                         print(f"Voice assistant failed: {exc}", flush=True)
+                try:
+                    question_worker.tick()
+                    question_error = None
+                except Exception as exc:  # Nor must questions about pull requests.
+                    if str(exc) != question_error:
+                        question_error = str(exc)
+                        print(f"Pull request questions failed: {exc}", flush=True)
                 watch.save_state(home / "heartbeat.json", {"time": time.time(), "pid": os.getpid()})
                 time.sleep(1)
 

@@ -2,6 +2,7 @@
 many agents this machine takes before Auto prefers a worker."""
 
 import json
+from pathlib import Path
 
 import dashboard_settings as settings
 import pytest
@@ -103,3 +104,14 @@ def test_an_unreadable_file_leaves_the_page_on_its_own_wording(tmp_path):
     assert settings.settings(tmp_path) == settings.settings(tmp_path / "missing")
     (tmp_path / settings.SETTINGS).write_text(json.dumps(["prReview"]))
     assert settings.settings(tmp_path) == settings.settings(tmp_path / "missing")
+
+
+def test_the_issue_task_starts_from_the_pages_wording_or_the_saved_one(tmp_path):
+    # The browser extension's Handle issue reads it here; the page keeps its own copy.
+    page = (Path(__file__).resolve().parents[1] / "assets/dashboard/settings.js").read_text()
+    default = settings.DEFAULT_PROMPTS["issue"]
+    assert default.replace("{url}", "${URL_TOKEN}") in page
+    url = "https://github.com/o/r/issues/1"
+    assert settings.task_prompt(tmp_path, "issue", url) == default.replace("{url}", url)
+    settings.save(tmp_path, {"task": "issue", "prompt": "Fix {url} now."})
+    assert settings.task_prompt(tmp_path, "issue", url) == f"Fix {url} now."
