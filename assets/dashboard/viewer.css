@@ -195,14 +195,59 @@
 .ws-live-state[data-live="unknown"] {
   color: var(--muted);
 }
-.ws-live-activity.amber {
-  color: var(--amber);
-}
 .ws-live-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
   margin-left: auto;
+}
+/* A worker the agent runs on; this machine goes unsaid. */
+.ws-live-machine {
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.ws-live-state .ws-stop,
+.ws-live-more {
+  padding: 5px 10px;
+}
+.ws-live-more {
+  min-width: 36px;
+  font-weight: 700;
+  line-height: 1;
+}
+/* The less used actions open below their "⋯", over the transcript. */
+.ws-live-menu {
+  position: relative;
+}
+.ws-live-menu-items {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 32px));
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  box-shadow: var(--shadow-popup);
+}
+.ws-live-menu-items button {
+  text-align: left;
+}
+.ws-live-menu-head {
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .ws-live .ws-quit:not(:disabled),
 .ws-live-agents .ws-quit:not(:disabled) {
@@ -237,6 +282,15 @@
 .ws-live-settings {
   color: var(--muted);
   font-size: 13px;
+}
+/* The model and effort read as a label that opens a choice of others. */
+button.ws-live-settings {
+  padding: 3px 6px;
+  border-color: transparent;
+  background: none;
+}
+button.ws-live-settings:not(:disabled)::after {
+  content: " ▾";
 }
 .ws-settings-fields {
   display: flex;

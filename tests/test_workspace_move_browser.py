@@ -99,6 +99,7 @@ def test_moving_a_working_agent_asks_first_and_follows_the_move(
     page.set_viewport_size({"width": width, "height": 844})
     page.clock.install()
     live = open_viewer(page, url, agents)
+    live.get_by_role("button", name="More actions for Claude in w1:p2").click()
     live.get_by_role("button", name="Move Claude in w1:p2 to another machine").click()
     card = live.get_by_role("group", name="Confirm moving the agent")
     expect(card).to_contain_text("Move Claude in w1:p2 to another machine?")
@@ -131,9 +132,7 @@ def test_moving_a_working_agent_asks_first_and_follows_the_move(
         "machine": "box",
         "confirm_working": True,
     }
-    expect(
-        live.get_by_role("button", name="Move Claude in w1:p2 to another machine")
-    ).to_be_disabled()
+    expect(live.get_by_role("button", name="More actions for Claude in w1:p2")).to_be_disabled()
     page.clock.run_for(2100)
     expect(status).to_have_text("Copying feature to Linux box (12 KB)")
     agents.clear()
@@ -193,6 +192,7 @@ def test_a_move_that_cannot_go_says_why_and_a_failed_one_how_to_resume(
 
     page.route("**/api/workspace-move", move)
     live = open_viewer(page, url, agents)
+    live.get_by_role("button", name="More actions for Claude in w1:p2").click()
     live.get_by_role("button", name="Move Claude in w1:p2 to another machine").click()
     card = live.get_by_role("group", name="Confirm moving the agent")
     expect(card.locator(".ws-move-error")).to_contain_text("need a Linux worker")
@@ -275,6 +275,7 @@ def test_a_workers_agent_moves_back_here_and_a_failure_says_where_to_resume(page
     line = page.locator("#ws-list tr").filter(has=page.get_by_text("remote-work", exact=True))
     line.get_by_role("button", name="Transcript", exact=True).click()
     live = page.locator("#ws-viewer").get_by_role("region", name="Agent status")
+    live.get_by_role("button", name="More actions for Claude in w3:p2").click()
     live.get_by_role("button", name="Move Claude in w3:p2 to this machine").click()
     card = live.get_by_role("group", name="Confirm moving the agent")
     expect(card).to_contain_text("Move Claude in w3:p2 to this machine?")
