@@ -2438,27 +2438,34 @@
   // Changing the model, effort or account ---------------------------------------------
   // Asked inline like a quit, with the choices New task offers. Neither agent changes
   // them in a running session from outside, so the server quits the idle agent and
-  // resumes the same conversation in its pane with them. A Claude agent on this machine
-  // may also continue on another of its logins: its transcript moves to that one.
+  // resumes the same conversation in its pane with them. A Claude agent may also continue
+  // on another login of the machine it runs on: its transcript moves to that one.
   async function loadSettingsChoices() {
     const question = settingsQuestion;
-    let choices = null;
-    try {
-      choices = (await window.dashboardAgents?.choices(question.agent)) ?? null;
-    } catch {
-      /* Offered without a list: Default only. */
-    }
+    const worker = question.agent === "claude" && workerLabel(viewer.entry);
+    const [choices, accounts] = await Promise.all([
+      // Offered without a list: Default only.
+      Promise.resolve(window.dashboardAgents?.choices(question.agent)).catch(() => null),
+      // A worker's logins are its own, read there; none offered when it does not answer.
+      worker
+        ? getJSON("/api/workspace-agents", { workspace: viewer.entry.workspace, accounts: 1 })
+            .then((value) => value.accounts)
+            .catch(() => null)
+        : null,
+    ]);
     if (settingsQuestion !== question) return;
-    question.choices = choices;
+    question.choices = choices ?? null;
+    question.workerAccounts = accounts;
     renderLive();
   }
-  // The logins a Claude agent here can continue on, as [{id, label}], the one it runs on
-  // among them; none where there is only one, or the agent runs on a worker.
+  // The logins a Claude agent can continue on, as [{id, label}], the one it runs on among
+  // them: this machine's, or its worker's own. None where there is only one.
   function accountChoices(agent, question) {
-    if (agent.agent !== "claude" || workerLabel(viewer.entry)) return [];
-    const listed = question.choices?.accounts ?? [];
+    if (agent.agent !== "claude") return [];
+    const worker = Boolean(workerLabel(viewer.entry));
+    const listed = (worker ? question.workerAccounts : question.choices?.accounts) ?? [];
     const named = listed.filter((choice) => choice.id !== "default");
-    // The server leaves the default login out when a named login is the same one.
+    // The server leaves this machine's default login out when a named login is the same one.
     const offered = [
       ...(!named.length || named.length < listed.length ? [{ id: "default" }] : []),
       ...named,
@@ -2466,7 +2473,8 @@
     if (question.current && !offered.some((choice) => choice.id === question.current))
       offered.unshift({ id: question.current });
     const quota = (id) => {
-      const left = window.dashboardUsage?.account(`claude:${id}`)?.left_percent;
+      // Usage is read for this machine's logins only.
+      const left = worker ? null : window.dashboardUsage?.account(`claude:${id}`)?.left_percent;
       return left == null ? "" : ` · ${Math.round(left)}% left`;
     };
     const choices = offered.map((choice) => ({

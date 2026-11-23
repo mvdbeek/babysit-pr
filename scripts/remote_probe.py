@@ -3529,6 +3529,91 @@ def move_write_bundle(git, path, state, move, base, file):
             git(path, "update-ref", "-d", ref)
 
 
+def account_relocation(files, store):
+    """Where one Claude session's transcript goes to continue on another account, whose
+    store (its home's ``projects``) is ``store``: ``(transcript, destination)``, or None
+    when only that store holds the session. ``files`` are the session's transcripts in
+    every account's store.
+
+    A copy already in ``store`` beside one elsewhere is refused: which one the agent
+    writes cannot be told apart. So is a folder of the session's files already there.
+    """
+    store = Path(os.path.realpath(store))
+    held = [f for f in files if Path(os.path.realpath(f)).parent.parent == store]
+    others = [f for f in files if f not in held]
+    if held:
+        if not others:
+            return None
+        raise ValueError("That account already holds a copy of this session")
+    if not others:
+        raise ValueError("That session's transcript is not on this machine")
+    file = max(others, key=lambda f: f.stat().st_mtime)
+    destination = store / file.parent.name / file.name
+    if os.path.lexists(destination.with_suffix("")):
+        raise ValueError("That account already holds files of this session")
+    return file, destination
+
+
+def relocate_session(file, destination):
+    """Move a Claude transcript and its folder (subagents, tool results) to
+    ``destination`` in another account's store (``account_relocation``).
+
+    The folder goes first and comes back if the transcript cannot follow, so a session
+    is never split between two accounts. Folders on the way are made, never followed
+    through a link.
+    """
+    store = destination.parent.parent
+    store.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder = destination.parent
+    if os.path.islink(store) or os.path.islink(folder):
+        raise ValueError(f"{folder} is a symbolic link")
+    folder.mkdir(mode=0o700, exist_ok=True)
+    if os.path.lexists(destination):
+        raise ValueError("That account already holds a copy of this session")
+    extra, moved = file.with_suffix(""), None
+    if extra.is_dir() and not extra.is_symlink():
+        moved = shutil.move(extra, destination.with_suffix(""))
+    try:
+        shutil.move(file, destination)
+    except OSError:
+        if moved:
+            shutil.move(moved, extra)
+        raise
+
+
+def _host_claude_accounts():
+    """This machine's Claude logins, as ``claude-account`` names them."""
+    return {"accounts": sorted(set(host_accounts().values()), key=lambda n: (n != "default", n))}
+
+
+def _host_account_move(session, account, sandbox, move):
+    """Continue a Claude session on ``account`` here: whether its transcript must move
+    to that account's store and, with ``move``, whether it did, its folder trusted for
+    that account (``_host_trust``). Refused for an unknown account, or one already
+    holding a copy (``account_relocation``)."""
+    if not isinstance(session, str) or not SESSION.fullmatch(session):
+        raise ValueError("Expected a session ID")
+    if not isinstance(move, bool):
+        raise ValueError("Expected whether to move")
+    if account is None:
+        raise ValueError("Expected a Claude account name")
+    claude_home, _, config = _host_claude("claude", account, sandbox)
+    store = Path(claude_home) / "projects"
+    if os.path.lexists(store) and host_session_root(store) is None:
+        raise ValueError(f"{store} is not a session store in this home")
+    files = [file for agent, file in host_session_named(session) if agent == "claude"]
+    found = account_relocation(files, store)
+    if found is None or not move:
+        return {"needed": found is not None, "moved": False}
+    file, destination = found
+    cwd = (claude_details(file) or {}).get("cwd")
+    relocate_session(file, destination)
+    if isinstance(cwd, str) and os.path.isabs(cwd):
+        # A resume types no directory to trust; the old account's trust is not this one's.
+        _host_trust(config, cwd)
+    return {"needed": True, "moved": True}
+
+
 def move_session_files(main, session, agent):
     """A session's files to move, by their name in the store: Claude's transcript and
     its folder (subagents, tool results), or Codex's rollout. Names the target would
@@ -4842,6 +4927,8 @@ OPS: dict[str, Callable[..., Any]] = {
     "processes": _host_processes,
     "move_bundle": _host_move_bundle,
     "move_pack": _host_move_pack,
+    "claude_accounts": _host_claude_accounts,
+    "account_move": _host_account_move,
 }
 
 
@@ -5634,6 +5721,28 @@ def validate_move_check(value):
     return value
 
 
+def validate_claude_accounts(value):
+    _expect(isinstance(value, dict) and set(value) == {"accounts"}, "fields")
+    names = value["accounts"]
+    _expect(
+        isinstance(names, list)
+        and len(names) <= 64
+        and all(isinstance(n, str) and ACCOUNT.fullmatch(n) for n in names),
+        "accounts",
+    )
+    return value
+
+
+def validate_account_move(value):
+    _expect(
+        isinstance(value, dict)
+        and set(value) == {"needed", "moved"}
+        and all(isinstance(value[k], bool) for k in value),
+        "fields",
+    )
+    return value
+
+
 def validate_move_session(value):
     _expect(isinstance(value, dict) and set(value) == {"transcript"}, "fields")
     _expect(
@@ -5834,6 +5943,8 @@ VALIDATORS = {
     "processes": validate_processes,
     "move_bundle": validate_staged,
     "move_pack": validate_staged,
+    "claude_accounts": validate_claude_accounts,
+    "account_move": validate_account_move,
 }
 
 

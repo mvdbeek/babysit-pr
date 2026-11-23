@@ -840,6 +840,13 @@ def viewed(path):
     return with_kept([*sessions(root), *forks(root)], "", root)
 
 
+def forget_remote_sessions(machine):
+    """Drop a worker's cached listings, as after its sessions moved between stores."""
+    with _lock:
+        for key in [key for key in _sessions if key[0] == machine.id]:
+            del _sessions[key]
+
+
 def remote_row(found):
     """A listing's row for a session a worker's probe ``found``."""
     row = {

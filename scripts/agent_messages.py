@@ -24,7 +24,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -575,9 +574,10 @@ def change_settings(request, home=None, machine=None):
     session resumed in the same pane with them (``resume``). An empty value is the
     agent's configured default. Docker access an agent here has is kept.
 
-    An ``account`` names the Claude login to continue on (``claude_accounts``); empty
-    keeps the one it runs on. Claude looks a session up in its own configuration's
-    store, so the transcript moves there between the quit and the resume.
+    An ``account`` names the Claude login to continue on, of this machine
+    (``claude_accounts``) or of the worker the agent runs on; empty keeps the one it runs
+    on. Claude looks a session up in its own configuration's store, so the transcript
+    moves there between the quit and the resume (``account_move``).
     """
     fields = ("workspace", "pane", "session", "model", "effort")
     if set(request) - {"account"} != set(fields) or not (
@@ -599,9 +599,8 @@ def change_settings(request, home=None, machine=None):
     if account:
         if target["agent"] != "claude":
             raise ValueError("Only a Claude agent can change account")
-        if machine is not None:
-            raise ValueError(f"An agent on {machine.label} keeps the account it runs on there")
-        move = account_move(session, account)
+        # Refused here, before the quit, when the account cannot take the session.
+        move = account_move(session, account, home, machine, move=False)
     docker = False
     if machine is None and sys.platform == "darwin":
         # Safehouse's grant, read as a move reads it; unknown access is not granted again.
@@ -618,10 +617,13 @@ def change_settings(request, home=None, machine=None):
     moved = None
     if move:
         try:
-            move_transcript(*move)
-        except OSError as exc:
+            account_move(session, account, home, machine, move=True)
+        except (OSError, ValueError) as exc:
             # The agent is gone already: it comes back on its own account, never not at all.
             moved = f"Its conversation could not move to {account} ({exc}); it stays on its own."
+        if machine is not None:
+            # The worker's listing names the account a resume types; read it again.
+            workspace_viewer.forget_remote_sessions(machine)
     settings = {"model": request["model"], "effort": request["effort"], "docker": docker}
     try:
         resumed = resume(
@@ -642,47 +644,57 @@ def change_settings(request, home=None, machine=None):
     }
 
 
-def account_move(session, account):
-    """Where a running Claude session's files go to continue on ``account``, as
-    ``(transcript, destination, cwd)``; None when it already runs there. Refused before
-    anything is quit when the account is unknown or already holds that session."""
-    destination_home = claude_accounts.account_home(account)
-    held = {
-        home: list((home / "projects").glob(f"*/{session}.jsonl"))
-        for home in {*claude_accounts.homes(), destination_home}
-    }
-    if held[destination_home]:
-        if not any(files for home, files in held.items() if home != destination_home):
-            return None
-        raise ValueError(f"The account {account} already holds a copy of this session")
-    row = workspace_viewer.session_anywhere(session)
-    if row is None or row["agent"] != "claude":
-        raise ValueError("That session's transcript is not on this machine; refresh")
-    file = Path(row["_file"])
-    destination = destination_home / "projects" / file.parent.name / file.name
-    if destination.with_suffix("").exists():
-        raise ValueError(f"The account {account} already holds files of this session")
-    return file, destination, row["_cwd"]
+def accounts(home=None, machine=None):
+    """The Claude logins an agent can continue on, as ``[{"id", "label"}]``: this
+    machine's as New task offers them, or the worker's own, as it names them."""
+    if machine is None:
+        return [{"id": a["id"], "label": a["label"]} for a in claude_accounts.choices()]
+    names = workspace_viewer.probe(home, machine, "claude_accounts")["accounts"]
+    return [{"id": name, "label": "Default" if name == "default" else name} for name in names]
 
 
-def move_transcript(file, destination, cwd):
-    """Move a Claude transcript and its folder (subagents, tool results) to another
-    account's store, and accept that account's folder trust dialog for its directory.
+def name_accounts(listed, sessions):
+    """Name the account of each Claude agent in ``listed`` that ``docker_status`` could
+    not, a worker's, from the listing of its checkout's ``sessions``."""
+    found = {s["id"]: s.get("claude_account") for s in sessions}
+    for agent in listed:
+        if agent.get("agent") == "claude" and agent.get("session") in found:
+            agent.setdefault("claude_account", found[agent["session"]])
 
-    The folder goes first and comes back if the transcript cannot follow, so the session
-    is never split between two accounts."""
-    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    folder, moved = file.with_suffix(""), None
-    if folder.is_dir() and not folder.is_symlink():
-        moved = shutil.move(folder, destination.with_suffix(""))
-    try:
-        shutil.move(file, destination)
-    except OSError:
-        if moved:
-            shutil.move(moved, folder)
-        raise
-    # A resume types no directory for wt to trust; the old account's trust is not this one's.
-    claude_accounts.trust(destination.parent.parent.parent, cwd)
+
+def account_move(session, account, home=None, machine=None, *, move):
+    """Whether a Claude session must move to ``account``'s store to continue on it and,
+    with ``move``, move it there (``remote_probe.relocate_session``) and accept that
+    account's folder trust for the session's directory, which a resume does not.
+
+    A worker does it all with its own accounts (``account_move`` op). Refused for an
+    unknown account, or one already holding a copy (``remote_probe.account_relocation``).
+    """
+    if machine is not None:
+        return workspace_viewer.probe(
+            home,
+            machine,
+            "account_move",
+            session=session,
+            account=account,
+            sandbox=cron_agents.BACKENDS[machine.os],
+            move=move,
+        )["needed"]
+    destination = claude_accounts.account_home(account)
+    files = [
+        file
+        for config in dict.fromkeys([*claude_accounts.homes(), destination])
+        for file in (config / "projects").glob(f"*/{session}.jsonl")
+    ]
+    found = remote_probe.account_relocation(files, destination / "projects")
+    if found is None or not move:
+        return found is not None
+    file, target = found
+    cwd = (workspace_viewer.details(file, "claude") or {}).get("cwd")
+    remote_probe.relocate_session(file, target)
+    if cwd:
+        claude_accounts.trust(destination, cwd)
+    return True
 
 
 def prompt(target, text, machine=None):

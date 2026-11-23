@@ -819,6 +819,100 @@ def test_the_resume_probe_reports_the_workers_own_paths(worker, monkeypatch):
             remote_probe.validate_resume({**found, **bad})
 
 
+def test_a_worker_agent_continues_on_another_of_the_workers_accounts(idle, monkeypatch):
+    psu = idle.host / ".claude" / "accounts" / "psu"
+    psu.mkdir(parents=True)
+    (psu / ".claude.json").write_text("{}")
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")  # Only ever the fake worker's config here.
+    assert agent_messages.accounts(idle.home, idle.machine) == [
+        {"id": "default", "label": "Default"},
+        {"id": "psu", "label": "psu"},
+    ]
+    file = claude_file(idle.host, idle.checkout, CLAUDE_SID)
+    (file.parent / CLAUDE_SID / "subagents").mkdir(parents=True)
+    (file.parent / CLAUDE_SID / "subagents" / "agent-1.jsonl").write_text("{}\n")
+    # The listing a resume reads is cached: it names the default login until it moves.
+    [listed] = [
+        s for s in agent_messages.sessions("w1", idle.home, idle.machine) if s["id"] == CLAUDE_SID
+    ]
+    assert listed["claude_account"] == "default"
+    steps = []
+
+    def exit_agent(request, home, *, stop, machine):
+        assert machine is idle.machine and file.exists()  # Nothing moved before the quit.
+        steps.append("quit")
+        return {"quit": True, "pane": request["pane"], "warning": None}
+
+    def resume(workspace, session, text, home, *, machine, agent_options, into):
+        [chosen] = [
+            s
+            for s in agent_messages.recorded(
+                agent_messages.workspace_root(workspace, machine), home, machine
+            )
+            if s["id"] == session
+        ]
+        steps.append(("resume", chosen["claude_account"], into))
+        return {"pane": into, "warning": None}
+
+    monkeypatch.setattr(agent_messages, "exit_agent", exit_agent)
+    monkeypatch.setattr(agent_messages, "resume", resume)
+    request = {
+        "workspace": "w1",
+        "pane": "w1:p1",
+        "session": CLAUDE_SID,
+        "model": "",
+        "effort": "",
+        "account": "psu",
+    }
+    for account, refusal in (("gmail", "Unknown Claude account gmail"),):
+        with pytest.raises(ValueError, match=refusal):
+            agent_messages.change_settings(
+                {**request, "account": account}, idle.home, machine=idle.machine
+            )
+    assert steps == []
+    value = agent_messages.change_settings(request, idle.home, machine=idle.machine)
+    assert value == {"changed": True, "pane": "w1:p1", "warning": None}
+    assert steps == ["quit", ("resume", "psu", "w1:p1")]
+    moved = psu / "projects" / file.parent.name
+    assert not file.exists() and (moved / file.name).is_file()
+    assert (moved / CLAUDE_SID / "subagents" / "agent-1.jsonl").read_text() == "{}\n"
+    config = json.loads((psu / ".claude.json").read_text())
+    assert config["projects"][str(idle.checkout)] == {"hasTrustDialogAccepted": True}
+    # Already there: nothing to move. Back on the default login, a copy left there refuses.
+    assert (
+        agent_messages.account_move(CLAUDE_SID, "psu", idle.home, idle.machine, move=False) is False
+    )
+    file.write_text((moved / file.name).read_text())
+    with pytest.raises(ValueError, match="already holds a copy"):
+        agent_messages.account_move(CLAUDE_SID, "psu", idle.home, idle.machine, move=False)
+
+
+def test_the_account_move_probe_refuses_what_it_cannot_place(worker, monkeypatch):
+    monkeypatch.setenv("HOME", str(worker.host))
+    args = dict(account="default", sandbox="safehouse", move=True)
+    for bad, said in (
+        ({"session": "../x"}, "Expected a session ID"),
+        ({"move": "yes"}, "Expected whether to move"),
+        ({"account": None}, "Expected a Claude account name"),
+        ({"account": "nobody"}, "Unknown Claude account"),
+    ):
+        with pytest.raises(ValueError, match=said):
+            remote_probe._host_account_move(**{"session": CLAUDE_SID, **args, **bad})
+    # The default login holds it alone: nothing to move.
+    assert remote_probe._host_account_move(CLAUDE_SID, **args) == {"needed": False, "moved": False}
+    other = worker.host / ".claude" / "accounts" / "psu"
+    other.mkdir(parents=True)
+    # A store that is a link to elsewhere is no store to move into.
+    (other / "projects").symlink_to(worker.host / "elsewhere", target_is_directory=True)
+    with pytest.raises(ValueError, match="is not a session store"):
+        remote_probe._host_account_move(CLAUDE_SID, **{**args, "account": "psu"})
+    for bad in ({"needed": "yes", "moved": False}, {"needed": True}):
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_account_move(bad)
+    with pytest.raises(ValueError, match="Malformed probe answer"):
+        remote_probe.validate_claude_accounts({"accounts": ["../x"]})
+
+
 # Through the dashboard -----------------------------------------------------------------
 
 
@@ -909,6 +1003,58 @@ def test_the_composer_routes_reach_the_worker(exited, site):
 
 
 @pytest.mark.browser
+def test_a_worker_agents_card_offers_the_workers_own_accounts(page, exited, site):
+    port, _ = site
+    (exited.host / ".claude" / "accounts" / "psu").mkdir(parents=True)
+    # The transcript the viewer opens on, the newest.
+    later = time.time() + 60
+    os.utime(claude_file(exited.host, exited.checkout, CLAUDE_SID), (later, later))
+    agent = {
+        "workspace_id": "w1",
+        "agent": "claude",
+        "agent_status": "idle",
+        "pane_id": "w1:p1",
+        "agent_session": {"value": CLAUDE_SID},
+    }
+    mini_store(exited, agents=[agent])
+    status, value = request(port, "/api/workspace-agents?workspace=mini%2Fw1&accounts=1")
+    assert status == 200 and value == {
+        "accounts": [{"id": "default", "label": "Default"}, {"id": "psu", "label": "psu"}]
+    }
+    status, value = request(port, "/api/workspace-agents?workspace=mini%2Fw1")
+    # Its account, from the worker's listing of the session.
+    assert [a["claude_account"] for a in value["agents"]] == ["default"]
+    changes = []
+
+    def change(route):
+        changes.append(route.request.post_data_json)
+        route.fulfill(json={"changed": True, "pane": "w1:p1", "warning": None})
+
+    page.route("**/api/workspace-agent-settings", change)
+    page.goto(f"http://127.0.0.1:{port}/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("feature", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    live = page.locator("#ws-live")
+    live.get_by_role("button", name="Change model or effort for Claude in w1:p1").click()
+    card = live.get_by_role("group", name="Change model or effort")
+    account = card.get_by_role("combobox", name="Account")
+    expect(account).to_have_value("default")
+    expect(account.locator("option")).to_have_text(["Default", "psu"])
+    account.select_option("psu")
+    card.get_by_role("button", name="Restart with these").click()
+    expect(page.locator("#ws-live-status")).to_contain_text("on the psu account")
+    assert changes == [
+        {
+            "workspace": "mini/w1",
+            "pane": "w1:p1",
+            "session": CLAUDE_SID,
+            "model": "",
+            "effort": "",
+            "account": "psu",
+        }
+    ]
+
+
 def test_a_worker_agent_is_messaged_from_its_row_without_docker_access(page, exited, site):
     port, _ = site
     agent = {
