@@ -1,3 +1,5 @@
+// Where the GitHub content script runs, once Settings turns it on.
+export const GITHUB_ORIGINS = ["https://github.com/*"];
 export function dashboardURL(value) {
   const url = new URL(value);
   if (

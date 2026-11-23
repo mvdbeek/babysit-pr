@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import agent_messages
 import browser_extension
 import dashboard
+import pr_reviews
 import pytest
 from playwright.sync_api import expect
 
@@ -302,8 +303,9 @@ def extension_browser(playwright, tmp_path, extension_server):
     shutil.copytree(Path(__file__).resolve().parents[1] / "extension", extension_path)
     manifest_path = extension_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    # Pregrant only the temporary server for automation; shipped permissions remain optional.
-    manifest["host_permissions"] = ["http://127.0.0.1/*"]
+    # Pregrant only the temporary server and (for its content script, which tests route
+    # to fixture pages) GitHub for automation; shipped permissions remain optional.
+    manifest["host_permissions"] = ["http://127.0.0.1/*", "https://github.com/*"]
     manifest_path.write_text(json.dumps(manifest))
     with playwright.chromium.launch_persistent_context(
         tmp_path / "profile",
@@ -625,3 +627,122 @@ def test_lost_response_retry_keeps_automatic_branch_and_request_id(
     page.get_by_role("button", name="Start task", exact=True).click()
     expect(page.locator("#workspace")).to_be_visible()
     assert len(extension_server.workspaces.calls) == 1
+
+
+REVIEWED = """### P1 1: <img src=x onerror="window.injected=true"> Data loss
+
+Body.
+
+### P3 1: A typo (verified)
+"""
+RISKS = "<details><summary>Risks</summary>\n\nRisks are minimal: a two-way door.\n\n</details>\n"
+
+
+@pytest.fixture
+def reviewed(extension_server, monkeypatch, tmp_path):
+    """test/repo#1 has a pr-review round on disk and a checkout with a workspace."""
+    folder = tmp_path / "home" / "src" / "agent-artefacts" / "outbox" / "pr-review-test-repo-1"
+    folder.mkdir(parents=True)
+    (folder / "2026-11-22-r1-verified.md").write_text(REVIEWED)
+    (folder / "2026-11-22-r1-reply.md").write_text(RISKS)
+    monkeypatch.setattr(
+        extension_server, "reviews", pr_reviews.Reviews(None, home=tmp_path / "home")
+    )
+    manager = extension_server.workspaces
+    snapshot = manager.snapshot()
+    snapshot["prs"] = {"pr-one": {"matches": [{"workspace_id": "w1"}]}}
+    monkeypatch.setattr(manager, "snapshot", lambda: snapshot)
+    return extension_server
+
+
+OPEN_WORKSPACE = "/?item=https%3A%2F%2Fgithub.com%2Ftest%2Frepo%2Fpull%2F1&view=1#prs"
+
+
+def test_pages_report_reviews_and_where_the_dashboard_shows_them(reviewed):
+    headers = pair(reviewed)
+    one, two = "https://github.com/test/repo/pull/1", "https://github.com/test/repo/pull/2"
+    code, value, _ = request(
+        reviewed,
+        "/api/extension",
+        {"action": "pages", "urls": [one, two, "https://example.com/test/repo/pull/1"]},
+        headers,
+    )
+    assert code == 200 and set(value["pages"]) == {one, two}
+    page = value["pages"][one]
+    assert page["dashboard"] == OPEN_WORKSPACE and page["workspace"] is True
+    assert page["review"]["counts"] == {"P1": 1, "P2": 0, "P3": 1}
+    assert page["review"]["risk"] == "Risks are minimal: a two-way door."
+    # Neither in the overview nor reviewed: nothing to show or open.
+    assert value["pages"][two] == {"review": None, "workspace": False, "dashboard": None}
+    for invalid in ({"action": "pages", "urls": one}, {"action": "pages", "urls": [one] * 101}):
+        assert request(reviewed, "/api/extension", invalid, headers)[0] == 400
+    # Only a paired extension may ask.
+    assert request(reviewed, "/api/extension", {"action": "pages", "urls": [one]})[0] == 403
+
+
+LIST_PAGE = """<!doctype html><title>Pull requests</title><main>
+<div><a id="issue_1_link" href="/test/repo/pull/1">Fix tests</a></div>
+<div><a id="issue_2_link" href="/test/repo/pull/2">Other</a></div>
+</main>"""
+PULL_PAGE = """<!doctype html><title>Fix tests</title><main>
+<p>Follows up <a href="/test/repo/pull/2">#2</a>.</p>
+<div id="partial-discussion-sidebar"><div>Reviewers</div></div>
+</main>"""
+
+
+@pytest.mark.browser
+def test_github_pages_show_reviews_and_open_babysitter(extension_browser, reviewed):
+    context, worker, _, base = extension_browser
+    pages = {"/test/repo/pulls": LIST_PAGE, "/test/repo/pull/1": PULL_PAGE}
+    context.route(
+        "https://github.com/**",
+        lambda route: route.fulfill(
+            body=pages.get(route.request.url.removeprefix("https://github.com"), "missing"),
+            content_type="text/html",
+        ),
+    )
+    # Off until Settings turns it on.
+    page = context.new_page()
+    page.goto("https://github.com/test/repo/pulls")
+    page.wait_for_timeout(500)
+    expect(page.locator(".babysit-chips")).to_have_count(0)
+    worker.evaluate("chrome.storage.local.set({github: true})")
+    worker.evaluate(
+        """async () => {
+          while (!(await chrome.scripting.getRegisteredContentScripts()).length)
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }"""
+    )
+    page.reload()
+    chips = page.locator("#issue_1_link + .babysit-chips")
+    expect(chips.locator(".babysit-chip").first).to_have_text("Review r1: 1 P1 · 1 P3")
+    expect(chips.get_by_role("link", name="Open workspace")).to_have_attribute(
+        "href", base + OPEN_WORKSPACE
+    )
+    # A pull request Babysitter knows nothing about is left alone.
+    expect(page.locator(".babysit-chips")).to_have_count(1)
+
+    page.goto("https://github.com/test/repo/pull/1")
+    card = page.locator("#partial-discussion-sidebar > .babysit-card")
+    expect(card).to_contain_text("pr-review r1, 2026-11-22")
+    expect(card.locator(".babysit-findings li").first).to_have_text(
+        'P1 <img src=x onerror="window.injected=true"> Data loss'
+    )
+    expect(card).to_contain_text("Risks are minimal: a two-way door.")
+    expect(card.get_by_role("link", name="Open workspace")).to_have_attribute(
+        "href", base + OPEN_WORKSPACE
+    )
+    # Links in the pull request's description are not list rows.
+    expect(page.locator(".babysit-chips")).to_have_count(0)
+    assert page.evaluate("window.injected") is None
+
+    worker.evaluate("chrome.storage.local.set({github: false})")
+    worker.evaluate(
+        """async () => {
+          while ((await chrome.scripting.getRegisteredContentScripts()).length)
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }"""
+    )
+    page.reload()
+    page.wait_for_timeout(500)
+    expect(page.locator(".babysit-card")).to_have_count(0)

@@ -12,13 +12,16 @@ import secrets
 import sqlite3
 import subprocess
 from contextlib import contextmanager
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import agent_messages
 from pr_workspaces import collie_url, herdr
 
 EXTENSION_ID = re.compile(r"[a-p]{32}")
 REQUEST_ID = re.compile(r"[a-zA-Z0-9-]{16,80}")
+PULL = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]{0,9})")
+# Pull requests one GitHub page may ask about: a list page shows 25 by default.
+MAX_PAGES = 100
 
 
 class Extension:
@@ -116,6 +119,8 @@ class Extension:
         return result
 
     def dispatch(self, server, client, request):
+        if request.get("action") == "pages":
+            return pages(server, request)
         workspaces = server.workspaces
         if not workspaces:
             raise ValueError("Workspace actions are not enabled")
@@ -222,6 +227,43 @@ class Extension:
                 }
             )
         return choices, None
+
+
+def pages(server, request):
+    """What the extension shows on GitHub for each pull request a page lists: its latest
+    pr-review round and where Babysitter shows it. Read-only."""
+    urls = request.get("urls")
+    if (
+        set(request) - {"action", "urls"}
+        or not isinstance(urls, list)
+        or len(urls) > MAX_PAGES
+        or not all(isinstance(url, str) for url in urls)
+    ):
+        raise ValueError("Invalid page request")
+    workspaces = server.workspaces
+    snapshot = workspaces.snapshot() if workspaces else {}
+    targets = {
+        target["url"].lower(): target
+        for target in (workspaces.targets() if workspaces else [])
+        if target.get("kind") in {None, "pr"} and isinstance(target.get("url"), str)
+    }
+    found = {}
+    for url in dict.fromkeys(urls):
+        match = PULL.fullmatch(url)
+        if not match:
+            continue
+        target = targets.get(url.lower())
+        info = snapshot.get("prs", {}).get(target["id"]) if target else None
+        workspace = any(m.get("workspace_id") for m in (info or {}).get("matches", []))
+        # The PR's row in the dashboard, which also opens its workspace when it has one.
+        # The dashboard finds the row by its own spelling of the URL.
+        query = {"item": target["url"], **({"view": "1"} if workspace else {})} if target else None
+        found[url] = {
+            "review": server.reviews.summary(match[1], match[2], int(match[3])),
+            "workspace": workspace,
+            "dashboard": f"/?{urlencode(query)}#prs" if query else None,
+        }
+    return {"pages": found}
 
 
 def submit(server, request):

@@ -3615,6 +3615,32 @@ def test_any_collie_workspace_offers_its_diff_and_transcript(
     assert "workspace-transcript?watch=feedback" in seen[-1]
 
 
+def test_a_link_with_view_opens_the_pull_requests_workspace(page, dashboard_site, workspace_routes):
+    """The browser extension's Open workspace link: the PR's row, then its conversation."""
+    url, _ = dashboard_site
+    seen = []
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: (
+            seen.append(route.request.url)
+            or route.fulfill(json={"sessions": [], "session": None, "entries": [], "start": 0})
+        ),
+    )
+    item = "https%3A%2F%2Fgithub.com%2Ftest%2Falpha%2Fpull%2F8"
+    page.goto(f"{url}/?item={item}&view=1#prs")
+    expect(page.locator("#pr-list tr.notification-target")).to_contain_text("Test PR")
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.locator("#ws-viewer-title")).to_have_text("Renamed workspace")
+    expect(viewer.get_by_role("link", name="PR #8")).to_be_visible()
+    assert "workspace-transcript?workspace=w1" in seen[-1]
+    # Without view, the row alone is shown.
+    page.keyboard.press("Escape")
+    page.goto(f"{url}/?item={item}#prs")
+    expect(page.locator("#pr-list tr.notification-target")).to_contain_text("Test PR")
+    page.wait_for_timeout(300)
+    expect(viewer).to_be_hidden()
+
+
 def test_a_transcript_opened_before_the_first_turn_appears_once_recorded(
     page, dashboard_site, workspace_routes
 ):
