@@ -1509,8 +1509,8 @@
   let quitQuestion = null;
   // The move asked about ({id, pane, session, machine, plan, error, loading}), likewise.
   let moveQuestion = null;
-  // The model and effort change asked about ({id, pane, session, agent, model, effort,
-  // choices}), likewise.
+  // The model, effort and account change asked about ({id, pane, session, agent, model,
+  // effort, account, current, choices}), likewise.
   let settingsQuestion = null;
   // The agent whose "⋯" menu is open ({id, pane}); a redraw while it is open keeps it so.
   let menuOpen = null;
@@ -2100,8 +2100,12 @@
     if (agent.model === undefined) return `${paneAgent(agent)}; its model and effort are not known`;
     return (
       `${paneAgent(agent)}: ${agent.model || "its default model"} with ` +
-      (agent.effort ? `${agent.effort} effort` : "its default effort")
+      (agent.effort ? `${agent.effort} effort` : "its default effort") +
+      (agent.claude_account ? ` on the ${accountLabel(agent.claude_account)} account` : "")
     );
+  }
+  function accountLabel(id) {
+    return id === "default" ? "Default" : id;
   }
   function activity(agent) {
     if (agent.status === "blocked" && agent.interaction?.idle) return ACTIVITY.idle;
@@ -2148,6 +2152,9 @@
         agent: agent.agent,
         model: agent.model || "",
         effort: agent.effort || "",
+        // The Claude login its transcript is stored under; null where unknown.
+        current: agent.claude_account ?? null,
+        account: agent.claude_account ?? "",
         choices: undefined,
         focus: true,
       };
@@ -2428,10 +2435,11 @@
     }
     return card;
   }
-  // Changing the model or effort --------------------------------------------------------
+  // Changing the model, effort or account ---------------------------------------------
   // Asked inline like a quit, with the choices New task offers. Neither agent changes
   // them in a running session from outside, so the server quits the idle agent and
-  // resumes the same conversation in its pane with them.
+  // resumes the same conversation in its pane with them. A Claude agent on this machine
+  // may also continue on another of its logins: its transcript moves to that one.
   async function loadSettingsChoices() {
     const question = settingsQuestion;
     let choices = null;
@@ -2444,12 +2452,45 @@
     question.choices = choices;
     renderLive();
   }
+  // The logins a Claude agent here can continue on, as [{id, label}], the one it runs on
+  // among them; none where there is only one, or the agent runs on a worker.
+  function accountChoices(agent, question) {
+    if (agent.agent !== "claude" || workerLabel(viewer.entry)) return [];
+    const listed = question.choices?.accounts ?? [];
+    const named = listed.filter((choice) => choice.id !== "default");
+    // The server leaves the default login out when a named login is the same one.
+    const offered = [
+      ...(!named.length || named.length < listed.length ? [{ id: "default" }] : []),
+      ...named,
+    ];
+    if (question.current && !offered.some((choice) => choice.id === question.current))
+      offered.unshift({ id: question.current });
+    const quota = (id) => {
+      const left = window.dashboardUsage?.account(`claude:${id}`)?.left_percent;
+      return left == null ? "" : ` · ${Math.round(left)}% left`;
+    };
+    const choices = offered.map((choice) => ({
+      id: choice.id,
+      label:
+        accountLabel(choice.label && choice.id !== "default" ? choice.label : choice.id) +
+        quota(choice.id),
+    }));
+    if (!question.current) choices.unshift({ id: "", label: "Its current login" });
+    return choices.length > 1 ? choices : [];
+  }
   function settingsCard(agent) {
     const question = settingsQuestion;
+    const accounts = accountChoices(agent, question);
     const card = node("div", undefined, "ws-question ws-move-confirm ws-settings-confirm");
     card.setAttribute("role", "group");
     card.setAttribute("aria-label", "Change model or effort");
-    card.append(node("strong", `Change model or effort of ${agentTitle(agent)} in ${agent.pane}?`));
+    card.append(
+      node(
+        "strong",
+        `Change model, effort${accounts.length ? " or account" : ""} of ` +
+          `${agentTitle(agent)} in ${agent.pane}?`,
+      ),
+    );
     if (question.choices === undefined) card.append(node("p", "Loading model choices…"));
     const choices = question.choices || { models: [], efforts: [] };
     const fill = (select, values, value) => {
@@ -2479,24 +2520,40 @@
       question.effort = effort.value;
     };
     effort.onchange = () => (question.effort = effort.value);
+    const account = node("select");
+    account.setAttribute("aria-label", "Account");
+    for (const choice of accounts) {
+      const option = node("option", choice.label);
+      option.value = choice.id;
+      account.append(option);
+    }
+    account.value = question.account;
+    const moving = () => Boolean(account.value) && account.value !== (question.current ?? "");
+    const note = node("p", undefined, "pr-meta");
+    const explain = () =>
+      (note.textContent =
+        "The agent quits and this conversation resumes in the same pane with these settings; " +
+        "Default is the agent’s own configured setting. Processes it started stop with it." +
+        (moving()
+          ? ` Its transcript moves to the ${accountLabel(account.value)} account, ` +
+            "which then holds this conversation."
+          : ""));
+    account.onchange = () => {
+      question.account = account.value;
+      explain();
+    };
+    explain();
     const fields = node("div", undefined, "ws-settings-fields");
     for (const [text, select] of [
       ["Model ", model],
       ["Effort ", effort],
+      ...(accounts.length ? [["Account ", account]] : []),
     ]) {
       const field = node("label", text, "ws-move-target");
       field.append(select);
       fields.append(field);
     }
-    card.append(
-      fields,
-      node(
-        "p",
-        "The agent quits and this conversation resumes in the same pane with these settings; " +
-          "Default is the agent’s own configured setting. Processes it started stop with it.",
-        "pr-meta",
-      ),
-    );
+    card.append(fields, note);
     const idle =
       ["idle", "done"].includes(agent.status) ||
       (agent.status === "blocked" && agent.interaction?.idle);
@@ -2514,7 +2571,8 @@
     const yes = node("button", "Restart with these", "ws-move");
     yes.type = "button";
     yes.disabled = !idle || question.choices === undefined;
-    yes.onclick = () => void changeSettings(agent, question.model, question.effort);
+    yes.onclick = () =>
+      void changeSettings(agent, question.model, question.effort, moving() ? account.value : "");
     const no = node("button", "Cancel");
     no.type = "button";
     no.onclick = () => {
@@ -2529,7 +2587,7 @@
     }
     return card;
   }
-  async function changeSettings(agent, model, effort) {
+  async function changeSettings(agent, model, effort, account) {
     if (!viewer || stopping()) return;
     const { entry, id } = viewer;
     const status = byId("ws-live-status");
@@ -2551,6 +2609,7 @@
           session: agent.session,
           model,
           effort,
+          ...(account ? { account } : {}),
         }),
       });
       const value = await response.json();
@@ -2558,7 +2617,8 @@
         value.error ||
         value.warning ||
         `Resumed ${agentTitle(agent)} in ${value.pane} on ` +
-          `${model || "its default model"} with ${effort ? `${effort} effort` : "its default effort"}.`;
+          `${model || "its default model"} with ${effort ? `${effort} effort` : "its default effort"}` +
+          (account ? ` on the ${accountLabel(account)} account.` : ".");
     } catch {
       message = "The restart could not be confirmed; refresh or check Collie.";
     } finally {

@@ -15,6 +15,7 @@ from unittest.mock import ANY
 from urllib.parse import quote
 
 import agent_messages
+import agent_settings
 import dashboard
 import herdr_handoff
 import pr_workspaces
@@ -2715,6 +2716,56 @@ def test_a_settings_change_is_refused_before_quitting_a_busy_or_unknown_choice(a
     data = read(state)
     assert "typed_text" not in data and "runs" not in data
     assert calls(state, ["agent", "send-keys"]) == []
+
+
+def test_an_account_change_moves_the_conversation_and_resumes_it_on_that_login(
+    adjusting, tmp_path, monkeypatch
+):
+    state, sid, checkout, home = adjusting
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("BABYSIT_CLAUDE_TRUST")  # Only ever this test's own config.
+    # The transcripts found here are this test's alone.
+    monkeypatch.setattr(agent_settings, "_files", {})
+    psu = tmp_path / ".claude" / "accounts" / "psu"
+    psu.mkdir(parents=True)
+    (psu / ".claude.json").write_text("{}")
+    file = next((tmp_path / "claude" / "projects").glob(f"*/{sid}.jsonl"))
+    (file.parent / sid / "subagents").mkdir(parents=True)
+    (file.parent / sid / "subagents" / "agent-1.jsonl").write_text("{}\n")
+    [agent] = agent_messages.docker_status("w1")
+    # The dashboard's own configuration is not a named login.
+    assert agent["claude_account"] is None
+    value = agent_messages.change_settings(settings_request(sid, account="psu"), home)
+    assert value == {"changed": True, "pane": "w1:p2", "warning": None}
+    moved = psu / "projects" / file.parent.name
+    assert not file.exists() and not (file.parent / sid).exists()
+    assert (moved / f"{sid}.jsonl").is_file()
+    assert (moved / sid / "subagents" / "agent-1.jsonl").read_text() == "{}\n"
+    agent = read(state)["agents"][0]
+    assert agent["argv"] == ["--model", "opus", "--effort", "high", "--resume", sid]
+    assert agent["claude_config_dir"] == str(psu.resolve())
+    # Its folder is trusted for that login, whose own dialog would otherwise wait.
+    config = json.loads((psu / ".claude.json").read_text())
+    assert config["projects"][str(checkout.resolve())]["hasTrustDialogAccepted"] is True
+    assert [a["claude_account"] for a in agent_messages.docker_status("w1")] == ["psu"]
+
+
+def test_an_account_change_is_refused_before_quitting_for_an_unknown_or_taken_login(
+    adjusting, tmp_path, monkeypatch
+):
+    state, sid, checkout, home = adjusting
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with pytest.raises(ValueError, match="Unknown Claude account 'gmail'"):
+        agent_messages.change_settings(settings_request(sid, account="gmail"), home)
+    file = next((tmp_path / "claude" / "projects").glob(f"*/{sid}.jsonl"))
+    taken = tmp_path / ".claude" / "accounts" / "psu" / "projects" / file.parent.name
+    taken.mkdir(parents=True)
+    (taken / file.name).write_text(file.read_text())
+    with pytest.raises(ValueError, match="already holds a copy"):
+        agent_messages.change_settings(settings_request(sid, account="psu"), home)
+    data = read(state)
+    assert "typed_text" not in data and "runs" not in data
+    assert file.exists()
 
 
 def test_the_agent_list_names_each_agents_model_and_effort(adjusting):
