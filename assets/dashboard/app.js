@@ -5,6 +5,9 @@ const attention = new Set(["blocked", "awaiting_release", "handoff"]);
 let navigationTarget = null;
 // A PR whose workspace a link asked to open (`view=1`), until its row and workspaces load.
 let viewerRequest = null;
+// The newest agent review per PR (refreshAgentReviews), and when it was last asked for.
+let agentReviews = {},
+  agentReviewsFetched = 0;
 // Declared early: opening the dashboard on #scheduled refreshes it during startup.
 let scheduledData = null,
   scheduledBusy = false;
@@ -1785,6 +1788,8 @@ const prTable = itemTable({
       readiness.append(
         feedback ? reviewBadge(pr, label, color) : el("span", label, `badge ${color}`),
       );
+    const agentChip = agentReviewChip(pr);
+    if (agentChip) readiness.append(agentChip);
     const roles = rolesCell(pr.roles);
     const checks = el("td", undefined, "pr-ci");
     checks.append(ciBadge(pr));
@@ -2018,6 +2023,47 @@ function refreshOverviews(force = false) {
   overviewsFetched = Date.now();
   // Issues render linked-PR CI from the PR overview, so refresh PRs first.
   void prTable.refresh().then(() => issueTable.refresh());
+  if (!$("prs-panel").hidden) void refreshAgentReviews();
+}
+// Agents' reviews of pull requests (the review sweep's and pr-review rounds), the newest
+// per PR, read at most once a minute while the PR list is shown.
+async function refreshAgentReviews() {
+  if (Date.now() - agentReviewsFetched < 60000) return;
+  agentReviewsFetched = Date.now();
+  try {
+    agentReviews = (await get("/api/agent-reviews")).reviews || {};
+    prTable.render();
+  } catch {
+    // The chips wait for the next minute's answer.
+  }
+}
+// The newest agent review of a PR, in its review column: the verdict or findings, linking
+// to the report. Grey once the PR has commits the review did not see.
+function agentReviewChip(pr) {
+  const review = agentReviews[`${pr.repo.toLowerCase()}#${pr.number}`];
+  if (!review) return null;
+  const stale = Boolean(review.head && pr.head_sha && !pr.head_sha.startsWith(review.head));
+  const counts = review.counts.map((c) => `${c.count} ${c.severity}`).join(" · ");
+  const label = `Agent: ${review.verdict || counts || "no findings"}`;
+  const tones = review.counts.map((c) => c.tone);
+  const tone = stale
+    ? ""
+    : /change|block|reject/i.test(review.verdict || "") || tones.includes("danger")
+      ? "red"
+      : tones.includes("attention")
+        ? "amber"
+        : "green";
+  const chip = review.links?.report ? link(label, review.links.report) : el("span", label);
+  chip.className = `badge ${tone} pr-agent-review`.replace("  ", " ");
+  chip.title = [
+    `${review.source === "sweep" ? "Review sweep" : "pr-review"} ${review.label || ""}, ${review.date || ""}`,
+    stale ? "The PR has commits since this review." : "",
+    counts,
+    ...review.findings.slice(0, 8).map((f) => `${f.severity}: ${f.title}`),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return chip;
 }
 async function refresh(force = false) {
   refreshOverviews(force);
@@ -2103,6 +2149,7 @@ function showPage(name) {
   if (name === "prs") prTable.render();
   if (name === "issues") issueTable.render();
   if (name === "prs" || name === "issues") refreshOverviews();
+  if (name === "prs") void refreshAgentReviews();
   if (name === "scheduled") void refreshScheduled();
   if (name === "workspaces") window.dispatchEvent(new Event("workspaces-visible"));
   if (name === "agents") window.dispatchEvent(new Event("agents-visible"));

@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import subprocess
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 import agent_messages
@@ -19,8 +20,10 @@ from pr_workspaces import collie_url, herdr
 
 EXTENSION_ID = re.compile(r"[a-p]{32}")
 REQUEST_ID = re.compile(r"[a-zA-Z0-9-]{16,80}")
-PULL = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]{0,9})")
-# Pull requests one GitHub page may ask about: a list page shows 25 by default.
+ITEM = re.compile(
+    r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(pull|issues)/([1-9][0-9]{0,9})"
+)
+# Pull requests or issues one GitHub page may ask about: a list page shows 25 by default.
 MAX_PAGES = 100
 
 
@@ -230,8 +233,9 @@ class Extension:
 
 
 def pages(server, request):
-    """What the extension shows on GitHub for each pull request a page lists: its latest
-    pr-review round and where Babysitter shows it. Read-only."""
+    """What the extension shows on GitHub for each pull request or issue a page names: the
+    newest agent review of a pull request, its head now, the checkouts linked to it on every
+    machine, and where Babysitter shows it. Read-only."""
     urls = request.get("urls")
     if (
         set(request) - {"action", "urls"}
@@ -245,25 +249,88 @@ def pages(server, request):
     targets = {
         target["url"].lower(): target
         for target in (workspaces.targets() if workspaces else [])
-        if target.get("kind") in {None, "pr"} and isinstance(target.get("url"), str)
+        if target.get("kind") in {None, "pr", "issue"} and isinstance(target.get("url"), str)
     }
+    rows = linked_rows(server)
+    wanted = [url for url in dict.fromkeys(urls) if ITEM.fullmatch(url)]
+    latest = server.reviews.latest() if any("/pull/" in url for url in wanted) else {}
     found = {}
-    for url in dict.fromkeys(urls):
-        match = PULL.fullmatch(url)
-        if not match:
-            continue
+    for url in wanted:
+        match = ITEM.fullmatch(url)
+        assert match
+        owner, repo, kind, number = match.groups()
         target = targets.get(url.lower())
-        info = snapshot.get("prs", {}).get(target["id"]) if target else None
-        workspace = any(m.get("workspace_id") for m in (info or {}).get("matches", []))
+        section = "issues" if kind == "issues" else "prs"
+        info = snapshot.get(section, {}).get(target["id"]) if target else None
+        matches = (info or {}).get("matches", [])
+        workspace = any(m.get("workspace_id") for m in matches)
+        listed = rows.get(url.lower())
+        if listed is None:
+            # Without the workspace overview: this machine's verified checkouts.
+            listed = [
+                {
+                    "name": m.get("name") or Path(m.get("path") or "").name,
+                    "branch": m.get("branch"),
+                    "machine": None,
+                    "status": m.get("agent_status"),
+                    "collie": m.get("url"),
+                    "dashboard": None,
+                }
+                for m in matches
+            ]
         # The PR's row in the dashboard, which also opens its workspace when it has one.
         # The dashboard finds the row by its own spelling of the URL.
-        query = {"item": target["url"], **({"view": "1"} if workspace else {})} if target else None
+        page = f"#{section}"
+        query = (
+            {"item": target["url"], **({"view": "1"} if workspace and kind == "pull" else {})}
+            if target
+            else None
+        )
         found[url] = {
-            "review": server.reviews.summary(match[1], match[2], int(match[3])),
+            "kind": "pr" if kind == "pull" else "issue",
+            "review": shown_review(latest.get(f"{owner}/{repo}#{number}".lower()))
+            if kind == "pull"
+            else None,
+            "head": target.get("head_sha") if target else None,
             "workspace": workspace,
-            "dashboard": f"/?{urlencode(query)}#prs" if query else None,
+            "workspaces": listed,
+            "dashboard": f"/?{urlencode(query)}{page}" if query else None,
         }
     return {"pages": found}
+
+
+def shown_review(review):
+    """What a GitHub page may hold of a review: its page scripts can read it, so no local
+    paths or session ids."""
+    if review is None:
+        return None
+    return {k: v for k, v in review.items() if k not in {"report", "checkout", "session"}}
+
+
+def linked_rows(server):
+    """The Workspaces tab's checkouts by the pull request or issue URL they are linked to
+    (lowercase), on this machine and on workers; {} without the workspace overview."""
+    overview = getattr(server, "workspace_overview", None)
+    if not overview:
+        return {}
+    found: dict[str, list] = {}
+    for row in overview.snapshot(start=False).get("workspaces", []):
+        for link in row.get("links") or []:
+            if not isinstance(link.get("url"), str):
+                continue
+            found.setdefault(link["url"].lower(), []).append(
+                {
+                    "name": row.get("name"),
+                    "branch": row.get("branch"),
+                    "machine": row.get("machine_label"),
+                    "status": row.get("agent_status"),
+                    "collie": row.get("workspace_url"),
+                    "dashboard": f"/?{urlencode({'workspace': row['key']})}#workspaces"
+                    if row.get("key")
+                    else None,
+                }
+            )
+    return found
 
 
 def submit(server, request):

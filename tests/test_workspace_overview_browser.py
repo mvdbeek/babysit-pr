@@ -1318,6 +1318,28 @@ def test_only_one_blocked_row_keeps_its_own_override(page, site):
     expect(page.get_by_role("checkbox", name="Remove anyway")).to_have_count(1)
 
 
+def test_a_link_to_one_checkout_opens_its_conversation(page, site):
+    """The browser extension links each checkout of a PR or issue: `?workspace=<row key>`."""
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        row("review-pr-21", links=[link("pr", 21, "open")], status="active"),
+        row("elsewhere", links=[link("pr", 22, "open")], status="active"),
+    ]
+    page.route("**/api/workspace-transcript?*", lambda route: route.fulfill(json=transcript()))
+    page.goto(f"{url}/?workspace=%2Fsrc%2Fworktrees%2Frepo%2Freview-pr-21#workspaces")
+    viewer = page.locator("#ws-viewer")
+    expect(viewer.locator("#ws-viewer-title")).to_have_text("review-pr-21")
+    expect(page.locator("#ws-search")).to_have_value("review-pr-21")
+    # Spent once used, so a reload is the user's own.
+    expect(page).to_have_url(f"{url}/#workspaces")
+    page.keyboard.press("Escape")
+    page.goto(f"{url}/?workspace=%2Fsrc%2Fworktrees%2Frepo%2Fgone#workspaces")
+    expect(page.locator("#ws-status-line")).to_have_text(
+        "That checkout is no longer in the workspace list."
+    )
+    expect(viewer).to_be_hidden()
+
+
 def test_arriving_for_one_item_searches_its_row_out_of_the_list(page, site):
     url, plugin, _ = site
     plugin.value["workspaces"] = [

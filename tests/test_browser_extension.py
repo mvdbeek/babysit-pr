@@ -11,9 +11,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import agent_messages
+import agent_reviews
 import browser_extension
 import dashboard
-import pr_reviews
 import pytest
 from playwright.sync_api import expect
 
@@ -629,51 +629,132 @@ def test_lost_response_retry_keeps_automatic_branch_and_request_id(
     assert len(extension_server.workspaces.calls) == 1
 
 
-REVIEWED = """### P1 1: <img src=x onerror="window.injected=true"> Data loss
+REPORT = """# Review: test/repo#1
 
-Body.
+- PR: https://github.com/test/repo/pull/1
+- Base: `main`
+- Reviewed head: `abc1234def` (1 commit)
+- Verdict: **changes needed**. The queue loses data on restart.
 
-### P3 1: A typo (verified)
+## Findings
+
+### Major
+**M1. <img src=x onerror="window.injected=true"> Data loss.**
+
+### Nit
+**N1. A typo.**
 """
-RISKS = "<details><summary>Risks</summary>\n\nRisks are minimal: a two-way door.\n\n</details>\n"
+
+
+class FakeOverview:
+    """The Workspaces tab's rows: a checkout here linked to test/repo#1 and one on a worker
+    linked to issue #3."""
+
+    def snapshot(self, start=True):
+        return {
+            "workspaces": [
+                {
+                    "key": "/src/worktrees/repo/review-pr-1",
+                    "name": "review-pr-1",
+                    "branch": "review-pr-1",
+                    "agent_status": "idle",
+                    "workspace_url": "http://collie.example/space/w1",
+                    "links": [{"url": "https://github.com/test/repo/pull/1", "kind": "pr"}],
+                },
+                {
+                    "key": "m:mini:/src/worktrees/repo/issue-3",
+                    "name": "issue-3",
+                    "branch": "issue-3",
+                    "machine_label": "mini",
+                    "agent_status": "working",
+                    "links": [{"url": "https://github.com/test/repo/issues/3", "kind": "issue"}],
+                },
+            ]
+        }
 
 
 @pytest.fixture
 def reviewed(extension_server, monkeypatch, tmp_path):
-    """test/repo#1 has a pr-review round on disk and a checkout with a workspace."""
-    folder = tmp_path / "home" / "src" / "agent-artefacts" / "outbox" / "pr-review-test-repo-1"
-    folder.mkdir(parents=True)
-    (folder / "2026-11-22-r1-verified.md").write_text(REVIEWED)
-    (folder / "2026-11-22-r1-reply.md").write_text(RISKS)
-    monkeypatch.setattr(
-        extension_server, "reviews", pr_reviews.Reviews(None, home=tmp_path / "home")
+    """test/repo#1 has a sweep review of an older head, a workspace and a linked checkout;
+    issue #3 has a checkout on a worker."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "2026-11-22-pr1.md").write_text(REPORT)
+    settings = {"owner": "test", "default_repo": "repo", "out": str(out)}
+    store = agent_reviews.Reviews(
+        tmp_path / "reviews", settings=lambda: settings, user_home=tmp_path / "home"
     )
+    store.record(
+        {
+            "source": "sweep",
+            "repo": "test/repo",
+            "number": 1,
+            "head": "abc1234def",
+            "date": "2026-11-22",
+            "label": "2026-11-22",
+            "report": str(out / "2026-11-22-pr1.md"),
+        }
+    )
+    monkeypatch.setattr(extension_server, "reviews", store)
+    monkeypatch.setattr(extension_server, "workspace_overview", FakeOverview())
     manager = extension_server.workspaces
     snapshot = manager.snapshot()
     snapshot["prs"] = {"pr-one": {"matches": [{"workspace_id": "w1"}]}}
     monkeypatch.setattr(manager, "snapshot", lambda: snapshot)
+    targets = manager.targets()
+    targets[0].update(kind="pr", head_sha="fff0000aaaa")
+    monkeypatch.setattr(manager, "targets", lambda: targets)
     return extension_server
 
 
 OPEN_WORKSPACE = "/?item=https%3A%2F%2Fgithub.com%2Ftest%2Frepo%2Fpull%2F1&view=1#prs"
+ONE_CHECKOUT = "/?workspace=%2Fsrc%2Fworktrees%2Frepo%2Freview-pr-1#workspaces"
 
 
-def test_pages_report_reviews_and_where_the_dashboard_shows_them(reviewed):
+def test_pages_report_reviews_workspaces_and_where_the_dashboard_shows_them(reviewed):
     headers = pair(reviewed)
     one, two = "https://github.com/test/repo/pull/1", "https://github.com/test/repo/pull/2"
+    issue = "https://github.com/test/repo/issues/3"
     code, value, _ = request(
         reviewed,
         "/api/extension",
-        {"action": "pages", "urls": [one, two, "https://example.com/test/repo/pull/1"]},
+        {"action": "pages", "urls": [one, two, issue, "https://example.com/test/repo/pull/1"]},
         headers,
     )
-    assert code == 200 and set(value["pages"]) == {one, two}
+    assert code == 200 and set(value["pages"]) == {one, two, issue}
     page = value["pages"][one]
     assert page["dashboard"] == OPEN_WORKSPACE and page["workspace"] is True
-    assert page["review"]["counts"] == {"P1": 1, "P2": 0, "P3": 1}
-    assert page["review"]["risk"] == "Risks are minimal: a two-way door."
-    # Neither in the overview nor reviewed: nothing to show or open.
-    assert value["pages"][two] == {"review": None, "workspace": False, "dashboard": None}
+    assert page["review"]["verdict"] == "changes needed"
+    # GitHub's page scripts can read what the page holds: no local paths or sessions.
+    assert not {"report", "checkout", "session"} & set(page["review"])
+    assert page["review"]["counts"] == [
+        {"severity": "Major", "count": 1, "tone": "danger"},
+        {"severity": "Nit", "count": 1, "tone": "muted"},
+    ]
+    # The head the dashboard knows now, for "new commits since this review".
+    assert page["review"]["head"] == "abc1234def" and page["head"] == "fff0000aaaa"
+    assert page["workspaces"] == [
+        {
+            "name": "review-pr-1",
+            "branch": "review-pr-1",
+            "machine": None,
+            "status": "idle",
+            "collie": "http://collie.example/space/w1",
+            "dashboard": ONE_CHECKOUT,
+        }
+    ]
+    # An issue lists its checkouts, a worker's too, with no review.
+    assert value["pages"][issue]["kind"] == "issue" and value["pages"][issue]["review"] is None
+    assert [w["machine"] for w in value["pages"][issue]["workspaces"]] == ["mini"]
+    # Neither in the overview nor reviewed nor checked out: nothing to show or open.
+    assert value["pages"][two] == {
+        "kind": "pr",
+        "review": None,
+        "head": None,
+        "workspace": False,
+        "workspaces": [],
+        "dashboard": None,
+    }
     for invalid in ({"action": "pages", "urls": one}, {"action": "pages", "urls": [one] * 101}):
         assert request(reviewed, "/api/extension", invalid, headers)[0] == 400
     # Only a paired extension may ask.
@@ -688,12 +769,18 @@ PULL_PAGE = """<!doctype html><title>Fix tests</title><main>
 <p>Follows up <a href="/test/repo/pull/2">#2</a>.</p>
 <div id="partial-discussion-sidebar"><div>Reviewers</div></div>
 </main>"""
+ISSUE_PAGE = """<!doctype html><title>An issue</title><main><p>Broken.</p></main>"""
 
 
 @pytest.mark.browser
-def test_github_pages_show_reviews_and_open_babysitter(extension_browser, reviewed):
+def test_github_pages_show_reviews_workspaces_and_open_babysitter(extension_browser, reviewed):
     context, worker, _, base = extension_browser
-    pages = {"/test/repo/pulls": LIST_PAGE, "/test/repo/pull/1": PULL_PAGE}
+    pages = {
+        "/test/repo/pulls": LIST_PAGE,
+        "/test/repo/pull/1": PULL_PAGE,
+        "/test/repo/pull/2": PULL_PAGE,
+        "/test/repo/issues/3": ISSUE_PAGE,
+    }
     context.route(
         "https://github.com/**",
         lambda route: route.fulfill(
@@ -715,7 +802,11 @@ def test_github_pages_show_reviews_and_open_babysitter(extension_browser, review
     )
     page.reload()
     chips = page.locator("#issue_1_link + .babysit-chips")
-    expect(chips.locator(".babysit-chip").first).to_have_text("Review r1: 1 P1 · 1 P3")
+    # The PR has commits the review did not see.
+    expect(chips.locator(".babysit-chip").first).to_have_text(
+        "Review (old head): changes needed · 1 Major · 1 Nit"
+    )
+    expect(chips).to_contain_text("1 workspace")
     expect(chips.get_by_role("link", name="Open workspace")).to_have_attribute(
         "href", base + OPEN_WORKSPACE
     )
@@ -724,17 +815,35 @@ def test_github_pages_show_reviews_and_open_babysitter(extension_browser, review
 
     page.goto("https://github.com/test/repo/pull/1")
     card = page.locator("#partial-discussion-sidebar > .babysit-card")
-    expect(card).to_contain_text("pr-review r1, 2026-11-22")
+    expect(card).to_contain_text("Sweep review 2026-11-22, 2026-11-22 at abc1234de")
+    expect(card).to_contain_text("The pull request has new commits since this review.")
     expect(card.locator(".babysit-findings li").first).to_have_text(
-        'P1 <img src=x onerror="window.injected=true"> Data loss'
+        'Major <img src=x onerror="window.injected=true"> Data loss'
     )
-    expect(card).to_contain_text("Risks are minimal: a two-way door.")
+    expect(card).to_contain_text("The queue loses data on restart.")
+    checkout = card.locator(".babysit-workspaces li")
+    expect(checkout).to_contain_text("review-pr-1 idle Collie")
+    expect(checkout.get_by_role("link", name="review-pr-1")).to_have_attribute(
+        "href", base + ONE_CHECKOUT
+    )
     expect(card.get_by_role("link", name="Open workspace")).to_have_attribute(
         "href", base + OPEN_WORKSPACE
     )
     # Links in the pull request's description are not list rows.
     expect(page.locator(".babysit-chips")).to_have_count(0)
     assert page.evaluate("window.injected") is None
+
+    # A page Babysitter knows nothing about says so.
+    page.goto("https://github.com/test/repo/pull/2")
+    card = page.locator(".babysit-card")
+    expect(card).to_contain_text("No agent review found.")
+    expect(card).to_contain_text("Not in your dashboard's overview.")
+
+    # An issue page lists its checkouts, a worker's too.
+    page.goto("https://github.com/test/repo/issues/3")
+    card = page.locator(".babysit-card")
+    expect(card.locator(".babysit-workspaces li")).to_contain_text("issue-3 mini · working")
+    expect(card).not_to_contain_text("agent review")
 
     worker.evaluate("chrome.storage.local.set({github: false})")
     worker.evaluate(

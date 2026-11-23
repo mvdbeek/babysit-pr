@@ -48,43 +48,52 @@ preserves its extension ID, connection and pairing. No new browser permissions
 are required unless you turn on GitHub pages (below). If you load a different
 directory, pair the new ID.
 
-## On GitHub pull requests
+## On GitHub pull requests and issues
 
-Version 0.3 can show what Babysitter knows on GitHub's pull request lists and pull
-request pages. Turn on **Show pr-review summaries and an Open in Babysitter button on
-GitHub** in the extension's Settings and accept the request for github.com access,
-then reload open GitHub tabs. It needs a paired dashboard.
+Version 0.4 shows what Babysitter knows on GitHub's pull request and issue lists and
+pages. Turn on **Show agent reviews, workspaces and an Open in Babysitter button on
+GitHub** in the extension's Settings and accept the request for github.com access, then
+reload open GitHub tabs. It needs a paired dashboard.
 
-- **List pages** (`/<owner>/<repo>/pulls` and `/pulls`): beside a pull request's
-  title, a chip with its latest pr-review round and its findings by priority
-  (`Review r2: 1 P1 · 3 P3`), linking to the findings, and **Open workspace** or
-  **Open in Babysitter**. Hover the chip for the finding titles and the risk verdict.
-- **A pull request's page**: a Babysitter section at the top of the sidebar (a card in
-  the corner on tabs without one, such as Files changed) with the round, its date and
-  reviewed commit, up to eight finding titles, the risk verdict, links to the findings
-  and the draft reply, and the same button.
+- **List pages** (`/<owner>/<repo>/pulls`, `/issues`, and `/pulls`): beside a title,
+  a chip with the pull request's newest agent review, its verdict and findings by
+  severity (`Review: changes needed · 1 Major · 4 Minor`), linking to the report; how
+  many checkouts are linked to the item; and **Open workspace** or **Open in
+  Babysitter**. A review of a head the pull request has moved on from reads
+  `Review (old head)` in grey. Hover the chips for the finding titles and the checkouts.
+- **An item's page**: a Babysitter section at the top of the sidebar (a card in the
+  corner on tabs without one, such as Files changed). For a pull request: the review's
+  kind (sweep or pr-review), run or round, date and reviewed commit, a warning when the
+  pull request has commits since, up to eight finding titles, the verdict sentence or
+  risk verdict, and links to the report and draft reply. For every item: its linked
+  checkouts, on this machine and on workers, each with its machine and agent status, a
+  link that opens its conversation in the dashboard and one to Collie. The card always
+  shows, and says when nothing is known: no review, no linked workspace, not in the
+  dashboard's overview.
 - **Open workspace** appears when the pull request has a checkout with a herdr
   workspace. It opens the dashboard's PR list at that row and then the workspace's
-  conversation. **Open in Babysitter** opens the row alone, with its workspace
-  actions. Pull requests that are neither in the dashboard's overview nor reviewed
-  show nothing.
+  conversation. **Open in Babysitter** opens the row alone, with its workspace actions.
+  A checkout's own link opens the Workspaces tab with that checkout's conversation.
 
-Reviews are the folders the pr-review skill writes, `pr-review-<owner>-<repo>-<number>`.
-The dashboard reads its own machine's from disk: `~/src/agent-artefacts/outbox`,
-each sandbox's `~/.cache/babysit-sandbox/<key>/artifacts` and
-`~/.local/state/pr-review`. Workers' reviews are found on the artefacts share, when the
-[artefacts experiment](artefacts.md) is configured and dufs runs with
-`--allow-search` (or `--allow-all`): one search for `pr-review-` per minute finds them all.
-Findings and draft-reply links need the share; reviews found only on disk show their
-summary without links. Summaries are reused for a minute. The newest round with a
-`verified.md` counts, with its latest trim.
+Reviews come from the dashboard's store of agent reviews (`GET /api/agent-reviews`):
+the [review sweep](review-sweep.md)'s, which it records as each review finishes, and
+pr-review rounds, imported from the folders the pr-review skill writes,
+`pr-review-<owner>-<repo>-<number>`. The dashboard reads its own machine's folders from
+disk: `~/src/agent-artefacts/outbox`, each sandbox's
+`~/.cache/babysit-sandbox/<key>/artifacts` and `~/.local/state/pr-review`. Workers'
+folders are found on the artefacts share, when the [artefacts experiment](artefacts.md)
+is configured and dufs runs with `--allow-search` (or `--allow-all`): one search for
+`pr-review-` per minute finds them all. Report links need the share; a report outside the
+shared folder shows its summary without a link. Linked checkouts are the Workspaces tab's
+rows; without the workspace overview, this machine's checkouts verified for the pull
+request.
 
-The page asks the extension's background for the pull requests it shows, and the
-background asks the dashboard with the pairing token; the page never sees the token.
-Only this extension's script on a github.com page is answered. The summary is shown as
-text, never markup. It is added to GitHub's page, so GitHub's own scripts can read it
-like the rest of the page. Turning the setting off unregisters the script; the github.com
-permission stays granted until you remove it on the extension's details page.
+The page asks the extension's background for the items it shows, and the background asks
+the dashboard with the pairing token; the page never sees the token. Only this
+extension's script on a github.com page is answered. The summary is shown as text, never
+markup. It is added to GitHub's page, so GitHub's own scripts can read it like the rest
+of the page. Turning the setting off unregisters the script; the github.com permission
+stays granted until you remove it on the extension's details page.
 
 ### Open in the installed app
 

@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import agent_messages
+import agent_reviews
 import agent_roster
 import agent_terminal
 import attachments
@@ -32,8 +33,8 @@ import dashboard_auth
 import dashboard_settings
 import llm_usage
 import machines
-import pr_reviews
 import service_control
+import sweep_settings
 import voice_assistant
 import work_tags
 import worker_api
@@ -168,6 +169,7 @@ ACTIONS = frozenset(
         "service-restart",
         "voice-turn",
         "voice-log",
+        "agent-reviews",
     }
 )
 # Every API route this dashboard answers: the report names only these, so anonymous
@@ -213,8 +215,25 @@ API_ROUTES = frozenset(
     }
     | {f"/api/{action}" for action in ACTIONS}
     | {f"/api/worker/{action}" for action in worker_api.ACTIONS}
-    | {"/api/extension"}
+    | {"/api/extension", "/api/review-sweep"}
 )
+
+
+def agent_reviews_answer(reviews, query):
+    """``GET /api/agent-reviews``: ``?url=<pull request>`` gives its reviews, newest first;
+    ``?heads=1`` the heads the sweep reviewed, by `owner/repo#number`; without either, every
+    reviewed pull request's newest review."""
+    params = parse_qs(query)
+    if set(params) - {"url", "heads"}:
+        raise ValueError("Unknown agent reviews parameter")
+    if params.get("heads") == ["1"]:
+        return {"heads": reviews.heads()}
+    if "url" in params:
+        match = agent_reviews.PULL.fullmatch(params["url"][0].rstrip("/"))
+        if not match:
+            raise ValueError("url must be a GitHub pull request")
+        return {"reviews": reviews.for_pr(match[1], int(match[2]))}
+    return {"reviews": reviews.latest()}
 
 
 def viewed_workspace(home, value):
@@ -567,7 +586,10 @@ class DashboardServer(ThreadingHTTPServer):
         workspace_viewer.use_store(home)
         # The dufs share the viewer's Artefacts tab reads; disabled unless configured.
         self.artefacts = workspace_artefacts.Artefacts(home)
-        self.reviews = pr_reviews.Reviews(self.artefacts)
+        # Agents' reviews of pull requests: the review sweep's and pr-review rounds.
+        self.reviews = agent_reviews.Reviews(
+            home, self.artefacts, settings=lambda: sweep_settings.load(home)
+        )
         # None while auth is off: every request is answered as before Phase 1.
         self.auth = auth
         # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.
@@ -1094,6 +1116,7 @@ class Handler(BaseHTTPRequestHandler):
                         "cron-action",
                         "voice-turn",
                         "voice-log",
+                        "agent-reviews",
                     }
                     else 1024
                 )
@@ -1159,6 +1182,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.server.push:
                     raise ValueError("Notification preferences are unavailable")
                 self.send_json(200, self.server.push.focus(request))
+                return
+            if action == "agent-reviews":
+                # The review sweep's track step: one finished review.
+                self.send_json(200, {"review": self.server.reviews.record(request)})
                 return
             if action == "tags":
                 self.server.tags.change(request)
@@ -1883,6 +1910,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, self.server.attention.get(fresh=fresh))
             elif route.path == "/api/tags":
                 self.send_json(200, self.server.tag_snapshot())
+            elif route.path == "/api/review-sweep":
+                self.send_json(200, sweep_settings.load(self.server.home))
+            elif route.path == "/api/agent-reviews":
+                self.send_json(200, agent_reviews_answer(self.server.reviews, route.query))
             elif route.path == "/api/prs":
                 self.send_json(
                     200,
