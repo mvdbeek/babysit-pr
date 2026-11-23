@@ -91,7 +91,9 @@ OPEN_TOOLS = 500
 MAX_PROMPTS = 100
 # Bumped whenever parsing changes what an entry holds: a saved transcript is parsed again
 # when it is next opened or has grown, and stays as it was parsed once its file is gone.
-PARSER = 2
+PARSER = 3
+# Claude Code's own notices between turns that its terminal shows, by record subtype.
+CLAUDE_NOTICES = frozenset({"compact_boundary", "informational", "scheduled_task_fire"})
 # Sessions a transcript lists at most, those kept only in the store included.
 KEPT_SESSIONS = 200
 # The archiver's first sweep after the dashboard starts, how often it sweeps after that,
@@ -1169,6 +1171,27 @@ class Transcript:
                     )
                 elif block.get("type") == "tool_use":
                     self.tool(block.get("id"), block.get("name"), block.get("input"), when)
+        elif kind == "system":
+            # What Claude Code prints between turns: the recap of where things stand
+            # after a while away, compaction, a /loop waking up, usage-limit notices.
+            text = item.get("content")
+            text = text.strip() if isinstance(text, str) else ""
+            subtype = item.get("subtype")
+            if not text:
+                return
+            if subtype == "away_summary":
+                self.entries.append(
+                    {
+                        "role": "assistant",
+                        "kind": "summary",
+                        "text": clip(text, MAX_TEXT),
+                        "time": when,
+                    }
+                )
+            elif subtype in CLAUDE_NOTICES:
+                self.entries.append(
+                    {"role": "user", "kind": "notice", "text": clip(text, MAX_TEXT), "time": when}
+                )
 
     def codex(self, item):
         payload = item.get("payload") or {}

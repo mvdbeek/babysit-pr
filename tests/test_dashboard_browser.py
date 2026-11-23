@@ -4611,6 +4611,8 @@ def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
         },
         {"role": "assistant", "text": TRANSCRIPT_MARKDOWN},
         {"role": "user", "kind": "notification", "text": 'Background command "tox" completed'},
+        {"role": "user", "kind": "notice", "text": "Conversation compacted"},
+        {"role": "assistant", "kind": "summary", "text": "Hop 26.1→26.2 is **resolved**."},
         {
             "role": "user",
             "kind": "error",
@@ -4658,9 +4660,14 @@ def test_transcript_renders_markdown_commands_notifications_and_tool_summaries(
     expect(viewer.locator(".ws-note")).to_have_text(
         [
             'Notification Background command "tox" completed',
+            "Claude Code Conversation compacted",
             "Turn failed bio_policy This content was flagged. Read more: https://example.org/policy",
         ]
     )
+    # Claude Code's recap after a while away reads as Claude's, marked as a summary.
+    recap = viewer.locator(".ws-kind-summary")
+    expect(recap.locator(".ws-msg-head")).to_contain_text("ClaudeSummary")
+    expect(recap.locator(".ws-md strong")).to_have_text("resolved")
     failed = viewer.locator(".ws-note-error")
     expect(failed.locator(".badge.red")).to_have_text("Turn failed")
     expect(failed.locator("a")).to_have_attribute("href", "https://example.org/policy")

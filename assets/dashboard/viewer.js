@@ -985,9 +985,7 @@
         hit.role === "tool"
           ? hit.name || "Tool"
           : hit.role === "assistant"
-            ? hit.agent === "claude"
-              ? "Claude"
-              : "Codex"
+            ? `${hit.agent === "claude" ? "Claude" : "Codex"}${hit.kind === "summary" ? " summary" : ""}`
             : USER_KINDS[hit.kind || "prompt"] || "Prompt";
       const session = sessionLabel({ ...hit, id: hit.session });
       head.append(node("strong", who), " ", node("span", session, "ws-hit-session"));
@@ -1208,6 +1206,7 @@
     command: "Command",
     output: "Command output",
     notification: "Notification",
+    notice: "Claude Code",
     error: "Turn failed",
   };
   // Questions an agent asked ------------------------------------------------------
@@ -1461,7 +1460,7 @@
       return item;
     }
     const kind = entry.role === "user" ? entry.kind || "prompt" : null;
-    if (kind === "notification" || kind === "error") {
+    if (kind === "notification" || kind === "notice" || kind === "error") {
       const item = node("div", undefined, "ws-note");
       const when = stamp(entry.time);
       if (when) item.append(when);
@@ -1470,13 +1469,19 @@
         item.classList.add("ws-note-error");
         item.append(badge(USER_KINDS.error, "red"));
         if (entry.code) item.append(" ", node("code", entry.code));
-      } else item.append(node("strong", USER_KINDS.notification));
+      } else item.append(node("strong", USER_KINDS[kind]));
       item.append(" ", linkify(entry.text));
       return item;
     }
-    const item = node("div", undefined, `ws-msg ws-${entry.role} ws-kind-${kind || "reply"}`);
+    const item = node(
+      "div",
+      undefined,
+      `ws-msg ws-${entry.role} ws-kind-${kind || (entry.kind === "summary" ? "summary" : "reply")}`,
+    );
     const head = node("div", undefined, "ws-msg-head");
     head.append(node("strong", kind ? USER_KINDS[kind] || "Prompt" : agent, "ws-msg-who"));
+    // Claude Code's recap of where things stand, written after a while away.
+    if (!kind && entry.kind === "summary") head.append(badge("Summary"));
     const when = stamp(entry.time);
     if (when) head.append(when);
     item.append(head);
