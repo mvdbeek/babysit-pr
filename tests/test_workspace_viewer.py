@@ -1001,6 +1001,42 @@ def prompt_line(text):
 LISTED = {"id": SID, "agent": "claude", "title": None, "updated": 0, "size": 0, "_file": "f"}
 
 
+def test_claude_codes_recaps_and_notices_between_turns_are_shown():
+    def system(subtype, content, **more):
+        record = {"type": "system", "subtype": subtype, "content": content, "timestamp": "t"}
+        return (json.dumps(record | more) + "\n").encode()
+
+    recap = "Hop 26.1→26.2 conflicts are resolved. Running the checks next."
+    parser = wv.Transcript("claude")
+    parser.consume(
+        system("away_summary", recap)
+        + system("compact_boundary", "Conversation compacted")
+        + system("scheduled_task_fire", "Claude resuming /loop wakeup (Nov 21 9:29am)")
+        + system("informational", "Usage limit reached · set to continue automatically at 3am")
+        # Bookkeeping the terminal does not show, and subagents' records, stay out.
+        + system("turn_duration", None, durationMs=5)
+        + system("stop_hook_summary", "")
+        + system("informational", "   ")
+        + system("compact_boundary", "Conversation compacted", isSidechain=True)
+    )
+    assert parser.entries == [
+        {"role": "assistant", "kind": "summary", "text": recap, "time": "t"},
+        {"role": "user", "kind": "notice", "text": "Conversation compacted", "time": "t"},
+        {
+            "role": "user",
+            "kind": "notice",
+            "text": "Claude resuming /loop wakeup (Nov 21 9:29am)",
+            "time": "t",
+        },
+        {
+            "role": "user",
+            "kind": "notice",
+            "text": "Usage limit reached · set to continue automatically at 3am",
+            "time": "t",
+        },
+    ]
+
+
 def test_a_long_transcript_keeps_its_newest_entries_and_whole_transcript_indices(monkeypatch):
     monkeypatch.setattr(wv, "MAX_ENTRIES", 10)
     tool = {"type": "tool_use", "id": "old", "name": "Bash", "input": {"command": "ls"}}
