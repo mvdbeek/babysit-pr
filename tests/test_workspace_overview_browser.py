@@ -1021,6 +1021,63 @@ def test_a_session_whose_file_was_deleted_is_still_read_and_searched_as_archived
     page.screenshot(path=f"reports/workspaces-transcript-archived-{width}.png")
 
 
+def test_a_fork_that_worked_in_a_checkout_is_shown_there_with_its_session(
+    page, site, tmp_path, monkeypatch
+):
+    """A fork of a session recorded in another checkout did all of this checkout's work."""
+    url, plugin, _ = site
+    checkout = tmp_path / "wt" / "forked"
+    checkout.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    parent = "8f2c6f0e-3b7a-4d34-9a8f-2b8d6c1e9a10"
+    folder = tmp_path / "claude" / "projects" / "-src-other" / parent / "subagents"
+    folder.mkdir(parents=True)
+    edit = {"file_path": f"{checkout}/a.py", "old_string": "a", "new_string": "b"}
+    records = [
+        {"type": "user", "isSidechain": True, "cwd": "/src/other", "message": {"content": "Go"}},
+        {
+            "type": "assistant",
+            "isSidechain": True,
+            "cwd": "/src/other",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Edit", "input": edit},
+                    {"type": "text", "text": "Fixed it over there."},
+                ]
+            },
+        },
+    ]
+    (folder / "agent-a1b2c3d4.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    (folder / "agent-a1b2c3d4.meta.json").write_text(
+        json.dumps({"agentType": "fork", "description": "Fix the other checkout"})
+    )
+    plugin.value["workspaces"] = [row("forked", key=str(checkout), path=str(checkout))]
+    # No agent runs there, and no session recorded there can be resumed.
+    page.route(
+        "**/api/workspace-agents?*",
+        lambda route: route.fulfill(
+            json={"agents": [], "sessions": [], "path": str(checkout), "workspace": None}
+        ),
+    )
+    page.goto(url + "/#workspaces")
+    line = page.locator("#ws-list tr").filter(has=page.get_by_text("forked", exact=True))
+    line.get_by_role("button", name="Transcript", exact=True).click()
+    dialog = page.locator("#ws-viewer")
+    expect(dialog.locator(".ws-msg").last).to_contain_text("Fixed it over there.")
+    expect(page.locator("#ws-viewer-meta")).to_contain_text(
+        f"Claude fork agent-a1b2c3d4 of session {parent}, recorded in /src/other."
+    )
+    label = dialog.get_by_role("combobox", name="Session").locator("option").first
+    expect(label).to_contain_text("· Claude fork · Fix the other checkout")
+    expect(page.locator("#ws-message-agent")).to_contain_text(
+        f"No agent is running and no session was recorded here. Resume session {parent} in"
+        " /src/other to continue its work."
+    )
+
+
 def test_a_row_listed_without_a_workspace_can_resume_its_session(page, site):
     url, _, _ = site
     key = "/src/worktrees/repo/open-work"

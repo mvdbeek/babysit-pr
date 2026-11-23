@@ -879,20 +879,32 @@
       )?.focus();
     }
   }
+  // A subagent of a session recorded elsewhere that worked in this checkout.
+  function subagentLabel(session) {
+    if (!session.fork_of) return "";
+    return session.subagent === "fork" ? " fork" : ` subagent (${session.subagent || "unknown"})`;
+  }
   function sessionLabel(session) {
     const agent = session.agent === "claude" ? "Claude" : "Codex";
     const account = session.claude_account ? ` (${session.claude_account})` : "";
     // Shown from the dashboard's own copy: the agent's session file is no longer listed.
     const kept = session.archived ? " · archived" : "";
-    return `${date(session.updated)} · ${agent}${account}${kept} · ${session.title || session.id}`;
+    const title = session.title || session.id;
+    return `${date(session.updated)} · ${agent}${subagentLabel(session)}${account}${kept} · ${title}`;
   }
   function agentName(data) {
     return data.session.agent === "claude" ? "Claude" : "Codex";
   }
   function transcriptMeta(data) {
+    const fork = data.session.fork_of;
     byId("ws-viewer-meta").textContent =
-      `${agentName(data)} session ${data.session.id}, ${data.total} entries, ` +
-      `updated ${date(data.session.updated)}.` +
+      (fork
+        ? `${agentName(data)}${subagentLabel(data.session)} ${data.session.id} of session ` +
+          `${fork}, recorded in ${data.session.recorded_in}. It worked in this checkout; ` +
+          `it cannot be resumed here, only its session there. `
+        : "") +
+      `${fork ? "Transcript" : `${agentName(data)} session ${data.session.id}`}, ` +
+      `${data.total} entries, updated ${date(data.session.updated)}.` +
       (data.session.archived
         ? " Archived: shown as the dashboard kept it, now that its session file is no longer listed." +
           (data.session.restorable
@@ -1020,6 +1032,8 @@
     controls.append(refreshButton());
     if (data.sessions.length) controls.append(searchForm(""));
     renderLive();
+    // The composer says how to continue a fork's work, once agents are known.
+    if (agentsRead === "loaded") renderAgents();
     const content = byId("ws-viewer-content");
     if (!data.session) {
       byId("ws-viewer-meta").textContent = "";
@@ -1649,6 +1663,7 @@
       Boolean(changingDocker),
       watchQuestion,
       cancellingWatch,
+      shownFork(),
     ]);
     if (holder.dataset.state === key) return;
     holder.dataset.state = key;
@@ -1695,6 +1710,17 @@
       holder.append(
         node("small", "No agent is running and no session was recorded here.", "pr-meta"),
       );
+      // A subagent's transcript is shown, whose session was recorded in another checkout.
+      const shown = shownFork();
+      if (shown) {
+        holder.append(
+          node(
+            "small",
+            ` Resume session ${shown.fork_of} in ${shown.recorded_in} to continue its work.`,
+            "pr-meta",
+          ),
+        );
+      }
       return;
     }
     const resume = choice(
@@ -1717,6 +1743,11 @@
         : "");
     holder.append(resume);
     renderWatch();
+  }
+  // The transcript shown, when it is a subagent's of a session recorded elsewhere.
+  function shownFork() {
+    const shown = viewer?.mode === "transcript" ? viewer.data?.session : null;
+    return shown?.fork_of ? { fork_of: shown.fork_of, recorded_in: shown.recorded_in } : null;
   }
   // The session a message would resume, while no agent runs.
   function pickedSession() {

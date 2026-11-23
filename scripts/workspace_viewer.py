@@ -112,6 +112,11 @@ SEARCH_RESULTS = 100
 _lock = threading.Lock()
 _details: dict[str, tuple[tuple, dict | None]] = {}
 DETAIL_FILES = 20000
+# Subagent transcripts: how far each was searched for a checkout, by (file, checkout),
+# as (inode, bytes read, whether it named the checkout); and their details, by file.
+_scanned: dict[tuple[str, str], tuple[int, int, bool]] = {}
+SCANNED_FILES = 20000
+_subagents: dict[str, tuple[tuple, dict | None]] = {}
 # The store, opened on first use: the dashboard's (``use_store``), or a private one.
 _store_path: Path | None = None
 _store: transcript_store.Store | None = None
@@ -123,6 +128,7 @@ CHECKOUT_TTL = 30
 # A worker's session listing per (machine id, checkout): a listing costs it a read of
 # every session store, and a transcript only ever reads a file listed here.
 _sessions: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+_forks: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 SESSION_TTL = 30
 SESSION_LISTINGS = 50
 block_text = remote_probe.block_text
@@ -714,6 +720,124 @@ def remote_sessions(home, machine, path):
     return listed
 
 
+def forks(path):
+    """Subagent transcripts of this machine that worked in this checkout though their
+    session was recorded elsewhere (``remote_probe.subagents_in``), newest first.
+
+    Listed to be read, never resumed: Claude resumes a session, not one of its forks.
+    """
+    root = Path(path).resolve()
+    with _lock:
+        scanned = dict(_scanned)
+    found = remote_probe.subagents_in(
+        root,
+        claude_accounts.homes(),
+        Path.home().resolve(),
+        scanned,
+        subagent_facts,
+    )
+    with _lock:
+        _scanned.update(scanned)
+        while len(_scanned) > SCANNED_FILES:
+            _scanned.pop(next(iter(_scanned)), None)
+    listed = []
+    for home, file, info, facts in found:
+        account = claude_accounts.account_name(home)
+        listed.append(
+            fork_row(
+                file.stem,
+                file.parent.parent.name,
+                facts,
+                info.st_mtime,
+                info.st_size,
+                file,
+                root,
+                account,
+            )
+        )
+    return listed
+
+
+def subagent_facts(file):
+    """``remote_probe.subagent_details``, read again only when the file changes."""
+    try:
+        current = version(file.stat())
+    except OSError:
+        return None
+    with _lock:
+        cached = _subagents.get(str(file))
+    if cached and cached[0] == current:
+        return cached[1]
+    found = remote_probe.subagent_details(file)
+    with _lock:
+        _subagents.pop(str(file), None)
+        _subagents[str(file)] = (current, found)
+        while len(_subagents) > DETAIL_FILES:
+            _subagents.pop(next(iter(_subagents)), None)
+    return found
+
+
+def fork_row(fork, session, facts, updated, size, file, root, account):
+    """A listing's row for a subagent transcript that worked in the checkout ``root``.
+
+    ``fork_of`` names its session, ``recorded_in`` where that was recorded. It is kept
+    in the store for ``root``, where it worked, so it stays listed there once its file
+    is gone.
+    """
+    row = {
+        "id": fork,
+        "agent": "claude",
+        "updated": updated,
+        "size": size,
+        "title": facts["title"],
+        "fork_of": session,
+        "recorded_in": facts["cwd"],
+        "subagent": facts["subagent"],
+        "_file": file,
+        "_cwd": str(root),
+    }
+    if account is not None:
+        row["claude_account"] = account
+    return row
+
+
+def remote_forks(home, machine, path):
+    """A worker's ``forks`` of its checkout, kept for SESSION_TTL as its sessions are."""
+    key = (machine.id, path)
+    with _lock:
+        cached = _forks.get(key)
+    if cached and time.monotonic() - cached[0] < SESSION_TTL:
+        return cached[1]
+    listed = [
+        fork_row(
+            found["id"],
+            found["fork_of"],
+            found,
+            found["updated"],
+            found["size"],
+            found["file"],
+            path,
+            found["account"],
+        )
+        for found in probe(home, machine, "forks", root=path)
+    ]
+    for row in listed:
+        row["title"] = remote_probe.display_text(row["title"])
+    with _lock:
+        _forks.pop(key, None)
+        _forks[key] = (time.monotonic(), listed)
+        while len(_forks) > SESSION_LISTINGS:
+            _forks.pop(next(iter(_forks)), None)
+    return listed
+
+
+def viewed(path):
+    """What the transcript view lists for this machine's checkout: its sessions, the
+    subagent transcripts that worked in it, and those the store kept for it."""
+    root = Path(path).resolve()
+    return with_kept([*sessions(root), *forks(root)], "", root)
+
+
 def remote_row(found):
     """A listing's row for a session a worker's probe ``found``."""
     row = {
@@ -750,6 +874,10 @@ def remote_kept(home, machine, path):
         if not kept:
             raise
         return kept
+    try:
+        listed = [*listed, *remote_forks(home, machine, path)]
+    except (OSError, ValueError):
+        pass  # Its sessions are listed all the same.
     return with_kept(listed, machine.id, path)
 
 
@@ -760,8 +888,10 @@ class Transcript:
     the place the store kept (``restore``), so only new bytes are ever parsed.
     """
 
-    def __init__(self, agent, max_line=None, load=None):
+    def __init__(self, agent, max_line=None, load=None, subagent=False):
         self.agent = agent
+        # A subagent's transcript is all sidechain, which a session's leaves out.
+        self.subagent = subagent
         self.max_line = max_line  # None: MAX_LINE.
         # ``load(index)`` reads a saved entry back, None once it is gone.
         self.load = load or (lambda index: None)
@@ -1001,7 +1131,7 @@ class Transcript:
         return tool
 
     def claude(self, item):
-        if item.get("isSidechain") or item.get("isMeta"):
+        if (item.get("isSidechain") and not self.subagent) or item.get("isMeta"):
             return
         kind = item.get("type")
         content = (item.get("message") or {}).get("content")
@@ -1221,6 +1351,7 @@ def bring_up_to_date(key, agent, read, wait=1.0, session=None, index=True):
             agent,
             REMOTE_MAX_LINE if machine else None,
             lambda index: kept.entry(row["id"], index),
+            remote_probe.subagent_transcript(file),
         )
         parser.restore(row)
         generation = row["generation"]
@@ -1283,7 +1414,7 @@ def transcript(
     wherever it was recorded: the agent runs here, whichever directory it started in.
     """
     return transcript_page(
-        with_kept(sessions(path), "", Path(path).resolve()),
+        viewed(path),
         lambda file: ("", str(file)),
         local_read,
         session,
@@ -1350,7 +1481,11 @@ def transcript_page(
                 "first": 0,
                 "total": 0,
             }
-        chosen = next((s for s in listed if s["id"] == prefer), listed[0])
+        # A session recorded here before any subagent of another that worked here.
+        chosen = next(
+            (s for s in listed if s["id"] == prefer),
+            next((s for s in listed if not s.get("fork_of")), listed[0]),
+        )
     else:
         if not isinstance(session, str) or not SESSION.match(session):
             raise ValueError("Choose a listed session")
@@ -1443,7 +1578,7 @@ def search_result(text, answer):
 def matching(path, expression, limit):
     """This checkout's entries matching an FTS ``expression``, as ``matching_sessions``."""
     return matching_sessions(
-        with_kept(sessions(path), "", Path(path).resolve()),
+        viewed(path),
         lambda file: ("", str(file)),
         local_read,
         expression,

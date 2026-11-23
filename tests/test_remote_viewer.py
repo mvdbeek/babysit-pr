@@ -451,6 +451,66 @@ def test_a_workers_running_session_is_read_wherever_it_was_recorded(worker):
         wv.remote_transcript(*args, missing, running=running(missing))
 
 
+def test_a_fork_that_worked_in_a_workers_checkout_is_listed_and_read(worker, monkeypatch):
+    """A fork of a session recorded elsewhere on the worker that committed in its checkout."""
+    recorded = worker.host / "elsewhere"
+    folder = worker.host / ".claude" / "projects" / "-elsewhere" / ELSEWHERE_SID / "subagents"
+    folder.mkdir(parents=True)
+    command = f"cd {worker.checkout} && git commit -qm 'Fix it'"
+    (folder / "agent-f0000001.jsonl").write_text(
+        jsonl(
+            {
+                "type": "assistant",
+                "isSidechain": True,
+                "cwd": str(recorded),
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {"command": command},
+                        }
+                    ]
+                },
+            },
+            {**claude_turn("assistant", recorded, "Committed"), "isSidechain": True},
+        )
+    )
+    (folder / "agent-f0000001.meta.json").write_text(
+        json.dumps({"agentType": "fork", "description": "Commit it there"})
+    )
+    with monkeypatch.context() as patch:
+        patch.setenv("HOME", str(worker.host))
+        found = remote_probe._host_forks(str(worker.checkout))
+    assert remote_probe.validate_forks(copy.deepcopy(found)) == found
+    assert [(f["id"], f["fork_of"], f["subagent"], f["title"], f["account"]) for f in found] == [
+        ("agent-f0000001", ELSEWHERE_SID, "fork", "Commit it there", "default")
+    ]
+    for change in (
+        {"id": "../x"},
+        {"agent": "codex"},
+        {"fork_of": "x"},
+        {"file": str(worker.claude)},
+        {"file": str(folder / "agent-f0000002.jsonl")},
+    ):
+        with pytest.raises(ValueError, match="Malformed probe answer"):
+            remote_probe.validate_forks([{**found[0], **change}])
+
+    args = (worker.home, worker.machine, str(worker.checkout))
+    assert not wv.remote_transcript(*args)["session"].get("fork_of")
+    value = wv.remote_transcript(*args, "agent-f0000001")
+    assert [e.get("text") or e.get("name") for e in value["entries"]] == ["Bash", "Committed"]
+    session = value["session"]
+    assert (session["fork_of"], session["subagent"], session["claude_account"]) == (
+        ELSEWHERE_SID,
+        "fork",
+        "default",
+    )
+    assert session["recorded_in"] == str(recorded.resolve())
+    assert {s["id"] for s in value["sessions"]} == {CLAUDE_SID, CODEX_SID, "agent-f0000001"}
+
+
 def test_remote_search_reads_the_workers_sessions_and_then_only_what_is_new(worker, monkeypatch):
     root = str(worker.checkout)
     found = wv.remote_search(worker.home, worker.machine, root, "codex task")
