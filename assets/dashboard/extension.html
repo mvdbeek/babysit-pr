@@ -11,6 +11,27 @@
     <main>
       <h1>Browser extension</h1>
       <p><a href="/">Back to dashboard</a></p>
+      <h2>Install or update</h2>
+      <p>
+        <a id="download" href="/extension.zip" download>Download the extension</a>
+        <span id="shipped-version"></span>
+      </p>
+      <ol>
+        <li>
+          Unzip it where it can stay, such as your home folder. It unpacks to a
+          <code>babysitter-extension</code> folder; an update replaces that folder's files.
+        </li>
+        <li>
+          The first time: open <code>chrome://extensions</code>, turn on Developer mode, click
+          <strong>Load unpacked</strong> and choose the folder. After an update: click
+          <strong>Reload</strong> on its card.
+        </li>
+      </ol>
+      <p>
+        Its ID is always <code id="shipped-id"></code>, whichever folder it is loaded from, so
+        pairing survives updates. The extension says when this dashboard has a newer version.
+      </p>
+      <h2>Pair</h2>
       <p>Pair your extension to start tasks and send follow-ups from your browser.</p>
       <p>Copy its ID from the extension settings. Pairing again replaces its previous token.</p>
       <form id="pair-form">

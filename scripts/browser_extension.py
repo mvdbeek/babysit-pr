@@ -4,13 +4,17 @@ Pairing is a same-origin dashboard action. Tokens grant only the endpoints below
 they cannot approve feedback, cancel watches, or administer the dashboard.
 """
 
+import base64
 import hashlib
+import io
 import json
 import os
 import re
 import secrets
 import sqlite3
 import subprocess
+import threading
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
@@ -30,6 +34,63 @@ MAX_PAGES = 100
 # What a GitHub page's Handle issue box adds to the dashboard's issue task.
 MAX_INSTRUCTIONS = 8000
 AGENT_CHOICES = ("agent", "model", "effort", "claude_account")
+# The extension this dashboard ships, downloadable from its pairing page.
+SOURCE = Path(__file__).resolve().parent.parent / "extension"
+# One folder name in every download, so unzipping a newer one replaces the old files.
+FOLDER = "babysitter-extension"
+_package_lock = threading.Lock()
+_package_cache: dict[str, object] = {}
+
+
+def shipped():
+    """The version and fixed ID of the extension in this checkout.
+
+    The manifest's public key fixes the ID wherever the folder is loaded from: Chrome
+    derives it from the key's SHA-256, written with the letters a-p.
+    """
+    manifest = json.loads((SOURCE / "manifest.json").read_text())
+    digest = hashlib.sha256(base64.b64decode(manifest["key"])).hexdigest()[:32]
+    return {
+        "version": manifest["version"],
+        "id": "".join(chr(ord("a") + int(c, 16)) for c in digest),
+        "download": "/extension.zip",
+    }
+
+
+def package():
+    """The extension's files as a zip under one folder, with its ETag and file name.
+
+    Rebuilt only when a file changes; fixed timestamps keep the bytes, and so the ETag,
+    the same for the same files.
+    """
+    files = sorted(
+        path
+        for path in SOURCE.rglob("*")
+        if path.is_file()
+        and not any(part.startswith(".") or part == "node_modules" for part in path.parts)
+    )
+    signature = tuple(
+        (str(path), stat.st_size, stat.st_mtime_ns) for path in files for stat in [path.stat()]
+    )
+    with _package_lock:
+        if _package_cache.get("signature") == signature:
+            return _package_cache["value"]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            info = zipfile.ZipInfo(f"{FOLDER}/{path.relative_to(SOURCE).as_posix()}")
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            archive.writestr(info, path.read_bytes())
+    body = buffer.getvalue()
+    value = (
+        body,
+        f'"{hashlib.sha256(body).hexdigest()[:32]}"',
+        f"{FOLDER}-{shipped()['version']}.zip",
+    )
+    with _package_lock:
+        _package_cache.update(signature=signature, value=value)
+    return value
 
 
 class Extension:
@@ -128,6 +189,9 @@ class Extension:
 
     def dispatch(self, server, client, request):
         action = request.get("action")
+        if action == "version":
+            # The extension's Settings ask, to offer an update; the reply header says it too.
+            return {"version": shipped()["version"]}
         if action == "pages":
             return pages(server, request)
         if action == "ask":

@@ -1,6 +1,21 @@
-import { dashboardURL, GITHUB_ORIGINS } from "./shared.js";
+import { api, availableUpdate, dashboardURL, GITHUB_ORIGINS } from "./shared.js";
 const $ = (id) => document.getElementById(id);
 $("extension-id").textContent = chrome.runtime.id;
+$("version").textContent = chrome.runtime.getManifest().version;
+$("reload-extension").onclick = () => chrome.runtime.reload();
+async function showUpdate() {
+  const update = await availableUpdate();
+  $("update").hidden = !update;
+  if (!update) return;
+  $("update-version").textContent = update.version;
+  $("update-link").href = update.download;
+}
+// Asking the dashboard records the version it ships; a page left open notices later replies.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && (changes.shipped || changes.config)) void showUpdate();
+});
+void showUpdate();
+void api({ action: "version" }).catch(() => {});
 const { config } = await chrome.storage.local.get("config");
 $("url").value = config?.url || "http://127.0.0.1:8765";
 $("token").value = config?.token || "";

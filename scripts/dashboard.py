@@ -212,6 +212,7 @@ API_ROUTES = frozenset(
         "/api/workspace-terminal",
         "/api/workspace-transcript",
         "/api/workspaces",
+        "/api/extension-package",
     }
     | {f"/api/{action}" for action in ACTIONS}
     | {f"/api/worker/{action}" for action in worker_api.ACTIONS}
@@ -786,6 +787,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Access-Control-Allow-Headers",
                     "Authorization, Content-Type, X-Babysit-Extension",
                 )
+                self.send_header("Access-Control-Expose-Headers", "X-Babysit-Extension-Version")
             if vary:
                 self.send_header("Vary", ", ".join(vary))
             for name, value in headers:
@@ -1522,7 +1524,17 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(request, dict):
                 raise ValueError("Expected an object")
             result = self.server.extension.dispatch(self.server, client, request)
-            self.send_json(400 if "error" in result else 200, result)
+            # The extension compares its own version and offers this dashboard's download.
+            try:
+                version = [("X-Babysit-Extension-Version", browser_extension.shipped()["version"])]
+            except (OSError, ValueError, KeyError):
+                version = []
+            self.send_body(
+                400 if "error" in result else 200,
+                json.dumps(result).encode(),
+                "application/json; charset=utf-8",
+                headers=version,
+            )
         except ValueError as exc:
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
@@ -2021,6 +2033,17 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     answer = {"repos": [], "idle": 0}
                 self.send_json(200, answer)
+            elif route.path == "/api/extension-package":
+                self.send_json(200, browser_extension.shipped())
+            elif route.path == "/extension.zip":
+                body, etag, name = browser_extension.package()
+                self.send_body(
+                    304 if etag_matches(self.headers.get("If-None-Match"), etag) else 200,
+                    body,
+                    "application/zip",
+                    etag=etag,
+                    headers=[("Content-Disposition", f'attachment; filename="{name}"')],
+                )
             elif route.path == "/api/settings":
                 self.send_json(200, dashboard_settings.settings(self.server.home))
             elif route.path == "/api/voice-turn":

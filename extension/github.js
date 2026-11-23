@@ -16,6 +16,8 @@
   // Each item page's forms and conversation, kept while GitHub redraws the page around them.
   const tools = new Map();
   let error = null;
+  // A newer extension on the dashboard: { version, download }.
+  let update = null;
   // The item whose corner card was closed, until another page.
   let hidden = null;
 
@@ -216,6 +218,18 @@
     if (page && !page.dashboard && !error)
       parts.push(node("p", "Not in your dashboard's overview.", "babysit-muted"));
     if (page?.dashboard) parts.push(openButton(page, "babysit-button"));
+    if (update) {
+      const notice = node(
+        "p",
+        `Extension ${update.version} is on your dashboard: `,
+        "babysit-small",
+      );
+      notice.append(
+        link("download it", update.download),
+        ", unzip it over this one and reload it.",
+      );
+      parts.push(notice);
+    }
     return parts;
   }
 
@@ -251,7 +265,7 @@
       else document.body.append(box);
     }
     const shown = box.querySelector(".babysit-details");
-    const state = digest([page, error]);
+    const state = digest([page, error, update]);
     if (shown.dataset.state !== state) {
       shown.dataset.state = state;
       shown.replaceChildren(...details(page));
@@ -492,6 +506,7 @@
         for (const url of wanted) known.set(url, { at: Date.now(), page: null });
       } else {
         error = null;
+        update = answer.update || null;
         for (const url of wanted)
           known.set(url, { at: Date.now(), page: answer.pages[url] || null });
       }

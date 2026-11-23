@@ -2,11 +2,13 @@
 
 import copy
 import http.client
+import io
 import json
 import re
 import shutil
 import threading
 import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -319,6 +321,49 @@ def test_followup_revalidates_session(tmp_path, monkeypatch):
     request["payload"]["session"] = "current"
     browser_extension.submit(server, request)
     assert sent == [("p1", "Continue")]
+
+
+def test_the_dashboard_serves_its_extension_and_names_its_version(extension_server):
+    server = extension_server
+    shipped = browser_extension.shipped()
+    source = Path(__file__).resolve().parents[1] / "extension"
+    assert request(server, "/api/extension-package", method="GET")[1] == shipped
+    assert re.fullmatch(r"[a-p]{32}", shipped["id"])
+
+    def download(headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+        conn.request("GET", "/extension.zip", headers=headers or {})
+        response = conn.getresponse()
+        result = response.status, response.read(), dict(response.getheaders())
+        conn.close()
+        return result
+
+    code, body, headers = download()
+    assert code == 200 and headers["Content-Type"] == "application/zip"
+    assert headers["Content-Disposition"] == (
+        f'attachment; filename="babysitter-extension-{shipped["version"]}.zip"'
+    )
+    archive = zipfile.ZipFile(io.BytesIO(body))
+    expected = {
+        f"babysitter-extension/{path.relative_to(source).as_posix()}"
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    assert set(archive.namelist()) == expected
+    assert archive.read("babysitter-extension/manifest.json") == (
+        (source / "manifest.json").read_bytes()
+    )
+    # The same files make the same bytes, so a rebuild keeps the ETag.
+    browser_extension._package_cache.clear()
+    assert download()[1] == body
+    assert download({"If-None-Match": headers["ETag"]})[0] == 304
+
+    # Every reply to the extension names the version this dashboard ships.
+    auth = pair(server)
+    code, value, response = request(server, "/api/extension", {"action": "version"}, auth)
+    assert code == 200 and value == {"version": shipped["version"]}
+    assert response["X-Babysit-Extension-Version"] == shipped["version"]
+    assert response["Access-Control-Expose-Headers"] == "X-Babysit-Extension-Version"
 
 
 @pytest.fixture
@@ -1062,3 +1107,51 @@ def test_github_pages_handle_issues_and_answer_questions(
     assert answering[1]["history"] == [{"question": "Why print?", "answer": first}]
     card.get_by_role("button", name="Clear").click()
     expect(card.locator(".babysit-turn")).to_have_count(0)
+
+
+@pytest.mark.browser
+def test_the_extension_downloads_from_the_dashboard_and_offers_its_updates(
+    extension_browser, extension_server, monkeypatch
+):
+    context, worker, client, base = extension_browser
+    shipped = browser_extension.shipped()
+    # The manifest's key fixes the ID Chrome gives the unpacked folder, wherever it is.
+    assert client == shipped["id"]
+    page = context.new_page()
+    page.goto(f"{base}/extension.html")
+    expect(page.locator("#extension-id")).to_have_value(shipped["id"])
+    expect(page.locator("#shipped-id")).to_have_text(shipped["id"])
+    expect(page.locator("#shipped-version")).to_have_text(f"(version {shipped['version']})")
+    with page.expect_download() as download:
+        page.get_by_role("link", name="Download the extension").click()
+    assert download.value.suggested_filename == f"babysitter-extension-{shipped['version']}.zip"
+
+    page.goto(f"chrome-extension://{client}/options.html")
+    expect(page.locator("#version")).to_have_text(shipped["version"])
+    expect(page.locator("#update")).to_be_hidden()
+    monkeypatch.setattr(browser_extension, "shipped", lambda: {**shipped, "version": "99.0.0"})
+    page.reload()
+    expect(page.locator("#update")).to_be_visible()
+    expect(page.locator("#update-version")).to_have_text("99.0.0")
+    expect(page.locator("#update-link")).to_have_attribute("href", f"{base}/extension.zip")
+
+    page.goto(f"chrome-extension://{client}/compose.html")
+    expect(page.locator("#update")).to_contain_text("Version 99.0.0 of this extension")
+
+    context.route(
+        "https://github.com/**",
+        lambda route: route.fulfill(body=ISSUE_PAGE, content_type="text/html"),
+    )
+    worker.evaluate("chrome.storage.local.set({github: true})")
+    worker.evaluate(
+        """async () => {
+          while (!(await chrome.scripting.getRegisteredContentScripts()).length)
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }"""
+    )
+    page.goto(ISSUE)
+    card = page.locator(".babysit-card")
+    expect(card).to_contain_text("Extension 99.0.0 is on your dashboard")
+    expect(card.get_by_role("link", name="download it")).to_have_attribute(
+        "href", f"{base}/extension.zip"
+    )

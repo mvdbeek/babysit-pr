@@ -5,6 +5,17 @@ const id = document.getElementById("extension-id");
 const supplied = new URLSearchParams(location.hash.slice(1)).get("id");
 if (/^[a-p]{32}$/.test(supplied || "")) id.value = supplied;
 history.replaceState(null, "", location.pathname);
+// The extension this dashboard ships: its version, and the fixed ID a download loads as.
+fetch("/api/extension-package")
+  .then((response) => (response.ok ? response.json() : Promise.reject()))
+  .then((shipped) => {
+    document.getElementById("shipped-version").textContent = `(version ${shipped.version})`;
+    document.getElementById("shipped-id").textContent = shipped.id;
+    if (!id.value) id.value = shipped.id;
+  })
+  .catch(() => {
+    document.getElementById("shipped-version").textContent = "";
+  });
 async function pair(revoke) {
   if (!form.reportValidity()) return;
   document.getElementById("token-box").hidden = true;
