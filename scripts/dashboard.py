@@ -1749,9 +1749,12 @@ class Handler(BaseHTTPRequestHandler):
                     )
             elif route.path == "/api/workspace-agents":
                 query = parse_qs(route.query)
-                if set(query) not in ({"workspace"}, {"key"}, {"watch"}) or any(
-                    len(values) != 1 for values in query.values()
-                ):
+                if set(query) not in (
+                    {"workspace"},
+                    {"key"},
+                    {"watch"},
+                    {"workspace", "accounts"},
+                ) or any(len(values) != 1 for values in query.values()):
                     raise ValueError("Supply a workspace, a workspace key or a watch")
                 # A worker's row or workspace is read and messaged there; the machine
                 # comes from the inventory or the registry, never the client.
@@ -1776,6 +1779,12 @@ class Handler(BaseHTTPRequestHandler):
                         self.server.workspace_checkout(workspace_id)
                     else:
                         self.server.remote_checkout(machine, workspace_id)
+                if "accounts" in query:
+                    # The Claude logins its agents can continue on, read on their machine.
+                    self.send_json(
+                        200, {"accounts": agent_messages.accounts(self.server.home, machine)}
+                    )
+                    return
                 if workspace_id is None:
                     # Nobody to message, but a recorded session can be resumed.
                     value = {
@@ -1805,6 +1814,7 @@ class Handler(BaseHTTPRequestHandler):
                         else live,
                         "url": live and collie_url(machine, live),
                     }
+                    agent_messages.name_accounts(value["agents"], value["sessions"])
                 value["machine_label"] = machine.label if machine else local_label(self.server.home)
                 self.send_json(200, value)
             elif route.path == "/api/workspace-artefacts" and not route.query:
