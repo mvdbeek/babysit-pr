@@ -597,6 +597,7 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
         "PIP_CACHE_DIR": f"{cache}/pip",
         "npm_config_cache": f"{cache}/npm",
         "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/ms-playwright",
+        "PLANEMO_GLOBAL_WORKSPACE": f"{cache}/planemo",
         "BABYSIT_ARTIFACT_DIR": f"{cache}/artifacts",
         "BABYSIT_SCRATCH": f"{cache}/scratch/{scratch_id(worktree)}",
         "GALAXY_VIRTUAL_ENV": f"{cache}/scratch/{scratch_id(worktree)}/galaxy-venv",

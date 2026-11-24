@@ -350,13 +350,16 @@ agents of that configuration (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
 `npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). uv's tools go there too
 (`UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`): their defaults lie under the read-only
 `~/.local`, where `uvx` fails. The executables `uv tool install` links are not on
-`PATH`; uv prints where they are. Each set of grants that reaches
+`PATH`; uv prints where they are. So does planemo's workspace
+(`PLANEMO_GLOBAL_WORKSPACE`, `~/.planemo` by default), which holds its Galaxy mirror
+and virtualenv; in the empty home each launch would clone Galaxy again. Housekeeping
+removes it after 7 days without use, like other unknown cache entries. Each set of grants that reaches
 beyond the sandbox (`--enable=docker`) gets its own, so a launch with Docker never
 runs downloads that a launch without it could have replaced. Host caches are
 never writable: code planted there would run outside the sandbox.
 
 The empty `$HOME` and `/tmp` are directories on disk, not a tmpfs, so what an agent
-installs or unpacks there (conda, `~/.planemo`, clones, `mkdtemp` workspaces) takes
+installs or unpacks there (conda, clones, `mkdtemp` workspaces) takes
 disk space rather than the machine's memory. Each launch gets its own pair,
 `~/.cache/babysit-sandbox/runs/<random>/home` and `.../tmp` (mode 0700), created
 with `mkdir` just before bwrap starts. `mkdir` refuses an existing name, and no

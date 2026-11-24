@@ -612,10 +612,13 @@ done
 # Last, so no --env-pass name can point an agent at host caches or another configuration.
 # uv's tools go in the cache too: their defaults, ~/.local/share/uv/tools and
 # ~/.local/bin, are bound read-only above, and uvx fails when it cannot create the first.
+# Planemo's workspace (~/.planemo by default) holds its Galaxy mirror and virtualenv; in
+# the empty home every launch would clone Galaxy again.
 argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
   --setenv UV_TOOL_DIR "$cache/uv-tools" --setenv UV_TOOL_BIN_DIR "$cache/uv-tools-bin"
   --setenv PIP_CACHE_DIR "$cache/pip" --setenv npm_config_cache "$cache/npm"
   --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright"
+  --setenv PLANEMO_GLOBAL_WORKSPACE "$cache/planemo"
   --setenv BABYSIT_ARTIFACT_DIR "$cache/artifacts")
 # Galaxy makes its environment wherever GALAXY_VIRTUAL_ENV says (scripts/common_startup.sh).
 [[ -z $scratch_id ]] || argv+=(--setenv BABYSIT_SCRATCH "$cache/scratch/$scratch_id"
