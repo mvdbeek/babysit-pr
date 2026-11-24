@@ -46,6 +46,22 @@
     );
   }
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // The card's buttons take their clicks on the window, in the capture phase, before any
+  // listener of the page's: a page that stops clicks on their way down would otherwise
+  // leave an onclick deaf.
+  const presses = new WeakMap();
+  window.addEventListener(
+    "click",
+    (event) => {
+      const target = event.target instanceof Element ? event.target.closest("button") : null;
+      const handler = target && presses.get(target);
+      if (handler && !target.disabled) handler(event);
+    },
+    true,
+  );
+  function onPress(element, handler) {
+    presses.set(element, handler);
+  }
   // Review text comes from agents' files: it is only ever text, and only web links link.
   function link(text, href, className) {
     const element = node("a", text, className);
@@ -254,10 +270,10 @@
         close.type = "button";
         close.title = "Hide until the next page";
         close.setAttribute("aria-label", "Hide Babysitter");
-        close.onclick = () => {
+        onPress(close, () => {
           hidden = url;
           box.remove();
-        };
+        });
         heading.append(close);
       }
       box.append(heading, node("div", undefined, "babysit-details"));
@@ -447,14 +463,14 @@
         form.requestSubmit();
       }
     });
-    clear.onclick = () => {
+    onPress(clear, () => {
       turns.length = 0;
       conversation.replaceChildren();
       idle();
-    };
-    stop.onclick = () => {
+    });
+    onPress(stop, () => {
       if (current?.id) void send({ type: "github-ask-cancel", id: current.id }).catch(() => {});
-    };
+    });
     form.onsubmit = async (event) => {
       event.preventDefault();
       const text = question.value.trim();
