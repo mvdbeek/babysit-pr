@@ -31,7 +31,7 @@ ITEM = re.compile(
 )
 # Pull requests or issues one GitHub page may ask about: a list page shows 25 by default.
 MAX_PAGES = 100
-# What a GitHub page's Handle issue box adds to the dashboard's issue task.
+# What a GitHub page's Handle issue or Review pull request box adds to the dashboard's task.
 MAX_INSTRUCTIONS = 8000
 AGENT_CHOICES = ("agent", "model", "effort", "claude_account")
 # The extension this dashboard ships, downloadable from its pairing page.
@@ -257,6 +257,8 @@ class Extension:
             return self.once(client, request, lambda: submit(server, request))
         if action == "handle-issue":
             return self.once(client, request, lambda: handle_issue(server, request))
+        if action == "review-pr":
+            return self.once(client, request, lambda: review_pr(server, request))
         raise ValueError("Unknown extension action")
 
     @staticmethod
@@ -395,39 +397,65 @@ def repository_clones(workspaces, match):
     return [r for r in repos if r["repo"].lower() == slug]
 
 
+# What each page's start button launches: the dashboard task it runs, the branch a new
+# task outside the overview gets, and the request's own name in errors.
+LAUNCHES = {
+    "issues": ("issue", "issue", "Handle issue"),
+    "pull": ("prReview", "review-pr", "Review pull request"),
+}
+
+
 def handle_issue(server, request):
     """Handle a GitHub issue from its page: the dashboard's issue task, with the page's
-    extra instructions. An issue in the overview gets its Handle action; any other is a
-    new task, on branch issue-<number>, in a clone of its repository on this machine."""
+    extra instructions."""
+    return launch(server, request, "issues")
+
+
+def review_pr(server, request):
+    """Review a GitHub pull request from its page: the dashboard's Review pull request
+    task, with the page's extra instructions, by the main reviewer from Settings unless
+    the page picks an agent."""
+    return launch(server, request, "pull")
+
+
+def launch(server, request, kind):
+    """Start an item's task as the dashboard's own button would. An item in the overview
+    gets its Handle action; any other is a new task, on branch <prefix>-<number>, in a
+    clone of its repository on this machine."""
+    task_name, prefix, title = LAUNCHES[kind]
     fields = ("url", "instructions", "clone", *AGENT_CHOICES)
     if set(request) - {"action", "request_id", *fields} or any(
         not isinstance(request.get(k, ""), str) for k in fields
     ):
-        raise ValueError("Invalid Handle issue request")
+        raise ValueError(f"Invalid {title} request")
     match = ITEM.fullmatch(request.get("url", ""))
-    if not match or match[3] != "issues":
-        raise ValueError("Handle a GitHub issue")
+    if not match or match[3] != kind:
+        raise ValueError(f"{title}: open a GitHub {'pull request' if kind == 'pull' else 'issue'}")
     url = request["url"]
     instructions = request.get("instructions", "").strip()
     if len(instructions) > MAX_INSTRUCTIONS:
         raise ValueError(f"Keep the instructions under {MAX_INSTRUCTIONS} characters")
-    task = dashboard_settings.task_prompt(server.home, "issue", url)
+    task = dashboard_settings.task_prompt(server.home, task_name, url)
     if instructions:
         task += f"\n\nAdditional instructions:\n{instructions}"
     choices = {k: request[k] for k in AGENT_CHOICES if request.get(k)}
+    if kind == "pull" and not choices.get("agent"):
+        choices = {"agent": dashboard_settings.settings(server.home)["reviewer"]}
     workspaces = server.workspaces
+    kinds = {"issue"} if kind == "issues" else {None, "pr"}
     target = next(
         (
             t
             for t in workspaces.targets()
-            if t.get("kind") == "issue" and str(t.get("url", "")).lower() == url.lower()
+            if t.get("kind") in kinds and str(t.get("url", "")).lower() == url.lower()
         ),
         None,
     )
     clone = request.get("clone")
     if target is not None:
         payload = {"id": target["id"], "action": "handle", "task": task, **choices}
-        info = workspaces.snapshot().get("issues", {}).get(target["id"]) or {}
+        section = "issues" if kind == "issues" else "prs"
+        info = workspaces.snapshot().get(section, {}).get(target["id"]) or {}
         if clone and clone in (info.get("clones") or []):
             payload["clone"] = clone
         elif not info.get("clones") and info.get("destination"):
@@ -447,7 +475,7 @@ def handle_issue(server, request):
         {
             "repo": chosen["repo"],
             "clone": chosen["clone"],
-            "name": f"issue-{match[4]}",
+            "name": f"{prefix}-{match[4]}",
             "task": task,
             **choices,
         }

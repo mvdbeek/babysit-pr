@@ -982,6 +982,61 @@ def test_handle_issue_outside_the_overview_starts_a_task_in_a_local_clone(
     assert len(manager.calls) == 1
 
 
+def review(url, **extra):
+    return {"action": "review-pr", "request_id": "review-1234567890ab", "url": url, **extra}
+
+
+def test_review_pr_runs_the_review_task_with_the_main_reviewer(extension_server, monkeypatch):
+    headers = pair(extension_server)
+    manager = extension_server.workspaces
+    extension_server.home.joinpath("dashboard-settings.json").write_text(
+        json.dumps({"task_prompts": {"prReview": "Review {url}."}, "reviewer": "claude"})
+    )
+    snapshot = manager.snapshot()
+    snapshot["prs"] = {"pr-one": {"clones": ["/fake/repo"], "matches": []}}
+    monkeypatch.setattr(manager, "snapshot", lambda: snapshot)
+    url = "https://github.com/test/repo/pull/1"
+    request_ = review(url, instructions="Focus on the parser.", clone="/fake/repo")
+    code, value, _ = request(extension_server, "/api/extension", request_, headers)
+    assert code == 200 and value["operation"]["status"] == "complete"
+    assert manager.calls == [
+        {
+            "id": "pr-one",
+            "action": "handle",
+            "agent": "claude",
+            "clone": "/fake/repo",
+            "task": f"Review {url}.\n\nAdditional instructions:\nFocus on the parser.",
+        }
+    ]
+    # An agent the page picks replaces the main reviewer, with its own settings.
+    picked = review(url, request_id="review-codex-123456", agent="codex", effort="high")
+    request(extension_server, "/api/extension", picked, headers)
+    assert manager.calls[1]["agent"] == "codex" and manager.calls[1]["effort"] == "high"
+
+
+def test_review_pr_outside_the_overview_starts_a_task_in_a_local_clone(extension_server):
+    headers = pair(extension_server)
+    manager = extension_server.workspaces
+    url = "https://github.com/test/repo/pull/9"
+    code, value, _ = request(extension_server, "/api/extension", review(url), headers)
+    assert code == 200
+    [call] = manager.calls
+    assert {k: v for k, v in call.items() if k != "task"} == {
+        "repo": "test/repo",
+        "clone": "/fake/repo",
+        "name": "review-pr-9",
+        # The main reviewer when Settings names none.
+        "agent": "codex",
+    }
+    assert call["task"].startswith(f"Review {url}. Read its description")
+    for invalid in (
+        review(ISSUE, request_id="review-issue-123456"),
+        review(url, request_id="review-field-123456", directory="/"),
+    ):
+        assert "error" in request(extension_server, "/api/extension", invalid, headers)[1]
+    assert len(manager.calls) == 1
+
+
 def test_questions_are_asked_and_read_back_by_the_extension_that_asked(extension_server):
     headers = pair(extension_server)
     home = extension_server.home
@@ -1080,9 +1135,20 @@ def test_github_pages_handle_issues_and_answer_questions(
     assert call["task"].endswith("Additional instructions:\nKeep it small.")
     expect(card.get_by_label("Extra instructions (optional)")).to_have_value("")
     expect(card.get_by_label("Ask about this pull request")).to_have_count(0)
+    expect(card.get_by_role("button", name="Review pull request")).to_have_count(0)
 
     page.goto("https://github.com/test/repo/pull/1")
     card = page.locator("#partial-discussion-sidebar > .babysit-card")
+    # A review starts from the card, by the main reviewer unless the card picks one.
+    expect(card.get_by_label("Agent")).to_have_value("")
+    card.get_by_label("Extra instructions (optional)").fill("Mind the tests.")
+    card.get_by_role("button", name="Review pull request").click()
+    expect(card.locator(".babysit-status")).to_have_text("Started Open in Collie")
+    call = manager.calls[1]
+    assert call["id"] == "pr-one" and call["action"] == "handle" and call["agent"] == "codex"
+    assert call["task"].startswith("Review https://github.com/test/repo/pull/1. Read")
+    assert call["task"].endswith("Additional instructions:\nMind the tests.")
+    expect(card.get_by_label("Extra instructions (optional)")).to_have_value("")
     box = card.get_by_label("Ask about this pull request")
     box.fill("Why print?")
     box.press("Enter")

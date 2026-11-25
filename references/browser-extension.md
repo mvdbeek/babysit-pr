@@ -101,6 +101,15 @@ reload open GitHub tabs. It needs a paired dashboard.
   agent, model, effort, account and clone the composer last used for this repository
   (Codex if it never did); picking the other agent keeps only the clone. The card follows
   the launch and links to the agent in Collie. Cmd/Ctrl+Enter in the box submits.
+- **Review pull request** (a pull request's card, version 0.7): the same box, agent
+  choice and button, starting the dashboard's **Review pull request** task (Settings →
+  task prompts) for this pull request, as the dashboard's own Review pull request button
+  does. A pull request in the overview gets its Handle action; any other starts a new
+  task on branch `review-pr-<number>` in a clone of its repository on the dashboard's
+  machine. **Main reviewer** is the agent Settings names as the main reviewer; picking an
+  agent overrides it, with the composer's model, effort and account for this repository
+  when it is the agent the composer last used. The clone is the composer's for this
+  repository either way.
 - **Ask about this pull request** (a pull request's card): type a question and press
   Enter (Shift+Enter for a new line). The answer streams into the card as Claude writes
   it, with what it is reading; **Stop** cancels it. Follow-up questions carry the

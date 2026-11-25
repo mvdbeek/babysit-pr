@@ -22,9 +22,14 @@ URL = "{url}"
 # A prompt is a paragraph or two. The textarea that writes it allows far more, so a
 # rejection here says the text is too long rather than silently keeping part of it.
 LIMIT = 8000
-# The issue task's default wording, as settings.js has it (a test keeps the two equal):
-# the browser extension's Handle issue starts from it without the page.
+# The default wording of the tasks the browser extension starts without the page, as
+# settings.js has it (a test keeps the two equal): Handle issue and Review pull request.
 DEFAULT_PROMPTS = {
+    "prReview": f"Review {URL}. Read its description, linked issues, and the full diff against "
+    "its base branch, then check out the branch and read the code the change touches. Look for "
+    "correctness bugs, regressions, missing tests, and unclear or unnecessarily complex code. "
+    "Do not push, comment, or submit a review on GitHub. Report each finding ranked by severity "
+    "with file and line references, and say what you checked.",
     "issue": f"Investigate and resolve {URL}. Read the issue and relevant code, implement the "
     "fix, and run the appropriate tests. Summarize the changes and validation.",
 }

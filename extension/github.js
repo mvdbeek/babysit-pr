@@ -1,8 +1,8 @@
 // Registered on github.com only after you turn it on in Settings. It finds the pull
 // requests and issues a page shows, asks the extension's background (which holds the
 // pairing token) what Babysitter knows about them, and shows that as text. An issue's card
-// can start an agent on it, and a pull request's can ask Babysitter about it. Nothing is
-// sent to GitHub.
+// can start an agent on it, and a pull request's can start a review of it or ask
+// Babysitter about it. Nothing is sent to GitHub.
 (() => {
   if (window.babysitGitHub) return;
   window.babysitGitHub = true;
@@ -286,7 +286,8 @@
       shown.dataset.state = state;
       shown.replaceChildren(...details(page));
     }
-    if (!tools.has(url)) tools.set(url, url.includes("/pull/") ? askTools(url) : handleTools(url));
+    if (!tools.has(url))
+      tools.set(url, url.includes("/pull/") ? pullTools(url) : launchTools(url, "issue"));
     const own = tools.get(url);
     if (own.parentElement !== box) box.append(own);
   }
@@ -304,15 +305,34 @@
     return element;
   }
 
-  // An issue's card: start an agent on it with the dashboard's issue task, plus whatever
-  // the box adds.
-  function handleTools(url) {
+  // What a card's start button launches: an issue's task, or a pull request's review.
+  const LAUNCHES = {
+    issue: {
+      type: "github-handle",
+      heading: "Handle this issue",
+      button: "Handle issue",
+      usual: "Usual agent",
+      rows: 3,
+    },
+    pull: {
+      type: "github-review",
+      heading: "Review this pull request",
+      button: "Review pull request",
+      usual: "Main reviewer",
+      rows: 2,
+    },
+  };
+
+  // Start an agent on the item with the dashboard's task for it (an issue's Handle issue,
+  // a pull request's Review pull request), plus whatever the box adds.
+  function launchTools(url, kind) {
+    const launch = LAUNCHES[kind];
     const form = node("form", undefined, "babysit-tools");
-    const instructions = textarea("Extra instructions (optional)", 3);
+    const instructions = textarea("Extra instructions (optional)", launch.rows);
     const agent = node("select", undefined, "babysit-select");
     agent.setAttribute("aria-label", "Agent");
     for (const [value, label] of [
-      ["", "Usual agent"],
+      ["", launch.usual],
       ["codex", "Codex"],
       ["claude", "Claude"],
     ]) {
@@ -320,13 +340,13 @@
       option.value = value;
       agent.append(option);
     }
-    const start = node("button", "Handle issue", "babysit-button babysit-primary");
+    const start = node("button", launch.button, "babysit-button babysit-primary");
     start.type = "submit";
     const status = node("p", undefined, "babysit-muted babysit-status");
     status.setAttribute("role", "status");
     const row = node("div", undefined, "babysit-row");
     row.append(agent, start);
-    form.append(node("p", "Handle this issue", "babysit-subheading"), instructions, row, status);
+    form.append(node("p", launch.heading, "babysit-subheading"), instructions, row, status);
     instructions.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) form.requestSubmit();
     });
@@ -352,7 +372,7 @@
       status.textContent = "Starting…";
       try {
         const answer = await send({
-          type: "github-handle",
+          type: launch.type,
           url,
           instructions: instructions.value,
           agent: agent.value,
@@ -505,6 +525,13 @@
       }
     };
     return section;
+  }
+
+  // A pull request's card: start a review of it, and ask about it.
+  function pullTools(url) {
+    const box = node("div");
+    box.append(launchTools(url, "pull"), askTools(url));
+    return box;
   }
 
   function ask(urls) {
