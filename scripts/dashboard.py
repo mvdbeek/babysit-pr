@@ -33,6 +33,7 @@ import dashboard_auth
 import dashboard_settings
 import llm_usage
 import machines
+import placement
 import service_control
 import sweep_settings
 import voice_assistant
@@ -1816,6 +1817,8 @@ class Handler(BaseHTTPRequestHandler):
                     }
                     agent_messages.name_accounts(value["agents"], value["sessions"])
                 value["machine_label"] = machine.label if machine else local_label(self.server.home)
+                # As New task names it, for a new agent started in this checkout.
+                value["machine"] = machine.id if machine else placement.LOCAL
                 self.send_json(200, value)
             elif route.path == "/api/workspace-artefacts" and not route.query:
                 # Asked once per page: whether the viewer offers its Artefacts tab.

@@ -4316,8 +4316,10 @@ def test_quitting_the_transcripts_agent_asks_first_and_leaves_it_not_running(
         "Quit Claude in w1:p2; its session can be resumed."
     )
     expect(strip).to_have_attribute("data-live", "false")
-    # The pinned strip says it in two words; hovering it says the rest.
-    expect(strip).to_have_text("Not running")
+    # The pinned strip says it in two words; hovering it says the rest. With no agent
+    # left in the checkout, a new one can be started there.
+    expect(strip.locator(".badge")).to_have_text("Not running")
+    expect(strip.get_by_role("button", name="New agent…")).to_be_visible()
     expect(strip).to_have_attribute("title", "No agent has this session open right now")
     expect(live.get_by_role("button", name=re.compile("^Quit"))).to_have_count(0)
     assert quits == [{"workspace": "w1", "pane": "w1:p2", "session": "s1"}]
@@ -4484,7 +4486,7 @@ def test_a_refused_quit_says_why_and_a_vanished_agent_drops_the_question(
     viewer_routes["agents"] = []
     page.clock.run_for(11000)
     expect(live.get_by_role("group", name="Confirm quitting the agent")).to_have_count(0)
-    expect(live.locator(".ws-live-state")).to_have_text("Not running")
+    expect(live.locator(".ws-live-state .badge")).to_have_text("Not running")
 
 
 def test_shift_enter_sends_the_message_and_enter_starts_a_new_line(
@@ -6520,6 +6522,8 @@ def test_transcript_offers_change_agent_in_its_checkout(page, dashboard_site, vi
     )
     page.goto(url + "/#prs")
     page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    # A checkout takes one agent at a time: the running one is changed instead.
+    expect(page.locator("#ws-live").get_by_role("button", name="New agent…")).to_have_count(0)
     page.get_by_role("button", name="More actions for Claude in w1:p2").click()
     page.get_by_role("button", name="Change agent for Claude in w1:p2").click()
     dialog = page.locator("#workspace-dialog")
@@ -6527,3 +6531,49 @@ def test_transcript_offers_change_agent_in_its_checkout(page, dashboard_site, vi
     expect(dialog.get_by_label("Directory", exact=True)).to_have_value("/fixture/checkout")
     expect(dialog.locator("#workspace-agent")).to_have_value("codex")
     expect(dialog.get_by_role("button", name="Quit and start new agent")).to_be_visible()
+
+
+def test_transcript_starts_a_new_agent_once_none_runs_in_its_checkout(
+    page, dashboard_site, viewer_routes
+):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = []
+    page.route(
+        "**/api/workspace-repos*",
+        lambda route: route.fulfill(json={"repos": [], "idle": 0}),
+    )
+    sent = []
+
+    def start(route):
+        sent.append(route.request.post_data_json)
+        op = {
+            "id": "op1",
+            "pr": "new:1",
+            "status": "running",
+            "message": "Starting the selected agent in /fixture/checkout",
+            "log": "",
+            "subject": {"kind": "directory", "path": "/fixture/checkout"},
+        }
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    expect(page.locator("#ws-live-state")).to_contain_text("Not running")
+    page.locator("#ws-live").get_by_role("button", name="New agent…").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(page.locator("#workspace-title")).to_have_text("New agent")
+    directory = dialog.get_by_label("Directory", exact=True)
+    expect(directory).to_have_value("/fixture/checkout")
+    expect(directory).not_to_be_editable()
+    # Nothing in the checkout is quit: no handoff warning, and no repository to choose.
+    expect(dialog).not_to_contain_text("will be stopped and quit")
+    expect(dialog.get_by_role("combobox", name="Repository and local clone")).to_be_hidden()
+    dialog.get_by_label("Task", exact=True).fill("Write the release notes")
+    dialog.get_by_role("button", name="Start agent").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Starting the selected agent")
+    assert len(sent) == 1
+    body = sent[0]
+    assert body["directory"] == "/fixture/checkout"
+    assert body["task"] == "Write the release notes"
+    assert not {"repo", "clone", "name", "machine"} & set(body)

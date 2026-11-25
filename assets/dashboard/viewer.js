@@ -1505,6 +1505,8 @@
   let agentsRead = "loading";
   // What the server calls this machine beside its workers; null without workers.
   let hostLabel = null;
+  // The machine the checkout is on, as New task names it ("local" for this one).
+  let hostMachine = "local";
   // The quit asked about ({id, pane, session}), until it is answered or the agent goes.
   let quitQuestion = null;
   // The move asked about ({id, pane, session, machine, plan, error, loading}), likewise.
@@ -1577,6 +1579,7 @@
     sessions = [];
     agentsRead = messageable(entry) ? "loading" : "unavailable";
     hostLabel = null;
+    hostMachine = "local";
     quitQuestion = null;
     moveQuestion = null;
     settingsQuestion = null;
@@ -1642,6 +1645,7 @@
       sessions = value.sessions;
       agentsRead = "loaded";
       hostLabel = value.machine_label || null;
+      hostMachine = value.machine || "local";
       renderAgents();
       refreshQuestions();
       renderLive();
@@ -2352,7 +2356,10 @@
     if (known && !shown) {
       // No session recorded here: any agent running is listed below.
       row.dataset.live = "none";
-      row.append(node("span", "No session is recorded in this checkout", "pr-meta"));
+      row.append(
+        node("span", "No session is recorded in this checkout", "pr-meta"),
+        ...newAgentButton(),
+      );
       return row;
     }
     // An agent of this session's kind whose session herdr does not know may well run this
@@ -2373,7 +2380,21 @@
       row.append(node("span", "an agent here may have it open", "pr-meta"));
       row.title = "An agent runs here, but which session it has open is not known";
     } else if (known) row.title = "No agent has this session open right now";
+    row.append(...newAgentButton());
     return row;
+  }
+  // A new conversation in this checkout once no agent runs in it: a checkout takes one
+  // agent at a time (Change agent… replaces one that runs). New task starts it there.
+  function newAgentButton() {
+    if (agentsRead !== "loaded" || agents.length || !draft?.path) return [];
+    const button = node("button", "New agent…", "ws-move");
+    button.type = "button";
+    button.title = "Start an agent with a new conversation in this checkout, as it is";
+    button.onclick = () =>
+      void window.dashboardTasks.create({
+        directory: { path: draft.path, machine: hostMachine },
+      });
+    return [button];
   }
   function agentRow(agent, data) {
     const [text, tone] = activity(agent);
@@ -2923,6 +2944,8 @@
       settingsQuestion && [settingsQuestion.pane, settingsQuestion.choices === undefined],
       agentsRead,
       hostLabel,
+      hostMachine,
+      draft?.path,
       workerLabel(viewer.entry),
       data.sessions.map((session) => session.id),
       agents.map((agent) => [

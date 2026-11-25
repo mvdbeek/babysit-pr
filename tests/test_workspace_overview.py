@@ -1683,6 +1683,8 @@ def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
                 }
             ]
             assert value["path"].endswith("merged-work") and value["sessions"] == []
+            # New agent… launches on the machine named here.
+            assert value["machine"] == "local"
             # Text that sends the reader to Collie links this workspace there.
             assert value["url"] == f"{pr_workspaces.COLLIE_URL}/space/w1"
             body = {"workspace": "w1", "text": "Please add a test.\r\nThen push.\x1b[201~\x15"}
