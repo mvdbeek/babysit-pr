@@ -212,6 +212,7 @@
       actions.append(button);
       const target = viewTarget(entry);
       if (target) actions.append(...window.workspaceViewer.buttons(target, viewTargets));
+      actions.append(...newAgentButton(entry));
       line.append(actions);
       return line;
     }
@@ -230,6 +231,7 @@
     actions.append(button);
     const target = viewTarget(entry);
     if (target) actions.append(...window.workspaceViewer.buttons(target, viewTargets));
+    actions.append(...newAgentButton(entry));
     const result = openResults.get(entry.key);
     if (result?.url) actions.append(anchor("Open in Collie", result.url));
     if (result?.error) {
@@ -240,15 +242,34 @@
     line.append(actions);
     return line;
   }
+  // A fresh conversation in a scanned checkout no agent runs in, as New task starts one in
+  // an existing directory (`wt --dir`); a checkout takes one agent at a time, and one
+  // that runs there is changed from its transcript instead (Change agent…).
+  function newAgentButton(entry) {
+    if (!scanned(entry) || entry.agents.length) return [];
+    const button = node("button", "New agent…");
+    button.type = "button";
+    button.dataset.focus = "new-agent";
+    button.title = "Start an agent with a new conversation in this checkout, as it is";
+    button.setAttribute("aria-label", `New agent in ${entry.name}`);
+    button.onclick = () =>
+      void window.dashboardTasks.create({
+        directory: { path: entry.path, machine: entry.machine || "local" },
+      });
+    return [button];
+  }
+  function scanned(entry) {
+    const own = entry.machine ? `m:${entry.machine}:${entry.path}` : entry.path;
+    return entry.key === own && !entry.missing && !entry.broken;
+  }
   // Scanned checkouts are read by their row; a row that is only a herdr workspace is
   // read through that workspace. A worker's rows are keyed by machine and read there.
   function viewTarget(entry) {
-    const own = entry.machine ? `m:${entry.machine}:${entry.path}` : entry.path;
-    const scanned = entry.key === own && !entry.missing && !entry.broken;
-    if (!scanned && !entry.workspace_ids.length) return null;
+    const own = scanned(entry);
+    if (!own && !entry.workspace_ids.length) return null;
     return {
       id: entry.key,
-      ...(scanned ? { key: entry.key } : {}),
+      ...(own ? { key: entry.key } : {}),
       workspace: entry.workspace_ids[0],
       ...(entry.machine ? { machineLabel: entry.machine_label } : {}),
       name: entry.name,

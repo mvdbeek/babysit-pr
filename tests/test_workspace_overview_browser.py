@@ -405,6 +405,64 @@ def test_worker_rows_show_their_machine_and_are_not_opened_from_here(page, site,
     assert not errors
 
 
+def test_a_checkout_without_an_agent_offers_a_new_one_there(page, site):
+    url, plugin, _ = site
+    plugin.value["workspaces"] = [
+        *WORKSPACES,
+        row(
+            "remote-work",
+            key="m:mini:/src/worktrees/repo/remote-work",
+            machine="mini",
+            machine_label="Mac mini",
+            machine_stale=False,
+        ),
+    ]
+    page.route(
+        "**/api/workspace-repos*", lambda route: route.fulfill(json={"repos": [], "idle": 0})
+    )
+    sent = []
+
+    def start(route):
+        sent.append(route.request.post_data_json)
+        op = {
+            "id": "op1",
+            "pr": "new:1",
+            "status": "running",
+            "message": "Starting the selected agent",
+            "log": "",
+            "subject": {"kind": "directory", "path": "/src/worktrees/repo/open-work"},
+        }
+        route.fulfill(json={"operation": op})
+
+    page.route("**/api/workspace-new", start)
+    page.goto(url + "/#workspaces")
+
+    def line(name):
+        return page.locator("#ws-list tr").filter(has=page.get_by_text(name, exact=True))
+
+    # One agent at a time: a checkout with one running offers none.
+    expect(
+        line("merged-work").get_by_role("button", name="New agent in merged-work")
+    ).to_have_count(0)
+    line("open-work").get_by_role("button", name="New agent in open-work").click()
+    dialog = page.locator("#workspace-dialog")
+    expect(page.locator("#workspace-title")).to_have_text("New agent")
+    expect(dialog.get_by_label("Directory", exact=True)).to_have_value(
+        "/src/worktrees/repo/open-work"
+    )
+    dialog.get_by_label("Task", exact=True).fill("Tidy the docs")
+    dialog.get_by_role("button", name="Start agent").click()
+    expect(page.locator("#workspace-progress")).to_contain_text("Starting the selected agent")
+    assert [body["directory"] for body in sent] == ["/src/worktrees/repo/open-work"]
+    page.locator("#workspace-dialog").get_by_role("button", name="Close workspace actions").click()
+    # A worker this dashboard cannot launch on is refused before anything is sent.
+    line("remote-work").get_by_role("button", name="New agent in remote-work").click()
+    dialog.get_by_label("Task", exact=True).fill("Tidy the docs")
+    dialog.get_by_role("button", name="Start agent").click()
+    expect(page.locator("#workspace-error")).to_contain_text("The worker is no longer available")
+    assert len(sent) == 1
+
+
 def test_a_worker_transcript_shows_its_agent_there_and_quits_it_there(page, site):
     url, plugin, _ = site
     plugin.value["workspaces"] = [

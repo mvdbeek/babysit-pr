@@ -3446,11 +3446,18 @@ async function workspaceDialog(item, handling = "", { preferred = null } = {}) {
 // A task with no PR or issue behind it, like `wtl`'s branch target: a new branch from a
 // base in any local clone, or, with a title, a GitHub issue filed first and then handled.
 // `fromLink` marks a prefill from a #task= link, which any website can open.
+// `prefill.directory` ({path, machine}) starts a new agent in that existing checkout, as
+// `prefill.handoff` does after quitting the agent there; both keep the checkout fixed.
 async function newTaskDialog(prefill = {}, fromLink = false) {
   // Stands in for the dialog's item; its id becomes the operation's once one starts.
   const owner = { id: null, newTask: true };
   workspaceDialogItem = owner;
-  $("workspace-title").textContent = prefill.handoff ? "Change agent" : "New task";
+  const place = prefill.handoff || prefill.directory;
+  $("workspace-title").textContent = prefill.handoff
+    ? "Change agent"
+    : prefill.directory
+      ? "New agent"
+      : "New task";
   $("workspace-error").textContent = "";
   const loading = el("p", "Finding local clones…");
   $("workspace-content").replaceChildren(loading);
@@ -3894,15 +3901,25 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       setRepo(taskRepo());
       placementChanged();
     };
-    if (prefill.handoff) {
+    if (place) {
       inPlace.checked = true;
       inPlace.onchange();
       inPlaceLabel.hidden = true;
-      directory.value = prefill.handoff.path;
+      directory.value = place.path;
       directory.readOnly = true;
       const machine = machineField.querySelector("select");
-      if (prefill.handoff.machine !== "local") machine.value = prefill.handoff.machine;
+      if (place.machine !== "local") machine.value = place.machine;
       machine.disabled = true;
+    }
+    if (prefill.directory)
+      directoryFields.append(
+        el(
+          "p",
+          "The agent starts a new conversation in this checkout, as it is. To continue an earlier session instead, use Resume and send in its transcript.",
+          "pr-meta",
+        ),
+      );
+    if (prefill.handoff) {
       agent.value = prefill.handoff.agent === "claude" ? "codex" : "claude";
       agent.dispatchEvent(new Event("change"));
       directoryFields.append(
@@ -3982,7 +3999,11 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
     cancel.onclick = () => $("workspace-dialog").close();
     const submit = el(
       "button",
-      prefill.handoff ? "Quit and start new agent" : "Start task",
+      prefill.handoff
+        ? "Quit and start new agent"
+        : prefill.directory
+          ? "Start agent"
+          : "Start task",
       "primary-action",
     );
     submit.type = "submit";
@@ -4021,10 +4042,13 @@ async function newTaskDialog(prefill = {}, fromLink = false) {
       $("workspace-error").textContent = "";
       try {
         let prompt = task.value;
+        // The worker went from the choices since the dialog opened: nothing was started.
+        if (place && place.machine !== "local" && machineChoice().machine !== place.machine)
+          throw Error(
+            `The worker is no longer available; reopen the ${prefill.handoff ? "handoff" : "dialog"}.`,
+          );
         if (prefill.handoff) {
           const source = prefill.handoff;
-          if (source.machine !== "local" && machineChoice().machine !== source.machine)
-            throw Error("The worker is no longer available; reopen the handoff.");
           const query = new URLSearchParams({
             workspace: source.workspace,
             session: source.session,
