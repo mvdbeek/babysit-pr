@@ -107,10 +107,12 @@ def test_an_unreadable_file_leaves_the_page_on_its_own_wording(tmp_path):
 
 
 def test_the_issue_task_starts_from_the_pages_wording_or_the_saved_one(tmp_path):
-    # The browser extension's Handle issue reads it here; the page keeps its own copy.
+    # The browser extension's Handle issue and Review pull request read them here; the
+    # page keeps its own copy.
     page = (Path(__file__).resolve().parents[1] / "assets/dashboard/settings.js").read_text()
+    for task in ("issue", "prReview"):
+        assert settings.DEFAULT_PROMPTS[task].replace("{url}", "${URL_TOKEN}") in page
     default = settings.DEFAULT_PROMPTS["issue"]
-    assert default.replace("{url}", "${URL_TOKEN}") in page
     url = "https://github.com/o/r/issues/1"
     assert settings.task_prompt(tmp_path, "issue", url) == default.replace("{url}", url)
     settings.save(tmp_path, {"task": "issue", "prompt": "Fix {url} now."})

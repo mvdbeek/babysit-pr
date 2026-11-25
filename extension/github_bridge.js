@@ -52,16 +52,19 @@ function text(value, limit) {
   return typeof value === "string" ? value.slice(0, limit) : "";
 }
 // Handle issue starts with the clone and agent settings the composer last used for this
-// repository, unless the page picks another agent.
-async function githubHandle(message) {
-  const repo = item(message.url, "issues");
+// repository, unless the page picks another agent. Review pull request keeps only the
+// clone unless the page picks the remembered agent: the dashboard's main reviewer
+// otherwise.
+async function githubLaunch(message, kind) {
+  const repo = item(message.url, kind);
   const key = `preferences:${await connection()}`;
   const preferences = (await chrome.storage.local.get(key))[key] || {};
   const remembered = preferences.repos?.[repo] || {};
-  const agent = ["codex", "claude"].includes(message.agent) ? message.agent : remembered.agent;
+  const picked = ["codex", "claude"].includes(message.agent) ? message.agent : null;
+  const agent = picked || (kind === "issues" ? remembered.agent : null);
   const same = agent && agent === remembered.agent;
   const request = {
-    action: "handle-issue",
+    action: kind === "issues" ? "handle-issue" : "review-pr",
     request_id: crypto.randomUUID(),
     url: message.url,
     instructions: text(message.instructions, 8000),
@@ -80,7 +83,8 @@ function questionId(value) {
 // Each message builds its own request: a page never passes fields through to the dashboard.
 const HANDLERS = {
   "github-pages": (message) => githubPages(message.urls),
-  "github-handle": githubHandle,
+  "github-handle": (message) => githubLaunch(message, "issues"),
+  "github-review": (message) => githubLaunch(message, "pull"),
   "github-status": (message) =>
     api({ action: "status", id: text(message.id, 100) }).then(({ operation }) => ({ operation })),
   "github-ask": (message) => {
