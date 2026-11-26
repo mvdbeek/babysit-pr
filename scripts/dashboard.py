@@ -2,6 +2,7 @@
 """Loopback dashboard with watch cancellation for the shared babysit-pr watcher."""
 
 import argparse
+import contextlib
 import errno
 import functools
 import gzip
@@ -17,6 +18,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,6 +31,7 @@ import agent_terminal
 import attachments
 import attention
 import browser_extension
+import credential_profiles
 import dashboard_auth
 import dashboard_settings
 import llm_usage
@@ -39,6 +42,7 @@ import sweep_settings
 import voice_assistant
 import work_tags
 import worker_api
+import worker_credentials
 import workspace_agents
 import workspace_artefacts
 import workspace_move
@@ -141,6 +145,7 @@ ACTIONS = frozenset(
         "workspace-cleanup",
         "workspace-open",
         "workspace-message",
+        "workspace-credential-grant",
         "workspace-answer",
         "workspace-choose",
         "workspace-docker",
@@ -165,6 +170,7 @@ ACTIONS = frozenset(
         "extension-pair",
         "effort-default",
         "settings",
+        "credential-profiles",
         "codex-update",
         "worker-update",
         "service-restart",
@@ -181,6 +187,7 @@ API_ROUTES = frozenset(
         "/api/attention",
         "/api/auth-report",
         "/api/codex-update",
+        "/api/credential-profiles",
         "/api/cron",
         "/api/cron-log",
         "/api/issues",
@@ -926,6 +933,16 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_port
         return self.headers.get("Host") not in {f"127.0.0.1:{port}", f"localhost:{port}"}
 
+    def credential_home(self):
+        """Credential actions require an admin even while dashboard auth only reports."""
+        auth = self.server.auth
+        if auth:
+            decision = auth.decide(self.command, self.path, self.headers, self.secure_host())
+            if decision.allowed and decision.credential in {"session", "admin"}:
+                return auth.store.home
+        self.fail(403, "Sign in as a dashboard admin to use credentials")
+        return None
+
     def same_origin_action(self, action):
         """The CSRF guard of post(), for a sign-in route's POST."""
         host = self.headers.get("Host")
@@ -1129,6 +1146,9 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.read_body(length, 5))
             if not isinstance(request, dict):
                 raise ValueError("Expected a JSON action request")
+            if action in {"credential-profiles", "workspace-credential-grant"}:
+                self.credential_action(action, request)
+                return
             if action == "review-approve":
                 # This exception to provider isolation always needs real authentication,
                 # including in report mode. Worker/launch keys cannot authorize it.
@@ -1455,6 +1475,86 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(400, str(exc))
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             self.fail(503, f"Cannot update watch: {exc}")
+
+    def credential_action(self, action, request):
+        home = self.credential_home()
+        if home is None:
+            return
+        try:
+            if action == "credential-profiles":
+                self.send_json(200, {"profiles": credential_profiles.update(home, request)})
+                return
+            self.grant_credential(home, request)
+        except credential_profiles.CredentialFailed as exc:
+            self.fail(502, str(exc))
+
+    def grant_credential(self, home, request):
+        keys = {"workspace", "pane", "session", "profile"}
+        if set(request) != keys | {"minutes"} or not all(
+            isinstance(request[key], str) and request[key] for key in keys
+        ):
+            raise ValueError("Choose a running worker session and a credential profile")
+        minutes = request["minutes"]
+        if not worker_credentials.valid_duration(minutes):
+            raise ValueError("Enter a positive whole number of minutes")
+        session = request["session"]
+        if session != str(uuid.UUID(session)):
+            raise ValueError("Choose a running worker session")
+        profile = credential_profiles.profiles(home).get(request["profile"])
+        if profile is None:
+            raise ValueError("That credential profile no longer exists")
+        machine, workspace = viewed_workspace(self.server.home, request["workspace"])
+        if machine is None or machine.os != "linux":
+            raise ValueError("Credential grants require a sandboxed Linux worker session")
+        grant = uuid.uuid4().hex
+        pane = request["pane"]
+        attempted = False
+        path = f"{worker_credentials.MOUNT}/{grant}"
+
+        def stage(_):
+            nonlocal attempted
+            data = credential_profiles.read(profile)
+            attempted = True
+            credential_profiles.worker_call(
+                self.server.home,
+                machine,
+                "grant",
+                pane,
+                session,
+                grant,
+                minutes,
+                data,
+            )
+            return (
+                f"Credential {json.dumps(profile['name'])} is available at {path} "
+                f"for up to {minutes} minute(s). Use it only for the task you are working on. "
+                "Pass the path to a tool that accepts a credential file, or read it inside a "
+                "program and use it directly. Do not print, echo, or copy its contents into chat, "
+                "tool output, command arguments, logs, or transcripts. Avoid shell tracing and "
+                "verbose logging. If you cannot use it without exposing it, stop and tell the user."
+            )
+
+        try:
+            result = agent_messages.send(
+                {"workspace": workspace, "pane": pane, "text": "Temporary credential"},
+                expected_session=session,
+                machine=machine,
+                prepare=stage,
+            )
+        except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
+            if attempted:
+                with contextlib.suppress(credential_profiles.CredentialFailed):
+                    credential_profiles.worker_call(
+                        self.server.home,
+                        machine,
+                        "revoke",
+                        pane,
+                        session,
+                        grant,
+                        minutes,
+                    )
+            raise
+        self.send_json(200, {**result, "minutes": minutes})
 
     def service_restart(self, request):
         """Restart the watcher daemon, or this dashboard, for the Services dialog."""
@@ -2059,6 +2159,13 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif route.path == "/api/settings":
                 self.send_json(200, dashboard_settings.settings(self.server.home))
+            elif route.path == "/api/credential-profiles":
+                home = self.credential_home()
+                if home is not None:
+                    try:
+                        self.send_json(200, {"profiles": credential_profiles.profiles(home)})
+                    except credential_profiles.CredentialFailed as exc:
+                        self.fail(502, str(exc))
             elif route.path == "/api/voice-turn":
                 query = parse_qs(route.query)
                 self.send_json(
@@ -2103,6 +2210,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/codex_update.js": ("codex_update.js", "text/javascript"),
                     "/service.js": ("service.js", "text/javascript"),
                     "/settings.js": ("settings.js", "text/javascript"),
+                    "/credentials.js": ("credentials.js", "text/javascript"),
                     "/shortcuts.js": ("shortcuts.js", "text/javascript"),
                     "/push.js": ("push.js", "text/javascript"),
                     "/sw.js": ("sw.js", "text/javascript"),

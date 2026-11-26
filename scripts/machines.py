@@ -449,6 +449,7 @@ control_dir.cache_clear = _control_dir.cache_clear  # type: ignore[attr-defined]
 def ssh_options(home) -> list[str]:
     options = {
         "BatchMode": "yes",
+        "RequestTTY": "no",
         "ConnectTimeout": "5",
         "ServerAliveInterval": "10",
         "ControlMaster": "auto",

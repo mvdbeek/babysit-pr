@@ -230,6 +230,8 @@ def test_remote_argv_quotes_hostile_arguments_and_paths(tmp_path, short_tmp):
         "-o",
         "BatchMode=yes",
         "-o",
+        "RequestTTY=no",
+        "-o",
         "ConnectTimeout=5",
         "-o",
         "ServerAliveInterval=10",

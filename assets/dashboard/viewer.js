@@ -2321,6 +2321,21 @@
       renderLive();
     };
     menu.push(quit);
+    if (worker && agent.session && viewer.entry.workspace && window.dashboardCredentials) {
+      const grant = button(
+        "credential-grant",
+        "Grant credential…",
+        "ws-move",
+        `Grant a credential to ${name}`,
+        "Let this session read a saved credential for a limited time",
+      );
+      grant.onclick = () =>
+        void window.dashboardCredentials.grant(
+          { workspace: viewer.entry.workspace, pane: agent.pane, session: agent.session },
+          `${name} on ${worker}`,
+        );
+      menu.push(grant);
+    }
     buttons.push(agentMenu(agent, menu));
     const holder = node("span", undefined, "ws-live-actions");
     holder.append(...buttons);

@@ -736,6 +736,24 @@ prevents the restart. Unknown access is shown as unavailable, never as disabled.
 Inspection requires macOS Seatbelt, so the toggle is macOS-only for now. This controls
 socket access; it does not start Docker.
 
+**Grant credential…** in a worker session’s **More actions** menu lets that launch
+read a gopass credential for a duration you set in minutes. In **Settings → Credentials**,
+add a profile with a gopass entry name and choose its password line or entire entry.
+The dashboard saves this metadata in its private auth home. Its service account
+needs `gopass` on its `PATH` and permission to decrypt the entry. Profile management
+and grants require a dashboard admin, including in report mode.
+[Dashboard sign-in setup](references/auth.md)
+
+After approval, the dashboard reads the credential and sends it over SSH stdin to
+the worker. The worker puts it in a private directory under `/dev/shm` and exposes
+the file through a read-only mount at `/run/babysit-credentials` in the chosen sandbox.
+The session receives the path and instructions to avoid printing or recording the
+contents. The worker removes the file after expiry, when it sees a different
+conversation in that launch, or when the sandbox exits. A process that has already
+read the file can keep a copy. The worker account and processes with equivalent host
+access can also reach it. This requires a fresh sandboxed launch on an updated Linux
+worker. A launch with Docker access cannot receive a grant.
+
 **Quit the agent when it is done**, beside the agent picker in the follow-up composer,
 works for every message, whether it goes to a running agent or resumes an exited
 session. It suits a closing instruction such as "approve and merge". The message gets

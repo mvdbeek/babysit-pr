@@ -23,6 +23,7 @@
     <script src="/codex_update.js" defer></script>
     <script src="/service.js" defer></script>
     <script src="/settings.js" defer></script>
+    <script src="/credentials.js" defer></script>
     <script src="/shortcuts.js" defer></script>
     <script src="/attachments.js" defer></script>
     <script src="/terminal.js" defer></script>
@@ -301,6 +302,15 @@
         <button id="settings-reset" type="button">Use the default</button>
       </div>
       <p id="settings-status" class="notifications-caption" role="status"></p>
+      <h3>Credentials</h3>
+      <p class="notifications-caption">
+        Grant a worker session temporary access to a gopass entry from the dashboard host.
+      </p>
+      <div class="settings-actions">
+        <button id="credential-settings-open" type="button" aria-haspopup="dialog">
+          Manage credentials…
+        </button>
+      </div>
       <h3>Keyboard shortcuts</h3>
       <p id="settings-shortcuts-note" class="notifications-caption"></p>
       <div class="settings-actions settings-shortcuts">
@@ -308,6 +318,70 @@
           Keyboard shortcuts…
         </button>
       </div>
+    </dialog>
+    <dialog id="credential-settings" aria-labelledby="credential-settings-title">
+      <div class="dialog-header">
+        <div class="notifications-heading">
+          <h2 id="credential-settings-title">Credentials</h2>
+          <button id="credential-settings-close" type="button" aria-label="Close credentials">
+            ×
+          </button>
+        </div>
+      </div>
+      <ul id="credential-profiles" hidden></ul>
+      <form id="credential-add" hidden>
+        <div class="settings-field">
+          <label for="credential-name">Profile name</label>
+          <input id="credential-name" required maxlength="80" />
+        </div>
+        <div class="settings-field">
+          <label for="credential-entry">gopass entry name</label>
+          <input
+            id="credential-entry"
+            required
+            maxlength="255"
+            placeholder="services/example"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </div>
+        <div class="settings-field">
+          <label for="credential-format">File contents</label>
+          <select id="credential-format" data-native>
+            <option value="password">Password line</option>
+            <option value="entry">Entire gopass entry</option>
+          </select>
+        </div>
+        <div class="settings-actions"><button type="submit">Add profile</button></div>
+      </form>
+      <p id="credential-settings-status" class="notifications-caption" role="status"></p>
+    </dialog>
+    <dialog id="credential-grant" aria-labelledby="credential-grant-title">
+      <div class="dialog-header">
+        <div class="notifications-heading">
+          <h2 id="credential-grant-title">Grant temporary credential</h2>
+          <button id="credential-grant-close" type="button" aria-label="Close grant">×</button>
+        </div>
+      </div>
+      <p id="credential-grant-target" class="notifications-caption"></p>
+      <form id="credential-grant-form" hidden>
+        <div class="settings-field">
+          <label for="credential-grant-profile">Credential profile</label>
+          <select id="credential-grant-profile" data-native required></select>
+        </div>
+        <div class="settings-field">
+          <label for="credential-grant-duration">Expires after (minutes)</label>
+          <input id="credential-grant-duration" type="number" min="1" step="1" value="5" required />
+        </div>
+        <p class="notifications-caption">
+          The worker removes the credential file when the grant expires. The session can still keep
+          a copy once it reads the file.
+        </p>
+        <div class="settings-actions">
+          <button type="submit">Grant access</button>
+        </div>
+      </form>
+      <p id="credential-grant-status" class="notifications-caption" role="status"></p>
     </dialog>
     <dialog id="shortcuts-dialog" aria-labelledby="shortcuts-title">
       <div class="dialog-header">

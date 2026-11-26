@@ -10,10 +10,15 @@ import http.client
 import json
 import os
 import sqlite3
+import subprocess
 import threading
 import time
+import uuid
 
+import agent_messages
+import credential_profiles
 import dashboard
+import dashboard_auth
 import pytest
 import service_control
 import wt
@@ -65,6 +70,133 @@ def get(server, path, headers=None, method="GET", body=None):
         return response.status, dict(response.getheaders()), response.read()
     finally:
         conn.close()
+
+
+def credential_post(server, action, body, headers=None):
+    return get(
+        server,
+        f"/api/{action}",
+        {"X-Babysit-Action": action, "Content-Type": "application/json", **(headers or {})},
+        method="POST",
+        body=json.dumps(body).encode(),
+    )
+
+
+def test_credentials_require_an_admin_even_in_report_mode(serve, tmp_path):
+    action = "credential-profiles"
+    body = {"name": "Main", "entry": "galaxy/main"}
+    assert credential_post(serve(), action, body)[0] == 403
+    auth = dashboard_auth.Auth(tmp_path / "auth", "report", log=lambda _: None)
+    server = serve(auth=auth)
+    _, read = auth.store.create_key("read")
+    headers = {"Authorization": f"Bearer {read}"}
+    assert get(server, f"/api/{action}", headers)[0] == 403
+    assert credential_post(server, action, body, headers)[0] == 403
+    assert credential_post(server, "workspace-credential-grant", {}, headers)[0] == 403
+    assert not (auth.store.home / credential_profiles.PROFILES).exists()
+
+
+@pytest.mark.parametrize("kind", ["password", "entry"])
+def test_grant_uses_ssh_stdin_and_rechecks_the_worker_session(serve, tmp_path, monkeypatch, kind):
+    key = b"fixture-credential"
+    data = key if kind == "password" else key + b"\nsecond-line\n"
+    executable = tmp_path / "gopass"
+    executable.write_text(
+        '#!/bin/sh\n[ -z "$GOPASS_DEBUG_LOG" ] || exit 1\n'
+        'case "$*" in\n'
+        '"list --flat") printf "%s\\n" "service/api" ;;\n'
+        '"show --password --alsoclip=false --nosync -- service/api") printf "%s\\n" "$DUMMY_KEY" ;;\n'
+        '"show --unsafe --noparsing --alsoclip=false --nosync -- service/api") '
+        'printf "%s\\n%s\\n" "$DUMMY_KEY" "second-line" ;;\n'
+        "*) exit 1 ;;\nesac\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("DUMMY_KEY", key.decode())
+    monkeypatch.setenv("GOPASS_DEBUG_LOG", str(tmp_path / "gopass.log"))
+    auth = dashboard_auth.Auth(tmp_path / "auth", "report", log=lambda _: None)
+    server = serve(auth=auth)
+    (tmp_path / "machines.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "machines": [{"id": "mini", "label": "Mini", "ssh": "test@mini", "os": "linux"}],
+            }
+        )
+    )
+    token = auth.store.create_session("fixture", "fixture", "break-glass")
+    headers = {"Cookie": f"{dashboard_auth.session_cookie_name(False)}={token}"}
+    profile = {"name": "Service API", "entry": "service/api", "format": kind}
+    code, _, response = credential_post(server, "credential-profiles", profile, headers)
+    assert code == 200
+    profile_id = next(iter(json.loads(response)["profiles"]))
+    assert json.loads((auth.store.home / credential_profiles.PROFILES).read_text()) == {
+        profile_id: profile
+    }
+
+    requests = []
+    sent = []
+    agent = {"pane": "w1:p1", "session": str(uuid.UUID(int=1))}
+    session = agent["session"]
+    replace = False
+
+    def run(home, machine, argv, *, input, **kwargs):
+        assert machine.id == "mini"
+        assert all(key.decode() not in word for word in argv)
+        action, pane, owner, filename, minutes = argv[-5:]
+        assert (pane, owner, minutes) == (agent["pane"], session, "60")
+        requests.append((action, filename, input))
+        if replace:
+            agent["session"] = str(uuid.UUID(int=2))
+        return subprocess.CompletedProcess(argv, 0, b'{"ok": true}', b"")
+
+    def prompt(target, message, machine):
+        sent.append((target.copy(), message, machine))
+        return {"sent": True, "pane": target["pane"]}
+
+    def agents(workspace, *, machine):
+        assert workspace == "w1" and machine.id == "mini"
+        return [agent.copy()]
+
+    monkeypatch.setattr(agent_messages, "agents", agents)
+    monkeypatch.setattr(agent_messages, "prompt_locked", prompt)
+    monkeypatch.setattr(credential_profiles.machines, "run", run)
+    request = {
+        "workspace": "mini/w1",
+        **agent,
+        "profile": profile_id,
+        "minutes": 60,
+    }
+
+    def grant(**changes):
+        return credential_post(
+            server, "workspace-credential-grant", {**request, **changes}, headers
+        )
+
+    assert grant(workspace="w1")[0] == 400
+    for invalid in (0, -1, 2.5, True):
+        assert grant(minutes=invalid)[0] == 400
+    assert grant(session=str(uuid.UUID(int=99)))[0] == 400
+    assert not requests
+    status, _, response = grant()
+    assert status == 200 and json.loads(response)["sent"]
+    assert json.loads(response)["minutes"] == 60
+    ((action, filename, payload),) = requests
+    assert (action, payload) == ("grant", data)
+    assert sent[0][0] == agent and sent[0][2].id == "mini"
+    assert f"/run/babysit-credentials/{filename}" in sent[0][1]
+    assert "for up to 60 minute" in sent[0][1]
+    assert "transcripts" in sent[0][1]
+    assert key not in response and key.decode() not in sent[0][1]
+
+    replace = True
+    assert grant()[0] == 400
+    assert len(requests) == 3 and len(sent) == 1
+    assert requests[2] == ("revoke", requests[1][1], None)
+
+    assert credential_post(server, "credential-profiles", {"remove": profile_id}, headers)[0] == 200
+    assert grant(session=agent["session"])[0] == 400
+    assert len(requests) == 3
 
 
 def test_api_json_is_gzipped_only_when_accepted_and_never_cached(serve, overview):

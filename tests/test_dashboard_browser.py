@@ -6511,6 +6511,56 @@ def test_codex_async_question_answers_in_the_transcript(
     page.screenshot(path=f"reports/codex-transcript-answer-{width}.png", full_page=True)
 
 
+def test_grant_temporary_credential_to_a_worker_session(
+    page, dashboard_site, viewer_routes, workspace_routes
+):
+    url, _ = dashboard_site
+    workspace_routes[0]["matches"][0]["workspace_id"] = "mini/w1"
+    viewer_routes["agents"] = [
+        {"pane": "w1:p2", "agent": "claude", "status": "working", "session": "s1"}
+    ]
+    profiles = {}
+    grants = []
+
+    def manage(route):
+        if route.request.method == "POST":
+            assert route.request.headers["x-babysit-action"] == "credential-profiles"
+            profiles["main"] = route.request.post_data_json
+        route.fulfill(json={"profiles": profiles})
+
+    def approve(route):
+        assert route.request.headers["x-babysit-action"] == "workspace-credential-grant"
+        grants.append(route.request.post_data_json)
+        route.fulfill(json={"sent": True, "pane": "w1:p2", "minutes": 75})
+
+    page.route("**/api/credential-profiles", manage)
+    page.route("**/api/workspace-credential-grant", approve)
+    page.goto(url + "/#prs")
+    page.locator("#settings-toggle").click()
+    page.get_by_role("button", name="Manage credentials…").click()
+    page.get_by_label("Profile name", exact=True).fill("Service API")
+    page.get_by_label("gopass entry name", exact=True).fill("service/api")
+    page.get_by_role("button", name="Add profile", exact=True).click()
+    expect(page.locator("#credential-profiles")).to_contain_text("Service API · service/api")
+    page.get_by_role("button", name="Close credentials").click()
+    page.get_by_role("button", name="Close settings").click()
+
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_role("button", name="More actions for Claude in w1:p2").click()
+    page.get_by_role("button", name="Grant a credential to Claude in w1:p2").click()
+    dialog = page.get_by_role("dialog", name="Grant temporary credential")
+    expect(dialog).to_contain_text("Grant access to Claude in w1:p2 on mini.")
+    duration = dialog.get_by_label("Expires after (minutes)")
+    expect(duration).to_have_value("5")
+    duration.fill("75")
+    assert not grants
+    dialog.get_by_role("button", name="Grant access").click()
+    expect(dialog.get_by_role("status")).to_have_text("Access granted to w1:p2 for 75 minutes.")
+    assert grants == [
+        {"workspace": "mini/w1", "pane": "w1:p2", "session": "s1", "profile": "main", "minutes": 75}
+    ]
+
+
 def test_transcript_offers_change_agent_in_its_checkout(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     viewer_routes["agents"] = [
