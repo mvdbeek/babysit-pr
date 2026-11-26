@@ -64,6 +64,8 @@ KNOWN = {
     ".pnpm-store",
     "ms-playwright",
     "conda",
+    "conda-pkgs",
+    "tool-conda",
     "black",
     "fissix",
     "gh",
@@ -336,13 +338,15 @@ def confined(home, cache, argv, path):
         ("XDG_CACHE_HOME", cache),
         ("UV_CACHE_DIR", os.path.join(cache, "uv")),
         ("npm_config_cache", os.path.join(cache, "npm")),
+        ("CONDA_PKGS_DIRS", os.path.join(cache, "conda-pkgs")),
     ):
         wrapped += ["--setenv", name, value]
     return [*wrapped, "--", *argv]
 
 
 def prune_tools(run, root, home, state):
-    """Each cache's uv, npm and pnpm caches, by their own tools, once every TOOLS_EVERY."""
+    """Each cache's uv, npm, pnpm and conda caches, by their own tools, once every
+    TOOLS_EVERY. conda drops tarballs and the packages no environment links."""
     if run.now - (state.get("tools_pruned_at") or 0) < TOOLS_EVERY:
         return
     path = tool_path(home)
@@ -360,6 +364,7 @@ def prune_tools(run, root, home, state):
             ("uv", ["uv", "cache", "prune"]),
             ("npm", ["npm", "cache", "verify"]),
             (".pnpm-store", ["pnpm", "store", "prune", "--store-dir", f"{cache}/.pnpm-store"]),
+            ("conda-pkgs", [f"{cache}/tool-conda/bin/conda", "clean", "--all", "--yes"]),
         )
         for folder, argv in commands:
             target = os.path.join(cache, folder)
