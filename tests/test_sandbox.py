@@ -486,8 +486,8 @@ def environment(home, bwrap="path", **extra):
     return {**base, "USER": "fixture", "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
 
-def sandbox_cache(home, config_var="", config_dir="", granted=""):
-    key = hashlib.sha256(f"{config_var}\0{config_dir}\0{granted}".encode()).hexdigest()[:16]
+def sandbox_cache(home, granted=""):
+    key = hashlib.sha256(f"grants\0{granted}".encode()).hexdigest()[:16]
     return str(home / ".cache/babysit-sandbox" / key)
 
 
@@ -563,7 +563,7 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
     ]
     assert argv[-5:] == ["--chdir", str(worktree), "--", "agent", "--flag"]
     assert not {str(home), "/tmp"} & set(tmpfs_targets(argv))
-    cache = sandbox_cache(home, "CLAUDE_CONFIG_DIR", account.resolve())
+    cache = sandbox_cache(home)
     writable = pairs(argv, "--bind")
     assert {source for source, target in writable if source == target} == {
         cache,
@@ -598,6 +598,9 @@ def test_wrapper_denies_by_default_and_binds_only_the_grants(checkout, tmp_path)
         "npm_config_cache": f"{cache}/npm",
         "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/ms-playwright",
         "PLANEMO_GLOBAL_WORKSPACE": f"{cache}/planemo",
+        "CONDA_PKGS_DIRS": f"{cache}/conda-pkgs",
+        "PLANEMO_CONDA_PREFIX": f"{cache}/tool-conda",
+        "GALAXY_CONFIG_CONDA_PREFIX": f"{cache}/tool-conda",
         "BABYSIT_ARTIFACT_DIR": f"{cache}/artifacts",
         "BABYSIT_SCRATCH": f"{cache}/scratch/{scratch_id(worktree)}",
         "GALAXY_VIRTUAL_ENV": f"{cache}/scratch/{scratch_id(worktree)}/galaxy-venv",
@@ -716,7 +719,7 @@ def test_wrapper_binds_one_agent_configuration_only(checkout):
     assert "configuration directory" in message and "does not exist" in message
 
 
-def test_wrapper_gives_each_agent_configuration_its_own_cache(checkout):
+def test_wrapper_shares_one_cache_between_agent_configurations(checkout):
     worktree, _, home = checkout
     caches = set()
     for option in ("--claude-config-dir=a", "--claude-config-dir=b", "--codex-home=a"):
@@ -726,8 +729,8 @@ def test_wrapper_gives_each_agent_configuration_its_own_cache(checkout):
         cache = grants(argv)[0][0]
         assert ("XDG_CACHE_HOME", cache) in pairs(argv, "--setenv")
         caches.add(cache)
-    assert len(caches) == 3
-    assert all(Path(cache).parent == home / ".cache/babysit-sandbox" for cache in caches)
+    # Every account and harness installs into the same one.
+    assert caches == {sandbox_cache(home)}
     # The cache root stays protected as a whole: no grant reaches another agent's cache.
     Path(next(iter(caches))).mkdir(parents=True)
     message = refused(worktree, environment(home), f"--add-dirs={next(iter(caches))}", "x")
@@ -760,14 +763,8 @@ def test_wrapper_keeps_a_separate_cache_for_each_grant(checkout, docker_socket):
         for enable in ((), ("--enable=playwright",), ("--enable=docker",))
     }
     # What an agent without Docker leaves in its cache never runs with the socket.
-    assert (
-        caches[()]
-        == caches[("--enable=playwright",)]
-        == sandbox_cache(home, "CLAUDE_CONFIG_DIR", account.resolve())
-    )
-    assert caches[("--enable=docker",)] == sandbox_cache(
-        home, "CLAUDE_CONFIG_DIR", account.resolve(), "docker"
-    )
+    assert caches[()] == caches[("--enable=playwright",)] == sandbox_cache(home)
+    assert caches[("--enable=docker",)] == sandbox_cache(home, "docker")
     assert caches[()] != caches[("--enable=docker",)]
 
 
@@ -1013,7 +1010,7 @@ def test_wrapper_binds_checked_directories_by_descriptor_when_bwrap_can(checkout
     by_path = printed(worktree, environment(home, bwrap="path"), *options)
     by_fd = printed(worktree, environment(home, bwrap="fd"), *options)
     granted = [str(home / ".codex"), str(worktree), str(common)]
-    cache = sandbox_cache(home, "CODEX_HOME", (home / ".codex").resolve())
+    cache = sandbox_cache(home)
     assert grants(by_path) == [(cache, cache)] + [(path, path) for path in granted]
     assert not pairs(by_path, "--bind-fd")
     # The cache root is babysit's own; only checked grants go by descriptor.
@@ -1684,7 +1681,6 @@ def test_other_agent_diagnostic_and_artifacts_do_not_add_grants(checkout, agent,
     config = home / f".{agent}"
     config.mkdir()
     option = "claude-config-dir" if agent == "claude" else "codex-home"
-    variable = "CLAUDE_CONFIG_DIR" if agent == "claude" else "CODEX_HOME"
     other = "codex" if agent == "claude" else "claude"
     env = environment(home, BABYSIT_ARTIFACT_DIR="/host")
     argv = printed(
@@ -1695,7 +1691,7 @@ def test_other_agent_diagnostic_and_artifacts_do_not_add_grants(checkout, agent,
         "--env-pass=PATH,BABYSIT_ARTIFACT_DIR",
         f"/usr/bin/{other}" if absolute else other,
     )
-    cache = sandbox_cache(home, variable, config.resolve())
+    cache = sandbox_cache(home)
     assert dict(pairs(argv, "--setenv"))["BABYSIT_ARTIFACT_DIR"] == f"{cache}/artifacts"
     assert dict(pairs(argv, "--setenv"))["PATH"] == f"/tmp/babysit-bin:{env['PATH']}"
     assert ("--dir", f"{cache}/artifacts") in list(zip(argv, argv[1:], strict=False))
@@ -1771,7 +1767,7 @@ def test_artifacts_persist_in_the_configuration_cache_not_the_temporary_home(cro
     assert result.returncode == 0, result.stderr
     assert not (home / "src/agent-artefacts/outbox/task/review.txt").exists()
     assert not (home / "ephemeral.txt").exists()
-    artifacts = Path(sandbox_cache(home, "CODEX_HOME", codex.resolve())) / "artifacts"
+    artifacts = Path(sandbox_cache(home)) / "artifacts"
     assert (artifacts / "review.txt").read_text() == "persistent\n"
     assert (artifacts / "task/review.txt").read_text() == "outbox\n"
     again = run(f"--codex-home={codex}", "sh", "-c", 'cat "$BABYSIT_ARTIFACT_DIR/review.txt"')
@@ -1883,7 +1879,7 @@ def test_a_launch_records_its_cache_and_checkout_for_housekeeping(checkout, tmp_
     assert result.returncode == 0, result.stderr
     index = home / ".cache/babysit-sandbox/index"
     key = Path(sandbox_cache(home)).name
-    assert (index / "keys" / key).read_text() == "configuration -\ngrants -\n"
+    assert (index / "keys" / key).read_text() == "grants -\n"
     assert (index / "scratch" / scratch_id(worktree)).read_text() == f"{worktree}\n"
     assert stat.S_IMODE(index.stat().st_mode) == 0o700
 

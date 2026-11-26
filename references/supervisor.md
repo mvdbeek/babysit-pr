@@ -344,16 +344,21 @@ It mounts the system read-only, gives the agent an empty `$HOME`, and allows
 writes only to `--add-dirs`, the one agent configuration directory it is given
 (exported as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Claude always gets an explicit
 one, so its `.claude.json` lives inside it; a missing one is refused rather than
-exported into the empty home) and `~/.cache/babysit-sandbox/<hash of that
-configuration directory and the enabled grants>`, a cache used only by sandboxed
-agents of that configuration (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
+exported into the empty home) and `~/.cache/babysit-sandbox/<hash of the enabled
+grants>`, a cache used only by sandboxed agents with those grants, whatever their
+account or harness (`XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
 `npm_config_cache`, `PLAYWRIGHT_BROWSERS_PATH`). uv's tools go there too
 (`UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`): their defaults lie under the read-only
 `~/.local`, where `uvx` fails. The executables `uv tool install` links are not on
 `PATH`; uv prints where they are. So does planemo's workspace
 (`PLANEMO_GLOBAL_WORKSPACE`, `~/.planemo` by default), which holds its Galaxy mirror
 and virtualenv; in the empty home each launch would clone Galaxy again. Housekeeping
-removes it after 7 days without use, like other unknown cache entries. Each set of grants that reaches
+removes it after 7 days without use, like other unknown cache entries. Planemo and
+Galaxy share one conda there (`PLANEMO_CONDA_PREFIX` and `GALAXY_CONFIG_CONDA_PREFIX`,
+`tool-conda`), whose tool environments are named after their requirements, so every
+checkout testing the same tool reuses one; every conda takes its packages from one
+package cache (`CONDA_PKGS_DIRS`, `conda-pkgs`), which hard-links them into each
+environment, the scratch directories' included. Each set of grants that reaches
 beyond the sandbox (`--enable=docker`) gets its own, so a launch with Docker never
 runs downloads that a launch without it could have replaced. Host caches are
 never writable: code planted there would run outside the sandbox.

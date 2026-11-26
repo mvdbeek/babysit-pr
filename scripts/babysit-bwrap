@@ -8,7 +8,7 @@
 # disk for each launch, removed after it), and writes only to --add-dirs (the
 # caller passes the worktree and its git common directory there), the one agent
 # configuration directory (which must exist; what it runs code from stays read-only) and
-# a cache root that only sandboxed agents of that configuration and grants use. Nothing
+# a cache root that only sandboxed agents with the same grants use. Nothing
 # is discovered from the working directory or its git files, which the agent can rewrite;
 # the one use of a grant's git files places empty directories in the sandbox's own home.
 # Every writable path must be absolute and is resolved first; home, its ancestors and
@@ -285,12 +285,13 @@ if [[ -n $granted && $config_var == CLAUDE_CONFIG_DIR ]]; then
   command=("$1" --strict-mcp-config "${@:2}")
 fi
 # Package caches for sandboxed agents only: nothing outside the sandbox runs code from
-# them, unlike the host caches an agent could otherwise plant code in. One per agent
-# configuration and set of grants, so an agent never runs downloads that one with
-# fewer grants could have replaced.
+# them, unlike the host caches an agent could otherwise plant code in. One per set of
+# grants, so an agent never runs downloads that one with fewer grants could have
+# replaced. Every account and harness with the same grants shares it: they all run as
+# this user, and a cache each would download and install the same packages again.
 sha=(sha256sum)
 command -v sha256sum >/dev/null || sha=(shasum -a 256) # macOS dry runs
-key=$(printf '%s\0%s\0%s' "$config_var" "$config_dir" "$granted" | "${sha[@]}")
+key=$(printf 'grants\0%s' "$granted" | "${sha[@]}")
 key=${key:0:16}
 cache=$home/.cache/babysit-sandbox/$key
 
@@ -613,12 +614,19 @@ done
 # uv's tools go in the cache too: their defaults, ~/.local/share/uv/tools and
 # ~/.local/bin, are bound read-only above, and uvx fails when it cannot create the first.
 # Planemo's workspace (~/.planemo by default) holds its Galaxy mirror and virtualenv; in
-# the empty home every launch would clone Galaxy again.
+# the empty home every launch would clone Galaxy again. Planemo and Galaxy share one
+# conda (~/miniconda3 and <tool_dependency_dir>/_conda by default): its tool environments
+# are named after their requirements, so each checkout that tests the same tool reuses
+# one, and every conda's packages come from one package cache, hard-linked into each
+# environment (the cache and the scratch directories are in one bind).
 argv+=(--setenv XDG_CACHE_HOME "$cache" --setenv UV_CACHE_DIR "$cache/uv"
   --setenv UV_TOOL_DIR "$cache/uv-tools" --setenv UV_TOOL_BIN_DIR "$cache/uv-tools-bin"
   --setenv PIP_CACHE_DIR "$cache/pip" --setenv npm_config_cache "$cache/npm"
   --setenv PLAYWRIGHT_BROWSERS_PATH "$cache/ms-playwright"
   --setenv PLANEMO_GLOBAL_WORKSPACE "$cache/planemo"
+  --setenv CONDA_PKGS_DIRS "$cache/conda-pkgs"
+  --setenv PLANEMO_CONDA_PREFIX "$cache/tool-conda"
+  --setenv GALAXY_CONFIG_CONDA_PREFIX "$cache/tool-conda"
   --setenv BABYSIT_ARTIFACT_DIR "$cache/artifacts")
 # Galaxy makes its environment wherever GALAXY_VIRTUAL_ENV says (scripts/common_startup.sh).
 [[ -z $scratch_id ]] || argv+=(--setenv BABYSIT_SCRATCH "$cache/scratch/$scratch_id"
@@ -654,7 +662,7 @@ if ((!print)); then
   mkdir -p "$cache"
   index=$home/.cache/babysit-sandbox/index
   (umask 077 && mkdir -p -- "$index/keys" "$index/scratch") || die "cannot create $index"
-  printf 'configuration %s\ngrants %s\n' "${config_dir:--}" "${granted:--}" >"$index/keys/$key"
+  printf 'grants %s\n' "${granted:--}" >"$index/keys/$key"
   [[ -z $scratch_id ]] || printf '%s\n' "$scratch_for" >"$index/scratch/$scratch_id"
   stale=()
   for entry in "$runs"/*; do

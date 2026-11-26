@@ -248,8 +248,8 @@ user step installs a daily systemd user timer, `babysit-housekeeping.timer`, whi
   changed for 7 days.
 - **Unused caches.** It removes a whole cache that no launch has used for 30 days, or
   whose agent configuration is gone. It never removes the cache of a running sandbox.
-- **Tool caches.** Once a week it runs `uv cache prune`, `npm cache verify` and
-  `pnpm store prune` in each cache. Each runs in a bubblewrap sandbox that can write
+- **Tool caches.** Once a week it runs `uv cache prune`, `npm cache verify`,
+  `pnpm store prune` and the shared conda's `conda clean --all` in each cache. Each runs in a bubblewrap sandbox that can write
   only that cache, since agents wrote what these tools read.
 
 After each run it writes `~/.local/state/babysit-pr/disk-usage.json`. That report

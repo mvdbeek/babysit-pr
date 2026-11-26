@@ -260,6 +260,25 @@ def test_tool_caches_are_pruned_weekly_in_a_sandbox_that_writes_only_their_cache
     assert len(calls.read_text().splitlines()) == 2  # Not again within the week.
 
 
+def test_the_shared_conda_cleans_its_package_cache(home, tmp_path, monkeypatch):
+    (home / ".local/state/babysit-pr/housekeeping.json").unlink()
+    path = cache(home, "a" * 16, "-", time.time())
+    (path / "conda-pkgs").mkdir()
+    (path / "tool-conda/bin").mkdir(parents=True)
+    calls = tmp_path / "calls"
+    fake(
+        tmp_path / "bin",
+        "bwrap",
+        f'echo "bwrap $*" >> "{calls}"\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"',
+    )
+    fake(path / "tool-conda/bin", "conda", f'echo "conda $*" >> "{calls}"')
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    housekeeping.main(["--src", str(tmp_path / "src")])
+    sandboxed, pruned = calls.read_text().splitlines()
+    assert pruned == "conda clean --all --yes"
+    assert f"--setenv CONDA_PKGS_DIRS {path / 'conda-pkgs'}" in sandboxed
+
+
 def test_the_report_lists_the_largest_checkouts(home, tmp_path):
     git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
     src = tmp_path / "src"
