@@ -653,6 +653,31 @@ def test_wrapper_tells_a_workers_agent_it_is_on_a_worker(checkout):
     assert pairs(argv, "--bind")[-1] == records
 
 
+def test_worker_credential_files_are_bound_read_only_per_launch(checkout):
+    worktree, _, home = checkout
+    (home / ".config" / "babysit-pr").mkdir(parents=True)
+    (home / ".config" / "babysit-pr" / "worker.json").write_text("{}")
+    account = home / "acct"
+    account.mkdir()
+    env = environment(home, HC_TERMINAL_ID="t7")
+    options = [f"--claude-config-dir={account}", f"--add-dirs={worktree}"]
+
+    def mounts(*flags):
+        return pairs(printed(worktree, env, *options, *flags, "--", "claude"), "--ro-bind")
+
+    target = "/run/babysit-credentials"
+    first = next(source for source, dest in mounts() if dest == target)
+    second = next(source for source, dest in mounts() if dest == target)
+    assert first != second
+    assert Path(first).name == "files"
+    assert Path(first).parent.parent == Path("/dev/shm") / f"babysit-credentials-{os.getuid()}"
+    with tempfile.TemporaryDirectory(dir="/tmp") as runtime:
+        env["XDG_RUNTIME_DIR"] = runtime
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(Path(runtime) / "docker.sock"))
+            assert all(dest != target for _, dest in mounts("--enable=docker"))
+
+
 @fd_bash
 def test_a_workers_broker_is_told_the_launchs_directory_and_grants(checkout, tmp_path):
     worktree, common, home = checkout

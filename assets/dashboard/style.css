@@ -348,7 +348,9 @@ header p {
 .service-note {
   color: var(--muted);
 }
-#settings-dialog {
+#settings-dialog,
+#credential-settings,
+#credential-grant {
   width: 560px;
 }
 .settings-field {
@@ -360,13 +362,21 @@ header p {
 .settings-field label {
   font-weight: 600;
 }
-.settings-field select {
+.settings-field select,
+#credential-settings .settings-field input {
   flex: 1;
   max-width: none;
   min-width: 0;
 }
+#credential-profiles li {
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+}
 #settings-capacity {
   width: 6em;
+}
+#credential-grant-duration {
+  width: 8em;
 }
 #settings-prompt {
   width: 100%;

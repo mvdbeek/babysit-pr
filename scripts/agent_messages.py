@@ -358,9 +358,26 @@ def send(request, home=None, *, expected_session=None, checkout=None, machine=No
     target = next((agent for agent in running if agent["pane"] == pane), None)
     if target is None:
         raise ValueError("That agent is no longer running; refresh")
-    if expected_session is not None and target.get("session") != expected_session:
-        raise ValueError("The agent session changed; reload the agent list")
-    result = prompt(target, prepared(text), machine)
+    if expected_session is None:
+        result = prompt(target, prepared(text), machine)
+    else:
+        if target.get("session") != expected_session:
+            raise ValueError("The agent session changed; reload the agent list")
+        message = prepared(text)
+        # Preparation may take time. Check again while holding the lock used by the
+        # dashboard's quit, restart and move actions, immediately before delivery.
+        with locked(("pane", lock_name(machine, pane))):
+            target = next(
+                (
+                    agent
+                    for agent in agents(request.get("workspace"), machine=machine)
+                    if agent["pane"] == pane and agent.get("session") == expected_session
+                ),
+                None,
+            )
+            if target is None:
+                raise ValueError("The agent session changed; reload the agent list")
+            result = prompt(target, message, machine)
     return watch_until_done(result, home, marker, request["text"]) if marker else result
 
 

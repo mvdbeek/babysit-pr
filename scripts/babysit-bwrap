@@ -154,7 +154,8 @@ done
 # Where a login has a runtime directory, herdr-core's socket is there instead of in
 # its state directory, so a grant of that directory would expose it too.
 runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-protected+=("${runtime%/}/herdr-core")
+credential_root=/dev/shm/babysit-credentials-$(id -u)
+protected+=("${runtime%/}/herdr-core" "$credential_root" "$(resolve "$credential_root")" /run/babysit-credentials)
 
 # This launcher's own directory and, when that is a checkout's scripts/, the checkout
 # and its git common directory: an agent writing either would change what the next
@@ -468,9 +469,15 @@ fi
 # directory and grants, which the sandbox cannot change. Its socket is bound like the
 # gpg proxy's.
 broker=
+credential_dir=
 if [[ -f $home/.config/babysit-pr/worker.json && -n $config_var ]]; then
   agent=claude
   [[ $config_var == CLAUDE_CONFIG_DIR ]] || agent=codex
+  credential_args=()
+  if ((!docker)) && { [[ -n ${HC_TERMINAL_ID:-} ]] || [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]]; }; then
+    credential_dir=$credential_root/${run##*/}
+    credential_args=(--credentials="${run##*/}")
+  fi
   if ((print)); then
     broker=$(mktemp -d -u "${XDG_RUNTIME_DIR:-/tmp}/babysit-register.XXXXXX")
   else
@@ -480,12 +487,14 @@ if [[ -f $home/.config/babysit-pr/worker.json && -n $config_var ]]; then
       mkdir -m 0700 "$broker/sessions" || die "cannot create a session record directory"
     fi
     exec {ready}< <(exec python3 -I "${self%/*}/worker_broker.py" --cwd="$cwd" --granted="$granted" \
+      ${credential_args[@]+"${credential_args[@]}"} \
       "$broker/register.sock" "$agent" "$config_dir" ${granted_dirs[@]+"${granted_dirs[@]}"} </dev/null)
-    if ! read -r -u "$ready" line || [[ $line != ready ]]; then
+    if ! read -r -u "$ready" line || [[ $line != ready && $line != 'ready credentials' ]]; then
       rmdir "$broker/sessions" "$broker" 2>/dev/null || true
       die "the registration broker did not start"
     fi
     exec {ready}<&-
+    [[ $line == 'ready credentials' ]] || credential_dir=
   fi
   argv+=(--perms 0700 --dir "$broker" --bind "$broker/register.sock" "$broker/register.sock")
   # Claude records its running session as sessions/<pid>.json by the PID it has here,
@@ -680,10 +689,13 @@ if ((!print)); then
   if ((${#stale[@]})); then
     setsid sh -c "$scrub" sh "${stale[@]}" </dev/null >/dev/null 2>&1 {lock}<&- &
   fi
-  setsid flock "$run/lock" sh -c "$scrub" sh "$run" </dev/null >/dev/null 2>&1 {lock}<&- &
+  setsid flock "$run/lock" sh -c "$scrub" sh "$run" ${credential_dir:+"$credential_dir"} </dev/null >/dev/null 2>&1 {lock}<&- &
   argv+=(--sync-fd "$lock")
 fi
 
+if [[ -n $credential_dir ]]; then
+  argv+=(--ro-bind "$credential_dir/files" /run/babysit-credentials)
+fi
 argv+=(--chdir "$cwd" -- "${command[@]}")
 if ((print)); then
   printf '%s\0' "${argv[@]}"

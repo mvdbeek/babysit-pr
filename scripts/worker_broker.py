@@ -2,7 +2,7 @@
 """Watch registration, handoff and sub-tasks for one sandbox: only its own worktrees and
 sessions.
 
-    worker_broker.py [--cwd=DIR] [--granted=FEATURES] LISTEN AGENT CONFIG_DIR [WORKTREE...]
+    worker_broker.py [--cwd=DIR] [--granted=FEATURES] [--credentials=RUN] LISTEN AGENT CONFIG_DIR [WORKTREE...]
 
 On a worker, babysit-bwrap starts this outside the sandbox and binds LISTEN inside,
 naming it in ``BABYSIT_REGISTER_SOCKET``; the sandbox never sees ``worker.json``, whose
@@ -83,6 +83,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import worker_api  # noqa: E402
+import worker_credentials  # noqa: E402
 import wt  # noqa: E402
 
 READ_TIMEOUT = 30  # For a whole request, however slowly it arrives.
@@ -546,12 +547,15 @@ def report_sessions(agent, parent, config_dir, store, proc=Path("/proc"), runnin
 def main(argv):
     argv = list(argv)
     launch = {"cwd": None, "docker": False}
+    credential_run = None
     while argv and argv[0].startswith("--"):
         name, _, value = argv.pop(0).partition("=")
         if name == "--cwd" and value.startswith("/"):
             launch["cwd"] = os.path.realpath(value)
         elif name == "--granted":
             launch["docker"] = "docker" in value.split(",")
+        elif name == "--credentials":
+            credential_run = value
         else:
             raise SystemExit(f"worker_broker: unknown option {name}")
     listen, agent, config_dir, *worktrees = argv
@@ -568,18 +572,52 @@ def main(argv):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     parent = os.getppid()
     reports = None
+    credentials = None
     server = socket.socket(socket.AF_UNIX)
+
+    def running():
+        return os.getppid() == parent
+
+    def current_session():
+        try:
+            found = (
+                running_claude_session(parent, config_dir, store)
+                if agent == "claude"
+                else running_codex_session(parent, config_dir)
+            )
+        except (OSError, ValueError, KeyError):
+            return None
+        return found[0] if found and running() else None
+
     try:
         server.bind(listen)
         server.listen()
         server.settimeout(1)
-        print("ready", flush=True)
+        if credential_run and not launch["docker"]:
+            panes = [
+                pane
+                for pane in (
+                    os.environ.get("HC_TERMINAL_ID"),
+                    os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None,
+                )
+                if pane
+            ]
+            if panes:
+                with contextlib.suppress(OSError, ValueError):
+                    vault = worker_credentials.Vault(
+                        worker_credentials.ROOT, credential_run, panes, current_session
+                    )
+                    credentials = threading.Thread(
+                        target=vault.serve, args=(_stopping, running), daemon=True
+                    )
+                    credentials.start()
+        print("ready credentials" if credentials is not None else "ready", flush=True)
         os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
         reports = threading.Thread(
             target=report_sessions, args=(agent, parent, config_dir, store), daemon=True
         )
         reports.start()
-        while os.getppid() == parent:
+        while running():
             try:
                 client, _ = server.accept()
             except TimeoutError:
@@ -596,6 +634,8 @@ def main(argv):
     finally:
         server.close()
         _stopping.set()
+        if credentials is not None:
+            credentials.join(3)
         with contextlib.suppress(OSError):
             os.unlink(listen)
         # The sandbox's session records: the directory is this launch's, and gone with it.
