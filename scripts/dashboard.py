@@ -122,6 +122,7 @@ WORKER_ACTIONS = {
     "workspace-interrupt",
     "workspace-quit",
     "workspace-agent-settings",
+    "workspace-directory-grant",
     "workspace-answer",
     "workspace-choose",
     "workspace-keys",
@@ -146,6 +147,7 @@ ACTIONS = frozenset(
         "workspace-open",
         "workspace-message",
         "workspace-credential-grant",
+        "workspace-directory-grant",
         "workspace-answer",
         "workspace-choose",
         "workspace-docker",
@@ -1149,6 +1151,8 @@ class Handler(BaseHTTPRequestHandler):
             if action in {"credential-profiles", "workspace-credential-grant"}:
                 self.credential_action(action, request)
                 return
+            if action == "workspace-directory-grant" and self.credential_home() is None:
+                return
             if action == "review-approve":
                 # This exception to provider isolation always needs real authentication,
                 # including in report mode. Worker/launch keys cannot authorize it.
@@ -1327,6 +1331,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(
                         200,
                         agent_messages.change_settings(request, self.server.home, machine=machine),
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})
+                return
+            if action == "workspace-directory-grant":
+                try:
+                    self.send_json(
+                        200, agent_messages.grant_directory(request, self.server.home, machine)
                     )
                 except (OSError, subprocess.SubprocessError) as exc:
                     self.send_json(503, {"error": f"Check the agent in Collie: {exc}"})

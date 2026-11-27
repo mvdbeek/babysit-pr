@@ -105,6 +105,7 @@ def resume_options(argv, kind, session):
         "--allow-dangerously-skip-permissions",
         "--no-alt-screen",
         "--verbose",
+        "--strict-mcp-config",
     }
     valued = {
         "--model",

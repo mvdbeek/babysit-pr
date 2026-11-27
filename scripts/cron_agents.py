@@ -380,7 +380,7 @@ def remote_checkout(job, home, machine):
     )
 
 
-def remote_command(job, machine, found, staged, effort, extra=()):
+def remote_command(job, machine, found, staged, effort, extra=(), directories=(), features=None):
     """The line typed on ``machine``: its own sandbox, with the paths its probe reported.
 
     babysit-bwrap is given the checkout, its common dir and the agent's configuration
@@ -389,7 +389,8 @@ def remote_command(job, machine, found, staged, effort, extra=()):
     before the prompt, as a resume's.
     """
     backend = BACKENDS[machine.os]
-    features = ("gpg",) if "gpg" in machine.labels else ()
+    if features is None:
+        features = ("gpg",) if "gpg" in machine.labels else ()
     confined = None
     if backend == "bwrap":
         if not found["launcher"]:
@@ -401,7 +402,9 @@ def remote_command(job, machine, found, staged, effort, extra=()):
         )
         confined = [
             own,
-            *sandbox.flags(sandbox.Grants(add_dirs=(found["path"], found["common"])), backend),
+            *sandbox.flags(
+                sandbox.Grants(add_dirs=(found["path"], found["common"], *directories)), backend
+            ),
         ]
     home = found["claude_home"] if job["agent"] == "claude" else None
     return wt.agent_command(

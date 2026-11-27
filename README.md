@@ -736,6 +736,16 @@ prevents the restart. Unknown access is shown as unavailable, never as disabled.
 Inspection requires macOS Seatbelt, so the toggle is macOS-only for now. This controls
 socket access; it does not start Docker.
 
+**Grant directory…** in a worker session's **More actions** menu gives that session
+write access to an existing directory on its Linux worker. Enter an absolute path or a
+path under `~/`; the worker checks it against the sandbox's protected paths before
+restarting the idle agent in the same pane and conversation. Existing directory grants
+and supported launch options are retained. The extra access lasts for that launch;
+resuming the session later uses the normal grants. A busy agent, unsent draft, unknown
+launch option, or a sandbox whose grants cannot be recovered prevents the restart.
+This action requires a dashboard admin, including in report mode. Restarting the sandbox
+also ends any temporary credential grants attached to the old launch.
+
 **Grant credential…** in a worker session’s **More actions** menu lets that launch
 read a gopass credential for a duration you set in minutes. In **Settings → Credentials**,
 add a profile with a gopass entry name and choose its password line or entire entry.

@@ -350,7 +350,8 @@ header p {
 }
 #settings-dialog,
 #credential-settings,
-#credential-grant {
+#credential-grant,
+#directory-grant {
   width: 560px;
 }
 .settings-field {
@@ -363,7 +364,8 @@ header p {
   font-weight: 600;
 }
 .settings-field select,
-#credential-settings .settings-field input {
+#credential-settings .settings-field input,
+#directory-grant .settings-field input {
   flex: 1;
   max-width: none;
   min-width: 0;
