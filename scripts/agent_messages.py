@@ -793,6 +793,8 @@ def grant_directory(request, home, machine):
     expected = found["claude_home"] if target["agent"] == "claude" else found["codex_home"]
     if config != expected:
         raise ValueError("Cannot preserve this agent's configuration; nothing was stopped")
+    if process.get("cwd") != found["cwd"]:
+        raise ValueError("Cannot preserve this agent's working directory; nothing was stopped")
     for existing in directories:
         remote_probe.call(
             home, machine, "directory_grant", 30, path=existing, babysit_root=machine.babysit_root

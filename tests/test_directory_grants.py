@@ -91,7 +91,7 @@ def test_directory_grant_checks_before_restart(monkeypatch):
         "inspect",
         lambda *a: (
             {"agent_session": {"value": "s"}},
-            {"foreground_processes": [{"pid": 7, "argv": ["codex"]}]},
+            {"foreground_processes": [{"pid": 7, "argv": ["codex"], "cwd": "/work"}]},
             {},
         ),
     )
@@ -102,7 +102,9 @@ def test_directory_grant_checks_before_restart(monkeypatch):
     )
     monkeypatch.setattr(agent_messages, "workspace_root", lambda *a: "/work")
     monkeypatch.setattr(agent_messages, "recorded", lambda *a: [{"id": "s", "agent": "codex"}])
-    monkeypatch.setattr(agent_messages, "remote_resume", lambda *a: {"codex_home": "/config"})
+    monkeypatch.setattr(
+        agent_messages, "remote_resume", lambda *a: {"codex_home": "/config", "cwd": "/work"}
+    )
     monkeypatch.setattr(
         agent_messages, "remote_command", lambda *a: calls.append(("command", a[-1])) or "command"
     )
