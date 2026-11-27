@@ -1499,6 +1499,8 @@ def answer_steps(questions, answers, agent="claude"):
         if not isinstance(given, dict) or set(given) - {"options", "text"} or len(given) != 1:
             raise ValueError("Choose options or write an answer for each question")
         if "text" in given:
+            if agent == "claude" and any(o.get("preview") for o in question["options"]):
+                raise ValueError("This Claude dialog does not offer a typed answer; use Collie")
             text = given["text"]
             text = squash(clean(text)) if isinstance(text, str) else ""
             if question["multi"] or not text or len(text) > MAX_ANSWER:

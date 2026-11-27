@@ -1293,6 +1293,7 @@
         }
         item.append(node("strong", option.label));
         if (option.description) item.append(" ", node("span", option.description, "pr-meta"));
+        if (option.preview) item.append(markdown(option.preview, "ws-option-preview ws-md"));
         list.append(item);
       }
       if (question.options.length) section.append(list);
@@ -1335,12 +1336,18 @@
         text.append(option.label);
         if (option.description) text.append(" ", node("small", option.description, "pr-meta"));
         label.append(input, text);
-        set.append(label);
+        const choiceBox = node("div", undefined, "ws-answer-choice");
+        choiceBox.append(label);
+        if (option.preview) choiceBox.append(markdown(option.preview, "ws-option-preview ws-md"));
+        set.append(choiceBox);
         return input;
       });
       let other = null;
       let text = null;
-      if (!question.multi) {
+      if (
+        !question.multi &&
+        !(entry.name === "AskUserQuestion" && question.options.some((o) => o.preview))
+      ) {
         const label = node("label", undefined, "ws-answer-other");
         other = document.createElement("input");
         other.type = "radio";

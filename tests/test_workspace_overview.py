@@ -3869,6 +3869,13 @@ def test_a_dialog_is_answered_for_a_session_recorded_in_another_directory(asking
     assert keys_sent(state) == [["2"], ["1"], ["3"], ["right"], ["1"]]
 
 
+def test_claude_preview_question_rejects_typed_answer():
+    question = {"multi": False, "options": [{"label": "One", "preview": "Example"}]}
+    with pytest.raises(ValueError, match="does not offer a typed answer"):
+        agent_messages.answer_steps([question], [{"text": "Other"}])
+    assert agent_messages.answer_steps([question], [{"options": [0]}]) == [[("key", "1")]]
+
+
 @pytest.mark.parametrize("prefix", ["", "-- "])
 def test_a_typed_answer_goes_through_the_type_something_option(asking, prefix):
     import agent_messages
