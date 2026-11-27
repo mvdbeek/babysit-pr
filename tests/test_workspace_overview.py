@@ -1996,6 +1996,18 @@ def test_quit_types_exit_into_an_idle_claude_and_sees_it_leave(quitting):
     assert calls(quitting, ["pane", "close"]) == []
 
 
+def test_quit_finds_the_agent_by_argv_where_herdr_reports_no_argv0(quitting):
+    # herdr on Linux lists a process by argv and name only, the agent inside its sandbox.
+    data = read(quitting)
+    data["process_info"]["w1:p2"]["foreground_processes"] = [
+        {"pid": 4240, "name": "bwrap", "argv": ["bwrap", "--", "claude"], "cwd": "/src/w"},
+        {"pid": 4242, "name": "claude", "argv": ["claude", "--resume", "s1"], "cwd": "/src/w"},
+    ]
+    quitting.write_text(json.dumps(data))
+    assert agent_messages.exit_agent(stop_request())["quit"] is True
+    assert read(quitting)["typed_text"] == [["w1:p2", "/exit"]]
+
+
 def test_quit_closes_the_shell_left_in_a_pane_split_off_for_an_agent(quitting):
     import agent_messages
     import cron_agents
@@ -2704,6 +2716,52 @@ def test_a_settings_change_resumes_the_session_in_its_pane_with_them(adjusting):
     agent = data["agents"][0]
     assert agent["pane_id"] == "w1:p2"
     assert agent["argv"] == ["--model", "opus", "--effort", "high", "--resume", sid]
+
+
+def test_a_settings_change_keeps_the_grants_of_its_bwrap_sandbox(adjusting, tmp_path, monkeypatch):
+    state, sid, checkout, home = adjusting
+    root = tmp_path / "sandbox-cache"
+    (root / "index/keys").mkdir(parents=True)
+    (root / "index/keys/0123456789abcdef").write_text("grants docker,gpg\n")
+    monkeypatch.setattr(agent_messages.remote_probe, "SANDBOX_CACHE", str(root))
+    monkeypatch.setattr(agent_messages.sys, "platform", "linux")
+    cache = str(root / "0123456789abcdef")
+    data = read(state)
+    data["process_info"]["w1:p2"]["foreground_processes"].insert(
+        0, {"pid": 4240, "name": "bwrap", "argv": ["bwrap", "--bind", cache, cache, "--", "claude"]}
+    )
+    state.write_text(json.dumps(data))
+    seen = {}
+    real = agent_messages.wt.agent_command
+
+    def agent_command(*args, **options):
+        seen.update(docker=options.get("docker"), features=options.get("features"))
+        return real(*args, **options)
+
+    monkeypatch.setattr(agent_messages.wt, "agent_command", agent_command)
+    assert agent_messages.change_settings(settings_request(sid), home)["changed"] is True
+    assert seen == {"docker": True, "features": ("gpg",)}
+
+
+def test_bwrap_grants_come_only_from_the_record_of_the_cache_it_binds(tmp_path, monkeypatch):
+    root = tmp_path / "sandbox-cache"
+    (root / "index/keys").mkdir(parents=True)
+    (root / "index/keys/aaaaaaaaaaaaaaaa").write_text("configuration /x\ngrants gpg\n")
+    monkeypatch.setattr(agent_messages.remote_probe, "SANDBOX_CACHE", str(root))
+
+    def procs(*argv):
+        return {"foreground_processes": [{"name": "bwrap", "argv": ["bwrap", *argv]}]}
+
+    cache = str(root / "aaaaaaaaaaaaaaaa")
+    assert agent_messages.bwrap_grants(procs("--bind", cache, cache)) == {"gpg"}
+    # A bind elsewhere, an unrecorded cache, or no sandbox at all grants nothing.
+    assert (
+        agent_messages.bwrap_grants(procs("--bind", "/x/aaaaaaaaaaaaaaaa", "/x/aaaaaaaaaaaaaaaa"))
+        == set()
+    )
+    other = str(root / "bbbbbbbbbbbbbbbb")
+    assert agent_messages.bwrap_grants(procs("--bind", other, other)) == set()
+    assert agent_messages.bwrap_grants({"foreground_processes": [{"argv": ["claude"]}]}) == set()
 
 
 def test_a_settings_change_is_refused_before_quitting_a_busy_or_unknown_choice(adjusting):

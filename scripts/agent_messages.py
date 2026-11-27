@@ -589,7 +589,7 @@ def change_settings(request, home=None, machine=None):
     Neither agent changes them in a running session from its command line, so the agent
     is quit as its own exit does (``exit_agent``, which refuses a busy one) and its
     session resumed in the same pane with them (``resume``). An empty value is the
-    agent's configured default. Docker access an agent here has is kept.
+    agent's configured default. Docker access and signing an agent here has are kept.
 
     An ``account`` names the Claude login to continue on, of this machine
     (``claude_accounts``) or of the worker the agent runs on; empty keeps the one it runs
@@ -619,10 +619,17 @@ def change_settings(request, home=None, machine=None):
         # Refused here, before the quit, when the account cannot take the session.
         move = account_move(session, account, home, machine, move=False)
     docker = False
+    features: tuple[str, ...] = ()
     if machine is None and sys.platform == "darwin":
         # Safehouse's grant, read as a move reads it; unknown access is not granted again.
         with contextlib.suppress(ValueError, RuntimeError, OSError, subprocess.SubprocessError):
             docker = agent_docker.has_access(agent_docker.inspect(target)[3]["pid"])
+    elif machine is None:
+        # babysit-bwrap's grants, as its cache's record names them; unknown ones are not.
+        with contextlib.suppress(ValueError, RuntimeError, OSError, subprocess.SubprocessError):
+            granted = bwrap_grants(herdr_handoff.inspect(pane)[1])
+            docker = "docker" in granted
+            features = tuple(name for name in ("gpg",) if name in granted)
     quit_ = exit_agent(
         {"workspace": request["workspace"], "pane": pane, "session": session},
         home,
@@ -641,7 +648,12 @@ def change_settings(request, home=None, machine=None):
         if machine is not None:
             # The worker's listing names the account a resume types; read it again.
             workspace_viewer.forget_remote_sessions(machine)
-    settings = {"model": request["model"], "effort": request["effort"], "docker": docker}
+    settings = {
+        "model": request["model"],
+        "effort": request["effort"],
+        "docker": docker,
+        "features": features,
+    }
     try:
         resumed = resume(
             request["workspace"],
@@ -659,6 +671,31 @@ def change_settings(request, home=None, machine=None):
         "pane": resumed.get("pane"),
         "warning": warned(resumed, moved).get("warning"),
     }
+
+
+def bwrap_grants(procs):
+    """The grants (``docker``, ``gpg``) of the babysit-bwrap sandbox among a pane's
+    foreground processes, as the index of the cache it binds records them: babysit-bwrap
+    writes that record at the launch, where no sandbox can reach it. Empty when no
+    process is such a sandbox, or its cache has no record."""
+    root = os.path.realpath(os.path.expanduser(remote_probe.SANDBOX_CACHE))
+    for process in procs.get("foreground_processes") or []:
+        argv = process.get("argv") or []
+        if herdr_handoff.program(process) != "bwrap":
+            continue
+        for option, source, target in zip(argv, argv[1:], argv[2:], strict=False):
+            parent, key = os.path.split(source)
+            if option != "--bind" or source != target or parent != root:
+                continue
+            if not remote_probe.CACHE_KEY.fullmatch(key):
+                continue
+            try:
+                with open(os.path.join(root, "index", "keys", key)) as stream:
+                    fields = dict(line.rstrip("\n").split(" ", 1) for line in stream if " " in line)
+            except OSError:
+                return set()
+            return {name for name in fields.get("grants", "-").split(",") if name != "-"}
+    return set()
 
 
 def accounts(home=None, machine=None):
@@ -881,8 +918,8 @@ def exit_agent(request, home=None, *, stop=True, machine=None):
             p
             for p in procs["foreground_processes"]
             # herdr on Linux names a worker's process by its argv alone.
-            if (herdr_handoff.program(p) if machine else Path(p.get("argv0", "")).name)
-            == herdr_handoff.AGENTS[kind]["process"]
+            # herdr on Linux reports no argv0, here or on a worker: its argv names it.
+            if herdr_handoff.program(p) == herdr_handoff.AGENTS[kind]["process"]
         ]
         if info.get("agent") != kind or len(matches) != 1:
             raise ValueError("Could not identify the agent's process; nothing was sent")
@@ -1907,7 +1944,7 @@ def resume(
     its file written back first (``workspace_viewer.restore``), and the result says it
     was ``restored``. A ``machine`` names the worker it all is
     on: its herdr, its session listing and its own paths, which its probe reports.
-    ``agent_options`` (``model``, ``effort``, ``docker``) keep a resume on the settings
+    ``agent_options`` (``model``, ``effort``, ``docker``, ``features``) keep a resume on the settings
     the session ran with on another machine (``workspace_move``), or new ones
     (``change_settings``). ``into`` is the pane its agent was just quit in: the session
     resumes in that pane's shell while it is open, and other agents may run beside it.
@@ -2244,6 +2281,7 @@ def launch(
             extra=[*options, *RESUME[chosen["agent"]], chosen["id"]],
             stage=lambda _: str(local),
             docker=bool(settings.get("docker")),
+            features=tuple(settings.get("features") or ()),
             worktree=worktree,
             sandbox_config_dir=chosen.get("claude_config_dir"),
         )
