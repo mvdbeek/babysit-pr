@@ -3114,6 +3114,35 @@ def _host_realpath(path):
     return {"path": os.path.realpath(os.path.expanduser(path))}
 
 
+def _host_directory_grant(path, babysit_root):
+    """Validate a directory with the same policy the worker's launcher enforces."""
+    _arg_paths([path, babysit_root], home=True)
+    if CONTROL.search(path) or ":" in path:
+        raise ValueError("The directory path contains an unsupported character")
+    path = os.path.realpath(os.path.expanduser(path))
+    if CONTROL.search(path) or ":" in path:
+        raise ValueError("The resolved directory path contains an unsupported character")
+    if not os.path.isdir(path):
+        raise ValueError("The directory does not exist on the worker")
+    launcher = os.path.join(
+        os.path.realpath(os.path.expanduser(babysit_root)), "scripts", "babysit-bwrap"
+    )
+    if not os.access(launcher, os.X_OK):
+        raise ValueError("babysit-bwrap is not installed on the worker")
+    result = subprocess.run(
+        [launcher, "--print-argv", "--add-dirs=" + path, "--", "true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode:
+        raise ValueError(
+            "The worker's sandbox refused that directory: " + result.stderr.strip()[:1000]
+        )
+    return {"path": path}
+
+
 def _host_resume(root, cwd, agent, account, babysit_root, sandbox):
     """What the line resuming a session in the checkout ``root`` needs on this machine.
 
@@ -4898,6 +4927,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "remove": _host_remove,
     "resume": _host_resume,
     "realpath": _host_realpath,
+    "directory_grant": _host_directory_grant,
     "diff": _host_diff,
     "bases": _host_bases,
     "sessions": _host_sessions,
@@ -5914,6 +5944,7 @@ VALIDATORS = {
     "remove": validate_remove,
     "resume": validate_resume,
     "realpath": validate_realpath,
+    "directory_grant": validate_realpath,
     "diff": validate_diff,
     "bases": validate_bases,
     "sessions": validate_sessions,

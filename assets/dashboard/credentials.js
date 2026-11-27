@@ -12,6 +12,37 @@
   const settingsStatus = byId("settings-status");
   const grantStatus = byId("grant-status");
   let target = null;
+  let directoryTarget = null;
+  const directoryDialog = document.getElementById("directory-grant");
+  const directoryForm = document.getElementById("directory-grant-form");
+  const directoryStatus = document.getElementById("directory-grant-status");
+  const directoryClose = document.getElementById("directory-grant-close");
+  let directorySaving = false;
+  directoryClose.onclick = () => directoryDialog.close();
+  directoryDialog.addEventListener("cancel", (event) => {
+    if (directorySaving) event.preventDefault();
+  });
+  directoryForm.onsubmit = async (event) => {
+    event.preventDefault();
+    directorySaving = true;
+    directoryClose.disabled = directoryForm.querySelector('button[type="submit"]').disabled = true;
+    directoryStatus.textContent = "Restarting the agent…";
+    try {
+      const value = await request("workspace-directory-grant", {
+        ...directoryTarget,
+        directory: document.getElementById("directory-grant-path").value.trim(),
+      });
+      directoryStatus.textContent =
+        value.warning ||
+        (value.changed ? "Directory access granted." : "The agent was not restarted.");
+    } catch (error) {
+      directoryStatus.textContent = error.message;
+    } finally {
+      directorySaving = false;
+      directoryClose.disabled = directoryForm.querySelector('button[type="submit"]').disabled =
+        false;
+    }
+  };
 
   async function request(action, body) {
     let response;
@@ -28,7 +59,7 @@
       );
     } catch {
       throw Error(
-        action === "workspace-credential-grant"
+        ["workspace-credential-grant", "workspace-directory-grant"].includes(action)
           ? "The connection dropped. Check the session before granting access again."
           : "Could not reach the dashboard.",
       );
@@ -106,6 +137,13 @@
   };
 
   window.dashboardCredentials = {
+    grantDirectory(recipient, label) {
+      directoryTarget = recipient;
+      directoryForm.reset();
+      directoryStatus.textContent = "";
+      document.getElementById("directory-grant-target").textContent = `Grant access to ${label}.`;
+      directoryDialog.showModal();
+    },
     async grant(recipient, label) {
       target = recipient;
       grantForm.hidden = true;

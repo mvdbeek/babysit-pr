@@ -2342,6 +2342,19 @@
           `${name} on ${worker}`,
         );
       menu.push(grant);
+      const directory = button(
+        "directory-grant",
+        "Grant directory…",
+        "ws-move",
+        `Grant directory access to ${name}`,
+        "Restart this idle worker session with access to a directory",
+      );
+      directory.onclick = () =>
+        window.dashboardCredentials.grantDirectory(
+          { workspace: viewer.entry.workspace, pane: agent.pane, session: agent.session },
+          `${name} on ${worker}`,
+        );
+      menu.push(directory);
     }
     buttons.push(agentMenu(agent, menu));
     const holder = node("span", undefined, "ws-live-actions");

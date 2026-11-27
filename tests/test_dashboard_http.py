@@ -93,6 +93,7 @@ def test_credentials_require_an_admin_even_in_report_mode(serve, tmp_path):
     assert get(server, f"/api/{action}", headers)[0] == 403
     assert credential_post(server, action, body, headers)[0] == 403
     assert credential_post(server, "workspace-credential-grant", {}, headers)[0] == 403
+    assert credential_post(server, "workspace-directory-grant", {}, headers)[0] == 403
     assert not (auth.store.home / credential_profiles.PROFILES).exists()
 
 

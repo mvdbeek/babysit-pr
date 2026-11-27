@@ -6605,6 +6605,33 @@ def test_grant_temporary_credential_to_a_worker_session(
     ]
 
 
+def test_grant_directory_to_a_worker_session(page, dashboard_site, viewer_routes, workspace_routes):
+    url, _ = dashboard_site
+    workspace_routes[0]["matches"][0]["workspace_id"] = "mini/w1"
+    viewer_routes["agents"] = [
+        {"pane": "w1:p2", "agent": "codex", "status": "idle", "session": "s1"}
+    ]
+    grants = []
+
+    def grant(route):
+        assert route.request.headers["x-babysit-action"] == "workspace-directory-grant"
+        grants.append(route.request.post_data_json)
+        route.fulfill(json={"changed": True, "pane": "w1:p2", "warning": None})
+
+    page.route("**/api/workspace-directory-grant", grant)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_role("button", name="More actions for Codex in w1:p2").click()
+    page.get_by_role("button", name="Grant directory access to Codex in w1:p2").click()
+    dialog = page.get_by_role("dialog", name="Grant directory access")
+    dialog.get_by_label("Directory on the worker").fill("/home/u/data")
+    dialog.get_by_role("button", name="Restart and grant access").click()
+    expect(dialog.get_by_role("status")).to_have_text("Directory access granted.")
+    assert grants == [
+        {"workspace": "mini/w1", "pane": "w1:p2", "session": "s1", "directory": "/home/u/data"}
+    ]
+
+
 def test_transcript_offers_change_agent_in_its_checkout(page, dashboard_site, viewer_routes):
     url, _ = dashboard_site
     viewer_routes["agents"] = [

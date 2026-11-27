@@ -383,6 +383,29 @@
       </form>
       <p id="credential-grant-status" class="notifications-caption" role="status"></p>
     </dialog>
+    <dialog id="directory-grant" aria-labelledby="directory-grant-title">
+      <div class="dialog-header">
+        <div class="notifications-heading">
+          <h2 id="directory-grant-title">Grant directory access</h2>
+          <button id="directory-grant-close" type="button" aria-label="Close directory grant">
+            ×
+          </button>
+        </div>
+      </div>
+      <p id="directory-grant-target" class="notifications-caption"></p>
+      <form id="directory-grant-form">
+        <div class="settings-field">
+          <label for="directory-grant-path">Directory on the worker</label>
+          <input id="directory-grant-path" required placeholder="/home/user/data" />
+        </div>
+        <p class="notifications-caption">
+          The idle agent will restart in the same session with write access to this directory until
+          it exits.
+        </p>
+        <div class="settings-actions"><button type="submit">Restart and grant access</button></div>
+      </form>
+      <p id="directory-grant-status" class="notifications-caption" role="status"></p>
+    </dialog>
     <dialog id="shortcuts-dialog" aria-labelledby="shortcuts-title">
       <div class="dialog-header">
         <div class="notifications-heading">

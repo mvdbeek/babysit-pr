@@ -673,6 +673,164 @@ def change_settings(request, home=None, machine=None):
     }
 
 
+def worker_sandbox_options(procs, kind, session):
+    """Recover the writable binds and agent arguments from a babysit-bwrap launch."""
+    processes = procs.get("foreground_processes") or []
+    agents = [p for p in processes if herdr_handoff.program(p) == kind]
+    wrappers = [p for p in processes if herdr_handoff.program(p) == "bwrap"]
+    if len(agents) != 1 or len(wrappers) != 1:
+        raise ValueError("Cannot inspect this agent's sandbox; nothing was stopped")
+    argv = wrappers[0].get("argv") or []
+    known_environment = {
+        "PATH",
+        "HOME",
+        "TERM",
+        "LANG",
+        "USER",
+        "XDG_CACHE_HOME",
+        "UV_CACHE_DIR",
+        "UV_TOOL_DIR",
+        "UV_TOOL_BIN_DIR",
+        "PIP_CACHE_DIR",
+        "npm_config_cache",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "PLANEMO_GLOBAL_WORKSPACE",
+        "CONDA_PKGS_DIRS",
+        "PLANEMO_CONDA_PREFIX",
+        "GALAXY_CONFIG_CONDA_PREFIX",
+        "BABYSIT_ARTIFACT_DIR",
+        "BABYSIT_SCRATCH",
+        "GALAXY_VIRTUAL_ENV",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "GNUPGHOME",
+        "DOCKER_HOST",
+        "BABYSIT_WORKER",
+        "BABYSIT_REGISTER_SOCKET",
+    }
+    if any(
+        argv[i] == "--setenv" and argv[i + 1] not in known_environment for i in range(len(argv) - 1)
+    ):
+        raise ValueError("Cannot preserve this sandbox's environment; nothing was stopped")
+    # The launcher places its cache bind immediately before its configuration and
+    # explicit directory binds. Its first tmpfs marks the end of that group.
+    start = next(
+        (
+            i + 3
+            for i in range(len(argv) - 2)
+            if argv[i] == "--bind"
+            and argv[i + 1] == argv[i + 2]
+            and re.search(r"/\.cache/babysit-sandbox/[0-9a-f]{16}$", argv[i + 1])
+        ),
+        None,
+    )
+    if start is None or "--tmpfs" not in argv[start:]:
+        raise ValueError("Cannot recover the sandbox's directory grants; nothing was stopped")
+    end = argv.index("--tmpfs", start)
+    binds = [argv[i + 2] for i in range(start, end - 2) if argv[i] in {"--bind", "--bind-fd"}]
+    if not binds:
+        raise ValueError("Cannot recover the sandbox's configuration; nothing was stopped")
+    options = agent_docker.resume_options(agents[0]["argv"], kind, session)
+    if any(
+        word == "--permission-mode" or word.startswith("--permission-mode=") for word in options
+    ):
+        raise ValueError("Cannot preserve this agent's permission mode; nothing was stopped")
+    # The launcher supplies this flag again on every launch.
+    options = [
+        word
+        for word in options
+        if word
+        not in {"--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox"}
+    ]
+    features = tuple(
+        name
+        for name, variable in (("docker", "DOCKER_HOST"), ("gpg", "GNUPGHOME"))
+        if "--setenv" in argv
+        and any(argv[i] == "--setenv" and argv[i + 1] == variable for i in range(len(argv) - 1))
+    )
+    return binds[0], binds[1:], options, features
+
+
+def grant_directory(request, home, machine):
+    """Restart one idle Linux worker session with an additional writable directory."""
+    keys = {"workspace", "pane", "session", "directory"}
+    if set(request) != keys or not all(isinstance(request[k], str) and request[k] for k in keys):
+        raise ValueError("Choose a running session and a directory")
+    if machine is None or machine.os != "linux":
+        raise ValueError("Directory grants require a Linux worker session")
+    pane, session = request["pane"], request["session"]
+    target = next(
+        (
+            a
+            for a in agents(request["workspace"], machine=machine)
+            if a["pane"] == pane and a.get("session") == session
+        ),
+        None,
+    )
+    if target is None or target.get("agent") not in RESUME:
+        raise ValueError("That session is no longer running in this pane; refresh")
+    directory = remote_probe.call(
+        home,
+        machine,
+        "directory_grant",
+        30,
+        path=request["directory"],
+        babysit_root=machine.babysit_root,
+    )["path"]
+    info, procs, _ = herdr_handoff.inspect(pane, machine)
+    if (info.get("agent_session") or {}).get("value") != session:
+        raise ValueError("The agent changed; refresh")
+    config, directories, options, features = worker_sandbox_options(procs, target["agent"], session)
+    process = next(
+        p for p in procs["foreground_processes"] if herdr_handoff.program(p) == target["agent"]
+    )
+    expected_process = (process["pid"], process["argv"])
+    root = workspace_root(request["workspace"], machine)
+    chosen = next((s for s in recorded(root, home, machine) if s["id"] == session), None)
+    if not chosen:
+        raise ValueError("The session is not recorded yet; nothing was stopped")
+    found = remote_resume(home, machine, root, chosen)
+    expected = found["claude_home"] if target["agent"] == "claude" else found["codex_home"]
+    if config != expected:
+        raise ValueError("Cannot preserve this agent's configuration; nothing was stopped")
+    for existing in directories:
+        remote_probe.call(
+            home, machine, "directory_grant", 30, path=existing, babysit_root=machine.babysit_root
+        )
+    # Check length and argument safety before quitting the running process.
+    settings = {
+        "directories": [*directories, directory],
+        "launch_options": options,
+        "docker": "docker" in features,
+        "features": tuple(f for f in features if f != "docker"),
+    }
+    command = remote_command(machine, chosen, found, "", None, settings)
+    if len(command.encode()) > wt.TYPED_LIMIT:
+        raise ValueError("The restart command is too long; nothing was stopped")
+    quit_ = exit_agent(
+        {k: request[k] for k in ("workspace", "pane", "session")},
+        home,
+        stop=False,
+        machine=machine,
+        expected_process=expected_process,
+    )
+    if not quit_["quit"]:
+        return {"changed": False, "pane": pane, "warning": quit_["warning"]}
+    try:
+        result = resume(
+            request["workspace"],
+            session,
+            "",
+            home,
+            machine=machine,
+            agent_options=settings,
+            into=pane,
+        )
+    except ValueError as exc:
+        raise ValueError(f"The agent quit, but its session did not resume: {exc}") from exc
+    return {"changed": True, "pane": result.get("pane"), "warning": result.get("warning")}
+
+
 def bwrap_grants(procs):
     """The grants (``docker``, ``gpg``) of the babysit-bwrap sandbox among a pane's
     foreground processes, as the index of the cache it binds records them: babysit-bwrap
@@ -878,7 +1036,7 @@ def interrupt(request, machine=None):
     return {"stopped": True, "pane": pane, "warning": None}
 
 
-def exit_agent(request, home=None, *, stop=True, machine=None):
+def exit_agent(request, home=None, *, stop=True, machine=None, expected_process=None):
     """Quit the agent of a pane as its own exit does, keeping its session.
 
     The pane's shell stays, unless babysit split the pane off for the agent
@@ -929,6 +1087,11 @@ def exit_agent(request, home=None, *, stop=True, machine=None):
             )
         if not isinstance(matches[0].get("argv"), list):
             raise ValueError("Could not identify the agent's process; nothing was sent")
+        if (
+            expected_process is not None
+            and (matches[0].get("pid"), matches[0].get("argv")) != expected_process
+        ):
+            raise ValueError("The agent changed before restart; nothing was sent")
         return (
             target,
             info,
@@ -2221,7 +2384,9 @@ def remote_command(machine, chosen, found, text, staged, agent_options=None):
         found,
         staged,
         options.get("effort") or "",
-        extra=[*RESUME[chosen["agent"]], chosen["id"]],
+        extra=[*options.get("launch_options", ()), *RESUME[chosen["agent"]], chosen["id"]],
+        directories=options.get("directories", ()),
+        features=options.get("features"),
     )
 
 
