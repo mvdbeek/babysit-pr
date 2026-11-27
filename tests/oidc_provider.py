@@ -2,7 +2,9 @@
 
 It runs on a free loopback port, signs ID tokens with RSA keys made by ``cryptography``,
 checks the client secret, the redirect URI and the PKCE verifier, and lets a test
-rotate keys or bend any claim. It never contacts a real identity provider.
+rotate keys or bend any claim. Like Cloudflare's browser integrity check in front of
+the real Keycloak, it answers 403 to urllib's default User-Agent. It never contacts a
+real identity provider.
 """
 
 import base64
@@ -129,7 +131,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def blocked(self):
+        """Cloudflare answers 403 "error code: 1010" to ``Python-urllib/3.x``."""
+        if self.headers.get("User-Agent", "").startswith("Python-urllib"):
+            self.reply(403)
+            return True
+        return False
+
     def do_GET(self):
+        if self.blocked():
+            return
         provider = self.server
         route = urlsplit(self.path)
         base = provider.issuer
@@ -176,6 +187,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.reply(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self.blocked():
+            return
         provider = self.server
         if urlsplit(self.path).path != "/realms/test/token":
             self.reply(404, {"error": "not_found"})
