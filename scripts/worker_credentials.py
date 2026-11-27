@@ -22,7 +22,11 @@ MAX_REQUEST = 2 * MAX_SECRET
 REVOKED_TTL = 60  # Keep cancelled IDs through any delayed SSH delivery.
 GRANT_ID = re.compile(r"[0-9a-f]{32}")
 RUN_ID = re.compile(r"[A-Za-z0-9]{10}")
-UNAVAILABLE = "This session needs a fresh sandboxed launch on an updated Linux worker"
+UNAVAILABLE = (
+    "Could not grant access to this session. Make sure the Linux worker is up to date, "
+    "then quit the agent and resume the conversation in a sandbox with Docker access off. "
+    "Try granting the credential again."
+)
 
 
 def valid_duration(minutes: object) -> bool:
