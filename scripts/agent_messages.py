@@ -677,10 +677,14 @@ def worker_sandbox_options(procs, kind, session):
     """Recover the writable binds and agent arguments from a babysit-bwrap launch."""
     processes = procs.get("foreground_processes") or []
     agents = [p for p in processes if herdr_handoff.program(p) == kind]
-    wrappers = [p for p in processes if herdr_handoff.program(p) == "bwrap"]
+    # With --unshare-pid, bwrap stays outside the namespace and forks a copy of itself as
+    # its init, so one sandbox is two bwrap processes with the same command line.
+    wrappers = {
+        tuple(p.get("argv") or ()) for p in processes if herdr_handoff.program(p) == "bwrap"
+    }
     if len(agents) != 1 or len(wrappers) != 1:
         raise ValueError("Cannot inspect this agent's sandbox; nothing was stopped")
-    argv = wrappers[0].get("argv") or []
+    argv = list(next(iter(wrappers)))
     known_environment = {
         "PATH",
         "HOME",

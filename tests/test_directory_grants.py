@@ -70,6 +70,14 @@ def test_recover_launch_directory_grants_and_options():
         ["--model", "example"],
         ("docker",),
     )
+    # bwrap's init in the new PID namespace is a second process with the same argv.
+    wrapper = procs["foreground_processes"][0]
+    procs["foreground_processes"].insert(1, {"argv": list(wrapper["argv"])})
+    assert agent_messages.worker_sandbox_options(procs, "codex", "session")[1] == ["/work", "/data"]
+    procs["foreground_processes"][1]["argv"].append("--other")
+    with pytest.raises(ValueError, match="Cannot inspect"):
+        agent_messages.worker_sandbox_options(procs, "codex", "session")
+    del procs["foreground_processes"][1]
     procs["foreground_processes"][0]["argv"].remove("--tmpfs")
     with pytest.raises(ValueError, match="Cannot recover"):
         agent_messages.worker_sandbox_options(procs, "codex", "session")
