@@ -490,3 +490,96 @@ def test_a_workspace_resolved_as_closed_is_not_looked_up_again(monkeypatch):
     # Before: None also meant "not resolved", so a closed workspace was looked up twice.
     assert messages.docker_status("w1", None) == []
     assert messages.agents("w1", live=None) == []
+
+
+def credential_grant(rig, tmp_path, read=lambda: b"fixture-secret"):
+    (tmp_path / "auth").mkdir(mode=0o700, exist_ok=True)
+    return messages.grant_credential(
+        {"workspace": "w1", "pane": "w1:p1", "session": SID},
+        tmp_path,
+        tmp_path / "auth",
+        5,
+        read,
+        lambda path: f"Read {path}",
+    )
+
+
+def grant_files(tmp_path):
+    return sorted((tmp_path / "auth").glob("credential-grants/*"))
+
+
+@pytest.fixture
+def credential_rig(rig, monkeypatch):
+    watched = []
+    monkeypatch.setattr(messages.host_credentials, "watch", lambda *a: watched.append(a))
+    rig.checks = []
+
+    def checks(pid, pairs):
+        rig.checks.append(pairs)
+        return [0 for _ in pairs]
+
+    monkeypatch.setattr(docker, "sandbox_checks", checks)
+    rig.watched = watched
+    return rig
+
+
+def test_a_credential_grant_restarts_the_agent_with_its_directory_read_only(
+    credential_rig, tmp_path
+):
+    rig = credential_rig
+    assert credential_grant(rig, tmp_path) == {"pane": "w1:p1", "warning": None}
+    (credential,) = (tmp_path / "auth").glob("credential-grants/*/credential")
+    assert credential.read_bytes() == b"fixture-secret"
+    assert credential.stat().st_mode & 0o777 == 0o400
+    assert credential.parent.parent.stat().st_mode & 0o777 == 0o700
+    command = rig.calls[-1][-1]
+    assert rig.calls[-1][:4] == ("herdr", "pane", "run", "w1:p1")
+    assert f"--add-dirs-ro={credential.parent} -- {rig.kind} " in command
+    assert "--enable=docker" not in command and SID in command and "$(cat" in command
+    assert "fixture-secret" not in command
+    # The restarted agent's own sandbox is asked whether it can read the file.
+    assert rig.checks == [[(b"file-read-data", str(credential))]]
+    assert rig.watched and rig.watched[0][0] == tmp_path / "auth"
+
+
+def test_a_credential_grant_drops_the_previous_grant_of_a_restarted_launch(
+    credential_rig, tmp_path
+):
+    rig = credential_rig
+    old = f"--add-dirs-ro=/Users/me/.config/babysit-pr-auth/credential-grants/{'a' * 32}"
+    rig.procs["foreground_processes"][0]["argv"][2:2] = [old, "--add-dirs-ro=/opt/data"]
+    credential_grant(rig, tmp_path)
+    command = rig.calls[-1][-1]
+    assert old not in command and "--add-dirs-ro=/opt/data" in command
+    assert command.count("credential-grants") == 1
+
+
+@pytest.mark.parametrize("problem", ["docker", "read", "working", "unrecorded"])
+def test_a_refused_credential_grant_leaves_the_agent_and_no_file(
+    credential_rig, tmp_path, monkeypatch, problem
+):
+    rig = credential_rig
+    read = lambda: b"fixture-secret"  # noqa: E731
+    if problem == "docker":
+        rig.access = True
+    elif problem == "read":
+
+        def read():
+            raise ValueError("Could not read the gopass entry on the dashboard host")
+
+    elif problem == "working":
+        rig.info["agent_status"] = "working"
+    else:
+        monkeypatch.setattr(messages.workspace_viewer, "sessions", lambda root: [])
+    with pytest.raises(ValueError):
+        credential_grant(rig, tmp_path, read)
+    assert not rig.calls
+    assert not grant_files(tmp_path)
+
+
+def test_an_unconfirmed_credential_read_is_reported(credential_rig, tmp_path, monkeypatch):
+    monkeypatch.setattr(docker, "sandbox_checks", lambda pid, pairs: [1])
+    value = credential_grant(credential_rig, tmp_path)
+    assert "Could not confirm" in value["warning"]
+    # The agent may still run with the grant: the file stays until it expires.
+    assert len(grant_files(tmp_path)) == 2

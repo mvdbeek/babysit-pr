@@ -34,6 +34,7 @@ import browser_extension
 import credential_profiles
 import dashboard_auth
 import dashboard_settings
+import host_credentials
 import llm_usage
 import machines
 import placement
@@ -603,6 +604,9 @@ class DashboardServer(ThreadingHTTPServer):
         )
         # None while auth is off: every request is answered as before Phase 1.
         self.auth = auth
+        if auth and sys.platform == "darwin":
+            # Expire the credential grants a previous run of the dashboard left.
+            host_credentials.watch(auth.store.home, agent_messages.pane_session)
         # Through `tailscale serve`, only user-owned devices may use more than /api/worker/.
         self.require_tailscale_user = require_tailscale_user
         # Set when the dashboard stops to be started again on the checkout's code.
@@ -1516,12 +1520,41 @@ class Handler(BaseHTTPRequestHandler):
         if profile is None:
             raise ValueError("That credential profile no longer exists")
         machine, workspace = viewed_workspace(self.server.home, request["workspace"])
+
+        def notice(path):
+            return (
+                f"Credential {json.dumps(profile['name'])} is available at {path} "
+                f"for up to {minutes} minute(s). Use it only for the task you are working on. "
+                "Pass the path to a tool that accepts a credential file, or read it inside a "
+                "program and use it directly. Do not print, echo, or copy its contents into chat, "
+                "tool output, command arguments, logs, or transcripts. Avoid shell tracing and "
+                "verbose logging. If you cannot use it without exposing it, stop and tell the user."
+            )
+
+        if machine is None and sys.platform == "darwin":
+            # A Safehouse agent here: restarted with the file's directory readable.
+            try:
+                result = agent_messages.grant_credential(
+                    {"workspace": workspace, "pane": request["pane"], "session": session},
+                    self.server.home,
+                    home,
+                    minutes,
+                    lambda: credential_profiles.read(profile),
+                    notice,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.fail(503, f"Check the agent in Collie: {exc}")
+                return
+            self.send_json(200, {**result, "minutes": minutes})
+            return
         if machine is None or machine.os != "linux":
-            raise ValueError("Credential grants require a sandboxed Linux worker session")
+            raise ValueError(
+                "Credential grants require a Safehouse agent on this Mac "
+                "or a sandboxed Linux worker session"
+            )
         grant = uuid.uuid4().hex
         pane = request["pane"]
         attempted = False
-        path = f"{worker_credentials.MOUNT}/{grant}"
 
         def stage(_):
             nonlocal attempted
@@ -1537,14 +1570,7 @@ class Handler(BaseHTTPRequestHandler):
                 minutes,
                 data,
             )
-            return (
-                f"Credential {json.dumps(profile['name'])} is available at {path} "
-                f"for up to {minutes} minute(s). Use it only for the task you are working on. "
-                "Pass the path to a tool that accepts a credential file, or read it inside a "
-                "program and use it directly. Do not print, echo, or copy its contents into chat, "
-                "tool output, command arguments, logs, or transcripts. Avoid shell tracing and "
-                "verbose logging. If you cannot use it without exposing it, stop and tell the user."
-            )
+            return notice(f"{worker_credentials.MOUNT}/{grant}")
 
         try:
             result = agent_messages.send(

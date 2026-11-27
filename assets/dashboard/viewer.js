@@ -2328,20 +2328,27 @@
       renderLive();
     };
     menu.push(quit);
-    if (worker && agent.session && viewer.entry.workspace && window.dashboardCredentials) {
+    const grantable = agent.session && viewer.entry.workspace && window.dashboardCredentials;
+    // A worker's Linux sandbox takes it as it runs; a Safehouse agent here is restarted.
+    if (grantable && (worker || agent.credential_grant)) {
       const grant = button(
         "credential-grant",
         "Grant credential…",
         "ws-move",
         `Grant a credential to ${name}`,
-        "Let this session read a saved credential for a limited time",
+        worker
+          ? "Let this session read a saved credential for a limited time"
+          : "Restart this idle session so it can read a saved credential for a limited time",
       );
       grant.onclick = () =>
         void window.dashboardCredentials.grant(
           { workspace: viewer.entry.workspace, pane: agent.pane, session: agent.session },
-          `${name} on ${worker}`,
+          worker ? `${name} on ${worker}` : name,
+          !worker,
         );
       menu.push(grant);
+    }
+    if (grantable && worker) {
       const directory = button(
         "directory-grant",
         "Grant directory…",

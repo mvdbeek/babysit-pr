@@ -1680,6 +1680,8 @@ def test_messages_reach_one_agent_of_the_workspace(site, tmp_path, monkeypatch):
                     # Started without settings: the agent's defaults.
                     "model": "",
                     "effort": "",
+                    # Only a Safehouse agent on a Mac takes one by a restart.
+                    "credential_grant": sys.platform == "darwin",
                 }
             ]
             assert value["path"].endswith("merged-work") and value["sessions"] == []
