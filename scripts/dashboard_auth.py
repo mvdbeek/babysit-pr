@@ -65,6 +65,8 @@ CACHE_SECONDS = 60
 REPORT_LOG_EVERY = 60
 HTTP_TIMEOUT = 10
 HTTP_MAX = 1024 * 1024
+# Cloudflare's browser integrity check refuses urllib's default "Python-urllib/3.x".
+USER_AGENT = "babysit-pr-dashboard"
 LOGIN_COOKIES = ("__Secure-babysit_login", "babysit_login")
 SESSION_COOKIES = ("__Host-babysit_session", "babysit_session")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -284,7 +286,9 @@ def http_json(url: str, data: bytes | None = None, headers: dict | None = None) 
     if not allowed_url(url):
         raise AuthError(f"Refusing a non-https identity provider URL: {url}", 503)
     request = urllib.request.Request(
-        url, data=data, headers={"Accept": "application/json", **(headers or {})}
+        url,
+        data=data,
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT, **(headers or {})},
     )
     try:
         with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
