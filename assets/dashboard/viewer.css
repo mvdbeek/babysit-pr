@@ -1485,3 +1485,16 @@ body.ws-tray-shown main {
     width: 100%;
   }
 }
+
+.ws-option-preview {
+  margin: 6px 0 10px 24px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.ws-option-preview > :first-child {
+  margin-top: 0;
+}
+.ws-option-preview > :last-child {
+  margin-bottom: 0;
+}

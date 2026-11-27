@@ -977,6 +977,23 @@ def test_question_tools_carry_their_questions_and_claudes_answers(stores):
             ],
         }
     ]
+    previews = wv.question_list(
+        {
+            "questions": [
+                {
+                    "question": "Choose",
+                    "options": [
+                        {"label": "A", "markdown": "**First** preview"},
+                        {"label": "B", "preview": "Second preview"},
+                    ],
+                }
+            ]
+        }
+    )
+    assert [option["preview"] for option in previews[0]["options"]] == [
+        "**First** preview",
+        "Second preview",
+    ]
     # Codex's request names a question its title and lists bare option strings.
     codex = wv.question_list('{"questions":[{"title":"Which?","options":["A","B"]}, 5]}')
     assert codex == [

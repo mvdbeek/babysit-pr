@@ -5222,6 +5222,50 @@ def test_questions_render_as_cards_and_a_waiting_one_is_answered_here(
     ]
 
 
+@pytest.mark.parametrize("width", [390, 1280])
+def test_claude_question_previews_are_visible_with_choices(
+    page, dashboard_site, viewer_routes, width
+):
+    url, _ = dashboard_site
+    session = {"id": "s1", "agent": "claude", "updated": 1, "size": 1, "title": "Go"}
+    question = {
+        **QUESTION,
+        "options": [
+            {"label": "First", "description": None, "preview": "**First wording**\n\nFull text."},
+            {"label": "Second", "description": None, "preview": "Second wording"},
+        ],
+    }
+    entries = [
+        question_entry([question], output="answered", answers={question["question"]: "First"}),
+        question_entry([question]),
+    ]
+    page.route(
+        "**/api/workspace-transcript?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": [session],
+                "session": session,
+                "entries": entries,
+                "start": 0,
+                "total": 2,
+            }
+        ),
+    )
+    viewer_routes["agents"][1].update(status="blocked", session="s1")
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    cards = page.locator("#ws-viewer .ws-question")
+    expect(cards).to_have_count(2)
+    for card in [cards.nth(0), cards.nth(1)]:
+        expect(card.locator(".ws-option-preview")).to_have_count(2)
+        expect(card.locator(".ws-option-preview strong")).to_have_text("First wording")
+        expect(card).to_contain_text("Second wording")
+    expect(cards.nth(1).get_by_label("First", exact=True)).to_be_visible()
+    expect(cards.nth(1).get_by_placeholder("Something else")).to_have_count(0)
+    assert page.locator("#ws-viewer").evaluate("el => el.scrollWidth <= el.clientWidth")
+
+
 def test_a_question_the_transcript_shows_is_not_drawn_again_below_it(
     page, dashboard_site, viewer_routes
 ):

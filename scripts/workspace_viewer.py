@@ -519,8 +519,10 @@ def question_list(value):
                 option = {"label": option}
             if isinstance(option, dict) and isinstance(option.get("label"), str):
                 description = option.get("description")
+                preview = option.get("preview") or option.get("markdown")
                 options.append(
                     {
+                        **({"preview": clip(preview, 20000)} if isinstance(preview, str) else {}),
                         "label": clip(option["label"], MAX_BRIEF),
                         "description": clip(description, 1000)
                         if isinstance(description, str)
