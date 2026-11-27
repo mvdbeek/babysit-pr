@@ -38,6 +38,7 @@ import claude_accounts
 import cron_agents
 import exit_watch
 import herdr_handoff
+import host_credentials
 import machines
 import remote_probe
 import sandbox
@@ -448,11 +449,13 @@ def docker_status(workspace_id, live=_UNSET, machine=None):
                 docker=None,
                 docker_supported=False,
                 docker_error="Docker access can only be inspected for agents on this Mac",
+                credential_grant=machine.os == "linux",
                 **worker_settings(target, machine),
             )
         return result
     for target in result:
-        target.update(docker=None, model="", effort="")
+        # A Safehouse agent here takes a grant by a restart (grant_credential).
+        target.update(docker=None, model="", effort="", credential_grant=sys.platform == "darwin")
         if target["agent"] == "claude" and target["session"]:
             target["claude_account"] = agent_settings.account(target["session"])
         try:
@@ -508,6 +511,127 @@ def set_docker(request, home=None):
         return change_docker(target, request["enabled"], home)
 
 
+def restart_local(target, info, record, home, text=""):
+    """Quit an idle Safehouse agent on this Mac and resume it as ``record`` prepared it.
+
+    ``text`` becomes the resumed session's prompt.
+    """
+    session_id = record["session_id"]
+    if not workspace_viewer.SESSION.fullmatch(session_id):
+        raise ValueError(
+            "Could not verify the current conversation; refresh before restarting the agent"
+        )
+    recent = _recent.get(session_id)
+    if recent and time.monotonic() - recent[1] < RECENT_RESUME:
+        raise ValueError(f"This session was just resumed; {UNCERTAIN}")
+    root = workspace_viewer.workspace_checkout(info["workspace_id"])
+    chosen = next(
+        (
+            s
+            for s in workspace_viewer.sessions(root)
+            if s["id"] == session_id and s["agent"] == record["agent"]
+        ),
+        None,
+    )
+    if chosen is None:
+        raise ValueError(
+            "The current session is not recorded yet; wait before restarting the agent"
+        )
+    owner = watch_owner(session_id, record["agent"], home, chosen.get("claude_config_dir"))
+    if owner:
+        raise ValueError(f"Not restarted: {owner}")
+    watched = exit_watcher(target["pane"], session_id, home)
+    if watched:
+        raise ValueError(
+            f"Not restarted: this agent quits by itself once its task is done ({watched}); "
+            "nothing was sent"
+        )
+    # Its exit is a quit's: never beside another exit of the pane (exit_agent).
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(herdr_handoff.pane_lock(home, target["pane"], wait=False))
+        except BlockingIOError:
+            raise ValueError(
+                "Another exit of this agent is under way; nothing was sent. Check it in Collie"
+            ) from None
+        agent_docker.quit_agent(record)
+        return launch(
+            info["workspace_id"],
+            chosen,
+            target["pane"],
+            text,
+            home,
+            options=record["options"],
+            cwd=record["cwd"],
+            launcher=record["launcher"],
+        )
+
+
+def grant_credential(request, home, auth_home, minutes, read, notice):
+    """Restart an idle Safehouse agent on this Mac with a credential file it may read.
+
+    Seatbelt fixes a sandbox's paths when it starts, so the agent is quit and its
+    session resumed in the same pane, Safehouse adding the grant's directory read-only.
+    ``read()`` returns the credential, read before anything is stopped. ``notice(path)``
+    is the resumed session's prompt. The file goes on expiry, or once the pane runs
+    another conversation (``host_credentials.sweep``).
+    """
+    workspace, pane, session = request["workspace"], request["pane"], request["session"]
+    root = workspace_viewer.workspace_checkout(workspace)
+    with locked(
+        ("checkout", os.path.realpath(root)),
+        ("session", session),
+        ("pane", pane),
+    ):
+        target = next((a for a in agents(workspace) if a["pane"] == pane), None)
+        if target is None or target.get("session") != session:
+            raise ValueError("That session is no longer running in this pane; refresh")
+        if target.get("agent") not in RESUME:
+            raise ValueError("Only Claude and Codex agents can receive a credential")
+        try:
+            info, procs, state, proc = agent_docker.inspect(target)
+            if (info.get("agent_session") or {}).get("value") != session:
+                raise ValueError("The agent changed; refresh")
+            if agent_docker.has_access(proc["pid"]):
+                raise ValueError("Turn off this agent's Docker access before granting a credential")
+            data = read()
+            path = host_credentials.stage(auth_home, data, minutes, pane, session)
+            host_credentials.watch(auth_home, pane_session)
+            try:
+                record = agent_docker.prepare(
+                    target, info, procs, state, proc, enabled=None, read_only=[str(path.parent)]
+                )
+                result = restart_local(target, info, record, home, notice(str(path)))
+            except BaseException:
+                host_credentials.remove(auth_home, path.parent.name)
+                raise
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+    warning = result["warning"]
+    if not warning:
+        try:
+            current, _, _, proc = agent_docker.inspect(target)
+            readable = (current.get("agent_session") or {}).get("value") == session and (
+                agent_docker.sandbox_checks(proc["pid"], [(b"file-read-data", str(path))]) == [0]
+            )
+        except (ValueError, RuntimeError, OSError, AttributeError, subprocess.SubprocessError):
+            readable = False
+        if not readable:
+            warning = (
+                "Could not confirm that the restarted agent can read the credential; check Collie."
+            )
+    return {"pane": pane, "warning": warning}
+
+
+def pane_session(pane):
+    """The agent session a pane on this machine runs; None when herdr cannot tell."""
+    try:
+        info = herdr_handoff.result("pane", "get", pane)["pane"]
+    except (ValueError, RuntimeError, KeyError, TypeError, OSError, subprocess.SubprocessError):
+        return None
+    return (info.get("agent_session") or {}).get("value")
+
+
 def change_docker(target, enabled, home):
     """Restart an idle agent with the requested access, without submitting a prompt."""
     try:
@@ -517,55 +641,7 @@ def change_docker(target, enabled, home):
         if agent_docker.has_access(proc["pid"]) == enabled:
             return {"pane": target["pane"], "docker": enabled, "warning": None}
         record = agent_docker.prepare(target, info, procs, state, proc, enabled)
-        session_id = record["session_id"]
-        if not workspace_viewer.SESSION.fullmatch(session_id):
-            raise ValueError(
-                "Could not verify the current conversation; refresh before changing Docker access"
-            )
-        recent = _recent.get(session_id)
-        if recent and time.monotonic() - recent[1] < RECENT_RESUME:
-            raise ValueError(f"This session was just resumed; {UNCERTAIN}")
-        root = workspace_viewer.workspace_checkout(info["workspace_id"])
-        chosen = next(
-            (
-                s
-                for s in workspace_viewer.sessions(root)
-                if s["id"] == session_id and s["agent"] == record["agent"]
-            ),
-            None,
-        )
-        if chosen is None:
-            raise ValueError(
-                "The current session is not recorded yet; wait before changing Docker access"
-            )
-        owner = watch_owner(session_id, record["agent"], home, chosen.get("claude_config_dir"))
-        if owner:
-            raise ValueError(f"Not restarted: {owner}")
-        watched = exit_watcher(target["pane"], session_id, home)
-        if watched:
-            raise ValueError(
-                f"Not restarted: this agent quits by itself once its task is done ({watched}); "
-                "nothing was sent"
-            )
-        # Its exit is a quit's: never beside another exit of the pane (exit_agent).
-        with contextlib.ExitStack() as held:
-            try:
-                held.enter_context(herdr_handoff.pane_lock(home, target["pane"], wait=False))
-            except BlockingIOError:
-                raise ValueError(
-                    "Another exit of this agent is under way; nothing was sent. Check it in Collie"
-                ) from None
-            agent_docker.quit_agent(record)
-            result = launch(
-                info["workspace_id"],
-                chosen,
-                target["pane"],
-                "",
-                home,
-                options=record["options"],
-                cwd=record["cwd"],
-                launcher=record["launcher"],
-            )
+        result = restart_local(target, info, record, home)
         observed = None
         if not result["warning"]:
             try:

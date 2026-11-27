@@ -204,6 +204,40 @@ def test_grant_uses_ssh_stdin_and_rechecks_the_worker_session(serve, tmp_path, m
     assert len(requests) == 3
 
 
+def test_a_grant_to_an_agent_on_this_mac_restarts_it_with_the_credential(
+    serve, tmp_path, monkeypatch
+):
+    auth = dashboard_auth.Auth(tmp_path / "auth", "report", log=lambda _: None)
+    server = serve(auth=auth)
+    token = auth.store.create_session("fixture", "fixture", "break-glass")
+    headers = {"Cookie": f"{dashboard_auth.session_cookie_name(False)}={token}"}
+    profiles = credential_profiles.update(auth.store.home, {"name": "API", "entry": "ci/api"})
+    profile_id = next(iter(profiles))
+    calls = []
+
+    def grant_credential(request, home, auth_home, minutes, read, notice):
+        calls.append((request, home, auth_home, minutes, read(), notice("/fixture/credential")))
+        return {"pane": request["pane"], "warning": None}
+
+    monkeypatch.setattr(credential_profiles, "read", lambda profile: b"fixture-secret")
+    monkeypatch.setattr(agent_messages, "grant_credential", grant_credential)
+    monkeypatch.setattr(dashboard.sys, "platform", "darwin")
+    session = str(uuid.UUID(int=1))
+    request = {"workspace": "w1", "pane": "w1:p1", "session": session}
+    status, _, response = credential_post(
+        server,
+        "workspace-credential-grant",
+        {**request, "profile": profile_id, "minutes": 15},
+        headers,
+    )
+    assert status == 200
+    assert json.loads(response) == {"pane": "w1:p1", "warning": None, "minutes": 15}
+    ((sent, home, auth_home, minutes, data, notice),) = calls
+    assert (sent, home, auth_home, minutes) == (request, tmp_path, auth.store.home, 15)
+    assert data == b"fixture-secret" and b"fixture-secret" not in response
+    assert "API" in notice and "/fixture/credential for up to 15 minute" in notice
+
+
 def test_api_json_is_gzipped_only_when_accepted_and_never_cached(serve, overview):
     server = serve(overview=overview)
     status, plain_headers, plain = get(server, "/api/prs")

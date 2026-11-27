@@ -6605,6 +6605,61 @@ def test_grant_temporary_credential_to_a_worker_session(
     ]
 
 
+def test_grant_credential_to_a_safehouse_agent_on_this_mac(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [
+        {
+            "pane": "w1:p2",
+            "agent": "codex",
+            "status": "idle",
+            "session": "s1",
+            "credential_grant": True,
+        }
+    ]
+    grants = []
+
+    def approve(route):
+        grants.append(route.request.post_data_json)
+        route.fulfill(json={"pane": "w1:p2", "warning": None, "minutes": 5})
+
+    page.route(
+        "**/api/credential-profiles",
+        lambda route: route.fulfill(
+            json={"profiles": {"main": {"name": "Service API", "entry": "service/api"}}}
+        ),
+    )
+    page.route("**/api/workspace-credential-grant", approve)
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_role("button", name="More actions for Codex in w1:p2").click()
+    # A directory grant is a worker's alone.
+    expect(
+        page.get_by_role("button", name="Grant directory access to Codex in w1:p2")
+    ).to_have_count(0)
+    page.get_by_role("button", name="Grant a credential to Codex in w1:p2").click()
+    dialog = page.get_by_role("dialog", name="Grant temporary credential")
+    expect(dialog).to_contain_text(
+        "Grant access to Codex in w1:p2. The idle agent restarts in its pane to receive it."
+    )
+    dialog.get_by_role("button", name="Grant access").click()
+    expect(dialog.get_by_role("status")).to_have_text("Access granted to w1:p2 for 5 minutes.")
+    assert grants == [
+        {"workspace": "w1", "pane": "w1:p2", "session": "s1", "profile": "main", "minutes": 5}
+    ]
+
+
+def test_an_agent_without_a_grant_path_offers_no_credential(page, dashboard_site, viewer_routes):
+    url, _ = dashboard_site
+    viewer_routes["agents"] = [
+        {"pane": "w1:p2", "agent": "codex", "status": "idle", "session": "s1"}
+    ]
+    page.goto(url + "/#prs")
+    page.locator("#pr-list tr").first.get_by_role("button", name="Transcript", exact=True).click()
+    page.get_by_role("button", name="More actions for Codex in w1:p2").click()
+    expect(page.get_by_role("button", name="Quit Codex in w1:p2")).to_be_visible()
+    expect(page.get_by_role("button", name="Grant a credential to Codex in w1:p2")).to_have_count(0)
+
+
 def test_grant_directory_to_a_worker_session(page, dashboard_site, viewer_routes, workspace_routes):
     url, _ = dashboard_site
     workspace_routes[0]["matches"][0]["workspace_id"] = "mini/w1"

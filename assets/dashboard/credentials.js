@@ -12,6 +12,7 @@
   const settingsStatus = byId("settings-status");
   const grantStatus = byId("grant-status");
   let target = null;
+  let restarting = false;
   let directoryTarget = null;
   const directoryDialog = document.getElementById("directory-grant");
   const directoryForm = document.getElementById("directory-grant-form");
@@ -144,11 +145,14 @@
       document.getElementById("directory-grant-target").textContent = `Grant access to ${label}.`;
       directoryDialog.showModal();
     },
-    async grant(recipient, label) {
+    async grant(recipient, label, restarts = false) {
       target = recipient;
+      restarting = restarts;
       grantForm.hidden = true;
       grantForm.reset();
-      byId("grant-target").textContent = `Grant access to ${label}.`;
+      byId("grant-target").textContent = restarts
+        ? `Grant access to ${label}. The idle agent restarts in its pane to receive it.`
+        : `Grant access to ${label}.`;
       grantStatus.textContent = "Loading profiles…";
       grant.showModal();
       try {
@@ -180,7 +184,9 @@
     if (approve.disabled) return;
     const minutes = duration.valueAsNumber;
     approve.disabled = byId("grant-close").disabled = profile.disabled = duration.disabled = true;
-    grantStatus.textContent = "Granting credential access…";
+    grantStatus.textContent = restarting
+      ? "Restarting the agent with credential access…"
+      : "Granting credential access…";
     try {
       const value = await request("workspace-credential-grant", {
         ...target,

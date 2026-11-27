@@ -764,6 +764,20 @@ read the file can keep a copy. The worker account and processes with equivalent 
 access can also reach it. This requires a fresh sandboxed launch on an updated Linux
 worker. A launch with Docker access cannot receive a grant.
 
+An agent on this Mac can receive a grant too. Seatbelt fixes what a Safehouse sandbox
+may read when it starts, so **Grant credential…** quits the idle agent and resumes its
+conversation in the same pane. Safehouse adds `--add-dirs-ro` for one new directory
+under `credential-grants/` in the auth home, which no other sandbox can read. The
+resumed session's first prompt gives the path and the same handling instructions. The
+existing restart checks apply: the agent must be idle, with no unsent draft, no
+watcher or exit watch that owns it, and only launch options the restart can preserve.
+Docker access must be off. The dashboard checks the agent's own sandbox for read access
+and warns if it cannot confirm it. It removes the file when the grant expires, or once
+the pane runs another conversation, checking every 15 seconds. It also removes expired
+grants after it restarts. A later Docker restart drops the old grant from the
+Safehouse command line. The sandbox keeps the read permission until the agent exits,
+but the file is gone after expiry.
+
 **Quit the agent when it is done**, beside the agent picker in the follow-up composer,
 works for every message, whether it goes to a running agent or resumes an exited
 session. It suits a closing instruction such as "approve and merge". The message gets
