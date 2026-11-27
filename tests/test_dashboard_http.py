@@ -104,9 +104,9 @@ def test_grant_uses_ssh_stdin_and_rechecks_the_worker_session(serve, tmp_path, m
     executable.write_text(
         '#!/bin/sh\n[ -z "$GOPASS_DEBUG_LOG" ] || exit 1\n'
         'case "$*" in\n'
-        '"list --flat") printf "%s\\n" "service/api" ;;\n'
-        '"show --password --alsoclip=false --nosync -- service/api") printf "%s\\n" "$DUMMY_KEY" ;;\n'
-        '"show --unsafe --noparsing --alsoclip=false --nosync -- service/api") '
+        '"list --flat") printf "%s\\n" "accounts/example.org/user+ci@example.org" ;;\n'
+        '"show --password --alsoclip=false --nosync -- accounts/example.org/user+ci@example.org") printf "%s\\n" "$DUMMY_KEY" ;;\n'
+        '"show --unsafe --noparsing --alsoclip=false --nosync -- accounts/example.org/user+ci@example.org") '
         'printf "%s\\n%s\\n" "$DUMMY_KEY" "second-line" ;;\n'
         "*) exit 1 ;;\nesac\n"
     )
@@ -126,7 +126,11 @@ def test_grant_uses_ssh_stdin_and_rechecks_the_worker_session(serve, tmp_path, m
     )
     token = auth.store.create_session("fixture", "fixture", "break-glass")
     headers = {"Cookie": f"{dashboard_auth.session_cookie_name(False)}={token}"}
-    profile = {"name": "Service API", "entry": "service/api", "format": kind}
+    profile = {
+        "name": "Service API",
+        "entry": "accounts/example.org/user+ci@example.org",
+        "format": kind,
+    }
     code, _, response = credential_post(server, "credential-profiles", profile, headers)
     assert code == 200
     profile_id = next(iter(json.loads(response)["profiles"]))

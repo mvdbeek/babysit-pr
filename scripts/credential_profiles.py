@@ -13,7 +13,10 @@ import machines
 import worker_credentials
 
 PROFILES = "credential-profiles.json"
-ENTRY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
+# A part may hold an email address, as in accounts/example.org/user+ci@example.org.
+ENTRY_PART = r"[A-Za-z0-9_][A-Za-z0-9_.@+-]*"
+ENTRY = re.compile(rf"{ENTRY_PART}(?:/{ENTRY_PART})*")
+ENTRY_CHARACTER = re.compile(r"[A-Za-z0-9_.@+/-]")
 FORMATS = ("password", "entry")
 _lock = threading.Lock()
 
@@ -53,8 +56,10 @@ def update(home: Path, request: dict) -> dict[str, dict[str, str]]:
             name, entry = request["name"], request["entry"]
             if not isinstance(name, str) or not (1 <= len(name.strip()) <= 80):
                 raise ValueError("Enter a profile name of up to 80 characters")
-            if not isinstance(entry, str) or len(entry) > 255 or not ENTRY.fullmatch(entry):
-                raise ValueError("Enter a gopass entry name such as galaxy/main")
+            if not isinstance(entry, str) or not (1 <= len(entry) <= 255):
+                raise ValueError("Enter a gopass entry name of up to 255 characters")
+            if not ENTRY.fullmatch(entry):
+                raise ValueError(entry_problem(entry))
             kind = request.get("format", "password")
             if kind not in FORMATS:
                 raise ValueError("Choose password line or entire entry")
@@ -74,6 +79,16 @@ def update(home: Path, request: dict) -> dict[str, dict[str, str]]:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         return saved
+
+
+def entry_problem(entry: str) -> str:
+    bad = next((c for c in entry if not ENTRY_CHARACTER.fullmatch(c)), None)
+    if bad is not None:
+        shown = repr(bad) if not bad.isprintable() or bad.isspace() else f"“{bad}”"
+        return f"A gopass entry name cannot contain {shown}"
+    return (
+        "Each part of a gopass entry name must start with a letter, digit or _, as in galaxy/main"
+    )
 
 
 def read(profile: dict[str, str]) -> bytes:
